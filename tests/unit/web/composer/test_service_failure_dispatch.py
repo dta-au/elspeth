@@ -40,6 +40,7 @@ from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError
+from tests.helpers.continuation_budgets import OWNER_LEASE_SECONDS
 from tests.unit.web.composer.test_compose_loop_interpretation_review_dispatch import _state_with_llm_node
 from tests.unit.web.sessions import test_continuation_composition_initialization as initialization_fixtures
 from tests.unit.web.sessions.test_continuation_live_phases import _advance, _phase_case
@@ -96,7 +97,7 @@ async def _issued_review_case(store, tmp_path, monkeypatch, *, calls=None):
     assert running is not None
     service, provider = runtime.materialization.service, runtime.bindings.provider_owner
     lease = await ContinuationLeaseAdoption(
-        store[1], running.session_operation_context, lease_seconds=30, required_work=work.coordinator
+        store[1], running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS, required_work=work.coordinator
     ).join()
     owner = ContinuationLivePhases(service, store[2], work, provider, lease)
     owner.bind_initial(runtime)

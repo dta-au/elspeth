@@ -27,10 +27,12 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     text = " ".join(current_section.split())
 
     assert f"Session epoch {SESSION_SCHEMA_EPOCH} replaces session epoch {SESSION_SCHEMA_EPOCH - 1}" in text
+    assert "one Composer lifecycle, Continuation" in text
+    assert "default-off Composer continuation" not in text
     assert "retains its committed graph-review authority" in text
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in text
     assert (
-        "Preserve epoch 75, both epoch 76 session-store contracts, epoch 77 and epoch 78 session stores and epoch 49 Landscape stores"
+        "Preserve epoch 75, both epoch 76 session-store contracts, epoch 77, epoch 78 and epoch 79 session stores and epoch 49 Landscape stores"
         in text
     )
     assert f"use a separately provisioned epoch {SESSION_SCHEMA_EPOCH} session store" in text

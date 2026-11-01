@@ -19,9 +19,9 @@ from elspeth.web.composer.continuation import ComposeFrame, EndFrame, Initialize
 from elspeth.web.composer.continuation_clock import ContinuationTimingObservation, SegmentFit, admit_action
 from elspeth.web.composer.continuation_composition_initialization import initialize_continuation_composition
 from elspeth.web.composer.continuation_env_inventory import _read_current_env_names
-from elspeth.web.composer.continuation_initialization import _registered, prepare_pretitle_bootstrap
+from elspeth.web.composer.continuation_initialization import _registered, adopt_recompose_original, prepare_pretitle_bootstrap
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
+from elspeth.web.composer.continuation_next_action import _is_first_compose_iteration, next_continuation_action_policy
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
@@ -357,9 +357,7 @@ class _SegmentDriver:
         if type(top) is InitializeFrame:
             if top.ingress_phase == "reserved":
                 if root.logical.kind != "compose_message":
-                    await self.service.advance_continuation_phase(
-                        owner=self.phases, authority=self.authority, selected=selected, work=self.work, provider_owner=self.provider
-                    )
+                    await adopt_recompose_original(service=self.service, selected=stored, required_work=self.work)
                     return None
                 request = SendMessageRequest.model_validate_json(top.request_json)
                 sql, projection = self.work.reserve_pair(RequiredWorkSource.INGRESS_SQL, RequiredWorkSource.INGRESS_PROJECTION)
@@ -403,12 +401,14 @@ class _SegmentDriver:
             self.phases.bind_initial(runtime)
             return None
         if type(top) is ComposeFrame and top.phase == "action_ready":
-            if self.phases.runtime is None:
+            if self.phases.runtime is None and _is_first_compose_iteration(top):
                 runtime = await initialize_continuation_composition(
                     service=self.service, authority=self.authority, selected=stored, required_work=self.work, provider_owner=self.provider
                 )
                 self.phases.bind_initial(runtime)
             else:
+                # Later published cuts restore their retained runtime sources;
+                # first initialization keeps its original stricter contract.
                 runtime, _inventory = await self.phases.current(selected)
             policy = runtime.source.policy
             # This packet owns delivery preflight only. The current SQL-backed

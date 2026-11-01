@@ -490,3 +490,289 @@ def test_owned_event_preserves_shared_closed_vocabulary():
             ContinuationEvent(cast(ContinuationEventTag, invalid), "{}")
     with pytest.raises(AuditIntegrityError, match="owned JSON text"):
         ContinuationEvent("checkpoint", cast(str, None))
+
+
+def _retained_payload_rows(connection, session_id, operation_id):
+    """Observe actual operation bytes without selecting every payload."""
+    from sqlalchemy import LargeBinary, cast, func, select
+
+    from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+
+    if connection.dialect.name == "sqlite":
+        actual_bytes = func.length(cast(chunks.c.payload, LargeBinary))
+    elif connection.dialect.name == "postgresql":
+        actual_bytes = func.octet_length(chunks.c.payload)
+    else:
+        raise AssertionError("retained-byte observation requires a supported database")
+    rows = connection.execute(
+        select(chunks.c.chunk_key, chunks.c.codec, chunks.c.byte_length, actual_bytes.label("actual_bytes")).where(
+            chunks.c.session_id == session_id,
+            chunks.c.operation_id == operation_id,
+        )
+    ).all()
+    assert all(type(row.actual_bytes) is int and row.byte_length == row.actual_bytes for row in rows)
+    return {row.chunk_key: (row.codec, row.actual_bytes) for row in rows}
+
+
+def _seed_snapshot_cursor_boundary(snapshot_store, cursor):
+    """Seed a C2 numeric edge, without a live C3 or history-count claim."""
+    from sqlalchemy import insert, update
+
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
+    from elspeth.web.coordination.database_clock import database_now
+    from elspeth.web.sessions.continuation import put_chunk
+    from elspeth.web.sessions.models import composer_async_operations_table as jobs
+    from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+    from elspeth.web.sessions.models import composer_continuation_events_table as events
+
+    engine, sid, operation_id, encoded = snapshot_store
+    stack = decode_continuation_snapshot(encoded).model_copy(update={"cursor": cursor})
+    boundary_json = encode_continuation_snapshot(stack)
+    checkpoint_id = "journal-numeric-boundary"
+    snapshot_key, event_key = f"snapshot:{checkpoint_id}", f"event:{cursor}"
+    with engine.begin() as connection:
+        now = database_now(connection)
+        put_chunk(
+            connection,
+            session_id=sid,
+            operation_id=operation_id,
+            key=snapshot_key,
+            payload=boundary_json.encode("utf-8"),
+            codec="snapshot.v2",
+        )
+        put_chunk(
+            connection,
+            session_id=sid,
+            operation_id=operation_id,
+            key=event_key,
+            payload=b"{}",
+            codec="event.v2",
+        )
+        connection.execute(
+            insert(events).values(
+                session_id=sid,
+                operation_id=operation_id,
+                sequence=cursor,
+                tag="checkpoint",
+                payload_chunk_key=event_key,
+                created_at=now,
+            )
+        )
+        connection.execute(
+            insert(checkpoints).values(
+                session_id=sid,
+                operation_id=operation_id,
+                checkpoint_id=checkpoint_id,
+                kind="transition",
+                cursor=cursor,
+                snapshot_chunk_key=snapshot_key,
+                frame_stack_version=1,
+                created_at=now,
+            )
+        )
+        connection.execute(
+            update(jobs)
+            .where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)
+            .values(
+                checkpoint_id=checkpoint_id,
+                journal_cursor=cursor,
+                status_revision=jobs.c.status_revision + 1,
+            )
+        )
+
+
+@pytest.mark.parametrize("previous_events", (0, 9))
+def test_complete_snapshot_byte_measurement_uses_final_root_and_raw_event_utf8(snapshot_store, previous_events):
+    from sqlalchemy import select
+
+    from elspeth.contracts.hashing import canonical_json
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
+    from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, load_snapshot, read_chunk
+    from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+
+    engine, sid, operation_id, encoded = snapshot_store
+    payload_json = '{"exact":"café 雪\\n"}'
+    with engine.begin() as connection:
+        current = load_snapshot(connection, session_id=sid, operation_id=operation_id)
+        if previous_events:
+            current = append_complete_snapshot(
+                connection,
+                session_id=sid,
+                operation_id=operation_id,
+                expected_checkpoint_id=current.checkpoint_id,
+                expected_cursor=current.cursor,
+                snapshot_json=current.payload_json,
+                event_batch=tuple(ContinuationEvent("checkpoint", "{}") for _ in range(previous_events)),
+                handoff=False,
+            )
+        before = _retained_payload_rows(connection, sid, operation_id)
+        final_cursor = current.cursor + 1
+        expected_root = encode_continuation_snapshot(
+            decode_continuation_snapshot(current.payload_json).model_copy(update={"cursor": final_cursor})
+        )
+        actual = append_complete_snapshot(
+            connection,
+            session_id=sid,
+            operation_id=operation_id,
+            expected_checkpoint_id=current.checkpoint_id,
+            expected_cursor=current.cursor,
+            snapshot_json=current.payload_json,
+            event_batch=(ContinuationEvent("checkpoint", payload_json),),
+            handoff=False,
+        )
+        after = _retained_payload_rows(connection, sid, operation_id)
+        root_key = connection.execute(
+            select(checkpoints.c.snapshot_chunk_key).where(
+                checkpoints.c.session_id == sid,
+                checkpoints.c.operation_id == operation_id,
+                checkpoints.c.checkpoint_id == actual.checkpoint_id,
+            )
+        ).scalar_one()
+        event_key = f"event:{final_cursor}"
+        assert actual.payload_json == expected_root and actual.cursor == final_cursor
+        assert read_chunk(connection, session_id=sid, operation_id=operation_id, key=root_key) == expected_root.encode("utf-8")
+        assert read_chunk(connection, session_id=sid, operation_id=operation_id, key=event_key) == payload_json.encode("utf-8")
+        assert after[root_key] == ("snapshot.v2", len(expected_root.encode("utf-8")))
+        assert after[event_key] == ("event.v2", len(payload_json.encode("utf-8")))
+        assert after[root_key][1] > len(expected_root)
+        assert after[event_key][1] > len(payload_json)
+        assert after[root_key][1] != len(canonical_json(expected_root).encode("utf-8"))
+        assert after[event_key][1] != len(canonical_json(payload_json).encode("utf-8"))
+        assert after.keys() - before.keys() == {root_key, event_key}
+        assert sum(size for _codec, size in after.values()) == (
+            sum(size for _codec, size in before.values()) + after[root_key][1] + after[event_key][1]
+        )
+        assert read_chunk(connection, session_id=sid, operation_id=operation_id, key="initial-snapshot") == encoded.encode("utf-8")
+        assert load_snapshot(connection, session_id=sid, operation_id=operation_id) == actual
+        if previous_events == 9:
+            assert current.cursor == 9 and actual.cursor == 10
+            assert after[root_key][1] == len(current.payload_json.encode("utf-8")) + 1
+
+
+def test_retained_payload_measurement_includes_history_and_off_head_keys(snapshot_store):
+    from sqlalchemy import select
+
+    from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, load_snapshot, put_chunk
+    from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+
+    engine, sid, operation_id, _encoded = snapshot_store
+    payload = '"café"'.encode()
+    with engine.begin() as connection:
+        original = _retained_payload_rows(connection, sid, operation_id)
+        put_chunk(connection, session_id=sid, operation_id=operation_id, key="off-head-original", payload=payload, codec="event.v2")
+        first = _retained_payload_rows(connection, sid, operation_id)
+        assert sum(size for _codec, size in first.values()) == sum(size for _codec, size in original.values()) + len(payload)
+        put_chunk(connection, session_id=sid, operation_id=operation_id, key="off-head-original", payload=payload, codec="event.v2")
+        assert _retained_payload_rows(connection, sid, operation_id) == first
+        put_chunk(connection, session_id=sid, operation_id=operation_id, key="off-head-distinct-key", payload=payload, codec="event.v2")
+        second = _retained_payload_rows(connection, sid, operation_id)
+        assert sum(size for _codec, size in second.values()) == sum(size for _codec, size in first.values()) + len(payload)
+        current = load_snapshot(connection, session_id=sid, operation_id=operation_id)
+        actual = append_complete_snapshot(
+            connection,
+            session_id=sid,
+            operation_id=operation_id,
+            expected_checkpoint_id=current.checkpoint_id,
+            expected_cursor=current.cursor,
+            snapshot_json=current.payload_json,
+            event_batch=(ContinuationEvent("checkpoint", "{}"),),
+            handoff=False,
+        )
+        after = _retained_payload_rows(connection, sid, operation_id)
+        head_key = connection.execute(
+            select(checkpoints.c.snapshot_chunk_key).where(
+                checkpoints.c.session_id == sid,
+                checkpoints.c.operation_id == operation_id,
+                checkpoints.c.checkpoint_id == actual.checkpoint_id,
+            )
+        ).scalar_one()
+        assert all(after[key] == value for key, value in original.items())
+        assert {"initial-snapshot", "off-head-original", "off-head-distinct-key", head_key, "event:1"} == set(after)
+        latest_only = after[head_key][1] + after["event:1"][1]
+        assert sum(size for _codec, size in after.values()) > latest_only
+        assert after["off-head-original"] == after["off-head-distinct-key"] == ("event.v2", len(payload))
+
+
+def test_journal_last_canonical_cursor_accepts_the_complete_append(snapshot_store):
+    from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX
+    from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, load_snapshot, read_chunk
+
+    _seed_snapshot_cursor_boundary(snapshot_store, _CANONICAL_SAFE_INTEGER_MAX - 1)
+    engine, sid, operation_id, _encoded = snapshot_store
+    with engine.begin() as connection:
+        current = load_snapshot(connection, session_id=sid, operation_id=operation_id)
+        actual = append_complete_snapshot(
+            connection,
+            session_id=sid,
+            operation_id=operation_id,
+            expected_checkpoint_id=current.checkpoint_id,
+            expected_cursor=current.cursor,
+            snapshot_json=current.payload_json,
+            event_batch=(ContinuationEvent("checkpoint", "{}"),),
+            handoff=False,
+        )
+        assert actual.cursor == _CANONICAL_SAFE_INTEGER_MAX
+        assert load_snapshot(connection, session_id=sid, operation_id=operation_id) == actual
+        assert read_chunk(connection, session_id=sid, operation_id=operation_id, key=f"event:{_CANONICAL_SAFE_INTEGER_MAX}") == b"{}"
+
+
+@pytest.mark.parametrize("batch_size", (1, 2))
+def test_journal_exhaustion_refuses_the_whole_batch_before_dml(snapshot_store, batch_size):
+    from rfc8785 import IntegerDomainError
+    from sqlalchemy import event, select
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX
+    from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, load_snapshot, put_chunk
+    from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+
+    _seed_snapshot_cursor_boundary(snapshot_store, _CANONICAL_SAFE_INTEGER_MAX - (batch_size - 1))
+    engine, sid, operation_id, _encoded = snapshot_store
+    writes = []
+
+    def observe_dml(_connection, _cursor, statement, _parameters, context, _executemany):
+        if context.isinsert or context.isupdate or context.isdelete:
+            writes.append(statement)
+
+    event.listen(engine, "before_cursor_execute", observe_dml)
+    try:
+        with engine.begin() as connection:
+            put_chunk(
+                connection,
+                session_id=sid,
+                operation_id=operation_id,
+                key="dml-observer-positive",
+                payload=b"{}",
+                codec="event.v2",
+            )
+        assert writes, "DML observation must see the actual positive INSERT"
+        writes.clear()
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    select(chunks.c.chunk_key).where(
+                        chunks.c.session_id == sid,
+                        chunks.c.operation_id == operation_id,
+                        chunks.c.chunk_key == "dml-observer-positive",
+                    )
+                ).scalar_one()
+                == "dml-observer-positive"
+            )
+        assert writes == [], "DML observation must not classify a SELECT as a write"
+        before = _snapshot_rows(engine)
+        with pytest.raises((AuditIntegrityError, IntegerDomainError)), engine.begin() as connection:
+            current = load_snapshot(connection, session_id=sid, operation_id=operation_id)
+            append_complete_snapshot(
+                connection,
+                session_id=sid,
+                operation_id=operation_id,
+                expected_checkpoint_id=current.checkpoint_id,
+                expected_cursor=current.cursor,
+                snapshot_json=current.payload_json,
+                event_batch=tuple(ContinuationEvent("checkpoint", "{}") for _ in range(batch_size)),
+                handoff=False,
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", observe_dml)
+    assert _snapshot_rows(engine) == before
+    assert writes == [], "journal exhaustion must refuse the complete batch before its first DML"

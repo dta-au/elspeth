@@ -304,7 +304,16 @@ async def test_archived_unclaimed_title_recovery_uses_actual_predecessor_without
     assert repository.settle_lost_inactive_continuation(inactive, auth_provider_type="local") is True
     with engine.connect() as conn:
         assert conn.execute(select(attempts)).all() == old_attempts
-        assert conn.execute(select(segments.c.state)).scalar_one() == "settled"
+        assert (
+            conn.execute(
+                select(segments.c.state).where(
+                    segments.c.session_id == str(inactive.session_id),
+                    segments.c.operation_id == inactive.operation_id,
+                    segments.c.sequence == inactive.segment_sequence,
+                )
+            ).scalar_one()
+            == "settled"
+        )
         assert conn.execute(select(physical)).all() == physical_before
         assert conn.execute(select(token_usage_ledger_table)).all() == ledger_before
         assert (

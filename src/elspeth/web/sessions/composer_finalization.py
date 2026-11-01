@@ -12,7 +12,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -94,6 +94,10 @@ if TYPE_CHECKING:
         SessionServiceProtocol,
     )
     from elspeth.web.sessions.schemas import CompositionStateResponse
+
+
+class _ProviderAuditFinalizationKwargs(TypedDict, total=False):
+    provider_audit_calls: tuple[ComposerLLMCall, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +248,15 @@ async def settle_composer_result(
         ):
             raise AuditIntegrityError("Continuation finalization changed its actual live SQL/budget owners")
 
+    provider_options: _ProviderAuditFinalizationKwargs = {}
+    cohort_calls = result.llm_calls
+    if type(inputs.budget_anchor) is ContinuationFinalizationBudget:
+        # Keep every original call in the result. Its checkpoint source is
+        # resolved/re-proved in the actual final transaction, not relabelled
+        # here with the replacement lease's coordinates.
+        provider_options["provider_audit_calls"] = result.llm_calls
+        cohort_calls = ()
+
     service = inputs.service
     session = inputs.session
     recovery_context = inputs.recovery_context
@@ -290,7 +303,7 @@ async def settle_composer_result(
         recovery_tools = result.tool_invocations if isinstance(result, GraphRecoveryResponse) or not result.persisted_tool_call_turn else ()
         audit_cohort, _bindings = _turn_audit_cohort_drafts(
             recovery_tools,
-            result.llm_calls,
+            cohort_calls,
             tool_composition_state_id=compose_base_state_id,
             llm_composition_state_id=compose_base_state_id,
             parent_assistant_id=parent_id,
@@ -309,6 +322,7 @@ async def settle_composer_result(
                     required_work=observation.required_work,
                     recovery=recovery,
                     build_response=_graph_recovery_response,
+                    **provider_options,
                 ),
                 name="composer-graph-recovery-terminal",
             )
@@ -552,7 +566,7 @@ async def settle_composer_result(
         parent_assistant_id = assistant_record.id
     audit_cohort, _pipeline_bindings = _turn_audit_cohort_drafts(
         result.tool_invocations if not result.persisted_tool_call_turn else (),
-        result.llm_calls,
+        cohort_calls,
         tool_composition_state_id=post_compose_state_id,
         llm_composition_state_id=compose_base_state_id,
         parent_assistant_id=parent_assistant_id,
@@ -575,6 +589,7 @@ async def settle_composer_result(
                 audit_composition_state_id=None,
                 required_work=observation.required_work,
                 build_response=partial(_message_with_state_response, state_response=state_response, live_validation=live_validation),
+                **provider_options,
             ),
             name="composer-operation-terminal-composite",
         )

@@ -21,7 +21,11 @@ from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation import LogicalRequestBinding
-from elspeth.web.composer.continuation_application_graph import capture_application_recorder_source
+from elspeth.web.composer.continuation_application_graph import (
+    capture_application_recorder_source,
+    capture_fresh_application_recorder_source,
+    require_application_recorder_capacity,
+)
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, RestoredPreparedBatchData
 from elspeth.web.composer.continuation_codec import PrivateChunk
@@ -232,7 +236,11 @@ def capture_turn_evidence(
     from elspeth.web.composer.continuation_evidence_application_data import capture_joint_evidence_graph, journal_effect_locators
 
     recorder_snapshot = recorder.snapshot_for_continuation(drained=drained)
-    recorder_source = capture_application_recorder_source(recorder_snapshot, env_ref_names=env_ref_names)
+    recorder_source = (
+        capture_fresh_application_recorder_source(recorder_snapshot, env_ref_names=env_ref_names)
+        if mandatory_retention
+        else capture_application_recorder_source(recorder_snapshot, env_ref_names=env_ref_names)
+    )
     recorder_chunk = recorder_source.chunk
     if expected_recorder is not None and recorder_chunk != expected_recorder:
         raise AuditIntegrityError("evidence capture changed its expected original recorder")
@@ -434,7 +442,9 @@ def capture_turn_evidence(
     # the same scalar/cross-link validator inherited by the retained snapshot.
     fields = capture_fields() if mandatory_retention or prior_application_entry is not None else None
     if fields is not None:
-        ce.require_evidence_fields_admission(fields, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+        ce.require_evidence_fields_admission(
+            fields, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk, recorder_source=recorder_source
+        )
         if prior_application_entry is not None and (
             fields.application_entry is None
             or fields.application_entry.applications[: len(prior_application_entry.applications)] != prior_application_entry.applications
@@ -446,6 +456,11 @@ def capture_turn_evidence(
     if fields is None:
         fields = capture_fields()
     snapshot = ce.TurnEvidenceSnapshot(**fields.__dict__, transcript=transcript_snapshot)
+    if mandatory_retention:
+        from elspeth.web.composer.continuation_message_shelf import require_message_shelf_integrity
+
+        require_message_shelf_integrity(transcript_snapshot, env_ref_names=env_ref_names)
+        require_application_recorder_capacity(recorder_source)
     return ce.admit_turn_evidence(
         snapshot,
         env_ref_names=env_ref_names,

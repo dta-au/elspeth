@@ -543,6 +543,7 @@ def require_evidence_fields_admission(
     env_ref_names: frozenset[str],
     recorder_chunk: PrivateChunk,
     sources: P4ApplicationSources | None = None,
+    recorder_source: ApplicationRecorderSource | None = None,
 ) -> ApplicationGraph | None:
     """Admit actual shared evidence fields without encoding a transcript.
 
@@ -555,7 +556,18 @@ def require_evidence_fields_admission(
     from elspeth.web.composer.continuation_retention import validate_retained_model
 
     validate_retained_model(snapshot)
-    recorder_source = _require_recorder_chunk(snapshot, recorder_chunk, env_ref_names=env_ref_names)
+    if recorder_source is None:
+        recorder_source = _require_recorder_chunk(snapshot, recorder_chunk, env_ref_names=env_ref_names)
+    else:
+        from elspeth.web.composer.continuation_application_graph import require_application_recorder_source
+
+        require_application_recorder_source(recorder_source, env_ref_names)
+        if (
+            type(recorder_chunk) is not PrivateChunk
+            or recorder_source.chunk != recorder_chunk
+            or recorder_source.chunk.reference != snapshot.recorder
+        ):
+            raise AuditIntegrityError("fresh evidence recorder differs from its complete original source")
     require_no_credential_material_in_state(
         state_from_evidence_json(snapshot.effects.initial_state_json),
         surface="composer_continuation_evidence_initial_state",

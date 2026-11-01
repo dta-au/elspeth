@@ -15,6 +15,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint, _receipt, prepare_ingress_on_connection
+from elspeth.web.sessions.continuation_recompose_source import read_recompose_original_on_connection
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.graph_recovery import GraphRecoveryAdmission
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
@@ -24,7 +25,7 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as physica
 from elspeth.web.sessions.models import sessions_table as sessions
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.sessions.routes._helpers import _initial_composition_state
-from elspeth.web.sessions.schemas import SendMessageRequest
+from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
 from elspeth.web.sessions.titles import is_default_session_title
 
 if TYPE_CHECKING:
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True, slots=True)
 class ContinuationTitleSource:
     selected: StoredContinuationSnapshot
-    request: SendMessageRequest
+    request: SendMessageRequest | RecomposeRequest
     actor_user_id: str
     records: tuple[ChatMessageRecord, ...]
     original_session_title: str
@@ -61,6 +62,24 @@ def read_title_source_on_connection(
         raise AuditIntegrityError("title source requires the closed inserted initializer")
     frame = root.frames[0]
     sid, operation = str(running.claim.session_id), running.claim.operation_id
+    if root.logical.kind == "compose_recompose":
+        original = read_recompose_original_on_connection(conn, running, selected=selected)
+        recovery = service._load_graph_recovery_context_on_connection(
+            conn,
+            running.claim.session_id,
+            turn_start_state_id=original.request.state_id,
+            session_operation_context=running.session_operation_context,
+        )
+        state = (
+            None
+            if recovery.context.malformed_head
+            else _initial_composition_state()
+            if recovery.record is None
+            else state_from_record(recovery.record)
+        )
+        return ContinuationTitleSource(
+            selected, original.request, original.actor_user_id, original.records, original.original_session_title, recovery, state, False
+        )
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
     try:
         request = SendMessageRequest.model_validate_json(parent.request_json, strict=True)

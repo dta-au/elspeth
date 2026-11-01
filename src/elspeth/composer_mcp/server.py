@@ -11,6 +11,7 @@ web.catalog, composer_mcp.session).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -1035,6 +1036,11 @@ def create_server(
             if checkout_refused:
                 return CallToolResult(content=[TextContent(type="text", text=response_text)], isError=True)
             return [TextContent(type="text", text=response_text)]
+        except asyncio.CancelledError as exc:
+            status = ComposerToolStatus.CANCELLED
+            error_class = type(exc).__name__
+            error_message = "cancelled"
+            raise
         finally:
             finished_at = datetime.now(UTC)
             latency_ms = (time.monotonic_ns() - started_ns) // 1_000_000
@@ -1073,9 +1079,8 @@ def create_server(
                 result_hash = stable_hash(error_payload_for_audit)
                 version_after = None
             else:
-                # PLUGIN_CRASH path: no result was sent to the LLM (the
-                # exception propagates as a server error). version_after
-                # is None to signal "dispatch did not complete".
+                # Cancelled or crashed dispatch: no result was sent to the
+                # caller. version_after is None because dispatch did not complete.
                 result_canonical = None
                 result_hash = None
                 version_after = None

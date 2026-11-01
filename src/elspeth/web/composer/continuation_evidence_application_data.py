@@ -21,6 +21,7 @@ from elspeth.web.composer.continuation_application_graph import (
     ApplicationGraphCut,
     ApplicationRecorderSource,
     admit_application_recorder_source,
+    application_recorder_chunk,
     capture_application_recorder_source,
     decode_application_graph,
     encode_application_graph,
@@ -680,7 +681,7 @@ def _admit_application_source(
     graph = decode_application_graph(graph_json, env_ref_names=env_ref_names, recorder_source=recorder_source)
     if (
         retained_effects(graph.effects) != snapshot.effects
-        or encode_recorder_snapshot(graph.recorder) != recorder_chunk
+        or application_recorder_chunk(graph.recorder, recorder_source=recorder_source) != recorder_chunk
         or (graph.effects.initial_state is graph.effects.latest_verified_state) is not snapshot.initial_is_latest
     ):
         raise AuditIntegrityError("evidence differs from its actual shared effects/recorder graph")

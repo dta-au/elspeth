@@ -9,8 +9,15 @@ import pytest
 import structlog
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.continuation_policy import minimal_continuation_policy
 from tests.helpers.postgres_target import postgres_test_target
 from tests.testcontainer.web.test_session_operation_fence_postgres import _register_instance
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_claim_is_segment_queue_only_and_running_is_never_requeued as test_claim_is_segment_queue_only_and_running_is_never_requeued,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_stale_pre_start_segment_claim_cannot_renew_or_release_reclaimed_work as test_stale_pre_start_segment_claim_cannot_renew_or_release_reclaimed_work,
+)
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_admission_binding_conflict_precedes_missing_base_membership as test_admission_binding_conflict_precedes_missing_base_membership,
 )
@@ -25,9 +32,6 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_changed_stop_state_prevents_exact_retry as test_changed_stop_state_prevents_exact_retry,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_claim_is_queue_only_and_running_never_requeued as test_claim_is_queue_only_and_running_never_requeued,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_concurrent_same_id_is_one_immutable_admission as test_concurrent_same_id_is_one_immutable_admission,
@@ -81,7 +85,7 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
     test_exact_retry_preserves_entire_assistant_audit_and_response_bundle as test_exact_retry_preserves_entire_assistant_audit_and_response_bundle,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_expired_job_refuses_business_write_at_database_clock as test_expired_job_refuses_business_write_at_database_clock,
+    test_expired_segment_refuses_actual_business_write_at_database_clock as test_expired_segment_refuses_actual_business_write_at_database_clock,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_failed_fresh_writer_read_preserves_unknown_terminal_custody as test_failed_fresh_writer_read_preserves_unknown_terminal_custody,
@@ -102,9 +106,6 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
     test_final_job_user_delete_guard_and_foreign_key_are_independent as test_final_job_user_delete_guard_and_foreign_key_are_independent,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_fresh_recovery_requires_persisted_compose_and_owned_instance as test_fresh_recovery_requires_persisted_compose_and_owned_instance,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
     test_independent_process_admission_converges_on_one_action as test_independent_process_admission_converges_on_one_action,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
@@ -117,19 +118,10 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
     test_new_job_actor_and_base_foreign_keys_have_unmasked_negative_controls as test_new_job_actor_and_base_foreign_keys_have_unmasked_negative_controls,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_queued_cancel_settles_without_a_claim_and_retains_immutable_body as test_queued_cancel_settles_without_a_claim_and_retains_immutable_body,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
     test_queued_provider_admission_cancellation_does_not_create_attempt as test_queued_provider_admission_cancellation_does_not_create_attempt,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_queued_settlement_rechecks_priority_under_owned_claim_lock as test_queued_settlement_rechecks_priority_under_owned_claim_lock,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
     test_real_schema_cross_session_and_cross_operation_bindings_are_rejected as test_real_schema_cross_session_and_cross_operation_bindings_are_rejected,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_recompose_tool_prefix_is_eligible_bare_narration_is_not as test_recompose_tool_prefix_is_eligible_bare_narration_is_not,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_required_audit_sql_failure_preserves_canonical_integrity_classification as test_required_audit_sql_failure_preserves_canonical_integrity_classification,
@@ -145,12 +137,6 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_running_bundle_rejects_nullability_and_fence_holes as test_running_bundle_rejects_nullability_and_fence_holes,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_stale_claim_cannot_release_or_renew_reclaimed_work as test_stale_claim_cannot_release_or_renew_reclaimed_work,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_start_refusal_rolls_back_fence_and_has_no_user_side_effect as test_start_refusal_rolls_back_fence_and_has_no_user_side_effect,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_stop_between_fresh_read_and_retry_lock_refuses_success as test_stop_between_fresh_read_and_retry_lock_refuses_success,
@@ -171,22 +157,10 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
     test_unchanged_state_retries_once_after_actual_sql_completion as test_unchanged_state_retries_once_after_actual_sql_completion,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_v1_running_claim_token_change_is_refused_without_row_changes as test_v1_running_claim_token_change_is_refused_without_row_changes,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_v1_terminal_settlement_clears_claim_token_and_preserves_attribution as test_v1_terminal_settlement_clears_claim_token_and_preserves_attribution,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_v1_terminal_settlement_refuses_attribution_substitution as test_v1_terminal_settlement_refuses_attribution_substitution,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
     test_v2_admission_actual_insert_conflict_replay_preserves_existing_bundle as test_v2_admission_actual_insert_conflict_replay_preserves_existing_bundle,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_v2_admission_child_sql_failure_rolls_back_whole_bundle_and_charge as test_v2_admission_child_sql_failure_rolls_back_whole_bundle_and_charge,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_v2_admission_configuration_refusals_preserve_default_v1 as test_v2_admission_configuration_refusals_preserve_default_v1,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_v2_admission_current_principal_and_base_refusals_before_new_writes as test_v2_admission_current_principal_and_base_refusals_before_new_writes,
@@ -195,22 +169,16 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
     test_v2_admission_decoder_preconditions_and_async_forwarding_use_real_rows as test_v2_admission_decoder_preconditions_and_async_forwarding_use_real_rows,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_v2_admission_default_v1_never_consults_continuation_seed as test_v2_admission_default_v1_never_consults_continuation_seed,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_v2_admission_disabled_exact_replay_ignores_new_seed_policy_and_current_state as test_v2_admission_disabled_exact_replay_ignores_new_seed_policy_and_current_state,
+    test_v2_admission_exact_replay_ignores_new_seed_policy_and_current_state as test_v2_admission_exact_replay_ignores_new_seed_policy_and_current_state,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_v2_admission_expired_quota_maintenance_is_separate_from_new_admission as test_v2_admission_expired_quota_maintenance_is_separate_from_new_admission,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_foreign_seed_refusal_preserves_rows as test_v2_admission_foreign_seed_refusal_preserves_rows,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
     test_v2_admission_fresh_bundle_uses_actual_sql_mode_and_reserved_ingress as test_v2_admission_fresh_bundle_uses_actual_sql_mode_and_reserved_ingress,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_v2_admission_fresh_disabled_refuses_exact_body_without_new_rows as test_v2_admission_fresh_disabled_refuses_exact_body_without_new_rows,
-)
-from tests.unit.web.coordination.test_composer_operation_authority import (
-    test_v2_admission_keeps_legacy_worker_budget_validation as test_v2_admission_keeps_legacy_worker_budget_validation,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_v2_admission_missing_server_policy_refuses_without_mutation as test_v2_admission_missing_server_policy_refuses_without_mutation,
@@ -237,9 +205,6 @@ from tests.unit.web.coordination.test_graph_recovery_persistence import (
     test_foreign_intermediate_checkpoint_refuses_recovery as test_foreign_intermediate_checkpoint_refuses_recovery,
 )
 from tests.unit.web.coordination.test_graph_recovery_persistence import (
-    test_malformed_gate_metadata_is_quarantined as test_malformed_gate_metadata_is_quarantined,
-)
-from tests.unit.web.coordination.test_graph_recovery_persistence import (
     test_park_preserves_current_unpersisted_candidate as test_park_preserves_current_unpersisted_candidate,
 )
 from tests.unit.web.coordination.test_graph_recovery_persistence import (
@@ -256,6 +221,9 @@ from tests.unit.web.coordination.test_graph_recovery_persistence import (
 )
 from tests.unit.web.coordination.test_graph_recovery_persistence import (
     test_unsaveable_candidate_never_blocks_reset as test_unsaveable_candidate_never_blocks_reset,
+)
+from tests.unit.web.coordination.test_graph_recovery_persistence import (
+    test_unsupported_gate_envelope_refuses_recovery_as_integrity_failure as test_unsupported_gate_envelope_refuses_recovery_as_integrity_failure,
 )
 from tests.unit.web.sessions.test_atomic_pipeline_review_evidence import (
     test_atomic_candidate_supersedes_older_identical_pending_review as test_atomic_candidate_supersedes_older_identical_pending_review,
@@ -292,6 +260,20 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
+# Retired V1 parent-held claim: current queued/running segment claim is imported above.
+# Retired V1 settle_lost fresh context: current candidate/owner PG wrappers prove exact liveness.
+# Retired V1 immediate queued cancel: current Stop marker and never-started settlement have PG proofs.
+# Retired V1 settle_unstarted priority: terminal-P4 PG wrapper proves current integrity-over-Stop order.
+# Retired V1 recompose start discriminator: current admission and segment-start PG proofs retain it.
+# Retired V1 stale parent claim: current stale segment renewal/release is imported above.
+# Retired V1 late start refusal: current admission no-write and start rollback have PG proofs.
+# Retired V1 parent claim-token tamper: current segment/current-attempt PG proofs retain identity.
+# Retired V1 parent claim clearing: current terminal bundle and attribution have PG proofs.
+# Retired V1 terminal UPDATE shape: current source/attribution PG opponents retain it.
+# Retired default-V1 seed bypass: fresh admission now has one Continuation lifecycle.
+# Retired disabled-mode fresh admission: Continuation is the sole current lifecycle.
+# Retired deadline_seconds argument: current action/segment policy owns timing admission.
+
 pytestmark = pytest.mark.testcontainer
 
 
@@ -320,7 +302,9 @@ def operation_store(operation_postgres_target, tmp_path):
         session = repository.create_session_with_initial_fence(
             user_id="alice", title="Durable", auth_provider_type="local", owner_instance_id="test-owner", lease_seconds=30
         )
-        authority = ComposerAsyncOperationAuthority(engine, owner_instance_id="test-owner", claim_lease_seconds=30)
+        authority = ComposerAsyncOperationAuthority(
+            engine, owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=minimal_continuation_policy()
+        )
         service = SessionServiceImpl(
             engine,
             data_dir=tmp_path,

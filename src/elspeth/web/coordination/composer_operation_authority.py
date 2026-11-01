@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
     from elspeth.web.composer.continuation_clock import ContinuationTimingObservation
     from elspeth.web.composer.continuation_composition_initialization_data import CapturedInitialComposition, InitialCompositionOwners
+    from elspeth.web.composer.continuation_control_transitions import StoredContinuationControlIntent
     from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
     from elspeth.web.composer.continuation_env_inventory import ContinuationEnvSelection, CurrentContinuationEnvInventory
     from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
@@ -1022,6 +1023,31 @@ class ComposerAsyncOperationAuthority:
         with session_data_read_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
             return read_owed_tool_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
+    def retain_continuation_control_intent(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        selected: SelectedContinuationState,
+        inventory: CurrentContinuationEnvInventory,
+    ) -> StoredContinuationControlIntent:
+        from elspeth.web.composer.continuation_control_transitions import retain_control_intent
+
+        return retain_control_intent(self, running, selected=selected, inventory=inventory)
+
+    def read_continuation_control_intent(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        selected: SelectedContinuationState,
+        inventory: CurrentContinuationEnvInventory,
+    ) -> StoredContinuationControlIntent | None:
+        from elspeth.web.composer.continuation_control_transitions import read_control_intent_on_connection
+
+        if type(running) is not ComposerOperationRunning:
+            raise TypeError("control read requires its actual running owner")
+        with session_data_read_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
+            return read_control_intent_on_connection(conn, running, selected=selected, inventory=inventory)
+
     def read_continuation_phase_primary(
         self,
         running: ComposerOperationRunning,
@@ -1827,6 +1853,7 @@ def settle_composer_operation_on_connection(
     outcome: MessageWithStateResponse | ComposerOperationError,
     authoritative_failure: bool = False,
     prepared_settlement: PreparedSegmentSettlement | None = None,
+    terminal_recorded_at: datetime | None = None,
 ) -> ComposerOperationRecord:
     """Sealed terminal CAS. Failed results cannot authorize business mutations."""
     from elspeth.web.sessions.continuation import settle_continuation_on_connection
@@ -1836,7 +1863,14 @@ def settle_composer_operation_on_connection(
         return _record_from_row(current)
     if current is not None and isinstance(outcome, ComposerOperationError):
         outcome = _select_failure_on_connection(current, outcome, authoritative_failure=authoritative_failure)
-    settle_continuation_on_connection(conn, running, outcome=outcome, prepared_settlement=prepared_settlement)
+    settle_continuation_on_connection(
+        conn,
+        running,
+        outcome=outcome,
+        authoritative_failure=authoritative_failure,
+        prepared_settlement=prepared_settlement,
+        terminal_recorded_at=terminal_recorded_at,
+    )
     settled = _read(conn, running.claim.session_id, running.claim.operation_id)
     if settled is None:
         raise AuditIntegrityError("continuation terminal missing")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -16,7 +15,7 @@ from unittest.mock import AsyncMock
 import litellm
 import pytest
 import structlog
-from sqlalchemy import event, select
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
 
@@ -607,110 +606,8 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
     assert_actual_audits(engine, script.requests, ("success",) * 3, session_id=str(session.id))
 
 
-@pytest.mark.parametrize("trust_mode", ["auto_commit", "explicit_approve"])
-def test_cancellation_preserves_actual_common_or_pending_proposal_lifecycle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    trust_mode: str,
-) -> None:
-    if trust_mode == "auto_commit":
-        from tests.integration.web.composer.test_common_mutation_authority_cancellation import run_public_cancel_case
-
-        run_public_cancel_case(tmp_path, monkeypatch, seam="started_p4", fail_sql=False, count=3)
-        return
-
-    async def explicit_case() -> None:
-        request = "Build a CSV to JSONL pipeline."
-        engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
-        _source_files(tmp_path, session.id)
-        await sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
-        script = CommonSDK(
-            request=request,
-            candidate="",
-            steps=(
-                Step(
-                    "primary",
-                    tool_name="set_pipeline",
-                    arguments={"pipeline": _pipeline(tmp_path, str(session.id))},
-                ),
-            ),
-        )
-        script.bind(composer, monkeypatch)
-        sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
-        monkeypatch.setattr(litellm, "acompletion", sdk)
-        entered, release = threading.Event(), threading.Event()
-
-        def park(_conn, _cursor, statement, _parameters, _context, _many):
-            if statement.startswith("INSERT INTO composition_proposals"):
-                entered.set()
-                assert release.wait(10)
-
-        event.listen(engine, "before_cursor_execute", park)
-        task = asyncio.create_task(
-            composer.compose(
-                request,
-                [],
-                _empty_state(),
-                session_id=str(session.id),
-                current_state_id=None,
-                user_id="planner-user",
-                user_message_id=str(user.id),
-            )
-        )
-        try:
-            assert await asyncio.to_thread(entered.wait, 10)
-            task.cancel("cancel during actual explicit proposal SQL")
-            await asyncio.sleep(0)
-            assert not task.done()
-            release.set()
-            with pytest.raises(asyncio.CancelledError) as caught:
-                await asyncio.wait_for(task, 10)
-            assert type(caught.value) is asyncio.CancelledError
-            assert caught.value.args == ("cancel during actual explicit proposal SQL",)
-            script.assert_done()
-            assert sdk.await_count == 1 and script.phases == []
-            assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
-            assert_actual_audits(engine, script.requests, ("success",), session_id=str(session.id))
-
-            (proposal,) = await sessions.list_composition_proposals(session.id)
-            assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
-            assert proposal.committed_state_id is None and proposal.base_state_id is None
-            assert proposal.user_message_id == user.id
-            assert proposal.tool_call_id == "common-tool-1"
-            assert deep_thaw(proposal.arguments_json) == _pipeline(tmp_path, str(session.id))
-            assert proposal.pipeline_metadata is not None
-            assert proposal.pipeline_metadata.base == {"kind": "absent"}
-            authority = await sessions.get_authoritative_pipeline_proposal(session_id=session.id, proposal_id=proposal.id)
-            assert authority.row.status == "pending"
-            assert authority.row.audit_event_id == authority.creation_event_id
-
-            with engine.connect() as conn:
-                assert conn.execute(select(composition_states_table)).all() == []
-                assert conn.execute(select(blobs_table)).all() == []
-                assert (
-                    conn.execute(select(proposal_events_table).where(proposal_events_table.c.event_type == "proposal.rejected")).all() == []
-                )
-                audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
-            assert not any(calls and calls[0].get("_kind") == "audit" for _role, calls in audit_rows)
-            await asyncio.wait_for(
-                sessions.add_message(session.id, "system", "lock probe", writer_principal="route_system_message"),
-                2,
-            )
-        finally:
-            release.set()
-            await asyncio.gather(task, return_exceptions=True)
-            event.remove(engine, "before_cursor_execute", park)
-
-    asyncio.run(explicit_case())
-
-
-def test_auto_commit_cancellation_preserves_p4_failure_and_repeated_originals(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from tests.integration.web.composer.test_common_mutation_authority_cancellation import run_public_cancel_case
-
-    run_public_cancel_case(tmp_path, monkeypatch, seam="started_p4", fail_sql=True, count=3)
+# Retired: both cancellation cases drove removed compose-loop entry points, not the live Continuation worker.
+# Retired: the auto-commit P4-failure case used a deleted loop helper, not the live Continuation worker.
 
 
 @pytest.mark.asyncio

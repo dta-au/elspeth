@@ -9672,12 +9672,14 @@ class SessionServiceImpl:
         ],
         required_work: RequiredWorkCoordinator | None = None,
         recovery: GraphRecoverySettlement | None = None,
+        provider_audit_calls: tuple[ComposerLLMCall, ...] = (),
     ) -> ComposerOperationRecord:
         """Publish final assistant/audit/snapshot/result in one exact COMPOSE transaction."""
         if (assistant is None) == (assistant_record is None):
             raise ValueError("terminal requires exactly one new or persisted assistant")
         frozen_created_at: datetime | None = None
         frozen_audit_ids = tuple(str(uuid.uuid4()) for _draft in audit_cohort)
+        frozen_provider_cohort: tuple[AuditMessageDraft, ...] | None = None
         sid = str(running.claim.session_id)
         context = running.session_operation_context
         attempted_response: MessageWithStateResponse | None = None
@@ -9697,6 +9699,7 @@ class SessionServiceImpl:
         def _sync() -> ComposerOperationRecord:
             nonlocal attempted_response, frozen_created_at
             nonlocal attempted_message, attempted_audit_rows, attempted_proposals, attempted_state
+            nonlocal frozen_audit_ids, frozen_provider_cohort
             with (
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
@@ -9715,8 +9718,20 @@ class SessionServiceImpl:
                 current_job = _record_from_row(job_row)
                 if attempted_response is not None and not _can_retry(current_job, now):
                     raise _ComposerTerminalRetryStateChanged("immutable terminal retry driving state changed")
+                provider_cohort: tuple[AuditMessageDraft, ...] = ()
+                if provider_audit_calls:
+                    from elspeth.web.sessions.continuation_provider_audit import continuation_provider_audit_drafts_on_connection
+
+                    self._assert_session_write_lock_held(conn, sid, caller="complete_composer_async_operation.provider_audit")
+                    provider_cohort = continuation_provider_audit_drafts_on_connection(conn, running, calls=provider_audit_calls)
+                    if frozen_provider_cohort is None:
+                        frozen_provider_cohort = provider_cohort
+                        frozen_audit_ids += tuple(str(uuid.uuid4()) for _draft in provider_cohort)
+                    elif frozen_provider_cohort != provider_cohort:
+                        raise _ComposerTerminalRetryStateChanged("immutable terminal provider cohort changed")
+                complete_audit_cohort = audit_cohort + provider_cohort
                 terminal_review = self._validate_terminal_graph_review(
-                    conn, running=running, drafts=audit_cohort, audit_state_id=audit_composition_state_id
+                    conn, running=running, drafts=complete_audit_cohort, audit_state_id=audit_composition_state_id
                 )
                 recovery_state_id = (
                     self._settle_graph_recovery_on_connection(
@@ -9773,7 +9788,7 @@ class SessionServiceImpl:
                     active_drafts = self._write_audit_cohort_on_connection(
                         conn,
                         session_id=running.claim.session_id,
-                        drafts=audit_cohort,
+                        drafts=complete_audit_cohort,
                         writer_principal="compose_loop",
                         composition_state_id=recovery_state_id if recovery_state_id is not None else audit_composition_state_id,
                         session_operation_context=context,
@@ -9981,7 +9996,13 @@ class SessionServiceImpl:
                         created_at=frozen_settled_at,
                         recorded_at=frozen_settled_at,
                     )
-                result = settle_composer_operation_on_connection(conn, running, outcome=attempted_failure, authoritative_failure=True)
+                result = settle_composer_operation_on_connection(
+                    conn,
+                    running,
+                    outcome=attempted_failure,
+                    authoritative_failure=True,
+                    terminal_recorded_at=frozen_settled_at,
+                )
             for draft in active_drafts:
                 record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)
             return result

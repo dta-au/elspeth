@@ -541,7 +541,6 @@ def next_continuation_action_policy(
             values = bootstrap_values(snapshot)
             if (
                 snapshot.logical != root.logical
-                or root.logical.kind != "compose_message"
                 or values.retained_context is None
                 or values.retained_context.availability != "available"
                 or top.ingress_phase != ("title_pending" if snapshot.auto_title_eligible else "ready")
@@ -549,6 +548,24 @@ def next_continuation_action_policy(
                 # Keep the original refusal for a manufactured later phase
                 # carrying no actual complete bounded bootstrap input.
                 raise AuditIntegrityError("next allowance has no closed reserved/inserted ingress cut")
+            if root.logical.kind == "compose_recompose":
+                from elspeth.contracts.hashing import stable_hash
+                from elspeth.web.sessions.continuation_recompose_source import _receipt as recompose_receipt
+
+                receipt = recompose_receipt(top.ingress_receipt_json or "")
+                if (
+                    top.ingress_phase != "ready"
+                    or snapshot.auto_title_eligible
+                    or receipt.session_id != root.logical.session_id
+                    or receipt.operation_id != root.logical.operation_id
+                    or receipt.original_user_message_id != root.logical.original_user_message_id
+                    or receipt.original_last_sequence != snapshot.original_last_sequence
+                    or receipt.transcript_sha256 != stable_hash(snapshot.records_json)
+                    or receipt.original_session_title != snapshot.original_session_title
+                ):
+                    raise AuditIntegrityError("next allowance lost its closed Recompose original-source cut")
+            elif root.logical.kind != "compose_message":
+                raise AuditIntegrityError("next allowance has no admitted Initialize request kind")
         # Fresh TITLE input includes its real provider allowance. Other ingress
         # cuts size SQL work only. Every real owner still rechecks the original
         # bootstrap, actor, current fence and may-dispatch boundary after start.

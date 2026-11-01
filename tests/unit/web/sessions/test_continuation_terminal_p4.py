@@ -929,7 +929,41 @@ async def test_terminal_p4_actual_unavailable_publication_precedes_cold_projecti
 
 
 @pytest.mark.asyncio
-async def test_terminal_p4_cold_unavailable_settlement_preserves_integrity_priority(operation_store, tmp_path, monkeypatch):
+async def test_terminal_p4_cold_stop_still_wins_over_an_ordinary_service_failure(operation_store, tmp_path, monkeypatch):
+    async with _terminal_case(operation_store, tmp_path, monkeypatch) as case:
+        owner, running, sdk, original, cause, _entered, phase = case
+        _, repository, cold_authority, _, _ = new_owners(operation_store)
+        source = await asyncio.to_thread(cold_authority.read_continuation_tool_failure, running, env_ref_names=phase.inventory.names)
+        assert type(source) is StoredTerminalP4Application
+        retained = decode_terminal_p4_result(
+            source.result_document, input_document=source.input_document, env_ref_names=phase.inventory.names
+        )
+        assert not retained.receipt.unwind_audit_failed
+        await _close_released_lease(operation_store, owner, running)
+        (candidate,) = list_recoverable_segments(operation_store[0], limit=10)
+        assert candidate.cancel_requested_at is None
+        marked = cold_authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
+        assert marked is not None and marked.cancel_requested_at is not None
+        assert (
+            repository.reconcile_unavailable_composer_segment(
+                candidate, owner_instance_id=candidate.owner_instance_id, lease_seconds=30, auth_provider_type="local"
+            )
+            == "settled"
+        )
+        terminal = cold_authority.get(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
+        assert terminal is not None and terminal.status == "failed" and terminal.failure_code == "request_cancelled"
+        assert terminal.result_json is not None
+        error = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
+        assert error.error_type == "request_cancelled" and error.failure_code == "request_cancelled"
+        assert await asyncio.to_thread(_readback, operation_store[0], phase) is phase.committed_outcome.audit_outcome
+        assert len(sdk) == 1 and owner.failure_custody.original is original and original.__cause__ is cause
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_after_discovery", (False, True))
+async def test_terminal_p4_cold_unavailable_settlement_preserves_integrity_priority(
+    operation_store, tmp_path, monkeypatch, stop_after_discovery
+):
     async with _actual_unavailable_terminal_case(operation_store, tmp_path, monkeypatch) as case:
         owner, running, sdk, original, cause, sql_error, sql_cause, phase, retained = case
         _, repository, cold_authority, _, _ = new_owners(operation_store)
@@ -940,6 +974,9 @@ async def test_terminal_p4_cold_unavailable_settlement_preserves_integrity_prior
         await _close_released_lease(operation_store, owner, running)
         (candidate,) = list_recoverable_segments(operation_store[0], limit=10)
         assert candidate.cancel_requested_at is None
+        if stop_after_discovery:
+            marked = cold_authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
+            assert marked is not None and marked.cancel_requested_at is not None
         assert (
             repository.reconcile_unavailable_composer_segment(
                 candidate, owner_instance_id=candidate.owner_instance_id, lease_seconds=30, auth_provider_type="local"

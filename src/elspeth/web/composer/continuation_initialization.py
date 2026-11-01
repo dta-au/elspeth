@@ -34,6 +34,10 @@ from elspeth.web.sessions.continuation_bootstrap_source import (
     read_pretitle_bootstrap_on_connection,
     require_pretitle_inserted_origin,
 )
+from elspeth.web.sessions.continuation_recompose_source import (
+    RecomposeOriginalSource,
+    publish_recompose_original_on_connection,
+)
 from elspeth.web.sessions.continuation_title_source import ContinuationTitleSource, read_title_source_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.routes._helpers import _join_freeform_owned_task
@@ -71,6 +75,44 @@ def _publish(
     sessions = _sessions(service)
     with locked_session_transaction(sessions._engine, str(running.claim.session_id)) as conn:
         return publish_pretitle_bootstrap_on_connection(conn, service, running, prepared=prepared)
+
+
+def _adopt_recompose(
+    service: ComposerServiceImpl, running: ComposerOperationRunning, selected: StoredContinuationSnapshot
+) -> RecomposeOriginalSource:
+    sessions = _sessions(service)
+    with locked_session_transaction(sessions._engine, str(running.claim.session_id)) as conn:
+        return publish_recompose_original_on_connection(conn, running, selected=selected)
+
+
+async def adopt_recompose_original(
+    *, service: ComposerServiceImpl, selected: StoredContinuationSnapshot, required_work: RequiredWorkBinding
+) -> RecomposeOriginalSource:
+    running = required_work.running
+    root = decode_continuation_snapshot(selected.payload_json)
+    if (
+        type(service) is not ComposerServiceImpl
+        or type(running) is not ComposerOperationRunning
+        or type(selected) is not StoredContinuationSnapshot
+        or root.logical.kind != "compose_recompose"
+        or len(root.frames) != 1
+        or type(root.frames[0]) is not InitializeFrame
+        or root.frames[0].ingress_phase != "reserved"
+    ):
+        raise AuditIntegrityError("Recompose adoption requires its current reserved owner")
+    required_work.validate_context(running.session_operation_context)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    clock = ContinuationActionClock(policy.actions.session_sql)
+    clock.finish_preparation()
+    return await clock.run(
+        "retention",
+        lambda: _registered(
+            work=required_work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=lambda: _adopt_recompose(service, running, selected),
+            expected=RecomposeOriginalSource,
+        ),
+    )
 
 
 async def _registered[T](*, work: RequiredWorkBinding, source: RequiredWorkSource, operation: Callable[[], T], expected: type[T]) -> T:
@@ -200,8 +242,8 @@ async def prepare_pretitle_bootstrap(
     required_work.validate_context(running.session_operation_context)
     root = decode_continuation_snapshot(selected.payload_json)
     frame = root.frames[0]
-    if len(root.frames) != 1 or type(frame) is not InitializeFrame or root.logical.kind != "compose_message":
-        raise AuditIntegrityError("pre-title bootstrap has no implemented SendMessage Initialize owner")
+    if len(root.frames) != 1 or type(frame) is not InitializeFrame:
+        raise AuditIntegrityError("pre-title bootstrap has no actual Initialize owner")
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
     clock = ContinuationActionClock(policy.actions.session_sql)
     clock.finish_preparation()

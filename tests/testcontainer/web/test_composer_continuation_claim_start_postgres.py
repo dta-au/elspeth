@@ -5,10 +5,7 @@ from tests.unit.web.coordination.test_composer_continuation_claim_start import (
     test_action_receipt_uses_real_first_attempt_effect_and_retained_frontier as test_action_receipt_uses_real_first_attempt_effect_and_retained_frontier,
 )
 from tests.unit.web.coordination.test_composer_continuation_claim_start import (
-    test_cancelled_v2_can_start_cleanup_but_business_guard_still_refuses as test_cancelled_v2_can_start_cleanup_but_business_guard_still_refuses,
-)
-from tests.unit.web.coordination.test_composer_continuation_claim_start import (
-    test_each_legacy_owner_preserves_v1_and_refuses_actual_v2 as test_each_legacy_owner_preserves_v1_and_refuses_actual_v2,
+    test_cancelled_request_can_start_cleanup_but_business_guard_still_refuses as test_cancelled_request_can_start_cleanup_but_business_guard_still_refuses,
 )
 from tests.unit.web.coordination.test_composer_continuation_claim_start import (
     test_expired_physical_lease_preserves_distributed_old_owner_liveness as test_expired_physical_lease_preserves_distributed_old_owner_liveness,
@@ -82,5 +79,7 @@ from tests.unit.web.sessions.test_continuation_cold_restore import (
 from tests.unit.web.sessions.test_continuation_cold_restore import (
     test_provider_action_facades_return_the_actual_complete_checkpoint as test_provider_action_facades_return_the_actual_complete_checkpoint,
 )
+
+# Retired V1/V2 owner cross-product: only the current segment lifecycle remains.
 
 pytestmark = pytest.mark.testcontainer

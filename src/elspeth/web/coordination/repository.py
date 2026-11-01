@@ -5255,11 +5255,19 @@ class _SessionOperationAuthorityRepository:
                     pass
                 else:
                     return "recovered"
-            outcome = (
-                request_cancelled_error(request_id=old.parent.request_id)
-                if old.parent.cancel_requested_at is not None
-                else terminal_service_failure(terminal_source, request_id=old.parent.request_id)
+            terminal_failure = (
+                terminal_service_failure(terminal_source, request_id=old.parent.request_id)
                 if type(terminal_source) is StoredTerminalP4Application
+                else None
+            )
+            # A later Stop cannot replace the original retained audit failure.
+            outcome = (
+                terminal_failure
+                if terminal_failure is not None and terminal_failure.error_type == "audit_integrity_error"
+                else request_cancelled_error(request_id=old.parent.request_id)
+                if old.parent.cancel_requested_at is not None
+                else terminal_failure
+                if terminal_failure is not None
                 else worker_lost_error(request_id=old.parent.request_id)
             )
             context = (
@@ -5375,11 +5383,18 @@ class _SessionOperationAuthorityRepository:
             from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
 
             terminal_source = read_lost_terminal_p4_on_connection(conn, session_id=sid, operation_id=candidate.operation_id)
-            outcome = (
-                request_cancelled_error(request_id=parent.request_id)
-                if parent.cancel_requested_at is not None
-                else terminal_service_failure(terminal_source, request_id=parent.request_id)
+            terminal_failure = (
+                terminal_service_failure(terminal_source, request_id=parent.request_id)
                 if type(terminal_source) is StoredTerminalP4Application
+                else None
+            )
+            outcome = (
+                terminal_failure
+                if terminal_failure is not None and terminal_failure.error_type == "audit_integrity_error"
+                else request_cancelled_error(request_id=parent.request_id)
+                if parent.cancel_requested_at is not None
+                else terminal_failure
+                if terminal_failure is not None
                 else worker_lost_error(request_id=parent.request_id)
             )
             settle_segment_on_connection(

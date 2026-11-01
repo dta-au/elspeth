@@ -41,6 +41,12 @@ from elspeth.web.sessions.continuation import (
     read_chunk,
 )
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint, ContinuationIngressPrepared, _receipt
+from elspeth.web.sessions.continuation_recompose_source import (
+    _receipt as _recompose_receipt,
+)
+from elspeth.web.sessions.continuation_recompose_source import (
+    read_recompose_original_on_connection,
+)
 from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
 from elspeth.web.sessions.continuation_title_source import ContinuationTitleSource, read_title_source_on_connection
 from elspeth.web.sessions.converters import state_from_record
@@ -52,7 +58,7 @@ from elspeth.web.sessions.models import composer_segment_attempts_table as attem
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import sessions_table as sessions
 from elspeth.web.sessions.routes._helpers import _initial_composition_state
-from elspeth.web.sessions.schemas import SendMessageRequest
+from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
 
 if TYPE_CHECKING:
     from elspeth.web.composer.service import ComposerServiceImpl
@@ -254,12 +260,22 @@ def _require_pretitle_inserted_data_on_connection(
     origin, _generation = pretitle_recovery_origin_data_on_connection(
         conn, session_id=session_id, operation_id=operation_id, sequence=sequence, selected=selected, generation=generation
     )
-    frame = decode_continuation_snapshot(origin.payload_json).frames[0]
+    root = decode_continuation_snapshot(origin.payload_json)
+    frame = root.frames[0]
+    if len(root.frames) != 1 or type(frame) is not InitializeFrame:
+        raise AuditIntegrityError("pre-title bootstrap lost its exact inserted Initialize source")
+    receipt = (
+        _recompose_receipt(frame.ingress_receipt_json)
+        if root.logical.kind == "compose_recompose" and frame.ingress_receipt_json is not None
+        else _receipt(frame.ingress_receipt_json)
+        if frame.ingress_receipt_json is not None
+        else None
+    )
     if (
-        type(frame) is not InitializeFrame
-        or frame.ingress_phase != "inserted"
+        frame.ingress_phase != "inserted"
         or frame.ingress_receipt_json is None
-        or origin.cursor != _receipt(frame.ingress_receipt_json).source_cursor + 1
+        or receipt is None
+        or origin.cursor != receipt.source_cursor + 1
     ):
         raise AuditIntegrityError("pre-title bootstrap cannot repeat preparation at a later inserted cut")
 
@@ -318,7 +334,7 @@ def _current_pretitle_value_inputs(
     *,
     selected: StoredContinuationSnapshot,
     chunk: PrivateChunk,
-) -> tuple[ContinuationBootstrapSnapshot, SendMessageRequest]:
+) -> tuple[ContinuationBootstrapSnapshot, SendMessageRequest | RecomposeRequest]:
     _require_sessions(conn, service)
     _require_current_continuation_running(conn, running)
     sid, operation = str(running.claim.session_id), running.claim.operation_id
@@ -338,8 +354,8 @@ def _current_pretitle_value_inputs(
     if values.retained_context is None or values.retained_context.availability != "available":
         raise AuditIntegrityError("pre-title bootstrap lost its actual bounded history read")
     request = values.request
-    if type(request) is not SendMessageRequest:
-        raise AuditIntegrityError("pre-title bootstrap has no implemented Recompose source owner")
+    if type(request) not in (SendMessageRequest, RecomposeRequest):
+        raise AuditIntegrityError("pre-title bootstrap has no admitted request owner")
     return snapshot, request
 
 
@@ -407,6 +423,42 @@ def require_current_pretitle_values_on_connection(
     from elspeth.web.sessions.continuation_ingress import _read_ingress_source_on_connection
 
     snapshot, request = _current_pretitle_value_inputs(conn, service, running, selected=selected, chunk=chunk)
+    if type(request) is RecomposeRequest:
+        original = read_recompose_original_on_connection(conn, running, selected=selected)
+        recovery = service._load_graph_recovery_context_on_connection(
+            conn,
+            running.claim.session_id,
+            turn_start_state_id=request.state_id,
+            session_operation_context=running.session_operation_context,
+        )
+        initial = _initial_composition_state() if recovery.record is None else state_from_record(recovery.record)
+        root = decode_continuation_snapshot(selected.payload_json)
+        ready_frame = root.frames[0]
+        if len(root.frames) != 1 or type(ready_frame) is not InitializeFrame:
+            raise AuditIntegrityError("Recompose bootstrap lost its exact ready Initialize source")
+        if (
+            recovery.context.malformed_head
+            or original.receipt is None
+            or snapshot.logical != root.logical
+            or snapshot.actor_user_id != original.actor_user_id
+            or snapshot.request_json != canonical_json(request.model_dump(mode="json"))
+            or snapshot.records_json != _canonical_records_json(original.records)
+            or snapshot.original_session_title != original.original_session_title
+            or snapshot.initial_state_json != canonical_json(initial.to_dict())
+            or snapshot.recovery_context_json != _canonical_adapter_json(_RECOVERY, recovery.context)
+            or snapshot.completion_gates_json
+            != (
+                _canonical_adapter_json(_GATES, recovery.effective_completion_gates)
+                if recovery.effective_completion_gates is not None
+                else None
+            )
+            or snapshot.auto_title_eligible
+            or ready_frame.ingress_phase != "ready"
+        ):
+            raise AuditIntegrityError("Recompose bootstrap changed its original SQL actor/request/transcript/base source")
+        return
+    if type(request) is not SendMessageRequest:
+        raise AuditIntegrityError("pre-title bootstrap lost its actual SendMessage request")
     ingress = _read_ingress_source_on_connection(
         conn, running, actual=selected, content=request.content, requested_state_id=request.state_id, composition_state_id=request.state_id
     )
@@ -426,6 +478,8 @@ def require_current_prepared_title_values_on_connection(
     from elspeth.web.sessions.continuation_ingress import read_prepared_title_ingress_on_connection
 
     snapshot, request = _current_pretitle_value_inputs(conn, service, running, selected=selected, chunk=chunk)
+    if type(request) is not SendMessageRequest:
+        raise AuditIntegrityError("TITLE preparation requires its actual SendMessage owner")
     ingress = read_prepared_title_ingress_on_connection(
         conn,
         running,

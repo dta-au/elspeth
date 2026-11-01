@@ -12,14 +12,14 @@ Continuation request); the recovery-only palette never does.
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
-from elspeth.web.credential_guard import require_no_credential_material
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _AdmittedToolBatch
@@ -56,7 +56,11 @@ class ContinuationControlIntent(BaseModel):
 class ContinuationControlRefused(ValueError):
     """A refused control call; the batch is refused before any mutation or discovery effect."""
 
-    def __init__(self, error_code: Literal["CONTINUATION_CALL_NOT_ALONE", "CONTINUATION_UNAVAILABLE"], detail: str) -> None:
+    def __init__(
+        self,
+        error_code: Literal["CONTINUATION_CALL_NOT_ALONE", "CONTINUATION_UNAVAILABLE", "argument_error"],
+        detail: str,
+    ) -> None:
         super().__init__(detail)
         self.error_code = error_code
         self.detail = detail
@@ -65,7 +69,16 @@ class ContinuationControlRefused(ValueError):
         # Literal codes, so the closed-registry census sees each producer.
         if self.error_code == "CONTINUATION_CALL_NOT_ALONE":
             return {"status": "ARG_ERROR", "error": self.detail, "error_code": "CONTINUATION_CALL_NOT_ALONE"}
+        if self.error_code == "argument_error":
+            return {"status": "ARG_ERROR", "error": self.detail, "error_code": "argument_error"}
         return {"status": "ARG_ERROR", "error": self.detail, "error_code": "CONTINUATION_UNAVAILABLE"}
+
+
+def _argument_refusal() -> ContinuationControlRefused:
+    return ContinuationControlRefused(
+        "argument_error",
+        "Invalid checkpoint_and_continue arguments. Use an object containing only optional notes of 1 to 500 UTF-8 bytes.",
+    )
 
 
 def continuation_control_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, object]]:
@@ -89,7 +102,12 @@ def continuation_control_tool_definitions(dialect: ToolContractDialect) -> list[
 
 
 def parse_continuation_control_batch(batch: _AdmittedToolBatch) -> ContinuationControlIntent | None:
-    """None when the batch has no control call; refuse a mixed batch before any effect."""
+    """Admit a sole control without modifying its provider call or original argument bytes.
+
+    Ordinary batches return None. Mixed batches and expected argument errors
+    are safe control refusals before effects; unrelated first-party defects
+    still propagate from their original owner.
+    """
     if not any(call.function.name == CONTINUATION_CONTROL_TOOL for call in batch.calls):
         return None
     if len(batch.calls) != 1:
@@ -98,13 +116,23 @@ def parse_continuation_control_batch(batch: _AdmittedToolBatch) -> ContinuationC
             "checkpoint_and_continue must be the only tool call in its batch; every call in this batch was refused before effects.",
         )
     call = batch.calls[0]
-    arguments = json.loads(call.function.arguments)
-    if type(arguments) is not dict:
-        raise ValueError("checkpoint_and_continue arguments must be an object")
-    parsed = ContinueArguments.model_validate(arguments)
+    arguments, parse_error = parse_json_strict(call.function.arguments)
+    if parse_error is not None or type(arguments) is not dict:
+        raise _argument_refusal()
+    try:
+        parsed = ContinueArguments.model_validate(arguments)
+    except ValidationError:
+        raise _argument_refusal() from None
     notes = parsed.notes
     if notes is not None:
-        if not notes.strip() or len(notes.encode("utf-8")) > CONTINUATION_NOTES_MAX_BYTES:
-            raise ValueError("checkpoint_and_continue notes must be 1 to 500 UTF-8 bytes")
-        require_no_credential_material(notes, surface="composer_continuation_notes")
+        try:
+            byte_length = len(notes.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise _argument_refusal() from None
+        if not notes.strip() or byte_length > CONTINUATION_NOTES_MAX_BYTES:
+            raise _argument_refusal()
+        try:
+            require_no_credential_material(notes, surface="composer_continuation_notes")
+        except CredentialMaterialRefused:
+            raise _argument_refusal() from None
     return ContinuationControlIntent(tool_call_id=call.id, notes=notes)

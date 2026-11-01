@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from tests.unit.web.coordination.test_composer_continuation_claim_start import queued, start_segment
 from tests.unit.web.coordination.test_composer_operation_authority import _admission_rows
 from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store
@@ -249,17 +250,72 @@ def test_v2_pre_start_claim_renews_and_releases_on_the_segment_row(operation_sto
         conn.execute(update(segments).values(claim_expires_at=short))
     with engine.connect() as conn:
         before_renewal = database_now(conn)
+        parent_before = conn.execute(select(jobs)).one()
     authority.renew_claim(claim)
     with engine.connect() as conn:
         renewed = restore_utc(conn.execute(select(segments.c.claim_expires_at)).scalar_one())
-        assert conn.execute(select(jobs.c.claim_token)).scalar_one() is None
+        assert conn.execute(select(jobs)).one() == parent_before
+        assert conn.execute(select(segments.c.claim_token, segments.c.claim_owner_instance_id, segments.c.generation)).one() == (
+            claim.claim_token,
+            "test-owner",
+            claim.ownership_generation,
+        )
     assert renewed > short
     assert renewed >= before_renewal + timedelta(seconds=authority._claim_lease_seconds) - timedelta(seconds=1)
     authority.release_claim(claim)
     with engine.connect() as conn:
-        assert conn.execute(select(segments.c.claim_token, segments.c.claim_expires_at)).one() == (None, None)
+        assert conn.execute(select(jobs)).one() == parent_before
+        assert conn.execute(select(segments.c.claim_token, segments.c.claim_owner_instance_id, segments.c.claim_expires_at)).one() == (
+            None,
+            None,
+            None,
+        )
     with pytest.raises(ComposerOperationFenceLost):
         authority.release_claim(claim)
+
+
+def test_claim_is_segment_queue_only_and_running_is_never_requeued(operation_store):
+    engine, *_ = operation_store
+    authority, _record, running = _running(operation_store)
+    before = _admission_rows(engine)
+    assert authority.claim_segment(limit=1) == ()
+    assert _admission_rows(engine) == before
+    for action in (authority.renew_claim, authority.release_claim):
+        with pytest.raises(ComposerOperationFenceLost):
+            action(running.claim)
+        assert _admission_rows(engine) == before
+    with pytest.raises(IntegrityError, match="composer operation immutable transition"), engine.begin() as conn:
+        conn.execute(update(jobs).values(status="queued", phase="queued"))
+    assert _admission_rows(engine) == before
+
+
+def test_stale_pre_start_segment_claim_cannot_renew_or_release_reclaimed_work(operation_store):
+    engine, *_ = operation_store
+    authority, _record = queued(operation_store)
+    (old,) = authority.claim_segment(limit=1)
+    with engine.begin() as conn:
+        conn.execute(update(segments).values(claim_expires_at=database_now(conn) - timedelta(seconds=1)))
+    (current,) = authority.claim_segment(limit=1)
+    assert current.claim_token != old.claim_token and current.attempt == old.attempt + 1
+    assert (current.segment_sequence, current.ownership_generation) == (old.segment_sequence, old.ownership_generation)
+    before = _admission_rows(engine)
+    for action in (authority.renew_claim, authority.release_claim):
+        with pytest.raises(ComposerOperationFenceLost):
+            action(old)
+        assert _admission_rows(engine) == before
+    assert authority.renew_claim(current).attempt == current.attempt
+    with engine.connect() as conn:
+        assert conn.execute(select(segments.c.claim_token, segments.c.claim_owner_instance_id)).one() == (
+            current.claim_token,
+            "test-owner",
+        )
+    authority.release_claim(current)
+    with engine.connect() as conn:
+        assert conn.execute(select(segments.c.claim_token, segments.c.claim_owner_instance_id, segments.c.claim_expires_at)).one() == (
+            None,
+            None,
+            None,
+        )
 
 
 def _settle(engine, running, outcome):
@@ -339,6 +395,34 @@ async def test_v2_completed_terminal_settles_with_phase_settled(operation_store)
     _assert_terminal_bundle(engine, running, status="completed", failure_code=None)
     before = _admission_rows(engine)
     assert _settle(engine, running, outcome) == settled
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authoritative_failure", (False, True))
+async def test_pending_stop_refuses_success_even_with_authoritative_failure_flag(operation_store, authoritative_failure):
+    from tests.unit.web.coordination.test_composer_operation_authority import response
+    from tests.unit.web.sessions.test_continuation_ingress import begin, ingress
+
+    engine, _repository, authority, service, sid = operation_store
+    running, work, selected, request, _seed = begin(operation_store)
+    await ingress(operation_store, running, work, selected, request)
+    work.coordinator.assert_completed()
+    assistant = await service.add_message(
+        sid,
+        "assistant",
+        "Persisted before Stop",
+        writer_principal="compose_loop",
+        session_operation_context=running.session_operation_context,
+    )
+    outcome = response(assistant, (), None)
+    marked = authority.request_cancel(session_id=sid, operation_id=running.claim.operation_id)
+    assert marked is not None and marked.cancel_requested_at is not None
+    before = _admission_rows(engine)
+    with locked_session_transaction(engine, str(sid)) as conn:
+        assert conn.execute(select(jobs.c.cancel_requested_at)).scalar_one() is not None
+        with pytest.raises(ComposerOperationCancelledDuringTurn):
+            settle_composer_operation_on_connection(conn, running, outcome=outcome, authoritative_failure=authoritative_failure)
     assert _admission_rows(engine) == before
 
 

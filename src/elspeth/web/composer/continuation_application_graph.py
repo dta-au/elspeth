@@ -9,6 +9,7 @@ contracts. Private authoring identity is explicit across recorder and batch.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from hashlib import sha256
 from typing import Any
 
 from pydantic import TypeAdapter
@@ -23,11 +24,14 @@ from elspeth.web.composer.audit import PrivatePlannerCandidate
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation import PrivateChunkRef
 from elspeth.web.composer.continuation_audit_buffer import (
+    RECORDER_CODEC,
     RecorderDrainCursors,
     RecorderSnapshot,
     RetainedVisibleLink,
     decode_recorder_snapshot,
     encode_recorder_snapshot,
+    recorder_snapshot_json,
+    validate_recorder_projection,
 )
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData
 from elspeth.web.composer.continuation_codec import PrivateChunk, owned_json, verify_private_chunk
@@ -84,12 +88,59 @@ class ApplicationRecorderSource:
         object.__setattr__(self, "env_ref_names", env_ref_names)
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class ProspectiveApplicationRecorderSource(ApplicationRecorderSource):
+    """Complete fresh DATA awaiting capacity; never an admitted stored source.
+
+    The normal stored constructor remains bounded. This separate nominal value
+    allows validation of a prospective oversized graph before its final refusal.
+    Its document must actually exceed the existing byte bound. Every consumer
+    revalidates its original binding; it can never enter admitted evidence.
+    """
+
+
+def _prospective_recorder_values(snapshot: RecorderSnapshot, env_ref_names: frozenset[str]) -> tuple[PrivateChunk, RecorderSnapshot]:
+    canonical, restored = validate_recorder_projection(snapshot)
+    encoded = canonical.encode("utf-8")
+    # This is a complete-text security traversal, not a retained-byte allowance.
+    # Fresh excess must not stop before a credential at its original tail.
+    require_no_credential_material(
+        canonical,
+        surface="composer_continuation_evidence_recorder",
+        env_ref_names=env_ref_names,
+        max_string_bytes=max(JSON_MAX_TOTAL_UTF8_BYTES, len(encoded)),
+    )
+    chunk = PrivateChunk(PrivateChunkRef(codec=RECORDER_CODEC, digest=sha256(encoded).hexdigest(), byte_length=len(encoded)), canonical)
+    return chunk, restored
+
+
+def capture_fresh_application_recorder_source(snapshot: RecorderSnapshot, *, env_ref_names: frozenset[str]) -> ApplicationRecorderSource:
+    """Preserve ordinary admission when fitting; defer only actual fresh excess."""
+    _require_source_environment(env_ref_names)
+    canonical = recorder_snapshot_json(snapshot)
+    if utf8_size(canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+        return capture_application_recorder_source(snapshot, env_ref_names=env_ref_names)
+    chunk, restored = _prospective_recorder_values(snapshot, env_ref_names)
+    return ProspectiveApplicationRecorderSource(chunk, restored, env_ref_names)
+
+
+def require_application_recorder_capacity(source: ApplicationRecorderSource) -> None:
+    """Classify valid fresh excess only after its enclosing validation finishes."""
+    from elspeth.web.composer.protocol import ComposerContextUnsupported
+
+    if type(source) not in (ApplicationRecorderSource, ProspectiveApplicationRecorderSource):
+        raise TypeError("application capacity requires its actual complete recorder source")
+    require_application_recorder_source(source, source.env_ref_names)
+    if source.chunk.reference.byte_length > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+        raise ComposerContextUnsupported("retained_chunk_bytes")
+
+
 def _require_source_environment(env_ref_names: frozenset[str]) -> None:
     if type(env_ref_names) is not frozenset or any(type(name) is not str for name in env_ref_names):
         raise TypeError("application recorder requires its closed environment-name set")
 
 
-def _require_source_chunk(chunk: PrivateChunk) -> None:
+def _require_source_chunk_shape(chunk: PrivateChunk) -> None:
     if type(chunk) is not PrivateChunk or type(chunk.reference) is not PrivateChunkRef:
         raise AuditIntegrityError("application recorder lost its complete original source role")
     if (type(chunk.canonical), type(chunk.reference.codec), type(chunk.reference.digest), type(chunk.reference.byte_length)) != (
@@ -99,6 +150,10 @@ def _require_source_chunk(chunk: PrivateChunk) -> None:
         int,
     ) or chunk.reference.codec != "composer.audit-buffer.v2":
         raise AuditIntegrityError("application recorder lost its complete original source role")
+
+
+def _require_source_chunk(chunk: PrivateChunk) -> None:
+    _require_source_chunk_shape(chunk)
     if not 0 <= chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
         utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != chunk.reference.byte_length
     ):
@@ -129,11 +184,19 @@ def admit_application_recorder_source(chunk: PrivateChunk, *, env_ref_names: fro
 
 def require_application_recorder_source(source: ApplicationRecorderSource, env_ref_names: frozenset[str]) -> ApplicationRecorderSource:
     _require_source_environment(env_ref_names)
-    if type(source) is not ApplicationRecorderSource:
+    if type(source) not in (ApplicationRecorderSource, ProspectiveApplicationRecorderSource):
         raise TypeError("application graph requires its actual source-admitted recorder")
     _require_source_environment(source.env_ref_names)
     if source.env_ref_names != env_ref_names:
         raise AuditIntegrityError("application recorder changed its admitted environment")
+    if type(source) is ProspectiveApplicationRecorderSource:
+        _require_source_chunk_shape(source.chunk)
+        chunk, _snapshot = _prospective_recorder_values(source.snapshot, env_ref_names)
+        if chunk != source.chunk:
+            raise AuditIntegrityError("prospective application recorder changed its complete original source")
+        if chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            raise AuditIntegrityError("prospective application recorder lost its actual complete document excess")
+        return source
     _require_source_chunk(source.chunk)
     if type(source.snapshot) is not RecorderSnapshot or encode_recorder_snapshot(source.snapshot) != source.chunk:
         raise AuditIntegrityError("application recorder changed its complete original fields")
@@ -141,8 +204,21 @@ def require_application_recorder_source(source: ApplicationRecorderSource, env_r
     return source
 
 
+def application_recorder_chunk(snapshot: RecorderSnapshot, *, recorder_source: ApplicationRecorderSource | None = None) -> PrivateChunk:
+    """Validate the selected prospective recorder without admitting its bytes.
+
+    Historical or unrelated snapshots retain the normal bounded encoder. Only
+    the exact complete prospective source document can defer its capacity cut.
+    """
+    if type(recorder_source) is ProspectiveApplicationRecorderSource:
+        require_application_recorder_source(recorder_source, recorder_source.env_ref_names)
+        if recorder_snapshot_json(snapshot) == recorder_source.chunk.canonical:
+            return recorder_source.chunk
+    return encode_recorder_snapshot(snapshot)
+
+
 def application_recorder_slots(graph: ApplicationGraph, source: ApplicationRecorderSource) -> dict[int, int]:
-    if encode_recorder_snapshot(graph.recorder) != source.chunk:
+    if application_recorder_chunk(graph.recorder, recorder_source=source) != source.chunk:
         raise AuditIntegrityError("application graph differs from its complete original recorder source")
     slots: dict[int, int] = {}
     for index, call in enumerate(graph.recorder.llm_calls):
@@ -184,7 +260,9 @@ def _atom_json(value: Any, owner: type[Any]) -> str:
     return encoded
 
 
-def application_members(value: Any, *, recorder_slots: dict[int, int] | None = None) -> tuple[str, dict[str, Any]] | None:
+def application_members(
+    value: Any, *, recorder_slots: dict[int, int] | None = None, recorder_source: ApplicationRecorderSource | None = None
+) -> tuple[str, dict[str, Any]] | None:
     if type(value) is ComposerLLMCall:
         if recorder_slots is None or id(value) not in recorder_slots:
             raise AuditIntegrityError("application LLM has no actual recorder identity slot")
@@ -223,7 +301,7 @@ def application_members(value: Any, *, recorder_slots: dict[int, int] | None = N
             "authored_state_hash": value.authored_state_hash,
         }
     if type(value) is RecorderSnapshot:
-        encode_recorder_snapshot(value)
+        application_recorder_chunk(value, recorder_source=recorder_source)
         return "application_recorder", {
             "invocations": value.invocations,
             "llm_calls": value.llm_calls,
@@ -325,7 +403,9 @@ def construct_application_member(kind: str, members: dict[str, Any]) -> Any:
     raise AuditIntegrityError("application graph has no actual constructor")
 
 
-def application_result_tools(graph: ApplicationGraph, env_ref_names: frozenset[str]) -> dict[int, str]:
+def application_result_tools(
+    graph: ApplicationGraph, env_ref_names: frozenset[str], *, recorder_source: ApplicationRecorderSource | None = None
+) -> dict[int, str]:
     from elspeth.web.composer.continuation_batch_data import _joint
     from elspeth.web.composer.continuation_p4_batch import _joined
 
@@ -369,7 +449,7 @@ def application_result_tools(graph: ApplicationGraph, env_ref_names: frozenset[s
         raise TypeError("application graph lost actual evidence/recorder owners")
     for effects in (graph.effects, *(item for cut in graph.cuts for item in (cut.effects_before, cut.effects_after))):
         _admit_effects(effects, env_ref_names)
-    encode_recorder_snapshot(graph.recorder)
+    application_recorder_chunk(graph.recorder, recorder_source=recorder_source)
     from elspeth.web.composer.continuation_tool_failure import require_retained_failure_links
 
     for data in (graph.selected, *(cut.data for cut in graph.cuts)):
@@ -390,7 +470,7 @@ def application_result_tools(graph: ApplicationGraph, env_ref_names: frozenset[s
         for snapshot in (cut.recorder_before, cut.recorder_after):
             if type(snapshot) is not RecorderSnapshot:
                 raise TypeError("application cut lost its actual recorder")
-            encode_recorder_snapshot(snapshot)
+            application_recorder_chunk(snapshot, recorder_source=recorder_source)
     return result_tools
 
 

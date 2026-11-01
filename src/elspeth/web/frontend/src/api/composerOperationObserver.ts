@@ -231,6 +231,7 @@ export class RevisionGate {
 }
 
 type StreamEnd = "terminal" | "reconnect" | "deadline" | "capacity" | "failed";
+type StatusAcceptance = "fresh" | "duplicate" | "stale" | "conflict";
 
 /**
  * Observe an admitted (or restored, or adopted) operation to its sealed
@@ -247,18 +248,29 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
   let stopAcknowledged = false;
   let capacityUntil = 0;
   const consumedDeadlines = new Set<string>();
+  let acceptedDeadline: { key: string; dueAt: number } | null = null;
   const pollAfter = () => Math.max(100, Math.min(gate.latest?.poll_after_ms ?? 1000, 60_000));
   const backoff = (failures: number) => Math.min(1000 * 2 ** Math.max(0, failures - 1), BACKOFF_CAP_MS);
 
-  const accept = (status: ComposerOperationStatus, fault: "snapshot_kind_mismatch" | "cancel_kind_mismatch" = "snapshot_kind_mismatch"): boolean => {
+  const accept = (status: ComposerOperationStatus, fault: "snapshot_kind_mismatch" | "cancel_kind_mismatch" = "snapshot_kind_mismatch"): StatusAcceptance => {
     if (status.kind !== descriptor.kind) throw new ComposerObservationFault(fault, new Error("Operation kind mismatch"));
     let fresh: boolean;
-    try { fresh = gate.accept(status); } catch { trustStream = false; return false; }
-    if (fresh) {
-      deliverComposerObservation(() => options.status?.(status));
-      if (status.cancel_requested) { stopAcknowledged = true; options.stopUnconfirmed?.(false); }
+    try { fresh = gate.accept(status); } catch { trustStream = false; return "conflict"; }
+    if (!fresh) return status.status_revision < gate.lastAccepted ? "stale" : "duplicate";
+    const segment = status.segment;
+    if (segment === null || segment.deadline_at === null) acceptedDeadline = null;
+    else {
+      const key = `${segment.sequence}:${segment.generation}:${segment.deadline_at}`;
+      if (acceptedDeadline?.key !== key) {
+        acceptedDeadline = { key, dueAt: performance.now() + Math.max(0, Date.parse(segment.deadline_at) - Date.parse(status.observed_at)) };
+      }
     }
-    return fresh;
+    deliverComposerObservation(() => options.status?.(status));
+    if (status.cancel_requested) {
+      stopAcknowledged = true;
+      deliverComposerObservation(() => options.stopUnconfirmed?.(false));
+    }
+    return "fresh";
   };
 
   // One connection. A connection is healthy only when it ends with terminal or
@@ -271,10 +283,19 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
     const lifetime = setTimeout(close, COMPOSER_STREAM_LIFETIME_MS + 5_000);
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     let deadlineFired = false;
+    const armAcceptedDeadline = () => {
+      if (deadlineTimer !== undefined) { clearTimeout(deadlineTimer); deadlineTimer = undefined; }
+      const deadline = acceptedDeadline;
+      if (deadline === null || consumedDeadlines.has(deadline.key)) return;
+      deadlineTimer = setTimeout(() => { consumedDeadlines.add(deadline.key); deadlineFired = true; close(); }, Math.max(0, deadline.dueAt - performance.now()));
+    };
     const previousWake = owner.wake;
     owner.wake = close;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
+      // A reconnect retains the original accepted deadline, even if its first
+      // snapshot repeats that state with a different observation timestamp.
+      armAcceptedDeadline();
       const response = await api.fetchComposerOperationStream(descriptor.sessionId, descriptor.operationId, stream.signal, gate.lastAccepted >= 0 ? gate.lastAccepted : null);
       if (!current()) return "failed";
       if (response.status === 503) {
@@ -295,20 +316,21 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
           sequence = frame.sequence;
           clearTimeout(idle); idle = setTimeout(close, COMPOSER_STREAM_IDLE_CLOSE_MS);
           if (frame.event === "status") {
-            accept(frame.payload);
+            const decision = accept(frame.payload);
             if (!trustStream) return "failed";
+            if (decision !== "fresh") continue;
+            armAcceptedDeadline();
             if (frame.payload.status === "completed" || frame.payload.status === "failed") return "terminal";
-            const segment = frame.payload.segment;
-            const deadlineKey = segment?.deadline_at == null ? null : `${segment.sequence}:${segment.generation}:${segment.deadline_at}`;
-            if (deadlineKey !== null && !consumedDeadlines.has(deadlineKey)) {
-              if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-              const delay = Math.max(0, Date.parse(segment!.deadline_at!) - Date.parse(frame.payload.observed_at));
-              deadlineTimer = setTimeout(() => { consumedDeadlines.add(deadlineKey); deadlineFired = true; close(); }, delay);
-            }
           } else if (frame.event === "progress") {
             deliverComposerObservation(() => options.progress?.({ ...frame.payload, session_id: descriptor.sessionId, inflight_requests: 1 } as ComposerProgressSnapshot));
-          } else if (frame.event === "terminal") return "terminal";
-          else if (frame.event === "reconnect") return "reconnect";
+          } else if (frame.event === "terminal") {
+            if (frame.payload.status_revision < gate.lastAccepted) continue;
+            if (frame.payload.status_revision === gate.lastAccepted) {
+              const accepted = gate.latest!;
+              if (frame.payload.status !== accepted.status || frame.payload.phase !== accepted.phase) { trustStream = false; return "failed"; }
+            }
+            return "terminal";
+          } else if (frame.event === "reconnect") return "reconnect";
         }
       }
       return deadlineFired ? "deadline" : "failed";
@@ -337,7 +359,8 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
     return apply(read);
   };
   const apply = async (snapshot: ComposerOperationSnapshot): Promise<Durable> => {
-    accept(snapshot);
+    const decision = accept(snapshot);
+    if (decision === "stale" || decision === "conflict") return { done: false, why: "live" };
     if (snapshot.status !== "completed" && snapshot.status !== "failed") return { done: false, why: "live" };
     // The terminal GET is read for its sealed result even at an equal revision.
     if (snapshot.status === "failed") validateComposerRecoveryBody(snapshot.error!.body, descriptor.sessionId);
@@ -376,8 +399,11 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
           if (stopped.kind === "session_missing") { clearComposerSessionCustody(descriptor.scope, descriptor.sessionId); throw new ComposerSessionMissing(); }
           stopFailures += 1;
         } else {
-          accept(stopped, "cancel_kind_mismatch");
-          stopAcknowledged = stopped.cancel_requested || stopped.status === "completed" || stopped.status === "failed";
+          const decision = accept(stopped, "cancel_kind_mismatch");
+          if (decision === "fresh" || decision === "duplicate") {
+            const accepted = gate.latest!;
+            stopAcknowledged = accepted.cancel_requested || accepted.status === "completed" || accepted.status === "failed";
+          }
           stopFailures = stopAcknowledged ? 0 : stopFailures + 1;
         }
       } catch (error) {
@@ -387,16 +413,16 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
           && "error_type" in error && error.error_type === "composer_continuation_stop_unavailable") {
           clearComposerStop(descriptor);
           stopFailures = 0;
-          options.stopUnconfirmed?.(false);
-          options.stopUnavailable?.();
+          deliverComposerObservation(() => options.stopUnconfirmed?.(false));
+          deliverComposerObservation(() => options.stopUnavailable?.());
         } else stopFailures += 1;
       }
       if (!stopAcknowledged && composerStopRequested(descriptor)) {
-        options.stopUnconfirmed?.(true);
+        deliverComposerObservation(() => options.stopUnconfirmed?.(true));
         await sleep(owner, backoff(stopFailures));
         continue;
       }
-      options.stopUnconfirmed?.(false);
+      deliverComposerObservation(() => options.stopUnconfirmed?.(false));
     }
     let end: StreamEnd = "failed";
     if (Date.now() < capacityUntil || !trustStream) end = "deadline"; // poll the GET this round
@@ -406,11 +432,11 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
       if (typeof outcome === "object") { capacityUntil = Date.now() + outcome.capacityMs; end = "deadline"; }
       else end = outcome;
     }
-    if (end === "reconnect") { consecutiveFailures = 0; options.interrupted?.(false); continue; }
+    if (end === "reconnect") { consecutiveFailures = 0; deliverComposerObservation(() => options.interrupted?.(false)); continue; }
     if (end === "failed") {
       consecutiveFailures += 1;
-      if (consecutiveFailures >= 2) options.interrupted?.(true);
-    } else if (end === "terminal") { consecutiveFailures = 0; options.interrupted?.(false); }
+      if (consecutiveFailures >= 2) deliverComposerObservation(() => options.interrupted?.(true));
+    } else if (end === "terminal") { consecutiveFailures = 0; deliverComposerObservation(() => options.interrupted?.(false)); }
     // Terminal, deadline, capacity, an untrusted stream, or a repeated failure: read the durable GET.
     if (end !== "failed" || consecutiveFailures >= 2) {
       try {

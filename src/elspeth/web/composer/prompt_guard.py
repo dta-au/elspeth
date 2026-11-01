@@ -13,15 +13,17 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, get_args
 from uuid import UUID, uuid4
 
+from elspeth.contracts import credential_material
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import is_lower_sha256_hex
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    PROMPT_GUARD_PROVENANCE_KEYS,
     GuardedProviderMessage,
     PromptGuardClient,
     PromptGuardContentPart,
@@ -33,10 +35,12 @@ from elspeth.contracts.prompt_guard import (
     PromptGuardRole,
     PromptGuardThinkingParts,
     PromptGuardToolArgumentParts,
+    PromptGuardTrust,
     validate_prompt_guard_content_parts,
     validate_prompt_guard_thinking_parts,
     validate_prompt_guard_tool_argument_parts,
 )
+from elspeth.contracts.url import SENSITIVE_PARAMS
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.required_work import RequiredWorkSource
@@ -50,13 +54,15 @@ _USER_PROMPT: ContextVar[str | None] = ContextVar("composer_prompt_guard_user", 
 
 
 class _GuardAuditCheck(TypedDict):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     audit_id: str
     operation_id: str
     operation_epoch: int
     role: PromptGuardRole
     adapter: str
     mode: PromptGuardMode
+    validity_policy_fingerprint: str
+    # Physical adapter/settings identity, or the explicit unconfigured policy.
     policy_fingerprint: str
     request_hash: str
     disposition: PromptGuardDisposition
@@ -68,6 +74,44 @@ class _GuardAuditCheck(TypedDict):
 class _GuardAuditEnvelope(TypedDict):
     _kind: Literal["prompt_guard_audit"]
     check: _GuardAuditCheck
+
+
+def prompt_guard_validity_policy_fingerprint() -> str:
+    """Identify logical validity independently of configured inspection limits.
+
+    Coverage/provenance, Unicode and the remaining detector algorithms are
+    versioned contracts. Finite credential rules come from their live owner so
+    changing an enforced rule cannot retain a prepared input's old identity.
+    Endpoint, timeout, Azure limits and credentials belong to adapter policy.
+    """
+    traversal = credential_material.CredentialTraversalPolicy()
+    policy = {
+        "domain": "composer_prompt_guard_logical_validity",
+        "coverage_version": 1,
+        "provenance_version": 1,
+        "unicode_version": 1,
+        "credential_traversal_version": 1,
+        "credential_url_version": 1,
+        "credential_private_key_version": 1,
+        "credential_reference_version": 1,
+        "roles": get_args(PromptGuardRole),
+        "provenance_keys": sorted(PROMPT_GUARD_PROVENANCE_KEYS),
+        "trust": sorted(trust.value for trust in PromptGuardTrust),
+        "credential_detector_version": credential_material.CREDENTIAL_DETECTOR_VERSION,
+        "credential_patterns": [(name, pattern.pattern, pattern.flags) for name, pattern in credential_material.CREDENTIAL_PATTERN_SPECS],
+        "credential_fields": sorted(credential_material.SECRET_FIELD_NAMES),
+        "credential_suffixes": credential_material.SECRET_FIELD_SUFFIXES,
+        "credential_structural_exemptions": sorted(credential_material.STRUCTURAL_FIELD_EXEMPTIONS),
+        "credential_url_parameters": sorted(SENSITIVE_PARAMS),
+        "credential_traversal": {
+            "max_depth": traversal.max_depth,
+            "max_nodes": traversal.max_nodes,
+            "max_width": traversal.max_width,
+            "max_string_bytes": traversal.max_string_bytes,
+        },
+    }
+    encoded = json.dumps(policy, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @contextmanager
@@ -251,6 +295,7 @@ def build_prompt_guard_mount(settings: PromptGuardSettings | None) -> PromptGuar
 def _request(
     *,
     policy_fingerprint: str,
+    validity_policy_fingerprint: str | None = None,
     role: PromptGuardRole,
     messages: Sequence[Mapping[str, Any]],
     tools: Sequence[Mapping[str, Any]],
@@ -269,6 +314,10 @@ def _request(
     """
     if type(enforce_azure_character_limits) is not bool:
         raise AuditIntegrityError("Prompt guard size policy requires an exact enforcement decision")
+    if validity_policy_fingerprint is None:
+        validity_policy_fingerprint = prompt_guard_validity_policy_fingerprint()
+    if not is_lower_sha256_hex(validity_policy_fingerprint):
+        raise AuditIntegrityError("Prompt guard validity policy lacks its exact fingerprint")
     genuine_user = resolve_prompt_guard_user_prompt(user_prompt)
     supported = genuine_user is not None
     user = genuine_user if genuine_user is not None else ""
@@ -286,6 +335,7 @@ def _request(
         raise AuditIntegrityError("Prompt guard partition conflicts with whole-message trust")
     exact = {
         "role": role,
+        "validity_policy_fingerprint": validity_policy_fingerprint,
         "policy_fingerprint": policy_fingerprint,
         "enforce_azure_character_limits": enforce_azure_character_limits,
         "user_prompt": genuine_user,
@@ -510,8 +560,10 @@ async def enforce_prompt_guard(
             ).encode("utf-8")
         ).hexdigest()
     )
+    validity_policy_fingerprint = prompt_guard_validity_policy_fingerprint()
     request, supported = _request(
         policy_fingerprint=policy_fingerprint,
+        validity_policy_fingerprint=validity_policy_fingerprint,
         role=role,
         messages=messages,
         tools=tools,
@@ -546,13 +598,14 @@ async def enforce_prompt_guard(
     envelope: _GuardAuditEnvelope = {
         "_kind": "prompt_guard_audit",
         "check": {
-            "schema_version": 1,
+            "schema_version": 2,
             "audit_id": audit_id,
             "operation_id": fence.operation_id,
             "operation_epoch": fence.operation_epoch,
             "role": role,
             "adapter": mount.client.adapter if mount is not None else "unconfigured",
             "mode": mode,
+            "validity_policy_fingerprint": validity_policy_fingerprint,
             "policy_fingerprint": policy_fingerprint,
             "request_hash": request.request_hash,
             "disposition": decision.disposition,

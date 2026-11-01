@@ -40,6 +40,7 @@ from elspeth.web.composer.advisor_content import PreparedAdvisorContent, scan_pr
 from elspeth.web.composer.llm_response_parsing import AnthropicCacheMarkerPlan, plan_anthropic_cache_markers
 from elspeth.web.composer.prompt_guard import (
     PromptGuardMount,
+    prompt_guard_validity_policy_fingerprint,
     resolve_prompt_guard_user_prompt,
     validate_prompt_guard_credentials,
 )
@@ -334,6 +335,7 @@ class PreparedProviderInput:
     _guard_client: object = field(init=False, repr=False)
     _guard_adapter: str | None = field(init=False, repr=False)
     _guard_fingerprint: str | None = field(init=False, repr=False)
+    _guard_validity_fingerprint: str = field(init=False, repr=False)
     _guard_timeout: int | float | None = field(init=False, repr=False)
     _advisor_content: tuple[PreparedAdvisorContent, ...] | None = field(init=False, repr=False)
     _consumed: bool = field(default=False, init=False, repr=False)
@@ -358,6 +360,7 @@ class PreparedProviderInput:
         self._guard_client = self.mount.client if self.mount is not None else None
         self._guard_adapter = self.mount.client.adapter if self.mount is not None else None
         self._guard_fingerprint = self.mount.client.policy_fingerprint if self.mount is not None else None
+        self._guard_validity_fingerprint = prompt_guard_validity_policy_fingerprint()
         self._guard_timeout = self.mount.client.timeout_seconds if self.mount is not None else None
         self._advisor_content = self.advisor_content
 
@@ -399,6 +402,8 @@ class PreparedProviderInput:
             or self.mount.client.timeout_seconds != self._guard_timeout
         ):
             raise AuditIntegrityError("Prepared provider input changed its selected guard mount")
+        if prompt_guard_validity_policy_fingerprint() != self._guard_validity_fingerprint:
+            raise AuditIntegrityError("Prepared provider input changed its selected logical guard policy")
         candidates = (
             ((self.evidence, self.tools),)
             if dispatch is None

@@ -3137,6 +3137,7 @@ class SessionServiceProtocol(Protocol):
         ],
         required_work: RequiredWorkCoordinator | None = None,
         recovery: GraphRecoverySettlement | None = None,
+        provider_audit_calls: tuple[ComposerLLMCall, ...] = (),
     ) -> ComposerOperationRecord: ...
 
     async def load_graph_recovery_context(

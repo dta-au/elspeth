@@ -666,13 +666,17 @@ def append_complete_snapshot(
     handoff: bool,
     prepared_append: PreparedContinuationAppend | None = None,
 ) -> StoredContinuationSnapshot:
+    from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX
     from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 
+    if type(expected_cursor) is not int or expected_cursor < 0:
+        raise AuditIntegrityError("continuation journal requires an exact nonnegative integer cursor")
     current = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
     if current.checkpoint_id != expected_checkpoint_id or current.cursor != expected_cursor:
         raise ContinuationCASConflict("continuation snapshot compare-and-swap failed")
     if not event_batch:
         raise ValueError("a durable transition requires its attribution event")
+    next_cursor = expected_cursor + len(event_batch)
     previous_stack = decode_continuation_snapshot(current.payload_json)
     frame_stack = decode_continuation_snapshot(snapshot_json)
     if (
@@ -680,15 +684,18 @@ def append_complete_snapshot(
         or frame_stack.mutation_ceiling != previous_stack.mutation_ceiling
         or frame_stack.policy_hash != previous_stack.policy_hash
         or frame_stack.admission_policy_json != previous_stack.admission_policy_json
-        or frame_stack.cursor not in (expected_cursor, expected_cursor + len(event_batch))
+        or frame_stack.cursor not in (expected_cursor, next_cursor)
     ):
         raise ContinuationCASConflict("continuation transition changed immutable request/policy or cursor")
+    if prepared_append is not None:
+        prepared_append.require_original()
+    if next_cursor > _CANONICAL_SAFE_INTEGER_MAX:
+        raise AuditIntegrityError("continuation journal exhausted its canonical cursor domain")
     if prepared_append is None:
         now = database_now(conn)
         checkpoint_id = str(uuid4())
     else:
-        prepared_append.require_original()
-        final_json = encode_continuation_snapshot(frame_stack.model_copy(update={"cursor": expected_cursor + len(event_batch)}))
+        final_json = encode_continuation_snapshot(frame_stack.model_copy(update={"cursor": next_cursor}))
         if (
             prepared_append.session_id != session_id
             or prepared_append.operation_id != operation_id
@@ -1357,18 +1364,31 @@ def settle_continuation_on_connection(
     running: ComposerOperationRunning,
     *,
     outcome: MessageWithStateResponse | ComposerOperationError,
+    authoritative_failure: bool = False,
     prepared_settlement: PreparedSegmentSettlement | None = None,
+    terminal_recorded_at: datetime | None = None,
 ) -> None:
     """The live owner's V2 terminal under its exact current fence and attempt.
 
-    A ``request_cancelled`` outcome is the one terminal a pending Stop allows.
+    A pending Stop allows cancellation or an explicitly authoritative failure,
+    while successful business completion still refuses it.
     The fence is left for the lease close, so the worker verifies
     the terminal before it releases (design §2.7).
     """
     claim, context = running.claim, running.session_operation_context
+    if terminal_recorded_at is not None:
+        if not (isinstance(outcome, ComposerOperationError) and authoritative_failure):
+            raise AuditIntegrityError("only an authoritative failed terminal may carry its frozen recorded time")
+        if prepared_settlement is not None and terminal_recorded_at != prepared_settlement.published_at:
+            raise AuditIntegrityError("frozen failed terminal time differs from its prepared settlement")
     cancelling = isinstance(outcome, ComposerOperationError) and outcome.failure_code == "request_cancelled"
     # False means no live continuation attempt holds this fence: not this owner.
-    if not require_continuation_mutation(conn, context, allow_cancel=cancelling, allow_expired_segment=True):
+    if not require_continuation_mutation(
+        conn,
+        context,
+        allow_cancel=cancelling or (authoritative_failure and isinstance(outcome, ComposerOperationError)),
+        allow_expired_segment=True,
+    ):
         raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
     sid = str(claim.session_id)
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == claim.operation_id)).one()
@@ -1401,7 +1421,7 @@ def settle_continuation_on_connection(
         outcome=outcome,
         settled_by="owner_terminal",
         attempt_outcome="settled",
-        now=database_now(conn),
+        now=terminal_recorded_at if terminal_recorded_at is not None else database_now(conn),
         prepared_settlement=prepared_settlement,
     )
 

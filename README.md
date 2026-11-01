@@ -100,11 +100,11 @@ describe what is exported and how to configure it.
 
 ## What changed in 0.8.10
 
-0.8.10 adds default-off Composer continuation and provider-authored default or
-named attachment roots with scalar or ordered plural selectors. Public draft
-reapplication strips private custody and resolves current metadata. MCP argument
-audits retain safe evidence on capture faults, and workers retain an actual
-committed terminal return through late cleanup. See the
+0.8.10 uses one Composer lifecycle, Continuation, and adds provider-authored
+default or named attachment roots with scalar or ordered plural selectors.
+Public draft reapplication strips private custody and resolves current metadata.
+MCP argument audits retain safe evidence on capture faults, and workers retain
+an actual committed terminal return through late cleanup. See the
 [upgrade notes](docs/release/0.8.10-upgrade-notes-draft.md) for the single
 Composer lifecycle, the Sessions epoch 80 hard cut, unchanged Landscape epoch 50
 and fresh-store procedures. Reload open browser tabs after deploying.

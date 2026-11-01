@@ -192,7 +192,7 @@ def _read_tool_failure_selection_on_connection(
         if error is not None or retained != envelope:
             raise AuditIntegrityError("failed Advisor guard row lost its exact original content/envelope")
         check = envelope["check"]
-        if type(check) is not dict or set(check) != {
+        common_fields = {
             "schema_version",
             "audit_id",
             "operation_id",
@@ -206,8 +206,21 @@ def _read_tool_failure_selection_on_connection(
             "reason",
             "started_at",
             "duration_ms",
-        }:
+        }
+        if type(check) is not dict or "schema_version" not in check:
             raise AuditIntegrityError("failed Advisor guard lost its complete original check fields")
+        schema = check["schema_version"]
+        if type(schema) is not int or schema not in (1, 2):
+            raise AuditIntegrityError("failed Advisor guard lost its exact original check version")
+        expected_fields = common_fields | ({"validity_policy_fingerprint"} if schema == 2 else set())
+        if set(check) != expected_fields:
+            raise AuditIntegrityError("failed Advisor guard lost its complete original check fields")
+        # V1 has no independent logical identity. Preserve it as legacy DATA;
+        # never fill a historical record from today's guard configuration.
+        if schema == 2 and (
+            not is_lower_sha256_hex(check["validity_policy_fingerprint"]) or not is_lower_sha256_hex(check["policy_fingerprint"])
+        ):
+            raise AuditIntegrityError("failed Advisor guard lost its exact original policy identities")
         if (check["operation_id"], check["operation_epoch"], check["role"]) != (
             issue.creator_operation_id,
             issue.creator_operation_epoch,
@@ -215,9 +228,7 @@ def _read_tool_failure_selection_on_connection(
         ):
             raise AuditIntegrityError("failed Advisor guard changed its actual request/creator")
         if (
-            type(check["schema_version"]) is not int
-            or check["schema_version"] != 1
-            or any(
+            any(
                 type(check[field]) is not str or not check[field]
                 for field in (
                     "audit_id",

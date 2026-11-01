@@ -14,7 +14,14 @@ from pydantic import Field, model_validator
 from sqlalchemy import Connection
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, ContinuationValue, InitializeFrame, ToolBatchFrame
+from elspeth.web.composer.continuation import (
+    ComposeFrame,
+    ContinuationFrameStack,
+    ContinuationValue,
+    EndFrame,
+    InitializeFrame,
+    ToolBatchFrame,
+)
 from elspeth.web.composer.continuation_next_action import handoff_cut_allowance, next_continuation_action_policy
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -44,10 +51,10 @@ def classify_drain_cut_on_connection(
 def classify_drain_cut(selected: SelectedContinuationState) -> ContinuationDrainDisposition:
     """Classify only current cuts whose existing selector completes validation.
 
-    This pure preparation grants no disposition or dispatch authority. The
-    landed phase owners require same-sequence recovery lineage, even at a
-    handoff-safe cut (runtime design §2.2). Future-only handoff allowances
-    therefore refuse until their actual handoff-lineage owners land.
+    This pure preparation grants no disposition or dispatch authority. Live
+    later Compose and END review cuts retain source owners for the same
+    sequence (runtime design §2.2). Other future-only handoff allowances still
+    refuse until their actual source and cold-resume owners land.
 
     Do not catch ``ContinuationCutNotResumable`` here: for PRIMARY/P4/unknown
     shapes the current selector raises it before detailed phase validation.
@@ -62,10 +69,11 @@ def classify_drain_cut(selected: SelectedContinuationState) -> ContinuationDrain
         raise AuditIntegrityError("drain classification lost its nominal complete root")
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
     next_continuation_action_policy(selected=selected, policy=policy)
-    if handoff_cut_allowance(root, policy) is not None:
-        raise AuditIntegrityError("drain cut has no landed handoff-lineage owner")
     top = root.frames[-1]
-    if type(top) not in (InitializeFrame, ComposeFrame, ToolBatchFrame):
+    live_later_cut = (type(top) is ComposeFrame and top.phase == "action_ready") or (type(top) is EndFrame and top.phase == "review_needed")
+    if handoff_cut_allowance(root, policy) is not None and not live_later_cut:
+        raise AuditIntegrityError("drain cut has no landed handoff-lineage owner")
+    if type(top) not in (InitializeFrame, ComposeFrame, ToolBatchFrame) and not live_later_cut:
         raise AuditIntegrityError("drain cut has no landed phase owner")
     if type(top) is InitializeFrame and any(effect.disposition == "dispatched" for effect in root.effect_frontier):
         return "unresolved"

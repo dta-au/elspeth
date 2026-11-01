@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Final, Literal
 
 from pydantic import ConfigDict, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass
@@ -73,7 +74,7 @@ class RecorderSnapshot:
 _BUFFER_CODEC = TypeAdapter(RecorderSnapshot)
 
 
-RECORDER_CODEC = "composer.audit-buffer.v2"
+RECORDER_CODEC: Final[Literal["composer.audit-buffer.v2"]] = "composer.audit-buffer.v2"
 _DOCUMENT_KEYS = frozenset({"blocks", "snapshot"})
 _CONTEXT_KEYS = frozenset({"capture_boundary", "messages", "schema_version", "tools"})
 _STORED_REQUEST_KEYS = frozenset({"disposition", "capture_boundary", "messages", "schema_version", "tools"})
@@ -164,7 +165,8 @@ def _restore_request(stored: object, blocks: _RecorderBlocks) -> object:
     return {"disposition": "retained", "canonical": canonical_json(context), "reasons": []}
 
 
-def encode_recorder_snapshot(snapshot: RecorderSnapshot) -> PrivateChunk:
+def recorder_snapshot_json(snapshot: RecorderSnapshot) -> str:
+    """Project the exact v2 document without claiming storage admission."""
     if type(snapshot) is not RecorderSnapshot:
         raise TypeError("audit buffer requires its owned snapshot")
     snapshot.validate_links_and_cursors()
@@ -177,17 +179,38 @@ def encode_recorder_snapshot(snapshot: RecorderSnapshot) -> PrivateChunk:
     blocks = _RecorderBlocks()
     for call in projected["llm_calls"]:
         call["private_request"] = _deduplicate_request(call["private_request"], blocks)
-    return encode_private_chunk(
-        codec=RECORDER_CODEC,
-        canonical=canonical_json({"blocks": blocks.document(), "snapshot": projected}),
-    )
+    return canonical_json({"blocks": blocks.document(), "snapshot": projected})
+
+
+def encode_recorder_snapshot(snapshot: RecorderSnapshot) -> PrivateChunk:
+    return encode_private_chunk(codec=RECORDER_CODEC, canonical=recorder_snapshot_json(snapshot))
+
+
+def validate_recorder_projection(snapshot: RecorderSnapshot) -> tuple[str, RecorderSnapshot]:
+    """Validate complete prospective DATA before deciding its capacity.
+
+    This returns no admitted chunk. The same decoder and exact v2 projection
+    retain all original constructors, block checks and field identity.
+    """
+    canonical = recorder_snapshot_json(snapshot)
+    restored = _decode_recorder_document(canonical)
+    if recorder_snapshot_json(restored) != canonical:
+        raise AuditIntegrityError("audit buffer omitted or normalized a retained field")
+    return canonical, restored
 
 
 def decode_recorder_snapshot(chunk: PrivateChunk) -> RecorderSnapshot:
     if type(chunk) is not PrivateChunk or chunk.reference.codec != RECORDER_CODEC:
         raise AuditIntegrityError("audit buffer has the wrong codec")
     verify_private_chunk(chunk.reference, chunk.canonical)
-    value, error = parse_json_strict(chunk.canonical)
+    snapshot = _decode_recorder_document(chunk.canonical)
+    if encode_recorder_snapshot(snapshot).canonical != chunk.canonical:
+        raise AuditIntegrityError("audit buffer omitted or normalized a retained field")
+    return snapshot
+
+
+def _decode_recorder_document(canonical: str) -> RecorderSnapshot:
+    value, error = parse_json_strict(canonical)
     if error is not None:
         raise AuditIntegrityError("audit buffer is not strict JSON")
     if type(value) is not dict or set(value) != _DOCUMENT_KEYS or type(value["blocks"]) is not dict or type(value["snapshot"]) is not dict:
@@ -208,6 +231,4 @@ def decode_recorder_snapshot(chunk: PrivateChunk) -> RecorderSnapshot:
     except ValidationError as exc:
         raise AuditIntegrityError("audit buffer violates its owned codec") from exc
     snapshot.validate_links_and_cursors()
-    if encode_recorder_snapshot(snapshot).canonical != chunk.canonical:
-        raise AuditIntegrityError("audit buffer omitted or normalized a retained field")
     return snapshot

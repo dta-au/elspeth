@@ -28,6 +28,7 @@ from elspeth.web.composer.continuation_bootstrap import (
     _RECOVERY,
     ContinuationBootstrapValues,
     _canonical_adapter_json,
+    _canonical_records_json,
     bootstrap_values,
     decode_continuation_bootstrap,
     encode_continuation_bootstrap,
@@ -77,6 +78,7 @@ from elspeth.web.sessions.continuation_bootstrap_source import (
     require_pretitle_publication_lineage_on_connection,
 )
 from elspeth.web.sessions.continuation_ingress import _receipt
+from elspeth.web.sessions.continuation_recompose_source import read_recompose_original_on_connection
 from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection, require_private_chunk_closure
 from elspeth.web.sessions.continuation_title_application import (
     CurrentTitleApplicationNames,
@@ -90,7 +92,7 @@ from elspeth.web.sessions.models import composer_continuation_events_table as ev
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from elspeth.web.sessions.models import sessions_table as sessions
 from elspeth.web.sessions.routes._helpers import _initial_composition_state
-from elspeth.web.sessions.schemas import SendMessageRequest
+from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
 
 if TYPE_CHECKING:
     from elspeth.web.composer.service import ComposerServiceImpl
@@ -233,6 +235,43 @@ def _require_original_values(
 
     snapshot = decode_continuation_bootstrap(bootstrap)
     original = bootstrap_values(snapshot)
+    if type(original.request) is RecomposeRequest:
+        source = read_recompose_original_on_connection(conn, running, selected=ready, current=False)
+        service = composer._require_sessions_service()
+        if type(service) is not SessionServiceImpl:
+            raise AuditIntegrityError("Recompose first Compose lost its actual sessions SQL owner")
+        recovery = service._load_graph_recovery_context_on_connection(
+            conn,
+            running.claim.session_id,
+            turn_start_state_id=original.request.state_id,
+            session_operation_context=running.session_operation_context,
+        )
+        initial = _initial_composition_state() if recovery.record is None else state_from_record(recovery.record)
+        if (
+            source.receipt is None
+            or snapshot.logical != selected.stack.logical
+            or snapshot.logical != decode_continuation_snapshot(ready.payload_json).logical
+            or snapshot.actor_user_id != source.actor_user_id
+            or snapshot.request_json != canonical_json(source.request.model_dump(mode="json"))
+            or snapshot.records_json != _canonical_records_json(source.records)
+            or snapshot.original_session_title != source.original_session_title
+            or snapshot.original_last_sequence != source.receipt.original_last_sequence
+            or stable_hash(snapshot.records_json) != source.receipt.transcript_sha256
+            or recovery.context.malformed_head
+            or snapshot.initial_state_json != canonical_json(initial.to_dict())
+            or snapshot.recovery_context_json != _canonical_adapter_json(_RECOVERY, recovery.context)
+            or snapshot.completion_gates_json
+            != (
+                _canonical_adapter_json(_GATES, recovery.effective_completion_gates)
+                if recovery.effective_completion_gates is not None
+                else None
+            )
+            or original.retained_context is None
+            or original.retained_context.availability != "available"
+        ):
+            raise AuditIntegrityError("Recompose first Compose changed its original SQL request/transcript/graph source")
+        require_original_bootstrap_transcript_on_connection(conn, snapshot)
+        return original
     if (
         type(original.request) is not SendMessageRequest
         or original.retained_context is None

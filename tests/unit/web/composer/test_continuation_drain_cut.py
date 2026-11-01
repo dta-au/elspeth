@@ -88,7 +88,13 @@ def test_unknown_title_still_refuses_before_its_structural_premise_exists() -> N
         classify_drain_cut(changed)
 
 
-@pytest.mark.parametrize("cut", sorted(HANDOFF_SAFE_CUTS))
+@pytest.mark.parametrize("cut", ("later-compose", "end-review"))
+def test_current_later_compose_and_end_review_use_same_sequence_handover(cut: str) -> None:
+    stack, _allowance = HANDOFF_SAFE_CUTS[cut]
+    assert classify_drain_cut(_selected(stack)) == "handover"
+
+
+@pytest.mark.parametrize("cut", sorted(set(HANDOFF_SAFE_CUTS) - {"later-compose", "end-review"}))
 def test_a_future_handoff_allowance_does_not_grant_an_unlanded_owner(cut: str) -> None:
     stack, _allowance = HANDOFF_SAFE_CUTS[cut]
     with pytest.raises(AuditIntegrityError, match="handoff-lineage owner"):

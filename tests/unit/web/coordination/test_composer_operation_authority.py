@@ -328,6 +328,36 @@ def test_continuation_history_rejects_independent_sql_identity_and_liveness_subs
         assert conn.execute(select(jobs.c.operation_id)).scalar_one() == operation_id
 
 
+@pytest.mark.asyncio
+async def test_expired_segment_refuses_actual_business_write_at_database_clock(operation_store):
+    from datetime import timedelta
+
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+    from elspeth.web.sessions.time_normalization import restore_utc
+
+    engine, _repository, _authority, service, sid = operation_store
+    context, operation_id = _seed_live_continuation_history(operation_store)
+    assert (await service.update_session_title(sid, "Live segment write", session_operation_context=context)).title == "Live segment write"
+    with engine.begin() as conn:
+        now = database_now(conn)
+        assert restore_utc(conn.execute(select(fences.c.lease_expires_at)).scalar_one()) > now
+        assert (
+            conn.execute(
+                update(segments)
+                .where(segments.c.session_id == str(sid), segments.c.operation_id == operation_id)
+                .values(deadline_at=now - timedelta(seconds=1))
+            ).rowcount
+            == 1
+        )
+    before = _admission_rows(engine)
+    with pytest.raises(ComposerOperationFenceLost):
+        await service.update_session_title(sid, "Expired segment must not write", session_operation_context=context)
+    assert _admission_rows(engine) == before
+    with engine.connect() as conn:
+        assert conn.execute(select(sessions_table.c.title)).scalar_one() == "Live segment write"
+        assert restore_utc(conn.execute(select(fences.c.lease_expires_at)).scalar_one()) > database_now(conn)
+
+
 def test_continuation_history_stop_and_deadline_are_transaction_local_controls(operation_store):
     from datetime import timedelta
 
@@ -1166,9 +1196,10 @@ def test_v2_admission_real_concurrency_has_one_atomic_fresh_winner(operation_sto
 
 
 def test_v2_admission_foreign_seed_refusal_preserves_rows(operation_store):
-    engine, _repository, authority, _service, sid = operation_store
+    engine, _repository, _authority, _service, sid = operation_store
+    authority = _admission_v2_authority(operation_store)
     before = _admission_rows(engine)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="owned server seed"):
         admit(authority, sid, seed=object())
     assert _admission_rows(engine) == before
 
@@ -1410,15 +1441,19 @@ async def test_failure_history_tied_timestamp_cursor_is_stable_and_actor_scoped(
         encode_composer_failure_cursor,
     )
 
-    engine, _repository, authority, _service, sid = operation_store
+    engine, repository, authority, service, sid = operation_store
     with engine.connect() as conn:
         fixed_now = database_now(conn) + timedelta(seconds=1)
     for _ in range(4):
+        # Admit and claim against the real database clock. A future clock at
+        # admission would make the new segment ineligible for the actual claim.
+        _record, running = start(operation_store)
         # Only the terminal writer's clock is pinned, so the four seals tie.
         with monkeypatch.context() as clock:
             clock.setattr("elspeth.web.sessions.service.database_now", lambda _conn: fixed_now)
             clock.setattr("elspeth.web.sessions.continuation.database_now", lambda _conn: fixed_now)
-            await _settled_failure(operation_store)
+            await service.fail_composer_async_operation(running, failure=failed())
+        repository.release(running.session_operation_context)
     all_outcomes, _ = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
     assert {outcome.settled_at for outcome in all_outcomes} == {fixed_now}
     assert [outcome.operation_id for outcome in all_outcomes] == sorted((outcome.operation_id for outcome in all_outcomes), reverse=True)
@@ -1989,7 +2024,8 @@ async def test_new_job_actor_and_base_foreign_keys_have_unmasked_negative_contro
         sid, composition_state_data(), provenance="session_seed", session_operation_context=context
     )
     repository.release(context)
-    parent, _fresh = admit(authority, sid)
+    parent_request = SendMessageRequest(operation_id=str(uuid4()), content="Build", state_id=state.id)
+    parent, _fresh = admit(authority, sid, parent_request)
     with engine.connect() as conn:
         template = dict(conn.execute(select(jobs).where(jobs.c.operation_id == parent.operation_id)).mappings().one())
     for field, invalid in (("actor_user_id", "absent-actor"), ("base_state_id", str(state.id))):
@@ -1999,6 +2035,10 @@ async def test_new_job_actor_and_base_foreign_keys_have_unmasked_negative_contro
         values = dict(template)
         values["session_id"] = str(other.id)
         values[field] = invalid
+        if field == "actor_user_id":
+            # Keep the base FK valid for this opponent so its actor FK is the
+            # one that must refuse; the other opponent uses the foreign base.
+            values["base_state_id"] = None
         request = SendMessageRequest(
             operation_id=parent.operation_id, content="Build", state_id=state.id if field == "base_state_id" else None
         )
@@ -2233,7 +2273,9 @@ async def test_failed_terminal_has_one_exact_immutable_retry(operation_store, mo
     bundles = []
 
     def lose_first_ack(*args, **kwargs):
-        bundles.append((kwargs["outcome"], kwargs["settled_at"]))
+        # The current terminal API derives the timestamp inside its SQL owner;
+        # the retryable caller freezes the selected outcome and authority bit.
+        bundles.append((kwargs["outcome"], kwargs["authoritative_failure"]))
         result = original_settle(*args, **kwargs)
         if len(bundles) == 1:
             raise RuntimeError("failed terminal precommit acknowledgment")
@@ -2242,13 +2284,13 @@ async def test_failed_terminal_has_one_exact_immutable_retry(operation_store, mo
     monkeypatch.setattr(service_module, "settle_composer_operation_on_connection", lose_first_ack)
     terminal = await service.fail_composer_async_operation(running, failure=failed())
     assert terminal.status == "failed" and terminal.failure_code == "worker_lost"
-    assert len(bundles) == 2 and bundles[0] == bundles[1]
-    assert terminal.settled_at == bundles[0][1]
+    assert len(bundles) == 2 and bundles[0] == bundles[1] and bundles[0][1] is True
+    assert terminal.settled_at is not None
     assert authority.get(session_id=sid, operation_id=record.operation_id) == terminal
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ("normal", "retry", "audit_failure", "cancel", "lost_fence"))
+@pytest.mark.parametrize("case", ("normal", "retry", "audit_failure", "cancel", "lost_fence", "distinct_clock"))
 async def test_failed_terminal_private_cause_is_atomic_frozen_and_exactly_correlated(operation_store, monkeypatch, case):
     import json
 
@@ -2279,6 +2321,15 @@ async def test_failed_terminal_private_cause_is_atomic_frozen_and_exactly_correl
         writer_principal="compose_loop",
         session_operation_context=running.session_operation_context,
     )
+    if case == "distinct_clock":
+        from datetime import timedelta
+
+        import elspeth.web.sessions.continuation as continuation_module
+
+        with engine.connect() as conn:
+            recorded_at = database_now(conn)
+        monkeypatch.setattr(service_module, "database_now", lambda _conn: recorded_at)
+        monkeypatch.setattr(continuation_module, "database_now", lambda _conn: recorded_at + timedelta(seconds=1))
     if case == "cancel":
         authority.request_cancel(session_id=sid, operation_id=record.operation_id)
     elif case == "lost_fence":
@@ -2296,7 +2347,7 @@ async def test_failed_terminal_private_cause_is_atomic_frozen_and_exactly_correl
         return result
 
     def settle(*args, **kwargs):
-        settlements.append((kwargs["outcome"], kwargs["settled_at"]))
+        settlements.append((kwargs["outcome"], kwargs["authoritative_failure"]))
         result = actual_settle(*args, **kwargs)
         if case == "retry" and len(settlements) == 1:
             raise RuntimeError("Synthetic acknowledgment failure after diagnostic insert")
@@ -2343,6 +2394,30 @@ async def test_failed_terminal_private_cause_is_atomic_frozen_and_exactly_correl
         assert writes[0][0][0] is writes[1][0][0]
     if case != "lost_fence":
         repository.release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_frozen_recorded_time_cannot_backdate_an_expired_live_fence(operation_store, monkeypatch):
+    from datetime import timedelta
+
+    import elspeth.web.sessions.continuation as continuation_module
+    import elspeth.web.sessions.service as service_module
+    from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
+
+    engine, repository, authority, service, sid = operation_store
+    record, running = start(operation_store)
+    with engine.connect() as conn:
+        recorded_at = database_now(conn)
+    monkeypatch.setattr(service_module, "database_now", lambda _conn: recorded_at)
+    monkeypatch.setattr(continuation_module, "database_now", lambda _conn: recorded_at + timedelta(days=1))
+
+    with pytest.raises(ComposerTerminalSQLCompletionUnknown):
+        await service.fail_composer_async_operation(running, failure=failed())
+
+    terminal = authority.get(session_id=sid, operation_id=record.operation_id)
+    assert terminal.status == "running"
+    assert terminal.settled_at is None
+    repository.release(running.session_operation_context)
 
 
 @pytest.mark.asyncio
@@ -2408,13 +2483,20 @@ async def test_required_ingress_cancellation_retains_actual_sql_until_binding_co
     monkeypatch.setattr(service, "_insert_chat_message", parked_insert)
     task = asyncio.create_task(_ingress(operation_store, running))
     await _wait_for_thread_event(entered)
-    task.cancel()
+    task.cancel("First ingress cancellation")
     await asyncio.sleep(0.05)
     assert not task.done()
-    task.cancel()
+    task.cancel("Second ingress cancellation")
     release.set()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(BaseExceptionGroup, match="Application lifecycle retained original outcomes") as caught:
         await task
+    originals = caught.value.exceptions
+    assert len(originals) == 2
+    assert all(type(original) is asyncio.CancelledError for original in originals)
+    assert [original.args for original in originals] == [
+        ("First ingress cancellation",),
+        ("Second ingress cancellation",),
+    ]
     current = authority.get(session_id=sid, operation_id=record.operation_id)
     assert current.status == "running" and current.user_message_id is not None
     with engine.connect() as conn:
