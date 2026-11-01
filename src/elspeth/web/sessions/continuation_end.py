@@ -25,6 +25,7 @@ from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode
 from elspeth.web.composer.continuation_end_transitions import EndTransition, end_candidate_for, retain_end_transition
 from elspeth.web.composer.continuation_end_values import encode_end_candidate
 from elspeth.web.composer.continuation_initialization import _registered
+from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import composer_quota_scope
@@ -35,7 +36,7 @@ from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, Ret
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_codec import PrivateChunk
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-    from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+    from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, RestoredContinuationRuntime
     from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.composer_app_services import ComposerAppServices
     from elspeth.web.sessions.composer_operations import ComposerOperationRecord
@@ -65,6 +66,7 @@ async def _retain(
     selected: SelectedContinuationState,
     transition: EndTransition,
     candidate: PrivateChunk | None = None,
+    captured: CapturedContinuationRuntime | None = None,
 ) -> SelectedContinuationState:
     runtime = phases.runtime
     if runtime is None or runtime.source.selected is not selected:
@@ -84,6 +86,7 @@ async def _retain(
             inventory=inventory,
             transition=transition,
             candidate=candidate,
+            captured=captured,
         ),
         expected=StoredContinuationSnapshot,
     )
@@ -107,8 +110,8 @@ async def enter_continuation_end(phases: ContinuationLivePhases, selected: Selec
 
 async def review_continuation_end(
     phases: ContinuationLivePhases, services: ComposerAppServices, selected: SelectedContinuationState
-) -> ComposerOperationRecord:
-    """Run the shared terminal gates and publish through the shared owner."""
+) -> ComposerOperationRecord | None:
+    """Run the shared terminal gates; publish, or return the next turn to the provider."""
     top = selected.stack.frames[-1]
     if type(top) is not EndFrame or top.phase != "review_needed":
         raise AuditIntegrityError("END review has no landed owner for this END phase")
@@ -172,7 +175,30 @@ async def review_continuation_end(
     if terminate.advisor_review_state is not None:
         live.advisor_review_state = terminate.advisor_review_state
     if terminate.action != "return":
-        raise AuditIntegrityError("END repair continuation has no landed next-iteration owner")
+        # A repair or flagged review asked the model to keep working. The
+        # next authoring transition is the provider's next PRIMARY call.
+        from elspeth.web.composer.service import _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE
+
+        live.repair_turns_used += terminate.repair_turns_delta
+        live.advisor_checkpoint_passes_used += terminate.advisor_passes_delta
+        if superseded_reply_index is not None:
+            # The gate superseded this reply: never published, kept as audit.
+            await service._completion._persist_withheld_reply(
+                "repair_gate_superseded",
+                superseded_reply,
+                session_id=bindings.session_id,
+                session_operation_context=context,
+            )
+        if terminate.advisor_injection_index is not None:
+            live.advisor_repair_context_introduced = True
+            if _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE:
+                live.pending_advisor_elision_indices.append(terminate.advisor_injection_index)
+                if superseded_reply_index is not None:
+                    live.pending_advisor_elision_indices.append(superseded_reply_index)
+        live.turn_evidence.transcript.observe_messages(live.llm_messages)
+        captured = await capture_continuation_runtime_owners(runtime, selected=current, inventory=runtime.materialization.inventory)
+        await _retain(phases, current, "end_repair_continued", captured=captured)
+        return None
     if superseded_reply_index is not None:
         del live.llm_messages[superseded_reply_index]
     if terminate.result is None:

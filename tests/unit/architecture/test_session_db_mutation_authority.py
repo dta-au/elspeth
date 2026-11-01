@@ -2524,7 +2524,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="2cea0ab45c22d2ef",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=2349,
+        line=2388,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2535,7 +2535,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="b503d2bcd2964b30",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=2403,
+        line=2442,
         connection_escape=False,
     ),
     WriterIdentity(

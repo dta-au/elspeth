@@ -1648,6 +1648,44 @@ def require_composer_operation_mutation_on_connection(conn: Connection, context:
         raise ComposerOperationFenceLost(session_id=UUID(f.session_id), operation_id=bound.operation_id, attempt=bound.attempt)
 
 
+def _proposal_claim_token(conn: Connection, row: Row[Any], context: SessionOperationContext) -> str | None:
+    """The live claim token that owns a proposal-writing composer operation.
+
+    The parent never holds a claim: its owner is the current segment's
+    claim, bound to this exact fence by an unrevoked attempt at the parent's
+    attempt. A revoked or superseded segment owner has no claim here.
+    """
+    fence = context.fence
+    segment = conn.execute(
+        select(segments.c.claim_token, segments.c.state).where(
+            segments.c.session_id == fence.session_id,
+            segments.c.operation_id == row.operation_id,
+            segments.c.sequence == row.current_segment_sequence,
+            segments.c.generation == row.ownership_generation,
+        )
+    ).one_or_none()
+    attempt = conn.execute(
+        select(segment_attempts.c.claim_attempt).where(
+            segment_attempts.c.session_id == fence.session_id,
+            segment_attempts.c.operation_id == row.operation_id,
+            segment_attempts.c.sequence == row.current_segment_sequence,
+            segment_attempts.c.generation == row.ownership_generation,
+            segment_attempts.c.session_operation_id == fence.operation_id,
+            segment_attempts.c.session_operation_epoch == fence.operation_epoch,
+            segment_attempts.c.revoked_at.is_(None),
+        )
+    ).one_or_none()
+    if segment is None or segment.state != "running" or attempt is None or attempt.claim_attempt != row.attempt:
+        return None
+    return _owned_claim_token(segment.claim_token)
+
+
+def _owned_claim_token(value: object) -> str | None:
+    if value is not None and type(value) is not str:
+        raise AuditIntegrityError("composer claim token is not owned text")
+    return value
+
+
 def _proposal_composer_binding(
     conn: Connection,
     context: SessionOperationContext,
@@ -1687,6 +1725,7 @@ def _proposal_composer_binding(
         or lease.released_at is not None
         or restore_utc(lease.lease_expires_at) <= now
         or row.claim_owner_instance_id != lease.owner_instance_id
+        or (claim_token := _proposal_claim_token(conn, row, context)) is None
         or row.attempt < 1
     ):
         raise AuditIntegrityError("proposal composer job/fence authority mismatch")
@@ -1694,6 +1733,7 @@ def _proposal_composer_binding(
         running.session_operation_context != context
         or running.claim.session_id != UUID(fence.session_id)
         or running.claim.operation_id != row.operation_id
+        or running.claim.claim_token != claim_token
         or running.claim.attempt != row.attempt
     ):
         raise AuditIntegrityError("proposal composer claim authority mismatch")

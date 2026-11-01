@@ -36,6 +36,7 @@ from elspeth.web.composer.continuation_codec import (
 from elspeth.web.composer.continuation_end_values import EndContinuationCandidate, decode_end_candidate
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
@@ -55,7 +56,7 @@ from elspeth.web.sessions.models import composer_operation_segments_table as seg
 
 END_EFFECT_OWNER = "composer_end"
 
-type EndTransition = Literal["end_entered", "end_review_dispatched"]
+type EndTransition = Literal["end_entered", "end_review_dispatched", "end_repair_continued"]
 
 
 def end_effect_key(response: PrivateChunkRef) -> str:
@@ -98,8 +99,9 @@ def retain_end_transition(
     inventory: CurrentContinuationEnvInventory,
     transition: EndTransition,
     candidate: PrivateChunk | None = None,
+    captured: CapturedContinuationRuntime | None = None,
 ) -> StoredContinuationSnapshot:
-    if transition not in ("end_entered", "end_review_dispatched"):
+    if transition not in ("end_entered", "end_review_dispatched", "end_repair_continued"):
         raise ValueError("END transition has no implemented source owner")
     if (
         type(authority) is not ComposerAsyncOperationAuthority
@@ -111,6 +113,8 @@ def retain_end_transition(
         raise AuditIntegrityError("END transition lost its actual current source/claim owners")
     if (transition == "end_entered") is (candidate is None):
         raise AuditIntegrityError("only END entry retains a new candidate")
+    if (transition == "end_repair_continued") is (captured is None):
+        raise AuditIntegrityError("only END repair continuation retains captured live owners")
     before = selected.stack
     sid, operation_id = before.logical.session_id, before.logical.operation_id
     with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
@@ -123,12 +127,18 @@ def retain_end_transition(
             raise AuditIntegrityError("END transition replaced its actual selected predecessor")
         if before.pending_owner_results or before.pending_settlement_ids or before.active_action_json is not None:
             raise AuditIntegrityError("END transition requires a quiescent selected cut")
-        if any(item.disposition not in ("committed", "refused") for item in before.effect_frontier):
-            raise AuditIntegrityError("END transition cannot start over an open effect")
         compose = _quiescent_compose(before.frames)
         paid = compose.pending_response
         if paid is None:
             raise AuditIntegrityError("END lost its actual paid PRIMARY response")
+        open_effects = tuple(item for item in before.effect_frontier if item.disposition not in ("committed", "refused"))
+        expected_open = (
+            (EffectFrontierEntry(effect_id=end_effect_key(paid), disposition="dispatched", receipt_id=None),)
+            if transition == "end_repair_continued"
+            else ()
+        )
+        if open_effects != expected_open:
+            raise AuditIntegrityError("END transition found another open effect")
         response = decode_continuation_response(
             read_committed_primary_response_on_connection(conn, running, selected=selected, reference=paid)
         )
@@ -157,6 +167,73 @@ def retain_end_transition(
                 canonical_json({"owner": END_EFFECT_OWNER, "transition": transition, "response": paid.digest}),
             )
             next_action = policy.actions.advisor
+        elif transition == "end_repair_continued":
+            selected_end = before.frames[-1]
+            if captured is None or captured.selected is not selected or type(selected_end) is not EndFrame or len(before.frames) != 2:
+                raise AuditIntegrityError("END repair continuation changed its actual selected capture")
+            captured_compose = captured.stack.frames[0]
+            if (
+                type(captured_compose) is not ComposeFrame
+                or len(captured.stack.frames) != 2
+                or captured.stack.frames[-1] != selected_end
+                or captured.stack.model_copy(update={"frames": before.frames}) != before
+                or captured_compose.pending_response != paid
+                or captured_compose.initial_version != compose.initial_version
+                or captured_compose.slice_sequence != compose.slice_sequence
+                or captured_compose.repair_turns + captured_compose.advisor_checkpoint_passes
+                <= compose.repair_turns + compose.advisor_checkpoint_passes
+            ):
+                raise AuditIntegrityError("END repair continuation must spend a repair or review pass on its own cut")
+            for chunk in captured.chunks:
+                put_chunk(
+                    conn,
+                    session_id=sid,
+                    operation_id=operation_id,
+                    key=private_chunk_key(chunk),
+                    payload=chunk.canonical.encode("utf-8"),
+                    codec=chunk.reference.codec,
+                )
+            following = captured_compose.model_copy(
+                update={"phase": "action_ready", "pending_response": None, "provider_effect_key": None, "provider_input_sha256": None}
+            )
+            receipt = f"repair:{following.iteration.digest}"
+            changed = conn.execute(
+                update(effects)
+                .where(
+                    effects.c.session_id == sid,
+                    effects.c.operation_id == operation_id,
+                    effects.c.effect_key == key,
+                    effects.c.owner == END_EFFECT_OWNER,
+                    effects.c.disposition == "dispatched",
+                    effects.c.creator_sequence == running.claim.segment_sequence,
+                    effects.c.creator_generation == running.claim.ownership_generation,
+                )
+                .values(
+                    disposition="committed",
+                    receipt_key=receipt,
+                    result_chunk_key=f"value:{following.iteration.codec}:{following.iteration.digest}",
+                )
+            )
+            if changed.rowcount != 1:
+                raise AuditIntegrityError("END repair continuation lost its exact dispatched review effect")
+            after = captured.stack.model_copy(
+                update={
+                    "frames": (following,),
+                    "effect_frontier": tuple(
+                        EffectFrontierEntry(effect_id=item.effect_id, disposition="committed", receipt_id=receipt)
+                        if item.effect_id == key
+                        else item
+                        for item in before.effect_frontier
+                    ),
+                }
+            )
+            event = ContinuationEvent(
+                "checkpoint",
+                canonical_json(
+                    {"owner": END_EFFECT_OWNER, "transition": transition, "effect_key": key, "iteration": following.iteration.digest}
+                ),
+            )
+            next_action = policy.actions.primary
         else:
             selected_end = before.frames[-1]
             if (
@@ -218,6 +295,13 @@ def retain_end_transition(
             event_batch=(event,),
             handoff=False,
         )
-        if decode_continuation_snapshot(retained.payload_json).frames[-1] != end:
-            raise AuditIntegrityError("END transition lost its retained frame")
+        if decode_continuation_snapshot(retained.payload_json).frames != after.frames:
+            raise AuditIntegrityError("END transition lost its retained frames")
+        if captured is not None:
+            from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
+            from elspeth.web.composer.continuation_runtime import _selected_chunks
+
+            root = decode_continuation_snapshot(retained.payload_json)
+            current = SelectedContinuationState(retained.checkpoint_id, root, _selected_chunks(root, captured.chunks, ()))
+            read_selected_turn_evidence_graph_on_connection(conn, running, selected=current, names=inventory.names)
         return retained

@@ -179,7 +179,7 @@ class ScriptedSDK:
             assert kwargs["tools"], "every PRIMARY call carries the provider palette"
             content, tool_calls = payload
             return _reply(content, tool_calls)
-        assert role == "end" and kwargs["model"] == self.advisor_model and "response_format" in kwargs
+        assert role in ("end", "early") and kwargs["model"] == self.advisor_model and "response_format" in kwargs
         return ModelResponse(
             model=self.advisor_model,
             choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(payload), "tool_calls": None}}],
@@ -293,3 +293,63 @@ async def test_tool_reply_runs_its_batch_then_a_second_primary_then_publishes(tm
         assert {key for key in effects if key.startswith("provider:")} == {"provider:0:0", "provider:0:1"}
         published = snapshot.result.message.content
         assert published.split("\n\n---\n\n")[0] == words
+
+
+def _early_clean() -> dict:
+    return {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "The draft is coherent.", "note": None}
+
+
+async def _seed_csv_session(app, tmp_path, session_id, trust_mode: str) -> None:
+    (tmp_path / "blobs" / str(session_id)).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "blobs" / str(session_id) / "input.csv").write_text("name\nAda\n", encoding="utf-8")
+    (tmp_path / "outputs" / str(session_id)).mkdir(parents=True, exist_ok=True)
+    await app.state.session_service.update_composer_preferences(session_id, trust_mode=trust_mode, density_default="high", actor="test")
+
+
+@pytest.mark.asyncio
+# auto_commit is blocked by the 1 MiB retained evidence/recorder pair bound
+# (report § 6); it joins this parametrization when that lands.
+@pytest.mark.parametrize("trust_mode", ("explicit_approve",))
+async def test_set_pipeline_proposal_completes_under_each_trust_mode(tmp_path, monkeypatch, trust_mode):
+    """A Continuation set_pipeline authors a proposal (explicit_approve) or a saved state (auto_commit).
+
+    The durable proposal binding must accept a Continuation segment owner.
+    The pipeline is the provider's own tool argument; nothing is server-authored.
+    """
+    from tests.integration.web.composer.test_freeform_pipeline_planner import _pipeline
+
+    app_ref: list = []
+    session_ref: list = []
+
+    def authoring(app):
+        pipeline = _pipeline(tmp_path, str(session_ref[0]))
+        return ("Building the pipeline.", [_tool_call(app, "author_1", "set_pipeline", pipeline)])
+
+    sdk = _LateToolSDK(
+        app_ref,
+        # The EARLY checkpoint reviews an empty -> non-empty saved graph. A
+        # pending proposal saves nothing, so explicit_approve has no EARLY call.
+        [
+            ("primary", authoring),
+            *((("early", _early_clean()),) if trust_mode == "auto_commit" else ()),
+            ("primary", ("The draft was saved.", None)),
+            ("end", _end_admit()),
+        ],
+    )
+    monkeypatch.setattr(litellm, "acompletion", sdk)
+    operation_id = str(uuid4())
+    async with _continuation_app(tmp_path, monkeypatch) as (app, token, session_id):
+        app_ref.append(app)
+        session_ref.append(session_id)
+        await _seed_csv_session(app, tmp_path, session_id, trust_mode)
+        snapshot = await _submit_and_settle(
+            app, token, session_id, message_body("Build a CSV to JSONL pipeline.", operation_id=operation_id)
+        )
+        assert snapshot.status == "completed", snapshot.error
+        expected = ["primary", "early", "primary", "end"] if trust_mode == "auto_commit" else ["primary", "primary", "end"]
+        assert [request["role"] for request in sdk.requests] == expected and not sdk.steps
+        result = snapshot.result
+        if trust_mode == "explicit_approve":
+            assert len(result.proposals) == 1
+        else:
+            assert result.state is not None and not result.proposals
