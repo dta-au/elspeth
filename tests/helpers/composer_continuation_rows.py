@@ -1,6 +1,6 @@
-"""Insert lifecycle-2 Composer operations directly, for route projection tests.
+"""Insert Composer operations directly, for route projection tests.
 
-Rows satisfy the epoch-79 v2 CHECK bundles. Private values carry recognisable
+Rows satisfy the epoch-80 CHECK bundles. Private values carry recognisable
 markers so a test can prove no projection leaks them.
 """
 
@@ -54,7 +54,6 @@ def insert_v2_operation(
             "operation_id": request.operation_id,
             "kind": "compose_message",
             "status": "queued" if state == "queued" else "running" if state == "running" else "failed",
-            "lifecycle_version": 2,
             "phase": {"queued": "queued", "running": "executing", "failed": "settled"}[state],
             "status_revision": status_revision,
             "current_segment_sequence": 1,
@@ -79,7 +78,7 @@ def insert_v2_operation(
                 claim_owner_instance_id="seeded-owner",
             )
         if state == "failed":
-            parent.update(_terminal_values(request_cancelled_error(request_id=None), now=now, settled_by="request_cancel"))
+            parent.update(_terminal_values(request_cancelled_error(request_id=None), now=now, settled_by="owner_terminal"))
             parent["cancel_requested_at"] = now
         conn.execute(insert(jobs).values(**parent))
         segment: dict[str, object] = {
@@ -119,7 +118,7 @@ def settle_v2_operation_failed(engine: Engine, *, session_id: UUID, operation_id
 
     with engine.begin() as conn:
         now = database_now(conn)
-        values = dict(_terminal_values(request_cancelled_error(request_id=None), now=now, settled_by="request_cancel"))
+        values = dict(_terminal_values(request_cancelled_error(request_id=None), now=now, settled_by="owner_terminal"))
         conn.execute(
             update(jobs)
             .where(jobs.c.session_id == str(session_id), jobs.c.operation_id == operation_id)
