@@ -20,7 +20,13 @@ from starlette.applications import Starlette
 
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
-from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_required_sql_finish_once, run_sync_in_worker
+from elspeth.web.async_workers import (
+    AsyncWorkerAdmissionTimeoutError,
+    QueuedClaimRelease,
+    run_claim_release_in_worker,
+    run_required_sql_finish_once,
+    run_sync_in_worker,
+)
 from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
 from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
 from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
@@ -393,7 +399,7 @@ class ComposerAsyncWorker:
             claims = await _owned(run_sync_in_worker(claimer, limit=remaining))
             if self._stopping or self._instance_draining.is_set():
                 for claim in claims:
-                    await _owned(run_sync_in_worker(self._authority.release_claim, claim))
+                    await self._release_unstarted_claim(claim)
                 break
             for claim in claims:
                 key = (claim.session_id, claim.operation_id)
@@ -543,6 +549,12 @@ class ComposerAsyncWorker:
             return True
         return False
 
+    async def _release_unstarted_claim(self, claim: ComposerOperationClaim) -> None:
+        # Process drain refuses ticketless shared-pool work, and an unstarted
+        # claim has no context to hold a drain ticket. Its hand-back is the one
+        # drain-admitted submission (U-37; container-grace note R2).
+        await _owned(run_claim_release_in_worker(QueuedClaimRelease(self._authority.release_claim, claim)))
+
     async def _job(self, claim: ComposerOperationClaim) -> _AdoptionSettlementHandoff | None:
         services = composer_app_services(self._app)
         lock = await services.compose_locks.get_lock(str(claim.session_id))
@@ -658,13 +670,19 @@ class ComposerAsyncWorker:
         next_renewal = time.monotonic() + self._claim_lease_seconds / 3
         try:
             while not acquired:
+                if self._instance_draining.is_set():
+                    # Drain refuses the segment-claim read itself. An unstarted
+                    # segment cannot start under drain, so hand it back; a
+                    # durable Stop marker stays for the next claimer.
+                    await self._release_unstarted_claim(claim)
+                    return
                 current = await _owned(run_sync_in_worker(self._authority.read_segment_claim, claim))
                 if current is None:
                     return
                 draining = self._stopping or self._instance_draining.is_set()
                 expired = self._drain_deadline is not None and self._drain_deadline.remaining_seconds(now=time.monotonic()) <= 0
                 if expired or (draining and current.cancel_requested_at is None):
-                    await _owned(run_sync_in_worker(self._authority.release_claim, claim))
+                    await self._release_unstarted_claim(claim)
                     return
                 try:
                     await asyncio.wait_for(lock.acquire(), timeout=min(0.25, self._claim_lease_seconds / 3))
@@ -747,10 +765,10 @@ class ComposerAsyncWorker:
         except SessionOperationConflictError:
             if running is not None or not known_unstarted:
                 raise
-            await _owned(run_sync_in_worker(self._authority.release_claim, claim))
+            await self._release_unstarted_claim(claim)
         except BaseException:
             if running is None and known_unstarted:
-                await _owned(run_sync_in_worker(self._authority.release_claim, claim))
+                await self._release_unstarted_claim(claim)
             raise
         finally:
             if acquired:

@@ -1116,7 +1116,7 @@ def test_transcript_blob_reader_call_is_under_the_reviewed_source_guard() -> Non
         ("src/elspeth/web/sessions/composer_operation_errors.py", "990f34740742ced097f6199cf174cfe9e3e79a9071ea3d8102d492bcc89ddc19"),
         ("src/elspeth/web/sessions/composer_operations.py", "895edd79e2c73867f8a22d5d5ed44dc325dcb0a3fba3c484b6a1666492474f01"),
         (TURN, "387e76e614f5835265f5940c61f0c96342933fc3ecacdd23843ae7b54b15c3ce"),
-        ("src/elspeth/web/sessions/composer_async_worker.py", "ce8543b819fbcf7e6b613a808724df892bf17a120831941cf9ff83cebf3191ee"),
+        ("src/elspeth/web/sessions/composer_async_worker.py", "353466393d08fe8c5f3b6aa3c412dde363f47554b93f1ef26253618a47db2959"),
     ),
 )
 def test_previous_source_guard_refuses_current_source(path: str, old_digest: str, monkeypatch: pytest.MonkeyPatch) -> None:

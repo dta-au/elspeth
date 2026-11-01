@@ -10,8 +10,9 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from types import MethodType
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final, final
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -34,6 +35,9 @@ from elspeth.web.required_executor import (
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 
+if TYPE_CHECKING:
+    from elspeth.web.sessions.composer_operations import ComposerOperationClaim
+
 #: Threads in the process-wide worker pool.
 MAX_WORKERS: Final[int] = 16
 #: Submissions allowed to sit queued behind busy threads. Together with
@@ -47,6 +51,41 @@ ADMISSION_CAPACITY: Final[int] = MAX_WORKERS + MAX_QUEUED
 #: cannot help and hanging the caller hides the fault.
 ADMISSION_WAIT_SECONDS: Final[float] = 1.0
 _ADMISSION_POLL_SECONDS: Final[float] = 0.02
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class QueuedClaimRelease:
+    """The one drain-time hand-back of an unstarted Composer queue claim.
+
+    Process drain refuses ticketless shared-pool work, but a queued or
+    pre-start claim must still be released on drain (U-37; container-grace
+    note R2). A pre-start claim has no session context or required-work
+    coordinator, so it cannot hold a drain ticket. This capability admits only
+    the bound ``ComposerAsyncOperationAuthority.release_claim`` of one owned
+    claim; generation quarantine still refuses it.
+    """
+
+    release: Callable[[ComposerOperationClaim], None]
+    claim: ComposerOperationClaim
+
+    def __post_init__(self) -> None:
+        from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+        from elspeth.web.sessions.composer_operations import ComposerOperationClaim
+
+        release = self.release
+        # MethodType is final, so isinstance is the exact-type check here.
+        if (
+            not isinstance(release, MethodType)
+            or release.__func__ is not ComposerAsyncOperationAuthority.release_claim
+            or type(release.__self__) is not ComposerAsyncOperationAuthority
+            or type(self.claim) is not ComposerOperationClaim
+        ):
+            raise AuditIntegrityError("Drain-time claim release requires the bound authority release of one owned claim")
+
+    def invoke(self) -> None:
+        self.release(self.claim)
+
 
 _SHARED_EXECUTOR: ThreadPoolExecutor | None = None
 _EXECUTOR_LOCK = threading.Lock()
@@ -115,23 +154,37 @@ def _install_replacement(executor: ThreadPoolExecutor) -> None:
         _SHARED_EXECUTOR = executor
 
 
-def _submission_unavailable(ticket: RequiredWorkTicket | None, finalizer: ApplicationFinalizerCapability | None = None) -> bool:
+def _submission_unavailable(
+    ticket: RequiredWorkTicket | None,
+    finalizer: ApplicationFinalizerCapability | None = None,
+    *,
+    claim_release: QueuedClaimRelease | None = None,
+) -> bool:
     _assert_recovery_registered()
     if finalizer is not None and (_APPLICATION_FINALIZER_OWNER is None or not _APPLICATION_FINALIZER_OWNER.owns_claimed(finalizer)):
         raise AuditIntegrityError("Invalid application finalizer authority")
+    if claim_release is not None and (type(claim_release) is not QueuedClaimRelease or ticket is not None or finalizer is not None):
+        raise AuditIntegrityError("Invalid drain-time claim release authority")
     allowed_finalizer = (
         finalizer is not None and _APPLICATION_FINALIZER_OWNER is not None and _APPLICATION_FINALIZER_OWNER.owns_claimed(finalizer)
     )
     return _GENERATION_UNAVAILABLE.is_set() or (
-        _INSTANCE_DRAINING.is_set() and not allowed_finalizer and (ticket is None or not ticket.permits_process_drain)
+        _INSTANCE_DRAINING.is_set()
+        and not allowed_finalizer
+        and claim_release is None
+        and (ticket is None or not ticket.permits_process_drain)
     )
 
 
 def _generation_for(
-    executor: ThreadPoolExecutor, ticket: RequiredWorkTicket | None = None, finalizer: ApplicationFinalizerCapability | None = None
+    executor: ThreadPoolExecutor,
+    ticket: RequiredWorkTicket | None = None,
+    finalizer: ApplicationFinalizerCapability | None = None,
+    *,
+    claim_release: QueuedClaimRelease | None = None,
 ) -> RequiredExecutorGenerationCustodian:
     global _GENERATION_COUNTER, _GENERATION_CUSTODIAN
-    if _submission_unavailable(ticket, finalizer):
+    if _submission_unavailable(ticket, finalizer, claim_release=claim_release):
         raise RequiredGenerationUnavailable("Shared executor lifecycle unavailable")
     callback = _RECOVERY_CALLBACK
     if callback is None:
@@ -167,7 +220,18 @@ async def _submit_shared[T](
     *,
     deferred_cancellations: list[asyncio.CancelledError] | None = None,
     watch_reader: ComposerOperationWatchReader | None = None,
+    claim_release: QueuedClaimRelease | None = None,
 ) -> ConcurrentFuture[T]:
+    if claim_release is not None and (
+        type(claim_release) is not QueuedClaimRelease
+        or ticket is not None
+        or finalizer is not None
+        or watch_reader is not None
+        or type(callable_) is not MethodType
+        or callable_.__self__ is not claim_release
+        or callable_.__func__ is not QueuedClaimRelease.invoke
+    ):
+        raise AuditIntegrityError("Drain-time claim release dispatch changed its prebound invocation")
     if watch_reader is not None and (
         type(watch_reader) is not ComposerOperationWatchReader
         or ticket is not None
@@ -187,7 +251,11 @@ async def _submit_shared[T](
     loop = asyncio.get_running_loop()
     try:
         executor = _get_shared_executor()
-        generation = _generation_for(executor, ticket, finalizer)
+        generation = (
+            _generation_for(executor, ticket, finalizer)
+            if claim_release is None
+            else _generation_for(executor, claim_release=claim_release)
+        )
         if watch_reader is not None:
             watch_reader.pin_generation(executor, generation)
     except BaseException as pre_submission_failure:
@@ -228,7 +296,7 @@ async def _submit_shared[T](
     future: ConcurrentFuture[T] | None = None
     with generation.submission_lock:
         try:
-            if generation.state != "active" or _submission_unavailable(ticket, finalizer):
+            if generation.state != "active" or _submission_unavailable(ticket, finalizer, claim_release=claim_release):
                 raise RequiredGenerationUnavailable("Shared executor generation quarantined")
             if watch_reader is not None:
                 _assert_current_watch_generation(watch_reader, executor, generation)
@@ -670,6 +738,14 @@ async def run_sync_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwar
     """
     concurrent_future = await _submit_shared(functools.partial(func, *args, **kwargs))
     return await _await_worker_future(concurrent_future, cancel_queued=True)
+
+
+async def run_claim_release_in_worker(release: QueuedClaimRelease) -> None:
+    """Release one unstarted Composer claim on the shared pool, admitted during process drain."""
+    if type(release) is not QueuedClaimRelease:
+        raise AuditIntegrityError("Claim release requires its owned drain-time capability")
+    concurrent_future = await _submit_shared(release.invoke, claim_release=release)
+    await _await_worker_future(concurrent_future, cancel_queued=True)
 
 
 async def run_stream_read_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:

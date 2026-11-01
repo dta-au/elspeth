@@ -14,7 +14,10 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
 from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
-from elspeth.web.sessions.composer_operations import ComposerOperationClaim
+from tests.unit.web.coordination.test_composer_continuation_claim_start import operation_store as _operation_store
+from tests.unit.web.coordination.test_composer_continuation_claim_start import queued
+
+operation_store = _operation_store
 
 
 def test_drain_deadline_is_absolute_and_remaining_time_never_restarts() -> None:
@@ -168,23 +171,46 @@ async def test_unexpected_scan_loop_cancellation_during_drain_still_requests_rec
     await worker.stop()
 
 
+def _real_worker(authority: ComposerAsyncOperationAuthority, monkeypatch: pytest.MonkeyPatch) -> ComposerAsyncWorker:
+    # Production shares one drain event between the worker and the shared
+    # pool; the pool refuses ticketless work once it is set.
+    from elspeth.web import async_workers
+
+    worker = ComposerAsyncWorker(
+        app=Starlette(),
+        authority=authority,
+        concurrency=1,
+        scan_interval_seconds=1.0,
+        claim_lease_seconds=30,
+        drain_seconds=10.0,
+        owner_instance_id="test-owner",
+        process_recovery=Mock(spec=ProcessRecovery),
+        instance_draining=threading.Event(),
+    )
+    monkeypatch.setattr(async_workers, "_INSTANCE_DRAINING", worker._instance_draining)
+    return worker
+
+
 @pytest.mark.asyncio
-async def test_claim_completed_after_drain_is_released_without_starting_a_job(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_claim_completed_after_drain_is_released_without_starting_a_job(operation_store, monkeypatch) -> None:
     from elspeth.web.sessions import composer_async_worker as module
 
-    worker, authority = _worker()
-    claim = ComposerOperationClaim(session_id=uuid4(), operation_id=str(uuid4()), claim_token="claim", attempt=1)
+    authority, record = queued(operation_store)
+    worker = _real_worker(authority, monkeypatch)
+    worker._prefer_segments = True
     entered = asyncio.Event()
     released = asyncio.Event()
+    actual_run_sync_in_worker = module.run_sync_in_worker
 
     async def run_owned(function, *args, **kwargs):
-        if function is authority.release_claim:
-            return function(*args, **kwargs)
-        assert function is authority.claim_next
+        # Hold only the claim in flight across the drain; anything else
+        # takes the actual shared pool and its drain refusal.
+        if function != authority.claim_segment:
+            return await actual_run_sync_in_worker(function, *args, **kwargs)
         assert kwargs == {"limit": 1}
         entered.set()
         await released.wait()
-        return (claim,)
+        return function(**kwargs)
 
     monkeypatch.setattr(module, "run_sync_in_worker", run_owned)
     claiming = asyncio.create_task(worker._claim_once())
@@ -192,8 +218,10 @@ async def test_claim_completed_after_drain_is_released_without_starting_a_job(mo
     worker.begin_drain()
     released.set()
     assert await claiming == 0
-    authority.release_claim.assert_called_once_with(claim)
     assert worker._jobs == {}
+    # The actual release ran: the segment is claimable again at once.
+    (again,) = authority.claim_segment(limit=1)
+    assert again.operation_id == record.operation_id
     await worker.stop()
 
 
@@ -212,3 +240,36 @@ async def test_stop_without_begin_drain_keeps_the_v1_cancellation_path() -> None
     await worker.stop()
     assert task.cancelled()
     assert worker.drain_deadline is None
+
+
+@pytest.mark.asyncio
+async def test_drain_hands_back_a_lock_waiting_v2_segment_claim_through_the_shared_pool(operation_store, monkeypatch) -> None:
+    # The unstarted segment's release must still execute under drain so the
+    # next instance can claim it at once.
+    from types import SimpleNamespace
+
+    from elspeth.web.sessions import composer_async_worker as module
+
+    authority, _record = queued(operation_store)
+    (claim,) = authority.claim_segment(limit=1)
+    assert authority.claim_segment(limit=1) == ()
+    lock = asyncio.Lock()
+
+    class _Locks:
+        async def get_lock(self, _session_id: str) -> asyncio.Lock:
+            return lock
+
+    monkeypatch.setattr(module, "composer_app_services", lambda _app: SimpleNamespace(compose_locks=_Locks()))
+    worker = _real_worker(authority, monkeypatch)
+    await lock.acquire()
+    try:
+        job = asyncio.create_task(worker._job_v2(claim))
+        await asyncio.sleep(0.3)
+        assert not job.done()
+        worker.begin_drain()
+        assert await asyncio.wait_for(job, timeout=5) is None
+    finally:
+        lock.release()
+    (again,) = authority.claim_segment(limit=1)
+    assert (again.operation_id, again.segment_sequence) == (claim.operation_id, claim.segment_sequence)
+    await worker.stop()

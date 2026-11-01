@@ -5902,7 +5902,7 @@ _reserve_CANCEL_ROUTE_SHA256 = "e8e446ebb845e7d006898b3abe6598c0a826d7d30cf8092b
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "68e30e0fcf7031e0d286d159baaa5cfcefb840ebb774022250e1b3b8ffcb3b9d",
     "src/elspeth/web/sessions/composer_turn.py": "b7362a516c6191409e883a188917d7bc8c232985d597f5eb4c18d63c200e4087",
-    "src/elspeth/web/sessions/composer_async_worker.py": "353466393d08fe8c5f3b6aa3c412dde363f47554b93f1ef26253618a47db2959",
+    "src/elspeth/web/sessions/composer_async_worker.py": "49bc69a40fe9139e287f635d874a8b5baf2216e90ba5b891f69132119c2b1f47",
 }
 
 _reserve_CANCEL_TOKEN_OWNER_PATH = "src/elspeth/web/sessions/composer_operations.py"

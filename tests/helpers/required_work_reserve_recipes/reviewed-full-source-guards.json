@@ -1,7 +1,7 @@
 {
   "src/elspeth/web/async_workers.py": {
     "protected_exports": [],
-    "sha256": "8fe8b426e259de0163289bcb3999a0024379ed94f132bfe8de77402144cc62ef"
+    "sha256": "ec47141c54cb9023900a498140b5104efd1416428bfd1f75e751a422f10c7106"
   },
   "src/elspeth/web/composer/transcript_blob_reader.py": {
     "protected_exports": [],
