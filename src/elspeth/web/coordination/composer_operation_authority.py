@@ -507,8 +507,6 @@ class ComposerAsyncOperationAuthority:
         if len(request_json.encode("utf-8")) > COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH:
             raise ValueError("invalid composer request encoded size")
         policy = self._continuation_policy
-        if policy is None:
-            raise ValueError("composer admission has no validated server policy")
         request: SendMessageRequest | RecomposeRequest
         if kind == "compose_message":
             request = SendMessageRequest.model_validate_json(request_json)
@@ -555,6 +553,9 @@ class ComposerAsyncOperationAuthority:
             if type(initial_trust_mode) is not str or initial_trust_mode not in ("auto_commit", "explicit_approve"):
                 raise AuditIntegrityError("continuation admission requires the current owned session trust mode")
             if seed is None:
+                # A replay above needs no policy; only a fresh server seed does.
+                if policy is None:
+                    raise ValueError("composer admission has no validated server policy")
                 seed = prepare_composer_continuation_admission(
                     session_id=session_id,
                     operation_id=operation_id,
@@ -613,7 +614,7 @@ class ComposerAsyncOperationAuthority:
             initial_action = ContinuationActionPolicy.model_validate_json(seed.action_json, strict=True)
             if initial_action != retained_policy.actions.session_sql:
                 raise AuditIntegrityError("initial action differs from the retained complete admission policy")
-            if retained_policy != policy:
+            if policy is not None and retained_policy != policy:
                 raise AuditIntegrityError("fresh server seed substituted another admission policy")
             initial_checkpoint_id = str(uuid4())
             try:
