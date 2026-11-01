@@ -17,23 +17,11 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationError,
     ComposerOperationRecord,
     ComposerOperationRunning,
-    composer_operation_request_hash,
+    composer_operation_admission_request_hash,
     composer_operation_result_hash,
     validate_composer_operation_request_json,
 )
-from elspeth.web.sessions.schemas import (
-    ComposerOperationStatusResponse,
-    ComposerOperationStreamHeartbeatFrame,
-    ComposerOperationStreamProgressFrame,
-    ComposerOperationStreamProgressPayload,
-    ComposerOperationStreamStatusFrame,
-    ComposerOperationStreamStatusPayload,
-    ComposerOperationStreamTerminalFrame,
-    ComposerOperationStreamTerminalPayload,
-    RecomposeRequest,
-    SendMessageRequest,
-    encode_composer_operation_stream_frame,
-)
+from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
 
 SID = UUID("11111111-1111-4111-8111-111111111111")
 OP = "22222222-2222-4222-8222-222222222222"
@@ -47,19 +35,16 @@ def queued_record() -> ComposerOperationRecord:
         operation_id=OP,
         kind="compose_message",
         status="queued",
-        request_hash=composer_operation_request_hash(session_id=SID, kind="compose_message", request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=SID, kind="compose_message", request=request),
         actor_user_id="alice",
         request_id="transport",
         base_state_id=None,
-        deadline_at=NOW + timedelta(seconds=60),
         created_at=NOW,
         updated_at=NOW,
         started_at=None,
         settled_at=None,
         cancel_requested_at=None,
-        claim_token_present=False,
         claim_owner_instance_id=None,
-        claim_expires_at=None,
         attempt=0,
         session_operation_id=None,
         session_operation_epoch=None,
@@ -70,6 +55,14 @@ def queued_record() -> ComposerOperationRecord:
         result_json=None,
         result_sha256=None,
         request_json=request.model_dump_json(),
+        phase="queued",
+        status_revision=0,
+        current_segment_sequence=1,
+        ownership_generation=1,
+        checkpoint_id="33333333-3333-4333-8333-333333333333",
+        journal_cursor=0,
+        ingress_phase="pending",
+        reserved_user_message_id=SID,
     )
 
 
@@ -171,8 +164,6 @@ def test_worst_case_json_escape_and_utf8_bounds() -> None:
         {"attempt": True},
         {"status": "unknown"},
         {"request_hash": "A" * 64},
-        {"claim_token_present": True},
-        {"session_operation_id": "partial"},
         {"settled_at": NOW},
         {"user_message_id": SID},
         {"updated_at": NOW - timedelta(seconds=1)},
@@ -190,8 +181,8 @@ def test_record_running_terminal_digest_and_poll_projection() -> None:
     running = replace(
         queued,
         status="running",
+        phase="executing",
         attempt=1,
-        claim_token_present=True,
         claim_owner_instance_id="worker",
         session_operation_id="session-op",
         session_operation_epoch=1,
@@ -205,8 +196,9 @@ def test_record_running_terminal_digest_and_poll_projection() -> None:
     terminal = replace(
         running,
         status="failed",
+        phase="settled",
         request_json=None,
-        claim_token_present=False,
+        cancel_requested_at=NOW,
         failure_code="request_cancelled",
         settled_by="owner_terminal",
         settled_at=NOW,
@@ -218,7 +210,7 @@ def test_record_running_terminal_digest_and_poll_projection() -> None:
     for changes in (
         {"result_sha256": "a" * 64},
         {"failure_code": "http_error"},
-        {"session_operation_id": None},
+        {"phase": "executing"},
         {"result_schema": "unknown"},
     ):
         with pytest.raises(AuditIntegrityError):
@@ -226,7 +218,7 @@ def test_record_running_terminal_digest_and_poll_projection() -> None:
 
 
 def test_claim_running_custody_refuses_cross_session_and_noncompose() -> None:
-    claim = ComposerOperationClaim(SID, OP, "claim", 1)
+    claim = ComposerOperationClaim(SID, OP, "claim", 1, 1, 1)
     context = SessionOperationContext(SessionOperationFence(str(SID), "fence", "lease", 1), SessionOperationKind.COMPOSE)
     assert ComposerOperationRunning(claim, context).claim == claim
     for foreign in (
@@ -236,79 +228,14 @@ def test_claim_running_custody_refuses_cross_session_and_noncompose() -> None:
         with pytest.raises(ValueError):
             ComposerOperationRunning(claim, foreign)
     with pytest.raises(ValueError):
-        ComposerOperationClaim(SID, OP, "claim", True)
-
-
-def test_status_response_requires_authoritative_terminal_shape() -> None:
-    base = {
-        "operation_id": OP,
-        "kind": "compose_message",
-        "status": "running",
-        "poll_after_ms": 1000,
-        "cancel_requested": False,
-        "deadline_at": NOW,
-        "deadline_remaining_ms": 1000,
-    }
-    assert ComposerOperationStatusResponse(**base).result is None
-    for changes in ({"status": "completed"}, {"status": "failed"}, {"extra": 1}, {"poll_after_ms": "1000"}):
+        ComposerOperationClaim(SID, OP, "claim", True, 1, 1)
+    for segment in ((0, 1), (1, 0), (True, 1)):
         with pytest.raises(ValueError):
-            ComposerOperationStatusResponse(**{**base, **changes})
-
-
-def test_stream_closed_frames_and_safe_progress_exact_lease_binding() -> None:
-    common = {"session_id": str(SID), "operation_id": OP, "sequence": 1}
-    frame = ComposerOperationStreamStatusFrame(
-        **common, payload=ComposerOperationStreamStatusPayload(status="running", cancel_requested=False, deadline_remaining_ms=1000)
-    )
-    assert encode_composer_operation_stream_frame(frame).startswith(b"event: status\ndata: ")
-    assert b"answer" not in encode_composer_operation_stream_frame(
-        ComposerOperationStreamTerminalFrame(**common, payload=ComposerOperationStreamTerminalPayload(status="completed"))
-    )
-    heartbeat = ComposerOperationStreamHeartbeatFrame(**common)
-    assert "payload" not in heartbeat.model_dump()
-    with pytest.raises(ValueError):
-        ComposerOperationStreamHeartbeatFrame(**common, payload={"answer": "secret"})
-    payload = ComposerOperationStreamProgressPayload(
-        session_operation_id="fence",
-        session_operation_epoch=1,
-        request_token="lease",
-        request_id="user-message",
-        phase="calling_model",
-        headline="Working",
-        updated_at=NOW,
-    )
-    progress = ComposerOperationStreamProgressFrame(**common, payload=payload)
-    assert progress.payload.request_id != progress.operation_id
-    for changes in ({"session_operation_epoch": 0}, {"headline": "x" * 181}, {"evidence": ("ok",) * 5}, {"answer": "provider text"}):
-        with pytest.raises(ValueError):
-            ComposerOperationStreamProgressPayload(**{**payload.model_dump(), **changes})
-    with pytest.raises(ValueError):
-        encode_composer_operation_stream_frame(progress.model_copy(update={"operation_id": "wrong"}))
-    # A deliberately corrupted owned instance cannot bypass serialization validation.
-    with pytest.raises(ValueError):
-        encode_composer_operation_stream_frame(
-            progress.model_copy(update={"payload": payload.model_copy(update={"headline": "x" * 70000})})
-        )
+            ComposerOperationClaim(SID, OP, "claim", 1, *segment)
 
 
 def queued_v2_record() -> ComposerOperationRecord:
-    from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
-
-    request = SendMessageRequest(operation_id=OP, content="hello")
-    return replace(
-        queued_record(),
-        deadline_at=None,
-        lifecycle_version=2,
-        phase="queued",
-        status_revision=0,
-        current_segment_sequence=1,
-        ownership_generation=1,
-        checkpoint_id="33333333-3333-4333-8333-333333333333",
-        journal_cursor=0,
-        ingress_phase="pending",
-        reserved_user_message_id=SID,
-        request_hash=composer_operation_admission_request_hash(session_id=SID, kind="compose_message", request=request),
-    )
+    return queued_record()
 
 
 @pytest.mark.parametrize(
@@ -321,39 +248,16 @@ def queued_v2_record() -> ComposerOperationRecord:
         ("running", "retry_waiting"),
     ],
 )
-def test_v2_active_records_have_no_total_deadline_or_parent_claim(status, phase):
+def test_active_records_accept_every_live_phase(status, phase):
     record = replace(queued_v2_record(), status=status, phase=phase)
-    assert record.deadline_at is None and record.lifecycle_version == 2
-    assert not record.claim_token_present
     assert replace(record, request_json=None).request_json is None
     committed = replace(record, ingress_phase="committed", user_message_id=SID)
     assert committed.user_message_id == committed.reserved_user_message_id
-    with pytest.raises(AuditIntegrityError, match="legacy deadline"):
-        _ = record.legacy_deadline_at
-
-
-def test_v1_deadline_and_default_lifecycle_are_preserved():
-    record = queued_record()
-    assert record.lifecycle_version == 1
-    assert record.legacy_deadline_at == record.deadline_at == NOW + timedelta(seconds=60)
-    assert record.phase is None and record.status_revision == record.journal_cursor == 0
-    with pytest.raises(AuditIntegrityError):
-        replace(record, deadline_at=None)
-    for changes in ({"phase": "queued"}, {"checkpoint_id": OP}, {"current_segment_sequence": 1}):
-        with pytest.raises(AuditIntegrityError):
-            replace(record, **changes)
-
-
-@pytest.mark.parametrize("version", [0, 3, True, "2"])
-def test_record_rejects_unknown_or_nonexact_lifecycle(version):
-    with pytest.raises(AuditIntegrityError):
-        replace(queued_record(), lifecycle_version=version)
 
 
 @pytest.mark.parametrize(
     "changes",
     [
-        {"deadline_at": NOW},
         {"session_id": str(SID)},
         {"operation_id": "not-canonical"},
         {"kind": "unknown"},
@@ -381,8 +285,6 @@ def test_record_rejects_unknown_or_nonexact_lifecycle(version):
         {"ingress_phase": "committed", "user_message_id": UUID(OP)},
         {"attempt": True},
         {"attempt": -1},
-        {"claim_token_present": True},
-        {"claim_expires_at": NOW},
         {"phase": None},
         {"phase": "settled"},
         {"settled_at": NOW},
@@ -463,7 +365,6 @@ def test_v2_terminal_receipts_validate_actual_strict_result_and_digest():
         {"result_json": "{}"},
         {"result_sha256": "a" * 64},
         {"result_schema": "unknown"},
-        {"claim_token_present": True},
     ],
 )
 def test_v2_terminal_receipts_refuse_changed_bundles(factory, changes):
@@ -514,8 +415,6 @@ def test_actual_v2_parent_sql_row_decodes_every_continuation_field(tmp_path):
                     actor_user_id="alice",
                     request_id="transport",
                     request_json=request.model_dump_json(),
-                    deadline_at=None,
-                    lifecycle_version=2,
                     phase="continuation_queued",
                     status_revision=7,
                     current_segment_sequence=2,
@@ -532,7 +431,7 @@ def test_actual_v2_parent_sql_row_decodes_every_continuation_field(tmp_path):
             row = connection.execute(select(jobs)).one()
             full = _record_from_row(row, request_json=row.request_json)
             poll = _record_from_row(row)
-        assert full.session_id == session.id and full.lifecycle_version == 2 and full.deadline_at is None
+        assert full.session_id == session.id
         assert (full.phase, full.status_revision, full.current_segment_sequence, full.ownership_generation) == (
             "continuation_queued",
             7,
@@ -560,7 +459,9 @@ def committed_v2_recompose_record(expected_user_message_id=SID):
     )
 
 
-def test_v2_recompose_record_uses_its_separate_lifecycle_hash():
+def test_v2_recompose_record_refuses_the_inner_request_hash():
+    from elspeth.web.sessions.composer_operations import composer_operation_request_hash
+
     request = RecomposeRequest(operation_id=OP, expected_user_message_id=SID)
     record = committed_v2_recompose_record()
     assert record.kind == "compose_recompose"
@@ -629,30 +530,12 @@ def test_v2_optional_owner_fence_projection_refuses_invalid_nominal_values(facto
 def test_v2_optional_owner_fence_projection_allows_absent_and_valid_values(factory, changes):
     record = replace(factory(), **changes)
     assert record.status == factory().status
-    assert record.claim_token_present is False
-    assert record.claim_expires_at is None
     assert replace(record, request_json=None).claim_owner_instance_id == record.claim_owner_instance_id
 
 
-@pytest.mark.parametrize("changes", [{"claim_token_present": 0}, {"base_state_id": str(SID), "request_json": None}])
+@pytest.mark.parametrize("changes", [{"attempt": 0.0}, {"base_state_id": str(SID), "request_json": None}])
 def test_v2_record_owned_projection_fields_remain_nominal(changes):
     with pytest.raises(AuditIntegrityError):
         replace(queued_v2_record(), **changes)
 
 
-def test_v1_status_projection_preserves_deadline_wire_bytes():
-    from elspeth.web.sessions.routes.composer.operations import composer_operation_status_response
-
-    projected = composer_operation_status_response(queued_record(), db_now=NOW, poll_after_ms=1000)
-    assert projected.model_dump_json() == (
-        '{"operation_id":"22222222-2222-4222-8222-222222222222","kind":"compose_message","status":"queued",'
-        '"poll_after_ms":1000,"cancel_requested":false,"deadline_at":"2026-10-06T00:01:00Z",'
-        '"deadline_remaining_ms":60000,"result":null,"error":null}'
-    )
-
-
-def test_v2_record_is_refused_by_legacy_status_projection():
-    from elspeth.web.sessions.routes.composer.operations import composer_operation_status_response
-
-    with pytest.raises(AuditIntegrityError, match="legacy deadline"):
-        composer_operation_status_response(queued_v2_record(), db_now=NOW, poll_after_ms=1000)
