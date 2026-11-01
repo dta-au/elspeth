@@ -53,7 +53,6 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
-from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -694,7 +693,3 @@ def _scrub_composer_route_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-@pytest.fixture(autouse=True)
-def _fenced_compose_for_legacy_tests(monkeypatch):
-    """See tests/helpers/composer_lease.py."""
-    install_fenced_compose_adapter(monkeypatch)

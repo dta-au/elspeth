@@ -135,7 +135,6 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
-from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -1338,9 +1337,3 @@ def inject_IntegrityError_on_chat_messages(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(SessionServiceImpl, "_insert_chat_message", _raise_for_chat_messages)
 
 
-@pytest.fixture(autouse=True)
-def _fenced_compose_for_legacy_tests(monkeypatch):
-    """Legacy compose() / _run_one_turn_for_test callers that name a session but
-    carry no session-operation context acquire an exact, short-lived COMPOSE
-    lease (the shared adapter in tests/helpers/composer_lease.py)."""
-    install_fenced_compose_adapter(monkeypatch)
