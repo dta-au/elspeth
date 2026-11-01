@@ -10,6 +10,7 @@ are the canary that catches the regression.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import tempfile
@@ -685,6 +686,136 @@ async def test_response_json_serialization_failure_is_plugin_crash_not_success()
     assert inv.version_after is None
     assert inv.result_canonical is None
     assert inv.result_hash is None
+
+
+@pytest.mark.asyncio
+async def test_preview_runtime_preflight_cancellation_records_before_reraise(tmp_path: Path) -> None:
+    from elspeth.composer_mcp import server as server_module
+    from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
+    from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    worker: asyncio.Task[object] | None = None
+    calls = 0
+    expected = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+    async def parked_preflight(_state: CompositionState) -> ValidationResult:
+        nonlocal worker, calls
+        worker = asyncio.current_task()
+        assert worker is not None
+        calls += 1
+        entered.set()
+        await release.wait()
+        return expected
+
+    real_preflight = server_module._mcp_preview_runtime_preflight
+    observed: list[tuple[asyncio.CancelledError, int]] = []
+
+    async def observe_preflight(*args, **kwargs):
+        try:
+            return await real_preflight(*args, **kwargs)
+        except asyncio.CancelledError as original:
+            caller = asyncio.current_task()
+            assert caller is not None
+            observed.append((original, caller.cancelling()))
+            raise
+
+    dispatch_calls = []
+
+    def forbidden_dispatch(*args, **kwargs):
+        dispatch_calls.append((args, kwargs))
+        raise AssertionError("preview dispatched before runtime preflight completed")
+
+    probe = _ProbeRecorder()
+    server = create_server(
+        create_catalog_service(),
+        tmp_path,
+        recorder=probe,
+        runtime_preflight=parked_preflight,
+        runtime_preflight_settings_hash="g5-settings",
+        runtime_preflight_coordinator=RuntimePreflightCoordinator(),
+    )
+    request = None
+    with (
+        patch("elspeth.composer_mcp.server._mcp_preview_runtime_preflight", new=observe_preflight),
+        patch("elspeth.composer_mcp.server._dispatch_tool", new=forbidden_dispatch),
+    ):
+        try:
+            request = asyncio.create_task(_call_handler(server.request_handlers, "preview_pipeline", {}))
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+            assert probe.invocations == []
+            assert request.cancel("g5-private-cancellation-message") is True
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await request
+
+            assert len(observed) == 1
+            assert caught.value is observed[0][0]
+            assert caught.value.args == ("g5-private-cancellation-message",)
+            assert request.cancelled()
+            assert request.cancelling() == observed[0][1] == 1
+            assert dispatch_calls == [] and calls == 1
+            assert worker is not None and not worker.done()
+            assert len(probe.invocations) == 1
+            inv = probe.invocations[0]
+            assert inv.tool_name == "preview_pipeline"
+            assert inv.status is ComposerToolStatus.CANCELLED
+            assert inv.error_class == type(caught.value).__name__
+            assert inv.error_message == "cancelled" and inv.error_category is None
+            assert json.loads(inv.arguments_canonical) == {}
+            assert inv.result_canonical is None and inv.result_hash is None
+            assert inv.version_before == 1 and inv.version_after is None
+            assert inv.latency_ms >= 0 and inv.started_at <= inv.finished_at
+            assert "g5-private-cancellation-message" not in json.dumps(inv.to_dict())
+        finally:
+            release.set()
+            if request is not None and not request.done():
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+            if worker is not None:
+                assert await asyncio.wait_for(asyncio.shield(worker), timeout=5.0) is expected
+
+
+@pytest.mark.asyncio
+async def test_preview_runtime_preflight_success_records_actual_result(tmp_path: Path) -> None:
+    from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+
+    calls = 0
+    expected = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+    async def passing_preflight(_state: CompositionState) -> ValidationResult:
+        nonlocal calls
+        calls += 1
+        return expected
+
+    probe = _ProbeRecorder()
+    server = create_server(
+        create_catalog_service(),
+        tmp_path,
+        recorder=probe,
+        runtime_preflight=passing_preflight,
+        runtime_preflight_settings_hash="g5-settings",
+    )
+    response = await _call_handler(server.request_handlers, "preview_pipeline", {})
+
+    assert calls == 1 and len(probe.invocations) == 1
+    assert response.root.isError is not True
+    inv = probe.invocations[0]
+    assert inv.tool_name == "preview_pipeline" and inv.status is ComposerToolStatus.SUCCESS
+    assert inv.error_class is inv.error_message is inv.error_category is None
+    assert inv.result_canonical is not None and inv.result_hash is not None
+    assert json.loads(inv.result_canonical) == json.loads(response.root.content[0].text)
+    assert inv.version_after == inv.version_before == 1
 
 
 @pytest.mark.asyncio
