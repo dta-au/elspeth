@@ -531,6 +531,10 @@ class ComposerAsyncOperationAuthority:
             if old is not None:
                 _binding(old, kind=kind, request_hash=request_hash, actor_user_id=actor_user_id, base_state_id=base_state_id)
                 return _record_from_row(old), False
+            # Authenticated exact replay needs no new policy. Every fresh
+            # admission must bind its seed to this owner's validated policy.
+            if policy is None:
+                raise ValueError("composer admission has no validated server policy")
             original_message_id = check_composer_request_preconditions_on_connection(
                 conn,
                 ComposerOperationPreconditions(session_id, actor_user_id, request_id, base_state_id, kind, request_json),
@@ -553,9 +557,6 @@ class ComposerAsyncOperationAuthority:
             if type(initial_trust_mode) is not str or initial_trust_mode not in ("auto_commit", "explicit_approve"):
                 raise AuditIntegrityError("continuation admission requires the current owned session trust mode")
             if seed is None:
-                # A replay above needs no policy; only a fresh server seed does.
-                if policy is None:
-                    raise ValueError("composer admission has no validated server policy")
                 seed = prepare_composer_continuation_admission(
                     session_id=session_id,
                     operation_id=operation_id,
@@ -614,7 +615,7 @@ class ComposerAsyncOperationAuthority:
             initial_action = ContinuationActionPolicy.model_validate_json(seed.action_json, strict=True)
             if initial_action != retained_policy.actions.session_sql:
                 raise AuditIntegrityError("initial action differs from the retained complete admission policy")
-            if policy is not None and retained_policy != policy:
+            if retained_policy != policy:
                 raise AuditIntegrityError("fresh server seed substituted another admission policy")
             initial_checkpoint_id = str(uuid4())
             try:

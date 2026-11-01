@@ -674,12 +674,26 @@ def test_finish_once_returns_actual_committed_outcome_before_deferred_cancellati
     import asyncio
     from threading import Event
 
+    from elspeth.web.composer.continuation import ComposeFrame
+    from elspeth.web.composer.continuation_prepared_p4 import decode_prepared_p4
     from elspeth.web.required_sql_outcomes import RequiredSQLReturned
     from elspeth.web.sessions import continuation_p4
+    from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4, StoredP4Application
     from tests.unit.web.sessions.test_common_mutation_authority_workers import coordinator_for
+    from tests.unit.web.sessions.test_continuation_owed_evidence import committed_evidence_case
 
     _engine, repository, authority, service, _sid = operation_store
-    running, prepared, commit = selected_p4(operation_store, graph=True)
+    running, selected, _inventory, retained_evidence, commit = asyncio.run(
+        committed_evidence_case(operation_store, graph=True, joint=True, persist_result=False)
+    )
+    assert sum(type(frame) is ComposeFrame for frame in selected.stack.frames) == 1
+    frame = selected.stack.frames[-1]
+    assert type(frame) is ToolBatchFrame and frame.phase == "effect_reconciling"
+    assert (selected.checkpoint_id, selected.stack.cursor) == (commit.expected_checkpoint_id, commit.expected_cursor)
+    (chunk,) = [item for item in selected.chunks if item.reference == frame.accumulator]
+    pending = decode_p4_pending_batch_chunk(chunk, env_ref_names=retained_evidence.env_ref_names)
+    assert pending.batch.p4_input_json is not None
+    prepared = decode_prepared_p4(pending.batch.p4_input_json, env_ref_names=retained_evidence.env_ref_names)
     coordinator, ticket = coordinator_for(running)
     entered, release = Event(), Event()
     original = continuation_p4.retain_p4_result_on_connection
@@ -709,11 +723,12 @@ def test_finish_once_returns_actual_committed_outcome_before_deferred_cancellati
                 private_tool_evidence=members.private_tool_evidence,
                 private_tool_failures=members.private_tool_failures,
                 rejection_records=members.rejection_records,
-                parent_composition_state_id=None,
-                expected_current_state_id=None,
-                plugin_crash_pending=False,
+                parent_composition_state_id=prepared.parent_composition_state_id,
+                expected_current_state_id=prepared.expected_current_state_id,
+                plugin_crash_pending=prepared.crash_pending,
                 continuation=commit,
                 continuation_prepared=prepared,
+                continuation_env_ref_names=retained_evidence.env_ref_names,
                 required_work=ticket,
             )
         )
@@ -733,12 +748,34 @@ def test_finish_once_returns_actual_committed_outcome_before_deferred_cancellati
             patch.setattr(continuation_p4, "retain_p4_result_on_connection", hold_actual)
             result = asyncio.run(drive())
         assert type(result) is RequiredSQLReturned
-        assert result.value is observed[0] and result.value.checkpoint is not None
+        assert type(result.value) is CommittedContinuationP4
+        assert len(observed) == 1 and result.value.audit_outcome is observed[0]
+        assert result.value.audit_outcome.checkpoint is not None
+        assert type(result.value.application) is StoredP4Application
+        assert authority.load_continuation_snapshot(running) == result.value.application.snapshot
+        assert not decode_continuation_snapshot(result.value.application.snapshot.payload_json).pending_owner_results
         assert len(result.deferred_cancellations) == 1
         assert result.deferred_cancellations[0].args == ("after actual SQL, before commit handoff",)
         assert ticket.complete
         coordinator.assert_completed()
-        assert str(recovered(authority, running, commit).receipt.assistant_id) == result.value.assistant_id
+        with _engine.connect() as conn:
+            assistant = conn.execute(
+                select(chat_messages_table).where(
+                    chat_messages_table.c.session_id == str(running.claim.session_id),
+                    chat_messages_table.c.id == result.value.audit_outcome.assistant_id,
+                )
+            ).one()
+            effect = conn.execute(
+                select(composer_continuation_effects_table).where(
+                    composer_continuation_effects_table.c.session_id == str(running.claim.session_id),
+                    composer_continuation_effects_table.c.operation_id == running.claim.operation_id,
+                    composer_continuation_effects_table.c.effect_key == commit.effect_key,
+                )
+            ).one()
+        assert assistant.role == "assistant" and assistant.content == prepared.assistant_content
+        assert effect.disposition == "committed"
+        with pytest.raises(AuditIntegrityError, match="no exact selected pending result"):
+            recovered(authority, running, commit)
     finally:
         release.set()
         repository.release(running.session_operation_context)

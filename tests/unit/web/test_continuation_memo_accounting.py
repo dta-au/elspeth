@@ -5590,6 +5590,7 @@ def _structure_actual_context(engine, *, continuation=True):
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
     from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
     from tests.fixtures.identities import ensure_test_identity
+    from tests.helpers.continuation_policy import minimal_continuation_policy
     from tests.unit.web.sessions.test_continuation_cold_restore import admit_continuation, start_continuation
 
     with engine.begin() as conn:
@@ -5603,7 +5604,9 @@ def _structure_actual_context(engine, *, continuation=True):
             session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
         )
         return repository, context
-    authority = ComposerAsyncOperationAuthority(engine, owner_instance_id="test-owner", claim_lease_seconds=30)
+    authority = ComposerAsyncOperationAuthority(
+        engine, owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=minimal_continuation_policy()
+    )
     admit_continuation((engine, repository, authority, None, session.id))
     return repository, start_continuation(repository, authority).session_operation_context
 
@@ -8006,7 +8009,8 @@ async def test_structure_dml_original_append_preserves_full_publication_and_revi
             )
         # Independent native driver observations derive from the five original
         # writes: event chunk/event, complete snapshot chunk/checkpoint, head CAS.
-        assert native == [("chunk", 7), ("event", 6), ("chunk", 7), ("checkpoint", 8), ("head", 9)]
+        # The single-lifecycle head CAS has no retired lifecycle-version bind.
+        assert native == [("chunk", 7), ("event", 6), ("chunk", 7), ("checkpoint", 8), ("head", 8)]
         return published.cursor
 
     try:
@@ -8016,7 +8020,7 @@ async def test_structure_dml_original_append_preserves_full_publication_and_revi
         assert result == selected.cursor + 1
         rows = _closed_dml_rows(snapshot)
         assert tuple(row.sql.kind for row in rows) == ("insert", "insert", "insert", "insert", "update")
-        assert tuple(row.sql.bind_arities for row in rows) == ((7,), (6,), (7,), (8,), (9,))
+        assert tuple(row.sql.bind_arities for row in rows) == ((7,), (6,), (7,), (8,), (8,))
         assert all(row.outcome == "returned" and not row.sql.executemany for row in rows)
     finally:
         repository.release(context)

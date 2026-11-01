@@ -12,9 +12,11 @@ from fastapi import HTTPException
 from sqlalchemy import event, func, select
 from sqlalchemy.exc import OperationalError
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.continuation_policy import minimal_continuation_policy
 from tests.unit.web.coordination import test_composer_operation_authority as operation_authority_tests
 from tests.unit.web.coordination.test_composer_operation_authority import admit
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.coordination.composer_operation_authority import admit_composer_operation
 from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission, ComposerQuotaExceeded, RepositoryRateLimitAuthority
 from elspeth.web.middleware.rate_limit import SharedRateLimiter
@@ -54,13 +56,22 @@ def another_session(repository, *, actor="alice"):
 
 @pytest.mark.parametrize("limit", [1, 2])
 @pytest.mark.parametrize("kind", ["message", "recompose"])
-def test_overlapping_same_id_commits_one_job_and_one_charge(operation_store, monkeypatch, limit, kind):
-    engine, _repo, authority, _service, sid = operation_store
-    request = (
-        SendMessageRequest(operation_id=str(uuid4()), content="One immutable action")
-        if kind == "message"
-        else RecomposeRequest(operation_id=str(uuid4()), expected_user_message_id=uuid4())
-    )
+@pytest.mark.asyncio
+async def test_overlapping_same_id_commits_one_job_and_one_charge(operation_store, monkeypatch, limit, kind):
+    engine, repository, authority, service, sid = operation_store
+    if kind == "message":
+        request = SendMessageRequest(operation_id=str(uuid4()), content="One immutable action")
+    else:
+        context = repository.acquire(
+            session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+        )
+        try:
+            original = await service.add_message(
+                sid, "user", "One immutable action", writer_principal="route_user_message", session_operation_context=context
+            )
+        finally:
+            repository.release(context)
+        request = RecomposeRequest(operation_id=str(uuid4()), expected_user_message_id=original.id)
     admission = quota(engine, limit)
     entered, release, contender = threading.Event(), threading.Event(), threading.Event()
     actual = RepositoryRateLimitAuthority.admit_on_connection
@@ -370,8 +381,11 @@ def test_reopened_engine_preserves_budget_and_replays_existing_action(operation_
         successor = ComposerAsyncOperationAuthority(reopened, owner_instance_id="test-owner", claim_lease_seconds=30)
         admission = quota(reopened)
         assert admit(successor, sid, request, quota=admission) == (row, False)
+        admitting_successor = ComposerAsyncOperationAuthority(
+            reopened, owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=minimal_continuation_policy()
+        )
         with pytest.raises(ComposerQuotaExceeded):
-            admit(successor, sibling, quota=admission)
+            admit(admitting_successor, sibling, quota=admission)
         assert counts(reopened) == (1, 1)
     finally:
         reopened.dispose()
@@ -381,7 +395,9 @@ def _process_submit(database_url, session_id, operation_id, limit):
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 
     engine = create_session_engine(database_url)
-    authority = ComposerAsyncOperationAuthority(engine, owner_instance_id="test-owner", claim_lease_seconds=30)
+    authority = ComposerAsyncOperationAuthority(
+        engine, owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=minimal_continuation_policy()
+    )
     try:
         request = SendMessageRequest(operation_id=operation_id, content="Independent engines")
         try:

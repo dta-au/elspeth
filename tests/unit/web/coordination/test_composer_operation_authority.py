@@ -810,12 +810,15 @@ def test_v2_admission_policy_constructor_is_nominal(operation_store, value):
         ComposerAsyncOperationAuthority(engine, owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=value)
 
 
-def test_v2_admission_missing_server_policy_refuses_without_mutation(operation_store):
+@pytest.mark.parametrize("supplied_seed", [False, True], ids=["generated-seed", "supplied-seed"])
+def test_v2_admission_missing_server_policy_refuses_without_mutation(operation_store, supplied_seed):
     engine, _repository, _authority, _service, sid = operation_store
     authority = ComposerAsyncOperationAuthority(engine, owner_instance_id="test-owner", claim_lease_seconds=30)
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Fresh admission requires current policy")
+    seed = _admission_seed(sid, request) if supplied_seed else None
     before = _admission_rows(engine)
     with pytest.raises(ValueError, match="no validated server policy"):
-        admit(authority, sid)
+        admit(authority, sid, request, seed=seed)
     assert _admission_rows(engine) == before
 
 
