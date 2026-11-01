@@ -284,9 +284,7 @@ class ContinuationLivePhases:
 
             def refresh_action_ready() -> RestoredContinuationRuntime:
                 with retention_stage_memo_scope() as memo:
-                    source = self.authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
                     fresh = self.authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
-                    _require_runtime_source_refresh(source, fresh)
                     action_runtime.materialization.advance_current_from_source(selected, inventory, fresh)
                     following = replace(action_runtime, source=fresh)
                     # Preserve the actual new bindings before bridge delivery
@@ -312,10 +310,20 @@ class ContinuationLivePhases:
                 runtime = self.runtime
 
                 def refresh() -> RestoredContinuationRuntime:
-                    fresh = read_source()
-                    _require_runtime_source_refresh(source, fresh)
-                    runtime.materialization.advance_current(selected, inventory)
-                    following = replace(runtime, source=fresh)
+                    if finish_read is None:
+                        # The registered current-source read already admitted
+                        # these producer inputs from this exact selected SQL
+                        # cohort. No second source or producer SQL proof is
+                        # needed before binding the same immutable DATA.
+                        runtime.materialization.advance_current_from_source(selected, inventory, source)
+                        following = replace(runtime, source=source)
+                    else:
+                        # Owed Stop must retain its separate completed-prefix
+                        # read and producer path, never adopt ordinary DATA.
+                        fresh = read_source()
+                        _require_runtime_source_refresh(source, fresh)
+                        runtime.materialization.advance_current(selected, inventory)
+                        following = replace(runtime, source=fresh)
                     # Retain the actual fresh source before the async SQL bridge can
                     # defer cancellation. No live messages/graph objects are rebuilt.
                     self.runtime = following
@@ -388,7 +396,7 @@ class ContinuationLivePhases:
         frame = selected.stack.frames[-1]
         if type(frame) is not ComposeFrame or frame.pending_response != result.response.reference:
             raise AuditIntegrityError("batch initialization changed its exact original paid response")
-        if await self._initialize_control(selected, result):
+        if await self._initialize_control(phase_read, result):
             return
         self.service._enforce_tool_call_cap(
             assistant_tool_calls=result.outcome.completion.tool_batch.calls,
@@ -423,12 +431,15 @@ class ContinuationLivePhases:
         following = CapturedContinuationRuntime(selected, root, _selected_chunks(root, captured.chunks, (chunk,)))
         await self._retain(following, inventory, "batch_initialized")
 
-    async def _initialize_control(
-        self, selected: SelectedContinuationState, result: PrimaryProviderResult | RetainedPrimaryPhaseData
-    ) -> bool:
+    async def _initialize_control(self, phase_read: _CurrentPhaseRead, result: PrimaryProviderResult | RetainedPrimaryPhaseData) -> bool:
         """Classify the complete paid batch before any ordinary sibling effect."""
         from elspeth.web.composer.continuation_message_family_builders import native_assistant_message
 
+        if type(phase_read) is not _CurrentPhaseRead:
+            raise AuditIntegrityError("control initialization lost its actual paid phase read")
+        selected, runtime, inventory = phase_read.selected, phase_read.runtime, phase_read.inventory
+        if runtime is not self.runtime or runtime.source.selected is not selected or phase_read.finish_read is not None:
+            raise AuditIntegrityError("control initialization lost its actual paid phase read")
         try:
             request = parse_continuation_control_batch(result.outcome.completion.tool_batch)
         except ContinuationControlRefused:
@@ -436,7 +447,9 @@ class ContinuationLivePhases:
         else:
             if request is None:
                 return False
-        runtime, inventory = await self.current(selected)
+        # The enclosing batch initializer already proved this exact selected
+        # source. Intent and result writers recheck currentness under their own
+        # SQL transactions; a second DATA read here cannot grant effect custody.
         intent: StoredContinuationControlIntent | None = None
         if request is not None:
             intent = await _registered(

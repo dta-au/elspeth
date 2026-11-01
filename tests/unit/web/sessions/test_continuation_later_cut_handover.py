@@ -7,8 +7,10 @@ phase commits and force one action-fit yield at the selected actual cut.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
+import httpx
 import pytest
 from litellm import ModelResponse
 from sqlalchemy import select
@@ -16,21 +18,52 @@ from sqlalchemy import select
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import ComposeFrame, EndFrame
 from elspeth.web.composer.continuation_clock import SegmentFit
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_handoff import classify_drain_cut
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.coordination.contracts import SessionOperationLeaseDisposition
+from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
+from elspeth.web.required_work import RequiredWorkSource, required_failure_leaves
+from elspeth.web.sessions import continuation as continuation_store
 from elspeth.web.sessions import continuation_driver as driver_module
-from elspeth.web.sessions.continuation_driver import ContinuationSegmentHandedOver
+from elspeth.web.sessions.continuation_driver import ContinuationSegmentHandedOver, ContinuationSegmentSettled
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+from elspeth.web.sessions.models import session_operation_fences_table as fences
 from tests.helpers.composer_operations import message_body
 from tests.helpers.continuation_app import ScriptedSDK, continuation_app, effects, end_admit, install_sdk, submit_and_settle
 from tests.unit.web.composer.test_continuation_cut_coverage import HANDOFF_SAFE_CUTS, _selected
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cut", ("later-compose", "end-review"))
-async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work(tmp_path, monkeypatch, cut):
+@asynccontextmanager
+async def _later_cut_app(tmp_path, monkeypatch, *, expect_unknown):
+    if not expect_unknown:
+        async with continuation_app(tmp_path, monkeypatch) as harness:
+            yield harness
+        return
+    lifetime = continuation_app(tmp_path, monkeypatch)
+    harness = await lifetime.__aenter__()
+    try:
+        yield harness
+    finally:
+        # Body assertions remain outside this exact negative lifecycle
+        # expectation; another teardown failure still escapes unchanged.
+        with pytest.raises(AuditIntegrityError, match="Composer worker still owns unfinished shutdown work"):
+            await lifetime.__aexit__(None, None, None)
+
+
+async def _admit_only(harness, body):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=harness.app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {harness.token}"},
+    ) as client:
+        accepted = await client.post(f"/api/sessions/{harness.session_id}/messages", json=body)
+        assert accepted.status_code == 202, accepted.text
+
+
+async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fit"):
     words = "The provider completed the request after a same-sequence handover."
     # A real END publication refusal requests a prose-only correction, whose
     # committed repair transition produces the next Compose action_ready.
@@ -65,6 +98,11 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
     old_runtimes = []
     old_effects = []
     outcomes = []
+    owner_jobs = []
+    suspend_attempts, committed, verified, readbacks, immutable_verified, released = [], [], [], [], [], []
+    read_receipts = []
+    original = RuntimeError("controlled actual later-cut suspend failure")
+    rolled_back = False
     phase_trace = []
     disposition_finished = asyncio.Event()
     force_handover = False
@@ -153,11 +191,13 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
                 old_runtimes.append(driver.phases.runtime)
                 old_effects.extend(effects(harness.app, operation_id))
                 force_handover = True
+                if mode == "drain":
+                    harness.app.state.composer_drain_signal.request()
         return result
 
     def refuse_one_fit(*args, **kwargs):
         nonlocal forced
-        if force_handover and not forced:
+        if mode != "drain" and force_handover and not forced:
             forced = True
             return SegmentFit.YIELD
         return actual_fit(*args, **kwargs)
@@ -165,6 +205,12 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
     async def observe_dispose(driver, original=None):
         if driver.running.claim.operation_id == operation_id:
             phase_trace.append(("dispose", driver.running.claim.ownership_generation, failure_trace(original)))
+            key = (driver.running.claim.session_id, operation_id)
+            job = driver.worker._jobs[key]
+            assert job is asyncio.current_task()
+            owner_jobs.append(job)
+            if mode == "drain":
+                assert driver.worker.drain_deadline is not None
         try:
             outcome = await actual_dispose(driver, original)
         except BaseException as failure:
@@ -177,28 +223,102 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
             disposition_finished.set()
         return outcome
 
-    async def observe_settle(driver, record, original=None):
+    async def observe_settle(driver, record, original=None, **kwargs):
         if driver.running.claim.operation_id == operation_id:
             phase_trace.append(("settle", driver.running.claim.ownership_generation, failure_trace(original)))
-        return await actual_settle(driver, record, original)
+        return await actual_settle(driver, record, original, **kwargs)
 
     monkeypatch.setattr(driver_module._SegmentDriver, "advance", observe_advance)
     monkeypatch.setattr(driver_module._SegmentDriver, "__init__", observe_init)
     monkeypatch.setattr(driver_module._SegmentDriver, "dispose", observe_dispose)
     monkeypatch.setattr(driver_module._SegmentDriver, "settle", observe_settle)
     monkeypatch.setattr(driver_module, "admit_action", refuse_one_fit)
-    async with continuation_app(tmp_path, monkeypatch) as harness:
+    async with _later_cut_app(tmp_path, monkeypatch, expect_unknown=mode == "rollback-before-release") as harness:
         sdk.app_ref.append(harness.app)
-        settling = asyncio.create_task(submit_and_settle(harness, message_body("Explain the current pipeline.", operation_id=operation_id)))
+        repository = harness.app.state.session_service.session_operation_authority
+        repository_type = type(repository)
+        actual_suspend = repository_type.suspend_composer_segment
+        actual_verify = repository_type.verify_recovery
+        actual_readback = repository_type.read_suspend_outcome
+        actual_immutable_verify = continuation_store.verify_recovery_on_connection
+        actual_release = repository_type.release
+        actual_recover = continuation_store.recover_segment_on_connection
+
+        def suspend(owner, running, **kwargs):
+            if running.claim.operation_id != operation_id:
+                return actual_suspend(owner, running, **kwargs)
+            suspend_attempts.append(running)
+            if mode == "stop-before-suspend":
+                stopped = harness.app.state.composer_async_operation_authority.request_cancel(
+                    session_id=running.claim.session_id, operation_id=operation_id
+                )
+                assert stopped is not None and stopped.cancel_requested_at is not None
+            receipt = actual_suspend(owner, running, **kwargs)
+            committed.append(receipt)
+            if mode == "ambiguous-after-commit":
+                raise original
+            return receipt
+
+        def recover(conn, **kwargs):
+            nonlocal rolled_back
+            receipt = actual_recover(conn, **kwargs)
+            if mode == "rollback-before-release" and kwargs["operation_id"] == operation_id and not rolled_back:
+                rolled_back = True
+                # This raises inside the real repository transaction after
+                # its recovery writes, so those writes actually roll back.
+                # The real drain also stops this process from subsequently
+                # claiming unrelated recovery work while rollback is checked.
+                harness.app.state.composer_drain_signal.request()
+                raise original
+            return receipt
+
+        def verify(owner, receipt, **kwargs):
+            result = actual_verify(owner, receipt, **kwargs)
+            if receipt.operation_id == operation_id:
+                verified.append(receipt)
+            return result
+
+        def readback(owner, observation, **kwargs):
+            if observation.running.claim.operation_id == operation_id:
+                readbacks.append(observation)
+            receipt = actual_readback(owner, observation, **kwargs)
+            if observation.running.claim.operation_id == operation_id:
+                read_receipts.append(receipt)
+            return receipt
+
+        def immutable_verify(conn, receipt):
+            result = actual_immutable_verify(conn, receipt)
+            if receipt.operation_id == operation_id:
+                immutable_verified.append(receipt)
+            return result
+
+        def release(owner, context, **kwargs):
+            released.append(context)
+            return actual_release(owner, context, **kwargs)
+
+        monkeypatch.setattr(repository_type, "suspend_composer_segment", suspend)
+        monkeypatch.setattr(repository_type, "verify_recovery", verify)
+        monkeypatch.setattr(repository_type, "read_suspend_outcome", readback)
+        monkeypatch.setattr(repository_type, "release", release)
+        monkeypatch.setattr(continuation_store, "recover_segment_on_connection", recover)
+        monkeypatch.setattr(continuation_store, "verify_recovery_on_connection", immutable_verify)
+        body = message_body("Explain the current pipeline.", operation_id=operation_id)
+        admission_only = mode in ("drain", "rollback-before-release")
+        settling = asyncio.create_task(_admit_only(harness, body) if admission_only else submit_and_settle(harness, body))
         disposed = asyncio.create_task(disposition_finished.wait())
         try:
             # Test-only failure guard uses the existing canonical app's
             # configured duration; it grants no lease or production budget.
             try:
-                await asyncio.wait_for(
-                    asyncio.wait((settling, disposed), return_when=asyncio.FIRST_COMPLETED),
-                    timeout=harness.app.state.settings.composer_timeout_seconds,
-                )
+                async with asyncio.timeout(harness.app.state.settings.composer_timeout_seconds):
+                    if admission_only:
+                        await asyncio.shield(settling)
+                        # A process drain deliberately withdraws HTTP executor
+                        # admission. Its public poller is not the producer's
+                        # completion oracle; wait for the actual dispose owner.
+                        await asyncio.shield(disposed)
+                    else:
+                        await asyncio.wait((settling, disposed), return_when=asyncio.FIRST_COMPLETED)
             except TimeoutError as timeout:
                 if cut == "later-compose":
                     raise TimeoutError(
@@ -206,11 +326,143 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
                     ) from timeout
                 raise
             assert selected_before, "the actual live owner did not produce the requested later cut"
-            assert forced and outcomes, "the actual worker did not attempt disposition at that cut"
+            assert outcomes and (forced if mode != "drain" else not forced), "the actual worker did not attempt the required disposition"
+            assert len(suspend_attempts) == 1
+            expected_before = ["primary", "end"] if cut == "later-compose" else ["primary"]
+            old_context = old_phases[0].lease.context
+            if mode in ("stop-before-suspend", "rollback-before-release"):
+                assert committed == [] and verified == []
+                assert read_receipts == [] and immutable_verified == []
+                if mode == "stop-before-suspend":
+                    assert type(outcomes[0]) is ContinuationSegmentSettled
+                    terminal = await settling
+                    assert terminal.status == "failed" and terminal.error is not None
+                    assert terminal.error.failure_code == "request_cancelled"
+                    assert sum(context is old_context for context in released) == 1
+                else:
+                    assert rolled_back and isinstance(outcomes[0], BaseException)
+                    assert len(owner_jobs) == 1
+                    job = owner_jobs[0]
+                    try:
+                        # Bound only the test's join; shielding preserves the
+                        # actual owner if cleanup cannot complete in this slice.
+                        await asyncio.wait_for(asyncio.shield(job), timeout=harness.app.state.settings.composer_timeout_seconds)
+                    except BaseException as owner_failure:
+                        leaves = required_failure_leaves(owner_failure)
+                        if not leaves or any(leaf is not original for leaf in leaves):
+                            raise
+                    assert job.done() and not job.cancelled()
+                    handoff = tuple(
+                        ticket
+                        for ticket in old_phases[0].work.coordinator.tickets
+                        if ticket.key.source is RequiredWorkSource.CONTINUATION_HANDOFF_SQL
+                    )
+                    assert len(handoff) == 1
+                    actual = handoff[0]._finish_once_handoff
+                    assert type(actual) is RequiredSQLRaised and actual.error is original
+                    old_phases[0].work.coordinator.assert_completed()
+                with harness.app.state.session_engine.connect() as conn:
+                    assert (
+                        conn.execute(select(events).where(events.c.operation_id == operation_id, events.c.tag == "recovered")).all() == []
+                    )
+                    assert conn.execute(
+                        select(segments.c.sequence, segments.c.generation).where(segments.c.operation_id == operation_id)
+                    ).all() == [(1, 1)]
+                    if mode == "rollback-before-release":
+                        (attempt,) = conn.execute(select(attempts).where(attempts.c.operation_id == operation_id)).all()
+                        assert attempt.sequence == 1 and attempt.generation == 1
+                        assert attempt.revoked_at is None and attempt.outcome is None
+                        assert (attempt.session_operation_id, attempt.session_operation_epoch) == (
+                            old_context.fence.operation_id,
+                            old_context.fence.operation_epoch,
+                        )
+                        fence = conn.execute(select(fences).where(fences.c.session_id == str(harness.session_id))).one()
+                        assert (fence.operation_id, fence.operation_epoch) == (
+                            old_context.fence.operation_id,
+                            old_context.fence.operation_epoch,
+                        )
+                        # The actual rollback is known to this injected SQL
+                        # body, but its generic raised result is no production
+                        # no-commit capability. Assert conservative retention,
+                        # including the worker adoption, rather than clean exit.
+                        lease = old_phases[0].lease
+                        assert lease.disposition is SessionOperationLeaseDisposition.UNKNOWN
+                        assert not lease.continuation_finished
+                        assert fence.released_at is None
+                        assert sum(context is old_context for context in released) == 0
+                        key = (harness.session_id, operation_id)
+                        adoption = harness.app.state.composer_async_worker._continuation_adoptions[key]
+                        assert adoption.lease is lease
+                assert sdk.roles == expected_before
+                final_effects = {row.effect_key: row for row in effects(harness.app, operation_id)}
+                assert final_effects == {row.effect_key: row for row in old_effects}
+                return
             handover = outcomes[0]
             assert type(handover) is ContinuationSegmentHandedOver, handover
             assert (handover.receipt.sequence, handover.receipt.previous_generation, handover.receipt.generation) == (1, 1, 2)
             assert handover.receipt.released_context is not None
+            assert len(committed) == 1 and committed[0] == handover.receipt
+            assert len(immutable_verified) == 1 and immutable_verified[0] is committed[0]
+            if mode == "ambiguous-after-commit":
+                # Raised-after-commit uses the actual candidate readback,
+                # whose immutable verification does not call verify_recovery.
+                assert verified == [] and len(readbacks) == len(read_receipts) == 1
+                observation, read_receipt = readbacks[0], read_receipts[0]
+                assert observation.running is suspend_attempts[0]
+                assert observation.running.claim is old_claims[0]
+                assert observation.running.session_operation_context is old_context
+                assert observation.candidate is read_receipt is committed[0] is handover.receipt
+                assert handover.receipt.released_context is old_context
+            else:
+                assert len(verified) == 1 and verified[0] is committed[0]
+                assert readbacks == read_receipts == []
+            assert sum(context is old_context for context in released) == 0
+            if mode == "drain":
+                assert len(owner_jobs) == 1
+                job = owner_jobs[0]
+                # Join the actual disposing owner; run_until_idle would start
+                # new reaper/claim work on the deliberately drained executor.
+                await asyncio.wait_for(asyncio.shield(job), timeout=harness.app.state.settings.composer_timeout_seconds)
+                assert job.done() and not job.cancelled()
+                worker = harness.app.state.composer_async_worker
+                key = (harness.session_id, operation_id)
+                assert key not in worker._jobs
+                assert key not in worker._continuation_adoptions and key not in worker._continuation_starts
+                assert old_phases[0].lease.continuation_finished
+                old_phases[0].work.coordinator.assert_completed()
+                with harness.app.state.session_engine.connect() as conn:
+                    retained = continuation_store.load_snapshot(conn, session_id=str(harness.session_id), operation_id=operation_id)
+                    after = decode_continuation_snapshot(retained.payload_json)
+                    assert conn.execute(
+                        select(segments.c.sequence, segments.c.generation, segments.c.state).where(segments.c.operation_id == operation_id)
+                    ).all() == [(1, 2, "interrupted")]
+                    (recovered,) = conn.execute(
+                        select(events).where(events.c.operation_id == operation_id, events.c.tag == "recovered")
+                    ).all()
+                    assert recovered.sequence == handover.receipt.cursor
+                before = selected_before[0].stack
+                assert after.frames == before.frames and after.effect_frontier == before.effect_frontier
+                assert after.semantic_frontier == before.semantic_frontier
+                assert sdk.roles == expected_before and resumed_cold == []
+                assert {row.effect_key: row for row in effects(harness.app, operation_id)} == {row.effect_key: row for row in old_effects}
+                return
+            if mode == "ambiguous-after-commit":
+                handoff = tuple(
+                    ticket
+                    for ticket in old_phases[0].work.coordinator.tickets
+                    if ticket.key.source is RequiredWorkSource.CONTINUATION_HANDOFF_SQL
+                )
+                assert len(handoff) == 1
+                actual = handoff[0]._finish_once_handoff
+                assert type(actual) is RequiredSQLRaised and actual.error is original
+                read_work = tuple(
+                    ticket
+                    for ticket in old_phases[0].work.coordinator.tickets
+                    if ticket.key.source is RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL
+                )
+                assert len(read_work) == 1 and read_work[0].complete
+                actual_read = read_work[0]._finish_once_handoff
+                assert type(actual_read) is RequiredSQLReturned and actual_read.value is handover.receipt
             terminal = await settling
             if terminal.status != "completed":
                 error = terminal.error
@@ -257,6 +509,18 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
                 if not task.done():
                     task.cancel()
             await asyncio.gather(disposed, settling, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cut", ("later-compose", "end-review"))
+async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work(tmp_path, monkeypatch, cut):
+    await _run_later_cut_handover(tmp_path, monkeypatch, cut)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("drain", "stop-before-suspend", "ambiguous-after-commit", "rollback-before-release"))
+async def test_live_later_cut_drain_stop_and_actual_suspend_outcomes(tmp_path, monkeypatch, mode):
+    await _run_later_cut_handover(tmp_path, monkeypatch, "end-review", mode=mode)
 
 
 @pytest.mark.parametrize("cut", ("advisor-input", "tool-ready", "end-repair", "end-publication"))

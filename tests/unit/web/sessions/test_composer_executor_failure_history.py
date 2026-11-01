@@ -17,7 +17,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationError,
     composer_operation_result_hash,
 )
-from elspeth.web.sessions.schemas import ComposerOperationFailurePageResponse, ComposerOperationStatusResponse
+from elspeth.web.sessions.schemas import ComposerOperationFailurePageResponse, ComposerOperationSnapshot
 from tests.unit.web.coordination.test_composer_operation_authority import start
 from tests.unit.web.sessions.test_composer_operation_error_parity import mutation_error
 from tests.unit.web.sessions.test_pipeline_rejection_callers import mounted_app
@@ -46,7 +46,7 @@ async def _actual_failure_responses(operation_store, tmp_path, original):
         history = await client.get(f"/api/sessions/{sid}/operations", params={"operation_id": admitted.operation_id})
     assert terminal.status_code == history.status_code == 200
     assert terminal.headers["Cache-Control"] == history.headers["Cache-Control"] == "no-store"
-    terminal_dto = ComposerOperationStatusResponse.model_validate_json(terminal.content, strict=True)
+    terminal_dto = ComposerOperationSnapshot.model_validate_json(terminal.content, strict=True)
     history_dto = ComposerOperationFailurePageResponse.model_validate_json(history.content, strict=True)
     assert terminal_dto.operation_id == admitted.operation_id and terminal_dto.status == "failed"
     assert terminal_dto.error == recovered and terminal_dto.result is None

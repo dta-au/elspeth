@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation import (
         ComposerSegmentRecoveryReceipt,
         ComposerSegmentStartObservation,
+        ComposerSegmentSuspendObservation,
         ComposerSegmentYieldReceipt,
         ContinuationOwnerCommit,
         StoredContinuationSnapshot,
@@ -2490,6 +2491,7 @@ class SessionOperationAuthority(Protocol):
         running: ComposerOperationRunning,
         *,
         retry_delay_seconds: float = 0.0,
+        observation: ComposerSegmentSuspendObservation | None = None,
         deadline: ComposerDrainDeadline | None = None,
     ) -> ComposerSegmentRecoveryReceipt:
         """Hand a live owner's segment to its next generation and release the fence."""
@@ -2514,6 +2516,12 @@ class SessionOperationAuthority(Protocol):
 
     def verify_recovery(self, receipt: ComposerSegmentRecoveryReceipt, *, deadline: ComposerDrainDeadline | None = None) -> None:
         """Read back an exact recovered generation, tolerating later peer progress."""
+        ...
+
+    def read_suspend_outcome(
+        self, observation: ComposerSegmentSuspendObservation, *, deadline: ComposerDrainDeadline | None = None
+    ) -> ComposerSegmentRecoveryReceipt:
+        """Reconcile the committing live suspend candidate against immutable SQL."""
         ...
 
     def read_yield_outcome(self, running: ComposerOperationRunning) -> ComposerSegmentYieldReceipt | None:

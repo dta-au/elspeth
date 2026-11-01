@@ -536,6 +536,11 @@ async def _litellm_acompletion(
     title = provider_custody.continuation_title
     clock = title.clock if title is not None else provider_custody.continuation_primary_clock
     timed_role = "TITLE" if title is not None else "PRIMARY"
+    if provider_custody.continuation_semantic_clock is not None:
+        if title is not None or clock is not None or prompt_guard_role != "advisor":
+            raise AuditIntegrityError("Semantic timing cannot replace TITLE, PRIMARY or a different physical role")
+        clock = provider_custody.continuation_semantic_clock
+        timed_role = "ADVISOR"
     if on_sdk_entry is not None and (clock is None or continuation_input_sha256 is None):
         raise AuditIntegrityError("SDK-entry progress requires an actual timed continuation PRIMARY")
     if prepared_input is None:

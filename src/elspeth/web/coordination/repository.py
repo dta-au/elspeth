@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation import (
         ComposerSegmentRecoveryReceipt,
         ComposerSegmentStartObservation,
+        ComposerSegmentSuspendObservation,
         ComposerSegmentYieldReceipt,
     )
     from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
@@ -5416,6 +5417,7 @@ class _SessionOperationAuthorityRepository:
         running: ComposerOperationRunning,
         *,
         retry_delay_seconds: float = 0.0,
+        observation: ComposerSegmentSuspendObservation | None = None,
         deadline: ComposerDrainDeadline | None = None,
     ) -> ComposerSegmentRecoveryReceipt:
         """Hand a live owner's segment to the next generation and release its fence.
@@ -5428,12 +5430,22 @@ class _SessionOperationAuthorityRepository:
         cancellation instead. A cut holding unresolved work refuses with
         ``ContinuationCutNotResumable`` and nothing is written.
         """
-        from elspeth.web.sessions.continuation import recover_segment_on_connection, require_continuation_mutation
+        from elspeth.web.sessions.continuation import (
+            ComposerSegmentSuspendObservation,
+            recover_segment_on_connection,
+            require_continuation_mutation,
+        )
         from elspeth.web.sessions.models import composer_operation_segments_table as segments
         from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 
         if type(running) is not ComposerOperationRunning:
             raise TypeError("handover requires the owned running custody")
+        if observation is not None and (
+            type(observation) is not ComposerSegmentSuspendObservation
+            or observation.running is not running
+            or observation.candidate is not None
+        ):
+            raise AuditIntegrityError("handover observation is not fresh custody of this exact running owner")
         claim, context = running.claim, running.session_operation_context
         if type(retry_delay_seconds) not in (int, float) or not math.isfinite(retry_delay_seconds) or not 0 <= retry_delay_seconds <= 60:
             raise ValueError("handover retry delay must be finite between zero and sixty seconds")
@@ -5478,7 +5490,10 @@ class _SessionOperationAuthorityRepository:
             )
             remaining = self._observed_lease_validity(conn, context, database_now=now)
             self._release_fence_on_connection(conn, context, database_now=now)
-            return replace(receipt, lease_validity_remaining=remaining, released_context=context)
+            candidate = replace(receipt, lease_validity_remaining=remaining, released_context=context)
+            if observation is not None:
+                observation.candidate = candidate
+            return candidate
 
     def commit_checkpoint_and_successor(
         self,
@@ -5532,6 +5547,16 @@ class _SessionOperationAuthorityRepository:
             raise TypeError("recovery verification requires its nominal receipt")
         with locked_session_transaction(self._engine, str(receipt.session_id), deadline=deadline) as conn:
             verify_recovery_on_connection(conn, receipt)
+
+    def read_suspend_outcome(
+        self, observation: ComposerSegmentSuspendObservation, *, deadline: ComposerDrainDeadline | None = None
+    ) -> ComposerSegmentRecoveryReceipt:
+        from elspeth.web.sessions.continuation import ComposerSegmentSuspendObservation, read_suspend_outcome_on_connection
+
+        if type(observation) is not ComposerSegmentSuspendObservation:
+            raise TypeError("suspend outcome requires its nominal writer observation")
+        with locked_session_transaction(self._engine, str(observation.running.claim.session_id), deadline=deadline) as conn:
+            return read_suspend_outcome_on_connection(conn, observation)
 
     def read_yield_outcome(self, running: ComposerOperationRunning) -> ComposerSegmentYieldReceipt | None:
         from elspeth.web.sessions.continuation import read_yield_outcome_on_connection

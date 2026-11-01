@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
     from elspeth.web.composer.continuation_clock import ContinuationActionClock
     from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
+    from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
     from elspeth.web.sessions.continuation import StoredContinuationSnapshot
     from elspeth.web.sessions.continuation_title_provider import PreparedTitleProvider, TitleAuditSettlementRequest
     from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -116,6 +117,7 @@ class ProviderInvocationOwner:
             context=binding.coordinator.authority.context,
             required_work=binding,
             cost_budget=self.cost_budget if family in (ProviderInvocationFamily.PRIMARY, ProviderInvocationFamily.ADVISOR) else None,
+            family=family,
         )
 
 
@@ -129,9 +131,11 @@ class ProviderCallCustody:
         "_context",
         "_cost_budget",
         "_cost_response_accountable",
+        "_family",
         "_primary_no_sdk_issuer",
         "_required_work",
         "_sdk_entered",
+        "_semantic_no_sdk_issuer",
         "_service",
         "_settlements",
         "_undispatched_recurrence",
@@ -150,6 +154,7 @@ class ProviderCallCustody:
         context: SessionOperationContext,
         required_work: RequiredWorkBinding,
         cost_budget: CommonProviderCostBudget | None = None,
+        family: ProviderInvocationFamily | None = None,
     ) -> None:
         if type(required_work) is not RequiredWorkBinding:
             raise AuditIntegrityError("Provider custody requires a nominal explicit binding")
@@ -158,12 +163,16 @@ class ProviderCallCustody:
             raise AuditIntegrityError("Provider custody requires exact COMPOSE authority")
         if cost_budget is not None and type(cost_budget) is not CommonProviderCostBudget:
             raise AuditIntegrityError("provider custody received foreign cost policy")
+        if family is not None and type(family) is not ProviderInvocationFamily:
+            raise AuditIntegrityError("Provider custody family requires its owned nominal discriminator")
+        self._family = family
         self._cost_budget = cost_budget
         self._cost_response_accountable = False
         self._service = service
         self._context = context
         self._required_work = required_work
         self._primary_no_sdk_issuer: PrimaryNoSdkIssuer | None = None
+        self._semantic_no_sdk_issuer: SemanticAdvisorNoSdkIssuer | None = None
         self.attempt: ProviderAttempt | None = None
         self.call: ComposerLLMCall | None = None
         self._sdk_entered = False
@@ -222,6 +231,37 @@ class ProviderCallCustody:
             raise AuditIntegrityError("PRIMARY no-SDK issuer requires original unentered physical custody")
         issuer.bind_custody(self)
         self._primary_no_sdk_issuer = issuer
+
+    @property
+    def family(self) -> ProviderInvocationFamily | None:
+        return self._family
+
+    @property
+    def continuation_semantic_clock(self) -> ContinuationActionClock | None:
+        issuer = self._semantic_no_sdk_issuer
+        if issuer is None:
+            return None
+        if self.family is not ProviderInvocationFamily.ADVISOR:
+            raise AuditIntegrityError("Semantic timing requires its nominal ADVISOR mint family")
+        issuer.require_original_clock()
+        return issuer.clock
+
+    def bind_semantic_no_sdk_issuer(self, issuer: SemanticAdvisorNoSdkIssuer) -> None:
+        from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+
+        if (
+            type(issuer) is not SemanticAdvisorNoSdkIssuer
+            or self.family is not ProviderInvocationFamily.ADVISOR
+            or self._semantic_no_sdk_issuer is not None
+            or self._primary_no_sdk_issuer is not None
+            or self.continuation_primary_clock is not None
+            or self.continuation_title is not None
+            or self.continuation_semantic_clock is not None
+            or self.attempt is not None
+        ):
+            raise AuditIntegrityError("Semantic timing and no-SDK authority require original ADVISOR custody")
+        issuer.bind_custody(self)
+        self._semantic_no_sdk_issuer = issuer
 
     async def retain_continuation_title(self, completion: _AdmittedLLMCompletion) -> None:
         from elspeth.web.composer.continuation_title_provider import retain_current_title_success
@@ -347,6 +387,8 @@ class ProviderCallCustody:
         )
         if self._primary_no_sdk_issuer is not None:
             self._primary_no_sdk_issuer.note_undispatched_cancel(self, admitted, model=model)
+        if self._semantic_no_sdk_issuer is not None:
+            self._semantic_no_sdk_issuer.note_undispatched_cancel(self, admitted, model=model)
         self.attempt = None
         self.call = None
         return cancellations
@@ -403,6 +445,8 @@ class ProviderCallCustody:
                 self.attempt = attempt
                 if self._primary_no_sdk_issuer is not None:
                     self._primary_no_sdk_issuer.note_admitted_attempt(self, attempt, model=model)
+                if self._semantic_no_sdk_issuer is not None:
+                    self._semantic_no_sdk_issuer.note_admitted_attempt(self, attempt, model=model)
                 self._admitted_ns = time.monotonic_ns()
                 self.call = None
                 self._sdk_entered = False
@@ -421,6 +465,8 @@ class ProviderCallCustody:
             raise AuditIntegrityError("Physical provider dispatch lacks exact admitted custody")
         if self._primary_no_sdk_issuer is not None:
             self._primary_no_sdk_issuer.mark_sdk_entered(self)
+        if self._semantic_no_sdk_issuer is not None:
+            self._semantic_no_sdk_issuer.mark_sdk_entered(self)
         if self._cost_budget is not None:
             self._cost_budget.dispatched()
         self._sdk_entered = True

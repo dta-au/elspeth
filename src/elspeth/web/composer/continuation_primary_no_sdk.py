@@ -32,6 +32,11 @@ class PrimaryNoSdkRefusalReason(Enum):
     STORAGE_FAILURE = "storage_failure"
     INTEGRITY_REFUSED = "integrity_refused"
     CANCELLED_BEFORE_SDK = "cancelled_before_sdk"
+    RETAINED_TAIL_UNBOUNDED = "retained_tail_unbounded"
+
+
+class ContinuationRetainedTailUnbounded(Exception):
+    """A complete paid result has no proven finite producer bound."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +249,10 @@ class PrimaryNoSdkIssuer:
                 or (reason is PrimaryNoSdkRefusalReason.STORAGE_FAILURE and not isinstance(original_failure, SQLAlchemyError))
                 or (reason is PrimaryNoSdkRefusalReason.INTEGRITY_REFUSED and not isinstance(original_failure, AuditIntegrityError))
                 or (reason is PrimaryNoSdkRefusalReason.CANCELLED_BEFORE_SDK and type(original_failure) is not asyncio.CancelledError)
+                or (
+                    reason is PrimaryNoSdkRefusalReason.RETAINED_TAIL_UNBOUNDED
+                    and type(original_failure) is not ContinuationRetainedTailUnbounded
+                )
                 or (self._attempt_id is not None and not self._cancelled_attempt)
                 or self._permit is not None
             ):

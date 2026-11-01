@@ -60,6 +60,7 @@ from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
 from elspeth.web.composer.continuation_progress import ContinuationFrontier
 from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
 from elspeth.web.composer.continuation_semantic_advisor_outcome import _SemanticAdvisorInvocationCapture
+from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls, build_llm_call_record
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput, prepare_provider_input
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
@@ -142,7 +143,7 @@ class PreparedSemanticAdvisorRequest:
     request_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
-        options = _SEMANTIC_ADVISOR_OPTIONS.validate_python(self.options, strict=True, extra="forbid")
+        options = _SEMANTIC_ADVISOR_OPTIONS.validate_python(deep_thaw(self.options), strict=True, extra="forbid")
         if options["response_format"] != continuation_advisor_response_format():
             raise AuditIntegrityError("Semantic Advisor request changed its owned decision schema")
         object.__setattr__(self, "options", options)
@@ -344,6 +345,7 @@ async def run_semantic_advisor(
     recorder: BufferingRecorder,
     timeout: float,
     on_provider_dispatch: Callable[[], None] | None = None,
+    no_sdk_issuer: SemanticAdvisorNoSdkIssuer | None = None,
     _outcome: _SemanticAdvisorInvocationCapture | None = None,
 ) -> SemanticAdvisorResult:
     """One actual Advisor call; no retry, source retention or action execution."""
@@ -357,6 +359,8 @@ async def run_semantic_advisor(
         raise AuditIntegrityError("Semantic Advisor invocation changed its actual provider/cost owner")
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("Semantic Advisor timeout must be finite and positive")
+    if no_sdk_issuer is not None and _outcome is None:
+        _outcome = _SemanticAdvisorInvocationCapture(request.source, request.request_sha256)
     if _outcome is not None:
         if (
             type(_outcome) is not _SemanticAdvisorInvocationCapture
@@ -368,7 +372,16 @@ async def run_semantic_advisor(
         _outcome.claimed = True
     request.verify()
     owner, prepared = request.owner, request.prepared
+    if no_sdk_issuer is not None:
+        if type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer or no_sdk_issuer.input_sha256 != request.request_sha256:
+            raise AuditIntegrityError("Semantic physical call changed its original prepared issuer")
+        no_sdk_issuer.require_original_request(request)
     custody = owner._new_advisor_custody(provider_owner)
+    if no_sdk_issuer is not None:
+        custody.bind_semantic_no_sdk_issuer(no_sdk_issuer)
+        if _outcome is None:
+            raise AuditIntegrityError("Semantic original issuer lost its private physical capture")
+        no_sdk_issuer.bind_capture(custody, _outcome)
     options = deep_thaw(request.options)
     limit = custody.cost_completion_limit()
     expected_limit = owner._settings.composer_advisor_max_completion_tokens
@@ -400,6 +413,9 @@ async def run_semantic_advisor(
     call: ComposerLLMCall | None = None
     async with provider_call_scope(custody):
         try:
+            if no_sdk_issuer is not None:
+                no_sdk_issuer.require_original_clock()
+                no_sdk_issuer.clock.finish_preparation()
             response = await asyncio.wait_for(
                 provider_gateway._litellm_acompletion(
                     provider_custody=custody,
@@ -449,6 +465,8 @@ async def run_semantic_advisor(
             status = ComposerLLMCallStatus.SUCCESS
         except BaseException as original:
             original_failure = original
+            if no_sdk_issuer is not None:
+                no_sdk_issuer.note_original_failure(custody, original)
             if _outcome is not None:
                 _outcome.original_failure = original
             error_class = error_message = type(original).__name__
@@ -510,11 +528,18 @@ async def run_semantic_advisor(
                     custody.mark_cost_response_accountable(admitted_metadata=metadata is not None)
                     custody.retain_audit(call)
                     recorder.record_llm_call(call, provider_custody=custody)
+                    if no_sdk_issuer is not None:
+                        no_sdk_issuer.note_paid_audit(custody, call)
                     if _outcome is not None:
                         _outcome.recorder_completed = True
                 if original_failure is not None and not isinstance(original_failure, PromptGuardRefused):
                     attach_llm_calls(original_failure, recorder)
+                if no_sdk_issuer is not None and _outcome is not None:
+                    no_sdk_issuer.note_original_observation(custody, _outcome)
     if decision is None or call is None or metadata is None or original_content is None or decision.decision_id != call.call_id:
         raise AuditIntegrityError("Semantic Advisor result lost its original decision/audit pair")
     response_chunk = encode_continuation_text_response(content=original_content, provider_metadata=metadata, audit_call=call)
-    return SemanticAdvisorResult(request.source, request.request_sha256, decision, call, response_chunk)
+    result = SemanticAdvisorResult(request.source, request.request_sha256, decision, call, response_chunk)
+    if no_sdk_issuer is not None:
+        no_sdk_issuer.note_original_result(result)
+    return result

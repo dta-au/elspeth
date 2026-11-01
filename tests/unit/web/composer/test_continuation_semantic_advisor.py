@@ -18,6 +18,7 @@ import litellm
 import pytest
 from litellm import ModelResponse
 from litellm.types.utils import Usage
+from pydantic import ValidationError
 
 from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
@@ -217,7 +218,12 @@ async def test_semantic_call_uses_real_guard_quota_audit_and_exact_schema(operat
     async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, baseline, custodies):
         if router:
             monkeypatch.setattr(inputs["owner"], "_advisor_endpoint_base_url", "https://openrouter.ai/api/v1")
-        request = prepare_semantic_advisor_request(**inputs)
+        original = prepare_semantic_advisor_request(**inputs)
+        request = replace(original)
+        assert request.source is original.source and request.prepared is original.prepared
+        assert request.request_sha256 == original.request_sha256
+        assert deep_thaw(request.options) == deep_thaw(original.options)
+        request.verify()
         recorder = BufferingRecorder()
         physical, dispatched = [], []
 
@@ -416,6 +422,18 @@ async def test_semantic_advisor_refuses_distinct_actual_service_before_quota_or_
 
     async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, custodies):
         request = prepare_semantic_advisor_request(**inputs)
+        invalid_options = deep_thaw(request.options)
+        invalid_options["max_tokens"] = str(invalid_options["max_tokens"])
+        with pytest.raises(ValidationError):
+            replace(request, options=invalid_options)
+        invalid_options = deep_thaw(request.options)
+        invalid_options["unexpected_option"] = True
+        with pytest.raises(ValidationError):
+            replace(request, options=invalid_options)
+        invalid_options = deep_thaw(request.options)
+        invalid_options["response_format"]["json_schema"]["schema"]["title"] = "Changed semantic response schema"
+        with pytest.raises(AuditIntegrityError, match="owned decision schema"):
+            replace(request, options=invalid_options)
         foreign_dir = tmp_path / "foreign-service"
         foreign_dir.mkdir()
         foreign_engine, _authority, foreign_service = _quota_service(foreign_dir)

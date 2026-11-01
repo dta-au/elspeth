@@ -22,6 +22,7 @@ from elspeth.web.coordination.quota_authority import ProviderAttempt
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_semantic_advisor import PreparedSemanticAdvisorRequest, SemanticAdvisorResult
+    from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +93,7 @@ async def observe_semantic_advisor_invocation(
     recorder: BufferingRecorder,
     timeout: float,
     on_provider_dispatch: Callable[[], None] | None = None,
+    no_sdk_issuer: SemanticAdvisorNoSdkIssuer | None = None,
 ) -> SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised:
     """Observe one original throwing invocation, including paid invalid output.
 
@@ -116,12 +118,16 @@ async def observe_semantic_advisor_invocation(
             recorder=recorder,
             timeout=timeout,
             on_provider_dispatch=on_provider_dispatch,
+            no_sdk_issuer=no_sdk_issuer,
             _outcome=capture,
         )
     except BaseException as error:
         if capture.original_failure is None:
             capture.original_failure = error
-        return SemanticAdvisorInvocationRaised(capture.snapshot(), error)
+        raised = SemanticAdvisorInvocationRaised(capture.snapshot(), error)
+        if no_sdk_issuer is not None:
+            no_sdk_issuer.seal_original_outcome(capture, raised)
+        return raised
     if (
         result.source is not capture.source
         or result.request_sha256 != capture.request_sha256
@@ -130,4 +136,7 @@ async def observe_semantic_advisor_invocation(
         or not capture.recorder_completed
     ):
         raise AuditIntegrityError("Semantic Advisor observation lost its original successful result")
-    return SemanticAdvisorInvocationReturned(result, capture.snapshot())
+    returned = SemanticAdvisorInvocationReturned(result, capture.snapshot())
+    if no_sdk_issuer is not None:
+        no_sdk_issuer.seal_original_outcome(capture, returned)
+    return returned

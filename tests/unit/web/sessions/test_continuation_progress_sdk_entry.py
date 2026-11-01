@@ -27,6 +27,7 @@ from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderCallCustody
+from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt
 from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
@@ -313,3 +314,45 @@ async def test_sdk_entry_publication_precedes_later_terminal_event(operation_sto
         assert ordered == ["calling_model", "complete"]
         latest = await registry.get_latest(str(progress.record.session_id))
         assert latest.phase == "complete" and latest.inflight_requests == 0 and progress.unregistered
+
+
+@pytest.mark.asyncio
+async def test_sdk_entry_after_explicit_progress_close_preserves_paid_call_and_reports_lifecycle_defect(
+    operation_store, tmp_path, monkeypatch
+):
+    async with _actual_owner(operation_store, tmp_path, monkeypatch) as (arguments, runtime, calls, progress, registry):
+        await progress.close()
+        assert progress.unregistered
+        result = await _primary(arguments, runtime, progress.notify_sdk_entry)
+        assert result.outcome.audit_call is not None and len(calls) == 1
+        latest = await registry.get_latest(str(progress.record.session_id))
+        assert latest.phase == "idle" and latest.request_token is None and latest.inflight_requests == 0
+        with pytest.raises(AuditIntegrityError, match="SDK entry after explicit progress retirement") as caught:
+            await progress.close()
+        assert caught.value is progress._entry_defects[0]
+
+
+@pytest.mark.asyncio
+async def test_advisory_progress_loss_does_not_become_late_sdk_entry_defect(operation_store, tmp_path, monkeypatch):
+    registry = ComposerProgressRegistry()
+    actual_claim = registry.claim_request
+    original = ComposerRequestLeaseLost("controlled advisory progress loss")
+
+    async def claim(**kwargs):
+        await actual_claim(**kwargs)
+
+        async def lost(_event):
+            raise original
+
+        return lost
+
+    monkeypatch.setattr(registry, "claim_request", claim)
+    async with _actual_owner(operation_store, tmp_path, monkeypatch, registry) as (arguments, runtime, calls, progress, _registry):
+        await progress.sink(ComposerProgressEvent(phase="starting", headline="Current segment started"))
+        assert progress.advisory_failures == [original]
+        result = await _primary(arguments, runtime, progress.notify_sdk_entry)
+        assert result.outcome.audit_call is not None and len(calls) == 1
+        await progress.close()
+        assert progress.unregistered and progress._entry_defects == []
+        latest = await registry.get_latest(str(progress.record.session_id))
+        assert latest.phase == "idle" and latest.request_token is None and latest.inflight_requests == 0

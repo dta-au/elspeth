@@ -626,6 +626,7 @@ class _PrimaryNoSdkRefusalData(BaseModel):
         "storage_failure",
         "integrity_refused",
         "cancelled_before_sdk",
+        "retained_tail_unbounded",
     ]
     public_error_json: str
     undispatched_attempt_id: str | None
@@ -797,7 +798,7 @@ def read_primary_no_sdk_refusal_on_connection(
     if effect.disposition != "refused":
         return None
     chunk_row = conn.execute(
-        select(chunks).where(
+        select(chunks.c.codec).where(
             chunks.c.session_id == sid,
             chunks.c.operation_id == operation_id,
             chunks.c.chunk_key == effect.result_chunk_key,

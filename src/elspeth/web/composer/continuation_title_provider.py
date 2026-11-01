@@ -13,7 +13,7 @@ from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import _read_current_env_names, materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_initialization import _registered, _sessions
-from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.continuation_title_values import capture_title_provider_result
 from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
@@ -30,9 +30,12 @@ from elspeth.web.sessions.continuation_title_provider import (
     CurrentTitleResult,
     PreparedTitleProvider,
     TitleAuditSettlementRequest,
+    TitleNoSdkRefusal,
     _current,
     prepare_title_provider_on_connection,
     read_title_result_on_connection,
+    read_v3_title_no_sdk_refusal_on_connection,
+    refuse_v3_title_unbounded_on_connection,
     require_title_creator,
     retain_title_response_on_connection,
 )
@@ -92,6 +95,26 @@ async def run_prepared_title_provider(
         raise AuditIntegrityError("TITLE execution requires its actual prepared/current invocation owners")
     if invocation_owner.required_work is not prepared.work or invocation_owner.service is not _sessions(prepared.composer):
         raise AuditIntegrityError("TITLE execution changed its actual original work/service")
+    root = decode_continuation_snapshot(prepared.selected.payload_json)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if type(policy) is ContinuationAdmissionPolicyV3:
+
+        def refuse_unbounded() -> TitleNoSdkRefusal:
+            with locked_session_transaction(prepared.authority._engine, str(prepared.running.claim.session_id)) as conn:
+                cold = read_v3_title_no_sdk_refusal_on_connection(
+                    conn,
+                    session_id=prepared.running.claim.session_id,
+                    operation_id=prepared.running.claim.operation_id,
+                    expected_prepared=prepared,
+                )
+                if cold is not None:
+                    return cold
+                return refuse_v3_title_unbounded_on_connection(conn, prepared)
+
+        await _registered(
+            work=prepared.work, source=RequiredWorkSource.CONTINUATION_STATE_SQL, operation=refuse_unbounded, expected=TitleNoSdkRefusal
+        )
+        return None
     custody = invocation_owner.mint(ProviderInvocationFamily.TITLE)
     custody.bind_continuation_title(prepared)
     settings = prepared.composer._settings

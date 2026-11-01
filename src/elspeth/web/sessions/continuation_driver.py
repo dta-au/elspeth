@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from collections.abc import Coroutine
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -39,20 +40,34 @@ from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
-from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkCoordinator, RequiredWorkRole, RequiredWorkSource
+from elspeth.web.coordination.lifecycle import ContinuationStage, SessionOperationLease
+from elspeth.web.required_work import (
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+    RequiredWorkSource,
+    RequiredWorkTicket,
+    reduce_composer_failures,
+)
 from elspeth.web.sessions.composer_app_services import ComposerAppServices
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error, request_cancelled_error, worker_lost_error
 from elspeth.web.sessions.composer_operations import (
     COMPOSER_CANCEL_REQUESTED,
+    COMPOSER_DEADLINE,
     COMPOSER_LEASE_LOST,
     COMPOSER_SHUTDOWN,
     ComposerOperationCancelledDuringTurn,
+    ComposerOperationError,
     ComposerOperationFenceLost,
     ComposerOperationRecord,
     ComposerOperationRunning,
 )
-from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, ComposerSegmentYieldReceipt, StoredContinuationSnapshot
+from elspeth.web.sessions.continuation import (
+    ComposerSegmentRecoveryReceipt,
+    ComposerSegmentSuspendObservation,
+    ComposerSegmentYieldReceipt,
+    StoredContinuationSnapshot,
+)
 from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, review_continuation_end
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
 from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
@@ -82,6 +97,81 @@ class ContinuationSegmentSettled:
 
 
 type ContinuationSegmentOutcome = ContinuationSegmentYielded | ContinuationSegmentHandedOver | ContinuationSegmentSettled
+type _ActionResult = ComposerOperationRecord | PrimaryNoSdkRefusalReceipt | None
+
+
+@dataclass(slots=True)
+class _ActionExpiry:
+    phases: ContinuationLivePhases
+    producer: RequiredWorkTicket
+    signal: RequiredWorkTicket
+    deadline: float
+    task: asyncio.Task[_ActionResult] | None = None
+    timer: asyncio.TimerHandle | None = None
+    completed_at: float | None = None
+    expired: bool = False
+    cause: TimeoutError = field(default_factory=lambda: TimeoutError("Continuation action exceeded its original allowance"))
+    callback_errors: list[BaseException] = field(default_factory=list)
+
+    def _interrupt(self, *, deadline: bool = True) -> None:
+        reason = COMPOSER_DEADLINE if deadline else COMPOSER_LEASE_LOST
+        try:
+            self.phases.cancel_business(reason)
+        except BaseException as error:
+            self.callback_errors.append(error)
+        finally:
+            task = self.task
+            if task is not None and not task.done():
+                try:
+                    task.cancel(reason)
+                except BaseException as error:
+                    self.callback_errors.append(error)
+
+    def fire(self) -> None:
+        if self.expired or (self.completed_at is not None and self.completed_at <= self.deadline):
+            return
+        if self.completed_at is None and time.monotonic() < self.deadline:
+            self.arm()
+            return
+        self.expired = True
+        try:
+            self.signal.complete_owned(self.cause)
+        except BaseException as error:
+            self.callback_errors.append(error)
+        if self.completed_at is None:
+            self._interrupt()
+
+    def arm(self) -> None:
+        try:
+            self.timer = asyncio.get_running_loop().call_later(max(0.0, self.deadline - time.monotonic()), self.fire)
+        except BaseException as error:
+            self.callback_errors.append(error)
+            self._interrupt(deadline=False)
+
+    def close(self, original: BaseException | None, *, observe_expiry: bool = True) -> tuple[BaseException, ...]:
+        if self.timer is not None:
+            try:
+                self.timer.cancel()
+            except BaseException as error:
+                self.callback_errors.append(error)
+        if observe_expiry and self.completed_at is not None and self.completed_at > self.deadline:
+            self.fire()
+        failures = tuple(self.callback_errors)
+        body_error = original
+        if failures:
+            body_error = BaseExceptionGroup(
+                "Continuation action observation failed", ([original] if original is not None else []) + list(failures)
+            )
+        try:
+            self.producer.complete_owned(body_error)
+        except BaseException as error:
+            failures = (*failures, error)
+        if not self.signal.complete:
+            try:
+                self.signal.complete_owned(self.cause if self.expired else None)
+            except BaseException as error:
+                failures = (*failures, error)
+        return failures
 
 
 class _SegmentDriver:
@@ -104,6 +194,7 @@ class _SegmentDriver:
         self.sql_deadline = sql_deadline
         self._consumed_native: list[BaseException] = []
         self._committed_failure: CommittedContinuationFailure | None = None
+        self._action_ordinal = 0
 
     def join_failure(self, error: BaseException, *additional: BaseException) -> BaseException:
         from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
@@ -179,7 +270,13 @@ class _SegmentDriver:
         )
         return stored, selected
 
-    async def settle(self, record: ComposerOperationRecord, original: BaseException | None = None) -> ContinuationSegmentSettled:
+    async def settle(
+        self,
+        record: ComposerOperationRecord,
+        original: BaseException | None = None,
+        *,
+        expired_failure: ComposerOperationError | None = None,
+    ) -> ContinuationSegmentSettled:
         from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
         from elspeth.web.sessions.composer_async_worker import _StartedSettlement, _terminal_completion_unknown
 
@@ -280,6 +377,8 @@ class _SegmentDriver:
             _stored, selected = await self.selected()
             await self.phases.finish_owed_prefix(selected)
             failure = request_cancelled_error(request_id=record.request_id)
+        elif expired_failure is not None:
+            failure = expired_failure
         elif original is None or isinstance(original, asyncio.CancelledError):
             failure = worker_lost_error(request_id=record.request_id)
         else:
@@ -298,6 +397,23 @@ class _SegmentDriver:
         )
         await self.worker._verify_terminal_before_release(self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal))
         return ContinuationSegmentSettled(terminal)
+
+    async def settle_expired(self, original: BaseException | None, *, timeout_seconds: float) -> ContinuationSegmentSettled:
+        from elspeth.web.sessions.composer_async_worker import _StartedSettlement
+
+        self.sql_deadline.begin_settlement()
+        current = await self.record()
+        if current.status in ("completed", "failed"):
+            # The committing SQL owner wins over delayed caller delivery. Its
+            # staged candidate or a merely finished Future is insufficient.
+            await self.worker._verify_terminal_before_release(
+                self.running, self.lease, current, _StartedSettlement(terminal_receipt=current)
+            )
+            return ContinuationSegmentSettled(current)
+        receipts = self.work.coordinator.settlement_failure_receipts()
+        reduction = reduce_composer_failures(receipts)
+        failure = reduction.project(request_id=current.request_id, timeout_seconds=timeout_seconds)
+        return await self.settle(current, original, expired_failure=failure)
 
     async def read_failure(self, names: frozenset[str]) -> ContinuationToolFailureRead:
         try:
@@ -342,14 +458,31 @@ class _SegmentDriver:
             return await self.settle(record, original)
         if disposition != "handover":
             raise AuditIntegrityError("V2 driver has no landed cross-sequence lineage owner")
+        observation = ComposerSegmentSuspendObservation(self.running)
 
         async def verify_handover(
             committed: ComposerSegmentRecoveryReceipt | None, original_failure: BaseException | None
         ) -> ComposerSegmentRecoveryReceipt:
             if original_failure is not None:
-                raise original_failure
+                # The SQL producer recorded this candidate before its commit
+                # boundary. Only immutable readback may promote an ambiguous
+                # raised outcome; the original remains in the SQL work ticket.
+                if observation.candidate is None:
+                    raise original_failure
+                recovered = await _registered(
+                    work=self.work,
+                    source=RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
+                    operation=partial(
+                        self.services.session_service.session_operation_authority.read_suspend_outcome,
+                        observation,
+                        deadline=self.worker.drain_deadline,
+                    ),
+                    expected=ComposerSegmentRecoveryReceipt,
+                )
+                return recovered
             if (
                 type(committed) is not ComposerSegmentRecoveryReceipt
+                or committed is not observation.candidate
                 or committed.released_context is not self.running.session_operation_context
             ):
                 raise AuditIntegrityError("V2 handover lost its actual committing release receipt")
@@ -373,6 +506,7 @@ class _SegmentDriver:
                 partial(
                     self.services.session_service.session_operation_authority.suspend_composer_segment,
                     self.running,
+                    observation=observation,
                     deadline=self.worker.drain_deadline,
                 ),
                 deadline=self.worker.drain_deadline,
@@ -662,18 +796,106 @@ class _SegmentDriver:
                 is SegmentFit.YIELD
             ):
                 return await self.dispose()
+            if self._worker_is_draining():
+                return await self.dispose()
             self.sql_deadline.begin_action(action, started_at=time.monotonic())
-            stage_owner = self.lease.create_continuation_stage(self.advance(stored, selected), name="continuation-phase")
-            stage = stage_owner.task
-            if stage is None:
-                raise AuditIntegrityError("Continuation phase allocation lacks its actual Task")
-            reader = ComposerOperationWatchReader.for_segment(self.worker, self.running, self.lease)
-            watch = asyncio.create_task(self.watch_stage(stage, reader), name="continuation-stage-watch")
-            observation = _OperationWatchObservation(reader=reader)
+            self._action_ordinal += 1
+            producer: RequiredWorkTicket | None = None
+            signal: RequiredWorkTicket | None = None
+            expiry: _ActionExpiry | None = None
+            stage_owner: ContinuationStage[_ActionResult] | None = None
+            stage_coroutine: Coroutine[object, object, _ActionResult] | None = None
+            try:
+                producer = self.work.coordinator.reserve(
+                    RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER,
+                    transition_ordinal=selected.stack.cursor,
+                    recurrence_ordinal=self._action_ordinal,
+                )
+                signal = self.work.coordinator.reserve(
+                    RequiredWorkSource.DEADLINE_SIGNAL,
+                    transition_ordinal=selected.stack.cursor,
+                    recurrence_ordinal=self._action_ordinal,
+                )
+                now = time.monotonic()
+                active_expiry = _ActionExpiry(self.phases, producer, signal, now + self.sql_deadline.remaining_dispatch(monotonic_now=now))
+                expiry = active_expiry
+
+                async def advance_recorded(
+                    current_stored: StoredContinuationSnapshot = stored,
+                    current_selected: SelectedContinuationState = selected,
+                    current_expiry: _ActionExpiry = active_expiry,
+                ) -> _ActionResult:
+                    try:
+                        return await self.advance(current_stored, current_selected)
+                    finally:
+                        current_expiry.completed_at = time.monotonic()
+
+                stage_coroutine = advance_recorded()
+                stage_owner = self.lease.create_continuation_stage(stage_coroutine, name="continuation-phase")
+                stage = stage_owner.task
+                if stage is None:
+                    raise AuditIntegrityError("Continuation phase allocation lacks its actual Task")
+                expiry.task = stage
+                expiry.arm()
+                reader = ComposerOperationWatchReader.for_segment(self.worker, self.running, self.lease)
+                observation = _OperationWatchObservation(reader=reader)
+                watch_coroutine = self.watch_stage(stage, reader)
+                try:
+                    watch = asyncio.create_task(watch_coroutine, name="continuation-stage-watch")
+                except BaseException as watch_setup:
+                    try:
+                        watch_coroutine.close()
+                    except BaseException as close_error:
+                        raise BaseExceptionGroup("Watcher allocation and close failed", [watch_setup, close_error]) from None
+                    raise
+            except BaseException as setup_error:
+                cleanup_errors: list[BaseException] = []
+                if expiry is not None and expiry.timer is not None:
+                    try:
+                        expiry.timer.cancel()
+                        expiry.timer = None
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                if stage_owner is not None and stage_owner.task is not None:
+                    try:
+                        self.phases.cancel_business(COMPOSER_LEASE_LOST)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                    try:
+                        stage_owner.task.cancel(COMPOSER_LEASE_LOST)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                    try:
+                        await self.lease.join_continuation_stage(stage_owner)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                elif stage_coroutine is not None:
+                    try:
+                        stage_coroutine.close()
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                combined = self.join_failure(setup_error, *cleanup_errors)
+                if expiry is not None:
+                    try:
+                        cleanup_errors.extend(expiry.close(combined, observe_expiry=False))
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+                else:
+                    for ticket, failure in ((producer, combined), (signal, None)):
+                        if ticket is not None and not ticket.complete:
+                            try:
+                                ticket.complete_owned(failure)
+                            except BaseException as error:
+                                cleanup_errors.append(error)
+                combined = self.join_failure(setup_error, *cleanup_errors)
+                if combined is setup_error:
+                    raise
+                raise combined from combined.__cause__
             original: BaseException | None = None
             try:
                 result = await self.lease.join_continuation_stage(stage_owner)
-            except (SessionOperationFenceLost, ComposerOperationFenceLost):
+            except (SessionOperationFenceLost, ComposerOperationFenceLost) as error:
+                original = error
                 raise
             except BaseException as error:
                 original = error
@@ -681,11 +903,18 @@ class _SegmentDriver:
                     self._consumed_native.append(error)
                 result = None
             finally:
-                failures = await _finish_operation_watcher(watch, observation)
+                action_failures = expiry.close(original)
+                failures = (*action_failures, *await _finish_operation_watcher(watch, observation))
                 if failures:
                     raise BaseExceptionGroup(
                         "Continuation stage observation failed", ([original] if original is not None else []) + list(failures)
                     )
+            if expiry.expired:
+                from elspeth.web.sessions.composer_async_worker import _terminal_completion_unknown
+
+                if original is not None and _terminal_completion_unknown(original):
+                    raise original
+                return await self.settle_expired(original, timeout_seconds=action.total)
             if original is not None:
                 from elspeth.web.sessions.composer_async_worker import _terminal_completion_unknown
 

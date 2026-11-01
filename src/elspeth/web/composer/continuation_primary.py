@@ -28,8 +28,16 @@ from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors,
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, owned_json
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV2, decode_continuation_policy
-from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalReason
+from elspeth.web.composer.continuation_policy import (
+    ContinuationAdmissionPolicyV2,
+    ContinuationAdmissionPolicyV3,
+    decode_continuation_policy,
+)
+from elspeth.web.composer.continuation_primary_no_sdk import (
+    ContinuationRetainedTailUnbounded,
+    PrimaryNoSdkIssuer,
+    PrimaryNoSdkRefusalReason,
+)
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers, _CurrentProducerInputs
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -288,7 +296,7 @@ async def _read_primary_candidate(
 def _current_cost_budget(
     conn: Connection,
     selected: SelectedContinuationState,
-    policy: ContinuationAdmissionPolicyV2,
+    policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
     existing: CommonProviderCostBudget | None,
 ) -> CommonProviderCostBudget:
     source = read_continuation_cost_snapshot_on_connection(conn, selected.stack)
@@ -382,7 +390,11 @@ def _freeze_input(
         )
 
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
-    if type(policy) is not ContinuationAdmissionPolicyV2:
+    if type(policy) is ContinuationAdmissionPolicyV2:
+        cost_policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 = policy
+    elif type(policy) is ContinuationAdmissionPolicyV3:
+        cost_policy = policy
+    else:
         current_inputs = producers._require_current()
         return prepared_from_current(current_inputs, cost_budget, reprove_after=True)
     # This one fresh lock/memo brackets the current producer proof, full SQL
@@ -392,7 +404,7 @@ def _freeze_input(
         retention_stage_memo_scope(),
     ):
         current_inputs = producers._require_current_on_connection(conn)
-        current_budget = _current_cost_budget(conn, selected, policy, cost_budget)
+        current_budget = _current_cost_budget(conn, selected, cost_policy, cost_budget)
         return prepared_from_current(current_inputs, current_budget, reprove_after=False)
 
 
@@ -431,7 +443,7 @@ async def run_continuation_primary(
     started = time.monotonic()
     clock = ContinuationActionClock(policy.actions.primary)
     budget = provider_owner.cost_budget
-    if type(policy) is not ContinuationAdmissionPolicyV2 and budget is not None:
+    if type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3) and budget is not None:
         raise AuditIntegrityError("legacy Continuation policy cannot activate a current cost allowance")
     if timeout > policy.actions.primary.total:
         raise AuditIntegrityError("primary invocation cannot renew its retained action allowance")
@@ -464,7 +476,7 @@ async def run_continuation_primary(
     invocation = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_READ_SQL, captured)
     if type(invocation) is not PreparedPrimaryInvocation:
         raise AuditIntegrityError("primary input preparation lost its actual request")
-    if type(policy) is ContinuationAdmissionPolicyV2:
+    if type(policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3):
         if type(invocation.cost_budget) is not CommonProviderCostBudget:
             raise AuditIntegrityError("PRIMARY input lost its original cost owner")
         if budget is None:
@@ -573,6 +585,14 @@ async def run_continuation_primary(
             issuer=issuer,
             reason=PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED,
             original_failure=error,
+        )
+    if type(policy) is ContinuationAdmissionPolicyV3:
+        return await _finish_primary_no_sdk(
+            authority=authority,
+            required_work=required_work,
+            issuer=issuer,
+            reason=PrimaryNoSdkRefusalReason.RETAINED_TAIL_UNBOUNDED,
+            original_failure=ContinuationRetainedTailUnbounded("V3 PRIMARY has no proven finite complete paid result bound"),
         )
     sql, projection = required_work.reserve_pair(
         RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION

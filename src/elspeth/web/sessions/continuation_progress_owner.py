@@ -124,6 +124,7 @@ class ContinuationProgressOwner:
         self._starting: asyncio.Task[None] | None = None
         self._heartbeat: asyncio.Task[None] | None = None
         self._closing: asyncio.Task[None] | None = None
+        self._explicit_close_started = False
         self._inflight: set[asyncio.Task[None]] = set()
         self._entry_tail: asyncio.Task[None] | None = None
         self._entry_fallback: asyncio.Task[None] | None = None
@@ -208,6 +209,8 @@ class ContinuationProgressOwner:
         provider call. The queued writer remains owned through ``close``.
         """
         if self._retired.is_set():
+            if self._explicit_close_started:
+                self._entry_defects.append(AuditIntegrityError("SDK entry after explicit progress retirement"))
             return
         try:
             publisher = self._publisher
@@ -286,10 +289,16 @@ class ContinuationProgressOwner:
             self._inflight.discard(task)
 
     async def close(self) -> None:
+        self._explicit_close_started = True
         self._retired.set()
         if self._closing is None:
             self._closing = asyncio.create_task(self._close(), name="continuation-progress-close")
         await _join(self._closing)
+        # A callback can arrive after the original close task has finished.
+        # Its retained defect must remain observable on a repeated close.
+        if self._entry_defects:
+            combined = _combine(self._entry_defects[0], *self._entry_defects[1:])
+            raise combined from combined.__cause__
 
     async def _close(self) -> None:
         errors: list[BaseException] = []

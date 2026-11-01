@@ -1019,6 +1019,51 @@ class ComposerSegmentRecoveryReceipt:
 
 
 @dataclass(slots=True)
+class ComposerSegmentSuspendObservation:
+    """Candidate produced by one live suspend writer, pending commit readback.
+
+    The candidate is recorded before the transaction exits. It grants no
+    handover authority until its exact predecessor and immutable recovery
+    rows are read back after the writer returns or raises.
+    """
+
+    running: ComposerOperationRunning
+    candidate: ComposerSegmentRecoveryReceipt | None = None
+
+
+def read_suspend_outcome_on_connection(conn: Connection, observation: ComposerSegmentSuspendObservation) -> ComposerSegmentRecoveryReceipt:
+    """Reconcile only the candidate issued by this live suspend attempt."""
+    if type(observation) is not ComposerSegmentSuspendObservation or type(observation.running) is not ComposerOperationRunning:
+        raise TypeError("suspend readback requires its nominal live observation")
+    candidate = observation.candidate
+    if candidate is None:
+        raise AuditIntegrityError("suspend readback has no actual writer candidate")
+    claim, context = observation.running.claim, observation.running.session_operation_context
+    if (
+        type(candidate) is not ComposerSegmentRecoveryReceipt
+        or candidate.session_id != claim.session_id
+        or candidate.operation_id != claim.operation_id
+        or candidate.sequence != claim.segment_sequence
+        or candidate.previous_generation != claim.ownership_generation
+        or candidate.generation != claim.ownership_generation + 1
+        or candidate.released_context is not context
+    ):
+        raise AuditIntegrityError("suspend readback substituted the live writer's candidate")
+    history = conn.execute(
+        select(attempts.c.claim_attempt).where(
+            attempts.c.session_id == str(claim.session_id),
+            attempts.c.operation_id == claim.operation_id,
+            attempts.c.sequence == claim.segment_sequence,
+            attempts.c.generation == claim.ownership_generation,
+        )
+    ).one_or_none()
+    if history is None or history.claim_attempt != claim.attempt:
+        raise AuditIntegrityError("suspend readback lost the live writer's exact attempt")
+    verify_recovery_on_connection(conn, candidate)
+    return candidate
+
+
+@dataclass(slots=True)
 class ComposerSegmentStartObservation:
     """The actual start producer's context and commit/readback observations.
 
