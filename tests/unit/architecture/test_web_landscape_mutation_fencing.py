@@ -16093,15 +16093,15 @@ def _reserve_selected_origin_effect_failures(
             def consumer(selected, node=node):
                 effect = retained_supplier_effect(node, retained_expression=selected)
                 if effect in _reserve_ENUM_TRANSFER_EFFECTS:
-                    # PROTOTYPE (immutability lane): enum members and the frozen
-                    # records that hold them are immutable at the language level
-                    # (maintainer ruling 2026-11-01, decision 3). A transfer of
-                    # such a value needs no consumer closure; re-evaluate with
-                    # enum-kind origins hidden so only a non-enum origin can
-                    # sustain a transfer row. Mutation rules (stores, reflected
-                    # writes, descriptor recovery) still see the enum receiver.
-                    def hidden(value, use, *, selected=selected, **kw):
-                        origin = selected(value, use, **kw)
+                    # Enum members and the frozen records that hold them are
+                    # immutable at the language level (maintainer ruling
+                    # 2026-11-01, decision 3). A transfer of such a value needs no
+                    # consumer closure; re-evaluate with enum-kind origins hidden
+                    # so only a non-enum origin can sustain a transfer row.
+                    # Mutation rules (stores, reflected writes, descriptor
+                    # recovery) still see the enum receiver.
+                    def hidden(expression, use, *, selected=selected, **kw):
+                        origin = selected(expression, use, **kw)
                         return None if origin is not None and origin[0] in _reserve_ENUM_TRANSFER_HIDDEN_KINDS else origin
 
                     effect = retained_supplier_effect(node, retained_expression=hidden)
@@ -19019,7 +19019,10 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/lifecycle.py",
             "SessionOperationLease",
-            "374805f097bb943ebd2bb1457a00b88769d70505128933ea589d6d891e62734a",
+            # Re-pinned for e43e18544 (_refuse_finish_from_owned_task): one private
+            # refusal method, no Landscape/payload/sink effect, not reachable from
+            # the sealed callbacks; guard_external_effect/raise_if_lost unchanged.
+            "f410355bb8f464044e8b947b316629777b72fb101c2b27fb5673762a80c70f5e",
         ),
         (
             "src/elspeth/web/coordination/lifecycle.py",
