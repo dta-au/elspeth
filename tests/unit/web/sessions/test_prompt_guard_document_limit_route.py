@@ -184,9 +184,10 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             # Exactly at the limit: the unit is inspected whole and the SDK is entered once.
-            session, _body, _first, _state, _before, settled, units, packed, unit = await second_turn_after_history(
+            session, _body, _first, _state, before, settled, units, packed, unit = await second_turn_after_history(
                 client, PROMPT_GUARD_MAX_TEXT_CHARACTERS
             )
+            turn_one_checks = _guard_checks(before)
             _assert_documents_reproduce_complete_units(units, packed)
             assert unit in packed
             inspected = [document for body in guard_bodies for document in body["documents"]]
@@ -195,9 +196,10 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
             assert all(body["userPrompt"] == _SECOND_PROMPT for body in guard_bodies)
             assert settled.result()["message"]["content"] == "Noted."
             assert len(sdk_calls) == 1
-            # The allow decision for this exact request was durable before the SDK ran.
-            assert checks_at_sdk_entry[0][-1]["disposition"] == "allow"
-            assert checks_at_sdk_entry[0][-1]["reason"] == "clean"
+            # Turn 2's own allow decision (one row beyond turn 1's) was durable before the SDK ran.
+            assert checks_at_sdk_entry[0][: len(turn_one_checks)] == turn_one_checks
+            assert len(checks_at_sdk_entry[0]) == len(turn_one_checks) + 1
+            assert (checks_at_sdk_entry[0][-1]["disposition"], checks_at_sdk_entry[0][-1]["reason"]) == ("allow", "clean")
 
             # One more character: the same indivisible unit is refused, never sliced.
             session, body, first, first_state, before, settled, units, packed, unit = await second_turn_after_history(
