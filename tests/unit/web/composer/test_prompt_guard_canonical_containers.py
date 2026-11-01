@@ -13,7 +13,6 @@ import pytest
 from elspeth.contracts.composer_content import CompleteValueManifest, ComposerContentScope
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, canonical_json_loads
-from elspeth.core.canonical import canonical_json as core_canonical_json
 from elspeth.web.composer import prompts as composer_prompts
 from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
@@ -255,7 +254,11 @@ async def test_live_initial_context_preserves_core_normalized_state_option(tmp_p
         _empty_state(), sources={"source": SourceSpec(**{**source, "options": {**source["options"], "field_mapping": field_mapping}})}
     )
     before = state.to_dict()
-    expected_wire_state = json.loads(core_canonical_json(before))
+    # The bounded view is the composer's lossless graph projection
+    # (composer_content._canonical_value), not core canonical JSON: core
+    # escapes a key that collides with its reserved type tag for hashing, but
+    # the model must see — and may echo back — the exact authored option.
+    expected_wire_state = before
     owner = invocation[2]
     context = owner.required_work.coordinator.authority.context
     service = _guarded_service(invocation, monkeypatch, composer_client=_azure_client(inspected), catalog=create_catalog_service())
@@ -284,5 +287,5 @@ async def test_live_initial_context_preserves_core_normalized_state_option(tmp_p
     assert manifest.scope == ComposerContentScope(UUID(context.fence.session_id), composition_content_hash(state))
     assert manifest.values == ()
     assert view["data"] == expected_wire_state
-    assert view["data"]["sources"]["source"]["options"]["field_mapping"] == json.loads(core_canonical_json(field_mapping))
+    assert view["data"]["sources"]["source"]["options"]["field_mapping"] == field_mapping
     invocation[3].assert_completed()
