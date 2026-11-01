@@ -24,6 +24,18 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 
 
 class ContinuationSQLDeadlineOwner:
+    running: ComposerOperationRunning
+    policy: ContinuationAdmissionPolicy
+    drain_signal: ComposerDrainSignal
+    drain_seconds: float
+    hard_expires_at: float
+    drain_finish_reserve_seconds: float
+    statement_cap: float
+    _action_expires_at: float
+    _settlement_expires_at: float
+    _settling: bool
+    _lock: threading.RLock
+
     def __init__(
         self,
         running: ComposerOperationRunning,
