@@ -197,9 +197,9 @@ def verify_opt_out_transformation(
     read_content_publication(previous)
     produced_publication = read_content_publication(produced)
     expected_metadata = deep_thaw(previous.composer_meta)
-    if produced_publication is not None:
-        expected_metadata = {} if expected_metadata is None else expected_metadata
-        expected_metadata[CONTENT_PUBLICATION_KEY] = produced_publication.to_payload()
+    if expected_metadata is None:
+        raise AuditIntegrityError("Stored composition state has no composer metadata")
+    expected_metadata[CONTENT_PUBLICATION_KEY] = produced_publication.to_payload()
     if (
         produced.derived_from_state_id != previous.id
         or produced.session_id != previous.session_id

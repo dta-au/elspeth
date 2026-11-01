@@ -56,7 +56,8 @@ def _bind_attempt_call(call: ComposerLLMCall, attempt: ProviderAttempt, admitted
 class ProviderInvocationFamily(IntEnum):
     PRIMARY = 0
     ADVISOR = 1
-    PLANNER = 2
+    # 2 was the never-written PLANNER family; values are not renumbered
+    # because the ordinal is part of persisted provider effect keys.
     TITLE = 3
 
 

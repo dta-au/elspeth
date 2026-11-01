@@ -48,7 +48,7 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # identity allowances, and fixes the active container policy singleton across
 # actors. Neither distinct epoch-76 predecessor is this combined contract.
 # Incompatible stores require a separately reviewed compatibility disposition.
-_COORDINATION_HARD_CUT_EPOCH = 79
+_COORDINATION_HARD_CUT_EPOCH = 80
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "auth_session_families": "ix_auth_session_families_expires_at",
     "web_instances": "ix_web_instances_lease_expires_at",
@@ -60,7 +60,6 @@ _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
     "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
     "rate_limit_events": "ix_rate_limit_events_expires_at",
-    "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",
 }
 _COORDINATION_HARD_CUT_TABLES: frozenset[str] = frozenset({*_COORDINATION_HARD_CUT_EXPIRY_INDEXES, "run_execution_inputs"})
 

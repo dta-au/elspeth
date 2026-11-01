@@ -2255,7 +2255,7 @@ def prepare_provider_effect_on_connection(
     )
     if snapshot_json != stored.payload_json:
         raise ContinuationCASConflict("provider preparation replaced the actual selected complete head")
-    if type(family) is not int or family not in (0, 1, 2, 3):
+    if type(family) is not int or family not in (0, 1, 3):
         raise ValueError("unknown physical provider family")
     if type(input_sha256) is not str or len(input_sha256) != 64 or any(char not in "0123456789abcdef" for char in input_sha256):
         raise ValueError("provider preparation requires its actual input digest")

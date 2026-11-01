@@ -241,7 +241,7 @@ def _record_from_row(row: Row[Any], *, request_json: str | None = None) -> Compo
             checkpoint_id=row.checkpoint_id,
             journal_cursor=row.journal_cursor,
             ingress_phase=row.ingress_phase,
-            reserved_user_message_id=UUID(row.reserved_user_message_id) if row.reserved_user_message_id is not None else None,
+            reserved_user_message_id=UUID(row.reserved_user_message_id),
         )
     except (ValueError, TypeError, ValidationError) as exc:
         raise AuditIntegrityError("composer operation row violates its owned record contract") from exc
@@ -474,11 +474,12 @@ class ComposerAsyncOperationAuthority:
         *,
         owner_instance_id: str,
         claim_lease_seconds: int,
-        continuation_policy: ContinuationAdmissionPolicy,
+        continuation_policy: ContinuationAdmissionPolicy | None = None,
     ) -> None:
+        """``continuation_policy`` is required to admit; read-only owners may omit it."""
         if engine.dialect.name not in ("sqlite", "postgresql") or not owner_instance_id.strip() or not 5 <= claim_lease_seconds <= 600:
             raise ValueError("invalid composer operation authority configuration")
-        if type(continuation_policy) is not ContinuationAdmissionPolicy:
+        if continuation_policy is not None and type(continuation_policy) is not ContinuationAdmissionPolicy:
             raise TypeError("continuation policy must be its owned complete admission policy")
         self._engine = engine
         self._owner_instance_id = owner_instance_id
@@ -505,6 +506,9 @@ class ComposerAsyncOperationAuthority:
         _bounded(max_nonterminal)
         if len(request_json.encode("utf-8")) > COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH:
             raise ValueError("invalid composer request encoded size")
+        policy = self._continuation_policy
+        if policy is None:
+            raise ValueError("composer admission has no validated server policy")
         request: SendMessageRequest | RecomposeRequest
         if kind == "compose_message":
             request = SendMessageRequest.model_validate_json(request_json)
@@ -558,10 +562,10 @@ class ComposerAsyncOperationAuthority:
                     request_json=request_json,
                     request_hash=request_hash,
                     base_state_id=base_state_id,
-                    policy_hash=self._continuation_policy.policy_hash,
-                    admission_policy_json=self._continuation_policy.model_dump_json(),
+                    policy_hash=policy.policy_hash,
+                    admission_policy_json=policy.model_dump_json(),
                     initial_trust_mode=cast(Literal["auto_commit", "explicit_approve"], initial_trust_mode),
-                    initial_action_json=self._continuation_policy.actions.session_sql.model_dump_json(),
+                    initial_action_json=policy.actions.session_sql.model_dump_json(),
                     original_user_message_id=str(original_message_id) if original_message_id is not None else None,
                 )
             if type(seed) is not ContinuationAdmissionSeed:
@@ -609,7 +613,7 @@ class ComposerAsyncOperationAuthority:
             initial_action = ContinuationActionPolicy.model_validate_json(seed.action_json, strict=True)
             if initial_action != retained_policy.actions.session_sql:
                 raise AuditIntegrityError("initial action differs from the retained complete admission policy")
-            if retained_policy != self._continuation_policy:
+            if retained_policy != policy:
                 raise AuditIntegrityError("fresh server seed substituted another admission policy")
             initial_checkpoint_id = str(uuid4())
             try:

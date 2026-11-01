@@ -494,85 +494,6 @@ def _enveloped_state_column(value: Any) -> Any:
     return envelope_state_column(value)
 
 
-def _current_adr019_counter_subsets_hold(
-    *,
-    rows_succeeded: int,
-    rows_failed: int,
-    rows_routed_success: int,
-    rows_routed_failure: int,
-    rows_quarantined: int,
-) -> bool:
-    return rows_routed_success <= rows_succeeded and rows_routed_failure <= rows_failed and rows_quarantined <= rows_failed
-
-
-def _legacy_disjoint_counter_shape_holds(
-    *,
-    status: SessionRunStatus,
-    rows_processed: int,
-    rows_succeeded: int,
-    rows_failed: int,
-    rows_routed_success: int,
-    rows_routed_failure: int,
-    rows_quarantined: int,
-) -> bool:
-    """Return true for the pre-ADR-019 disjoint session-counter contract."""
-    if status not in SESSION_TERMINAL_RUN_STATUS_VALUES:
-        return False
-    legacy_total = rows_succeeded + rows_failed + rows_routed_success + rows_routed_failure + rows_quarantined
-    if rows_processed < legacy_total:
-        return False
-
-    success_indicator = rows_succeeded > 0 or rows_routed_success > 0
-    failure_indicator = rows_failed > 0 or rows_routed_failure > 0 or rows_quarantined > 0
-    if status == "completed":
-        return success_indicator and not failure_indicator
-    if status == "completed_with_failures":
-        return success_indicator and failure_indicator
-    if status == "failed":
-        return True
-    if status == "empty":
-        return rows_processed == 0 and not success_indicator and not failure_indicator
-    return status == "cancelled"
-
-
-def _normalize_pre_adr019_session_counters(
-    *,
-    status: SessionRunStatus,
-    rows_processed: int,
-    rows_succeeded: int,
-    rows_failed: int,
-    rows_routed_success: int,
-    rows_routed_failure: int,
-    rows_quarantined: int,
-) -> tuple[int, int]:
-    """Fold unambiguous legacy disjoint counters into ADR-019 base counters.
-
-    ADR-019 did not change the session DB schema, so historical rows have no
-    version marker. Only shapes that fail the current subset invariant but pass
-    the previous disjoint predicate are normalized; current rows and ambiguous
-    data are left untouched for the response/schema guards to validate.
-    """
-    if _current_adr019_counter_subsets_hold(
-        rows_succeeded=rows_succeeded,
-        rows_failed=rows_failed,
-        rows_routed_success=rows_routed_success,
-        rows_routed_failure=rows_routed_failure,
-        rows_quarantined=rows_quarantined,
-    ):
-        return rows_succeeded, rows_failed
-    if not _legacy_disjoint_counter_shape_holds(
-        status=status,
-        rows_processed=rows_processed,
-        rows_succeeded=rows_succeeded,
-        rows_failed=rows_failed,
-        rows_routed_success=rows_routed_success,
-        rows_routed_failure=rows_routed_failure,
-        rows_quarantined=rows_quarantined,
-    ):
-        return rows_succeeded, rows_failed
-    return rows_succeeded + rows_routed_success, rows_failed + rows_routed_failure + rows_quarantined
-
-
 def _interpretation_event_record_from_row(row: Any) -> InterpretationEventRecord:
     """Convert a SQLAlchemy row to an InterpretationEventRecord.
 
@@ -4197,14 +4118,13 @@ class SessionServiceImpl:
                     committed_hash = composition_content_hash(state_from_record(committed_record))
                     if committed_hash != state_content_hash:
                         raise AuditIntegrityError("pipeline exact retry state content mismatch")
-                    expected_metadata = final_composer_metadata
-                    if read_content_publication(committed_record) is not None:
-                        expected_metadata = prepare_content_publication(
-                            settled_state,
-                            session_id=session_id,
-                            state_id=committed_record.id,
-                            state_version=committed_record.version,
-                        ).composer_meta
+                    read_content_publication(committed_record)
+                    expected_metadata = prepare_content_publication(
+                        settled_state,
+                        session_id=session_id,
+                        state_id=committed_record.id,
+                        state_version=committed_record.version,
+                    ).composer_meta
                     if deep_thaw(committed_record.composer_meta) != deep_thaw(expected_metadata):
                         raise AuditIntegrityError("pipeline exact retry final metadata mismatch")
                     return (
@@ -9263,15 +9183,6 @@ class SessionServiceImpl:
 
     def _row_to_run_record(self, row: Any) -> RunRecord:
         """Convert a SQLAlchemy row to a RunRecord."""
-        rows_succeeded, rows_failed = _normalize_pre_adr019_session_counters(
-            status=row.status,
-            rows_processed=row.rows_processed,
-            rows_succeeded=row.rows_succeeded,
-            rows_failed=row.rows_failed,
-            rows_routed_success=row.rows_routed_success,
-            rows_routed_failure=row.rows_routed_failure,
-            rows_quarantined=row.rows_quarantined,
-        )
         return RunRecord(
             id=UUID(row.id),
             session_id=UUID(row.session_id),
@@ -9280,8 +9191,8 @@ class SessionServiceImpl:
             started_at=restore_utc(row.started_at),
             finished_at=restore_utc(row.finished_at) if row.finished_at is not None else None,
             rows_processed=row.rows_processed,
-            rows_succeeded=rows_succeeded,
-            rows_failed=rows_failed,
+            rows_succeeded=row.rows_succeeded,
+            rows_failed=row.rows_failed,
             rows_routed_success=row.rows_routed_success,
             rows_routed_failure=row.rows_routed_failure,
             rows_quarantined=row.rows_quarantined,

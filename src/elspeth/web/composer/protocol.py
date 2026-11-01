@@ -23,22 +23,19 @@ if TYPE_CHECKING:
 
     from elspeth.contracts.prompt_guard import PromptGuardMode
     from elspeth.contracts.session_operation import SessionOperationContext
-    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
     from elspeth.web.composer.audit import BufferingRecorder
-    from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
+    from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
     from elspeth.web.composer.prompt_guard import PromptGuardMount
-    from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationOwner
+    from elspeth.web.composer.provider_quota import ProviderCallCustody
     from elspeth.web.composer.strict_transport import StrictToolsSetting
-    from elspeth.web.execution.completion_gates import CompletionGateFacts
     from elspeth.web.prompt_guard_config import PromptGuardSettings
-    from elspeth.web.required_work import RequiredWorkBinding
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
-from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
-from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
+from elspeth.contracts.composer_mutation import ComposerMutationRevocation
+from elspeth.contracts.composer_progress import ComposerProgressReason
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity, AdvisorTerminalPublication
 from elspeth.web.composer.advisor_decision import AdvisorGateDecision
@@ -1875,85 +1872,13 @@ class ComposerSettings(Protocol):
 class ComposerService(Protocol):
     """Protocol for the LLM-driven pipeline composer.
 
-    Accepts a user message, pre-fetched chat history, and current state.
-    Runs the LLM tool-use loop. Returns the assistant's response
-    and the (possibly updated) state. Tool-call turns may persist their
-    assistant/tool audit rows through SessionServiceProtocol; terminal
-    no-tool assistant messages are still route-persisted (seam contract B).
+    The Continuation driver advances each Compose request through the
+    concrete ``ComposerServiceImpl`` phase owners; this protocol names the
+    surface other callers depend on.
     """
 
     @property
     def composer_prompt_guard_mount(self) -> PromptGuardMount | None: ...
-
-    async def compose_recovery(
-        self,
-        *,
-        message: str,
-        recovery_context: GraphRecoveryContext,
-        session_operation_context: SessionOperationContext,
-        required_work: RequiredWorkBinding,
-        provider_owner: ProviderInvocationOwner,
-        budget_seconds: float | None = None,
-    ) -> GraphRecoveryResponse:
-        """Request terminal recovery using scalar context before graph hydration."""
-
-    async def compose(
-        self,
-        message: str,
-        messages: list[ComposerHistoryMessage],
-        state: CompositionState,
-        session_id: str | None = None,
-        current_state_id: str | None = None,
-        user_id: str | None = None,
-        progress: ComposerProgressSink | None = None,
-        user_message_id: str | None = None,
-        session_operation_context: SessionOperationContext | None = None,
-        # Durable advisor gate fact from the prior state row (ruling
-        # 2026-09-22). ``None`` = none known: the END gate reviews as before.
-        completion_gates: CompletionGateFacts | None = None,
-        budget_seconds: float | None = None,
-        required_work: RequiredWorkBinding | None = None,
-        provider_owner: ProviderInvocationOwner | None = None,
-        recovery_context: GraphRecoveryContext | None = None,
-        retained_operation_context: RetainedOperationContext | None = None,
-        advisor_history: AdvisorTranscriptHistory | None = None,
-        *,
-        mutation_ceiling: ComposerMutationCeiling | None = None,
-    ) -> ComposerResult:
-        """Run the LLM composition loop.
-
-        Args:
-            message: The user's chat message.
-            messages: Chat history as dicts with role/content keys. Exact
-                persisted human-user rows also carry the route-owned internal
-                authorship marker; provider message construction strips it.
-                The route handler fetches ChatMessageRecord from
-                session_service.get_messages(), converts each to a dict,
-                and passes the result here. ComposerService may depend on
-                SessionServiceProtocol for tool-call turn persistence (seam
-                contract B), but does not fetch history itself.
-            state: The current CompositionState.
-            current_state_id: Database id of ``state`` when it came from a
-                persisted session row. Used as the stale-state guard for
-                compose-loop tool-call audit persistence.
-            user_id: Current user ID. Passed through to secret tools.
-            user_message_id: Database id of the just-persisted user
-                ``chat_messages`` row that triggered this compose call
-                (Phase 5a Task 2.5). Threaded through the compose loop into
-                inline-blob writers so any blob materialised by a tool call
-                this turn records ``created_from_message_id`` pointing back
-                at this id. Defaults to ``None`` for test paths and
-                non-route callers; the composite FK on
-                ``(created_from_message_id, session_id)`` in ``blobs_table``
-                rejects cross-session lineage, so a wrong id surfaces as
-                IntegrityError rather than silent provenance corruption.
-
-        Returns:
-            ComposerResult with assistant message and updated state.
-
-        Raises:
-            ComposerConvergenceError: If the loop exceeds max_turns.
-        """
 
     async def explain_run_diagnostics(
         self,

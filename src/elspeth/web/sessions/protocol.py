@@ -1064,7 +1064,7 @@ class CompositionStateData:
     validation_errors: Sequence[CompositionValidationError] | None = None
     # Operational/audit meta describing how this state was reached. Distinct
     # from ``metadata_`` which carries user-facing PipelineMetadata. ``None``
-    # is honest for revert/fork paths and for non-compose write paths.
+    # only before insert: ``prepare_content_publication`` stamps every stored row.
     composer_meta: Mapping[str, Any] | None = None
     # User-facing PipelineMetadata. Required: every stored state carries it
     # (require_stored_state_metadata), so no producer may omit it.
@@ -1159,8 +1159,9 @@ class CompositionStateRecord:
     created_at: datetime
     derived_from_state_id: UUID | None
     # Operational/audit meta describing how this state was reached. Distinct
-    # from ``metadata_`` which carries user-facing PipelineMetadata. ``None``
-    # is honest for revert/fork paths and for non-compose write paths.
+    # from ``metadata_`` which carries user-facing PipelineMetadata. Every
+    # stored row carries it (the column is NOT NULL and every insert stamps
+    # ``content_publication``); the default serves unsaved test projections.
     composer_meta: Mapping[str, Any] | None = None
     sources: Mapping[str, Mapping[str, Any]] | None = None
     source: Mapping[str, Any] | None = None
