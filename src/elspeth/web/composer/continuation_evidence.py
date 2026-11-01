@@ -252,7 +252,7 @@ class TurnEvidenceFields(ContinuationValue):
             raise ValueError("evidence review/decision shelf contains orphaned or reordered identities")
         if self.initial_is_latest and self.effects.initial_state_json != self.effects.latest_verified_state_json:
             raise ValueError("shared initial/latest state changed its complete bytes")
-        if self.recorder.codec != "composer.audit-buffer.v1":
+        if self.recorder.codec != "composer.audit-buffer.v2":
             raise ValueError("evidence recorder changed its closed original source role")
         if len({item.binding for item in self.abandonment_limitations}) != len(self.abandonment_limitations):
             raise ValueError("evidence limitation map contains duplicate bindings")
@@ -332,7 +332,7 @@ def state_from_evidence_json(text: str) -> CompositionState:
 def recorder_from_evidence_json(encoded: str) -> RecorderSnapshot:
     from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
 
-    chunk = encode_private_chunk(codec="composer.audit-buffer.v1", canonical=encoded)
+    chunk = encode_private_chunk(codec="composer.audit-buffer.v2", canonical=encoded)
     return decode_recorder_snapshot(chunk)
 
 
@@ -519,7 +519,7 @@ def _select_recorder_chunk(snapshot: TurnEvidenceFields, chunks: tuple[PrivateCh
             raise AuditIntegrityError("evidence dependency has conflicting original bytes or lengths before deduplication")
         available.setdefault(key, chunk)
     reference = snapshot.recorder
-    if type(reference) is not PrivateChunkRef or reference.codec != "composer.audit-buffer.v1":
+    if type(reference) is not PrivateChunkRef or reference.codec != "composer.audit-buffer.v2":
         raise AuditIntegrityError("evidence recorder lost its nominal closed original reference")
     actual = available.get((reference.codec, reference.digest))
     if actual is None or actual.reference != reference:
@@ -532,7 +532,7 @@ def _require_recorder_chunk(
 ) -> ApplicationRecorderSource:
     from elspeth.web.composer.continuation_application_graph import admit_application_recorder_source
 
-    if type(chunk) is not PrivateChunk or chunk.reference != snapshot.recorder or chunk.reference.codec != "composer.audit-buffer.v1":
+    if type(chunk) is not PrivateChunk or chunk.reference != snapshot.recorder or chunk.reference.codec != "composer.audit-buffer.v2":
         raise AuditIntegrityError("evidence recorder differs from its original closed source")
     return admit_application_recorder_source(chunk, env_ref_names=env_ref_names)
 

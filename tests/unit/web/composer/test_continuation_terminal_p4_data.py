@@ -499,7 +499,7 @@ def test_terminal_recorder_visible_alias_is_checked_before_publication():
     original = encode_terminal_p4_input(terminal_input())
     payload = json.loads(original.canonical)
     recorder = json.loads(payload["recorder"]["canonical"])
-    recorder["visible_tool_events"][0]["invocation_index"] = 1
+    recorder["snapshot"]["visible_tool_events"][0]["invocation_index"] = 1
     changed = canonical_json(recorder)
     payload["recorder"]["canonical"] = changed
     payload["recorder"]["reference"]["digest"] = sha256(changed.encode()).hexdigest()

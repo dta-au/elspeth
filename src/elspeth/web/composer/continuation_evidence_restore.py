@@ -114,7 +114,7 @@ def read_selected_turn_evidence_graph_data_on_connection(
     if len(compose) != 1:
         raise AuditIntegrityError("cold evidence requires exactly one actual Compose frame")
     frame = compose[0]
-    if frame.initial_state.codec != "composer.state.v1" or frame.audit_buffer.codec != "composer.audit-buffer.v1":
+    if frame.initial_state.codec != "composer.state.v1" or frame.audit_buffer.codec != "composer.audit-buffer.v2":
         raise AuditIntegrityError("cold evidence changed its selected state/recorder format")
     sid = str(session_id)
     if (root.logical.session_id, root.logical.operation_id) != (sid, operation_id):

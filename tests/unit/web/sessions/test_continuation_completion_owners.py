@@ -307,9 +307,7 @@ async def _seed_csv_session(app, tmp_path, session_id, trust_mode: str) -> None:
 
 
 @pytest.mark.asyncio
-# auto_commit is blocked by the 1 MiB retained evidence/recorder pair bound
-# (report § 6); it joins this parametrization when that lands.
-@pytest.mark.parametrize("trust_mode", ("explicit_approve",))
+@pytest.mark.parametrize("trust_mode", ("explicit_approve", "auto_commit"))
 async def test_set_pipeline_proposal_completes_under_each_trust_mode(tmp_path, monkeypatch, trust_mode):
     """A Continuation set_pipeline authors a proposal (explicit_approve) or a saved state (auto_commit).
 
