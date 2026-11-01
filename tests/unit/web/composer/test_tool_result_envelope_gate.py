@@ -110,6 +110,11 @@ _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
         "parsed back (plugin-schema data to its producer type) with no key added, so the producer that built it "
         "remains the census authority"
     ),
+    ("continuation_tool_batch.py", "_retained_discovery_result"): (
+        "restores a live plugin-schema outcome's frozen admitted-wire mappingproxy to its producer model "
+        "before continuation re-admission (b18274fd3), exactly as decode_tool_result_value does for retained "
+        "data; adds no data key, so the plugin-schema producer remains the census authority"
+    ),
     ("discovery_response.py", "to_tool_result"): (
         "re-envelopes the declaration-selected producer encoding for legacy consumers; adds no data key, "
         "and the original tool producer remains the census authority"
