@@ -232,7 +232,7 @@ async def publish_continuation_result(
     """Publish one provider-authored result through the one shared finalizer.
 
     The terminal composite (assistant row, audit cohort, proposals and the
-    V2 terminal) commits in one transaction; this owner never builds the
+    Continuation terminal) commits in one transaction; this owner never builds the
     reply, graph or proposal itself.
     """
     from elspeth.web.sessions.composer_finalization import (

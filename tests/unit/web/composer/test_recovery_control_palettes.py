@@ -405,3 +405,17 @@ async def test_pending_review_reply_accepts_recovery_without_completion_gate(tmp
     assert result.graph_recovery_intent.message == _QUESTION
     finalize.assert_not_called()
     advisor.assert_not_called()
+
+
+@pytest.mark.parametrize("dialect", tuple(ToolContractDialect))
+def test_checkpoint_and_continue_is_in_the_compose_palette_only(dialect: ToolContractDialect) -> None:
+    """K-1 (U-40): every compose palette offers the Continuation control exactly once,
+    before the trailing cache anchor; the recovery-only palette never does."""
+    from elspeth.web.composer.continuation_controls import CONTINUATION_CONTROL_TOOL
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+
+    compose = [tool["function"]["name"] for tool in composer_loop_tool_definitions(dialect)]
+    assert compose.count(CONTINUATION_CONTROL_TOOL) == 1
+    assert compose[-1] != CONTINUATION_CONTROL_TOOL
+    recovery = [tool["function"]["name"] for tool in recovery_tool_definitions(dialect)]
+    assert CONTINUATION_CONTROL_TOOL not in recovery

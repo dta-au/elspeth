@@ -30,9 +30,8 @@ from elspeth.web.composer import prompt_guard_clients
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.config import WebSettings
 from elspeth.web.prompt_guard_config import PromptGuardSettings
-from elspeth.web.sessions.composer_operation_versions import COMPOSER_OPERATION_VERSION_HEADER
 from elspeth.web.sessions.models import chat_messages_table, composer_continuation_effects_table
-from elspeth.web.sessions.schemas import ComposerOperationSnapshotV2
+from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.composer_operations import message_body
 
@@ -78,7 +77,6 @@ async def _continuation_app(tmp_path, monkeypatch):
         composer_rate_limit_per_minute=100,
         shareable_link_signing_key=b"\x00" * 32,
         plugin_allowlist=("transform:passthrough",),
-        composer_continuation_enabled=True,
         composer_async_scan_interval_seconds=0.05,
     )
     app = create_app(settings=settings)
@@ -114,12 +112,11 @@ def _reply(content: str, tool_calls=None) -> ModelResponse:
     )
 
 
-async def _submit_and_settle(app, token, session_id, body, *, rounds: int = 240) -> ComposerOperationSnapshotV2:
-    headers = {"Authorization": f"Bearer {token}", COMPOSER_OPERATION_VERSION_HEADER: "2"}
+async def _submit_and_settle(app, token, session_id, body, *, rounds: int = 240) -> ComposerOperationSnapshot:
+    headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers) as client:
         accepted = await client.post(f"/api/sessions/{session_id}/messages", json=body)
         assert accepted.status_code == 202, accepted.text
-        assert accepted.headers[COMPOSER_OPERATION_VERSION_HEADER] == "2"
         for _ in range(rounds):
             response = await client.get(f"/api/sessions/{session_id}/operations/{body['operation_id']}")
             if response.status_code == 503 and response.json()["error_type"] == "database_unavailable":
@@ -128,7 +125,7 @@ async def _submit_and_settle(app, token, session_id, body, *, rounds: int = 240)
                 await asyncio.sleep(0.25)
                 continue
             assert response.status_code == 200, response.text
-            snapshot = ComposerOperationSnapshotV2.model_validate_json(response.content, strict=True)
+            snapshot = ComposerOperationSnapshot.model_validate_json(response.content, strict=True)
             if snapshot.status in ("completed", "failed"):
                 # Join the owner's verified release before the lifespan ends.
                 await app.state.composer_async_worker.run_until_idle()
