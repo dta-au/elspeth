@@ -1674,7 +1674,22 @@ class SessionOperationLease:
         finally:
             self._closed = True
 
+    def _refuse_finish_from_owned_task(self) -> None:
+        """Fail at once instead of hanging when a finish is awaited from a task this lease owns.
+
+        The finish task joins every owned task, and the caller would be one of
+        them, so the two tasks would wait on each other forever. Leaving the
+        caller out of the join is not a fix either: that would release authority
+        while the caller's work is still running.
+        """
+        caller = asyncio.current_task()
+        if caller is not None and caller in self._owned_tasks:
+            raise contract_errors.AuditIntegrityError(
+                "Lease finish awaited from a task this lease owns would self-join its owned-task join"
+            )
+
     async def _join_finish_task(self, task: asyncio.Task[None]) -> None:
+        self._refuse_finish_from_owned_task()
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -1684,6 +1699,7 @@ class SessionOperationLease:
             raise
 
     async def _join_continuation_finish(self, task: asyncio.Task[None], deadline: ComposerDrainDeadline) -> None:
+        self._refuse_finish_from_owned_task()
         cancellations: list[asyncio.CancelledError] = []
         while not task.done():
             remaining = deadline.remaining_seconds(now=time.monotonic())

@@ -13,7 +13,7 @@
   },
   "src/elspeth/web/coordination/lifecycle.py": {
     "protected_exports": [],
-    "sha256": "c328240de2b159e3e6682efc572944f6fdebca372d007aa0b74b859f3222fca6"
+    "sha256": "e25c5085ebc8ddfec670f5e847bce5445b1ac4bd9253614c747310abbd7385fa"
   },
   "src/elspeth/web/execution_lease_cleanup.py": {
     "protected_exports": [],

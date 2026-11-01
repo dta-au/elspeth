@@ -873,6 +873,39 @@ async def test_owned_task_exception_is_joined_then_propagated_after_release() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("finish", ("close", "consume_archive"))
+async def test_finish_awaited_from_an_owned_task_refuses_instead_of_self_joining(finish: str) -> None:
+    # The finish task joins every owned task. Awaited from inside one, the two
+    # tasks would wait on each other forever (a test seam did exactly this,
+    # 2026-11-01). The finish must refuse at once instead.
+    authority = _FakeAuthority()
+    kind = SessionOperationKind.ARCHIVE if finish == "consume_archive" else SessionOperationKind.COMPOSE
+    lease = await _acquire(authority, operation_kind=kind, renew_interval_seconds=10)
+
+    async def finish_lease() -> None:
+        if finish == "consume_archive":
+            await lease.consume_archive()
+        else:
+            await lease.close()
+
+    owned = lease.create_task(finish_lease(), name="test-owned-self-finish")
+    done, _ = await asyncio.wait({owned}, timeout=5)
+
+    # Without the refusal this fails here after 5 s. The deadlocked pair cannot
+    # be cancelled (their joins are shielded by design), so the process may then
+    # be unable to exit. That is the hang the refusal exists to prevent.
+    assert owned in done, "a finish awaited from an owned task self-joined instead of refusing"
+    with pytest.raises(AuditIntegrityError, match="self-join"):
+        owned.result()
+    # The refused call had already started the finish task, which now joins the
+    # finished owner and surfaces the owner's refusal to the real caller.
+    with pytest.raises(AuditIntegrityError, match="self-join"):
+        await finish_lease()
+    assert lease.closed is True
+
+
+@pytest.mark.asyncio
 async def test_archive_consume_joins_children_stops_renewal_and_never_releases_after_confirmed_cascade() -> None:
     authority = _FakeAuthority()
     lease = await _acquire(authority, operation_kind=SessionOperationKind.ARCHIVE, renew_interval_seconds=10)
