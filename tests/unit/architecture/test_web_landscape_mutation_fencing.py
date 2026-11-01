@@ -16745,6 +16745,13 @@ class ContinuationSQLDeadlineOwner:
             or any(
                 not isinstance(member, ast.FunctionDef)
                 and not (isinstance(member, ast.Expr) and isinstance(member.value, ast.Constant) and isinstance(member.value.value, str))
+                # A bare simple annotation binds no class attribute or descriptor.
+                and not (
+                    isinstance(member, ast.AnnAssign)
+                    and member.value is None
+                    and member.simple == 1
+                    and isinstance(member.target, ast.Name)
+                )
                 for member in cls.body
             )
             or any(
