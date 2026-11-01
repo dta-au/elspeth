@@ -1,27 +1,32 @@
-per_file_rules:
-- pattern: contracts/declaration_contracts.py
-  rules:
-  - FG2
-  reason: isinstance(self.row_data, Mapping) is a type-validation guard that raises
-    TypeError on wrong type (offensive programming), then calls deep_freeze() on the
-    validated value — not a conditional freeze bypass
+allow_hits:
+- key: contracts/declaration_contracts.py:FG2:_module_:fp=54e6eced3fed5bff
+  owner: "@elspeth-maintainers"
+  reason: BoundaryInputs.__post_init__ isinstance(self.row_data, Mapping) is a type-validation guard that raises
+    TypeError on wrong type (offensive programming), then calls deep_freeze() on the validated value — not a
+    conditional freeze bypass.
+  safety: The guard's only branch raises; deep_freeze(self.row_data) runs unconditionally after it.
   expires: null
-  max_hits: 1
-- pattern: contracts/diversion.py
-  rules:
-  - FG2
-  reason: isinstance guards validate SinkWriteResult field types at construction (crash on wrong type) — offensive programming, not freeze guards
+- key: contracts/diversion.py:FG2:_module_:fp=115eb9beac47667b
+  owner: "@elspeth-maintainers"
+  reason: SinkWriteResult.__post_init__ isinstance(self.diversions, tuple) validates the field type at construction
+    and raises PluginContractViolation on a wrong type — offensive programming, not a freeze guard.
+  safety: The guard's only branch raises; the tuple elements are then checked to be RowDiversion instances.
   expires: null
-  max_hits: 1
-- pattern: contracts/schema_contract.py
-  rules:
-  - FG1
-  reason: SchemaContract._by_normalized and _by_original use shallow wraps — values are FieldContract (frozen DCs) and str (scalars)
+- key: contracts/schema_contract.py:FG1:_module_:fp=4d2a1e7b95ffe57d
+  owner: "@elspeth-maintainers"
+  reason: SchemaContract._by_normalized is a shallow MappingProxyType over a dict built fresh in __post_init__ —
+    values are FieldContract (frozen dataclasses), so a shallow wrap is a complete freeze.
+  safety: The wrapped dict is a local built in __post_init__ and never escapes, so no mutable alias remains.
   expires: null
-  max_hits: 2
-- pattern: contracts/config/runtime.py
-  rules:
-  - FG1
-  reason: RuntimeRateLimitConfig.services uses MappingProxyType(dict()) — values are RuntimeServiceRateLimit (frozen DCs)
+- key: contracts/schema_contract.py:FG1:_module_:fp=75dcd9d743088bde
+  owner: "@elspeth-maintainers"
+  reason: SchemaContract._by_original is a shallow MappingProxyType over a dict built fresh in __post_init__ —
+    values are str (scalars), so a shallow wrap is a complete freeze.
+  safety: The wrapped dict is a local built in __post_init__ and never escapes, so no mutable alias remains.
   expires: null
-  max_hits: 1
+- key: contracts/config/runtime.py:FG1:_module_:fp=73d979d7d3b9ca0d
+  owner: "@elspeth-maintainers"
+  reason: RuntimeRateLimitConfig.services uses MappingProxyType(dict()) — every value is checked to be a
+    RuntimeServiceRateLimit (frozen dataclass) immediately above, so a shallow wrap is a complete freeze.
+  safety: dict(self.services) detaches from the caller's mapping; values are isinstance-checked frozen dataclasses.
+  expires: null
