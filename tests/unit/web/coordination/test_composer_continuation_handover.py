@@ -49,9 +49,7 @@ def _running(store):
 
 
 def _cancel(authority, record):
-    return authority.request_cancel(
-        session_id=record.session_id, operation_id=record.operation_id, cancelled_failure=request_cancelled_error
-    )
+    return authority.request_cancel(session_id=record.session_id, operation_id=record.operation_id)
 
 
 def test_handover_keeps_sequence_advances_generation_and_releases_fence(operation_store):
@@ -278,8 +276,7 @@ def _assert_terminal_bundle(engine, running, *, status, failure_code):
         payload = read_chunk(
             conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, key=event.payload_chunk_key
         )
-    assert (parent.lifecycle_version, parent.status, parent.phase, parent.settled_by, parent.request_json) == (
-        2,
+    assert (parent.status, parent.phase, parent.settled_by, parent.request_json) == (
         status,
         "settled",
         "owner_terminal",

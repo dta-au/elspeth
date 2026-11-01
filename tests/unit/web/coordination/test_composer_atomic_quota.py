@@ -23,7 +23,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationCapacityError,
     ComposerOperationConflictError,
     ComposerOperationPreconditionRefused,
-    composer_operation_request_hash,
+    composer_operation_admission_request_hash,
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
@@ -85,7 +85,7 @@ def test_overlapping_same_id_commits_one_job_and_one_charge(operation_store, mon
             duplicate = workers.submit(compete)
             assert contender.wait(5)
             assert counts(engine) == (0, 0)
-            assert authority.claim_next(limit=1) == ()
+            assert authority.claim_segment(limit=1) == ()
         finally:
             release.set()
         results = (winner.result(timeout=5), duplicate.result(timeout=5))
@@ -107,7 +107,7 @@ def test_duplicate_leaves_second_slot_for_distinct_session(operation_store):
     with pytest.raises(ComposerQuotaExceeded):
         admit(authority, rejected, quota=admission)
     assert counts(engine) == (2, 2)
-    assert {claim.session_id for claim in authority.claim_next(limit=10)} == {sid, sibling}
+    assert {claim.session_id for claim in authority.claim_segment(limit=10)} == {sid, sibling}
 
 
 def test_cross_session_budget_denial_rolls_back_losing_job(operation_store):
@@ -128,7 +128,7 @@ def test_cross_session_budget_denial_rolls_back_losing_job(operation_store):
     accepted = [target for target in outcomes if target is not None]
     assert len(accepted) == 1
     assert counts(engine) == (1, 1)
-    assert {claim.session_id for claim in authority.claim_next(limit=10)} == set(accepted)
+    assert {claim.session_id for claim in authority.claim_segment(limit=10)} == set(accepted)
 
 
 def test_quota_sql_fault_rolls_back_both_effects_and_retry(operation_store, monkeypatch):
@@ -150,7 +150,7 @@ def test_quota_sql_fault_rolls_back_both_effects_and_retry(operation_store, monk
             admit(authority, sid, request, quota=admission)
         assert caught.value is original
     assert counts(engine) == (0, 0)
-    assert authority.claim_next(limit=1) == ()
+    assert authority.claim_segment(limit=1) == ()
     assert admit(authority, sid, request, quota=admission)[1]
     assert counts(engine) == (1, 1)
 
@@ -285,16 +285,13 @@ async def test_cancelled_awaiter_leaves_worker_owned_atomic_pair(operation_store
             session_id=sid,
             operation_id=request.operation_id,
             kind="compose_message",
-            request_hash=composer_operation_request_hash(session_id=sid, kind="compose_message", request=request),
+            request_hash=composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=request),
             actor_user_id="alice",
             request_id="cancelled",
             base_state_id=None,
             request_json=request.model_dump_json(),
-            deadline_seconds=180,
             max_nonterminal=64,
             auth_provider_type="local",
-            lifecycle_version=1,
-            continuation_enabled=False,
         )
     )
     try:

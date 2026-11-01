@@ -206,19 +206,6 @@ def test_terminal_parent_excluded_even_if_segment_still_running(operation_store)
     assert _admission_rows(engine) == before
 
 
-def test_v1_running_parent_excluded(operation_store):
-    engine, repository, authority, _, sid = operation_store
-    record, fresh = admit(authority, sid)
-    assert fresh
-    (claim,) = authority.claim_next(limit=1)
-    context = repository.start_composer_async_operation(claim, owner_instance_id="test-owner", lease_seconds=30, auth_provider_type="local")
-    repository.release(context)
-    before = _admission_rows(engine)
-    assert authority.list_expired_running(limit=1)[0].operation_id == record.operation_id
-    assert list_recoverable_segments(engine, limit=1) == ()
-    assert _admission_rows(engine) == before
-
-
 def test_stop_and_archive_are_observed_for_locked_writer_disposition(operation_store):
     engine, repository, _, _, _ = operation_store
     _, _, _, context = _started(operation_store)
@@ -257,7 +244,7 @@ def test_filter_before_bound_with_stable_tie_order(operation_store, monkeypatch)
     for session in sorted(sessions, key=lambda item: str(item.id), reverse=True):
         with monkeypatch.context() as admission_clock:
             admission_clock.setattr(admission_module, "database_now", lambda conn: tied_at)
-            record, fresh = admit(authority, session.id, lifecycle_version=2, continuation_enabled=True)
+            record, fresh = admit(authority, session.id)
         assert fresh
         assert record.created_at == tied_at
         (claim,) = authority.claim_segment(limit=1)

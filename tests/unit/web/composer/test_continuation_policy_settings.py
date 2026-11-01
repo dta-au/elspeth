@@ -41,7 +41,7 @@ _DESIGN_DEFAULTS: dict[str, tuple[float, float | None, float | None, float, floa
 
 
 def _enabled(**overrides: Any) -> WebSettings:
-    return continuation_test_settings(composer_continuation_enabled=True, **overrides)
+    return continuation_test_settings(**overrides)
 
 
 def _policy(**overrides: Any) -> ContinuationAdmissionPolicy:
@@ -54,12 +54,6 @@ def _bounds_with(role: str, stage: str, value: float) -> dict[str, Any]:
     bounds = ContinuationActionBoundsSettings().model_dump(mode="json")
     bounds[role][stage] = value
     return bounds
-
-
-def test_v2_admission_stays_refused_with_default_settings() -> None:
-    settings = continuation_test_settings()
-    assert settings.composer_continuation_enabled is False
-    assert continuation_policy_from_settings(settings) is None
 
 
 def test_production_policy_from_settings_round_trips_and_is_versioned() -> None:
@@ -226,12 +220,11 @@ def test_fixture_is_the_production_policy() -> None:
 
 
 def test_fixture_construction_path_is_the_settings_mapping() -> None:
-    assert continuation_policy_from_settings(continuation_test_settings()) is None
+    assert continuation_policy_from_settings(continuation_test_settings()) == minimal_continuation_policy()
     assert type(minimal_continuation_policy()) is ContinuationAdmissionPolicy
 
 
-@pytest.mark.parametrize("enabled", (False, True))
-def test_app_wires_the_settings_policy_into_the_composer_authority(tmp_path: Any, enabled: bool) -> None:
+def test_app_wires_the_settings_policy_into_the_composer_authority(tmp_path: Any) -> None:
     from elspeth.web.app import create_app
 
     settings = continuation_test_settings(
@@ -240,12 +233,10 @@ def test_app_wires_the_settings_policy_into_the_composer_authority(tmp_path: Any
         payload_store_path=tmp_path / "payloads",
         composer_boot_probe_enabled=False,
         plugin_allowlist=("transform:passthrough",),
-        composer_continuation_enabled=enabled,
     )
     app = create_app(settings=settings)
     try:
         retained = app.state.composer_async_operation_authority._continuation_policy
-        assert retained == continuation_policy_from_settings(settings)
-        assert (retained is None) is (not enabled)
+        assert retained is not None and retained == continuation_policy_from_settings(settings)
     finally:
         app.state.session_engine.dispose()

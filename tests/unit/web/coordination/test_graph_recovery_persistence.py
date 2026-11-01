@@ -1,11 +1,11 @@
 """Transactional recovery proofs with real session storage and no providers."""
 
 from dataclasses import replace
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, select, text, update
-from tests.unit.web.coordination.test_composer_operation_authority import response, start
+from tests.unit.web.coordination.test_composer_operation_authority import _ingress, response, start
 
 from elspeth.contracts.composer_content import ContentPublication
 from elspeth.contracts.freeze import deep_thaw
@@ -23,17 +23,8 @@ pytest_plugins = ["tests.unit.web.coordination.test_composer_operation_authority
 
 async def begin(store, state_id=None):
     _engine, _repo, _authority, service, sid = store
-    record, running = start(store, SendMessageRequest(operation_id=str(uuid4()), content="Recover and discuss", state_id=state_id))
-    await service.add_message_with_transcript(
-        sid,
-        "user",
-        "Recover and discuss",
-        operation_id=UUID(record.operation_id),
-        requested_state_id=state_id,
-        writer_principal="route_user_message",
-        session_operation_context=running.session_operation_context,
-        running=running,
-    )
+    _record, running = start(store, SendMessageRequest(operation_id=str(uuid4()), content="Recover and discuss", state_id=state_id))
+    await _ingress(store, running)
     admission = await service.load_graph_recovery_context(
         sid,
         turn_start_state_id=state_id,
@@ -280,7 +271,10 @@ async def test_safe_checkpoint_skips_lossy_unknown_graph_fields(operation_store)
 
 
 @pytest.mark.asyncio
-async def test_malformed_gate_metadata_is_quarantined(operation_store):
+async def test_unsupported_gate_envelope_refuses_recovery_as_integrity_failure(operation_store):
+    """Control: swallow the envelope refusal and quarantine the head again -> red."""
+    from elspeth.contracts.errors import AuditIntegrityError
+
     engine, _repo, _authority, service, sid = operation_store
     running, _admission = await begin(operation_store)
     saved = await service.save_composition_state(
@@ -299,15 +293,17 @@ async def test_malformed_gate_metadata_is_quarantined(operation_store):
         session_operation_context=running.session_operation_context,
     )
     assert admission.context.malformed_head and admission.record is None
-    settlement = await service.prepare_graph_recovery(
-        sid,
-        context=admission.context,
-        intent=GraphRecoveryIntent("reset_to_safe_checkpoint", "Let's discuss.", None, "recover-7"),
-        session_operation_context=running.session_operation_context,
-    )
-    assert settlement.target_state_id == saved.id and settlement.malformed_head
-    terminal = await finish(operation_store, running, settlement)
-    assert "historical row was preserved" in terminal.result_json
+    with pytest.raises(AuditIntegrityError, match="envelope version 999 is not supported"):
+        await service.prepare_graph_recovery(
+            sid,
+            context=admission.context,
+            intent=GraphRecoveryIntent("reset_to_safe_checkpoint", "Let's discuss.", None, "recover-7"),
+            session_operation_context=running.session_operation_context,
+        )
+    with engine.connect() as conn:
+        assert conn.execute(
+            select(composition_states_table.c.composer_meta).where(composition_states_table.c.id == str(saved.id))
+        ).scalar_one() == {"_version": 999}
 
 
 @pytest.mark.asyncio
