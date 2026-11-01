@@ -7,6 +7,7 @@ No failed batch, constructed receipt, or decoded DATA supplies write authority.
 
 import asyncio
 import json
+import threading
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
 
@@ -318,13 +319,28 @@ async def test_terminal_p4_transaction_boundaries_keep_real_original_and_one_phy
         physical_error = OperationalError("terminal commit delivery control", None, RuntimeError("same DBAPI original"))
         before_error, readback_error = RuntimeError("before actual terminal commit"), RuntimeError("actual readback unavailable")
         reached = []
+        # After any error escapes the writer transaction, production reads the
+        # outcome back through the same locked-begin seam. That readback is not
+        # a second physical writer, so it is recorded apart and never faulted.
+        readbacks = []
+        readback_threads = set()
+        actual_readback = type(service)._readback_continuation_p4_transaction
+
+        def recorded_readback(self, observation, *, original, env_ref_names):
+            if self is service:
+                readbacks.append(observation)
+            readback_threads.add(threading.get_ident())
+            try:
+                return actual_readback(self, observation, original=original, env_ref_names=env_ref_names)
+            finally:
+                readback_threads.discard(threading.get_ident())
 
         @contextmanager
         def begin(self, session_id):
             candidate = None
             with actual_begin(self, session_id) as conn:
                 yield conn
-                if self is service and owner.p4 is not None:
+                if self is service and owner.p4 is not None and threading.get_ident() not in readback_threads:
                     observation = owner.p4.writer_observation
                     if observation is not None and observation.application_candidate is not None and not observation.committed:
                         candidate = observation
@@ -341,10 +357,16 @@ async def test_terminal_p4_transaction_boundaries_keep_real_original_and_one_phy
             raise error from BaseExceptionGroup("actual terminal commit delivery and readback", (original, readback_error))
 
         monkeypatch.setattr(type(service), "_session_process_locked_begin", begin)
-        if fault == "unknown_readback":
-            monkeypatch.setattr(type(service), "_readback_continuation_p4_transaction", unknown)
+        monkeypatch.setattr(
+            type(service), "_readback_continuation_p4_transaction", unknown if fault == "unknown_readback" else recorded_readback
+        )
         observed = await _finish_issued_batch(owner)
+        # Exactly one physical writer transaction; a real second writer still turns this red.
         assert len(reached) == 1, "terminal writer prerequisite: actual transaction must reach its application candidate"
+        if fault == "none":
+            assert readbacks == []
+        elif fault in ("before_commit", "after_commit"):
+            assert len(readbacks) == 1 and readbacks[0] is reached[0], "an escaped writer error must be read back once"
         phase = owner.p4
         assert phase is not None and phase.writer_observation is reached[0]
         observation = phase.writer_observation
