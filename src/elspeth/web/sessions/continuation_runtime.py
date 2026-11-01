@@ -22,12 +22,14 @@ from elspeth.web.composer.continuation_env_inventory import (
 )
 from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, TurnEvidenceSnapshot
 from elspeth.web.composer.continuation_iteration import ContinuationIterationSnapshot, decode_continuation_iteration
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy, decode_continuation_policy
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, decode_continuation_policy
 from elspeth.web.composer.continuation_prompt_producers import _CurrentProducerInputs, _read_current_inputs
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.composer.provider_cost import CommonProviderCostSnapshot
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
 from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.time_normalization import restore_utc
@@ -40,7 +42,8 @@ class ContinuationRuntimeSource:
     original: ContinuationBootstrapValues
     iteration: ContinuationIterationSnapshot
     evidence: TurnEvidenceSnapshot
-    policy: ContinuationAdmissionPolicy
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2
+    cost_snapshot: CommonProviderCostSnapshot | None
     timing: ContinuationTimingObservation
     admitted_evidence: AdmittedTurnEvidence = field(compare=False)
     attachments: ContinuationAttachmentHistory
@@ -173,6 +176,7 @@ def _runtime_source_from_inputs_on_connection(
     if iteration.producer_inputs != inputs.producer_inputs:
         raise AuditIntegrityError("runtime iteration differs from its actual current message inputs")
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+    cost_snapshot = read_continuation_cost_snapshot_on_connection(conn, selected.stack)
     segment = conn.execute(
         select(segments).where(
             segments.c.session_id == str(running.claim.session_id),
@@ -197,7 +201,7 @@ def _runtime_source_from_inputs_on_connection(
         watermark=policy.segment.watermark,
     )
     return ContinuationRuntimeSource(
-        selected, inputs.bootstrap, inputs.values, iteration, evidence, policy, timing, inputs.admitted_evidence, attachments
+        selected, inputs.bootstrap, inputs.values, iteration, evidence, policy, cost_snapshot, timing, inputs.admitted_evidence, attachments
     )
 
 

@@ -52,7 +52,7 @@ from elspeth.web.composer.private_diagnostic_facts import bind_received_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
 from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_cost import CommonProviderCostRequest
+from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostRequest
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -533,6 +533,8 @@ async def _litellm_acompletion(
         raise AuditIntegrityError("Physical provider requires exact explicit custody")
     provider_custody.required_work.validate_context(provider_custody.context)
     title = provider_custody.continuation_title
+    clock = title.clock if title is not None else provider_custody.continuation_primary_clock
+    timed_role = "TITLE" if title is not None else "PRIMARY"
     if prepared_input is None:
         prepared_input = prepare_provider_input(
             messages=kwargs["messages"],
@@ -632,7 +634,7 @@ async def _litellm_acompletion(
     provider_custody.prepare_cost_request(cost_request)
     if "max_tokens" in cost_request:
         kwargs["max_tokens"] = cost_request["max_tokens"]
-    if title is None:
+    if clock is None:
         await enforce_prompt_guard(
             mount=prompt_guard_mount,
             mode=prompt_guard_mode,
@@ -648,7 +650,7 @@ async def _litellm_acompletion(
         )
     else:
 
-        async def title_guard() -> None:
+        async def timed_guard() -> None:
             await enforce_prompt_guard(
                 mount=prompt_guard_mount,
                 mode=prompt_guard_mode,
@@ -663,31 +665,33 @@ async def _litellm_acompletion(
                 thinking_parts=thinking_parts,
             )
 
-        await title.clock.run("guard", title_guard)
+        await clock.run("guard", timed_guard)
     verify_dispatch()
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
     if continuation_input_sha256 is not None and continuation_provider_input_hash(kwargs) != continuation_input_sha256:
         raise AuditIntegrityError("Primary provider wire changed its actual prepared continuation input")
-    if title is None:
+    if clock is None:
         await provider_custody.admit(model=kwargs["model"])
     else:
 
-        async def title_quota() -> None:
+        async def timed_quota() -> None:
             await provider_custody.admit(model=kwargs["model"])
 
         try:
-            await title.clock.run("quota", title_quota)
+            await clock.run("quota", timed_quota)
         except BaseException as quota_failure:
             if provider_custody.attempt is not None:
                 try:
                     cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
                 except BaseException as disposition_failure:
                     raise BaseExceptionGroup(
-                        "TITLE quota stage and required undispatched disposition", [quota_failure, disposition_failure]
+                        f"{timed_role} quota stage and required undispatched disposition", [quota_failure, disposition_failure]
                     ) from None
                 if cancellations:
-                    raise BaseExceptionGroup("TITLE quota stage and original cancellations", [quota_failure, *cancellations]) from None
+                    raise BaseExceptionGroup(
+                        f"{timed_role} quota stage and original cancellations", [quota_failure, *cancellations]
+                    ) from None
             raise
     try:
         verify_dispatch()
@@ -706,29 +710,31 @@ async def _litellm_acompletion(
                 "Provider pre-dispatch callback and original cancellations", [callback_failure, *cancellations]
             ) from None
         raise
-    if title is None:
+    if clock is None:
         provider_custody.mark_sdk_entered()
         return await litellm.acompletion(**kwargs)
 
-    async def title_physical() -> Any:
+    async def timed_physical() -> Any:
         verify_dispatch()
-        if asyncio.get_running_loop().time() >= title.clock.deadline:
-            raise TimeoutError("TITLE original action deadline expired before SDK entry")
+        if asyncio.get_running_loop().time() >= clock.deadline:
+            raise TimeoutError(f"{timed_role} original action deadline expired before SDK entry")
         provider_custody.mark_sdk_entered()
         return await litellm.acompletion(**kwargs)
 
     try:
-        return await title.clock.run("physical", title_physical)
+        return await clock.run("physical", timed_physical)
     except BaseException as physical_failure:
         if provider_custody.has_undispatched_attempt():
             try:
                 cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
             except BaseException as disposition_failure:
                 raise BaseExceptionGroup(
-                    "TITLE physical stage and known-undispatched disposition", [physical_failure, disposition_failure]
+                    f"{timed_role} physical stage and known-undispatched disposition", [physical_failure, disposition_failure]
                 ) from None
             if cancellations:
-                raise BaseExceptionGroup("TITLE physical stage and original cancellations", [physical_failure, *cancellations]) from None
+                raise BaseExceptionGroup(
+                    f"{timed_role} physical stage and original cancellations", [physical_failure, *cancellations]
+                ) from None
         raise
 
 
@@ -775,6 +781,7 @@ class ProviderGateway:
         tools: Sequence[Mapping[str, Any]],
         *,
         user_prompt: str | None = None,
+        cost_budget: CommonProviderCostBudget | None = None,
     ) -> PreparedContinuationPrimaryRequest:
         """Freeze ordinary physical-input identity without guard/quota/SDK clearance."""
         prepared = self.prepare_loop_input(messages, tools, user_prompt=user_prompt)
@@ -788,6 +795,16 @@ class ProviderGateway:
         )
         _apply_openrouter_app_identity(kwargs)
         _apply_openrouter_usage_accounting(kwargs)
+        if cost_budget is not None:
+            if type(cost_budget) is not CommonProviderCostBudget:
+                raise AuditIntegrityError("PRIMARY preparation requires its exact admitted cost owner")
+            cost_request: CommonProviderCostRequest = {"messages": kwargs["messages"]}
+            if "tools" in kwargs:
+                cost_request["tools"] = kwargs["tools"]
+            if "max_tokens" in kwargs:
+                cost_request["max_tokens"] = kwargs["max_tokens"]
+            cost_budget.prepare_request(cost_request)
+            kwargs["max_tokens"] = cost_request["max_tokens"]
         self.verify_input(prepared)
         return PreparedContinuationPrimaryRequest(continuation_provider_input_hash(kwargs), kwargs, prepared)
 
@@ -1322,6 +1339,9 @@ class ProviderGateway:
                             max_completion_tokens_requested=(
                                 provider_custody.cost_completion_limit() if provider_custody is not None else None
                             ),
+                            cost_response_accountable=(
+                                response_metadata is not None if provider_custody is not None and provider_custody.has_cost_budget else None
+                            ),
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,
@@ -1524,6 +1544,9 @@ class ProviderGateway:
                             response_metadata=response_metadata,
                             max_completion_tokens_requested=(
                                 provider_custody.cost_completion_limit() if provider_custody is not None else None
+                            ),
+                            cost_response_accountable=(
+                                response_metadata is not None if provider_custody is not None and provider_custody.has_cost_budget else None
                             ),
                             error_class=error_class,
                             error_message=error_message,

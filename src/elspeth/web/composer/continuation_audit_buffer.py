@@ -176,6 +176,8 @@ def encode_recorder_snapshot(snapshot: RecorderSnapshot) -> PrivateChunk:
     )
     blocks = _RecorderBlocks()
     for call in projected["llm_calls"]:
+        if call["cost_response_accountable"] is None:
+            del call["cost_response_accountable"]
         call["private_request"] = _deduplicate_request(call["private_request"], blocks)
     return encode_private_chunk(
         codec=RECORDER_CODEC,

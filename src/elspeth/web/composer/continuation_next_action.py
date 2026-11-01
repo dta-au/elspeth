@@ -23,7 +23,12 @@ from elspeth.web.composer.continuation import (
     ToolBatchFrame,
 )
 from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
-from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationAdmissionPolicy, decode_continuation_policy
+from elspeth.web.composer.continuation_policy import (
+    ContinuationActionPolicy,
+    ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
+    decode_continuation_policy,
+)
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 
 if TYPE_CHECKING:
@@ -382,7 +387,9 @@ def _require_quiescent_handoff_cut(root: ContinuationFrameStack) -> None:
         raise AuditIntegrityError("next allowance cut still holds an open effect")
 
 
-def handoff_cut_allowance(root: ContinuationFrameStack, policy: ContinuationAdmissionPolicy) -> ContinuationActionPolicy | None:
+def handoff_cut_allowance(
+    root: ContinuationFrameStack, policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2
+) -> ContinuationActionPolicy | None:
     """Size the handoff-safe cuts no recovery owner produces; None for every other cut.
 
     These cuts exist only after a yield (design §2.4): a later Compose
@@ -430,9 +437,9 @@ def handoff_cut_allowance(root: ContinuationFrameStack, policy: ContinuationAdmi
 
 
 def next_continuation_action_policy(
-    *, selected: SelectedContinuationState, policy: ContinuationAdmissionPolicy
+    *, selected: SelectedContinuationState, policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2
 ) -> ContinuationActionPolicy:
-    if type(selected) is not SelectedContinuationState or type(policy) is not ContinuationAdmissionPolicy:
+    if type(selected) is not SelectedContinuationState or type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2):
         raise TypeError("next allowance requires its actual selected DATA and retained policy")
     selected.__post_init__()
     root = selected.stack

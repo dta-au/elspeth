@@ -13,7 +13,7 @@ import time
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationAdmissionPolicy
+from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2
 from elspeth.web.sessions.composer_drain import (
     COMPOSER_DRAIN_DISPOSITION_SECONDS,
     COMPOSER_DRAIN_FINISH_RESERVE_SECONDS,
@@ -25,7 +25,7 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 
 class ContinuationSQLDeadlineOwner:
     running: ComposerOperationRunning
-    policy: ContinuationAdmissionPolicy
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2
     drain_signal: ComposerDrainSignal
     drain_seconds: float
     hard_expires_at: float
@@ -40,14 +40,14 @@ class ContinuationSQLDeadlineOwner:
         self,
         running: ComposerOperationRunning,
         *,
-        policy: ContinuationAdmissionPolicy,
+        policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2,
         drain_signal: ComposerDrainSignal,
         drain_seconds: float,
         hard_expires_at: float,
     ) -> None:
         if (
             type(running) is not ComposerOperationRunning
-            or type(policy) is not ContinuationAdmissionPolicy
+            or type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2)
             or type(drain_signal) is not ComposerDrainSignal
             or type(drain_seconds) not in (float, int)
             or not math.isfinite(drain_seconds)

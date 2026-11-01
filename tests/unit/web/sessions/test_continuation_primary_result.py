@@ -7,6 +7,7 @@ current message producers, quota, original audit and settlement are real.
 import asyncio
 import json
 from dataclasses import replace
+from decimal import Decimal
 
 import litellm
 import pytest
@@ -34,6 +35,7 @@ from elspeth.web.composer.continuation_prompt_producers import load_current_mess
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash, continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostPolicy, CommonProviderCostSnapshot
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
@@ -198,7 +200,18 @@ async def post_p4_primary_input(store, tmp_path, monkeypatch):
     )
 
 
-async def publish_actual(store, tmp_path, monkeypatch, *, failure=None, post_p4=False):
+async def publish_actual(
+    store,
+    tmp_path,
+    monkeypatch,
+    *,
+    failure=None,
+    post_p4=False,
+    applicable_cost=True,
+    prebind_cost=True,
+    sdk_delay=0.0,
+    expect_timeout=False,
+):
     if post_p4:
         kwargs, produced, recorder, requests, drained = await post_p4_primary_input(store, tmp_path, monkeypatch)
     else:
@@ -215,17 +228,41 @@ async def publish_actual(store, tmp_path, monkeypatch, *, failure=None, post_p4=
         with engine.connect() as conn:
             effect = conn.execute(select(effects).where(effects.c.owner == "provider")).one()
         assert effect.disposition == "dispatched" and effect.result_chunk_key is None
+        if sdk_delay:
+            await asyncio.sleep(sdk_delay)
         if failure is not None:
             raise failure
+        usage = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        if applicable_cost:
+            usage["cost"] = 0.01
         return ModelResponse(
             model="test/model",
             choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "Actual café reply", "tool_calls": None}}],
-            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            usage=usage,
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)
     work = kwargs["required_work"]
     provider = ProviderInvocationOwner(service=store[3], required_work=work)
+    if applicable_cost and prebind_cost:
+        stack = kwargs["selected"].stack
+        policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash).provider_cost
+        budget = CommonProviderCostBudget(
+            CommonProviderCostSnapshot(
+                stack.logical.session_id,
+                stack.logical.original_user_message_id,
+                2,
+                "continuation_v2",
+                CommonProviderCostPolicy(
+                    max_provider_calls=policy.max_provider_calls,
+                    max_request_bytes=policy.max_request_bytes,
+                    max_completion_tokens=policy.max_completion_tokens,
+                    max_cumulative_provider_cost=Decimal(policy.max_cumulative_provider_cost),
+                    repair_budget=policy.repair_budget,
+                ),
+            )
+        )
+        provider.bind_cost_budget(budget)
     args = {
         "service": kwargs["service"],
         "authority": kwargs["authority"],
@@ -240,7 +277,11 @@ async def publish_actual(store, tmp_path, monkeypatch, *, failure=None, post_p4=
         "timeout": 5,
     }
     with prompt_guard_user_scope(REQUEST):
-        if failure is None:
+        if expect_timeout:
+            with pytest.raises(TimeoutError):
+                await run_continuation_primary(**args)
+            result = None
+        elif failure is None:
             result = await run_continuation_primary(**args)
         else:
             with pytest.raises(type(failure)) as caught:
@@ -249,6 +290,165 @@ async def publish_actual(store, tmp_path, monkeypatch, *, failure=None, post_p4=
             result = None
     work.coordinator.assert_completed()
     return kwargs, produced, recorder, physical_calls, result
+
+
+@pytest.mark.asyncio
+async def test_primary_uses_admitted_v2_cost_owner_for_actual_sdk_and_settlement(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
+
+    kwargs, _produced, recorder, physical_calls, result = await publish_actual(operation_store, tmp_path, monkeypatch, applicable_cost=True)
+    running = kwargs["inventory"].running
+    try:
+        assert result is not None
+        assert len(physical_calls) == len(recorder.llm_calls) == 1
+        with operation_store[0].connect() as conn:
+            attempt = conn.execute(select(physical)).one()
+            ledger = conn.execute(select(usage)).one()
+            restored = read_continuation_cost_snapshot_on_connection(conn, decode_continuation_snapshot(result.snapshot.payload_json))
+        assert attempt.ledger_entry_id == ledger.entry_id
+        assert result.outcome.audit_call.provider_cost == 0.01
+        assert result.outcome.audit_call.call_id == attempt.attempt_id
+        assert restored is not None
+        assert restored.physical_calls == 1
+        assert restored.charges[0].call_id == attempt.attempt_id
+        assert restored.charges[0].cost == Decimal("0.01")
+        assert restored.charges[0].response_accountable is True
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_primary_cold_sql_bootstrap_keeps_paid_cost_and_refuses_call_cap_before_sdk(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
+    from elspeth.web.composer.provider_cost import CommonProviderCostRefused
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
+    from tests.helpers.continuation_policy import continuation_test_settings
+    from tests.unit.web.sessions import test_continuation_cold_restore
+
+    admitted = continuation_policy_from_settings(
+        continuation_test_settings(
+            composer_planner_max_provider_calls=1,
+            composer_planner_max_cumulative_provider_cost=Decimal("0.015"),
+        )
+    )
+    authority = ComposerAsyncOperationAuthority(
+        operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=admitted
+    )
+    store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
+    monkeypatch.setattr(test_continuation_cold_restore, "minimal_continuation_policy", lambda: admitted)
+    kwargs, produced, recorder, physical_calls, result = await publish_actual(
+        store, tmp_path, monkeypatch, applicable_cost=True, prebind_cost=False
+    )
+    try:
+        assert result is not None
+        assert len(physical_calls) == 1
+        with operation_store[0].connect() as conn:
+            restored = read_continuation_cost_snapshot_on_connection(conn, decode_continuation_snapshot(result.snapshot.payload_json))
+            assert len(conn.execute(select(physical)).all()) == 1
+            assert len(conn.execute(select(usage)).all()) == 1
+        assert restored is not None
+        assert restored.physical_calls == len(restored.charges) == 1
+        assert restored.validated_cost == Decimal("0.01")
+        assert restored.refusal_code is None
+        with prompt_guard_user_scope(REQUEST), pytest.raises(CommonProviderCostRefused, match="PROVIDER_CALLS_EXHAUSTED"):
+            kwargs["service"]._provider_gateway.prepare_continuation_primary(
+                list(produced.messages), [], user_prompt=REQUEST, cost_budget=CommonProviderCostBudget(restored)
+            )
+        assert len(physical_calls) == 1
+
+        running = kwargs["inventory"].running
+        read_work = inventory_work(running)
+        selected = await load_selected_continuation(authority=authority, running=running, selected=result.snapshot, required_work=read_work)
+        inventory = await materialize_continuation_env_inventory(
+            advisor=inventory_advisor(store[3]), authority=authority, selected=selected, required_work=read_work
+        )
+        read_work.coordinator.assert_completed()
+        produced.producers.advance_current(selected, inventory)
+        stale = CommonProviderCostBudget(
+            CommonProviderCostSnapshot(restored.session_id, restored.request_id, 2, "continuation_v2", restored.policy)
+        )
+        next_work = inventory_work(running)
+        next_owner = ProviderInvocationOwner(service=store[3], required_work=next_work)
+        next_owner.bind_cost_budget(stale)
+        with prompt_guard_user_scope(REQUEST), pytest.raises(AuditIntegrityError, match="complete current SQL source"):
+            await run_continuation_primary(
+                service=kwargs["service"],
+                authority=authority,
+                selected=selected,
+                producers=produced.producers,
+                messages=list(produced.messages),
+                tools=[],
+                recorder=recorder,
+                drained=RecorderDrainCursors(),
+                required_work=next_work,
+                provider_owner=next_owner,
+                timeout=5,
+            )
+        next_work.coordinator.assert_completed()
+        assert len(physical_calls) == 1
+        with operation_store[0].connect() as conn:
+            assert len(conn.execute(select(physical)).all()) == 1
+            assert len(conn.execute(select(usage)).all()) == 1
+    finally:
+        store[1].release(kwargs["inventory"].running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_primary_clips_operator_completion_override_before_retained_input_hash(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from tests.helpers.continuation_policy import continuation_test_settings
+    from tests.unit.web.sessions import test_continuation_cold_restore
+
+    admitted = continuation_policy_from_settings(continuation_test_settings(composer_planner_max_completion_tokens=3))
+    authority = ComposerAsyncOperationAuthority(
+        operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=admitted
+    )
+    store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
+    monkeypatch.setattr(test_continuation_cold_restore, "minimal_continuation_policy", lambda: admitted)
+    kwargs, _produced, _recorder, physical_calls, result = await publish_actual(store, tmp_path, monkeypatch, applicable_cost=True)
+    try:
+        assert result is not None and len(physical_calls) == 1
+        assert physical_calls[0]["max_tokens"] == 3
+        frame = decode_continuation_snapshot(result.snapshot.payload_json).frames[-1]
+        assert frame.provider_input_sha256 == continuation_provider_input_hash(physical_calls[0])
+        assert result.outcome.audit_call.max_completion_tokens_requested == 3
+    finally:
+        store[1].release(kwargs["inventory"].running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_primary_physical_stage_expires_during_actual_sdk_before_total_action_timeout(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from tests.helpers.continuation_policy import continuation_test_settings
+    from tests.unit.web.sessions import test_continuation_cold_restore
+
+    base = continuation_policy_from_settings(continuation_test_settings())
+    primary = base.actions.primary.model_copy(update={"physical": 0.05})
+    admitted = base.model_copy(update={"actions": base.actions.model_copy(update={"primary": primary})})
+    authority = ComposerAsyncOperationAuthority(
+        operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=admitted
+    )
+    store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
+    monkeypatch.setattr(test_continuation_cold_restore, "minimal_continuation_policy", lambda: admitted)
+    kwargs, _produced, _recorder, physical_calls, result = await publish_actual(
+        store, tmp_path, monkeypatch, applicable_cost=True, sdk_delay=0.2, expect_timeout=True
+    )
+    try:
+        assert result is None
+        assert len(physical_calls) == 1
+        with operation_store[0].connect() as conn:
+            attempt = conn.execute(select(physical)).one()
+            ledger = conn.execute(select(usage)).one()
+            effect = conn.execute(select(effects).where(effects.c.owner == "provider")).one()
+        assert attempt.settled_at is not None
+        assert attempt.ledger_entry_id == ledger.entry_id
+        assert effect.disposition == "dispatched"
+        assert effect.provider_attempt_id is None
+    finally:
+        store[1].release(kwargs["inventory"].running.session_operation_context)
 
 
 @pytest.mark.asyncio
@@ -442,8 +642,8 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
     original_outcome = ProviderGateway._call_llm_outcome_with_audit
     prepared = []
 
-    def observe(self, messages, tools, *, user_prompt=None):
-        actual = original(self, messages, tools, user_prompt=user_prompt)
+    def observe(self, messages, tools, *, user_prompt=None, cost_budget=None):
+        actual = original(self, messages, tools, user_prompt=user_prompt, cost_budget=cost_budget)
         prepared.append(actual)
         return actual
 
@@ -518,6 +718,7 @@ async def test_primary_input_refuses_changed_selected_message_after_actual_compl
         "tools": [],
         "recorder": recorder,
         "drained": RecorderDrainCursors(),
+        "cost_budget": None,
     }
     try:
         actual = await asyncio.to_thread(_freeze_input, **args)

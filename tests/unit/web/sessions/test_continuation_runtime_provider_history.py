@@ -92,7 +92,7 @@ async def prepared_runtime(store, tmp_path, monkeypatch, *, tool_calls=None):
                     },
                 }
             ],
-            usage={"prompt_tokens": 13 + number, "completion_tokens": 5, "total_tokens": 18 + number},
+            usage={"prompt_tokens": 13 + number, "completion_tokens": 5, "total_tokens": 18 + number, "cost": 0.01},
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)

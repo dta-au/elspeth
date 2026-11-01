@@ -28,6 +28,7 @@ from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continu
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
     ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
     decode_continuation_policy,
 )
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
@@ -475,12 +476,15 @@ class ComposerAsyncOperationAuthority:
         *,
         owner_instance_id: str,
         claim_lease_seconds: int,
-        continuation_policy: ContinuationAdmissionPolicy | None = None,
+        continuation_policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | None = None,
     ) -> None:
         """``continuation_policy`` is required to admit; read-only owners may omit it."""
         if engine.dialect.name not in ("sqlite", "postgresql") or not owner_instance_id.strip() or not 5 <= claim_lease_seconds <= 600:
             raise ValueError("invalid composer operation authority configuration")
-        if continuation_policy is not None and type(continuation_policy) is not ContinuationAdmissionPolicy:
+        if continuation_policy is not None and type(continuation_policy) not in (
+            ContinuationAdmissionPolicy,
+            ContinuationAdmissionPolicyV2,
+        ):
             raise TypeError("continuation policy must be its owned complete admission policy")
         self._engine = engine
         self._owner_instance_id = owner_instance_id

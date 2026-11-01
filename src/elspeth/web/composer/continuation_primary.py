@@ -20,14 +20,16 @@ from elspeth.web.async_workers import run_required_sql_finish_once
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation import ComposeFrame
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, owned_json
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
-from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV2, decode_continuation_policy
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.continuation_tool_batch import _state_from_tool_json
 from elspeth.web.composer.protocol import ComposerContextUnsupported
+from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostSnapshot, continuation_common_cost_policy
 from elspeth.web.composer.provider_gateway import PreparedContinuationPrimaryRequest
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -37,6 +39,7 @@ from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import PreparedContinuationProvider, StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
+from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +93,7 @@ def _project[T](
                 PreparedContinuationProvider,
                 StoredContinuationSnapshot,
                 PrimaryProviderResult,
+                ContinuationRuntimeSource,
             ):
                 raise AuditIntegrityError("primary SQL returned an unfamiliar owned result")
             value = outcome.value
@@ -123,6 +127,7 @@ def _freeze_input(
     tools: list[dict[str, Any]],
     recorder: BufferingRecorder,
     drained: RecorderDrainCursors,
+    cost_budget: CommonProviderCostBudget | None,
 ) -> PreparedPrimaryInvocation:
     if (
         type(service) is not ComposerServiceImpl
@@ -166,7 +171,9 @@ def _freeze_input(
     # worker does not carry the async prompt ContextVar; its actual admitted
     # bootstrap owns the original authenticated human input explicitly.
     try:
-        request = service._provider_gateway.prepare_continuation_primary(messages, tools, user_prompt=current_inputs.values.message)
+        request = service._provider_gateway.prepare_continuation_primary(
+            messages, tools, user_prompt=current_inputs.values.message, cost_budget=cost_budget
+        )
     except ComposerContextUnsupported:
         producers._require_current()
         raise
@@ -208,9 +215,46 @@ async def run_continuation_primary(
     if type(selected) is not SelectedContinuationState or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
         raise AuditIntegrityError("primary invocation requires its actual selected input and finite positive allowance")
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+    started = time.monotonic()
+    clock = ContinuationActionClock(policy.actions.primary)
+    budget = provider_owner.cost_budget
+    if type(policy) is ContinuationAdmissionPolicyV2:
+        source_sql, source_projection = required_work.reserve_pair(
+            RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION
+        )
+        try:
+            source_outcome = await run_required_sql_finish_once(
+                source_sql,
+                authority.read_continuation_runtime,
+                running,
+                selected=selected,
+                inventory=producers.inventory,
+            )
+        except BaseException:
+            source_projection.complete_without_submission()
+            raise
+        source_runtime = _project(required_work, source_sql, source_projection, RequiredWorkSource.CONTINUATION_READ_SQL, source_outcome)
+        if type(source_runtime) is not ContinuationRuntimeSource or type(source_runtime.cost_snapshot) is not CommonProviderCostSnapshot:
+            raise AuditIntegrityError("PRIMARY cost read lost its complete original SQL source")
+        if budget is None:
+            provider_owner.bind_cost_budget(CommonProviderCostBudget(source_runtime.cost_snapshot))
+            budget = provider_owner.cost_budget
+            if budget is None:
+                raise AuditIntegrityError("PRIMARY could not bind its original cost owner")
+        elif budget.snapshot() != source_runtime.cost_snapshot:
+            raise AuditIntegrityError("PRIMARY cost owner differs from its complete current SQL source")
+        budget.validate_binding(
+            session_id=selected.stack.logical.session_id,
+            request_id=selected.stack.logical.original_user_message_id,
+            lifecycle_version=2,
+        )
+        if budget.snapshot().applicability != "continuation_v2" or budget.snapshot().policy != continuation_common_cost_policy(policy):
+            raise AuditIntegrityError("PRIMARY cost owner differs from its immutable admitted policy")
+        budget.require_supported_configuration()
+    elif budget is not None:
+        raise AuditIntegrityError("legacy Continuation policy cannot activate a current cost allowance")
     if timeout > policy.actions.primary.total:
         raise AuditIntegrityError("primary invocation cannot renew its retained action allowance")
-    started = time.monotonic()
     deadline = started + timeout
     deadline_owner = required_work.coordinator.sql_deadline_owner
     if deadline_owner is not None:
@@ -219,10 +263,6 @@ async def run_continuation_primary(
         deadline = min(deadline, started + deadline_owner.remaining_dispatch(monotonic_now=started))
     if deadline <= started:
         raise TimeoutError("primary action exhausted its original allowance before input preparation")
-    # None is the retained lifecycle-v2 cost contract. An applicable monetary
-    # owner needs its separately approved prepared-input/allowance join.
-    if provider_owner.cost_budget is not None:
-        raise AuditIntegrityError("primary continuation cannot replace an applicable monetary allowance owner")
     sql, projection = required_work.reserve_pair(RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION)
     try:
         captured = await run_required_sql_finish_once(
@@ -236,6 +276,7 @@ async def run_continuation_primary(
             tools=tools,
             recorder=recorder,
             drained=drained,
+            cost_budget=budget,
         )
     except BaseException:
         projection.complete_without_submission()
@@ -279,7 +320,9 @@ async def run_continuation_primary(
     dispatched = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_STATE_SQL, dispatch_outcome)
     if type(dispatched) is not StoredContinuationSnapshot:
         raise AuditIntegrityError("primary dispatch intent lost its actual complete root")
+    clock.finish_preparation()
     custody = provider_owner.mint(ProviderInvocationFamily.PRIMARY)
+    custody.bind_continuation_primary_clock(clock)
     frame = selected.stack.frames[-1]
     if type(frame) is not ComposeFrame:
         raise AuditIntegrityError("primary dispatch lost its actual compose state")
@@ -314,14 +357,17 @@ async def run_continuation_primary(
         RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
     )
     try:
-        published = await run_required_sql_finish_once(
-            sql,
-            authority.publish_continuation_primary,
-            prepared.binding,
-            selected=dispatched,
-            outcome=actual,
-            recorder=snapshot,
-            env_ref_names=producers.inventory.names,
+        published = await clock.run(
+            "retention",
+            lambda: run_required_sql_finish_once(
+                sql,
+                authority.publish_continuation_primary,
+                prepared.binding,
+                selected=dispatched,
+                outcome=actual,
+                recorder=snapshot,
+                env_ref_names=producers.inventory.names,
+            ),
         )
     except BaseException:
         projection.complete_without_submission()

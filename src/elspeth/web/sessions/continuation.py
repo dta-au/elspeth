@@ -34,6 +34,7 @@ from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUME
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
     ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
     ContinuationSegmentPolicy,
     decode_continuation_policy,
 )
@@ -678,6 +679,7 @@ def append_complete_snapshot(
     if (
         frame_stack.logical != previous_stack.logical
         or frame_stack.mutation_ceiling != previous_stack.mutation_ceiling
+        or frame_stack.provider_cost_policy != previous_stack.provider_cost_policy
         or frame_stack.policy_hash != previous_stack.policy_hash
         or frame_stack.admission_policy_json != previous_stack.admission_policy_json
         or frame_stack.cursor not in (expected_cursor, expected_cursor + len(event_batch))
@@ -762,7 +764,7 @@ def append_complete_snapshot(
 @dataclass(frozen=True, slots=True)
 class _SegmentStartSelection:
     snapshot: StoredContinuationSnapshot
-    policy: ContinuationAdmissionPolicy
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2
     action: ContinuationActionPolicy
     action_json: str
 
@@ -774,7 +776,7 @@ def _initial_segment_action(
     segment: Row[Any],
     snapshot: StoredContinuationSnapshot,
     stack: ContinuationFrameStack,
-    policy: ContinuationAdmissionPolicy,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2,
 ) -> ContinuationActionPolicy:
     del conn
     if (
@@ -811,7 +813,7 @@ def _selected_segment_action(
     segment: Row[Any],
     snapshot: StoredContinuationSnapshot,
     stack: ContinuationFrameStack,
-    policy: ContinuationAdmissionPolicy,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2,
 ) -> ContinuationActionPolicy:
     if segment.sequence == 1 and segment.generation == 1:
         return _initial_segment_action(conn, parent=parent, segment=segment, snapshot=snapshot, stack=stack, policy=policy)
@@ -896,7 +898,7 @@ class ComposerSegmentStartObservation:
     context: SessionOperationContext | None = None
     committed: bool = False
     reconciled: bool = False
-    policy: ContinuationAdmissionPolicy | None = None
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | None = None
     hard_expires_at: float | None = None
 
 

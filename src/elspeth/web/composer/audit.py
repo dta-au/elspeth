@@ -534,6 +534,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "seed",
     "provider_cost",
     "provider_cost_source",
+    "cost_response_accountable",
     "pricing_model",
     "max_completion_tokens_requested",
     "planner_policy_hash",
@@ -546,7 +547,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
 
 def _public_llm_call_audit_payload(call: ComposerLLMCall) -> dict[str, Any]:
     raw = call.to_dict()
-    return {field: raw[field] for field in _LLM_CALL_PUBLIC_AUDIT_FIELDS}
+    return {field: raw[field] for field in _LLM_CALL_PUBLIC_AUDIT_FIELDS if field != "cost_response_accountable" or raw[field] is not None}
 
 
 def llm_call_audit_envelope(call: ComposerLLMCall) -> dict[str, object]:

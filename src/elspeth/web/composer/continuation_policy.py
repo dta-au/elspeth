@@ -7,6 +7,7 @@ custody. Current security and capability admission still run at every use.
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from typing import Annotated, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -20,7 +21,8 @@ PositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)
 # The persisted policy's version tag. A later shape is a NEW frozen model with a
 # new tag; this v1 model is never edited once admitted operations retain it.
 CONTINUATION_POLICY_SCHEMA_VERSION: Final = "composer.continuation.policy.v1"
-_KNOWN_POLICY_SCHEMA_VERSIONS: Final = frozenset({CONTINUATION_POLICY_SCHEMA_VERSION})
+CONTINUATION_POLICY_SCHEMA_VERSION_V2: Final = "composer.continuation.policy.v2"
+_KNOWN_POLICY_SCHEMA_VERSIONS: Final = frozenset({CONTINUATION_POLICY_SCHEMA_VERSION, CONTINUATION_POLICY_SCHEMA_VERSION_V2})
 
 
 class ContinuationActionPolicy(BaseModel):
@@ -100,7 +102,53 @@ class ContinuationAdmissionPolicy(BaseModel):
         return stable_hash(self.model_dump(mode="json"))
 
 
-def decode_continuation_policy(encoded: str, expected_hash: str) -> ContinuationAdmissionPolicy:
+class ContinuationAdmittedCostPolicy(BaseModel):
+    """Frozen cost limits captured from the existing operator settings."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    max_provider_calls: Annotated[int, Field(strict=True, ge=1)]
+    max_request_bytes: Annotated[int, Field(strict=True, ge=1)]
+    max_completion_tokens: Annotated[int, Field(strict=True, ge=1)]
+    max_cumulative_provider_cost: Decimal
+    repair_budget: Annotated[int, Field(strict=True, ge=0)]
+
+    @model_validator(mode="after")
+    def _finite_cost(self) -> Self:
+        if not self.max_cumulative_provider_cost.is_finite() or self.max_cumulative_provider_cost < 0:
+            raise ValueError("provider cost limit requires finite nonnegative Decimal")
+        return self
+
+
+class ContinuationAdmissionPolicyV2(BaseModel):
+    """New immutable admission shape; persisted v1 operations retain their decoder."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    schema_version: Literal["composer.continuation.policy.v2"] = CONTINUATION_POLICY_SCHEMA_VERSION_V2
+    segment: ContinuationSegmentPolicy
+    actions: ContinuationActionBounds
+    provider_cost: ContinuationAdmittedCostPolicy
+
+    @model_validator(mode="after")
+    def _finite_segment_sizing(self) -> Self:
+        for action in (
+            self.actions.primary,
+            self.actions.advisor,
+            self.actions.title,
+            self.actions.read,
+            self.actions.session_sql,
+            self.actions.blob,
+            self.actions.external,
+        ):
+            if not math.isfinite(action.total + self.segment.reserve + self.segment.watermark):
+                raise ValueError("complete segment sizing allowance must be finite")
+        return self
+
+    @property
+    def policy_hash(self) -> str:
+        return stable_hash(self.model_dump(mode="json"))
+
+
+def decode_continuation_policy(encoded: str, expected_hash: str) -> ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2:
     value, error = parse_json_strict(encoded)
     if error is not None:
         raise AuditIntegrityError("continuation policy is not strict JSON")
@@ -112,7 +160,8 @@ def decode_continuation_policy(encoded: str, expected_hash: str) -> Continuation
     if type(version) is not str or version not in _KNOWN_POLICY_SCHEMA_VERSIONS:
         raise AuditIntegrityError("continuation policy has an unknown schema version")
     try:
-        policy = ContinuationAdmissionPolicy.model_validate_json(canonical_json(value))
+        kind = ContinuationAdmissionPolicy if version == CONTINUATION_POLICY_SCHEMA_VERSION else ContinuationAdmissionPolicyV2
+        policy = kind.model_validate_json(canonical_json(value))
     except ValueError as exc:
         raise AuditIntegrityError("continuation policy violates its complete owned contract") from exc
     if policy.policy_hash != expected_hash:

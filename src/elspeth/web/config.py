@@ -388,11 +388,11 @@ class WebSettings(BaseModel):
         ),
     )
     composer_timeout_seconds: float = Field(..., gt=0)
-    # Direct planner policy and legacy eligible Web v1 compatibility bounds.
-    # Common v1 preserves physical calls, exact request bytes, completion and
-    # post-call cost; v2 has no legacy planner policy. The repair value is
-    # facade compatibility only: default 2 does not control common repair;
-    # a nondefault value refuses eligible v1 admission before provider work.
+    # Existing direct-planner and legacy v1 limits also bind newly admitted
+    # Continuation v2 PRIMARY/Advisor calls for one logical Compose request.
+    # TITLE has independent accounting and does not consume this budget.
+    # The repair value remains a supported-configuration sentinel: only 2 is
+    # admitted, and it does not reset or size the common repair counter.
     composer_planner_max_provider_calls: int = Field(default=75, strict=True, ge=1)
     composer_planner_max_request_bytes: int = Field(default=2 * 1024 * 1024, strict=True, ge=1)
     composer_planner_max_completion_tokens: int = Field(default=16_384, strict=True, ge=1)

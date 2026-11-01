@@ -13,6 +13,8 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationActionBounds,
     ContinuationActionPolicy,
     ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
+    ContinuationAdmittedCostPolicy,
     ContinuationSegmentPolicy,
 )
 from elspeth.web.config import WebSettings
@@ -53,7 +55,7 @@ def _local_action(stages: ContinuationLocalStageSettings) -> ContinuationActionP
     )
 
 
-def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicy:
+def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicyV2:
     """The complete validated Continuation admission policy."""
     if type(settings) is not WebSettings:
         raise TypeError("continuation policy requires the owned WebSettings")
@@ -62,7 +64,7 @@ def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmi
     advisor_guard_settings = settings.composer_advisor_prompt_guard
     advisor_guard = _guard_seconds(advisor_guard_settings if advisor_guard_settings is not None else settings.composer_prompt_guard)
     advisor = bounds.advisor
-    policy = ContinuationAdmissionPolicy(
+    policy = ContinuationAdmissionPolicyV2(
         segment=ContinuationSegmentPolicy(
             nominal=settings.composer_continuation_segment_nominal_seconds,
             watermark=settings.composer_continuation_watermark_seconds,
@@ -84,6 +86,13 @@ def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmi
             blob=_local_action(bounds.blob),
             external=_local_action(bounds.external),
         ),
+        provider_cost=ContinuationAdmittedCostPolicy(
+            max_provider_calls=settings.composer_planner_max_provider_calls,
+            max_request_bytes=settings.composer_planner_max_request_bytes,
+            max_completion_tokens=settings.composer_planner_max_completion_tokens,
+            max_cumulative_provider_cost=settings.composer_planner_max_cumulative_provider_cost,
+            repair_budget=settings.composer_planner_repair_budget,
+        ),
     )
     _require_first_segment_fits_its_chain(policy)
     return policy
@@ -98,7 +107,7 @@ def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmi
 _FIRST_SEGMENT_SESSION_SQL_ACTIONS: Final = 3
 
 
-def _require_first_segment_fits_its_chain(policy: ContinuationAdmissionPolicy) -> None:
+def _require_first_segment_fits_its_chain(policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2) -> None:
     actions = policy.actions
     chain = actions.title.total + _FIRST_SEGMENT_SESSION_SQL_ACTIONS * actions.session_sql.total
     required = actions.primary.total + policy.segment.reserve + chain

@@ -19,6 +19,7 @@ from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecrypti
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.protocol import ComposerContextUnsupported, ComposerMutationAuthorityRevoked
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.required_executor import RequiredGenerationUnavailable
@@ -30,6 +31,16 @@ if TYPE_CHECKING:
 
 _JSON: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 _RETRYABLE_STORAGE_ERRNOS = frozenset((errno.EIO, errno.ENOSPC, errno.EROFS))
+_COST_REFUSAL_PUBLIC: dict[str, tuple[int, str, str]] = {
+    "REPAIR_POLICY_UNSUPPORTED": (503, "configuration_unsupported", "The configured composer repair budget is unsupported."),
+    "COST_UNAVAILABLE": (503, "cost_unavailable", "The composer could not determine the model cost."),
+    "COST_CAP_EXCEEDED": (422, "provider_policy_refused", "This request reached its admitted model cost limit."),
+    "PROVIDER_CALLS_EXHAUSTED": (422, "provider_policy_refused", "This request reached its admitted provider call limit."),
+    "REQUEST_BYTES_EXHAUSTED": (422, "provider_policy_refused", "This provider request exceeds its admitted byte limit."),
+    "COMPLETION_TOKENS_EXCEEDED": (502, "invalid_provider_response", "The model exceeded the admitted completion limit."),
+    "MALFORMED_RESPONSE": (502, "invalid_provider_response", "The model returned an unusable response."),
+    "RESPONSE_TRUNCATED": (502, "invalid_provider_response", "The model response was truncated."),
+}
 
 
 def _http_error(status: int, body: dict[str, JsonValue], error_type: str | None = None) -> ComposerOperationError:
@@ -247,6 +258,16 @@ def project_composer_operation_error(
     if len(leaves) != 1:
         return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
     leaf = leaves[0]
+    if isinstance(leaf, CommonProviderCostRefused):
+        admitted = _COST_REFUSAL_PUBLIC.get(leaf.code)
+        if admitted is None:
+            return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
+        cost_status, cost_error_type, cost_detail = admitted
+        return _http_error(
+            cost_status,
+            {"error_type": cost_error_type, "detail": cost_detail, "request_id": request_id},
+            cost_error_type,
+        )
     if isinstance(leaf, ComposerMutationAuthorityRevoked):
         mutation_payload: dict[str, JsonValue] = {**leaf.to_payload()}
         return _http_error(409, {"detail": mutation_payload}, "composer_mutation_authority_revoked")

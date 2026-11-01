@@ -15,7 +15,9 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.continuation_policy import (
     CONTINUATION_POLICY_SCHEMA_VERSION,
+    CONTINUATION_POLICY_SCHEMA_VERSION_V2,
     ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
@@ -44,7 +46,7 @@ def _enabled(**overrides: Any) -> WebSettings:
     return continuation_test_settings(**overrides)
 
 
-def _policy(**overrides: Any) -> ContinuationAdmissionPolicy:
+def _policy(**overrides: Any) -> ContinuationAdmissionPolicyV2:
     policy = continuation_policy_from_settings(_enabled(**overrides))
     assert policy is not None
     return policy
@@ -59,7 +61,7 @@ def _bounds_with(role: str, stage: str, value: float) -> dict[str, Any]:
 def test_production_policy_from_settings_round_trips_and_is_versioned() -> None:
     policy = _policy()
     encoded = policy.model_dump_json()
-    assert json.loads(encoded)["schema_version"] == CONTINUATION_POLICY_SCHEMA_VERSION == "composer.continuation.policy.v1"
+    assert json.loads(encoded)["schema_version"] == CONTINUATION_POLICY_SCHEMA_VERSION_V2 == "composer.continuation.policy.v2"
     assert decode_continuation_policy(encoded, policy.policy_hash) == policy
 
 
@@ -156,7 +158,6 @@ def test_action_bounds_read_from_one_json_environment_object(monkeypatch: pytest
         "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85",
         "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
         "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
-        "ELSPETH_WEB__COMPOSER_CONTINUATION_ENABLED": "true",
         "ELSPETH_WEB__COMPOSER_CONTINUATION_ACTION_BOUNDS": json.dumps(_bounds_with("session_sql", "retention", 7.5)),
     }.items():
         monkeypatch.setenv(key, value)
@@ -188,7 +189,9 @@ def test_policy_decode_refuses_missing_unknown_added_and_removed_fields(mutate: 
 
 
 def test_v1_policy_golden_bytes_and_hash_are_pinned() -> None:
-    policy = _policy()
+    current = _policy()
+    policy = ContinuationAdmissionPolicy(segment=current.segment, actions=current.actions)
+    assert policy.schema_version == CONTINUATION_POLICY_SCHEMA_VERSION
     # Pinned v1 encoding and identity of the production defaults. A change here
     # is a new policy identity for every admitted operation: re-pin deliberately.
     assert policy.model_dump_json() == _GOLDEN_V1_ENCODING
@@ -221,7 +224,7 @@ def test_fixture_is_the_production_policy() -> None:
 
 def test_fixture_construction_path_is_the_settings_mapping() -> None:
     assert continuation_policy_from_settings(continuation_test_settings()) == minimal_continuation_policy()
-    assert type(minimal_continuation_policy()) is ContinuationAdmissionPolicy
+    assert type(minimal_continuation_policy()) is ContinuationAdmissionPolicyV2
 
 
 def test_app_wires_the_settings_policy_into_the_composer_authority(tmp_path: Any) -> None:

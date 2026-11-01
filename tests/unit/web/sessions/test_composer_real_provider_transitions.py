@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,17 +12,22 @@ from uuid import UUID, uuid4
 
 import litellm
 import pytest
+import structlog
 from httpx import ASGITransport, AsyncClient, MockTransport, Response
 from jsonschema import Draft202012Validator
 from sqlalchemy import select
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
+from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_gateway import (
     ProviderGateway,
     _admit_composer_llm_completion,
@@ -31,12 +37,15 @@ from elspeth.web.composer.service import ComposerAvailability, ComposerServiceIm
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
 from elspeth.web.prompt_guard_config import PromptGuardSettings
+from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+from elspeth.web.sessions.continuation_driver import _SegmentDriver
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import (
     composer_async_operations_table,
     quota_provider_attempts_table,
     token_usage_ledger_table,
 )
+from elspeth.web.sessions.service import SessionServiceImpl
 from tests.helpers.composer_operations import (
     message_body,
     recompose_body,
@@ -60,8 +69,94 @@ class _Dispatch:
 async def test_each_real_composer_transition_has_its_own_settled_provider_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transition: str
 ) -> None:
-    app, service = _make_app(tmp_path, quota_enabled=True)
+    app, fixture_service = _make_app(tmp_path, quota_enabled=True)
     engine = app.state.session_engine
+    # The route fixture uses a subclass for old direct-turn shortcuts. The live
+    # Continuation pre-title owner requires the exact production service type.
+    service = SessionServiceImpl(
+        engine,
+        telemetry=app.state.sessions_telemetry,
+        log=structlog.get_logger("test"),
+        session_operation_authority=fixture_service.session_operation_authority,
+        owner_instance_id=fixture_service.session_operation_owner_instance_id,
+        chargeable_admission_policy=fixture_service._chargeable_admission_policy,
+    )
+    app.state.session_service = service
+    from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
+    from elspeth.web.composer import continuation_evidence
+    from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    from elspeth.web.composer.continuation_retention import retained_model_json_view
+
+    evidence_pairs: list[tuple[int | None, int]] = []
+    rejected_evidence_pairs: list[tuple[int | None, int]] = []
+    rejected_tool_phases: list[tuple[str, str, str | None]] = []
+    original_encode_evidence = continuation_evidence._encode_turn_evidence_source
+    original_advance = ContinuationLivePhases.advance
+
+    def measure_evidence_pair(*args, **kwargs):
+        evidence_bytes = bounded_canonical_json_size(
+            retained_model_json_view(args[0]), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        ).admitted_bytes
+        recorder_bytes = kwargs["recorder_chunk"].reference.byte_length
+        evidence_pairs.append((evidence_bytes, recorder_bytes))
+        try:
+            return original_encode_evidence(*args, **kwargs)
+        except AuditIntegrityError as error:
+            if str(error) == "evidence and original recorder exceed their complete pair bound":
+                rejected_evidence_pairs.append((evidence_bytes, recorder_bytes))
+            raise
+
+    monkeypatch.setattr(continuation_evidence, "_encode_turn_evidence_source", measure_evidence_pair)
+
+    async def observe_tool_phase(self, selected):
+        try:
+            return await original_advance(self, selected)
+        except AuditIntegrityError as error:
+            if str(error) == "selected phase has no matching live tool action":
+                top = selected.stack.frames[-1]
+                graph = self.runtime.graph if self.runtime is not None else None
+                batch = graph.batch if graph is not None else None
+                rejected_tool_phases.append(
+                    (
+                        type(top).__name__,
+                        top.phase if type(top) in (ComposeFrame, ToolBatchFrame) else "no-phase",
+                        batch.batch.phase if batch is not None else None,
+                    )
+                )
+            raise
+
+    monkeypatch.setattr(ContinuationLivePhases, "advance", observe_tool_phase)
+    worker_failures: list[BaseException] = []
+    settled_failures: list[BaseException] = []
+    original_finished = ComposerAsyncWorker._job_finished
+    original_settle = _SegmentDriver.settle
+
+    def capture_worker_failure(self, key, task):
+        if self is app.state.composer_async_worker and not task.cancelled():
+            failure = task.exception()
+            if failure is not None:
+                worker_failures.append(failure)
+        original_finished(self, key, task)
+
+    monkeypatch.setattr(ComposerAsyncWorker, "_job_finished", capture_worker_failure)
+
+    async def capture_settlement_failure(self, record, original=None):
+        if original is not None:
+            settled_failures.append(original)
+        return await original_settle(self, record, original)
+
+    monkeypatch.setattr(_SegmentDriver, "settle", capture_settlement_failure)
+
+    def safe_failure(error: BaseException) -> str:
+        if isinstance(error, BaseExceptionGroup):
+            return "group(" + ", ".join(safe_failure(child) for child in error.exceptions) + ")"
+        if type(error) in (AuditIntegrityError, CommonProviderCostRefused):
+            return f"{type(error).__name__}: {str(error).splitlines()[0]}"
+        if type(error) is AttributeError:
+            line = str(error).splitlines()[0]
+            if re.fullmatch(r"'[A-Za-z_][A-Za-z_0-9]*' object has no attribute '[A-Za-z_][A-Za-z_0-9]*'", line):
+                return f"AttributeError: {line}"
+        return type(error).__name__
 
     def local_available(**kwargs: object) -> ComposerAvailability:
         model = kwargs["model"]
@@ -286,7 +381,7 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                     "finish_reason": "tool_calls" if tool_calls else "stop",
                 }
             ],
-            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": 0.01},
         )
 
     # Leave ProviderGateway, physical admission, audited advisor and settlement real.
@@ -309,12 +404,16 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                 operation_id = str(uuid4())
                 operation_ids.append(operation_id)
                 if transition == "recompose":
-                    user = await service.add_message(
-                        UUID(session_id),
-                        "user",
-                        "Hello",
-                        writer_principal="route_user_message",
-                    )
+                    from tests.helpers.session_fences import fenced_operation_context
+
+                    with fenced_operation_context(engine, session_id) as context:
+                        user = await service.add_message(
+                            UUID(session_id),
+                            "user",
+                            "Hello",
+                            writer_principal="route_user_message",
+                            session_operation_context=context,
+                        )
                     path = f"/api/sessions/{session_id}/recompose"
                     body = recompose_body(user.id, operation_id=operation_id)
                 else:
@@ -329,8 +428,23 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
                         operation_id=operation_id,
                     )
                 before = len(dispatches)
-                settled = await submit_and_settle(client, app, path=path, body=body)
-                assert settled.final.json()["status"] == "completed", settled.final.text
+                try:
+                    settled = await submit_and_settle(client, app, path=path, body=body)
+                except AssertionError as error:
+                    if worker_failures:
+                        raise AssertionError(f"{error}; original worker failure: {worker_failures[-1]!r}") from error
+                    raise
+                assert settled.final.json()["status"] == "completed", (
+                    settled.final.text
+                    + "; original settlement failure: "
+                    + safe_failure(settled_failures[-1])
+                    + f"; evidence/recorder byte pairs: {evidence_pairs[-6:]}"
+                    + f"; rejected pair: {rejected_evidence_pairs[-1:]}"
+                    + f"; rejected tool phases: {rejected_tool_phases[-3:]}"
+                    + f"; provider dispatch count: {len(dispatches)}"
+                    if settled_failures
+                    else settled.final.text
+                )
                 this_transition = dispatches[before:]
                 assert this_transition, "transition bypassed the primary provider"
                 assert {call.operation_id for call in this_transition} == {operation_id}
@@ -509,7 +623,7 @@ async def test_transition_instrument_rejects_primary_provider_bypass(tmp_path: P
                     "finish_reason": "stop",
                 }
             ],
-            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": 0.01},
         )
         counterfeited = True
         return _admit_composer_llm_completion(response)

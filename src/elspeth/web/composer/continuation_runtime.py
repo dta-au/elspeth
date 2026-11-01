@@ -185,7 +185,29 @@ def _restore_live(
     progress: ComposerProgressSink | None,
     finish_read: ContinuationFinishRead | None = None,
 ) -> RestoredContinuationRuntime:
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV2
+    from elspeth.web.composer.provider_cost import CommonProviderCostBudget, continuation_common_cost_policy
     from elspeth.web.composer.service import _chat_ingress_inputs_for_compose
+
+    cost_source = source.cost_snapshot
+    if cost_source is None:
+        if provider_owner.cost_budget is not None:
+            raise AuditIntegrityError("legacy runtime gained a current cost owner")
+    else:
+        if type(source.policy) is not ContinuationAdmissionPolicyV2:
+            raise AuditIntegrityError("runtime cost source lacks admitted v2 policy")
+        cost_source_owner = CommonProviderCostBudget(cost_source)
+        cost_source_owner.validate_binding(
+            session_id=selected.stack.logical.session_id,
+            request_id=selected.stack.logical.original_user_message_id,
+            lifecycle_version=2,
+        )
+        if cost_source.applicability != "continuation_v2" or cost_source.policy != continuation_common_cost_policy(source.policy):
+            raise AuditIntegrityError("runtime cost source changed immutable admitted limits")
+        if provider_owner.cost_budget is None:
+            provider_owner.bind_cost_budget(cost_source_owner)
+        elif provider_owner.cost_budget.snapshot() != cost_source:
+            raise AuditIntegrityError("warm Continuation cost owner differs from complete durable accounting")
 
     _index, frame = _compose(selected)
     names = inventory.names

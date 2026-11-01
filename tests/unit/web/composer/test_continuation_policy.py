@@ -1,6 +1,7 @@
 """Retained timing policy preserves admitted bounds across process changes."""
 
 import json
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -11,12 +12,45 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     decode_continuation_policy,
 )
-from tests.helpers.continuation_policy import minimal_continuation_policy
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
+from tests.helpers.continuation_policy import continuation_test_settings, minimal_continuation_policy
+
+
+def test_v2_admission_retains_operator_cost_overrides_and_refuses_tampering():
+    settings = continuation_test_settings(
+        composer_planner_max_provider_calls=3,
+        composer_planner_max_request_bytes=4096,
+        composer_planner_max_completion_tokens=31,
+        composer_planner_max_cumulative_provider_cost=Decimal("1.25"),
+    )
+    policy = continuation_policy_from_settings(settings)
+    assert policy.schema_version == "composer.continuation.policy.v2"
+    assert policy.provider_cost.max_provider_calls == 3
+    assert policy.provider_cost.max_request_bytes == 4096
+    assert policy.provider_cost.max_completion_tokens == 31
+    assert policy.provider_cost.max_cumulative_provider_cost == Decimal("1.25")
+    assert policy.provider_cost.repair_budget == 2
+    assert decode_continuation_policy(policy.model_dump_json(), policy.policy_hash) == policy
+
+    changed = json.loads(policy.model_dump_json())
+    changed["provider_cost"]["max_provider_calls"] = 4
+    with pytest.raises(AuditIntegrityError, match="hash mismatch"):
+        decode_continuation_policy(json.dumps(changed), policy.policy_hash)
 
 
 def test_complete_policy_roundtrips_for_flag_off_draining():
     policy = minimal_continuation_policy()
     assert decode_continuation_policy(policy.model_dump_json(), policy.policy_hash) == policy
+
+
+def test_retained_v1_policy_still_decodes_without_new_cost_limits():
+    current = minimal_continuation_policy()
+    old = ContinuationAdmissionPolicy(segment=current.segment, actions=current.actions)
+    assert old.schema_version == "composer.continuation.policy.v1"
+    restored = decode_continuation_policy(old.model_dump_json(), old.policy_hash)
+    assert type(restored) is ContinuationAdmissionPolicy
+    assert restored == old
+    assert "provider_cost" not in restored.model_dump()
 
 
 def test_changed_bound_is_refused_under_original_policy_hash():
@@ -70,7 +104,7 @@ def test_finite_action_and_segment_bounds_cannot_overflow_segment_sizing(reserve
     data["segment"].update(nominal=1.7e308, watermark=watermark, reserve=reserve)
     data["actions"]["primary"]["physical"] = physical
     with pytest.raises(ValidationError, match="finite"):
-        ContinuationAdmissionPolicy.model_validate(data)
+        type(minimal_continuation_policy()).model_validate(data)
 
 
 def test_json_exponent_overflow_has_the_owned_refusal_type():

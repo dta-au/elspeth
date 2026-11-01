@@ -101,6 +101,31 @@ def test_v2_retains_unknown_without_activating_legacy_cap():
         budget.validate_binding(session_id="session", request_id="request", lifecycle_version=1)
 
 
+def test_v2_admitted_policy_enforces_same_physical_and_monetary_limits():
+    admitted = policy(max_provider_calls=1, max_completion_tokens=3, max_cumulative_provider_cost=Decimal("0.01"))
+    budget = CommonProviderCostBudget(CommonProviderCostSnapshot("session", "request", 2, "continuation_v2", admitted))
+    request = {"messages": [{"role": "user", "content": "ordinary"}], "tools": [], "max_tokens": 50}
+    budget.prepare_request(request)
+    assert request["max_tokens"] == 3
+    budget.dispatched()
+    budget.consume_settled(call(completion_tokens=3), response_accountable=True)
+    assert budget.snapshot().physical_calls == 1
+    assert budget.snapshot().validated_cost == Decimal("0.01")
+    budget.require_output()
+    with pytest.raises(CommonProviderCostRefused, match="PROVIDER_CALLS_EXHAUSTED"):
+        budget.require_dispatch()
+    with pytest.raises(CommonProviderCostRefused, match="COST_CAP_EXCEEDED"):
+        budget.require_end_headroom()
+
+
+def test_v2_repair_override_refuses_before_any_physical_dispatch():
+    admitted = policy(repair_budget=3)
+    budget = CommonProviderCostBudget(CommonProviderCostSnapshot("session", "request", 2, "continuation_v2", admitted))
+    with pytest.raises(CommonProviderCostRefused, match="REPAIR_POLICY_UNSUPPORTED"):
+        budget.require_dispatch()
+    assert budget.snapshot().physical_calls == 0
+
+
 def test_request_limit_measures_utf8_bytes_and_preserves_lower_advisor_limit():
     from elspeth.core.canonical import canonical_json
 

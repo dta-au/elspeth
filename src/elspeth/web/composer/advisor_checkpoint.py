@@ -748,6 +748,9 @@ class AdvisorCheckpointOwner:
                             response=response,
                             response_metadata=response_metadata,
                             max_completion_tokens_requested=max_completion,
+                            cost_response_accountable=(
+                                response_metadata is not None if provider_custody is not None and provider_custody.has_cost_budget else None
+                            ),
                             error_class=error_class,
                             error_message=error_message,
                             credential_surface="composer_advisor_response",
