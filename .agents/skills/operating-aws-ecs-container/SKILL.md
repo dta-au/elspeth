@@ -367,7 +367,10 @@ compatibility record is pinned to them by
 change. The Terraform package it describes is tracked at `deploy/aws-ecs/terraform/`.
 
 For the 0.8.10 session-epoch cut (78 → 79), follow
-`docs/release/0.8.10-upgrade-notes-draft.md`: it provisions a **new** session
-database through `session_database_name`, then runs the `schema_init_doctor` and
-`runtime_doctor` tasks and `bootstrap-admin`, and leaves the old store
-untouched. The drop-everything reset above is not an upgrade procedure.
+`docs/release/0.8.10-upgrade-notes-draft.md`, "AWS ECS: new stores only". As on
+ACA, 0.8.10 is installed as a **separate, fresh Scenario A deployment** through
+`docs/runbooks/aws-ecs-cold-install.md`, with new Sessions and Landscape
+databases. That procedure runs `provision-storage`, then the `schema_init_doctor`
+and `runtime_doctor` tasks, then `bootstrap-admin`. The existing service and all
+its stores stay untouched; do not roll 0.8.10 onto them. The drop-everything
+reset above is not an upgrade procedure.

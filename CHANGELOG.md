@@ -163,7 +163,10 @@ package version do not establish combined-release qualification or publication.
   runs in separately supervised workers. Baseline generation uses a protected
   snapshot whose symlinks are resolved as the filesystem resolves them. The
   three findings stay open until the operator builds, installs and qualifies
-  that runtime.
+  that runtime:
+  - S1 `csf_49e6c1d4c587149b07c83516`, keyed repository maintenance;
+  - S2 `csf_652f5deeb8d970ec214048eb`, checkout-controlled startup;
+  - S3 `csf_e22b5e22120644ec52c10bfd`, provider SDK in the keyed parent.
 - **The `codex-cli` judge transport is disabled.** Its native shell could read
   the judge worker's provider credentials, and Codex CLI cannot be shown to
   disable that shell completely. `call_judge` and the worker both refuse it.
@@ -171,9 +174,9 @@ package version do not establish combined-release qualification or publication.
   whose read-only tools are confined to the evidence snapshot. Every judge
   rationale is now secret-scrubbed.
 - **Gateway adapters are operator-trusted code by design.** The adapter
-  credential and network-authority finding is closed by design: adapters, like
-  plugins, run only because the operator installed them. The threat model and
-  gateway README record this.
+  credential and network-authority finding (`csf_cfe54ceaf27dac2419e05855`) is
+  closed by design: adapters, like plugins, run only because the operator
+  installed them. The threat model and gateway README record this.
 - **Signing is suspended pending the on-prem migration.** Signing is not part
   of CI. Trust-tier findings are tracked by the keyless before-and-after
   finding-set comparison.
@@ -204,6 +207,12 @@ refused, not migrated; deploy 0.8.10 against a fresh Sessions store and leave
 the epoch-78 database in place. Landscape epoch 50 remains unchanged. The AWS ECS and
 Azure Container Apps fresh-store procedures are in
 [docs/release/0.8.10-upgrade-notes-draft.md](docs/release/0.8.10-upgrade-notes-draft.md).
+
+**`composer_planner_repair_budget` must be `2`.** Any other value now refuses
+a version-1 Compose request on an empty graph before any provider call (HTTP
+503, `configuration_unsupported`). Startup does not report it. Before
+upgrading, confirm that `ELSPETH_WEB__COMPOSER_PLANNER_REPAIR_BUDGET` is unset
+or `2`.
 
 Framework retry-shutdown diagnostics now use `RetryShutdownRequestedError`, an
 `InterruptedError` subtype. Persisted pre-attempt `exception_type` values change
