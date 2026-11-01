@@ -96,6 +96,8 @@ _CONTINUATION_EVENT_TAG_CHECK = (
 _CONTINUATION_ROLLOVER_REASON_CHECK = (
     "rollover_reason IS NULL OR rollover_reason IN ('quantum', 'watermark', 'action_fit', 'slice_limit', 'shutdown', 'model_request')"
 )
+# Pinned against ``ContinuationEffectOwner`` by the same independent test.
+_CONTINUATION_EFFECT_OWNER_CHECK = "owner IN ('provider', 'tool_dispatch', 'read', 'session_sql', 'composer_end', 'composer_iteration')"
 
 
 def _sql_non_blank_text(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
@@ -3977,6 +3979,7 @@ composer_continuation_effects_table = Table(
         ["provider_attempt_id"], ["quota_provider_attempts.attempt_id"], name="fk_composer_effects_attempt", ondelete="RESTRICT"
     ),
     CheckConstraint("disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown')", name="ck_composer_effects_disposition"),
+    CheckConstraint(_CONTINUATION_EFFECT_OWNER_CHECK, name="ck_composer_effects_owner"),
     CheckConstraint(
         "disposition NOT IN ('committed', 'refused') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
         name="ck_composer_effects_receipt",

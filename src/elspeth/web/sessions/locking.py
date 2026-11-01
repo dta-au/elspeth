@@ -377,6 +377,21 @@ def locked_session_transaction(engine: Engine, session_id: str, *, deadline: Com
 
 
 @contextlib.contextmanager
+def session_data_read_transaction(
+    engine: Engine, session_id: str, *, deadline: ComposerDrainDeadline | None = None
+) -> Iterator[Connection]:
+    """Read one coherent DATA cohort; preserve exclusion on other topologies."""
+    from elspeth.web.sessions.engine import deferred_session_data_read, session_engine_supports_deferred_data_reads
+
+    if session_engine_supports_deferred_data_reads(engine):
+        with deferred_session_data_read(engine) as conn:
+            yield conn
+        return
+    with locked_session_transaction(engine, session_id, deadline=deadline) as conn:
+        yield conn
+
+
+@contextlib.contextmanager
 def sqlite_transaction_session_lock(conn: Connection, engine: Engine, session_id: str) -> Iterator[None]:
     """Hold the shared SQLite mutex until the transaction terminates."""
     lock_stack = ExitStack()

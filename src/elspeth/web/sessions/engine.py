@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from enum import Enum, auto
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -30,8 +31,17 @@ from sqlalchemy import ColumnElement, Engine, create_engine, event, func, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.engine.url import make_url
+from sqlalchemy.pool import QueuePool
+
+from elspeth.contracts.errors import AuditIntegrityError
 
 _SESSION_WRITE_INTENT_OPTION = "elspeth_session_write_intent"
+_SESSION_DATA_READ_CAPABILITY_OPTION = "elspeth_session_data_read_capability"
+
+
+class _SessionDataReadCapability(Enum):
+    FILE_WAL_QUEUE_POOL = auto()
+
 
 # SQLite's built-in ``lower()`` folds ASCII only, so ``lower('Élodie')`` keeps
 # its capital and a case-insensitive search for the name as displayed finds
@@ -122,6 +132,7 @@ def create_session_engine(url: str, *, read_only: bool = False, **kwargs: Any) -
 
     if engine.dialect.name != "sqlite":
         return engine
+    engine.update_execution_options(**{_SESSION_DATA_READ_CAPABILITY_OPTION: None})
 
     @event.listens_for(engine, "connect")
     def _configure_sqlite_session(
@@ -205,4 +216,53 @@ def create_session_engine(url: str, *, read_only: bool = False, **kwargs: Any) -
             f"workload."
         )
 
+    custom_connection_factory = "connect_args" in kwargs and (
+        type(kwargs["connect_args"]) is not dict or "factory" in kwargs["connect_args"]
+    )
+    if (
+        not read_only
+        and not is_memory_db
+        and db_path != ""
+        and engine.dialect.driver == "pysqlite"
+        and type(engine.pool) is QueuePool
+        and not custom_connection_factory
+        and not any(option in kwargs for option in ("creator", "pool", "module", "plugins", "pool_reset_on_return"))
+    ):
+        engine.update_execution_options(**{_SESSION_DATA_READ_CAPABILITY_OPTION: _SessionDataReadCapability.FILE_WAL_QUEUE_POOL})
     return engine
+
+
+def session_engine_supports_deferred_data_reads(engine: Engine) -> bool:
+    """Recognize the factory-proved independent file-WAL connection topology."""
+    if type(engine) is not Engine:
+        return False
+    options = engine.get_execution_options()
+    database = engine.url.database
+    return (
+        _SESSION_DATA_READ_CAPABILITY_OPTION in options
+        and options[_SESSION_DATA_READ_CAPABILITY_OPTION] is _SessionDataReadCapability.FILE_WAL_QUEUE_POOL
+        and engine.dialect.name == "sqlite"
+        and engine.dialect.driver == "pysqlite"
+        and type(engine.pool) is QueuePool
+        and type(database) is str
+        and database not in ("", ":memory:")
+        and not database.startswith("file:")
+        and not engine.url.query
+    )
+
+
+@contextmanager
+def deferred_session_data_read(engine: Engine) -> Iterator[Connection]:
+    """Hold one explicit snapshot for a reviewed DATA reader, without write intent.
+
+    This is a transaction boundary for fixed pure readers, not mutation authority.
+    Every later provider preparation or business write must fence itself again.
+    """
+    if not session_engine_supports_deferred_data_reads(engine):
+        raise AuditIntegrityError("Deferred session DATA read requires its qualified file-WAL engine")
+    with engine.connect() as conn:
+        if conn.in_transaction():
+            raise AuditIntegrityError("Deferred session DATA read requires a fresh root connection")
+        conn.execution_options(**{_SESSION_WRITE_INTENT_OPTION: False})
+        with conn.begin():
+            yield conn

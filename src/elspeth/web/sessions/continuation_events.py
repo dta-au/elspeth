@@ -1,4 +1,4 @@
-"""The closed event vocabulary shared by continuation metadata and owners."""
+"""Closed event and effect-owner vocabularies for Continuation metadata."""
 
 from typing import Final, Literal, get_args
 
@@ -19,3 +19,12 @@ ContinuationEventTag = Literal[
     "settled",
 ]
 CONTINUATION_EVENT_TAGS: Final[tuple[ContinuationEventTag, ...]] = get_args(ContinuationEventTag)
+
+ContinuationEffectOwner = Literal[
+    "provider",
+    "tool_dispatch",
+    "read",
+    "session_sql",
+    "composer_end",
+    "composer_iteration",
+]

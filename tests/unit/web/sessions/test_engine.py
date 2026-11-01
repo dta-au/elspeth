@@ -25,14 +25,23 @@ so a meaningful WAL assertion requires a file-backed DB.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
-from elspeth.web.sessions.engine import create_session_engine
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.sessions.engine import (
+    _SESSION_DATA_READ_CAPABILITY_OPTION,
+    _SESSION_WRITE_INTENT_OPTION,
+    create_session_engine,
+    deferred_session_data_read,
+    session_engine_supports_deferred_data_reads,
+)
+from elspeth.web.sessions.locking import session_data_read_transaction
 from elspeth.web.sessions.models import (
     SESSION_DB_APPLICATION_ID,
     SESSION_SCHEMA_EPOCH,
@@ -174,6 +183,113 @@ def test_session_engine_connect_read_does_not_use_begin_immediate(file_db_url: s
         conn.execute(text("SELECT 1")).all()
 
     assert "BEGIN IMMEDIATE" not in _begin_statements(trace)
+
+
+def test_explicit_data_snapshot_overrides_inherited_write_intent_and_returns_connection(file_db_url: str) -> None:
+    engine = create_session_engine(file_db_url)
+    engine.update_execution_options(**{_SESSION_WRITE_INTENT_OPTION: True})
+    assert session_engine_supports_deferred_data_reads(engine)
+    trace = _attach_trace(engine)
+    try:
+        with deferred_session_data_read(engine) as conn:
+            assert conn.in_transaction()
+            assert conn.execute(text("SELECT 1")).scalar_one() == 1
+        assert conn.closed and not conn.in_transaction()
+        assert _begin_statements(trace) == ["BEGIN"]
+        trace.clear()
+        with engine.begin() as writer:
+            writer.execute(text("CREATE TABLE explicit_data_read_probe (id INTEGER PRIMARY KEY)"))
+        assert _begin_statements(trace) == ["BEGIN IMMEDIATE"]
+    finally:
+        engine.dispose()
+
+
+def test_data_snapshot_original_error_rolls_back_before_a_new_writer(file_db_url: str) -> None:
+    engine = create_session_engine(file_db_url)
+    original = RuntimeError("original DATA reader error")
+    trace = _attach_trace(engine)
+    try:
+        with pytest.raises(RuntimeError, match="original DATA reader error") as caught, deferred_session_data_read(engine) as conn:
+            assert conn.execute(text("SELECT 1")).scalar_one() == 1
+            raise original
+        assert caught.value is original and conn.closed and not conn.in_transaction()
+        assert _begin_statements(trace) == ["BEGIN"] and "ROLLBACK" in trace
+        with engine.begin() as writer:
+            writer.execute(text("CREATE TABLE after_data_error_probe (id INTEGER PRIMARY KEY)"))
+            writer.execute(text("INSERT INTO after_data_error_probe (id) VALUES (1)"))
+        with engine.connect() as fresh:
+            assert fresh.execute(text("SELECT id FROM after_data_error_probe")).scalar_one() == 1
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("memory", [False, True], ids=["file-static-pool", "memory-static-pool"])
+def test_shared_connection_data_read_preserves_original_locked_begin(file_db_url: str, memory: bool) -> None:
+    engine = create_session_engine("sqlite://" if memory else file_db_url, poolclass=StaticPool)
+    try:
+        assert not session_engine_supports_deferred_data_reads(engine)
+        trace = _attach_trace(engine)
+        with session_data_read_transaction(engine, "shared-data-read") as conn:
+            assert conn.execute(text("SELECT 1")).scalar_one() == 1
+        assert _begin_statements(trace) == ["BEGIN IMMEDIATE"]
+        with pytest.raises(AuditIntegrityError, match="qualified file-WAL engine"), deferred_session_data_read(engine):
+            raise AssertionError("unsupported engine entered a deferred read")
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("topology", ["creator", "prebuilt-pool", "module", "reset", "connection-factory"])
+def test_custom_connection_topologies_do_not_receive_data_read_capability(file_db_url: str, tmp_path: Path, topology: str) -> None:
+    def connect():
+        return sqlite3.connect(tmp_path / "session_test.db", check_same_thread=False)
+
+    if topology == "creator":
+        engine = create_session_engine(file_db_url, creator=connect)
+    elif topology == "prebuilt-pool":
+        engine = create_session_engine(file_db_url, pool=QueuePool(connect))
+    elif topology == "module":
+        engine = create_session_engine(file_db_url, module=sqlite3)
+    elif topology == "reset":
+        engine = create_session_engine(file_db_url, pool_reset_on_return=None)
+    else:
+        assert topology == "connection-factory"
+        engine = create_session_engine(file_db_url, connect_args={"factory": sqlite3.Connection})
+    try:
+        assert type(engine.pool) is QueuePool
+        assert not session_engine_supports_deferred_data_reads(engine)
+        with pytest.raises(AuditIntegrityError, match="qualified file-WAL engine"), deferred_session_data_read(engine):
+            raise AssertionError("custom topology entered a deferred read")
+    finally:
+        engine.dispose()
+
+
+def test_data_read_capability_is_withdrawn_if_pool_is_replaced(file_db_url: str, tmp_path: Path) -> None:
+    engine = create_session_engine(file_db_url)
+    assert session_engine_supports_deferred_data_reads(engine)
+    original = engine.pool
+    replacement = StaticPool(lambda: sqlite3.connect(tmp_path / "session_test.db"))
+    try:
+        engine.pool = replacement
+        assert not session_engine_supports_deferred_data_reads(engine)
+    finally:
+        engine.pool = original
+        replacement.dispose()
+    try:
+        assert session_engine_supports_deferred_data_reads(engine)
+        engine.dispose()
+        assert session_engine_supports_deferred_data_reads(engine)
+    finally:
+        engine.dispose()
+
+
+def test_boolean_marker_cannot_impersonate_factory_data_read_capability(file_db_url: str) -> None:
+    engine = create_session_engine(file_db_url)
+    try:
+        assert session_engine_supports_deferred_data_reads(engine)
+        engine.update_execution_options(**{_SESSION_DATA_READ_CAPABILITY_OPTION: True})
+        assert not session_engine_supports_deferred_data_reads(engine)
+    finally:
+        engine.dispose()
 
 
 def test_initialize_session_schema_stamps_application_id_and_user_version(
