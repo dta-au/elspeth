@@ -20,7 +20,7 @@ import structlog
 from sqlalchemy import insert, select, text
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
-from tests.helpers.composition_state import composition_state_data, stored_default_pipeline_metadata
+from tests.helpers.composition_state import composition_state_data, stamped_state_values, stored_default_pipeline_metadata
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, FencedSession, seed_token_policies
 
 from elspeth.contracts.blobs import IdentityStorageQuotaExceededError
@@ -523,13 +523,15 @@ def test_container_storage_serializes_cross_identity_output_reservations(pg_fenc
         state_id, run_id = str(uuid.uuid4()), str(uuid.uuid4())
         conn.execute(
             insert(composition_states_table).values(
-                metadata_=stored_default_pipeline_metadata(),
-                id=state_id,
-                session_id=session_id,
-                version=1,
-                is_valid=True,
-                provenance="session_seed",
-                created_at=DAY,
+                **stamped_state_values(
+                    metadata_=stored_default_pipeline_metadata(),
+                    id=state_id,
+                    session_id=session_id,
+                    version=1,
+                    is_valid=True,
+                    provenance="session_seed",
+                    created_at=DAY,
+                )
             )
         )
         conn.execute(insert(runs_table).values(id=run_id, session_id=session_id, state_id=state_id, status="running", started_at=DAY))

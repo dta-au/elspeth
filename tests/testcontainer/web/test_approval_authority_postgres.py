@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import Engine, func, insert, select, text, update
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import stored_default_pipeline_metadata
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 
 from elspeth.web.coordination.approval_authority import (
     ApprovalAlreadyDecided,
@@ -83,13 +83,15 @@ def _seed(engine: Engine) -> None:
         )
         conn.execute(
             insert(composition_states_table).values(
-                metadata_=stored_default_pipeline_metadata(),
-                id="state-1",
-                session_id="session-1",
-                version=1,
-                is_valid=True,
-                provenance="session_seed",
-                created_at=now,
+                **stamped_state_values(
+                    metadata_=stored_default_pipeline_metadata(),
+                    id="state-1",
+                    session_id="session-1",
+                    version=1,
+                    is_valid=True,
+                    provenance="session_seed",
+                    created_at=now,
+                )
             )
         )
 

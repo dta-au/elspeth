@@ -196,8 +196,8 @@ async def test_protocol_primary_and_advisor_share_settled_cost_and_sql_precedes_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("family", [ProviderInvocationFamily.PLANNER, ProviderInvocationFamily.TITLE])
-async def test_protocol_planner_and_title_are_outside_common_budget(owned, family):
+@pytest.mark.parametrize("family", [ProviderInvocationFamily.TITLE])
+async def test_protocol_title_is_outside_common_budget(owned, family):
     owner = owned[4]
     # Excluded-family mints do not prevent a later request-policy binding.
     custody = owner.mint(family)
@@ -212,7 +212,7 @@ async def test_protocol_planner_and_title_are_outside_common_budget(owned, famil
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("family", [ProviderInvocationFamily.PLANNER, ProviderInvocationFamily.TITLE])
+@pytest.mark.parametrize("family", [ProviderInvocationFamily.TITLE])
 async def test_protocol_excluded_families_minted_after_binding_do_not_charge_common_budget(owned, family):
     """Direct required custody protocol and real SQL settlement, without SDK dispatch."""
     owner = owned[4]

@@ -16,6 +16,7 @@ from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.models import composition_graph_parks_table, composition_states_table
 from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.state_envelope import envelope_state_column
+from tests.helpers.composition_state import stamped_state_values
 from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store_fixture
 from tests.unit.web.coordination.test_composer_operation_authority import start
 from tests.unit.web.coordination.test_graph_recovery_persistence import begin, finish
@@ -34,18 +35,20 @@ def _checkpoint(engine, session_id, *, state=None):
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id),
-                session_id=str(session_id),
-                version=1,
-                sources=envelope_state_column(payload["sources"]),
-                nodes=envelope_state_column(payload["nodes"]),
-                edges=envelope_state_column(payload["edges"]),
-                outputs=envelope_state_column(payload["outputs"]),
-                metadata_=envelope_state_column(payload["metadata"]),
-                is_valid=True,
-                composer_meta=envelope_state_column({"validation_lane": "strict", "completion_gates": {"schema_version": 2}}),
-                created_at=datetime.now(UTC),
-                provenance="session_seed",
+                **stamped_state_values(
+                    id=str(state_id),
+                    session_id=str(session_id),
+                    version=1,
+                    sources=envelope_state_column(payload["sources"]),
+                    nodes=envelope_state_column(payload["nodes"]),
+                    edges=envelope_state_column(payload["edges"]),
+                    outputs=envelope_state_column(payload["outputs"]),
+                    metadata_=envelope_state_column(payload["metadata"]),
+                    is_valid=True,
+                    composer_meta=envelope_state_column({"validation_lane": "strict", "completion_gates": {"schema_version": 2}}),
+                    created_at=datetime.now(UTC),
+                    provenance="session_seed",
+                )
             )
         )
     return state_id

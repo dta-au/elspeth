@@ -1056,11 +1056,11 @@ try {
     await a.evaluate(id => window.custodyAcceptance.start(id), operationId);
     await waitFor(backend, x => x.composerEntered, 'quarantine case composer running');
     const valid = (await read(a)).foreground;
-    const raw = JSON.stringify({ schema: 'composer-operations.v1', entries: [
+    const raw = JSON.stringify({ schema: 'composer-operations.v2', entries: [
       { foreground: valid, unresolvedSubmissions: [] },
       { foreground: { ...valid, mode: 'observer', operationId: otherId }, unresolvedSubmissions: [] },
     ] });
-    await a.evaluate(raw => sessionStorage.setItem('elspeth_composer_operations_v1', raw), raw);
+    await a.evaluate(raw => sessionStorage.setItem('elspeth_composer_operations_v2', raw), raw);
     await load(a);
     const hydrated = await read(a); assert.equal(hydrated.foreground.operationId, operationId); assert.ok(hydrated.notice.includes('read-only recovery')); assert.equal(hydrated.raw, raw);
     evidence.witnesses.quarantineNotice = hydrated.notice;

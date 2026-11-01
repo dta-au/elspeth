@@ -13,6 +13,7 @@ import structlog
 from sqlalchemy import event, insert, select, update
 from sqlalchemy.engine import Connection, Engine, Transaction
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values
 from tests.unit.web.conftest import _make_session
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -827,21 +828,23 @@ async def test_composer_completion_mutations_write_fixed_shapes_under_exact_blob
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id),
-                session_id=str(created.id),
-                version=1,
-                source=None,
-                sources=None,
-                nodes=[],
-                edges=[],
-                outputs=[],
-                metadata_={"name": "Completion authority", "description": ""},
-                is_valid=True,
-                validation_errors=None,
-                composer_meta=None,
-                created_at=created_at,
-                derived_from_state_id=None,
-                provenance="session_seed",
+                **stamped_state_values(
+                    id=str(state_id),
+                    session_id=str(created.id),
+                    version=1,
+                    source=None,
+                    sources=None,
+                    nodes=[],
+                    edges=[],
+                    outputs=[],
+                    metadata_={"name": "Completion authority", "description": ""},
+                    is_valid=True,
+                    validation_errors=None,
+                    composer_meta=None,
+                    created_at=created_at,
+                    derived_from_state_id=None,
+                    provenance="session_seed",
+                )
             )
         )
     authority = service.session_operation_authority
@@ -911,21 +914,23 @@ async def test_composer_completion_mutations_enforce_kind_session_and_latest_sta
         ):
             conn.execute(
                 insert(composition_states_table).values(
-                    id=str(state_id),
-                    session_id=str(session_id),
-                    version=version,
-                    source=None,
-                    sources=None,
-                    nodes=[],
-                    edges=[],
-                    outputs=[],
-                    metadata_={"name": "State", "description": ""},
-                    is_valid=True,
-                    validation_errors=None,
-                    composer_meta=None,
-                    created_at=now,
-                    derived_from_state_id=None,
-                    provenance="session_seed",
+                    **stamped_state_values(
+                        id=str(state_id),
+                        session_id=str(session_id),
+                        version=version,
+                        source=None,
+                        sources=None,
+                        nodes=[],
+                        edges=[],
+                        outputs=[],
+                        metadata_={"name": "State", "description": ""},
+                        is_valid=True,
+                        validation_errors=None,
+                        composer_meta=None,
+                        created_at=now,
+                        derived_from_state_id=None,
+                        provenance="session_seed",
+                    )
                 )
             )
     authority = service.session_operation_authority
@@ -996,21 +1001,23 @@ async def test_composer_completion_released_authority_writes_zero_and_successor_
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id),
-                session_id=str(created.id),
-                version=1,
-                source=None,
-                sources=None,
-                nodes=[],
-                edges=[],
-                outputs=[],
-                metadata_={"name": "Completion takeover", "description": ""},
-                is_valid=True,
-                validation_errors=None,
-                composer_meta=None,
-                created_at=now,
-                derived_from_state_id=None,
-                provenance="session_seed",
+                **stamped_state_values(
+                    id=str(state_id),
+                    session_id=str(created.id),
+                    version=1,
+                    source=None,
+                    sources=None,
+                    nodes=[],
+                    edges=[],
+                    outputs=[],
+                    metadata_={"name": "Completion takeover", "description": ""},
+                    is_valid=True,
+                    validation_errors=None,
+                    composer_meta=None,
+                    created_at=now,
+                    derived_from_state_id=None,
+                    provenance="session_seed",
+                )
             )
         )
     authority = service.session_operation_authority

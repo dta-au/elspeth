@@ -23,7 +23,6 @@ from tests.helpers.composer_operations import build_composer_operation_app
 
 from elspeth.web.composer.progress import ComposerProgressSnapshot
 from elspeth.web.composer_stream import BoundedComposerStreamResponse, ComposerStreamPermits
-from elspeth.web.sessions.composer_operation_versions import COMPOSER_OPERATION_VERSION_HEADER
 
 
 def _events(body: str) -> list[dict[str, object]]:
@@ -43,7 +42,7 @@ async def _stream_until_settled(setup, seeded, *, settle_after: float, headers: 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=setup.app),
         base_url="http://test",
-        headers={"Authorization": f"Bearer {setup.token}", COMPOSER_OPERATION_VERSION_HEADER: "2", **(headers or {})},
+        headers={"Authorization": f"Bearer {setup.token}", **(headers or {})},
         timeout=60,
     ) as client:
         request = asyncio.create_task(client.get(f"/api/sessions/{setup.session_id}/operations/{seeded.operation_id}/stream"))
@@ -74,14 +73,11 @@ async def test_first_frame_is_status_keyed_by_revision_and_terminal_carries_no_r
     response = await _stream_until_settled(setup, seeded, settle_after=1.5, headers=headers)
     assert response.status_code == 200, response.text
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert response.headers[COMPOSER_OPERATION_VERSION_HEADER] == "2"
     frames = _events(response.text)
     first, last = frames[0], frames[-1]
     assert (first["event"], first["id"]) == ("status", "5")
-    assert first["data"]["schema_version"] == "composer-operation-stream.v2"
     assert first["data"]["payload"]["status_revision"] == 5
     assert set(first["data"]["payload"]) == {
-        "protocol_version",
         "operation_id",
         "kind",
         "status",
@@ -122,7 +118,7 @@ async def test_malformed_last_event_id_is_refused_before_any_byte(tmp_path, valu
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=setup.app),
         base_url="http://test",
-        headers={"Authorization": f"Bearer {setup.token}", COMPOSER_OPERATION_VERSION_HEADER: "2", "Last-Event-ID": value},
+        headers={"Authorization": f"Bearer {setup.token}", "Last-Event-ID": value},
     ) as client:
         response = await client.get(f"/api/sessions/{setup.session_id}/operations/{seeded.operation_id}/stream")
     assert response.status_code == 422, response.text
@@ -138,7 +134,7 @@ async def test_valid_last_event_id_is_logged_as_the_resume_point(tmp_path) -> No
     with capture_logs() as logs:
         await _stream_until_settled(setup, seeded, settle_after=1.2, headers={"Last-Event-ID": "4"})
     opened = [entry for entry in logs if entry["event"] == "composer_stream.opened"]
-    assert opened == [{"event": "composer_stream.opened", "protocol_version": 2, "resumed_from_revision": 4, "log_level": "info"}]
+    assert opened == [{"event": "composer_stream.opened", "resumed_from_revision": 4, "log_level": "info"}]
 
 
 class _BoundProgressRegistry:
@@ -165,7 +161,7 @@ class _BoundProgressRegistry:
 
 @pytest.mark.asyncio
 async def test_v2_progress_frame_is_segment_bound_and_carries_no_fence_or_token(tmp_path) -> None:
-    """B-10 (stream). Control: reuse the v1 progress payload in v2 -> red."""
+    """B-10 (stream). Control: add a fence or token field to the progress payload -> red."""
     setup = await build_composer_operation_app(tmp_path)
     seeded = _seed(setup)
     setup.app.state.composer_progress_registry = _BoundProgressRegistry(seeded.operation_id, str(setup.session_id))
@@ -188,7 +184,7 @@ async def test_draining_instance_sends_reconnect_and_ends(tmp_path) -> None:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=setup.app),
         base_url="http://test",
-        headers={"Authorization": f"Bearer {setup.token}", COMPOSER_OPERATION_VERSION_HEADER: "2"},
+        headers={"Authorization": f"Bearer {setup.token}"},
     ) as client:
         request = asyncio.create_task(client.get(f"/api/sessions/{setup.session_id}/operations/{seeded.operation_id}/stream"))
         await asyncio.sleep(1.2)
@@ -280,7 +276,7 @@ async def test_connecting_to_an_already_terminal_v2_row_sends_status_then_termin
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=setup.app),
         base_url="http://test",
-        headers={"Authorization": f"Bearer {setup.token}", COMPOSER_OPERATION_VERSION_HEADER: "2"},
+        headers={"Authorization": f"Bearer {setup.token}"},
     ) as client:
         response = await asyncio.wait_for(
             client.get(f"/api/sessions/{setup.session_id}/operations/{seeded.operation_id}/stream"), timeout=10
@@ -288,35 +284,6 @@ async def test_connecting_to_an_already_terminal_v2_row_sends_status_then_termin
     frames = _events(response.text)
     assert [(frame["event"], frame["id"]) for frame in frames] == [("status", "9"), ("terminal", "9")]
     assert frames[0]["data"]["payload"]["segment"] is None
-
-
-@pytest.mark.asyncio
-async def test_v1_stream_ignores_last_event_id_as_before(tmp_path) -> None:
-    """R-4. Control: validate Last-Event-ID before lifecycle dispatch -> red (422 for a v1 row)."""
-    from tests.helpers.composer_operations import message_body
-
-    setup = await build_composer_operation_app(tmp_path)
-    operation_id = str(__import__("uuid").uuid4())
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=setup.app),
-        base_url="http://test",
-        headers={"Authorization": f"Bearer {setup.token}"},
-        timeout=30,
-    ) as client:
-        admitted = await client.post(f"/api/sessions/{setup.session_id}/messages", json=message_body("v1", operation_id=operation_id))
-        assert admitted.status_code == 202
-        request = asyncio.create_task(
-            client.get(f"/api/sessions/{setup.session_id}/operations/{operation_id}/stream", headers={"Last-Event-ID": "abc"})
-        )
-        await asyncio.sleep(1.2)
-        stopped = await client.post(f"/api/sessions/{setup.session_id}/operations/{operation_id}/cancel")
-        assert stopped.status_code == 200
-        response = await asyncio.wait_for(request, timeout=10)
-    assert response.status_code == 200, response.text
-    assert response.headers[COMPOSER_OPERATION_VERSION_HEADER] == "1"
-    events = [frame["event"] for frame in _events(response.text)]
-    assert events[-1] == "terminal" and "reconnect" not in events
-    assert all(frame["data"]["schema_version"] == "composer-operation-stream.v1" for frame in _events(response.text))
 
 
 @pytest.mark.asyncio

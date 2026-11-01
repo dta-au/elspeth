@@ -20,7 +20,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import stored_default_pipeline_metadata
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 
 
 @pytest.fixture
@@ -71,9 +71,9 @@ def test_blob_inline_resolutions_current_schema_epoch(engine) -> None:
     # Epoch 69 binds freeform message ingress receipts.
     # Epoch 70 renames the persisted tutorial Build stage to build.
     # Epoch 71 adds mode-neutral fork/revert receipts.
-    assert SESSION_SCHEMA_EPOCH == 79
+    assert SESSION_SCHEMA_EPOCH == 80
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 79
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 80
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:
@@ -238,20 +238,22 @@ def _seed_run_and_blob(conn, *, run_id: str, blob_id: str) -> None:
     )
     conn.execute(
         insert(composition_states_table).values(
-            id=state_id,
-            session_id=session_id,
-            version=1,
-            source=None,
-            nodes=None,
-            edges=None,
-            outputs=None,
-            metadata_=stored_default_pipeline_metadata(),
-            is_valid=True,
-            validation_errors=None,
-            composer_meta=None,
-            created_at=now,
-            derived_from_state_id=None,
-            provenance="session_seed",
+            **stamped_state_values(
+                id=state_id,
+                session_id=session_id,
+                version=1,
+                source=None,
+                nodes=None,
+                edges=None,
+                outputs=None,
+                metadata_=stored_default_pipeline_metadata(),
+                is_valid=True,
+                validation_errors=None,
+                composer_meta=None,
+                created_at=now,
+                derived_from_state_id=None,
+                provenance="session_seed",
+            )
         )
     )
     conn.execute(

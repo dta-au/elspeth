@@ -80,6 +80,7 @@ from elspeth.web.sessions.models import schema_identity_table as session_schema_
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.skill_markdown_history import RepositorySkillMarkdownHistoryAuthority
+from elspeth.web.sessions.state_envelope import envelope_state_column
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 pytestmark = pytest.mark.testcontainer
@@ -536,10 +537,10 @@ def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, inc
             text(
                 """
                 INSERT INTO composition_states (
-                    id, session_id, version, is_valid, created_at, provenance, metadata_
+                    id, session_id, version, is_valid, created_at, provenance, metadata_, composer_meta
                 ) VALUES (
                     :state_id, :session_id, 1, false, CURRENT_TIMESTAMP,
-                    'session_seed', CAST(:metadata AS JSON)
+                    'session_seed', CAST(:metadata AS JSON), CAST(:composer_meta AS JSON)
                 )
                 """
             ),
@@ -547,6 +548,9 @@ def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, inc
                 "state_id": f"{session_id}-state",
                 "session_id": session_id,
                 "metadata": json.dumps(stored_default_pipeline_metadata()),
+                # The column is NOT NULL; this trigger proof never reads the
+                # row back, so it needs no content publication.
+                "composer_meta": json.dumps(envelope_state_column({})),
             },
         )
         conn.execute(
@@ -2020,7 +2024,7 @@ def test_postgres_runs_check_drift_refuses_current_epoch_without_rewriting_schem
         checks_before = Counter((check["name"], check["sqltext"]) for check in inspect(conn).get_check_constraints("runs"))
         identity_before = conn.execute(select(session_schema_identity_table)).all()
         rows_before = run_rows(conn)
-        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 79
+        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 80
     assert probe_session_schema(postgres_engine) is SchemaState.STALE
     with pytest.raises(SessionSchemaError) as raised:
         init_session_schema(postgres_engine)
@@ -2043,7 +2047,7 @@ def test_postgres_runs_check_reflection_is_current_idempotent_and_identity_bound
     with postgres_engine.connect() as conn:
         identity_before = conn.execute(select(session_schema_identity_table)).all()
         rows_before = run_rows(conn)
-        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 79
+        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 80
     init_session_schema(postgres_engine)
     with postgres_engine.connect() as conn:
         assert conn.execute(select(session_schema_identity_table)).all() == identity_before

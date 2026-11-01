@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import Engine, event, func, insert, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import stored_default_pipeline_metadata
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 from elspeth.web.sessions.models import (
@@ -55,12 +55,14 @@ def seeded(engine: Engine) -> Engine:
             )
             conn.execute(
                 insert(composition_states_table).values(
-                    metadata_=stored_default_pipeline_metadata(),
-                    id=state_id,
-                    session_id=session_id,
-                    version=1,
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id,
+                        version=1,
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
         conn.execute(
