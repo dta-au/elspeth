@@ -20,6 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_required_sql_finish_once
 from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord
@@ -238,6 +239,11 @@ _RECOMPOSE_LABELS: Final = _ComposerTurnLabels(
 )
 
 
+
+
+async def _discard_progress(event: ComposerProgressEvent) -> None:
+    """The sink of a turn whose progress claim failed: advisory UX, never the outcome (E20)."""
+    del event
 
 
 def _graph_recovery_response(

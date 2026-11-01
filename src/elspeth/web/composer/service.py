@@ -388,6 +388,29 @@ def _announce_staged_review_handoff(result: ComposerResult, raw_content: str | N
     return _append_interpretation_review_handoff_message(result, raw_content)
 
 
+_ADVISOR_ATTEMPTED_ACTIONS_MAX_ITEMS: Final[int] = 8
+
+
+def _record_advisor_repair_mutations(
+    review_state: _AdvisorReviewState,
+    tool_outcomes: tuple[_ToolOutcome, ...],
+) -> _AdvisorReviewState:
+    """Record only successful composition-state mutations after an END FLAG."""
+    if review_state.completed_passes == 0:
+        return review_state
+    actions = list(review_state.successful_mutating_actions)
+    for outcome in tool_outcomes:
+        if outcome.error_class is not None or outcome.post_version <= outcome.pre_version:
+            continue
+        tool_name = outcome.call.function.name
+        if type(tool_name) is str and tool_name not in actions:
+            actions.append(tool_name)
+    return replace(
+        review_state,
+        successful_mutating_actions=tuple(actions[:_ADVISOR_ATTEMPTED_ACTIONS_MAX_ITEMS]),
+    )
+
+
 # The per-dispatch audit envelope (DispatchAudit, begin_dispatch, finish_*)
 # and the structural enforcement helper (dispatch_with_audit) live in
 # web/composer/audit.py next to the BufferingRecorder. See the audit.py module
