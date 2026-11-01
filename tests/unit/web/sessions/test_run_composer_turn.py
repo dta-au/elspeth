@@ -2516,6 +2516,16 @@ async def test_cancel_fenced_convergence_handler_leaves_its_exception_llm_calls_
         raise_after=ComposerConvergenceError(3, budget_exhausted="composition", partial_state=_EMPTY_STATE, llm_calls=(llm_call,)),
     )
     session = await service.create_session("alice", "Fenced convergence", "local")
+    # The capture must re-project the durable head for the handler to attempt
+    # its save; the turn is admitted on a head carrying the identical graph.
+    empty = _EMPTY_STATE.to_dict()
+    head = await service.save_composition_state(
+        session.id,
+        CompositionStateData(
+            sources=empty["sources"], nodes=empty["nodes"], edges=empty["edges"], outputs=empty["outputs"], metadata_=empty["metadata"]
+        ),
+        provenance="tool_call",
+    )
     async with _running_job(app, service, session.id, kind="compose_message", content="Converge.") as job:
         job_holder.append(job)
         with pytest.raises(ComposerOperationCancelledDuringTurn):
@@ -2523,7 +2533,8 @@ async def test_cancel_fenced_convergence_handler_leaves_its_exception_llm_calls_
         assert job.observation.compose_result is None
         assert job.observation.pending_exception_llm_calls == (llm_call,)
         assert job.observation.audit_cohort_durable is False
-        assert await service.get_current_state(session.id) is None
+        current = await service.get_current_state(session.id)
+        assert current is not None and current.id == head.id, "the fenced save wrote no recovery row"
         assert _llm_call_audit_rows(await service.get_messages(session.id, limit=None)) == []
 
         services = composer_app_services(app)

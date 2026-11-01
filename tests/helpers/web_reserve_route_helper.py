@@ -91,9 +91,12 @@ def code_for(tree, owners):
 
 
 GRAMMARS = {
-    "_handle_convergence_error": "8032fa7144f05421b9d59d93be654a0e800bb6090b8307f374c34296c99f45be",
-    "_handle_plugin_crash": "c0345259ed743d014249dfc660177a0f614e7d48572bd85107b2dbf1cc33aa25",
-    "_handle_runtime_preflight_failure": "fd3578fce1748f626a5c0e09fab7f7f60f15c1e8ee0e8c950f580c378f553865",
+    # Reviewed 2026-11-01 (fix-crash-capture): each handler saves its capture
+    # only when it re-projects the durable head; _handle_plugin_crash also
+    # drains a P4 unwind carrier's rolled-back suffix.
+    "_handle_convergence_error": "6ccf500918a5775e8e98e1e1545d99ef01f1039e237a5c6df9aca381054fd70c",
+    "_handle_plugin_crash": "248e52ed5296fdff3757dfc93002093368fea979ae6bbcb682ee66fd77535b2c",
+    "_handle_runtime_preflight_failure": "f2a2910daf52855281b32006f9a3663ca28489ddd9a6ee4b74aa8ca64ca4503e",
     "_run_composer_turn": "7e4bc316e58c1c2c8abfef2c7a0038fa364313d7c9eeb4e040418547292b422c",
     # Reviewed 2026-11-01: the moved runtime-preflight caller (41fcaafce),
     # then the verified-checkpoint refusal before the strict-lane save

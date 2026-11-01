@@ -1120,6 +1120,30 @@ async def _durable_completion_gates(
     return completion_gates_meta_from_facts(graph.effective_completion_gates)
 
 
+async def _recovery_capture_is_durable_head(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    partial_state: CompositionState,
+) -> bool:
+    """Whether a recovery capture re-projects the durable head it would replace.
+
+    A recovery persist appends a row, and the head is the highest version, so
+    every such save becomes the session head. P4 commits each mutating tool
+    turn as a ``tool_call`` checkpoint and verifies it against the dispatched
+    state. When P4 committed, ``partial_state`` is that checkpoint's graph and
+    the save re-projects it in the strict lane. When P4 rolled back (a plugin
+    crash unwind) or never started (a runtime-preflight crash inside a batch),
+    nothing committed, verified or authorized the graph. It must not become
+    the head; the carried tool invocations remain the crash evidence.
+    """
+    graph = await service.read_current_composition_graph(session_id)
+    if graph.hydration_error is not None:
+        raise AuditIntegrityError("Cannot bind a recovery capture to an unreadable composition head")
+    if graph.record is None:
+        return False
+    return composition_content_hash(_state_from_record(graph.record)) == composition_content_hash(partial_state)
+
+
 def merge_composer_meta_updates(
     existing_meta: Mapping[str, Any] | None,
     updates: Mapping[str, Any],
@@ -3317,7 +3341,12 @@ async def _handle_convergence_error(
         response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
     required_state_failure: SQLAlchemyError | None = None
     persisted_state_id: UUID | None = None
-    if exc.partial_state is not None:
+    # Save only a re-projection of the durable checkpoint; an unverified
+    # capture is never saved, because any save becomes the session head.
+    capture = exc.partial_state
+    if capture is not None and not await _recovery_capture_is_durable_head(service, session_id, capture):
+        capture = None
+    if capture is not None:
         # Persistence guard: DB write failure should not upgrade the
         # response from 422 (convergence error) to 500 (internal).
         #
@@ -3334,7 +3363,7 @@ async def _handle_convergence_error(
         # the app-level fail-closed handler, not become a recovery detail.
         try:
             state_data, _validation = await _state_data_from_composer_state(
-                exc.partial_state,
+                capture,
                 settings=settings,
                 secret_service=secret_service,
                 user_id=user_id,
@@ -3503,7 +3532,11 @@ async def _handle_plugin_crash(
 
     required_state_failure: SQLAlchemyError | None = None
     persisted_state_id_pc: UUID | None = None
-    if exc.partial_state is not None:
+    # A P4 unwind leaves an uncommitted graph here; see the convergence sibling.
+    capture = exc.partial_state
+    if capture is not None and not await _recovery_capture_is_durable_head(service, session_id, capture):
+        capture = None
+    if capture is not None:
         # Persistence guard: DB write failure MUST NOT mask the original
         # plugin crash (response stays as the 500 below, the save failure
         # is recorded as a separate audit-system-failure slog event).
@@ -3518,7 +3551,7 @@ async def _handle_plugin_crash(
         # see the comment there for the full rationale.
         try:
             state_data, _validation = await _state_data_from_composer_state(
-                exc.partial_state,
+                capture,
                 settings=settings,
                 secret_service=secret_service,
                 user_id=user_id,
@@ -3600,14 +3633,19 @@ async def _handle_plugin_crash(
     # earlier entries are the calls that successfully ran before the
     # plugin bug fired.
     # Compose-loop plugin-crash rows commit before the carrier is raised.
-    # Retain this drain only for older/non-loop carriers with no failed_turn.
+    # Drain only carriers whose turn left no rows: older/non-loop carriers
+    # with no failed_turn, and a P4 unwind (no assistant row, no tool
+    # responses), which carries exactly its rolled-back suffix.
     # Tool rows and LLM sidecars settle as ONE cohort in a single
     # transaction (elspeth-90231248dc) despite their differing state ids.
+    unpersisted_turn = exc.failed_turn is None or (
+        exc.failed_turn.assistant_message_id is None and exc.failed_turn.tool_responses_persisted == 0
+    )
     try:
         await _persist_turn_audit_cohort(
             service,
             session_id,
-            exc.tool_invocations if exc.failed_turn is None else (),
+            exc.tool_invocations if unpersisted_turn else (),
             exc.llm_calls,
             tool_composition_state_id=persisted_state_id_pc,
             llm_composition_state_id=llm_composition_state_id,
@@ -3691,14 +3729,14 @@ async def _handle_runtime_preflight_failure(
       cache re-raise.
 
     * Recovery site (both paths) — this helper emits
-      ``source=runtime_preflight`` exactly once per invocation. When
-      ``exc.partial_state is not None``, the emission is fired
+      ``source=runtime_preflight`` exactly once per invocation. When a
+      capture re-projects the durable head, the emission is fired
       automatically by the persist_invalid arm of the re-call to
-      ``_state_data_from_composer_state``. When ``exc.partial_state is
-      None`` (the path-1 cached re-raise with no LLM mutation case), the
-      persist_invalid re-call is skipped and the helper instead fires
-      the recovery emission inline. Either way, the recovery counter
-      increments once per handler invocation.
+      ``_state_data_from_composer_state``. When there is no capture (the
+      path-1 cached re-raise with no LLM mutation case) or the capture is
+      withheld as unverified, the persist_invalid re-call is skipped and
+      the helper instead fires the recovery emission inline. Either way,
+      the recovery counter increments once per handler invocation.
 
     Operators querying primary failure rate filter on
     ``source ∈ {compose, recompose, cached_preflight, plugin_crash,
@@ -3778,7 +3816,12 @@ async def _handle_runtime_preflight_failure(
 
     required_state_failure: SQLAlchemyError | None = None
     persisted_state_id_rpf: UUID | None = None
-    if exc.partial_state is not None:
+    # A preflight crash inside a batch escapes before P4; see the convergence
+    # sibling. A withheld capture takes the no-partial telemetry branch below.
+    capture = exc.partial_state
+    if capture is not None and not await _recovery_capture_is_durable_head(service, session_id, capture):
+        capture = None
+    if capture is not None:
         # Persistence guard: DB write failure MUST NOT mask the original
         # runtime-preflight failure (response stays as the 500 below; the
         # save failure is recorded as a separate audit-system-failure
@@ -3793,7 +3836,7 @@ async def _handle_runtime_preflight_failure(
         # SQLAlchemyError width.
         try:
             state_data, _validation = await _state_data_from_composer_state(
-                exc.partial_state,
+                capture,
                 settings=settings,
                 secret_service=secret_service,
                 user_id=user_id,
@@ -3847,7 +3890,8 @@ async def _handle_runtime_preflight_failure(
     else:
         # Recovery acknowledgment (elspeth-0891e8da73). When no partial
         # state is captured (the path-1 cached re-raise with no LLM
-        # mutation case), the persist_invalid re-call above is skipped,
+        # mutation case) or the capture is withheld as unverified, the
+        # persist_invalid re-call above is skipped,
         # so its source=runtime_preflight emission inside
         # _state_data_from_composer_state never fires. The no-silent-failures
         # rule (the logging-telemetry-policy skill §Telemetry (Operational

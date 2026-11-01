@@ -23,6 +23,7 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.composer_operations import submit_and_settle
+from tests.helpers.recovery_checkpoint import commit_p4_checkpoint
 from tests.unit.web.sessions.test_completion_gate_roundtrip import _green_result
 from tests.unit.web.sessions.test_routes import (
     _assert_required_route_guard_checks,
@@ -72,9 +73,14 @@ async def test_metadata_recovery_save_does_not_reattribute_prior_advisor_note(tm
         async def compose(self, message, chat_messages, state: CompositionState, **kwargs):
             del message, chat_messages
             assert kwargs["completion_gates"] == facts
-            # Production metadata mutation increments the version. The turn
-            # then fails before adjudication and the route saves its partial state.
-            raise ComposerConvergenceError(max_turns=5, budget_exhausted="composition", partial_state=state.with_metadata(patch))
+            # Production metadata mutation increments the version and P4
+            # commits it as a checkpoint. The turn then fails before
+            # adjudication and the route re-projects that checkpoint. An
+            # unchanged graph is already the durable head.
+            partial = state.with_metadata(patch)
+            if patch:
+                await commit_p4_checkpoint(service, session.id, partial, session_operation_context=kwargs["session_operation_context"])
+            raise ComposerConvergenceError(max_turns=5, budget_exhausted="composition", partial_state=partial)
 
     app.state.composer_service = InterruptedComposer()
     if route == "recompose":
@@ -89,12 +95,20 @@ async def test_metadata_recovery_save_does_not_reattribute_prior_advisor_note(tm
     after = await service.get_current_state(session.id)
     assert after is not None
     assert after.id != before.id
-    assert after.version == before.version + 1
+    # A changed graph: the P4 checkpoint, then the capture re-projecting it.
+    assert after.version == before.version + (2 if patch else 1)
     assert response_body["detail"]["error_type"] == "convergence"
     assert response_body["detail"]["partial_state"]["id"] == str(after.id)
     rebuilt = state_from_record(after)
     assert rebuilt.metadata == reviewed.with_metadata(patch).metadata
     reloaded_facts = parse_completion_gates(after.composer_meta)
+    if patch:
+        # The capture carries the checkpoint's gates, never the reviewed
+        # head's note re-attributed to the changed intent.
+        signoff = reloaded_facts.advisor_signoff
+        assert signoff is None or signoff.for_graph != completion_gate_fingerprint(rebuilt)
+        assert advisor_block_covers_unchanged_graph(reloaded_facts, rebuilt, initial_version=rebuilt.version) is False
+        return
     assert reloaded_facts == facts
     result = merge_completion_gates(_green_result(), reloaded_facts, rebuilt)
     assert result.readiness.completion_ready is False

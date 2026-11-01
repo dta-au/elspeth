@@ -634,6 +634,9 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     # Finalization hydrates the advisor-verified head only to compare its
     # content hash with the result state (f898c8af1); a mismatch refuses.
     "src/elspeth/web/sessions/composer_finalization.py:settle_composer_result.state_from_record": "committed_checkpoint_comparison",
+    # Recovery handlers hydrate the durable head only to compare its content
+    # hash with the crash capture; a mismatch withholds the save.
+    "src/elspeth/web/sessions/routes/_helpers.py:_recovery_capture_is_durable_head._state_from_record": "committed_checkpoint_comparison",
     # Admission hydrates the base only to refuse an undecodable one.
     "src/elspeth/web/coordination/composer_operation_authority.py:ComposerAsyncOperationAuthority.admit.state_from_record": "committed_checkpoint_comparison",
     # The TITLE source reaches the provider only through _litellm_acompletion's request guard.

@@ -18,11 +18,35 @@ from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPlug
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerRequiredRecoveryFailure
 from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
+from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.time_normalization import restore_utc
+from tests.helpers.recovery_checkpoint import commit_p4_checkpoint
 from tests.unit.web.sessions.test_composer_async_worker import _worker
 from tests.unit.web.sessions.test_routes import _EMPTY_STATE, _llm_call, _llm_call_audit_rows, _make_app
 from tests.unit.web.sessions.test_run_composer_turn import _CancelCommittingComposer, _run, _running_job
 from tests.unit.web.sessions.test_unwind_persist_forensics import _tool_invocation
+
+
+async def _durable_head_is_the_capture(service, session_id: UUID) -> None:
+    """Make the carrier's graph the durable head before the turn is admitted.
+
+    A recovery capture is saved only when it re-projects the durable head.
+    These tests fail every session-authority write during the turn, so the
+    checkpoint cannot be committed in-turn as P4 would; the head the turn is
+    admitted on already carries the identical graph instead.
+    """
+    data = _EMPTY_STATE.to_dict()
+    await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=data["sources"],
+            nodes=data["nodes"],
+            edges=data["edges"],
+            outputs=data["outputs"],
+            metadata_=data["metadata"],
+        ),
+        provenance="tool_call",
+    )
 
 
 @pytest.mark.asyncio
@@ -39,6 +63,7 @@ async def test_required_partial_storage_failure_outranks_stop_without_duplicate_
     jobs = []
     app.state.composer_service = _CancelCommittingComposer(jobs, raise_after=failure)
     session = await service.create_session("alice", "Required recovery", "local")
+    await _durable_head_is_the_capture(service, session.id)
     original = OperationalError("synthetic", {}, RuntimeError("storage unavailable"))
     async with _running_job(app, service, session.id, kind="compose_message", content="Recover.") as job:
         jobs.append(job)
@@ -81,6 +106,7 @@ async def test_recovery_storage_required_and_optional_controls(tmp_path: Path, a
         handler = _helpers._handle_runtime_preflight_failure
     original = OperationalError("SQL_RECOVERY_CANARY", {"parameter": "SQL_PARAMETER_CANARY"}, RuntimeError("SQL_CAUSE_CANARY"))
     async with _running_job(app, service, session.id, kind="compose_message", content="Control.") as job:
+        await commit_p4_checkpoint(service, session.id, _EMPTY_STATE, session_operation_context=job.lease.context)
 
         async def invoke():
             return await handler(
@@ -166,6 +192,7 @@ async def test_recovery_and_actual_audit_sql_failure_retain_group_and_recover_on
     jobs = []
     app.state.composer_service = _CancelCommittingComposer(jobs, raise_after=failure)
     session = await service.create_session("alice", "Recovery collision", "local")
+    await _durable_head_is_the_capture(service, session.id)
     state_sql = OperationalError("STATE_SQL_CANARY", {}, RuntimeError("state private cause"))
     audit_sql = OperationalError("AUDIT_SQL_CANARY", {}, RuntimeError("audit private cause"))
     audit_insert_attempts = 0

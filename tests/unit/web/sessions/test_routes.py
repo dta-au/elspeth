@@ -131,6 +131,7 @@ from tests.helpers.composer_operations import (
     submit_and_settle,
 )
 from tests.helpers.composition_state import composition_state_data
+from tests.helpers.recovery_checkpoint import raise_after_p4_checkpoint, return_after_p4_checkpoint
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -318,8 +319,13 @@ def _assert_required_recovery_failure(
     path: str,
     body: dict[str, object],
     composer: Any,
+    committed_checkpoint: bool = False,
 ) -> None:
-    """Required worker recovery seals exact503 and cannot invent a saved head."""
+    """Required worker recovery seals exact503 and cannot invent a saved head.
+
+    With ``committed_checkpoint`` the double committed P4's checkpoint, so
+    the head must still be that ``tool_call`` row, never a recovery row.
+    """
     assert response.status_code == 503
     payload = response.json()
     assert uuid.UUID(payload["request_id"])
@@ -328,7 +334,10 @@ def _assert_required_recovery_failure(
         "error_type": "database_unavailable",
         "request_id": payload["request_id"],
     }
-    assert asyncio.run(service.get_current_state(uuid.UUID(str(session_id)))) is None
+    if committed_checkpoint:
+        assert _read_persisted_provenance(service, str(session_id)) == "tool_call"
+    else:
+        assert asyncio.run(service.get_current_state(uuid.UUID(str(session_id)))) is None
     replay = client.post(path, json=body)
     assert replay.status_code == 202
     assert replay.json()["operation_id"] == body["operation_id"]
@@ -7479,6 +7488,8 @@ class TestRecomposeConvergencePartialState:
         app, service = _make_app(tmp_path)
         app.state.settings = app.state.settings.model_copy(update={"compartment_id": "own"})
         app.state.composer_service = mock_composer
+        # The capture re-projects the checkpoint P4 committed in-request.
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
         client = TestClient(app, raise_server_exceptions=False)
 
         # Create session
@@ -7646,8 +7657,9 @@ class TestRecomposeConvergencePartialState:
             ),
         )
 
-        app, _service = _make_app(tmp_path)
+        app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
         client = TestClient(app, raise_server_exceptions=False)
 
         session_id = client.post("/api/sessions", json={"title": "timeout"}).json()["id"]
@@ -7745,6 +7757,7 @@ class TestRecomposeConvergencePartialState:
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
         client = TestClient(app, raise_server_exceptions=False)
 
         # Create session and seed a user message for recompose precondition
@@ -7815,6 +7828,7 @@ class TestRecomposeConvergencePartialState:
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
 
         def _raise_operational(*_args, **_kwargs):
             raise OperationalError(
@@ -7846,6 +7860,7 @@ class TestRecomposeConvergencePartialState:
             path=f"/api/sessions/{session_id}/recompose",
             body=body,
             composer=mock_composer,
+            committed_checkpoint=True,
         )
 
     def test_recompose_convergence_save_failure_redacts_sqlalchemy_internals(self, tmp_path) -> None:
@@ -7880,6 +7895,7 @@ class TestRecomposeConvergencePartialState:
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
 
         # Canary strings chosen to be recognisably synthetic — if any appear
         # anywhere in the JSON response body, redaction failed.
@@ -7917,6 +7933,7 @@ class TestRecomposeConvergencePartialState:
             path=f"/api/sessions/{session_id}/recompose",
             body=body,
             composer=mock_composer,
+            committed_checkpoint=True,
         )
         body_text = recompose_resp.text
         # Primary assertion: no canary substring anywhere in the serialised body.
@@ -7981,6 +7998,7 @@ class TestRecomposeConvergencePartialState:
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post("/api/sessions", json={"title": "Blob leak"})
@@ -8049,8 +8067,9 @@ class TestRecomposeConvergencePartialState:
             ),
         )
 
-        app, _service = _make_app(tmp_path)
+        app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
         client = TestClient(app, raise_server_exceptions=False)
 
         # Capture the user_id forwarded into _state_data_from_composer_state.
@@ -8129,6 +8148,7 @@ class TestRecomposeConvergencePartialState:
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post("/api/sessions", json={"title": "Recompose convergence + secrets"})
@@ -8540,7 +8560,8 @@ class TestComposePluginCrashResponse:
         pre-request state and silently reverts the LLM's successful mutations.
 
         Symmetric with ``TestRecomposeConvergencePartialState`` for the
-        convergence-error path.
+        convergence-error path. The double commits the checkpoint P4 would
+        have committed; the capture re-projects it.
         """
         import asyncio
 
@@ -8561,6 +8582,7 @@ class TestComposePluginCrashResponse:
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.post("/api/sessions", json={"title": "Test"})
@@ -8590,6 +8612,56 @@ class TestComposePluginCrashResponse:
         assert persisted is not None, "partial_state must be persisted to composition_states on plugin crash"
         assert persisted.metadata_ is not None
         assert persisted.metadata_.get("name") == "after-first-mutation"
+
+    @pytest.mark.parametrize("kind", ["convergence", "plugin_crash", "runtime_preflight"])
+    def test_crash_capture_withholds_a_partial_state_no_checkpoint_committed(self, tmp_path, kind) -> None:
+        """A capture that is not the durable head is never saved, so never becomes it.
+
+        Here no P4 checkpoint holds the carrier's graph (as after a P4 unwind,
+        or a preflight crash inside a batch). The handler must not write it:
+        no state row, no ``partial_state`` in the body, the head unchanged.
+        """
+        import asyncio
+
+        from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerRuntimePreflightError
+
+        partial = CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(name="never-committed"),
+            version=5,
+        )
+        failure: Exception
+        if kind == "convergence":
+            failure = ComposerConvergenceError(max_turns=5, budget_exhausted="composition", partial_state=partial)
+        elif kind == "plugin_crash":
+            failure = ComposerPluginCrashError(ValueError("plugin bug"), partial_state=partial)
+        else:
+            failure = ComposerRuntimePreflightError(original_exc=ValueError("preflight bug"), partial_state=partial)
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=failure)
+
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+        session_id = client.post("/api/sessions", json={"title": "Unverified capture"}).json()["id"]
+
+        response = _settled_composer_response(
+            client,
+            app,
+            path=f"/api/sessions/{session_id}/messages",
+            body=message_body("Build me a pipeline", state_id=current_head_state_id_sync(client, session_id)),
+        )
+
+        assert response.status_code == (422 if kind == "convergence" else 500), response.text
+        assert "partial_state" not in response.json()["detail"]
+        loop = asyncio.new_event_loop()
+        try:
+            assert loop.run_until_complete(service.get_state_versions(uuid.UUID(session_id))) == []
+        finally:
+            loop.close()
 
     def test_compose_plugin_crash_no_partial_state_persists_nothing(self, tmp_path) -> None:
         """When a plugin crashes BEFORE any mutation (partial_state is None),
@@ -8751,6 +8823,7 @@ class TestComposePluginCrashResponse:
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
 
         # Patch save_composition_state to raise a non-IntegrityError
         # SQLAlchemyError subclass — simulates lock timeout / deadlock /
@@ -8784,6 +8857,7 @@ class TestComposePluginCrashResponse:
             path=f"/api/sessions/{session_id}/messages",
             body=body,
             composer=mock_composer,
+            committed_checkpoint=True,
         )
         assert self.SECRET_PATH not in response.text
 
@@ -8820,6 +8894,7 @@ class TestComposePluginCrashResponse:
 
         app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
 
         def _raise_operational(*_args, **_kwargs):
             raise OperationalError(
@@ -8849,6 +8924,7 @@ class TestComposePluginCrashResponse:
             path=f"/api/sessions/{session_id}/messages",
             body=body,
             composer=mock_composer,
+            committed_checkpoint=True,
         )
 
     def test_compose_plugin_crash_save_successful_omits_partial_state_save_failed_flag(self, tmp_path) -> None:
@@ -8919,8 +8995,9 @@ class TestComposePluginCrashResponse:
             side_effect=ComposerPluginCrashError(original, partial_state=partial),
         )
 
-        app, _service = _make_app(tmp_path)
+        app, service = _make_app(tmp_path)
         app.state.composer_service = mock_composer
+        mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
 
         # TypeError from our own dataclass path — a Tier 1 bug that must propagate.
         def _raise_type_error(*_args, **_kwargs):
@@ -9921,6 +9998,7 @@ def test_recompose_convergence_persists_runtime_invalid_partial_state(tmp_path) 
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
     client = TestClient(app, raise_server_exceptions=False)
 
     resp = client.post("/api/sessions", json={"title": "Test"})
@@ -9983,6 +10061,7 @@ def test_compose_plugin_crash_persists_runtime_invalid_partial_state(tmp_path) -
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
     client = TestClient(app, raise_server_exceptions=False)
 
     resp = client.post("/api/sessions", json={"title": "Test"})
@@ -10077,6 +10156,8 @@ def test_compose_runtime_preflight_persists_partial_state(tmp_path) -> None:
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    # The loop committed and verified result.state as its P4 checkpoint.
+    mock_composer.compose.side_effect = return_after_p4_checkpoint(service, mock_composer.compose.return_value)
     client = TestClient(app, raise_server_exceptions=False)
 
     resp = client.post("/api/sessions", json={"title": "Test"})
@@ -10211,6 +10292,7 @@ def test_recompose_runtime_preflight_persists_partial_state(tmp_path) -> None:
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    mock_composer.compose.side_effect = return_after_p4_checkpoint(service, mock_composer.compose.return_value)
     client = TestClient(app, raise_server_exceptions=False)
 
     resp = client.post("/api/sessions", json={"title": "Recompose runtime preflight"})
@@ -10276,6 +10358,7 @@ def test_compose_cached_runtime_preflight_persists_partial_state(tmp_path) -> No
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
     client = TestClient(app, raise_server_exceptions=False)
 
     resp = client.post("/api/sessions", json={"title": "Cached preflight"})
@@ -10656,6 +10739,7 @@ def test_runtime_preflight_handler_save_failure_sets_partial_state_save_failed_f
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    mock_composer.compose.side_effect = return_after_p4_checkpoint(service, mock_composer.compose.return_value)
 
     # Canary strings to verify the response body never echoes SQL/parameter
     # internals (mirrors the convergence/plugin-crash redaction contract).
@@ -10695,6 +10779,7 @@ def test_runtime_preflight_handler_save_failure_sets_partial_state_save_failed_f
         path=f"/api/sessions/{session_id}/messages",
         body=body,
         composer=mock_composer,
+        committed_checkpoint=True,
     )
     body_text = response.text
     # Redaction parity: no SQL / parameter / __cause__ leakage in the body.
@@ -11397,6 +11482,7 @@ def test_handle_convergence_error_persists_convergence_persist_provenance(tmp_pa
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
     client = TestClient(app, raise_server_exceptions=False)
 
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
@@ -11439,6 +11525,7 @@ def test_handle_plugin_crash_persists_plugin_crash_persist_provenance(tmp_path: 
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
     client = TestClient(app, raise_server_exceptions=False)
 
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
@@ -11509,6 +11596,7 @@ def test_handle_runtime_preflight_failure_persists_preflight_persist_provenance(
 
     app, service = _make_app(tmp_path)
     app.state.composer_service = mock_composer
+    mock_composer.compose.side_effect = raise_after_p4_checkpoint(service, mock_composer.compose.side_effect)
     client = TestClient(app, raise_server_exceptions=False)
 
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
