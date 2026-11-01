@@ -1,6 +1,10 @@
 # Structural GraphValidationError raise sites where no single node is at fault.
 # These are graph-topology errors (cycles, wrong source/sink count, namespace
 # collisions) — component_id=None is the correct attribution.
+#
+# Still per-file count rules, not exact allow_hits: the GA1 fingerprint hashes
+# the raise's line number ("GA1|file|lineno|context"), so an exact key would go
+# stale on any edit above the raise. Keep each max_hits at the measured count.
 
 per_file_rules:
   # ── graph.py: ExecutionGraph.validate() ──
@@ -16,7 +20,8 @@ per_file_rules:
   - pattern: "core/dag/builder.py"
     rules: ["GA1"]
     reason: >
-      Structural: pipeline cycle detection (2 sites), missing sources,
-      missing sinks, and sources/source-settings name mismatch (ADR-025
-      plural-source surface) — no single node at fault.
-    max_hits: 5
+      Structural: missing sources, missing sinks, and sources/source-settings
+      name mismatch (ADR-025 plural-source surface) — no single node at fault.
+      The two pipeline cycle-detection raises this rule once covered are gone
+      from builder.py; max_hits was 5 and is now the measured 3.
+    max_hits: 3
