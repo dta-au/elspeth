@@ -8,7 +8,7 @@ import type {
   CompositionState,
   ToolCall,
 } from "@/types/api";
-import type { ComposerOperationStatusV2 } from "@/types/composerOperations";
+import type { ComposerOperationStatus } from "@/types/composerOperations";
 import {
   COMPLETION_OUTCOME_LABELS,
   type CompletionOutcome,
@@ -46,8 +46,8 @@ interface ComposingIndicatorProps {
   onRetryInterruptedRequest?: () => void;
   retryDisabledReason?: string | null;
   lastRejection?: ToolCall["rejection"];
-  /** Latest Composer-Operation-Version 2 state (Continuation); null for v1. */
-  operationStatus?: ComposerOperationStatusV2 | null;
+  /** Latest accepted composer operation state; null when none is observed. */
+  operationStatus?: ComposerOperationStatus | null;
   /** Two live-update connects failed; the request may still be running. */
   liveUpdatesInterrupted?: boolean;
   /** Stop was pressed and the server has not confirmed it yet. */
@@ -61,12 +61,12 @@ export const LIVE_UPDATES_INTERRUPTED = "Live updates interrupted. Reconnecting.
 interface ContinuationView { label: string; headline: string }
 
 /**
- * Design §4.2 copy for v2 states. Executing keeps the ordinary backend
+ * Design §4.2 copy for operation states. Executing keeps the ordinary backend
  * progress view; Stop takes precedence over phase. Never says "saved": a
  * checkpoint is internal, not a saved pipeline revision.
  */
 export function continuationView(
-  status: ComposerOperationStatusV2 | null | undefined,
+  status: ComposerOperationStatus | null | undefined,
   stopPending: boolean,
 ): ContinuationView | null {
   const live = status?.status === "queued" || status?.status === "running";
@@ -92,7 +92,7 @@ export function continuationView(
 }
 
 /** Shows the successor notice once per operation and segment, never on first attach or reload. */
-function useSuccessorNotice(status: ComposerOperationStatusV2 | null | undefined, cleared: boolean): boolean {
+function useSuccessorNotice(status: ComposerOperationStatus | null | undefined, cleared: boolean): boolean {
   // baseline: the last segment already started when first seen (never announced);
   // announced: the last successor already announced as running.
   const seen = useRef<{ operation: string; baseline: number; announced: number } | null>(null);

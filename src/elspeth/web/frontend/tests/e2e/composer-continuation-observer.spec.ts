@@ -1,6 +1,6 @@
 // W-1: the Composer Continuation observer in a real browser (design §4, §5.4).
 // The browser and the authenticated account are real; every /api response is
-// mocked, including a lifecycle-2 operation and its SSE stream, so no LLM is
+// mocked, including a composer operation and its SSE stream, so no LLM is
 // called. The send goes through the tutorial's Build step, which uses the same
 // submission path as freeform.
 import { expect, test, type Page, type Route } from "@playwright/test";
@@ -29,16 +29,16 @@ function message(role: "user" | "assistant", content: string): Record<string, un
 }
 
 type Phase = "queued" | "executing" | "continuation_queued";
-function statusV2(operationId: string, revision: number, phase: Phase, sequence: number, running: boolean): Record<string, unknown> {
+function operationStatus(operationId: string, revision: number, phase: Phase, sequence: number, running: boolean): Record<string, unknown> {
   const now = new Date().toISOString();
   return {
-    protocol_version: 2, operation_id: operationId, kind: "compose_message", status: phase === "queued" ? "queued" : "running", phase,
+    operation_id: operationId, kind: "compose_message", status: phase === "queued" ? "queued" : "running", phase,
     status_revision: revision, created_at: stamp, observed_at: now, poll_after_ms: 1000, cancel_requested: false,
     segment: { sequence, generation: sequence, state: running ? "running" : "queued", deadline_at: running ? new Date(Date.now() + 600_000).toISOString() : null },
   };
 }
 function frame(operationId: string, event: string, sequence: number, payload?: Record<string, unknown>): string {
-  const data = { schema_version: "composer-operation-stream.v2", session_id: sid, operation_id: operationId, sequence, event, ...(payload === undefined ? {} : { payload }) };
+  const data = { session_id: sid, operation_id: operationId, sequence, event, ...(payload === undefined ? {} : { payload }) };
   const id = payload !== undefined && (event === "status" || event === "terminal") ? `id: ${String(payload.status_revision)}\n` : "";
   return `${id}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
@@ -55,7 +55,7 @@ async function installRoutes(page: Page, fixture: Fixture, secondStream: Promise
     const json = async (body: unknown, status = 200, headers: Record<string, string> = {}): Promise<void> => { await route.fulfill({ status, json: body, headers }); };
     const op = fixture.operationId;
     if (path === "/api/system/status") {
-      await json({ composer_available: true, composer_model: "test", composer_advisor_model: "test", composer_provider: "test", composer_reason: null, composer_missing_keys: [], composer_timeout_seconds: 180, tutorial_ready: true, tutorial_reason: null, plugin_policy_readiness: { tutorial_ready: true, rows: [] }, composer_operation_admission_version: 2 });
+      await json({ composer_available: true, composer_model: "test", composer_advisor_model: "test", composer_provider: "test", composer_reason: null, composer_missing_keys: [], composer_timeout_seconds: 180, tutorial_ready: true, tutorial_reason: null, plugin_policy_readiness: { tutorial_ready: true, rows: [] } });
       return;
     }
     if (path === "/api/composer-preferences") { await json(prefs); return; }
@@ -71,24 +71,24 @@ async function installRoutes(page: Page, fixture: Fixture, secondStream: Promise
       fixture.operationId = body.operation_id;
       fixture.versionHeader = req.headers()["composer-operation-version"] ?? null;
       fixture.messages = [message("user", body.content)];
-      await json({ ...statusV2(body.operation_id, 0, "queued", 1, false), result: null, error: null }, 202, { "Composer-Operation-Version": "2" });
+      await json({ ...operationStatus(body.operation_id, 0, "queued", 1, false), result: null, error: null }, 202);
       return;
     }
     if (path === `/api/sessions/${sid}/messages`) { await json(fixture.messages); return; }
     if (op !== null && path === `/api/sessions/${sid}/operations/${op}/stream`) {
       fixture.streams += 1;
-      const headers = { "Content-Type": "text/event-stream", "Composer-Operation-Version": "2" };
+      const headers = { "Content-Type": "text/event-stream" };
       if (fixture.streams === 1) {
         await route.fulfill({ status: 200, headers, body:
-          frame(op, "status", 0, statusV2(op, 1, "executing", 1, true))
-          + frame(op, "status", 1, statusV2(op, 2, "continuation_queued", 2, false))
+          frame(op, "status", 0, operationStatus(op, 1, "executing", 1, true))
+          + frame(op, "status", 1, operationStatus(op, 2, "continuation_queued", 2, false))
           + frame(op, "reconnect", 2) });
         return;
       }
       if (fixture.streams === 2) {
         await secondStream;
         await route.fulfill({ status: 200, headers, body:
-          frame(op, "status", 0, statusV2(op, 3, "executing", 2, true)) + frame(op, "reconnect", 1) });
+          frame(op, "status", 0, operationStatus(op, 3, "executing", 2, true)) + frame(op, "reconnect", 1) });
         return;
       }
       await thirdStream;
@@ -97,7 +97,7 @@ async function installRoutes(page: Page, fixture: Fixture, secondStream: Promise
     }
     if (op !== null && path === `/api/sessions/${sid}/operations/${op}`) {
       fixture.messages = [fixture.messages[0], message("assistant", "The pipeline is ready for review.")];
-      await json({ ...statusV2(op, 4, "executing", 2, true), status: "completed", phase: "settled", segment: null, result: { message: fixture.messages[1], state, proposals: [] }, error: null }, 200, { "Composer-Operation-Version": "2" });
+      await json({ ...operationStatus(op, 4, "executing", 2, true), status: "completed", phase: "settled", segment: null, result: { message: fixture.messages[1], state, proposals: [] }, error: null });
       return;
     }
     if (path === `/api/sessions/${sid}/state`) { await json(op !== null && fixture.messages.length > 1 ? state : null); return; }
@@ -127,7 +127,8 @@ test("a continuing request shows Continuing, announces its next step once, and c
   await expect(status).toContainText("Continuing");
   await expect(status).toContainText("The composer reached a checkpoint. The next step of this request is queued.");
   await expect(status).not.toContainText(/saved/i);
-  expect(fixture.versionHeader).toBe("2");
+  // One composer lifecycle: the client sends no lifecycle header.
+  expect(fixture.versionHeader).toBeNull();
 
   releaseSecond();
   await expect(status).toContainText("Still working on this request.");

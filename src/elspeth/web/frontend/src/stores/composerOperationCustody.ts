@@ -1,7 +1,15 @@
 import { canonicalUuid, exactRecord, operationKind, text } from "@/api/composerOperationDecoder";
-import type { ComposerProtocolVersion, OperationCustody, PrincipalScope, SessionCustody, SubmittedCustody } from "@/types/composerOperations";
+import type { OperationCustody, PrincipalScope, SessionCustody, SubmittedCustody } from "@/types/composerOperations";
 
-export const COMPOSER_CUSTODY_KEY = "elspeth_composer_operations_v1";
+// Bumped with the single composer lifecycle (0.8.10): records written by an
+// earlier bundle live under the old key and are never read.
+export const COMPOSER_CUSTODY_KEY = "elspeth_composer_operations_v2";
+// Removal only, never read: retired records still name principal-scoped
+// operations, so they leave storage wherever the current record does.
+const RETIRED_CUSTODY_KEYS = ["elspeth_composer_operations_v1"] as const;
+function removeRetiredCustody(): void {
+  for (const retired of RETIRED_CUSTODY_KEYS) try { sessionStorage.removeItem(retired); } catch { /* Storage unavailable. */ }
+}
 export const COMPOSER_BODY_LIMIT = 512 * 1024;
 export const COMPOSER_AGGREGATE_LIMIT = 1024 * 1024;
 export const COMPOSER_CUSTODY_LIFETIME_MS = 24 * 60 * 60 * 1000;
@@ -12,7 +20,8 @@ let stopControlsQuarantined = false;
 export function composerStopPersistenceLimited(): boolean { return stopPersistenceLimited; }
 let expiredHydration = false;
 let quarantinedHydration = false;
-const schema = "composer-operations.v1";
+export const COMPOSER_CUSTODY_SCHEMA = "composer-operations.v2";
+const schema = COMPOSER_CUSTODY_SCHEMA;
 const encoder = new TextEncoder();
 const records = new Map<string, SessionCustody>();
 let authenticatedScope: PrincipalScope | null = null;
@@ -22,7 +31,7 @@ export function samePrincipal(a: PrincipalScope, b: PrincipalScope): boolean { r
 function key(scope: PrincipalScope, sessionId: string): string { return JSON.stringify([scope.principalId, scope.authProvider, sessionId]); }
 function bytes(value: unknown): number { return encoder.encode(JSON.stringify(value)).byteLength; }
 function admitDescriptor(value: unknown, scope: PrincipalScope, restore = false): OperationCustody {
-  const record = exactRecord(value, ["mode", "scope", "sessionId", "operationId", "kind", "createdAt", "body", "protocolVersion"], ["mode", "scope", "sessionId", "operationId", "kind", "createdAt"]);
+  const record = exactRecord(value, ["mode", "scope", "sessionId", "operationId", "kind", "createdAt", "body"], ["mode", "scope", "sessionId", "operationId", "kind", "createdAt"]);
   const persistedScope = exactRecord(record.scope, ["principalId", "authProvider"]);
   if (persistedScope.principalId !== scope.principalId || persistedScope.authProvider !== scope.authProvider) throw new CustodyPrincipalMismatch("Custody principal mismatch");
   const sessionId = canonicalUuid(record.sessionId), operationId = canonicalUuid(record.operationId), kind = operationKind(record.kind);
@@ -31,11 +40,7 @@ function admitDescriptor(value: unknown, scope: PrincipalScope, restore = false)
     if (!restore) throw new Error("Expired custody requires reconciliation");
     expiredHydration = true;
   }
-  // A missing version is a pre-upgrade record or an old server: version 1.
-  if (record.protocolVersion !== undefined && record.protocolVersion !== 1 && record.protocolVersion !== 2) throw new Error("Unknown custody protocol version");
-  // Written only when given, so v1 custody stays byte-identical in storage.
-  const version: { protocolVersion?: ComposerProtocolVersion } = record.protocolVersion === 2 ? { protocolVersion: 2 } : record.protocolVersion === 1 ? { protocolVersion: 1 } : {};
-  const common = { scope: Object.freeze({ ...scope }), sessionId, operationId, kind, createdAt: record.createdAt, ...version };
+  const common = { scope: Object.freeze({ ...scope }), sessionId, operationId, kind, createdAt: record.createdAt };
   if (record.mode === "observer") {
     if ("body" in record) throw new Error("Observer cannot possess replay body");
     return Object.freeze({ ...common, mode: "observer" });
@@ -109,6 +114,7 @@ export function authenticateComposerCustody(scope: PrincipalScope): void {
 
   if (hydrated) return;
   hydrated = true;
+  removeRetiredCustody();
   let raw: string | null;
   try { raw = sessionStorage.getItem(COMPOSER_CUSTODY_KEY); } catch { return; }
   if (raw === null) return;
@@ -192,34 +198,20 @@ export function acquireComposerOperationCustody(descriptor: SubmittedCustody): S
   if (reservedCustodyBytes(candidate) > COMPOSER_AGGREGATE_LIMIT) throw new Error("Reconcile pending composer actions before submitting more content");
   records.set(key(descriptor.scope, descriptor.sessionId), { ...existing, foreground: admitted }); persist(); return admitted;
 }
-export function attachComposerObserver(descriptor: OperationCustody, activeId: string, kind: unknown, retainAmbiguous: boolean, protocolVersion: ComposerProtocolVersion = 1): OperationCustody {
+export function attachComposerObserver(descriptor: OperationCustody, activeId: string, kind: unknown, retainAmbiguous: boolean): OperationCustody {
   if (activeId === descriptor.operationId) throw new Error("Active refusal cannot relabel the submitted action");
   const existing = findComposerOperationCustody(descriptor.scope, descriptor.sessionId);
   const unresolved = new Map(existing.unresolvedSubmissions);
   if (retainAmbiguous && descriptor.mode === "submitted") unresolved.set(descriptor.operationId, descriptor);
-  const observer = admitDescriptor({ mode: "observer", scope: descriptor.scope, sessionId: descriptor.sessionId, operationId: activeId, kind, createdAt: Date.now(), protocolVersion }, descriptor.scope);
+  const observer = admitDescriptor({ mode: "observer", scope: descriptor.scope, sessionId: descriptor.sessionId, operationId: activeId, kind, createdAt: Date.now() }, descriptor.scope);
   records.set(key(descriptor.scope, descriptor.sessionId), { foreground: observer, unresolvedSubmissions: unresolved }); persist(); return observer;
 }
-export function composerProtocolVersion(descriptor: OperationCustody): ComposerProtocolVersion {
-  return descriptor.protocolVersion ?? 1;
-}
-/** Custody records the version the server echoed, which decides how the operation is read. */
-export function recordComposerProtocolVersion<T extends OperationCustody>(descriptor: T, version: ComposerProtocolVersion): T {
-  const existing = findComposerOperationCustody(descriptor.scope, descriptor.sessionId);
-  const updated = Object.freeze({ ...descriptor, protocolVersion: version }) as T;
-  const unresolved = new Map(existing.unresolvedSubmissions);
-  if (updated.mode === "submitted" && unresolved.has(updated.operationId)) unresolved.set(updated.operationId, updated);
-  const foreground = existing.foreground?.operationId === descriptor.operationId ? updated : existing.foreground;
-  if (foreground === existing.foreground && unresolved.size === existing.unresolvedSubmissions.size && !existing.unresolvedSubmissions.has(descriptor.operationId)) return updated;
-  records.set(key(descriptor.scope, descriptor.sessionId), { foreground, unresolvedSubmissions: unresolved }); persist();
-  return updated;
-}
 /** A tab without custody adopts the session's live operation as an observer (no replay body). */
-export function adoptComposerObserver(scope: PrincipalScope, sessionId: string, active: Readonly<{ operation_id: string; kind: string; lifecycle_version: ComposerProtocolVersion }>): OperationCustody | null {
+export function adoptComposerObserver(scope: PrincipalScope, sessionId: string, active: Readonly<{ operation_id: string; kind: string }>): OperationCustody | null {
   if (authenticatedScope === null || !samePrincipal(authenticatedScope, scope)) return null;
   const existing = findComposerOperationCustody(scope, sessionId);
   if (existing.foreground !== null || existing.unresolvedSubmissions.size > 0) return null;
-  const observer = admitDescriptor({ mode: "observer", scope, sessionId, operationId: active.operation_id, kind: active.kind, createdAt: Date.now(), ...(active.lifecycle_version === 2 ? { protocolVersion: 2 } : {}) }, scope);
+  const observer = admitDescriptor({ mode: "observer", scope, sessionId, operationId: active.operation_id, kind: active.kind, createdAt: Date.now() }, scope);
   records.set(key(scope, sessionId), { foreground: observer, unresolvedSubmissions: new Map() }); persist();
   return observer;
 }
@@ -260,4 +252,5 @@ export function clearComposerSessionCustody(scope: PrincipalScope, sessionId: st
 export function purgeComposerCustody(): void {
   records.clear(); stopped.clear(); stopPersistenceLimited = false; stopControlsQuarantined = false; expiredHydration = false; quarantinedHydration = false; authenticatedScope = null; hydrated = false; hydrationBlocked = false;
   try { sessionStorage.removeItem(COMPOSER_CUSTODY_KEY); sessionStorage.removeItem(COMPOSER_STOP_KEY); } catch { /* No persisted credentials or fallback token. */ }
+  removeRetiredCustody();
 }

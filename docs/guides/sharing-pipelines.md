@@ -70,15 +70,15 @@ accept this trade-off.
 ## First-deploy operator action
 
 Since 0.8.1, shareable-review state is part of the broader web session
-database contract. The unreleased 0.8.10 candidate expects `SESSION_SCHEMA_EPOCH=79`
+database contract. The unreleased 0.8.10 candidate expects `SESSION_SCHEMA_EPOCH=80`
 and `SQLITE_SCHEMA_EPOCH=50`; confirm both against the deployed service's
 live schema constants before a fresh installation.
 
 Epoch 78 retains authoritative committed graph-review facts and adds durable quota
 custody and shared rate-limit policy binding; Landscape epoch 50 binds run calls
-to provider attempts. Preserve epoch-75, both distinct epoch-76 and epoch-77 session
+to provider attempts. Preserve epoch-75, both distinct epoch-76, epoch-77, epoch-78 and epoch-79 session
 store contracts and epoch-49 Landscape stores with their compatible prior application,
-and provision separate epoch-79 Sessions and epoch-50 Landscape targets for the candidate.
+and provision separate epoch-80 Sessions and epoch-50 Landscape targets for the candidate.
 Drain and isolate old/new workers; they must
 not share these stores. Compatibility keys do not automatically evict old
 replicas.

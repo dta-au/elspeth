@@ -4,6 +4,7 @@ import { useBlobStore } from "./blobStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import { installComposeTurnDouble } from "@/test/composeTurnDouble";
+import { completedSnapshot, liveSnapshot } from "@/test/composerOperationWire";
 import recoveryProducerFixtures from "@/test/composerRecoveryProducerFixtures.json";
 import { acquireComposerOperationCustody, findComposerOperationCustody, authenticateComposerCustody, purgeComposerCustody } from "./composerOperationCustody";
 import type {
@@ -212,11 +213,11 @@ function durableReply(): ChatMessage {
   return { id: durableReplyId, session_id: durableSession, role: "assistant", content: "Done", tool_calls: null, created_at: "2026-10-06T00:00:01Z" };
 }
 function durableCompleted(operationId: string, kind: "compose_message" | "compose_recompose" = "compose_message", version = 2): import("@/types/composerOperations").ComposerOperationSnapshot {
-  return { operation_id: operationId, kind, status: "completed", cancel_requested: false, poll_after_ms: 100, deadline_at: "2030-01-01T00:00:00Z", deadline_remaining_ms: 0, result: { message: durableReply(), state: makeCompositionState(version), proposals: [] }, error: null };
+  return completedSnapshot(operationId, { message: durableReply(), state: makeCompositionState(version), proposals: [] }, { kind });
 }
 async function armDurableTransport() {
   const api = await import("@/api/client");
-  vi.mocked(api.submitComposerOperation).mockImplementation(async (descriptor) => ({ operation_id: descriptor.operationId, kind: descriptor.kind, status: "running", poll_after_ms: 100 }));
+  vi.mocked(api.submitComposerOperation).mockImplementation(async (descriptor) => liveSnapshot(descriptor.operationId, { kind: descriptor.kind }));
   vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(new Response(null, { status: 503 }));
   vi.mocked(api.fetchMessages).mockImplementation(async () => {
     const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[vi.mocked(api.submitComposerOperation).mock.calls.length - 1]?.[0];

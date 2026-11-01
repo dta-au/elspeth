@@ -283,7 +283,7 @@ export function ChatPanelContent({
   const acceptProposal = useSessionStore((s) => s.acceptProposal);
   const rejectProposal = useSessionStore((s) => s.rejectProposal);
   const composerProgress = useSessionStore((s) => s.composerProgress);
-  const composerOperationStatusV2 = useSessionStore((s) => s.composerOperationStatusV2);
+  const composerOperationStatus = useSessionStore((s) => s.composerOperationStatus);
   const composerLiveUpdatesInterrupted = useSessionStore((s) => s.composerLiveUpdatesInterrupted);
   const composerStopPendingOperationId = useSessionStore((s) => s.composerStopPendingOperationId);
   const composerStopPending = composerStopPendingOperationId !== null;
@@ -1309,7 +1309,7 @@ export function ChatPanelContent({
             completionOutcome={freeformCompletionOutcome}
             liveToolCalls={liveToolCalls}
             lastRejection={lastComposerRejection}
-            operationStatus={composerOperationStatusV2}
+            operationStatus={composerOperationStatus}
             liveUpdatesInterrupted={composerLiveUpdatesInterrupted}
             stopPending={composerStopPending}
             onRetryInterruptedRequest={interruptedRequest === undefined
@@ -1331,7 +1331,7 @@ export function ChatPanelContent({
         onSend={handleSend}
         disabled={isComposing}
         onCancel={isComposing ? cancelComposition : undefined}
-        stopPending={isComposing && (composerStopPending || (composerOperationStatusV2?.cancel_requested ?? false))}
+        stopPending={isComposing && (composerStopPending || (composerOperationStatus?.cancel_requested ?? false))}
         inputRef={inputRef}
         onToggleBlobManager={() => setShowBlobManager((v) => !v)}
         showBlobManager={showBlobManager}

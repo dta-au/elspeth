@@ -1304,11 +1304,6 @@ export interface SystemStatus {
    */
   composer_timeout_seconds?: number;
   /**
-   * The Composer-Operation-Version a new submission should request: 2 only
-   * when the server admits Continuation. Missing (older servers) means 1.
-   */
-  composer_operation_admission_version?: 1 | 2;
-  /**
    * False when the deployment runs in locked-down server-only mode
    * (ELSPETH_WEB__USER_SECRETS_ENABLED=false): users cannot add their own
    * keys and SecretsPanel renders read-only. Absent is treated as enabled

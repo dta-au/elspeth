@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import * as composer from "@/config/composer";
 
 describe("durable composer observation policy", () => {
-  it("adds a fixed grace to the server remaining duration", () => {
-    expect(composer.COMPOSE_CLIENT_GRACE_MS).toBe(25_000);
+  it("has no client observation deadline grace (the composer has no total deadline)", () => {
+    expect("COMPOSE_CLIENT_GRACE_MS" in composer).toBe(false);
   });
   it("has no stale deployment wall-clock default", () => {
     expect("DEFAULT_COMPOSE_TIMEOUT_MS" in composer).toBe(false);

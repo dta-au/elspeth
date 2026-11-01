@@ -1,5 +1,4 @@
 export const COMPOSE_LOADING_SESSION_MESSAGE = "Loading this session…";
-export const COMPOSE_CLIENT_GRACE_MS = 25_000;
 
 /** The request may have taken effect; recovery must read before writing. */
 export const COMPOSE_OUTCOME_UNCONFIRMED = "compose_outcome_unconfirmed";

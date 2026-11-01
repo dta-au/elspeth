@@ -1,15 +1,30 @@
+// Composer operation admission and observation (Continuation design §3.5–§3.7, §4.3).
+//
+// Every compose submission (freeform and tutorial alike) passes through
+// submitAndObserveComposerOperation; every restored or adopted operation
+// through observeComposerOperation. One owner per operation identity holds the
+// observation from the POST to the sealed terminal.
+//
+// Resume is state transfer: every status frame and every GET is a complete
+// snapshot keyed by the parent's SQL status_revision, so any replica can serve
+// any reconnect. The client accepts a strictly greater revision, ignores an
+// equal or smaller one, and treats an equal revision with different state as
+// a protocol error (it then trusts only the GET). There is no total deadline:
+// a segment deadline schedules one GET and never ends observation.
+//
+// Retirement of custody happens only on a sealed terminal, a definitive
+// admission refusal, or the exact missing-session answer. A refused read
+// never proves an operation finished.
 import * as api from "./client";
 import { currentAuthGeneration, isCurrentAuthGeneration } from "./authSession";
-import { ComposerSseDecoder, validateComposerRecoveryBody, decodeComposerOperationFrame } from "./composerOperationDecoder";
-import { COMPOSER_CUSTODY_LIFETIME_MS, acquireComposerOperationCustody, composerProtocolVersion, composerStopRequested, requestComposerStop, attachComposerObserver, clearComposerSessionCustody, composerCustodyScope, findComposerOperationCustody, recordComposerProtocolVersion, samePrincipal, settleComposerCustody } from "@/stores/composerOperationCustody";
-import { detachComposerObserversV2, observeComposerOperationV2, wakeComposerObserverV2 } from "./composerOperationObserverV2";
-import { composerAdmissionVersion } from "@/config/composerProtocol";
-import { ComposerObservationFault, deliverComposerObservation } from "./composerObservationFault";
-import { COMPOSE_CLIENT_GRACE_MS, COMPOSE_USER_CANCEL_ABORT_REASON } from "@/config/composer";
-import type { ApiError, ComposerProgressSnapshot, MessageWithStateResponse } from "@/types/index";
-import type { ComposerOperationStatusV2, OperationCustody, SubmittedCustody } from "@/types/composerOperations";
-
 import { ComposerObservationDetached, ComposerSessionMissing } from "./composerObserverErrors";
+import { ComposerSseDecoder, decodeComposerOperationFrame, validateComposerRecoveryBody } from "./composerOperationDecoder";
+import { ComposerObservationFault, deliverComposerObservation } from "./composerObservationFault";
+import { COMPOSER_CUSTODY_LIFETIME_MS, acquireComposerOperationCustody, attachComposerObserver, clearComposerSessionCustody, clearComposerStop, composerCustodyScope, composerStopRequested, findComposerOperationCustody, requestComposerStop, samePrincipal, settleComposerCustody } from "@/stores/composerOperationCustody";
+import { COMPOSE_USER_CANCEL_ABORT_REASON } from "@/config/composer";
+import type { ApiError, ComposerProgressSnapshot, MessageWithStateResponse } from "@/types/index";
+import type { ComposerOperationSnapshot, ComposerOperationStatus, OperationCustody, SubmittedCustody } from "@/types/composerOperations";
+
 export { ComposerObservationDetached, ComposerObservationFault, ComposerSessionMissing };
 /** The winner's authenticated terminal is separate from the refused submission. */
 export class ComposerActiveAttachment extends Error {
@@ -18,31 +33,56 @@ export class ComposerActiveAttachment extends Error {
     this.name = "ComposerActiveAttachment";
   }
 }
-interface ObserverOptions { signal?: AbortSignal; current?: () => boolean; progress?: (snapshot: ComposerProgressSnapshot) => void; timeout?: () => void; reconciliationOnly?: boolean; status?: (status: ComposerOperationStatusV2) => void; interrupted?: (interrupted: boolean) => void; stopUnconfirmed?: (unconfirmed: boolean) => void; stopUnavailable?: () => void }
-interface ObserverOwner { generation: number; descriptor: OperationCustody; controller: AbortController; stop: boolean; stopRequested: boolean; stopTarget: OperationCustody | null }
-const owners = new Map<string, ObserverOwner>();
+
+export const COMPOSER_STREAM_IDLE_CLOSE_MS = 25_000;
+export const COMPOSER_STREAM_LIFETIME_MS = 120_000;
+const BACKOFF_CAP_MS = 8_000;
+const DEFAULT_CAPACITY_RETRY_MS = 5_000;
+
+export interface ComposerObserverOptions {
+  signal?: AbortSignal;
+  current?: () => boolean;
+  progress?: (snapshot: ComposerProgressSnapshot) => void;
+  /** Every accepted state, in revision order (phase, segment, Stop). */
+  status?: (status: ComposerOperationStatus) => void;
+  /** Live-update health: true after two failed connects, false on the next healthy one. */
+  interrupted?: (interrupted: boolean) => void;
+  /** Stop was asked for but the server has not acknowledged it yet. */
+  stopUnconfirmed?: (unconfirmed: boolean) => void;
+  /** This build refused Stop; the operation remains under observation. */
+  stopUnavailable?: () => void;
+}
+
+interface Owner { generation: number; descriptor: OperationCustody; controller: AbortController; wake: () => void }
+const owners = new Set<Owner>();
+function identity(descriptor: OperationCustody): string {
+  return JSON.stringify([descriptor.scope.principalId, descriptor.scope.authProvider, descriptor.sessionId, descriptor.operationId]);
+}
+function live(owner: Owner): boolean { return !owner.controller.signal.aborted && isCurrentAuthGeneration(owner.generation); }
 function replayAgeEligible(descriptor: OperationCustody): boolean {
   const age = Date.now() - descriptor.createdAt;
   return age >= 0 && age <= COMPOSER_CUSTODY_LIFETIME_MS;
 }
-function ownerKey(descriptor: OperationCustody): string { return JSON.stringify([descriptor.scope.principalId, descriptor.scope.authProvider, descriptor.sessionId, descriptor.operationId]); }
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(new ComposerObservationDetached()); return; }
-    const abort = () => { clearTimeout(timer); reject(new ComposerObservationDetached()); };
-    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
-    signal.addEventListener("abort", abort, { once: true });
+/** A wakeable sleep: Stop and other durable intent end it at once. */
+function sleep(owner: Owner, ms: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (owner.controller.signal.aborted) { reject(new ComposerObservationDetached()); return; }
+    const done = () => { clearTimeout(timer); owner.wake = () => undefined; owner.controller.signal.removeEventListener("abort", aborted); resolve(); };
+    const aborted = () => { clearTimeout(timer); owner.wake = () => undefined; reject(new ComposerObservationDetached()); };
+    const timer = setTimeout(done, ms);
+    owner.wake = done;
+    owner.controller.signal.addEventListener("abort", aborted, { once: true });
   });
 }
+
 export function detachComposerObservers(sessionId?: string): void {
-  for (const owner of owners.values()) if (sessionId === undefined || owner.descriptor.sessionId === sessionId) owner.controller.abort();
-  detachComposerObserversV2(sessionId);
+  for (const owner of owners) if (sessionId === undefined || owner.descriptor.sessionId === sessionId) owner.controller.abort();
 }
-/** v2 observation that hands a lifecycle-1 answer back to this (v1) observer. */
-function observeV2(descriptor: OperationCustody, options: ObserverOptions): Promise<MessageWithStateResponse> {
-  const { submit: _submit, ...rest } = options as ObserverOptions & { submit?: boolean };
-  return observeComposerOperationV2(descriptor, { ...rest, handBackToV1: (v1) => observeComposerOperation(v1, rest) });
-}
+/**
+ * Record Stop for every held operation of the session and send it. Returns
+ * false when some held operation has no live observer in this tab, so the
+ * caller can resume one to see the outcome.
+ */
 export function cancelObservedComposerOperation(sessionId: string): boolean {
   const scope = composerCustodyScope();
   if (scope === null) return false;
@@ -52,227 +92,339 @@ export function cancelObservedComposerOperation(sessionId: string): boolean {
   if (targets.size === 0) return false;
   let allObserved = true;
   for (const target of targets.values()) {
-    const owner = [...owners.values()].find((item) => !item.controller.signal.aborted && isCurrentAuthGeneration(item.generation) && item.descriptor.operationId === target.operationId && item.descriptor.sessionId === sessionId && samePrincipal(item.descriptor.scope, scope));
     requestComposerStop(target);
-    if (composerProtocolVersion(target) === 2) {
-      // The v2 observer re-sends Stop until the server acknowledges it.
-      wakeComposerObserverV2(sessionId, target.operationId);
-      void api.cancelComposerOperationV2(sessionId, target.operationId).catch(() => undefined);
-      continue;
-    }
-    if (owner !== undefined) { owner.stop = true; owner.stopRequested = true; owner.stopTarget = target; }
-    else allObserved = false;
+    const observers = [...owners].filter((owner) => live(owner) && owner.descriptor.operationId === target.operationId && owner.descriptor.sessionId === sessionId && samePrincipal(owner.descriptor.scope, scope));
+    if (observers.length === 0) allObserved = false;
+    // The observer re-sends Stop until the server acknowledges it.
+    for (const owner of observers) owner.wake();
     // Only durable terminal establishes settlement. Capture each held target,
     // including unresolved admissions, without following a later winner.
     void api.cancelComposerOperation(sessionId, target.operationId).catch(() => undefined);
   }
   return allObserved;
 }
-export async function submitAndObserveComposerOperation(descriptor: SubmittedCustody, options: ObserverOptions = {}): Promise<MessageWithStateResponse> {
-  // Every compose submission (freeform and tutorial alike) passes through here,
-  // so this is the one place a new submission's version is chosen: the
-  // server-advertised admission version. A v1 descriptor carries no field.
-  const requested = descriptor.protocolVersion ?? composerAdmissionVersion();
-  const admitted = acquireComposerOperationCustody(requested === 2 ? { ...descriptor, protocolVersion: 2 } : descriptor);
-  return observeComposerOperation(admitted, { ...options, submit: true });
+
+export async function submitAndObserveComposerOperation(descriptor: SubmittedCustody, options: ComposerObserverOptions = {}): Promise<MessageWithStateResponse> {
+  return run(acquireComposerOperationCustody(descriptor), options, true);
 }
-export async function observeComposerOperation(initial: OperationCustody, options: ObserverOptions & { submit?: boolean } = {}): Promise<MessageWithStateResponse> {
-  if (composerProtocolVersion(initial) === 2 && options.submit !== true) return observeV2(initial, options);
-  const generation = currentAuthGeneration();
-  const owner: ObserverOwner = { generation, descriptor: initial, controller: new AbortController(), stop: composerStopRequested(initial), stopRequested: composerStopRequested(initial), stopTarget: composerStopRequested(initial) ? initial : null };
-  const key = ownerKey(initial);
-  const previous = owners.get(key);
-  if (previous !== undefined) previous.controller.abort();
-  owners.set(key, owner);
+/** Observe held custody. Observation alone never grants another POST. */
+export async function observeComposerOperation(descriptor: OperationCustody, options: ComposerObserverOptions = {}): Promise<MessageWithStateResponse> {
+  return run(descriptor, options, false);
+}
+
+async function run(initial: OperationCustody, options: ComposerObserverOptions, submit: boolean): Promise<MessageWithStateResponse> {
+  for (const other of owners) if (identity(other.descriptor) === identity(initial)) other.controller.abort();
+  const owner: Owner = { generation: currentAuthGeneration(), descriptor: initial, controller: new AbortController(), wake: () => undefined };
+  owners.add(owner);
   const current = () => {
     const scope = composerCustodyScope();
-    return !owner.controller.signal.aborted && isCurrentAuthGeneration(generation) && scope !== null && samePrincipal(scope, initial.scope) && (options.current?.() ?? true);
+    return live(owner) && scope !== null && samePrincipal(scope, initial.scope) && (options.current?.() ?? true);
   };
   const check = () => { if (!current()) throw new ComposerObservationDetached(); };
-  const abort = () => {
+  // A user Stop delivered through the request signal is durable Stop intent;
+  // any other abort (a deadline, navigation) only detaches this observer.
+  const onAbort = () => {
     if (!current()) return;
-    if (options.signal?.reason === COMPOSE_USER_CANCEL_ABORT_REASON) { owner.stop = true; owner.stopRequested = true; owner.stopTarget = owner.descriptor; requestComposerStop(owner.descriptor); }
+    if (options.signal?.reason === COMPOSE_USER_CANCEL_ABORT_REASON) { requestComposerStop(owner.descriptor); owner.wake(); }
     else owner.controller.abort();
   };
-  options.signal?.addEventListener("abort", abort);
-  // Restored submitted custody may be an admission whose response was lost.
-  // Observation alone never grants another POST or lets another terminal
-  // retire the original immutable body.
-  let ambiguous = initial.mode === "submitted" && options.submit !== true;
-  let shouldSubmit = options.submit === true;
-  let delegateToV2 = false;
-  let streamAttempted = false;
-  let backoff = 1000;
-  let observationDeadline = Number.POSITIVE_INFINITY;
-  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-  const tightenDeadline = (remainingMs: number) => {
-    const candidate = performance.now() + remainingMs + COMPOSE_CLIENT_GRACE_MS;
-    if (candidate >= observationDeadline) return;
-    observationDeadline = candidate;
-    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-    deadlineTimer = setTimeout(() => {
-      try { if (current()) options.timeout?.(); }
-      finally { owner.controller.abort(); }
-    }, Math.max(0, observationDeadline - performance.now()));
-  };
+  options.signal?.addEventListener("abort", onAbort);
+  let first: ComposerOperationSnapshot | null = null;
   try {
-    if (options.signal?.aborted) {
-      // Stop before POST never dispatches an action. Deadlines only detach.
-      settleComposerCustody(initial); throw new ComposerObservationDetached();
+    if (submit) {
+      // Stop before POST never dispatches an action.
+      if (options.signal?.aborted) { settleComposerCustody(initial); throw new ComposerObservationDetached(); }
+      first = await admit(owner, initial as SubmittedCustody, check);
     }
-    while (true) {
-      check();
-      if (shouldSubmit && replayAgeEligible(owner.descriptor) && !owner.stopRequested && options.submit === true && owner.descriptor.mode === "submitted") {
-        shouldSubmit = false;
-        try {
-          const ack = await api.submitComposerOperation(owner.descriptor);
-          check();
-          if (ack.operation_id !== owner.descriptor.operationId || ack.kind !== owner.descriptor.kind) throw new ComposerObservationFault("ack_identity_mismatch", new Error("Composer acknowledgement identity mismatch"));
-          ambiguous = false;
-          // Custody records the version the server echoed (a missing echo is 1).
-          const echoed = ack.protocolVersion ?? 1;
-          if (echoed !== composerProtocolVersion(owner.descriptor)) owner.descriptor = recordComposerProtocolVersion(owner.descriptor, echoed);
-          // Delegate after the admission boundary, so observation errors are never read as admission errors.
-          delegateToV2 = echoed === 2;
-        } catch (error) {
-          check();
-          if (error instanceof ComposerObservationFault) throw error;
-          const active = api.composerActiveOperation(error);
-          if (active !== null) {
-            if (!ambiguous) { settleComposerCustody(owner.descriptor); if (owner.stopTarget?.operationId === owner.descriptor.operationId) owner.stop = false; }
-            owner.descriptor = attachComposerObserver(owner.descriptor, active.operation_id, active.kind, ambiguous);
-            // A refused body is never relabelled with the winner's identity.
-            // The store keeps the optimistic row as the losing user's draft.
-          } else if (api.isDefinitiveComposerRefusal(error)) {
-            settleComposerCustody(owner.descriptor); throw error;
-          } else {
-            ambiguous = true;
-          }
-        }
-      }
-      if (delegateToV2) return await observeV2(owner.descriptor, options);
-      check();
-      if (owner.stop) {
-        try {
-          const cancelled = await api.cancelComposerOperation(initial.sessionId, owner.stopTarget!.operationId);
-          check();
-          // A missing read cannot prove the earlier admission thread stopped.
-          // Keep retrying cancellation if that thread commits later.
-          if (cancelled.kind === "session_missing") { clearComposerSessionCustody(initial.scope, initial.sessionId); throw new ComposerSessionMissing(); }
-          if (cancelled.kind !== "operation_missing" && cancelled.kind !== owner.stopTarget!.kind) throw new ComposerObservationFault("cancel_kind_mismatch", new Error("Cancellation kind mismatch"));
-          owner.stop = cancelled.kind === "operation_missing" || ((cancelled.status === "queued" || cancelled.status === "running") && !cancelled.cancel_requested);
-        } catch (error) { check(); if (error instanceof ComposerObservationFault || error instanceof ComposerSessionMissing) throw error; }
-      }
-      if (!streamAttempted && !ambiguous) {
-        streamAttempted = true;
-        await readStream(owner, current, tightenDeadline, options.progress);
-        check();
-      }
-      let durableTerminal = false;
+    if (!(owner.descriptor.mode === "observer" && initial.mode === "submitted")) return await follow(owner, options, current, check, first);
+    // A refused submission observes the winner, whose terminal keeps the
+    // "another action finished" contract; the refused body stays a draft.
+    let result: MessageWithStateResponse;
+    try { result = await follow(owner, options, current, check, null); }
+    catch (error) {
+      if (typeof error === "object" && error !== null && "composer_operation" in error) throw new ComposerActiveAttachment({ status: "failed", error: error as ApiError });
+      throw error;
+    }
+    throw new ComposerActiveAttachment({ status: "completed", result });
+  } finally {
+    options.signal?.removeEventListener("abort", onAbort);
+    owners.delete(owner);
+  }
+}
+
+/**
+ * POST the submitted body. Returns once the admission is established (or the
+ * owner now observes the active winner). An ambiguous admission is resolved
+ * only by a read of the same identity, whose snapshot is returned for the
+ * observer to apply; a missing read may replay the same immutable ID and body
+ * while the custody is young and no Stop was asked for.
+ */
+async function admit(owner: Owner, descriptor: SubmittedCustody, check: () => void): Promise<ComposerOperationSnapshot | null> {
+  let ambiguous = false;
+  let shouldSubmit = true;
+  let backoff = 1000;
+  while (true) {
+    check();
+    if (shouldSubmit && replayAgeEligible(descriptor) && !composerStopRequested(descriptor)) {
+      shouldSubmit = false;
       try {
-        const snapshot = await api.fetchComposerOperation(initial.sessionId, owner.descriptor.operationId);
+        const admitted = await api.submitComposerOperation(descriptor);
         check();
-        if (snapshot.kind === "session_missing") {
-          clearComposerSessionCustody(initial.scope, initial.sessionId); throw new ComposerSessionMissing();
-        }
-        if (snapshot.kind === "operation_missing") {
-          // This read cannot establish that an older admission thread stopped.
-          // Replay remains restricted to the exact submitted descriptor.
-          if (ambiguous && replayAgeEligible(owner.descriptor) && owner.descriptor.mode === "submitted" && options.submit === true && !owner.stopRequested && options.reconciliationOnly !== true) shouldSubmit = true;
-          await sleep(backoff, owner.controller.signal); backoff = Math.min(backoff * 2, 8000); continue;
-        }
-        if (snapshot.kind !== owner.descriptor.kind) throw new ComposerObservationFault("snapshot_kind_mismatch", new Error("Operation kind mismatch"));
-        // A bound authoritative snapshot establishes admission permanently
-        // for this observation, even if a later read is missing.
-        ambiguous = false;
-        backoff = 1000;
-        if (snapshot.status === "completed" || snapshot.status === "failed") {
-          if (snapshot.status === "failed") validateComposerRecoveryBody(snapshot.error!.body, initial.sessionId);
-          const bodyError = snapshot.status === "failed" ? await api.apiErrorFromBody(snapshot.error!.http_status, snapshot.error!.body) : null;
-          const terminalError = bodyError !== null ? {
-            ...bodyError,
-            failure_code: snapshot.error!.failure_code === "http_error" ? bodyError.failure_code : snapshot.error!.failure_code,
-            diagnostic_id: snapshot.error!.diagnostic_id ?? undefined,
-            composer_operation: { operation_id: snapshot.operation_id, kind: snapshot.kind, failure_code: snapshot.error!.failure_code },
-          } : null;
-          check();
-          durableTerminal = true;
-          settleComposerCustody(owner.descriptor);
-          if (owner.descriptor.mode === "observer" && initial.mode === "submitted") throw new ComposerActiveAttachment(
-            snapshot.status === "completed" ? { status: "completed", result: snapshot.result! } : { status: "failed", error: terminalError! },
-          );
-          if (snapshot.status === "completed") return snapshot.result!;
-          throw terminalError;
-        }
-        tightenDeadline(snapshot.deadline_remaining_ms);
-        await sleep(Math.max(100, Math.min(snapshot.poll_after_ms, 60000)), owner.controller.signal);
+        if (admitted.operation_id !== descriptor.operationId || admitted.kind !== descriptor.kind) throw new ComposerObservationFault("ack_identity_mismatch", new Error("Composer acknowledgement identity mismatch"));
+        return null;
       } catch (error) {
         check();
         if (error instanceof ComposerObservationFault) throw error;
-        if (isVersionRequired(error) && !durableTerminal) {
-          // The attached (or restored) operation is lifecycle 2: read it as v2.
-          owner.descriptor = recordComposerProtocolVersion(owner.descriptor, 2);
-          return await delegateAttached(owner.descriptor, initial, options);
+        const active = api.composerActiveOperation(error);
+        if (active !== null) {
+          if (!ambiguous) settleComposerCustody(descriptor);
+          // A refused body is never relabelled with the winner's identity.
+          // The store keeps the optimistic row as the losing user's draft.
+          owner.descriptor = attachComposerObserver(descriptor, active.operation_id, active.kind, ambiguous);
+          return null;
         }
-        if (durableTerminal || error instanceof ComposerSessionMissing || error instanceof ComposerActiveAttachment || api.isDefinitiveComposerRefusal(error)) throw error;
-        // Decode/transport/GET outages preserve pending custody and retry under
-        // the same generation. They do not fail or replay an observed action.
-        await sleep(backoff, owner.controller.signal); backoff = Math.min(backoff * 2, 8000);
+        if (api.isDefinitiveComposerRefusal(error)) { settleComposerCustody(descriptor); throw error; }
+        ambiguous = true;
       }
     }
-  } finally {
-    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-    options.signal?.removeEventListener("abort", abort);
-    if (owners.get(key) === owner) owners.delete(key);
+    // Not ambiguous (nothing was dispatched) or Stop was asked for: observe it.
+    if (!ambiguous || composerStopRequested(descriptor)) return null;
+    try {
+      const read = await api.fetchComposerOperation(descriptor.sessionId, descriptor.operationId);
+      check();
+      if ("operation_id" in read) {
+        if (read.kind !== descriptor.kind) throw new ComposerObservationFault("snapshot_kind_mismatch", new Error("Operation kind mismatch"));
+        // A bound authoritative snapshot establishes admission permanently.
+        return read;
+      }
+      if (read.kind === "session_missing") { clearComposerSessionCustody(descriptor.scope, descriptor.sessionId); throw new ComposerSessionMissing(); }
+      // This read cannot establish that an older admission thread stopped.
+      // Replay remains restricted to the exact submitted descriptor.
+      shouldSubmit = true;
+    } catch (error) {
+      check();
+      if (error instanceof ComposerObservationFault || error instanceof ComposerSessionMissing || api.isDefinitiveComposerRefusal(error)) throw error;
+      // Decode/transport/GET outages keep custody and retry the same read.
+    }
+    await sleep(owner, backoff); backoff = Math.min(backoff * 2, BACKOFF_CAP_MS);
   }
 }
-function isVersionRequired(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "error_type" in error && error.error_type === "composer_operation_version_required";
-}
-/** A v2 operation observed on behalf of a refused submission keeps the v1 "another action finished" contract. */
-async function delegateAttached(descriptor: OperationCustody, initial: OperationCustody, options: ObserverOptions): Promise<MessageWithStateResponse> {
-  if (!(descriptor.mode === "observer" && initial.mode === "submitted")) return observeV2(descriptor, options);
-  let result: MessageWithStateResponse;
-  try { result = await observeV2(descriptor, options); }
-  catch (error) {
-    if (typeof error === "object" && error !== null && "composer_operation" in error) throw new ComposerActiveAttachment({ status: "failed", error: error as ApiError });
-    throw error;
+
+/** Revision bookkeeping, exported for its own tests. */
+export class RevisionGate {
+  private highest = -1;
+  private accepted: ComposerOperationStatus | null = null;
+  get lastAccepted(): number { return this.highest; }
+  get latest(): ComposerOperationStatus | null { return this.accepted; }
+  /** True for a new state; false for a duplicate or stale one; throws on an equal-revision conflict. */
+  accept(status: ComposerOperationStatus): boolean {
+    if (status.status_revision < this.highest) return false;
+    if (status.status_revision === this.highest && this.accepted !== null) {
+      const same = status.status === this.accepted.status && status.phase === this.accepted.phase && status.cancel_requested === this.accepted.cancel_requested
+        && JSON.stringify(status.segment) === JSON.stringify(this.accepted.segment);
+      if (!same) throw new Error("Composer protocol error: equal revision with different state");
+      return false;
+    }
+    this.highest = status.status_revision; this.accepted = status;
+    return true;
   }
-  throw new ComposerActiveAttachment({ status: "completed", result });
 }
-async function readStream(owner: ObserverOwner, current: () => boolean, tightenDeadline: (remainingMs: number) => void, progress?: (snapshot: ComposerProgressSnapshot) => void): Promise<void> {
-  const controller = new AbortController();
-  const close = () => controller.abort();
-  owner.controller.signal.addEventListener("abort", close, { once: true });
-  let timer = setTimeout(close, 15000);
-  const lifetimeTimer = setTimeout(close, 120000);
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  try {
-    const response = await api.fetchComposerOperationStream(owner.descriptor.sessionId, owner.descriptor.operationId, controller.signal);
-    if (!current() || !response.ok || response.headers.get("content-type")?.split(";")[0] !== "text/event-stream" || response.body === null) return;
-    reader = response.body.getReader();
-    const decoder = new ComposerSseDecoder();
-    let sequence = -1;
-    while (current()) {
-      const chunk = await reader.read();
-      if (!current()) return;
-      if (chunk.done) { decoder.finish(); return; }
-      for (const value of decoder.push(chunk.value)) {
-        const frame = decodeComposerOperationFrame(value, owner.descriptor.sessionId, owner.descriptor.operationId);
-        if (frame.sequence <= sequence) continue;
-        sequence = frame.sequence;
-        clearTimeout(timer); timer = setTimeout(close, 15000);
-        if (frame.event === "status") tightenDeadline(frame.payload.deadline_remaining_ms);
-        if (frame.event === "terminal") return;
-        if (frame.event === "progress") deliverComposerObservation(() => progress?.({ ...frame.payload, session_id: frame.session_id, inflight_requests: 1 }));
+
+type StreamEnd = "terminal" | "reconnect" | "deadline" | "capacity" | "failed";
+
+/**
+ * Observe an admitted (or restored, or adopted) operation to its sealed
+ * terminal. `first` is a snapshot already read for this identity (the read
+ * that resolved an ambiguous admission); it is applied before anything else.
+ */
+async function follow(owner: Owner, options: ComposerObserverOptions, current: () => boolean, check: () => void, first: ComposerOperationSnapshot | null): Promise<MessageWithStateResponse> {
+  const descriptor = owner.descriptor;
+  const controller = owner.controller;
+  const gate = new RevisionGate();
+  let trustStream = true;
+  let consecutiveFailures = 0;
+  let stopFailures = 0;
+  let stopAcknowledged = false;
+  let capacityUntil = 0;
+  const consumedDeadlines = new Set<string>();
+  const pollAfter = () => Math.max(100, Math.min(gate.latest?.poll_after_ms ?? 1000, 60_000));
+  const backoff = (failures: number) => Math.min(1000 * 2 ** Math.max(0, failures - 1), BACKOFF_CAP_MS);
+
+  const accept = (status: ComposerOperationStatus, fault: "snapshot_kind_mismatch" | "cancel_kind_mismatch" = "snapshot_kind_mismatch"): boolean => {
+    if (status.kind !== descriptor.kind) throw new ComposerObservationFault(fault, new Error("Operation kind mismatch"));
+    let fresh: boolean;
+    try { fresh = gate.accept(status); } catch { trustStream = false; return false; }
+    if (fresh) {
+      deliverComposerObservation(() => options.status?.(status));
+      if (status.cancel_requested) { stopAcknowledged = true; options.stopUnconfirmed?.(false); }
+    }
+    return fresh;
+  };
+
+  // One connection. A connection is healthy only when it ends with terminal or
+  // reconnect; frames received before an unexplained end do not reset failures.
+  const readStream = async (): Promise<StreamEnd | { capacityMs: number }> => {
+    const stream = new AbortController();
+    const close = () => stream.abort();
+    controller.signal.addEventListener("abort", close, { once: true });
+    let idle = setTimeout(close, COMPOSER_STREAM_IDLE_CLOSE_MS);
+    const lifetime = setTimeout(close, COMPOSER_STREAM_LIFETIME_MS + 5_000);
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let deadlineFired = false;
+    const previousWake = owner.wake;
+    owner.wake = close;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const response = await api.fetchComposerOperationStream(descriptor.sessionId, descriptor.operationId, stream.signal, gate.lastAccepted >= 0 ? gate.lastAccepted : null);
+      if (!current()) return "failed";
+      if (response.status === 503) {
+        const seconds = Number(response.headers.get("Retry-After"));
+        return { capacityMs: Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, 60_000) : DEFAULT_CAPACITY_RETRY_MS };
+      }
+      if (!response.ok || response.headers.get("content-type")?.split(";")[0] !== "text/event-stream" || response.body === null) return "failed";
+      reader = response.body.getReader();
+      const decoder = new ComposerSseDecoder();
+      let sequence = -1;
+      while (current()) {
+        const chunk = await reader.read();
+        if (!current()) return "failed";
+        if (chunk.done) { decoder.finish(); break; }
+        for (const raw of decoder.push(chunk.value)) {
+          const frame = decodeComposerOperationFrame(raw, descriptor.sessionId, descriptor.operationId);
+          if (frame.sequence <= sequence) continue;
+          sequence = frame.sequence;
+          clearTimeout(idle); idle = setTimeout(close, COMPOSER_STREAM_IDLE_CLOSE_MS);
+          if (frame.event === "status") {
+            accept(frame.payload);
+            if (!trustStream) return "failed";
+            if (frame.payload.status === "completed" || frame.payload.status === "failed") return "terminal";
+            const segment = frame.payload.segment;
+            const deadlineKey = segment?.deadline_at == null ? null : `${segment.sequence}:${segment.generation}:${segment.deadline_at}`;
+            if (deadlineKey !== null && !consumedDeadlines.has(deadlineKey)) {
+              if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+              const delay = Math.max(0, Date.parse(segment!.deadline_at!) - Date.parse(frame.payload.observed_at));
+              deadlineTimer = setTimeout(() => { consumedDeadlines.add(deadlineKey); deadlineFired = true; close(); }, delay);
+            }
+          } else if (frame.event === "progress") {
+            deliverComposerObservation(() => options.progress?.({ ...frame.payload, session_id: descriptor.sessionId, inflight_requests: 1 } as ComposerProgressSnapshot));
+          } else if (frame.event === "terminal") return "terminal";
+          else if (frame.event === "reconnect") return "reconnect";
+        }
+      }
+      return deadlineFired ? "deadline" : "failed";
+    } catch (error) {
+      if (error instanceof ComposerObservationFault) throw error;
+      return deadlineFired ? "deadline" : "failed";
+    } finally {
+      clearTimeout(idle); clearTimeout(lifetime); if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      controller.signal.removeEventListener("abort", close);
+      owner.wake = previousWake;
+      stream.abort();
+      if (reader !== undefined) { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+    }
+  };
+
+  // The durable GET. Returns the sealed result, throws a sealed failure, or
+  // returns "live" / "missing".
+  type Durable = { done: true; result: MessageWithStateResponse } | { done: false; why: "live" | "missing" };
+  const readDurable = async (): Promise<Durable> => {
+    const read = await api.fetchComposerOperation(descriptor.sessionId, descriptor.operationId);
+    check();
+    if (!("operation_id" in read)) {
+      if (read.kind === "session_missing") { clearComposerSessionCustody(descriptor.scope, descriptor.sessionId); throw new ComposerSessionMissing(); }
+      return { done: false, why: "missing" };
+    }
+    return apply(read);
+  };
+  const apply = async (snapshot: ComposerOperationSnapshot): Promise<Durable> => {
+    accept(snapshot);
+    if (snapshot.status !== "completed" && snapshot.status !== "failed") return { done: false, why: "live" };
+    // The terminal GET is read for its sealed result even at an equal revision.
+    if (snapshot.status === "failed") validateComposerRecoveryBody(snapshot.error!.body, descriptor.sessionId);
+    const bodyError = snapshot.status === "failed" ? await api.apiErrorFromBody(snapshot.error!.http_status, snapshot.error!.body) : null;
+    check();
+    settleComposerCustody(descriptor);
+    if (snapshot.status === "completed") return { done: true, result: snapshot.result! };
+    throw {
+      ...bodyError!,
+      failure_code: snapshot.error!.failure_code === "http_error" ? bodyError!.failure_code : snapshot.error!.failure_code,
+      diagnostic_id: snapshot.error!.diagnostic_id ?? undefined,
+      composer_operation: { operation_id: snapshot.operation_id, kind: snapshot.kind, failure_code: snapshot.error!.failure_code },
+    };
+  };
+  // A sealed failure or a lost session ends observation; any other read error keeps custody and retries.
+  const isFinal = (error: unknown) => error instanceof ComposerSessionMissing || error instanceof ComposerObservationDetached || (typeof error === "object" && error !== null && "composer_operation" in error);
+
+  if (first !== null) {
+    try {
+      const durable = await apply(first);
+      if (durable.done) return durable.result;
+    } catch (error) {
+      check();
+      if (error instanceof ComposerObservationFault || isFinal(error)) throw error;
+      // A malformed recovery body keeps custody; the loop re-reads the GET.
+    }
+  }
+  while (true) {
+    check();
+    // Unconfirmed Stop has its own retry schedule and is not held behind a stream.
+    if (composerStopRequested(descriptor) && !stopAcknowledged) {
+      try {
+        const stopped = await api.cancelComposerOperation(descriptor.sessionId, descriptor.operationId);
+        check();
+        if (!("operation_id" in stopped)) {
+          if (stopped.kind === "session_missing") { clearComposerSessionCustody(descriptor.scope, descriptor.sessionId); throw new ComposerSessionMissing(); }
+          stopFailures += 1;
+        } else {
+          accept(stopped, "cancel_kind_mismatch");
+          stopAcknowledged = stopped.cancel_requested || stopped.status === "completed" || stopped.status === "failed";
+          stopFailures = stopAcknowledged ? 0 : stopFailures + 1;
+        }
+      } catch (error) {
+        check();
+        if (error instanceof ComposerObservationFault || error instanceof ComposerSessionMissing) throw error;
+        if (typeof error === "object" && error !== null && "status" in error && error.status === 409
+          && "error_type" in error && error.error_type === "composer_continuation_stop_unavailable") {
+          clearComposerStop(descriptor);
+          stopFailures = 0;
+          options.stopUnconfirmed?.(false);
+          options.stopUnavailable?.();
+        } else stopFailures += 1;
+      }
+      if (!stopAcknowledged && composerStopRequested(descriptor)) {
+        options.stopUnconfirmed?.(true);
+        await sleep(owner, backoff(stopFailures));
+        continue;
+      }
+      options.stopUnconfirmed?.(false);
+    }
+    let end: StreamEnd = "failed";
+    if (Date.now() < capacityUntil || !trustStream) end = "deadline"; // poll the GET this round
+    else {
+      const outcome = await readStream();
+      check();
+      if (typeof outcome === "object") { capacityUntil = Date.now() + outcome.capacityMs; end = "deadline"; }
+      else end = outcome;
+    }
+    if (end === "reconnect") { consecutiveFailures = 0; options.interrupted?.(false); continue; }
+    if (end === "failed") {
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= 2) options.interrupted?.(true);
+    } else if (end === "terminal") { consecutiveFailures = 0; options.interrupted?.(false); }
+    // Terminal, deadline, capacity, an untrusted stream, or a repeated failure: read the durable GET.
+    if (end !== "failed" || consecutiveFailures >= 2) {
+      try {
+        const durable = await readDurable();
+        if (durable.done) return durable.result;
+      } catch (error) {
+        check();
+        if (error instanceof ComposerObservationFault) throw error;
+        if (isFinal(error)) throw error;
+        if (api.isDefinitiveComposerRefusal(error)) throw error; // custody is kept: a refused read proves nothing
       }
     }
-  } catch (error) {
-    if (error instanceof ComposerObservationFault) throw error;
-    // One authenticated durable GET observer handles transport/decode fallback.
-  }
-  finally {
-    clearTimeout(timer); clearTimeout(lifetimeTimer); controller.abort(); owner.controller.signal.removeEventListener("abort", close);
-    if (reader !== undefined) { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+    if (end === "failed") await sleep(owner, backoff(consecutiveFailures));
+    else if (end === "terminal") await sleep(owner, backoff(1)); // the stream said terminal but the GET did not yet
+    else if (end === "deadline") await sleep(owner, Date.now() < capacityUntil || !trustStream ? pollAfter() : 0);
   }
 }

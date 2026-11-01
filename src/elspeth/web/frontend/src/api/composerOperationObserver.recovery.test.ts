@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { cancelObservedComposerOperation, ComposerActiveAttachment, detachComposerObservers, observeComposerOperation, submitAndObserveComposerOperation } from "./composerOperationObserver";
-import { acquireComposerOperationCustody, authenticateComposerCustody, composerStopPersistenceLimited, COMPOSER_AGGREGATE_LIMIT, COMPOSER_STOP_KEY, requestComposerStop, COMPOSER_CUSTODY_KEY, COMPOSER_CUSTODY_LIFETIME_MS, composerStopRequested, findComposerOperationCustody, purgeComposerCustody } from "@/stores/composerOperationCustody";
+import { acquireComposerOperationCustody, authenticateComposerCustody, composerStopPersistenceLimited, COMPOSER_AGGREGATE_LIMIT, COMPOSER_STOP_KEY, requestComposerStop, COMPOSER_CUSTODY_KEY, COMPOSER_CUSTODY_LIFETIME_MS, COMPOSER_CUSTODY_SCHEMA, composerStopRequested, findComposerOperationCustody, purgeComposerCustody } from "@/stores/composerOperationCustody";
+import { completedSnapshot, liveSnapshot, streamUnavailable } from "@/test/composerOperationWire";
 import type { ComposerOperationSnapshot, SubmittedCustody } from "@/types/composerOperations";
 import { attachComposerObserver, settleComposerCustody } from "@/stores/composerOperationCustody";
 vi.mock("./client", () => ({ submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(), apiErrorFromBody: vi.fn(), composerActiveOperation: vi.fn(), isDefinitiveComposerRefusal: vi.fn() }));
@@ -8,8 +9,11 @@ import * as api from "./client";
 const sessionId = "11111111-1111-4111-8111-111111111111", operationId = "22222222-2222-4222-8222-222222222222", other = "33333333-3333-4333-8333-333333333333";
 const scope = { principalId: "principal", authProvider: "local" };
 function descriptor(): SubmittedCustody { return { mode: "submitted", scope, sessionId, operationId, kind: "compose_message", createdAt: Date.now(), body: { operation_id: operationId, content: "hello", state_id: null } }; }
-function snapshot(status: "running" | "completed" = "completed", id = operationId): ComposerOperationSnapshot { return { operation_id: id, kind: "compose_message", status, cancel_requested: false, poll_after_ms: 1000, deadline_at: "2026-10-06T00:00:00Z", deadline_remaining_ms: status === "running" ? 100000 : 0, result: status === "running" ? null : { message: { id: other, session_id: sessionId, role: "assistant", content: "done", tool_calls: null, created_at: "2026-10-06T00:00:00Z" }, state: null, proposals: [] }, error: null }; }
-beforeEach(() => { vi.resetAllMocks(); vi.useFakeTimers(); purgeComposerCustody(); sessionStorage.clear(); authenticateComposerCustody(scope); vi.mocked(api.fetchComposerOperationStream).mockRejectedValue(new Error("offline")); vi.mocked(api.composerActiveOperation).mockReturnValue(null); vi.mocked(api.isDefinitiveComposerRefusal).mockReturnValue(false); vi.mocked(api.cancelComposerOperation).mockResolvedValue({ kind: "operation_missing" }); });
+function snapshot(status: "running" | "completed" = "completed", id = operationId): ComposerOperationSnapshot {
+  if (status === "running") return liveSnapshot(id, { poll_after_ms: 1000 });
+  return completedSnapshot(id, { message: { id: other, session_id: sessionId, role: "assistant", content: "done", tool_calls: null, created_at: "2026-10-06T00:00:00Z" }, state: null, proposals: [] } as unknown as NonNullable<ComposerOperationSnapshot["result"]>, { poll_after_ms: 1000 });
+}
+beforeEach(() => { vi.resetAllMocks(); vi.useFakeTimers(); purgeComposerCustody(); sessionStorage.clear(); authenticateComposerCustody(scope); vi.mocked(api.fetchComposerOperationStream).mockImplementation(async () => streamUnavailable()); vi.mocked(api.composerActiveOperation).mockReturnValue(null); vi.mocked(api.isDefinitiveComposerRefusal).mockReturnValue(false); vi.mocked(api.cancelComposerOperation).mockResolvedValue({ kind: "operation_missing" }); });
 afterEach(() => { detachComposerObservers(); vi.useRealTimers(); purgeComposerCustody(); });
 it("Stop persists and cancels each exact unresolved action after the winner settles", async () => {
   const first = acquireComposerOperationCustody(descriptor());
@@ -17,13 +21,14 @@ it("Stop persists and cancels each exact unresolved action after the winner sett
   settleComposerCustody(winner);
   expect(findComposerOperationCustody(scope, sessionId).foreground).toBeNull();
   vi.mocked(api.fetchComposerOperation).mockResolvedValue(snapshot("running"));
-  const observing = observeComposerOperation(first, { reconciliationOnly: true }).catch((error: unknown) => error);
+  const observing = observeComposerOperation(first).catch((error: unknown) => error);
   await vi.advanceTimersByTimeAsync(0);
   expect(cancelObservedComposerOperation(sessionId)).toBe(true);
   expect(composerStopRequested(first)).toBe(true);
   expect(vi.mocked(api.cancelComposerOperation).mock.calls.map(([, id]) => id)).toEqual([operationId]);
   await vi.advanceTimersByTimeAsync(1000);
-  expect(api.cancelComposerOperation).toHaveBeenCalledTimes(2);
+  // The observer re-sends the unconfirmed Stop to the same exact target.
+  expect(vi.mocked(api.cancelComposerOperation).mock.calls.length).toBeGreaterThanOrEqual(2);
   expect(api.submitComposerOperation).not.toHaveBeenCalled();
   expect(vi.mocked(api.cancelComposerOperation).mock.calls.every(([, id]) => id !== other)).toBe(true);
   detachComposerObservers(); await vi.advanceTimersByTimeAsync(0); await observing;
@@ -44,9 +49,11 @@ it("ownerless Stop records every unresolved identity without canceling the settl
 it("ownerless Stop survives detach and retries its exact target on restored late admission", async () => {
   const pending = acquireComposerOperationCustody(descriptor());
   expect(cancelObservedComposerOperation(sessionId)).toBe(false); expect(composerStopRequested(pending)).toBe(true);
+  // The late admission becomes visible: Stop is acknowledged, then the terminal is read.
+  vi.mocked(api.cancelComposerOperation).mockResolvedValueOnce({ kind: "operation_missing" }).mockResolvedValue({ ...snapshot("running"), cancel_requested: true });
   vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce(snapshot("running")).mockResolvedValue(snapshot());
   const observing = observeComposerOperation(pending);
-  await vi.advanceTimersByTimeAsync(1000); await observing;
+  await vi.advanceTimersByTimeAsync(2000); await observing;
   expect(api.cancelComposerOperation).toHaveBeenCalledTimes(3);
   expect(vi.mocked(api.cancelComposerOperation).mock.calls.every(([, id]) => id === operationId)).toBe(true);
   expect(api.submitComposerOperation).not.toHaveBeenCalled();
@@ -66,7 +73,7 @@ it("mixed expired and fresh custody exposes readonly descriptors while preservin
   purgeComposerCustody();
   const expired = { ...descriptor(), createdAt: Date.now() - COMPOSER_CUSTODY_LIFETIME_MS - 1 };
   const fresh = { ...descriptor(), sessionId: other };
-  const raw = JSON.stringify({ schema: "composer-operations.v1", entries: [expired, fresh].map((foreground) => ({ foreground, unresolvedSubmissions: [] })) });
+  const raw = JSON.stringify({ schema: COMPOSER_CUSTODY_SCHEMA, entries: [expired, fresh].map((foreground) => ({ foreground, unresolvedSubmissions: [] })) });
   sessionStorage.setItem(COMPOSER_CUSTODY_KEY, raw); authenticateComposerCustody(scope);
   expect(findComposerOperationCustody(scope, sessionId).foreground).toEqual(expired);
   expect(findComposerOperationCustody(scope, other).foreground).toEqual(fresh);
@@ -87,7 +94,7 @@ it("persisted Stop control restores on a fresh custody module without changing r
   fresh.purgeComposerCustody();
 });
 it("unreadable nested failed terminal never settles exact submitted custody", async () => {
-  vi.mocked(api.submitComposerOperation).mockResolvedValue({ operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000 });
+  vi.mocked(api.submitComposerOperation).mockResolvedValue(liveSnapshot(operationId, { status: "queued", phase: "queued" }));
   vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...snapshot(), status: "failed", result: null, error: { http_status: 500, error_type: "composer_plugin_crash", failure_code: "http_error", diagnostic_id: null, body: { detail: { failed_turn: { assistant_message_id: 22, tool_calls_attempted: {}, tool_responses_persisted: -3, transcript_url: 5, extra: true } } } } });
   const observing = submitAndObserveComposerOperation(descriptor()).catch((error: unknown) => error);
   await vi.advanceTimersByTimeAsync(0);
@@ -116,7 +123,7 @@ it("quota admission reserves every held action's later persisted Stop control", 
 it("malformed sibling remains quarantined while a valid identity stays reachable for readonly recovery", async () => {
   purgeComposerCustody();
   const valid = descriptor();
-  const raw = JSON.stringify({ schema: "composer-operations.v1", entries: [{ foreground: valid, unresolvedSubmissions: [] }, { foreground: { ...descriptor(), sessionId: other, mode: "unknown" }, unresolvedSubmissions: [] }] });
+  const raw = JSON.stringify({ schema: COMPOSER_CUSTODY_SCHEMA, entries: [{ foreground: valid, unresolvedSubmissions: [] }, { foreground: { ...descriptor(), sessionId: other, mode: "unknown" }, unresolvedSubmissions: [] }] });
   sessionStorage.setItem(COMPOSER_CUSTODY_KEY, raw); authenticateComposerCustody(scope); authenticateComposerCustody(scope);
   expect(findComposerOperationCustody(scope, sessionId).foreground?.operationId).toBe(operationId);
   expect(findComposerOperationCustody(scope, other).foreground).toBeNull();

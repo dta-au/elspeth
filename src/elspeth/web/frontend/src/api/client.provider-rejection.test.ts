@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { apiErrorFromBody, parseResponse } from "./client";
 import { decodeComposerOperationSnapshot } from "./composerOperationDecoder";
-import { decodeComposerOperationSnapshotV2 } from "./composerOperationDecoderV2";
 import type { SafeRequestRejection } from "@/types";
 
 const sessionId = "11111111-1111-4111-8111-111111111111";
@@ -48,12 +47,10 @@ describe("primary provider rejection at the real shared API-error boundary", () 
     }
   });
 
-  it.each([1, 2])("retains rejection after the actual V%s terminal-body decoder", (version) => {
+  it("retains rejection after the actual terminal-body decoder", () => {
     const error = { http_status: 502, body: envelope(rejection, true), error_type: "llm_unavailable", failure_code: "http_error", diagnostic_id: null };
-    const common = { operation_id: operationId, kind: "compose_message", status: "failed", cancel_requested: false, poll_after_ms: 1000, result: null, error };
-    const decoded = version === 1
-      ? decodeComposerOperationSnapshot({ ...common, deadline_at: "2026-10-31T00:00:00Z", deadline_remaining_ms: 0 }, sessionId, operationId)
-      : decodeComposerOperationSnapshotV2({ ...common, protocol_version: 2, phase: "settled", status_revision: 9, created_at: "2026-10-31T00:00:00Z", observed_at: "2026-10-31T00:00:00Z", segment: null }, sessionId, operationId);
+    const terminal = { operation_id: operationId, kind: "compose_message", status: "failed", phase: "settled", status_revision: 9, created_at: "2026-10-31T00:00:00Z", observed_at: "2026-10-31T00:00:00Z", cancel_requested: false, poll_after_ms: 1000, segment: null, result: null, error };
+    const decoded = decodeComposerOperationSnapshot(terminal, sessionId, operationId);
     expect(decoded.error).not.toBeNull();
     if (decoded.error === null) throw new Error("The real durable decoder dropped the terminal failure");
     expect(apiErrorFromBody(decoded.error.http_status, decoded.error.body)).toMatchObject({ request_rejection: rejection, error_type: "llm_unavailable" });
