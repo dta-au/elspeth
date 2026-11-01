@@ -15,7 +15,7 @@ from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.composer.continuation import ComposeFrame, InitializeFrame
+from elspeth.web.composer.continuation import ComposeFrame, EndFrame, InitializeFrame
 from elspeth.web.composer.continuation_clock import ContinuationTimingObservation, SegmentFit, admit_action
 from elspeth.web.composer.continuation_composition_initialization import initialize_continuation_composition
 from elspeth.web.composer.continuation_env_inventory import _read_current_env_names
@@ -49,9 +49,11 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationRunning,
 )
 from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, ComposerSegmentYieldReceipt, StoredContinuationSnapshot
+from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, review_continuation_end
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
+from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
 from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
-from elspeth.web.sessions.schemas import MessageWithStateResponse, SendMessageRequest
+from elspeth.web.sessions.schemas import SendMessageRequest
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
@@ -350,7 +352,7 @@ class _SegmentDriver:
         )
         return ContinuationSegmentHandedOver(receipt)
 
-    async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> MessageWithStateResponse | None:
+    async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> ComposerOperationRecord | None:
         root, top = selected.stack, selected.stack.frames[-1]
         if type(top) is InitializeFrame:
             if top.ingress_phase == "reserved":
@@ -436,12 +438,23 @@ class _SegmentDriver:
                 runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
             self.phases.accept_primary(primary_result)
             return None
+        if is_applied_batch_cut(selected):
+            # The post-batch phase either returns the next authoring
+            # transition to the provider or publishes the result it reached.
+            return await advance_continuation_iteration(self.phases, self.services, selected)
+        if type(top) is EndFrame:
+            # END publishes through the shared terminal owner in its own
+            # transaction; the returned record is that committed terminal.
+            return await review_continuation_end(self.phases, self.services, selected)
+        if type(top) is ComposeFrame and top.phase == "response_retained" and await primary_issued_no_tools(self.phases, selected):
+            await enter_continuation_end(self.phases, selected)
+            return None
         await self.service.advance_continuation_phase(
             owner=self.phases, authority=self.authority, selected=selected, work=self.work, provider_owner=self.provider
         )
         return None
 
-    async def watch_stage(self, stage: asyncio.Task[MessageWithStateResponse | None], reader: ComposerOperationWatchReader) -> None:
+    async def watch_stage(self, stage: asyncio.Task[ComposerOperationRecord | None], reader: ComposerOperationWatchReader) -> None:
         key = (self.running.claim.session_id, self.running.claim.operation_id)
         stop_delivered = False
         try:
@@ -552,28 +565,14 @@ class _SegmentDriver:
                     return await self.dispose(original)
                 return await self.settle(await self.record(), original)
             if result is not None:
-                if type(result) is not MessageWithStateResponse:
-                    raise AuditIntegrityError("Continuation publication lost its nominal actual response")
-                names = await _read_current_env_names(self.service._advisor_checkpoint, str(self.running.claim.session_id))
-                try:
-                    terminal = await _registered(
-                        work=self.work,
-                        source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-                        operation=partial(
-                            self.authority.settle_continuation_owner,
-                            self.running,
-                            outcome=result,
-                            env_ref_names=names,
-                            deadline=self.worker.drain_deadline,
-                        ),
-                        expected=ComposerOperationRecord,
-                    )
-                except ComposerOperationCancelledDuringTurn:
-                    return await self.settle(await self.record())
+                # The END owner already committed this terminal together with
+                # its assistant row and audit cohort (the shared R2 composite).
+                if type(result) is not ComposerOperationRecord or result.status != "completed":
+                    raise AuditIntegrityError("Continuation publication lost its actual committed terminal")
                 await self.worker._verify_terminal_before_release(
-                    self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal)
+                    self.running, self.lease, result, _StartedSettlement(terminal_receipt=result)
                 )
-                return ContinuationSegmentSettled(terminal)
+                return ContinuationSegmentSettled(result)
 
 
 async def run_continuation_segment(

@@ -2655,14 +2655,23 @@ async def _execute_continuation_call_live(
                     )
                     anti_anchor.record_success()
                     tool_feedback_json = _serialize_tool_result(proposal_result)
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    proposal_message = tool_result_message(call_id=tool_call.id, result=proposal_result, serialized=tool_feedback_json)
+                    if ctx.message_producers is not None:
+                        # Same publication seam as every other tool result: the
+                        # message is registered before it enters provider context.
+                        ctx.message_producers.require_context(
+                            session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id
+                        )
+                        ctx.message_producers.register_tool_result_message(
+                            completion=call_model.completion,
+                            tool_index=call.index,
+                            call=tool_call,
+                            result=proposal_result,
+                            serialized=tool_feedback_json,
+                            message=proposal_message,
+                            catalog=ctx.policy_catalog,
+                        )
+                    llm_messages.append(proposal_message)
                     turn_has_mutation = True
                     continue
                 # ``None`` means invalid LLM arguments, an unacceptable

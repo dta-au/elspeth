@@ -22,7 +22,6 @@ def state_record_from_row(row: Any) -> CompositionStateRecord:
         id=UUID(row.id),
         session_id=UUID(row.session_id),
         version=row.version,
-        source=unwrap_state_column(row.source),
         sources=unwrap_state_column(row_mapping["sources"] if "sources" in row_mapping else None),
         nodes=unwrap_state_column(row.nodes),
         edges=unwrap_state_column(row.edges),

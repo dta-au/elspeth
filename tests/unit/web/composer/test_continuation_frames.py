@@ -310,7 +310,7 @@ def test_seed_entrypoints_admit_complete_original_before_snapshot_work(monkeypat
     from elspeth.web.credential_guard import CredentialMaterialRefused
     from elspeth.web.sessions.composer_operations import (
         COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH,
-        composer_operation_v2_request_hash,
+        composer_operation_admission_request_hash,
     )
     from elspeth.web.sessions.schemas import SendMessageRequest
 
@@ -319,7 +319,7 @@ def test_seed_entrypoints_admit_complete_original_before_snapshot_work(monkeypat
     policy = minimal_continuation_policy()
     clean_request = SendMessageRequest(operation_id=operation_id, content="café" * 15_000)
     clean_json = clean_request.model_dump_json()
-    clean_hash = composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=clean_request)
+    clean_hash = composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=clean_request)
     assert 65_536 < len(clean_json.encode("utf-8")) < COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH
     kwargs = {
         "session_id": sid,
@@ -360,7 +360,7 @@ def test_seed_entrypoints_admit_complete_original_before_snapshot_work(monkeypat
             content=clean_request.content + "\npassword=example-value",  # secret-scan: allow-this-line
         )
         bad_json = bad_request.model_dump_json()
-        bad_hash = composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=bad_request)
+        bad_hash = composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=bad_request)
         assert bad_json.encode("utf-8").index(b"password=") > 65_536
         expected_error = CredentialMaterialRefused
         expected_message = None

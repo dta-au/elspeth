@@ -530,7 +530,7 @@ _STRUCTURE_STORE_LAYOUTS = (
         "head_cas",
         stored_continuation.jobs,
         ("checkpoint_id", "journal_cursor", "status_revision", "updated_at"),
-        ("session_id", "operation_id", "lifecycle_version", "checkpoint_id", "journal_cursor"),
+        ("session_id", "operation_id", "checkpoint_id", "journal_cursor"),
     ),
     ("snapshot_sequence", stored_continuation.events, (), ("session_id", "operation_id")),
 )
@@ -1461,7 +1461,7 @@ def _structure_store_source_shape(statement: object, role: str) -> tuple:
             bind_ids.append(identity)
         ordinal = bind_ids.index(identity)
         if tag is not None:
-            expected = 0 if tag == "zero" else 2 if tag == "lifecycle_two" else 1
+            expected = 0 if tag == "zero" else 1
             if type(node.value) is not int or node.value != expected:
                 raise _StructureShapeRefusal("source_constant")
             fixed.append((ordinal, tag))
@@ -1482,7 +1482,7 @@ def _structure_store_source_shape(statement: object, role: str) -> tuple:
                 or clause.modifiers
             ):
                 raise _StructureShapeRefusal("source_predicate_expression")
-            tag = "lifecycle_two" if role == "head_cas" and name == "lifecycle_version" else None
+            tag = None
             result.append(
                 (
                     "eq",
@@ -1723,7 +1723,7 @@ def _structure_dml_shape(trace, owner: _StructureInvocation, context, *, final_p
         raise _StructureShapeRefusal("dml_current_rows")
     for ordinal, tag in fixed:
         value = rows[0][names[bind_ids[ordinal]]]
-        expected = 0 if tag == "zero" else 2 if tag == "lifecycle_two" else 1
+        expected = 0 if tag == "zero" else 1
         if type(value) is not int or value != expected:
             raise _StructureShapeRefusal("dml_current_constant")
     if final_parameters is not ...:
@@ -1751,7 +1751,7 @@ def _structure_dml_shape(trace, owner: _StructureInvocation, context, *, final_p
                 value = final_parameters[positions.index(name)]
             else:
                 raise _StructureShapeRefusal("dml_final_correspondence")
-            expected = 0 if tag == "zero" else 2 if tag == "lifecycle_two" else 1
+            expected = 0 if tag == "zero" else 1
             if type(value) is not int or value != expected:
                 raise _StructureShapeRefusal("dml_final_constant")
     return StructureSqlShape(

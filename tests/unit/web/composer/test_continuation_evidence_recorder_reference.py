@@ -128,9 +128,9 @@ def test_planted_credentials_refuse_on_every_read_after_the_clean_source_was_rea
 
     secret = "postgresql://user:secret@host/db"  # secret-scan: allow-this-line
     payload = json.loads(audit.canonical)
-    body = payload["withheld_replies"][-1]["content"]
+    body = payload["snapshot"]["withheld_replies"][-1]["content"]
     assert len(body) > 100_000
-    payload["withheld_replies"][-1]["content"] = body[: -len(secret)] + secret
+    payload["snapshot"]["withheld_replies"][-1]["content"] = body[: -len(secret)] + secret
     canonical = canonical_json(payload)
     encoded = canonical.encode()
     corrupt = PrivateChunk(
@@ -215,11 +215,11 @@ def test_late_original_recorder_integrity_wins_over_actual_pair_excess(mode, fau
     payload = json.loads(audit.canonical)
     if fault == "credential":
         secret = "postgresql://user:secret@host/db"  # secret-scan: allow-this-line
-        body = payload["withheld_replies"][-1]["content"]
+        body = payload["snapshot"]["withheld_replies"][-1]["content"]
         assert len(body) > len(secret)
-        payload["withheld_replies"][-1]["content"] = body[: -len(secret)] + secret
+        payload["snapshot"]["withheld_replies"][-1]["content"] = body[: -len(secret)] + secret
     else:
-        payload["drained"]["withheld_replies"] = 9_999_999
+        payload["snapshot"]["drained"]["withheld_replies"] = 9_999_999
     canonical = canonical_json(payload)
     encoded = canonical.encode()
     reference = PrivateChunkRef(codec=audit.reference.codec, digest=sha256(encoded).hexdigest(), byte_length=len(encoded))

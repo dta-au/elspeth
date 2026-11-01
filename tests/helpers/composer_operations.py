@@ -28,9 +28,7 @@ class ComposerOperationApp:
     composer: DelayedComposerFake
 
 
-async def build_composer_operation_app(
-    tmp_path: Path, *, timeout_seconds: float = 300.0, continuation_enabled: bool = False
-) -> ComposerOperationApp:
+async def build_composer_operation_app(tmp_path: Path, *, timeout_seconds: float = 300.0) -> ComposerOperationApp:
     settings = WebSettings(
         data_dir=tmp_path,
         landscape_url=f"sqlite:///{tmp_path}/runs/audit.db",
@@ -42,7 +40,6 @@ async def build_composer_operation_app(
         composer_rate_limit_per_minute=100,
         shareable_link_signing_key=b"\x00" * 32,
         plugin_allowlist=("transform:passthrough",),
-        composer_continuation_enabled=continuation_enabled,
     )
     app = create_app(settings=settings)
     provider = app.state.auth_provider
@@ -84,17 +81,17 @@ class SettledComposerOperation:
     final: httpx.Response
 
     def result(self):
-        from elspeth.web.sessions.schemas import ComposerOperationStatusResponse
+        from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
-        snapshot = ComposerOperationStatusResponse.model_validate_json(self.final.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(self.final.content, strict=True)
         if snapshot.result is None:
             raise AssertionError("Composer operation did not complete successfully")
         return snapshot.result.model_dump(mode="json")
 
     def error(self):
-        from elspeth.web.sessions.schemas import ComposerOperationStatusResponse
+        from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
-        snapshot = ComposerOperationStatusResponse.model_validate_json(self.final.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(self.final.content, strict=True)
         if snapshot.error is None:
             raise AssertionError("Composer operation did not fail")
         return snapshot.error.http_status, snapshot.error.body
@@ -105,6 +102,7 @@ def install_composer_async_worker(
 ):
     from threading import Event
 
+    from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
     from elspeth.web.composer.progress import ComposerProgressRegistry
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
     from elspeth.web.middleware.request_id import RequestIdMiddleware
@@ -118,8 +116,13 @@ def install_composer_async_worker(
     limiter = app.state.rate_limiter
     if isinstance(limiter, ComposerRateLimiter):
         install_composer_rate_limiter(app, limit=limiter._limit)
+    # Production builds the authority with the validated Continuation policy
+    # (``web/app.py``); a hand-built worker fixture must carry the same one.
     authority = ComposerAsyncOperationAuthority(
-        app.state.session_engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=claim_lease_seconds
+        app.state.session_engine,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        claim_lease_seconds=claim_lease_seconds,
+        continuation_policy=continuation_policy_from_settings(app.state.settings),
     )
     if "instance_draining" not in app.state._state:
         app.state.instance_draining = Event()
@@ -164,9 +167,9 @@ async def submit_and_settle(client: httpx.AsyncClient, app: FastAPI, *, path: st
     accepted = await client.post(path, json=body)
     if accepted.status_code != 202:
         raise AssertionError(f"Composer admission returned {accepted.status_code}: {accepted.text}")
-    from elspeth.web.sessions.schemas import ComposerOperationAcceptedResponse, ComposerOperationStatusResponse
+    from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
-    acknowledgement = ComposerOperationAcceptedResponse.model_validate_json(accepted.content, strict=True)
+    acknowledgement = ComposerOperationSnapshot.model_validate_json(accepted.content, strict=True)
     operation_id = body["operation_id"]
     assert acknowledgement.operation_id == operation_id
     endpoint = path.rsplit("/", 1)[1]
@@ -180,7 +183,7 @@ async def submit_and_settle(client: httpx.AsyncClient, app: FastAPI, *, path: st
         terminal = await client.get(f"/api/sessions/{session_id}/operations/{operation_id}")
         if terminal.status_code != 200:
             raise AssertionError(f"Composer observation returned {terminal.status_code}: {terminal.text}")
-        snapshot = ComposerOperationStatusResponse.model_validate_json(terminal.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(terminal.content, strict=True)
         assert snapshot.operation_id == operation_id
         assert snapshot.kind == expected_kind
         if snapshot.status in ("completed", "failed"):

@@ -97,7 +97,7 @@ def _require_source_chunk(chunk: PrivateChunk) -> None:
         str,
         str,
         int,
-    ) or chunk.reference.codec != "composer.audit-buffer.v1":
+    ) or chunk.reference.codec != "composer.audit-buffer.v2":
         raise AuditIntegrityError("application recorder lost its complete original source role")
     if not 0 <= chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
         utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != chunk.reference.byte_length

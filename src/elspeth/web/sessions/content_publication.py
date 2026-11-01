@@ -21,7 +21,6 @@ def storage_content_hash(state: CompositionStateData | CompositionStateRecord) -
         raise AuditIntegrityError("Content publication requires an owned state snapshot")
     return content_storage_digest(
         {
-            "legacy_source": deep_thaw(state.source) if type(state) is CompositionStateRecord else None,
             "sources": deep_thaw(state.sources),
             "nodes": deep_thaw(state.nodes),
             "edges": deep_thaw(state.edges),
@@ -54,13 +53,13 @@ def prepare_content_publication(
     return replace(state, composer_meta=metadata)
 
 
-def read_content_publication(state: CompositionStateRecord) -> ContentPublication | None:
-    """Validate current applicability; absence remains uninspected legacy data."""
+def read_content_publication(state: CompositionStateRecord) -> ContentPublication:
+    """Validate current applicability. Every insert stamps it, so absence is corruption."""
     if type(state) is not CompositionStateRecord:
         raise AuditIntegrityError("Content publication requires an owned persisted snapshot")
     metadata = state.composer_meta
     if metadata is None or CONTENT_PUBLICATION_KEY not in metadata:
-        return None
+        raise AuditIntegrityError("Stored composition state has no content publication")
     publication = ContentPublication.from_payload(metadata[CONTENT_PUBLICATION_KEY])
     expected = ContentPublication(state.session_id, state.id, state.version, storage_content_hash(state))
     if publication != expected:

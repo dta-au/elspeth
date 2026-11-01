@@ -263,7 +263,7 @@ async def test_drain_hands_back_a_lock_waiting_v2_segment_claim_through_the_shar
     worker = _real_worker(authority, monkeypatch)
     await lock.acquire()
     try:
-        job = asyncio.create_task(worker._job_v2(claim))
+        job = asyncio.create_task(worker._job(claim))
         await asyncio.sleep(0.3)
         assert not job.done()
         worker.begin_drain()

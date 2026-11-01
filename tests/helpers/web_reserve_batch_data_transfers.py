@@ -206,7 +206,7 @@ BODY_BINDINGS = {
     (APPLICATION, "ApplicationGraph"): "c04a53fba0584d86e7380bdd690819677a5c20f72a470dd509a5b2c952e3f5d4",
     (APPLICATION, "ApplicationRecorderSource"): "18f04ae52a559c0a700e0e174eee11499edeee64005ea9451bfd1382d0881547",
     (APPLICATION, "_require_source_environment"): "4250c1045487039b3734a80304e3ca551c6b449356536ceda11eb7c3473c9e21",
-    (APPLICATION, "_require_source_chunk"): "a0fd3cabbade96edf38d9ef740d6c1ddcf6333256cf7d6df8898cf1e997bc61f",
+    (APPLICATION, "_require_source_chunk"): "5de1b575eda35e417991e706db8fb62e79f6020258124b8bd1c9312e700233dc",
     (APPLICATION, "_require_source_credentials"): "e230d7605324b4992061e82c46da1f91432bff3d0a247df087aa6b410e88c26b",
     (APPLICATION, "capture_application_recorder_source"): "2c30870331665726c24c01616128cd33dfa54685ad74cdc830579bb67ae1fe41",
     (APPLICATION, "admit_application_recorder_source"): "4bc7de23a334690724e751448b65f252630ba5cca6251b672ef6611405843db5",

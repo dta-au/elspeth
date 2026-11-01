@@ -951,15 +951,6 @@ class ChatMessageRecord:
             freeze_fields(self, "tool_calls")
 
 
-@dataclass(frozen=True, slots=True)
-class MessageIngressFresh:
-    """A newly accepted user row with its same-transaction transcript."""
-
-    operation_id: UUID
-    message: ChatMessageRecord
-    transcript: tuple[ChatMessageRecord, ...]
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CompositionRejectionEventRecord:
     """One ``composition_rejection_events`` row, projected for the audit-grade view.
@@ -1073,7 +1064,7 @@ class CompositionStateData:
     validation_errors: Sequence[CompositionValidationError] | None = None
     # Operational/audit meta describing how this state was reached. Distinct
     # from ``metadata_`` which carries user-facing PipelineMetadata. ``None``
-    # is honest for revert/fork paths and for non-compose write paths.
+    # only before insert: ``prepare_content_publication`` stamps every stored row.
     composer_meta: Mapping[str, Any] | None = None
     # User-facing PipelineMetadata. Required: every stored state carries it
     # (require_stored_state_metadata), so no producer may omit it.
@@ -1168,11 +1159,11 @@ class CompositionStateRecord:
     created_at: datetime
     derived_from_state_id: UUID | None
     # Operational/audit meta describing how this state was reached. Distinct
-    # from ``metadata_`` which carries user-facing PipelineMetadata. ``None``
-    # is honest for revert/fork paths and for non-compose write paths.
+    # from ``metadata_`` which carries user-facing PipelineMetadata. Every
+    # stored row carries it (the column is NOT NULL and every insert stamps
+    # ``content_publication``); the default serves unsaved test projections.
     composer_meta: Mapping[str, Any] | None = None
     sources: Mapping[str, Mapping[str, Any]] | None = None
-    source: Mapping[str, Any] | None = None
     # Effective reads retain the actual immutable row separately. Historical
     # version-list reads leave this unset and return the original snapshot.
     review_projection: CompositionStateReviewProjection | None = None
@@ -1181,8 +1172,6 @@ class CompositionStateRecord:
         require_stored_state_metadata(self, state_id=self.id)
         serialize_composition_validation_errors(self.validation_errors)
         non_none = []
-        if self.source is not None:
-            non_none.append("source")
         if self.sources is not None:
             non_none.append("sources")
         if self.nodes is not None:
@@ -2550,17 +2539,6 @@ class SessionOperationAuthority(Protocol):
         """Prove this actual producer's committed context or known unstarted claim."""
         ...
 
-    def start_composer_async_operation(
-        self,
-        claim: ComposerOperationClaim,
-        *,
-        owner_instance_id: str,
-        lease_seconds: int,
-        auth_provider_type: str,
-    ) -> SessionOperationContext:
-        """Atomically bind one queued claim to a new COMPOSE fence."""
-        ...
-
     def create_session_with_initial_fence(
         self,
         *,
@@ -3295,9 +3273,9 @@ class SessionServiceProtocol(Protocol):
         parent_assistant_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         running: ComposerOperationRunning,
-        required_work: RequiredWorkTicket | None = None,
-        continuation: StoredContinuationSnapshot | None = None,
-    ) -> MessageIngressFresh | ContinuationIngressCheckpoint:
+        required_work: RequiredWorkTicket,
+        continuation: StoredContinuationSnapshot,
+    ) -> ContinuationIngressCheckpoint:
         """Accept a user message once and return a nominal admission result.
 
         The insert and the transcript read MUST happen inside one
@@ -3373,23 +3351,6 @@ class SessionServiceProtocol(Protocol):
         Implementations must return the final session head because an opted-
         out session may auto-resolve a prepared event and derive a newer state
         inside the settlement transaction.
-        """
-        ...
-
-    async def commit_composition_response(
-        self,
-        *,
-        session_id: UUID,
-        expected_current_state_id: UUID | None,
-        state: CompositionStateData,
-        assistant_content: str,
-        raw_content: str | None,
-        session_operation_context: SessionOperationContext,
-    ) -> TransitionResponseSettlement:
-        """Atomically persist one post-compose state and its response.
-
-        The exact live COMPOSE authority is validated in the same database
-        transaction as both rows, so takeover commits neither half.
         """
         ...
 

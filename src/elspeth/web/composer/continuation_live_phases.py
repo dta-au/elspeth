@@ -14,7 +14,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome, _DispatchOutcome, _PersistOutcome
 from elspeth.web.composer.continuation import ComposeFrame, EffectFrontierEntry, ToolBatchFrame
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, encode_coupled_batch_data
 from elspeth.web.composer.continuation_clock import ContinuationTimingObservation
@@ -64,6 +64,7 @@ from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
 
 if TYPE_CHECKING:
     from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.composer.state import CompositionState
 
 
 def _require_runtime_source_refresh(before: ContinuationRuntimeSource, fresh: ContinuationRuntimeSource) -> None:
@@ -112,6 +113,9 @@ class ContinuationLivePhases:
     business_stage: ContinuationStage[None] | None = None
     failure_custody: ContinuationToolFailureCustody | None = None
     terminal_completion: TerminalServiceCompletion | None = None
+    # The warm post-batch source: this batch's dispatch fold, its committed
+    # P4 publication and the batch entry state, for the post-batch owner.
+    finished_batch: tuple[_DispatchOutcome, _PersistOutcome, CompositionState] | None = None
 
     def observe_stop(self) -> None:
         self.cancellation_requested.set()
@@ -605,6 +609,10 @@ class ContinuationLivePhases:
 
         critical = self.lease.create_continuation_stage(publish(), name="continuation-required-p4")
         await self.lease.join_continuation_stage(critical)
+        publication = owner.publication
+        if publication is None:
+            raise AuditIntegrityError("completed P4 lost its actual committed publication")
+        self.finished_batch = (dispatch, publication, data.batch.entry_state)
 
     async def finish_owed_prefix(self, selected: SelectedContinuationState) -> None:
         """Finish an actual retained prefix; the SQL owner proves durable Stop."""

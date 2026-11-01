@@ -382,9 +382,9 @@ class WebSettings(BaseModel):
         ge=1,
         le=262_144,
         description=(
-            "Maximum complete-original bytes inspected by each current V2 attachment read, before paging. "
+            "Maximum complete-original bytes inspected by each current Continuation attachment read, before paging. "
             "Operators may tighten the existing inspection ceiling; independent response and credential limits still apply. "
-            "This setting does not configure V1 or direct-tool attachment reads."
+            "This setting does not configure direct-tool attachment reads."
         ),
     )
     composer_timeout_seconds: float = Field(..., gt=0)
@@ -435,13 +435,11 @@ class WebSettings(BaseModel):
         allow_inf_nan=False,
         description=(
             "Actual infrastructure termination grace declared by the operator. This setting does not change the platform grace. "
-            "When Continuation is enabled, the larger HTTP/worker drain must leave one second for membership stop and five seconds of margin."
+            "The larger HTTP/worker drain must leave one second for membership stop and five seconds of margin."
         ),
     )
-    # Composer Continuation (V2). Admission is default-off; a missing
-    # Composer-Operation-Version still means V1 whatever this says. The values
-    # bind only at admission and are retained per operation (design §4).
-    composer_continuation_enabled: bool = False
+    # Composer Continuation. The values bind only at admission and are
+    # retained per operation (design §4).
     # Upper bounds keep every derived deadline representable as a timedelta.
     composer_continuation_segment_nominal_seconds: float = Field(default=420.0, gt=0, le=86_400, allow_inf_nan=False)
     composer_continuation_watermark_seconds: float = Field(default=120.0, gt=0, le=86_400, allow_inf_nan=False)
@@ -1336,17 +1334,12 @@ class WebSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_continuation_shutdown_grace(self) -> WebSettings:
-        """Check the prepared V2 budget without changing legacy V1 drain settings.
+        """Refuse a declared termination grace shorter than the Continuation drain budget.
 
         The full U-37 integration must coordinate HTTP, worker disposition and
         membership shutdown before this declaration can bound a real process.
-        Unconditional process-grace enforcement remains that integration's
-        obligation; this compatibility gate does not qualify V1 shutdown.
         """
-        if (
-            self.composer_continuation_enabled
-            and max(self.web_http_drain_seconds, self.composer_async_drain_seconds) + 1.0 + 5.0 > self.composer_shutdown_grace_seconds
-        ):
+        if max(self.web_http_drain_seconds, self.composer_async_drain_seconds) + 1.0 + 5.0 > self.composer_shutdown_grace_seconds:
             raise ValueError("composer_shutdown_grace_seconds must cover max(web_http_drain_seconds, composer_async_drain_seconds) + 1 + 5")
         return self
 

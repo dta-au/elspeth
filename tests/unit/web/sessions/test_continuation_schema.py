@@ -34,12 +34,12 @@ def test_continuation_children_bind_every_parent_key(tmp_path):
         engine.dispose()
 
 
-def test_v2_parent_owns_no_total_deadline_and_has_resume_pointer():
+def test_parent_owns_no_total_deadline_or_claim_and_has_resume_pointer():
+    """Epoch 80: one lifecycle. Control: re-add a dropped V1 column or make a pointer nullable -> red."""
     from elspeth.web.sessions.models import composer_async_operations_table as jobs
 
-    assert jobs.c.deadline_at.nullable
-    assert {
-        "lifecycle_version",
+    assert not {"lifecycle_version", "deadline_at", "claim_token", "claim_expires_at"} & set(jobs.c.keys())
+    pointer = (
         "phase",
         "status_revision",
         "current_segment_sequence",
@@ -48,8 +48,10 @@ def test_v2_parent_owns_no_total_deadline_and_has_resume_pointer():
         "journal_cursor",
         "ingress_phase",
         "reserved_user_message_id",
-    } <= set(jobs.c.keys())
-    assert jobs.c.lifecycle_version.server_default.arg == "1"
+    )
+    assert set(pointer) <= set(jobs.c.keys())
+    assert not any(jobs.c[name].nullable for name in pointer)
+    assert "ix_composer_async_operations_claimable" not in {index.name for index in jobs.indexes}
 
 
 @pytest.mark.parametrize("delta", [-1, 1])
@@ -132,7 +134,6 @@ def continuation_parent(tmp_path):
                 operation_id=operation_id,
                 kind="compose_message",
                 status="queued",
-                lifecycle_version=2,
                 phase="queued",
                 current_segment_sequence=1,
                 ownership_generation=1,
@@ -142,7 +143,6 @@ def continuation_parent(tmp_path):
                 request_hash="a" * 64,
                 actor_user_id="alice",
                 request_json="{}",
-                deadline_at=None,
                 created_at=now,
                 updated_at=now,
             )
@@ -174,7 +174,7 @@ def test_v2_parent_preserves_immutable_identity_and_monotonic_cursor(continuatio
     engine, sid, operation_id = continuation_parent
     with engine.begin() as connection:
         connection.execute(update(jobs).where(jobs.c.session_id == sid).values(journal_cursor=3, status_revision=2))
-    for change in ({"reserved_user_message_id": "replacement"}, {"journal_cursor": 2}, {"status_revision": 1}, {"lifecycle_version": 1}):
+    for change in ({"reserved_user_message_id": "replacement"}, {"journal_cursor": 2}, {"status_revision": 1}):
         with pytest.raises(IntegrityError), engine.begin() as connection:
             connection.execute(update(jobs).where(jobs.c.session_id == sid).values(**change))
     with engine.connect() as connection:
@@ -267,7 +267,7 @@ def test_v2_terminal_failure_requires_result_schema(continuation_parent):
                 phase="settled",
                 request_json=None,
                 failure_code="worker_lost",
-                settled_by="settle_unstarted",
+                settled_by="settle_lost",
                 settled_at=database_now(connection),
                 result_schema=None,
                 result_json="{}",

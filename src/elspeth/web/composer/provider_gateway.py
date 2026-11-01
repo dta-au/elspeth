@@ -445,6 +445,7 @@ def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[st
     affected; advisor is web-composer only by design (the tool is not
     registered in the CLI dispatch tables).
     """
+    from elspeth.web.composer.continuation_controls import continuation_control_tool_definitions
     from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 
     tools = wire_tool_definitions(dialect)
@@ -458,8 +459,10 @@ def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[st
             break
     else:
         raise AuditIntegrityError("Compose loop must advertise set_pipeline")
-    # Preserve the established trailing cache anchor.
-    return [*tools[:-1], *recovery_tool_definitions(dialect), tools[-1]]
+    # Preserve the established trailing cache anchor. Every compose loop is a
+    # Continuation request, so it also offers checkpoint_and_continue; the
+    # recovery-only palette never does.
+    return [*tools[:-1], *recovery_tool_definitions(dialect), *continuation_control_tool_definitions(dialect), tools[-1]]
 
 
 def build_composer_loop_request_kwargs(

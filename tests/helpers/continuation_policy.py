@@ -59,10 +59,7 @@ def continuation_test_settings(**overrides: Any) -> WebSettings:
 
 
 def minimal_continuation_policy(**setting_overrides: Any) -> ContinuationAdmissionPolicy:
-    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_enabled=True, **setting_overrides))
-    if policy is None:
-        raise AssertionError("an enabled continuation setting produced no policy")
-    return policy
+    return continuation_policy_from_settings(continuation_test_settings(**setting_overrides))
 
 
 def observed_sql_trial_policy(

@@ -812,17 +812,12 @@ allowed_dict_patterns:
   # in commit 1e7e42d7a; listed here as part of the rearchitect merge into
   # RC5.2 (pre-existing on RC5.2 from the listed commits).
   # ═══════════════════════════════════════════════════════════════════════════
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_model_turn:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_model_turn:tools (list)"
   # Deep-copy the same selected SDK message/tool wires before dispatch and
   # derive the exact cache-marked request digest; no internal evidence DTO.
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._prepare_primary_delivery:messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._prepare_primary_delivery:tools (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._dispatch_tool_batch:llm_messages (list)"
-  # Extracted body of _dispatch_tool_batch: the verbatim move to the module-level
-  # run_tool_batch (composer/service.py decomposition) carries the same OpenAI
-  # chat-completion message list. The service.py:_dispatch_tool_batch entry above
-  # remains valid for the thin delegator that still builds and forwards the list.
+  # The shared run_tool_batch owner carries the OpenAI chat-completion message
+  # list after retirement of the V1 service delegator.
   - "src/elspeth/web/composer/tool_batch.py:run_tool_batch:llm_messages (list)"
   # Live Continuation extraction forwards the same aliased external provider
   # message list through initialization, preparation and one-call execution.
@@ -1178,7 +1173,6 @@ allowed_dict_patterns:
   # verbatim into the module-level run_tool_batch (composer/service.py
   # decomposition); same Tier-3 parsed-dict semantics, no enclosing class now.
   - "src/elspeth/web/composer/tool_batch.py:_do_dispatch:_arguments"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_messages:return (list)"
   - "src/elspeth/web/composer/provider_gateway.py:composer_loop_tool_definitions:return (list)"
   # LiteLLM request kwargs for the compose loop and the pipeline planner,
   # built once so the boot probe sends exactly what production sends.

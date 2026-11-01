@@ -6,8 +6,8 @@ control, not graph authoring: it carries optional notes only, it must be the
 sole call in its batch, and the host never derives the next action from it.
 Notes are model text; they never certify progress (design §2.1, I-4).
 
-Only lifecycle-2 (Continuation) compose palettes advertise it; a v1 job has
-no segment to yield.
+Every compose palette advertises it (every compose request is a
+Continuation request); the recovery-only palette never does.
 """
 
 from __future__ import annotations

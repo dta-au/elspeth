@@ -33,7 +33,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.http_client import AcceptanceCredentials, AcceptanceHttpClient
 from elspeth.web._acceptance_common.replica_probes import (
-    P1_OPERATION_POLL_GRACE_SECONDS,
+    P1_OPERATION_TERMINAL_BOUND_SECONDS,
     TERMINAL_RUN_STATUSES,
     CrossReplicaProgressObservation,
     LeaseTakeoverObservation,
@@ -53,7 +53,7 @@ from elspeth.web.azure_container_apps_acceptance import (
     _SqlAlchemyReader,
     acceptance_error_envelope,
 )
-from elspeth.web.sessions.schemas import ComposerOperationStatusResponse
+from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
 _FENCE_SQL = (
     "SELECT owner_instance_id, lease_expires_at FROM session_operation_fences "
@@ -326,18 +326,18 @@ def _fresh_message_visibility(
     )
     if written.response.status != 202 or written.response.instance_id != owner_id or written.response.operation_id != operation_id:
         raise AcceptanceCheckError("probe_message_write")
-    terminal: ComposerOperationStatusResponse | None = None
+    terminal: ComposerOperationSnapshot | None = None
     completed_at: float | None = None
     operation_poll_deadline: float | None = None
 
     def completed() -> bool:
         nonlocal terminal, completed_at, operation_poll_deadline
         observed = _exchange(owner, "a", f"/api/sessions/{session_id}/operations/{operation_id}", capture, clock=polling.clock)
-        terminal = ComposerOperationStatusResponse.model_validate_json(json.dumps(observed.body))
+        terminal = ComposerOperationSnapshot.model_validate_json(json.dumps(observed.body))
         if observed.response.instance_id != owner_id or terminal.operation_id != operation_id:
             raise AcceptanceCheckError("probe_operation_identity")
-        remaining = observed.received_at + terminal.deadline_remaining_ms / 1000 + P1_OPERATION_POLL_GRACE_SECONDS
-        operation_poll_deadline = remaining if operation_poll_deadline is None else min(operation_poll_deadline, remaining)
+        if operation_poll_deadline is None:
+            operation_poll_deadline = observed.received_at + P1_OPERATION_TERMINAL_BOUND_SECONDS
         if terminal.status == "failed":
             raise AcceptanceCheckError("probe_message_write")
         if terminal.status == "completed":

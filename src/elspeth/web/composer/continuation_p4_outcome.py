@@ -44,7 +44,6 @@ class _HistoricalCheckpointColumns(BaseModel):
     """Exactly the original JSON column values, including their member order."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    source: dict[str, JsonValue] | None
     sources: dict[str, dict[str, JsonValue]] | None
     nodes: list[dict[str, JsonValue]] | None
     edges: list[dict[str, JsonValue]] | None
@@ -84,7 +83,6 @@ def historical_checkpoint_columns_json(record: CompositionStateRecord) -> str:
         raise TypeError("historical columns require their original owned state record")
     columns = _HistoricalCheckpointColumns.model_validate(
         {
-            "source": owned_json(record.source),
             "sources": owned_json(record.sources),
             "nodes": owned_json(record.nodes),
             "edges": owned_json(record.edges),
@@ -193,9 +191,8 @@ def historical_checkpoint_record(value: HistoricalCheckpointData, *, env_ref_nam
     errors = decode_stored_composition_validation_errors(columns.validation_errors)
     # Reuse the actual component-aware payload admission. Its normalized
     # temporary source map is used for inspection only; the row below retains
-    # the original source/sources columns separately and exactly.
+    # the original sources column exactly.
     data = CompositionStateData(
-        source=columns.source,
         sources=columns.sources,
         nodes=columns.nodes,
         edges=columns.edges,
@@ -213,7 +210,6 @@ def historical_checkpoint_record(value: HistoricalCheckpointData, *, env_ref_nam
         id=value.id,
         session_id=value.session_id,
         version=value.version,
-        source=columns.source,
         sources=columns.sources,
         nodes=columns.nodes,
         edges=columns.edges,

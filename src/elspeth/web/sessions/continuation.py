@@ -44,7 +44,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationError,
     ComposerOperationFenceLost,
     ComposerOperationRunning,
-    composer_operation_v2_request_hash,
+    composer_operation_admission_request_hash,
 )
 from elspeth.web.sessions.continuation_events import CONTINUATION_EVENT_TAGS, ContinuationEventTag
 from elspeth.web.sessions.converters import state_from_record
@@ -171,7 +171,6 @@ def require_continuation_mutation(
         parent is not None
         and segment is not None
         and live_fence is not None
-        and parent.lifecycle_version == 2
         and parent.status == "running"
         and principal is not None
         and principal.archived_at is None
@@ -384,7 +383,6 @@ def load_snapshot(conn: Connection, *, session_id: str, operation_id: str) -> St
         select(jobs.c.checkpoint_id, jobs.c.journal_cursor).where(
             jobs.c.session_id == session_id,
             jobs.c.operation_id == operation_id,
-            jobs.c.lifecycle_version == 2,
         )
     ).one_or_none()
     if parent is None:
@@ -525,6 +523,43 @@ def _settlement_driving(parent: Row[Any], segment: Row[Any], history: Row[Any] |
     )
 
 
+def _published_end_review(
+    stack: ContinuationFrameStack, outcome: MessageWithStateResponse | ComposerOperationError
+) -> tuple[str, str, str] | None:
+    """The END review effect a successful publication commits, if any.
+
+    Only a ``MessageWithStateResponse`` publishes. Its END review effect is the
+    one ``dispatched`` ``end:<response>`` entry of the top ``EndFrame``; the
+    published assistant row is its receipt and the retained candidate is its
+    result. Every other dispatched effect still becomes ``unknown``.
+    """
+    from elspeth.web.composer.continuation import ComposeFrame, EndFrame, ToolBatchFrame
+    from elspeth.web.composer.continuation_end_transitions import end_effect_key
+    from elspeth.web.composer.continuation_iteration_transitions import advance_effect_key, applied_batch_cut
+
+    top = stack.frames[-1]
+    if type(outcome) is not MessageWithStateResponse:
+        return None
+    if type(top) is EndFrame:
+        compose = stack.frames[0]
+        if type(compose) is not ComposeFrame or compose.pending_response is None:
+            raise AuditIntegrityError("END publication lost its actual paid PRIMARY response")
+        key = end_effect_key(compose.pending_response)
+        result = f"value:{top.candidate.codec}:{top.candidate.digest}"
+    elif type(top) is ToolBatchFrame and top.phase == "result_retained" and top.accumulator.codec == "composer.applied-p4-batch.v2":
+        # The post-batch phase itself ended the request (source-proof stop or
+        # the last-chance reply); its one dispatched effect is the reviewer.
+        _compose, batch = applied_batch_cut(stack.frames)
+        key = advance_effect_key(batch.response)
+        result = f"value:{batch.accumulator.codec}:{batch.accumulator.digest}"
+    else:
+        return None
+    matching = tuple(item for item in stack.effect_frontier if item.effect_id == key)
+    if len(matching) != 1 or matching[0].disposition != "dispatched":
+        raise AuditIntegrityError("publication lost its single dispatched owner review effect")
+    return key, outcome.message.id, result
+
+
 def _settlement_transition(
     stored: StoredContinuationSnapshot,
     *,
@@ -536,9 +571,19 @@ def _settlement_transition(
     from elspeth.web.coordination.composer_operation_authority import _terminal_values
 
     stack = decode_continuation_snapshot(stored.payload_json)
-    unresolved = tuple(item.effect_id for item in stack.effect_frontier if item.disposition == "dispatched")
+    published = _published_end_review(stack, outcome)
+    unresolved = tuple(
+        item.effect_id
+        for item in stack.effect_frontier
+        if item.disposition == "dispatched" and (published is None or item.effect_id != published[0])
+    )
     frontier = tuple(
-        item.model_copy(update={"disposition": "unknown"}) if item.effect_id in unresolved else item for item in stack.effect_frontier
+        item.model_copy(update={"disposition": "unknown"})
+        if item.effect_id in unresolved
+        else item.model_copy(update={"disposition": "committed", "receipt_id": published[1]})
+        if published is not None and item.effect_id == published[0]
+        else item
+        for item in stack.effect_frontier
     )
     terminal = _terminal_values(outcome, now=published_at, settled_by=settled_by)
     attribution = (
@@ -704,7 +749,6 @@ def append_complete_snapshot(
         .where(
             jobs.c.session_id == session_id,
             jobs.c.operation_id == operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.checkpoint_id == expected_checkpoint_id,
             jobs.c.journal_cursor == expected_cursor,
         )
@@ -970,7 +1014,6 @@ def recover_segment_on_connection(
         .where(
             jobs.c.session_id == session_id,
             jobs.c.operation_id == operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status == "running",
             jobs.c.current_segment_sequence == segment.sequence,
             jobs.c.ownership_generation == expected_generation,
@@ -1249,6 +1292,21 @@ def settle_segment_on_connection(
         )
         if marked.rowcount != len(unresolved):
             raise AuditIntegrityError("continuation settlement lost an unresolved effect row")
+    published = _published_end_review(decode_continuation_snapshot(stored.payload_json), outcome)
+    if published is not None:
+        committed = conn.execute(
+            update(effects)
+            .where(
+                effects.c.session_id == session_id,
+                effects.c.operation_id == operation_id,
+                effects.c.effect_key == published[0],
+                effects.c.disposition == "dispatched",
+                effects.c.receipt_key.is_(None),
+            )
+            .values(disposition="committed", receipt_key=published[1], result_chunk_key=published[2])
+        )
+        if committed.rowcount != 1:
+            raise AuditIntegrityError("END publication lost its single dispatched review effect row")
     if history is not None:
         revoked = conn.execute(
             update(attempts)
@@ -1283,7 +1341,6 @@ def settle_segment_on_connection(
         .where(
             jobs.c.session_id == session_id,
             jobs.c.operation_id == operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status == parent.status,
             jobs.c.current_segment_sequence == segment.sequence,
             jobs.c.ownership_generation == segment.generation,
@@ -1305,12 +1362,10 @@ def settle_continuation_on_connection(
     """The live owner's V2 terminal under its exact current fence and attempt.
 
     A ``request_cancelled`` outcome is the one terminal a pending Stop allows.
-    The fence is left for the lease close, as for V1, so the worker verifies
+    The fence is left for the lease close, so the worker verifies
     the terminal before it releases (design §2.7).
     """
     claim, context = running.claim, running.session_operation_context
-    if claim.segment_sequence is None or claim.ownership_generation is None:
-        raise TypeError("continuation settlement requires its segment claim")
     cancelling = isinstance(outcome, ComposerOperationError) and outcome.failure_code == "request_cancelled"
     # False means no live continuation attempt holds this fence: not this owner.
     if not require_continuation_mutation(conn, context, allow_cancel=cancelling, allow_expired_segment=True):
@@ -1389,8 +1444,6 @@ def yield_segment_on_connection(
     from elspeth.web.composer.continuation_handoff import ContinuationYieldEvent, roll_slice_for_successor
 
     claim, context = running.claim, running.session_operation_context
-    if claim.segment_sequence is None or claim.ownership_generation is None:
-        raise TypeError("yield requires a continuation segment claim")
     fence = context.fence
     # False means no live continuation attempt holds this fence: not this owner.
     if not require_continuation_mutation(conn, context, allow_cancel=False, allow_expired_segment=True):
@@ -1497,7 +1550,6 @@ def yield_segment_on_connection(
         .where(
             jobs.c.session_id == sid,
             jobs.c.operation_id == operation,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status == "running",
             jobs.c.current_segment_sequence == sequence,
             jobs.c.ownership_generation == generation,
@@ -1629,8 +1681,6 @@ def read_yield_outcome_on_connection(conn: Connection, running: ComposerOperatio
     from elspeth.web.composer.continuation_handoff import ContinuationYieldEvent
 
     claim, fence = running.claim, running.session_operation_context.fence
-    if claim.segment_sequence is None or claim.ownership_generation is None:
-        raise TypeError("yield outcome requires a continuation segment claim")
     sid, operation = str(claim.session_id), claim.operation_id
     history = conn.execute(
         select(attempts).where(
@@ -1695,7 +1745,7 @@ def _select_segment_start_on_connection(
     owner_instance_id: str,
     segment_policy: ContinuationSegmentPolicy | None = None,
 ) -> _SegmentStartSelection:
-    if type(claim) is not ComposerOperationClaim or claim.segment_sequence is None or claim.ownership_generation is None:
+    if type(claim) is not ComposerOperationClaim:
         raise TypeError("continuation start requires its nominal segment claim")
     if segment_policy is not None and type(segment_policy) is not ContinuationSegmentPolicy:
         raise TypeError("segment policy must be its actual owned type")
@@ -1716,7 +1766,6 @@ def _select_segment_start_on_connection(
     if (
         parent is None
         or segment is None
-        or parent.lifecycle_version != 2
         or parent.status not in ("queued", "running")
         or parent.attempt != claim.attempt
         or parent.current_segment_sequence != claim.segment_sequence
@@ -1757,7 +1806,7 @@ def _select_segment_start_on_connection(
     if (
         request.operation_id != claim.operation_id
         or (str(request.state_id) if request.state_id is not None else None) != parent.base_state_id
-        or composer_operation_v2_request_hash(session_id=claim.session_id, kind=parent.kind, request=request) != parent.request_hash
+        or composer_operation_admission_request_hash(session_id=claim.session_id, kind=parent.kind, request=request) != parent.request_hash
         or (
             logical.session_id,
             logical.operation_id,
@@ -1878,7 +1927,6 @@ def start_segment_on_connection(
         .where(
             jobs.c.session_id == str(claim.session_id),
             jobs.c.operation_id == claim.operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status.in_(("queued", "running")),
             jobs.c.attempt == claim.attempt,
             jobs.c.current_segment_sequence == claim.segment_sequence,
@@ -2269,7 +2317,7 @@ def prepare_provider_effect_on_connection(
     )
     if snapshot_json != stored.payload_json:
         raise ContinuationCASConflict("provider preparation replaced the actual selected complete head")
-    if type(family) is not int or family not in (0, 1, 2, 3):
+    if type(family) is not int or family not in (0, 1, 3):
         raise ValueError("unknown physical provider family")
     if type(input_sha256) is not str or len(input_sha256) != 64 or any(char not in "0123456789abcdef" for char in input_sha256):
         raise ValueError("provider preparation requires its actual input digest")

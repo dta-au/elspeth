@@ -37,7 +37,7 @@ from elspeth.web.composer.turn_effects import (
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
-from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
 from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.schemas import SendMessageRequest
@@ -100,7 +100,7 @@ def _selected_request_content_hash(selected: SelectedContinuationState) -> str:
     if (
         str(request.operation_id) != logical.operation_id
         or (str(request.state_id) if request.state_id is not None else None) != logical.base_state_id
-        or composer_operation_v2_request_hash(session_id=UUID(logical.session_id), kind=logical.kind, request=request)
+        or composer_operation_admission_request_hash(session_id=UUID(logical.session_id), kind=logical.kind, request=request)
         != logical.request_hash
     ):
         raise AuditIntegrityError("P4 projection changed its immutable original send request")

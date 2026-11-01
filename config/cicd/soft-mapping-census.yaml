@@ -912,7 +912,7 @@ files:
   src/elspeth/web/composer/service.py:
     Mapping[str, Any]: 2
     Mapping[str, object]: 1
-    dict[str, Any]: 14
+    dict[str, Any]: 10
   src/elspeth/web/composer/session_tool.py:
     boundary: 1
     dict[str, Any]: 4
@@ -1117,7 +1117,7 @@ files:
   src/elspeth/web/sessions/proposal_decoder.py:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/protocol.py:
-    Mapping[str, Any]: 38
+    Mapping[str, Any]: 37
   src/elspeth/web/sessions/routes/_helpers.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 1
@@ -1136,10 +1136,10 @@ files:
     Mapping[str, Any]: 16
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 804
+  Mapping[str, Any]: 803
   Mapping[str, object]: 327
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1186
+  dict[str, Any]: 1182
   dict[str, object]: 408
-  soft: 2733
+  soft: 2728

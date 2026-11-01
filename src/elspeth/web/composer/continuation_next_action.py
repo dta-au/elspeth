@@ -234,6 +234,58 @@ def validate_continuation_structure_data_on_connection(
             if set(ambiguous) != set(tool_unresolved):
                 raise AuditIntegrityError("structural admission mixed a tool result with another unresolved owner")
             return ambiguous
+    if type(top) is EndFrame and ambiguous:
+        from elspeth.web.composer.continuation_end_transitions import END_EFFECT_OWNER, end_effect_key
+
+        compose_root = root.frames[0]
+        if type(compose_root) is not ComposeFrame or compose_root.pending_response is None:
+            raise AuditIntegrityError("structural admission lost the END review's paid PRIMARY response")
+        key = end_effect_key(compose_root.pending_response)
+        review = tuple(row for row in actual if row.effect_key == key)
+        if (
+            len(root.frames) != 2
+            or top.phase != "review_needed"
+            or ambiguous != (key,)
+            or tool_unresolved
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+            or len(review) != 1
+            or review[0].owner != END_EFFECT_OWNER
+            or review[0].receipt_key is not None
+            or review[0].result_chunk_key is not None
+        ):
+            raise AuditIntegrityError("structural admission lost the closed in-flight END review shape")
+        # The review made provider calls whose outcome is not durably known.
+        # It is settled as unknown, never re-run by a new owner.
+        return ambiguous
+    if (
+        type(top) is ToolBatchFrame
+        and top.phase == "result_retained"
+        and top.accumulator.codec == "composer.applied-p4-batch.v2"
+        and ambiguous
+        and not tool_unresolved
+    ):
+        from elspeth.web.composer.continuation_iteration_transitions import (
+            ITERATION_EFFECT_OWNER,
+            advance_effect_key,
+            applied_batch_cut,
+        )
+
+        _compose, batch = applied_batch_cut(root.frames)
+        key = advance_effect_key(batch.response)
+        phase = tuple(row for row in actual if row.effect_key == key)
+        if (
+            ambiguous != (key,)
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+            or len(phase) != 1
+            or phase[0].owner != ITERATION_EFFECT_OWNER
+            or phase[0].receipt_key is not None
+            or phase[0].result_chunk_key is not None
+        ):
+            raise AuditIntegrityError("structural admission lost the closed in-flight post-batch shape")
+        # The post-batch phase may have made Advisor calls; never re-run it.
+        return ambiguous
     if tool_unresolved:
         if (
             type(top) is ToolBatchFrame

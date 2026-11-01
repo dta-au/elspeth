@@ -123,7 +123,6 @@ def compose(api: ApiClient, prefix: str, prompt: str, out: Path, index: int) -> 
         if snapshot["status"] == "failed":
             error = snapshot["error"]
             raise ApiError(error["http_status"], json.dumps(error["body"]))
-        observation_deadline = min(observation_deadline, time.monotonic() + snapshot["deadline_remaining_ms"] / 1000 + 30)
         samples.append(snapshot)
         save(out / f"turn-{index}.progress.json", samples)
         time.sleep(snapshot["poll_after_ms"] / 1000)

@@ -1037,7 +1037,7 @@ def _resolve_vague_term(
         else:
             final_nodes.append(n)
     # Vague-term review patches only nodes; the sources map is carried forward
-    # unchanged. The legacy singular ``source`` column is dead.
+    # unchanged.
     return state_record.sources, final_nodes, artifact_hash
 
 
@@ -1198,7 +1198,7 @@ def _resolve_prompt_template_review(
         else:
             final_nodes.append(current_node)
     # Prompt-template review patches only node review metadata; the sources map
-    # is carried forward unchanged. The legacy singular ``source`` column is dead.
+    # is carried forward unchanged.
     return state_record.sources, final_nodes, artifact_hash
 
 
@@ -1330,7 +1330,7 @@ def _resolve_pipeline_decision_review(
         else:
             final_nodes.append(current_node)
     # Pipeline-decision review patches only node review metadata; the sources map
-    # is carried forward unchanged. The legacy singular ``source`` column is dead.
+    # is carried forward unchanged.
     return state_record.sources, final_nodes, None
 
 
@@ -1415,7 +1415,7 @@ def _resolve_model_choice_review(
         else:
             final_nodes.append(current_node)
     # Model-choice review patches only node options; the sources map is
-    # carried forward unchanged. The legacy singular ``source`` column is dead.
+    # carried forward unchanged.
     return state_record.sources, final_nodes, None
 
 
@@ -1618,7 +1618,6 @@ class _SessionPendingInterpretationValidator:
         candidate_state = state_from_record(
             replace(
                 candidate.base_state,
-                source=None,
                 sources=data.sources,
                 nodes=data.nodes,
                 edges=data.edges,

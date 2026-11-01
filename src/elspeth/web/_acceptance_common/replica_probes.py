@@ -56,14 +56,15 @@ from uuid import UUID, uuid4
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.web.sessions.schemas import ComposerOperationStatusResponse, SendMessageRequest
+from elspeth.web.sessions.schemas import ComposerOperationSnapshot, SendMessageRequest
 
 from .errors import AcceptanceCheckError, AcceptanceInputError
 from .http_client import AcceptanceHttpClient
 
 Probe = Literal["P1", "P2", "P3", "P4a", "P4b"]
 FenceConflictTrialKind = Literal["same_operation", "distinct_operations"]
-P1_OPERATION_POLL_GRACE_SECONDS: Final = 30.0
+# A Continuation operation has no single total deadline; a probe bounds its own observation.
+P1_OPERATION_TERMINAL_BOUND_SECONDS: Final = 600.0
 ProbeOutcome = Literal["pass", "fail", "cannot_pass", "unreachable"]
 Mechanism = Literal[
     "session_operation_fence",
@@ -716,16 +717,14 @@ class ReplicaProbeDriver:
             terminal_status="completed" if terminal.status == "completed" else "failed",
         )
 
-    def _poll_composer_operation(self, session_id: str, operation_id: str) -> ComposerOperationStatusResponse:
-        def poll(client: AcceptanceHttpClient) -> ComposerOperationStatusResponse:
-            deadline: float | None = None
+    def _poll_composer_operation(self, session_id: str, operation_id: str) -> ComposerOperationSnapshot:
+        def poll(client: AcceptanceHttpClient) -> ComposerOperationSnapshot:
+            deadline = self._clock() + P1_OPERATION_TERMINAL_BOUND_SECONDS
             while True:
                 body = client.request_json("GET", f"/api/sessions/{session_id}/operations/{operation_id}", expected_statuses={200})
-                status = ComposerOperationStatusResponse.model_validate_json(json.dumps(body))
+                status = ComposerOperationSnapshot.model_validate_json(json.dumps(body))
                 if status.operation_id != operation_id:
                     raise AcceptanceCheckError("probe_operation_identity")
-                remaining = self._clock() + status.deadline_remaining_ms / 1000 + P1_OPERATION_POLL_GRACE_SECONDS
-                deadline = remaining if deadline is None else min(deadline, remaining)
                 if status.status in ("completed", "failed"):
                     return status
                 if self._clock() >= deadline:

@@ -114,7 +114,7 @@ def read_selected_turn_evidence_graph_data_on_connection(
     if len(compose) != 1:
         raise AuditIntegrityError("cold evidence requires exactly one actual Compose frame")
     frame = compose[0]
-    if frame.initial_state.codec != "composer.state.v1" or frame.audit_buffer.codec != "composer.audit-buffer.v1":
+    if frame.initial_state.codec != "composer.state.v1" or frame.audit_buffer.codec != "composer.audit-buffer.v2":
         raise AuditIntegrityError("cold evidence changed its selected state/recorder format")
     sid = str(session_id)
     if (root.logical.session_id, root.logical.operation_id) != (sid, operation_id):
@@ -137,8 +137,7 @@ def read_selected_turn_evidence_graph_data_on_connection(
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one()
     principal = conn.execute(select(sessions.c.user_id, sessions.c.archived_at).where(sessions.c.id == sid)).one()
     if (
-        parent.lifecycle_version != 2
-        or parent.actor_user_id != snapshot.actor_user_id
+        parent.actor_user_id != snapshot.actor_user_id
         or principal.user_id != snapshot.actor_user_id
         or parent.request_hash != root.logical.request_hash
         or parent.kind != root.logical.kind

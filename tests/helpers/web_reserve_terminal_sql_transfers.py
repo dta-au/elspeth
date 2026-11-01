@@ -18,9 +18,9 @@ TERMINAL = "_run_composer_terminal_sql"
 COMPLETE = "complete_composer_async_operation"
 FAIL = "fail_composer_async_operation"
 GRAMMARS = {
-    TERMINAL: "b9434496ecd1693abf1c49209a7c1f9b0aaf3a79ca96191bc01465399e9dfe9c",
-    COMPLETE: "c3a5979ae7d9e64d630b8b1b1d0032f93e28f165f8787ea4ccc4251f07252c67",
-    FAIL: "d9a28db1e77ac3fe1a9c9c8f945ce2b5a6555da0188654df739f141136bf3c13",
+    TERMINAL: "93da3084c4fae4391b94a4ef92030fca564d0cf5440ed9f16cfb89c366461d30",
+    COMPLETE: "2016fe4452d0d644b2b2d695740ad6d7fc2622c037bb61bab4548bbb842e8ca3",
+    FAIL: "1cad58ac17d2e91ea893aa6c650e337580fbd93ec7a69bc08205c56cfe17b365",
 }
 # Current finite declaration includes the continuation P4/title methods and
 # nullable audit parameters. Every evaluated header/default stays in the hash;

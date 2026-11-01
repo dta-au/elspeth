@@ -1,4 +1,4 @@
-"""The worker's bounded startup/periodic V2 recovery sweep.
+"""The worker's bounded startup/periodic recovery sweep.
 
 Discovery is advisory. The repository revalidates the complete original owner
 and chooses recovery or terminal Stop inside its own session transaction.
@@ -27,9 +27,6 @@ async def reap_continuations_once(worker: ComposerAsyncWorker) -> int:
         key = candidate.session_id, candidate.operation_id
         if key in worker._jobs:
             continue
-        if key in worker._adoption_recovery_pending:
-            worker._process_recovery.request_shutdown()
-            continue
         disposition = await _owned(
             run_sync_in_worker(
                 repository.reconcile_unavailable_composer_segment,
@@ -47,9 +44,6 @@ async def reap_continuations_once(worker: ComposerAsyncWorker) -> int:
     for inactive_candidate in inactive:
         key = inactive_candidate.session_id, inactive_candidate.operation_id
         if key in worker._jobs:
-            continue
-        if key in worker._adoption_recovery_pending:
-            worker._process_recovery.request_shutdown()
             continue
         settled = await _owned(
             run_sync_in_worker(

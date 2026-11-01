@@ -97,7 +97,6 @@ def list_inactive_continuations(engine: Engine, *, limit: int) -> tuple[Continua
                 )
             )
             .where(
-                jobs.c.lifecycle_version == 2,
                 jobs.c.status.in_(("queued", "running")),
                 sessions_table.c.archived_at.is_not(None),
                 segments.c.state.in_(("queued", "interrupted")),
@@ -227,7 +226,6 @@ def list_recoverable_segments(engine: Engine, *, limit: int) -> tuple[Continuati
                 )
             )
             .where(
-                jobs.c.lifecycle_version == 2,
                 jobs.c.status.in_(("queued", "running")),
                 segments.c.state == "running",
                 attempts.c.revoked_at.is_(None),

@@ -9,7 +9,7 @@ from fastapi.routing import APIRoute
 
 from elspeth.web.sessions import schemas
 from elspeth.web.sessions.routes.composer import compose
-from elspeth.web.sessions.schemas import ComposerOperationAcceptedResponse, ComposerOperationSnapshotV2, RecomposeRequest
+from elspeth.web.sessions.schemas import ComposerOperationAcceptedResponse, ComposerOperationSnapshot, RecomposeRequest
 
 
 def _assert_durable_recompose_schema(schema: dict) -> None:
@@ -25,11 +25,11 @@ def test_mounted_recompose_advertises_durable_admission_and_canonical_request() 
     assert route.status_code == 202
     # Admission protocol v1 answers with the accepted envelope; v2 answers with
     # the operation snapshot (test_operation_versions). Both are 202 bodies.
-    assert route.response_model == ComposerOperationAcceptedResponse | ComposerOperationSnapshotV2
+    assert route.response_model == ComposerOperationAcceptedResponse | ComposerOperationSnapshot
     operation = app.openapi()["paths"]["/api/sessions/{session_id}/recompose"]["post"]
     assert operation["responses"]["202"]["content"]["application/json"]["schema"]["anyOf"] == [
         {"$ref": "#/components/schemas/ComposerOperationAcceptedResponse"},
-        {"$ref": "#/components/schemas/ComposerOperationSnapshotV2"},
+        {"$ref": "#/components/schemas/ComposerOperationSnapshot"},
     ]
     assert "200" not in operation["responses"]
     assert get_type_hints(compose.parse_recompose_body)["return"] is RecomposeRequest
