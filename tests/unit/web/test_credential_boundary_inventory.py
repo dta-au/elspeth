@@ -631,6 +631,9 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     "src/elspeth/web/sessions/continuation_composition_initialization.py:_require_original_values.state_from_record": "committed_checkpoint_comparison",
     "src/elspeth/web/sessions/continuation_p4.py:decode_p4_receipt.state_from_record": "committed_checkpoint_comparison",
     "src/elspeth/web/sessions/continuation_p4.py:retain_p4_result_on_connection.state_from_record": "committed_checkpoint_comparison",
+    # Finalization hydrates the advisor-verified head only to compare its
+    # content hash with the result state (f898c8af1); a mismatch refuses.
+    "src/elspeth/web/sessions/composer_finalization.py:settle_composer_result.state_from_record": "committed_checkpoint_comparison",
     # Admission hydrates the base only to refuse an undecodable one.
     "src/elspeth/web/coordination/composer_operation_authority.py:ComposerAsyncOperationAuthority.admit.state_from_record": "committed_checkpoint_comparison",
     # The TITLE source reaches the provider only through _litellm_acompletion's request guard.
