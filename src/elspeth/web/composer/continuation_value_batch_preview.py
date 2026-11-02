@@ -22,6 +22,12 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
+from elspeth.web.composer.continuation_preview_observation import (
+    OriginalPreviewObservation,
+    observe_original_preview_result,
+    preview_source_data,
+    require_original_preview_observation,
+)
 from elspeth.web.composer.continuation_value_batch_preparation import (
     PreparedValueBatchCall,
     ValueBatchComputation,
@@ -103,7 +109,7 @@ def plan_preview_value_source(prepared: PreparedValueBatchCall) -> PreviewValueS
     )
 
 
-async def compute_preview_value(prepared: PreparedValueBatchCall) -> ValueBatchComputation:
+async def observe_empty_preview_value(prepared: PreparedValueBatchCall) -> OriginalPreviewObservation:
     """Produce the original pure value; never issue, publish or discard a result.
 
     The real runtime validator returns its complete fixed empty-pipeline
@@ -113,6 +119,7 @@ async def compute_preview_value(prepared: PreparedValueBatchCall) -> ValueBatchC
     a resolver. Core owns audit and full-tail admission before SQL issue.
     """
     plan = plan_preview_value_source(prepared)
+    source = preview_source_data(prepared)
     ctx, call = prepared.context, prepared.call
     arguments = call.arguments
     if type(arguments) is not dict or arguments != plan.arguments:
@@ -183,4 +190,10 @@ async def compute_preview_value(prepared: PreparedValueBatchCall) -> ValueBatchC
         or canonical_json(strict.model_dump(mode="json")) != strict_json
     ):
         raise AuditIntegrityError("preview changed its original pure result or empty source")
-    return ValueBatchComputation(result)
+    return observe_original_preview_result(prepared, source=source, result=result, strict=strict)
+
+
+async def compute_preview_value(prepared: PreparedValueBatchCall) -> ValueBatchComputation:
+    observed = await observe_empty_preview_value(prepared)
+    require_original_preview_observation(observed, prepared)
+    return ValueBatchComputation(observed.result)

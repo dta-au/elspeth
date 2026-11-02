@@ -143,12 +143,18 @@ def _retained_discovery_result(tool_name: str, result: ToolResult, *, env_ref_na
     return result
 
 
-def encode_tool_result_value(
+def prepare_tool_result_value(
     tool_name: str,
     result: ToolResult,
     *,
     env_ref_names: frozenset[str] = frozenset(),
 ) -> ToolResultValue:
+    """Construct the same admitted complete DATA for exact byte planning.
+
+    This preserves the original state/discovery/member admissions. It grants
+    no storage or execution permission; the ordinary encoder additionally
+    requires its unchanged full cold-decode reproof below.
+    """
     if type(result) is not ToolResult or type(result.updated_state) is not CompositionState:
         raise TypeError("tool continuation codec requires the actual nominal result and state")
     state_json = canonical_json(result.updated_state.to_dict())
@@ -175,6 +181,17 @@ def encode_tool_result_value(
         validation_snapshot_hash=result._validation_snapshot_hash,
         state_validation_withheld=result._state_validation_withheld,
     )
+    return value
+
+
+def encode_tool_result_value(
+    tool_name: str,
+    result: ToolResult,
+    *,
+    env_ref_names: frozenset[str] = frozenset(),
+) -> ToolResultValue:
+    """Retain the same complete value and unchanged cold-decode reproof."""
+    value = prepare_tool_result_value(tool_name, result, env_ref_names=env_ref_names)
     # Refuse a value that this build cannot restore completely; no lossy fallback.
     decode_tool_result_value(value, pre_state=result.updated_state, env_ref_names=env_ref_names)
     return value

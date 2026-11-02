@@ -10,6 +10,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, suppress
 from hashlib import sha256
+from uuid import uuid4
 
 import litellm
 import pytest
@@ -18,11 +19,14 @@ from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.prompt_guard import PromptGuardDecision
 from elspeth.web.composer import continuation_primary as primary_source
+from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_private_chunk
 from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
-from elspeth.web.composer.provider_quota import ProviderCallCustody
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
+from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationOwner
 from elspeth.web.coordination.quota_authority import ProviderAttempt, _undispatched_cancellation_event_id, _usage_entry_id
 from elspeth.web.required_sql_outcomes import RequiredSQLReturned
 from elspeth.web.sessions import continuation_primary as primary_sql
@@ -39,8 +43,12 @@ from elspeth.web.sessions.models import composer_continuation_chunks_table as ch
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 from elspeth.web.sessions.models import composer_continuation_provider_ordinals_table as ordinals
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
+from tests.unit.web.composer.test_prompt_guard_admission import _GuardClient
+from tests.unit.web.sessions.test_continuation_primary_v4_live import _v4_primary_input
+from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST
 from tests.unit.web.sessions.test_continuation_runtime_provider_history import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_runtime_provider_history import prepared_runtime, publish
 
@@ -677,3 +685,89 @@ async def test_failed_or_unknown_undispatched_disposition_cannot_issue_no_sdk_re
         with operation_store[0].connect() as conn:
             assert _cold_no_sdk_receipt(conn, case["running"], case["prepared"].binding.effect_key) is None
         case["arguments"]["required_work"].coordinator.assert_completed()
+
+
+async def _run_v4_guard_case(kwargs, produced, recorder, store):
+    work = kwargs["required_work"]
+    with prompt_guard_user_scope(REQUEST):
+        return await primary_source.run_continuation_primary(
+            service=kwargs["service"],
+            authority=kwargs["authority"],
+            selected=kwargs["selected"],
+            producers=produced.producers,
+            messages=list(produced.messages),
+            tools=[],
+            recorder=recorder,
+            drained=RecorderDrainCursors(),
+            required_work=work,
+            provider_owner=ProviderInvocationOwner(service=store[3], required_work=work),
+            timeout=5,
+        )
+
+
+@pytest.mark.asyncio
+async def test_v4_guard_refusal_closes_pre_h_with_original_audit_and_no_physical_attempt(operation_store, tmp_path, monkeypatch):
+    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    running = kwargs["inventory"].running
+    assert running is not None
+    guard = _GuardClient(PromptGuardDecision("blocked", "policy_blocked"))
+    kwargs["service"]._provider_gateway._prompt_guard_mount = PromptGuardMount(guard)
+    sdk = []
+
+    async def completion(**_kwargs):
+        sdk.append(1)
+        raise AssertionError("guarded PRIMARY entered SDK")
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    receipt = await _run_v4_guard_case(kwargs, produced, recorder, store)
+    assert type(receipt) is primary_sql.PrimaryNoSdkRefusalReceipt
+    assert len(guard.requests) == 1 and sdk == []
+    rows = _rows(store[0], running)
+    assert len(rows["effect"]) == 1 and rows["effect"][0]["disposition"] == "refused"
+    assert rows["physical"] == rows["usage"] == []
+    with store[0].connect() as conn:
+        assert conn.execute(select(holds).where(holds.c.session_id == str(running.claim.session_id))).all() == []
+        assert _cold_no_sdk_receipt(conn, running, rows["effect"][0]["effect_key"]) == receipt
+        audits = conn.execute(
+            select(messages).where(messages.c.session_id == str(running.claim.session_id), messages.c.role == "audit")
+        ).all()
+    guard_checks = [item["check"] for row in audits for item in row.tool_calls or () if item.get("_kind") == "prompt_guard_audit"]
+    assert len(guard_checks) == 1
+    assert (guard_checks[0]["role"], guard_checks[0]["disposition"], guard_checks[0]["reason"]) == ("composer", "blocked", "policy_blocked")
+    terminal = receipt.terminal
+    assert terminal.status == "failed" and terminal.failure_code == "http_error"
+    public = json.loads(terminal.result_json)
+    assert public["http_status"] == 422
+    assert public["body"]["detail"]["error_type"] == "prompt_guard_blocked"
+    assert public["body"]["detail"]["audit_id"] == guard_checks[0]["audit_id"]
+
+
+@pytest.mark.asyncio
+async def test_v4_admitted_h_cannot_relabel_later_guard_error_as_no_sdk_refusal(operation_store, tmp_path, monkeypatch):
+    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    running = kwargs["inventory"].running
+    assert running is not None
+    forged = PromptGuardRefused(decision=PromptGuardDecision("blocked", "policy_blocked"), audit_id=str(uuid4()))
+    original = ProviderCallCustody.require_cost_dispatch
+    sdk = []
+
+    def after_admission(custody):
+        if custody.continuation_primary_v4_admission is not None:
+            raise forged
+        return original(custody)
+
+    async def completion(**_kwargs):
+        sdk.append(1)
+        raise AssertionError("post-H guard error entered SDK")
+
+    monkeypatch.setattr(ProviderCallCustody, "require_cost_dispatch", after_admission)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    with pytest.raises(AuditIntegrityError, match="V4 PRIMARY no-SDK refusal lacks proved unentered admitted custody"):
+        await _run_v4_guard_case(kwargs, produced, recorder, store)
+    rows = _rows(store[0], running)
+    assert sdk == [] and len(rows["effect"]) == len(rows["physical"]) == 1
+    assert rows["effect"][0]["disposition"] == "dispatched"
+    assert rows["physical"][0]["settled_at"] is None and rows["usage"] == []
+    assert not [row for row in rows["chunks"] if row["codec"] == "composer.primary-no-sdk-refusal.v1"]
+    with store[0].connect() as conn:
+        assert _cold_no_sdk_receipt(conn, running, rows["effect"][0]["effect_key"]) is None

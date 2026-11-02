@@ -15,7 +15,6 @@ from collections.abc import Sequence
 from typing import Any
 
 import httpx
-import litellm
 import pytest
 from sqlalchemy import select
 
@@ -23,11 +22,28 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import prompt_guard
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
-from elspeth.web.sessions.models import quota_provider_attempts_table
+from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.models import (
+    composer_continuation_checkpoints_table,
+    composer_continuation_effects_table,
+    composer_continuation_events_table,
+    quota_provider_attempts_table,
+    token_usage_ledger_table,
+)
 from tests.helpers import continuation_app as continuation_app_module
 from tests.helpers.composer_operations import message_body
-from tests.helpers.continuation_app import ACTOR, continuation_app, install_sdk, settle
+from tests.helpers.continuation_app import (
+    ACTOR,
+    ScriptedSDK,
+    continuation_app,
+    end_admit,
+    install_sdk,
+    observe_original_driver_failures,
+    settle,
+)
 
 _LOCAL_DETAIL = "The authoring input is outside the supported prompt guard input envelope. The protected dispatch was not sent."
 _MARKER = "SEAM7-LIMIT-UNIT:"
@@ -54,32 +70,6 @@ def _assert_documents_reproduce_complete_units(units: Sequence[str], documents: 
         assert width is not None, f"document {position} ({len(document)} chars) does not reproduce complete units"
         del remaining[:width]
     assert remaining == [], f"{len(remaining)} units were not reproduced"
-
-
-def _handoff(kwargs: dict[str, Any]) -> litellm.ModelResponse:
-    return litellm.ModelResponse(
-        model=kwargs["model"],
-        choices=[
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "seam7-handoff",
-                            "type": "function",
-                            "function": {
-                                "name": "handoff_to_user",
-                                "arguments": json.dumps({"action": "reset_to_safe_checkpoint", "message": "Noted."}),
-                            },
-                        }
-                    ],
-                },
-                "finish_reason": "tool_calls",
-            }
-        ],
-        usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
-    )
 
 
 def _guard_checks(rows) -> list[dict[str, Any]]:
@@ -114,9 +104,24 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
     pack_calls: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
     guard_bodies: list[dict[str, Any]] = []
     sdk_calls: list[dict[str, Any]] = []
+    guard_http_counts_at_sdk_entry: list[int] = []
     checks_at_sdk_entry: list[list[dict[str, Any]]] = []
+    diagnostic_trace: list[dict[str, Any]] = []
     current_session: list[Any] = []
     service_ref: list[Any] = []
+    sdk = ScriptedSDK(
+        [
+            ("primary", ("Noted.", None)),
+            ("primary", ("Noted.", None)),
+            ("end", end_admit()),
+            ("primary", ("Noted.", None)),
+            ("primary", ("Noted.", None)),
+            ("end", end_admit()),
+            ("primary", ("Noted.", None)),
+            ("primary", ("Noted.", None)),
+            ("end", end_admit()),
+        ]
+    )
 
     original_pack = prompt_guard._pack_documents
 
@@ -127,8 +132,9 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
 
     async def completion(**kwargs):
         checks_at_sdk_entry.append(_guard_checks(await service_ref[0].get_messages(current_session[0], limit=None)))
+        guard_http_counts_at_sdk_entry.append(len(guard_bodies))
         sdk_calls.append(kwargs)
-        return _handoff(kwargs)
+        return await sdk(**kwargs)
 
     # Only the guard's HTTP transport and the model SDK are replaced; the
     # packer is observed through its original implementation.
@@ -153,16 +159,36 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
             current_session[:] = [session.id]
             first = _first_prompt(unit_length)
             assert len(first) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
-            first_settled = await submit(session.id, message_body(first))
+            first_body = message_body(first)
+            with monkeypatch.context() as diagnostic_patch:
+                observed_first = observe_original_driver_failures(diagnostic_patch, first_body["operation_id"], session_id=session.id)
+                first_settled = await submit(session.id, first_body)
+            diagnostic_trace.extend(observed_first)
             first_state = await service.get_current_state(session.id)
             before = await service.get_messages(session.id, limit=None)
             pack_calls.clear()
             guard_bodies.clear()
             sdk_calls.clear()
+            guard_http_counts_at_sdk_entry.clear()
             checks_at_sdk_entry.clear()
             body = message_body(_SECOND_PROMPT, state_id=None if first_state is None else first_state.id)
-            settled = await submit(session.id, body)
-            assert len(pack_calls) == 1
+            if unit_length == PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1:
+                # Observe only the over-limit second operation. The wrapper
+                # calls the original driver and changes no deadline or result.
+                with monkeypatch.context() as diagnostic_patch:
+                    observed = observe_original_driver_failures(diagnostic_patch, body["operation_id"], session_id=session.id)
+                    settled = await submit(session.id, body)
+                diagnostic_trace.extend(observed)
+            else:
+                with monkeypatch.context() as diagnostic_patch:
+                    observed = observe_original_driver_failures(diagnostic_patch, body["operation_id"], session_id=session.id)
+                    settled = await submit(session.id, body)
+                diagnostic_trace.extend(observed)
+            # The first pack belongs to the initial PRIMARY. Over-limit input
+            # must refuse there, before any reply-only classifier can run.
+            assert pack_calls
+            if unit_length == PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1:
+                assert len(pack_calls) == 1
             units, packed = pack_calls[0]
             marked = [unit for unit in units if _MARKER in unit]
             assert marked == [_history_unit(first)]
@@ -181,7 +207,72 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
         assert sdk_calls == []
         assert settled.status == "failed", settled.model_dump_json()
         assert settled.error is not None
-        assert settled.error.http_status == 422, settled.model_dump_json()
+        failure_detail = settled.model_dump_json()
+        if settled.error.http_status != 422:
+            # Read only bounded identities and dispositions after the public
+            # terminal. Never log provider wire, user content or audit chunks.
+            diagnostic: dict[str, Any] = {"snapshot": json.loads(failure_detail), "driver_trace": diagnostic_trace[-20:]}
+            try:
+                record = await run_sync_in_worker(
+                    app.state.composer_async_operation_authority.get, session_id=session.id, operation_id=body["operation_id"]
+                )
+                diagnostic["record"] = (
+                    None
+                    if record is None
+                    else {
+                        "status": record.status,
+                        "failure_code": record.failure_code,
+                        "attempt": record.attempt,
+                        "segment": record.current_segment_sequence,
+                        "generation": record.ownership_generation,
+                        "cursor": record.journal_cursor,
+                        "settled_by": record.settled_by,
+                    }
+                )
+                observed_rows = await service.get_messages(session.id, limit=None)
+                diagnostic["guard_checks"] = [
+                    (check["role"], check["disposition"], check["reason"])
+                    for check in _guard_checks(observed_rows)
+                    if record is not None and check["operation_id"] == record.session_operation_id
+                ]
+                with service._engine.connect() as connection:
+                    try:
+                        stored = load_snapshot(connection, session_id=str(session.id), operation_id=body["operation_id"])
+                        stack = decode_continuation_snapshot(stored.payload_json)
+                        policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
+                        diagnostic["policy"] = {"type": type(policy).__name__, "schema_version": policy.schema_version}
+                    except Exception as error:
+                        diagnostic["policy_readback_error_type"] = type(error).__name__
+                    diagnostic["effects"] = [
+                        (row.owner, row.disposition, row.effect_key)
+                        for row in connection.execute(
+                            select(
+                                composer_continuation_effects_table.c.owner,
+                                composer_continuation_effects_table.c.disposition,
+                                composer_continuation_effects_table.c.effect_key,
+                            ).where(composer_continuation_effects_table.c.operation_id == body["operation_id"])
+                        )
+                    ][:20]
+                    diagnostic["events"] = [
+                        row.tag
+                        for row in connection.execute(
+                            select(composer_continuation_events_table.c.tag).where(
+                                composer_continuation_events_table.c.operation_id == body["operation_id"]
+                            )
+                        )
+                    ][:20]
+                    diagnostic["checkpoints"] = [
+                        (row.kind, row.cursor)
+                        for row in connection.execute(
+                            select(composer_continuation_checkpoints_table.c.kind, composer_continuation_checkpoints_table.c.cursor).where(
+                                composer_continuation_checkpoints_table.c.operation_id == body["operation_id"]
+                            )
+                        )
+                    ][:20]
+            except Exception as error:
+                diagnostic["readback_error_type"] = type(error).__name__
+            failure_detail = json.dumps(diagnostic, sort_keys=True, default=str)
+        assert settled.error.http_status == 422, failure_detail
         public = settled.error.body
         assert public["detail"]["error_type"] == "prompt_guard_unsupported_input"
         assert public["detail"]["detail"] == _LOCAL_DETAIL
@@ -211,7 +302,7 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
         assert len(attempts) == 1 and attempts[0].operation_id != record.session_operation_id
         assert first not in json.dumps(public) + json.dumps(checks)
 
-        # Exactly at the limit: the unit is inspected whole and the SDK is entered once.
+        # Exactly at the limit: the unit is inspected whole before PRIMARY SDK entry.
         (
             _session,
             _body,
@@ -227,20 +318,63 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
         turn_one_checks = _guard_checks(before)
         _assert_documents_reproduce_complete_units(units, packed)
         assert unit in packed
-        inspected = [document for body in guard_bodies for document in body["documents"]]
+        with service._engine.connect() as connection:
+            quota_attempts = connection.execute(
+                select(
+                    quota_provider_attempts_table.c.session_id,
+                    quota_provider_attempts_table.c.operation_id,
+                    quota_provider_attempts_table.c.settled_at,
+                    quota_provider_attempts_table.c.ledger_entry_id,
+                )
+            ).all()
+            token_ledger = connection.execute(
+                select(
+                    token_usage_ledger_table.c.session_id,
+                    token_usage_ledger_table.c.prompt_tokens,
+                    token_usage_ledger_table.c.completion_tokens,
+                )
+            ).all()
+        assert [request["model"] for request in sdk_calls] == ["test/model", "test/model", "test/advisor"], json.dumps(
+            {
+                "first_statuses": [refused_first_settled.status, at_limit_first_settled.status],
+                "status": settled.status,
+                "error_status": None if settled.error is None else settled.error.http_status,
+                "error_body": None if settled.error is None else settled.error.body,
+                "driver_trace": diagnostic_trace[-20:],
+                "quota_attempts": [tuple(row) for row in quota_attempts],
+                "token_ledger": [tuple(row) for row in token_ledger],
+                "guard_checks": [
+                    (check["role"], check["disposition"], check["reason"])
+                    for check in _guard_checks(await service.get_messages(_session.id, limit=None))
+                ],
+            },
+            sort_keys=True,
+            default=str,
+        )
+        assert guard_http_counts_at_sdk_entry
+        first_primary_http = guard_bodies[: guard_http_counts_at_sdk_entry[0]]
+        inspected = [document for body in first_primary_http for document in body["documents"]]
         _assert_documents_reproduce_complete_units(units, inspected)
         assert tuple(inspected) == packed
-        assert all(body["userPrompt"] == _SECOND_PROMPT for body in guard_bodies)
-        assert len(sdk_calls) == 1
+        assert all(body["userPrompt"] == _SECOND_PROMPT for body in first_primary_http)
         # Turn 2's own allow decision (one row beyond turn 1's) was durable before the SDK ran.
         assert checks_at_sdk_entry[0][: len(turn_one_checks)] == turn_one_checks
         assert len(checks_at_sdk_entry[0]) == len(turn_one_checks) + 1
         assert (checks_at_sdk_entry[0][-1]["disposition"], checks_at_sdk_entry[0][-1]["reason"]) == ("allow", "clean")
 
         # Integration completion point (U-40): both first turns and the at-limit
-        # second turn complete with the model's handoff reply, and turn 1 leaves
+        # second turn complete with the model's ordinary reply, and turn 1 leaves
         # a checkpoint state behind.
-        for completed in (refused_first_settled, at_limit_first_settled, settled):
-            assert completed.status == "completed", completed.model_dump_json()
+        for label, completed in (
+            ("over_limit_first", refused_first_settled),
+            ("at_limit_first", at_limit_first_settled),
+            ("at_limit_second", settled),
+        ):
+            assert completed.status == "completed", json.dumps(
+                {"case": label, "settled": completed.model_dump(mode="json"), "driver_trace": diagnostic_trace[-40:]},
+                sort_keys=True,
+                default=str,
+            )
             assert completed.result is not None and completed.result.message.content == "Noted."
+        assert sdk.steps == []
         assert first_state is not None and at_limit_state is not None

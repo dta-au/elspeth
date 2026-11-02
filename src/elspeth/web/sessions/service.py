@@ -57,7 +57,7 @@ from elspeth.web.async_workers import (
     run_stream_read_in_worker,
     run_sync_in_worker,
 )
-from elspeth.web.composer.advisor_audit import ADVISOR_GRAPH_REVIEW_AUDIT_KIND, AdvisorGraphReviewFact
+from elspeth.web.composer.advisor_audit import ADVISOR_GRAPH_REVIEW_AUDIT_KIND, AdvisorCheckpointPassRecord, AdvisorGraphReviewFact
 from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent, GraphRecoveryPark, qualify_editable_checkpoint
 from elspeth.web.composer.no_tool_policy import visible_message_segments
@@ -8072,6 +8072,7 @@ class SessionServiceImpl:
         running: ComposerOperationRunning,
         drafts: Sequence[AuditMessageDraft],
         audit_state_id: UUID | None,
+        prospective_model_pass: AdvisorCheckpointPassRecord | None = None,
     ) -> AdvisorGraphReviewFact | None:
         """Validate the captured base and actual review inside terminal custody."""
         from elspeth.web.composer.advisor_decision import AdvisorBlockCause
@@ -8137,7 +8138,21 @@ class SessionServiceImpl:
                     )
                 ):
                     raise AuditIntegrityError("Unchanged graph rejection cannot be erased by prose review")
-                self._assert_graph_review_receipt(conn, fact)
+                if prospective_model_pass is None:
+                    self._assert_graph_review_receipt(conn, fact)
+                elif (
+                    type(prospective_model_pass) is not AdvisorCheckpointPassRecord
+                    or fact.identity.source != "model"
+                    or prospective_model_pass.phase != "end"
+                    or prospective_model_pass.source != "model"
+                    or prospective_model_pass.publication_binding != fact.identity.binding
+                    or prospective_model_pass.provider_attempts < 1
+                    or (
+                        fact.action == "passed"
+                        and (prospective_model_pass.verdict != "clean" or prospective_model_pass.publication_verdict != "ADMIT")
+                    )
+                ):
+                    raise AuditIntegrityError("Prepared terminal graph review lost its exact prospective model pass")
         return found
 
     async def create_run(
@@ -11096,12 +11111,48 @@ class SessionServiceImpl:
         provider_audit_calls: tuple[ComposerLLMCall, ...] = (),
         publication_result: ComposerResult | None = None,
         publication_projection: PublicationProjectionInput | GraphRecoveryProjectionInput | None = None,
+        transaction_conn: Connection | None = None,
+        terminal_created_at: datetime | None = None,
+        audit_message_ids: tuple[str, ...] | None = None,
+        expected_provider_cohort: tuple[AuditMessageDraft, ...] | None = None,
+        expected_message: ChatMessageRecord | None = None,
+        expected_response: MessageWithStateResponse | None = None,
+        prepared_settlement: PreparedSegmentSettlement | None = None,
+        deferred_telemetry: list[AuditMessageDraft] | None = None,
     ) -> ComposerOperationRecord:
         """Publish final assistant/audit/snapshot/result in one exact COMPOSE transaction."""
         if (assistant is None) == (assistant_record is None):
             raise ValueError("terminal requires exactly one new or persisted assistant")
-        frozen_created_at: datetime | None = None
-        frozen_audit_ids = tuple(str(uuid.uuid4()) for _draft in audit_cohort)
+        if transaction_conn is not None:
+            if (
+                not transaction_conn.in_transaction()
+                or terminal_created_at is None
+                or audit_message_ids is None
+                or expected_provider_cohort is None
+                or expected_message is None
+                or expected_response is None
+                or prepared_settlement is None
+                or deferred_telemetry is None
+                or recovery is not None
+            ):
+                raise AuditIntegrityError("END same-connection finalizer requires its exact prepared terminal bundle")
+        elif any(
+            item is not None
+            for item in (
+                terminal_created_at,
+                audit_message_ids,
+                expected_provider_cohort,
+                expected_message,
+                expected_response,
+                prepared_settlement,
+                deferred_telemetry,
+            )
+        ):
+            raise AuditIntegrityError("ordinary finalizer cannot borrow an END prepared terminal bundle")
+        frozen_created_at: datetime | None = terminal_created_at
+        frozen_audit_ids = (
+            audit_message_ids[: len(audit_cohort)] if audit_message_ids is not None else tuple(str(uuid.uuid4()) for _draft in audit_cohort)
+        )
         frozen_provider_cohort: tuple[AuditMessageDraft, ...] | None = None
         sid = str(running.claim.session_id)
         context = running.session_operation_context
@@ -11125,15 +11176,18 @@ class SessionServiceImpl:
             nonlocal frozen_audit_ids, frozen_provider_cohort
             from elspeth.web.coordination.composer_operation_authority import graph_recovery_prior_read_scope
 
+            connection_scope = (
+                self._session_process_locked_begin(sid) if transaction_conn is None else contextlib.nullcontext(transaction_conn)
+            )
             with (
-                self._session_process_locked_begin(sid) as conn,
+                connection_scope as conn,
                 self._session_write_lock(conn, sid),
                 self._session_composer_mutation_transaction(
                     conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE
                 ),
                 graph_recovery_prior_read_scope(conn),
             ):
-                now = database_now(conn)
+                now = database_now(conn) if terminal_created_at is None else terminal_created_at
                 if frozen_created_at is None:
                     frozen_created_at = now
                 # The bound row itself is selected on this transaction below;
@@ -11150,11 +11204,20 @@ class SessionServiceImpl:
 
                     self._assert_session_write_lock_held(conn, sid, caller="complete_composer_async_operation.provider_audit")
                     provider_cohort = continuation_provider_audit_drafts_on_connection(conn, running, calls=provider_audit_calls)
+                    if expected_provider_cohort is not None and provider_cohort != expected_provider_cohort:
+                        raise AuditIntegrityError("END prepared provider cohort changed before finalization")
                     if frozen_provider_cohort is None:
                         frozen_provider_cohort = provider_cohort
-                        frozen_audit_ids += tuple(str(uuid.uuid4()) for _draft in provider_cohort)
+                        if audit_message_ids is None:
+                            frozen_audit_ids += tuple(str(uuid.uuid4()) for _draft in provider_cohort)
+                        elif len(audit_message_ids) != len(audit_cohort) + len(provider_cohort):
+                            raise AuditIntegrityError("END prepared audit IDs differ from the full provider cohort")
+                        else:
+                            frozen_audit_ids = audit_message_ids
                     elif frozen_provider_cohort != provider_cohort:
                         raise _ComposerTerminalRetryStateChanged("immutable terminal provider cohort changed")
+                elif expected_provider_cohort is not None and expected_provider_cohort:
+                    raise AuditIntegrityError("END prepared provider cohort has no original calls")
                 complete_audit_cohort = audit_cohort + provider_cohort
                 terminal_review = self._validate_terminal_graph_review(
                     conn, running=running, drafts=complete_audit_cohort, audit_state_id=audit_composition_state_id
@@ -11233,6 +11296,8 @@ class SessionServiceImpl:
                         raise AuditIntegrityError("terminal reused assistant differs from durable record")
                 if attempted_message is not None and message != attempted_message:
                     raise _ComposerTerminalRetryStateChanged("immutable terminal assistant bundle changed")
+                if expected_message is not None and message != expected_message:
+                    raise AuditIntegrityError("END prepared assistant ID, sequence, time or content changed")
                 attempted_message = message
                 try:
                     active_drafts = self._write_audit_cohort_on_connection(
@@ -11319,6 +11384,8 @@ class SessionServiceImpl:
                         }
                     )
                 response = MessageWithStateResponse.model_validate(response.model_dump(mode="python"), strict=True)
+                if expected_response is not None and response != expected_response:
+                    raise AuditIntegrityError("END prepared public response changed before terminal CAS")
                 attempted_response = response
                 projection_actor = None
                 if publication_projection is not None:
@@ -11337,6 +11404,7 @@ class SessionServiceImpl:
                     conn,
                     running,
                     outcome=response,
+                    prepared_settlement=prepared_settlement,
                     publication_result=publication_result,
                     publication_projection=publication_projection,
                     publication_assistant=message if publication_projection is not None else None,
@@ -11345,10 +11413,17 @@ class SessionServiceImpl:
                     recovery_prior_state=recovery_prior_state,
                 )
             # Telemetry is after commit and cannot change the stored terminal.
-            for draft in active_drafts:
-                record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)
+            if deferred_telemetry is not None:
+                deferred_telemetry.extend(active_drafts)
+            else:
+                for draft in active_drafts:
+                    record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)
             return result
 
+        if transaction_conn is not None:
+            # This branch executes synchronously before its first await. The END
+            # owner holds the supplied connection and emits mirrors after commit.
+            return _sync()
         return await self._run_composer_terminal_sql(running, _sync, can_retry=_can_retry, required_work=required_work)
 
     async def fail_continuation_tool_operation(

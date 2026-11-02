@@ -34,6 +34,16 @@ from elspeth.web.sessions.continuation_retained_capacity import ProspectiveConti
 
 _CODEC = "composer.primary-no-sdk-refusal.v1"
 _PLACEHOLDER_RECEIPT = "00000000-0000-4000-8000-000000000000"
+_V4_NO_SDK_REASONS = (
+    PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED,
+    PrimaryNoSdkRefusalReason.PRE_SDK_DEADLINE,
+    PrimaryNoSdkRefusalReason.CHARGEABLE_REFUSED,
+    PrimaryNoSdkRefusalReason.COST_REFUSED,
+    PrimaryNoSdkRefusalReason.STORAGE_FAILURE,
+    PrimaryNoSdkRefusalReason.INTEGRITY_REFUSED,
+    PrimaryNoSdkRefusalReason.CANCELLED_BEFORE_SDK,
+    PrimaryNoSdkRefusalReason.RETAINED_TAIL_UNBOUNDED,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +69,7 @@ class PrimaryNoSdkTailBatch:
 
 
 def fixed_v4_primary_no_sdk_error(reason: PrimaryNoSdkRefusalReason) -> ComposerOperationError:
-    if type(reason) is not PrimaryNoSdkRefusalReason:
+    if type(reason) is not PrimaryNoSdkRefusalReason or reason not in _V4_NO_SDK_REASONS:
         raise TypeError("V4 PRIMARY no-SDK error requires its closed original reason")
     return ComposerOperationError(
         http_status=503,
@@ -148,7 +158,7 @@ def prepare_primary_no_sdk_tail_plan(
         raise TypeError("V4 PRIMARY no-SDK plan requires original admitted head, attempt and model")
     root = decode_continuation_snapshot(admitted.payload_json)
     sizes = []
-    for reason in PrimaryNoSdkRefusalReason:
+    for reason in _V4_NO_SDK_REASONS:
         data = _PrimaryNoSdkRefusalData(
             version=1,
             session_id=root.logical.session_id,
@@ -168,7 +178,7 @@ def prepare_primary_no_sdk_tail_plan(
             undispatched_attempt_id=attempt_id,
             undispatched_model=requested_model,
         )
-        sizes.append(len(canonical_json(data.model_dump(mode="json")).encode("utf-8")))
+        sizes.append(len(canonical_json(data.model_dump(mode="json", exclude_unset=True)).encode("utf-8")))
     maximum_receipt_bytes = max(sizes)
     snapshot_json, events = _shape(
         admitted=admitted,
@@ -257,7 +267,7 @@ def build_primary_no_sdk_tail_batch(
         undispatched_attempt_id=plan.attempt_id,
         undispatched_model=plan.requested_model,
     )
-    receipt_json = canonical_json(data.model_dump(mode="json"))
+    receipt_json = canonical_json(data.model_dump(mode="json", exclude_unset=True))
     if len(receipt_json.encode("utf-8")) > plan.maximum_receipt_bytes or len(permit.receipt_key) != len(_PLACEHOLDER_RECEIPT):
         raise AuditIntegrityError("V4 PRIMARY no-SDK receipt exceeded its original fixed bound")
     chunk = encode_private_chunk(codec=_CODEC, canonical=receipt_json)

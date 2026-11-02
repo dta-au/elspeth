@@ -39,6 +39,7 @@ from elspeth.web.composer.continuation_policy import (
 from elspeth.web.composer.continuation_primary_no_sdk import (
     PrimaryNoSdkIssuer,
     PrimaryNoSdkRefusalReason,
+    primary_guard_refusal_reason,
 )
 from elspeth.web.composer.continuation_primary_observation import observe_v4_primary_provider_result
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers, _CurrentProducerInputs
@@ -364,6 +365,9 @@ def _pre_sdk_failure(
         return PrimaryNoSdkRefusalReason.CHARGEABLE_REFUSED, error, cancellations
     if type(error) is CommonProviderCostRefused:
         return PrimaryNoSdkRefusalReason.COST_REFUSED, error, cancellations
+    guard_reason = primary_guard_refusal_reason(error)
+    if guard_reason is not None:
+        return guard_reason, error, cancellations
     if isinstance(error, SQLAlchemyError):
         return PrimaryNoSdkRefusalReason.STORAGE_FAILURE, error, cancellations
     if isinstance(error, AuditIntegrityError):

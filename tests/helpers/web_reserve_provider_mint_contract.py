@@ -38,6 +38,7 @@ def __init__(self, worker: ComposerAsyncWorker, services: ComposerAppServices, r
     self._progress_cleanup_failures: list[BaseException] = []
     self._iteration_stage: IterationStageData | None = None
     self._action_clock: ContinuationActionClock | None = None
+    self._handled_reply_deadlines: list[_HandledReplyDeadline] = []
 """,
 }
 
@@ -63,12 +64,14 @@ class _SegmentDriver:
     async def settle(self, record: ComposerOperationRecord, original: BaseException | None = None, *, expired_failure: ComposerOperationError | None = None) -> ContinuationSegmentSettled: pass
     async def settle_expired(self, original: BaseException | None, *, timeout_seconds: float) -> ContinuationSegmentSettled: pass
     async def read_failure(self, names: frozenset[str]) -> ContinuationToolFailureRead: pass
+    async def retain_reply_deadline(self, observed: ObservedClassifierReplyDeadline, *, expiry: _ActionExpiry, stage: ContinuationStage[_ActionResult], clock: ContinuationActionClock) -> None: pass
+    async def consume_tool_refusal(self, expected: ToolNoExecutionRefusal) -> ContinuationSegmentSettled: pass
     async def dispose(self, original: BaseException | None = None) -> ContinuationSegmentOutcome: pass
-    async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> MessageWithStateResponse | None: pass
+    async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> _ActionResult: pass
     async def pending_control(self, selected: SelectedContinuationState) -> StoredContinuationControlIntent | None: pass
     async def iteration_stage(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> IterationStageData | None: pass
     async def yield_control(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState, *, reason: Literal["model_request", "action_fit"], action_fit: ActionFitSuccessorPlan | None = None) -> ContinuationSegmentOutcome: pass
-    async def watch_stage(self, stage: asyncio.Task[MessageWithStateResponse | None], reader: ComposerOperationWatchReader) -> None: pass
+    async def watch_stage(self, stage: asyncio.Task[_ActionResult], reader: ComposerOperationWatchReader) -> None: pass
     def _worker_is_draining(self) -> bool: pass
     async def run(self, adoption_failure: BaseException | None) -> ContinuationSegmentOutcome: pass
 """

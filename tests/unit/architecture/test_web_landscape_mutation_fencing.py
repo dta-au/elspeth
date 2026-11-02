@@ -16985,6 +16985,9 @@ class ContinuationActionClock:
         self.started_monotonic = time.monotonic()
         self.preparation_deadline_monotonic = self.started_monotonic + policy.preparation
         self._seen: set[str] = set()
+        self._guard_complete = False
+        self._active_stage: ContinuationTimedStage | None = None
+        self._active_stage_deadline_monotonic: float | None = None
 
     def require_preparation_time(self, *, monotonic_now: float | None = None) -> None:
         now = time.monotonic() if monotonic_now is None else monotonic_now
@@ -16999,8 +17002,23 @@ class ContinuationActionClock:
         self.require_preparation_time()
         self._seen.add("preparation")
 
+    def require_active_quota_time(self, *, monotonic_now: float | None = None) -> None:
+        "Prove completed preparation and the original live quota/action bounds."
+        now = time.monotonic() if monotonic_now is None else monotonic_now
+        if type(now) is not float or not math.isfinite(now):
+            raise ValueError("quota observation must be finite monotonic time")
+        if (
+            "preparation" not in self._seen
+            or (self.policy.guard is not None and not self._guard_complete)
+            or self._active_stage != "quota"
+            or self._active_stage_deadline_monotonic is None
+        ):
+            raise ValueError("quota admission requires completed preparation and its active stage")
+        if now > min(self.started_monotonic + self.policy.total, self._active_stage_deadline_monotonic):
+            raise TimeoutError("continuation quota or original action allowance expired")
+
     async def run[T](self, stage: ContinuationTimedStage, operation: Callable[[], Awaitable[T]]) -> T:
-        if stage in self._seen or "preparation" not in self._seen:
+        if stage in self._seen or "preparation" not in self._seen or self._active_stage is not None:
             raise ValueError("continuation action stage repeated or preparation unbound")
         match stage:
             case "guard":
@@ -17014,13 +17032,22 @@ class ContinuationActionClock:
         if seconds is None:
             raise ValueError("an inapplicable action stage cannot execute")
         self._seen.add(stage)
+        stage_started_monotonic = time.monotonic()
         deadline = min(self.deadline, asyncio.get_running_loop().time() + seconds)
-        with retention_stage_memo_scope() if stage == "retention" else without_retention_stage_memo():
-            async with asyncio.timeout_at(deadline) as timeout:
-                result = await operation()
-                if timeout.expired() or asyncio.get_running_loop().time() >= deadline:
-                    raise TimeoutError("continuation stage expired while its actual owner was joined")
-                return result
+        self._active_stage = stage
+        self._active_stage_deadline_monotonic = min(self.started_monotonic + self.policy.total, stage_started_monotonic + seconds)
+        try:
+            with retention_stage_memo_scope() if stage == "retention" else without_retention_stage_memo():
+                async with asyncio.timeout_at(deadline) as timeout:
+                    result = await operation()
+                    if timeout.expired() or asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError("continuation stage expired while its actual owner was joined")
+                    if stage == "guard":
+                        self._guard_complete = True
+                    return result
+        finally:
+            self._active_stage = None
+            self._active_stage_deadline_monotonic = None
 """
     ).body[0]
     clock_class = _reserve_node_at(clock, "ContinuationActionClock")
@@ -17148,6 +17175,30 @@ class ContinuationActionClock:
             "if remaining < -1:",
             id="expired-read-allowed",
         ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "clock.policy is not self._active_action",
+            "False",
+            id="foreign-action-clock-policy",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "clock.started_monotonic != self._action_started_at",
+            "False",
+            id="renewed-action-clock-start",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "self._action_started_at = started_at",
+            "self._action_started_at = time.monotonic()",
+            id="original-action-start-replaced",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "signal_start + self.drain_seconds - self.drain_finish_reserve_seconds - monotonic_now",
+            "signal_start + self.drain_seconds - monotonic_now",
+            id="dispatch-spends-drain-finish-margin",
+        ),
     ],
 )
 def test_reserve_sql_deadline_requires_positive_nominal_claim_and_original_read_bounds(path, original, replacement):
@@ -17197,7 +17248,7 @@ def test_reserve_sql_deadline_requires_positive_nominal_claim_and_original_read_
         pytest.param(
             "src/elspeth/web/composer/continuation_clock.py",
             "result = await operation()",
-            "self.retained_operation = operation\n                result = await operation()",
+            "self.retained_operation = operation\n                    result = await operation()",
             id="stored-callback",
         ),
         pytest.param(
@@ -17211,6 +17262,30 @@ def test_reserve_sql_deadline_requires_positive_nominal_claim_and_original_read_
             "if timeout.expired() or asyncio.get_running_loop().time() >= deadline:",
             "if False:",
             id="expired-return-accepted",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_clock.py",
+            "self.policy.guard is not None and not self._guard_complete",
+            "False",
+            id="quota-before-original-guard-completed",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_clock.py",
+            'self._active_stage != "quota"',
+            "False",
+            id="quota-outside-original-stage",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_clock.py",
+            "min(self.started_monotonic + self.policy.total, self._active_stage_deadline_monotonic)",
+            "self.started_monotonic + self.policy.total",
+            id="quota-renewed-past-original-stage",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_clock.py",
+            "or self._active_stage is not None:",
+            ":",
+            id="nested-stage-callback-admitted",
         ),
     ],
 )
@@ -17261,6 +17336,11 @@ def test_reserve_recompose_return_receipt_refuses_capability_and_callback_substi
             "    async def start_progress(self, record: ComposerOperationRecord) -> None:\n",
             "    async def start_progress(self, record: ComposerOperationRecord) -> None:\n        self.work = foreign\n",
             id="retained-binding-reassigned",
+        ),
+        pytest.param(
+            "self._handled_reply_deadlines: list[_HandledReplyDeadline] = []",
+            "self._handled_reply_deadlines: list[_HandledReplyDeadline] = [self.provider]",
+            id="provider-escaped-into-reply-deadline-data",
         ),
     ],
 )
@@ -17382,10 +17462,10 @@ class ComposerOperationRunning:
         """
 class ContinuationSQLDeadlineOwner:
     def __init__(self, running: ComposerOperationRunning, *,
-                 policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+                 policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
                  drain_signal: ComposerDrainSignal, drain_seconds: float, hard_expires_at: float) -> None:
         if (type(running) is not ComposerOperationRunning
-            or type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3)
+            or type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
             or type(drain_signal) is not ComposerDrainSignal
             or type(drain_seconds) not in (float, int)
             or not math.isfinite(drain_seconds)
@@ -17401,6 +17481,7 @@ class ContinuationSQLDeadlineOwner:
         self._settlement_expires_at = self.hard_expires_at
         self._settling = False
         self._active_action = None
+        self._action_started_at = None
         self._lock = threading.RLock()
 
     def validate_context(self, context: SessionOperationContext, *, operation_id: str | None, attempt: int | None) -> None:
@@ -17422,9 +17503,40 @@ class ContinuationSQLDeadlineOwner:
             raise AuditIntegrityError("SQL timing substituted an unretained action or clock")
         with self._lock:
             self._active_action = action
+            self._action_started_at = started_at
             self._action_expires_at = min(self.hard_expires_at, started_at + action.total)
             self._settlement_expires_at = min(self.hard_expires_at, self._action_expires_at + self.policy.segment.reserve)
             self._settling = False
+
+    def require_action_clock(self, clock: ContinuationActionClock) -> None:
+        "Verify original active timing DATA without admitting or renewing work."
+        with self._lock:
+            if (
+                type(clock) is not ContinuationActionClock
+                or clock.policy is not self._active_action
+                or clock.started_monotonic != self._action_started_at
+                or self._action_expires_at != min(self.hard_expires_at, clock.started_monotonic + clock.policy.total)
+            ):
+                raise AuditIntegrityError("SQL timing lost its original active action clock")
+
+    def remaining_action(self, *, monotonic_now: float) -> float:
+        "Observe the original action/hard/drain bound for a nested action."
+        if type(monotonic_now) is not float or not math.isfinite(monotonic_now):
+            raise ValueError("Continuation action timing requires a finite monotonic observation")
+        with self._lock:
+            expires_at = self._action_expires_at
+        signal_start = self.drain_signal.started_at
+        if signal_start is not None:
+            expires_at = min(expires_at, signal_start + self.drain_seconds)
+        return expires_at - monotonic_now
+
+    def remaining_dispatch(self, *, monotonic_now: float) -> float:
+        "Observe business time without spending the drain finish margin."
+        remaining = self.remaining_action(monotonic_now=monotonic_now)
+        signal_start = self.drain_signal.started_at
+        if signal_start is not None:
+            remaining = min(remaining, signal_start + self.drain_seconds - self.drain_finish_reserve_seconds - monotonic_now)
+        return remaining
 
     def begin_settlement(self) -> None:
         with self._lock:
@@ -17615,6 +17727,8 @@ def sql_deadline_owner(self) -> ContinuationSQLDeadlineOwner | None:
                 "ContinuationAdmissionPolicy": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicy",
                 "ContinuationAdmissionPolicyV2": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV2",
                 "ContinuationAdmissionPolicyV3": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV3",
+                "ContinuationAdmissionPolicyV4": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV4",
+                "ContinuationActionClock": "elspeth.web.composer.continuation_clock.ContinuationActionClock",
                 "ContinuationActionPolicy": "elspeth.web.composer.continuation_policy.ContinuationActionPolicy",
                 "ComposerDrainSignal": "elspeth.web.sessions.composer_drain.ComposerDrainSignal",
                 "ComposerDrainDeadline": "elspeth.web.sessions.composer_drain.ComposerDrainDeadline",

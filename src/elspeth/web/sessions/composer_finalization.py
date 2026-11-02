@@ -147,6 +147,89 @@ class ComposerFinalizationInputs:
         freeze_fields(self, "chat_ingress", "chat_ingress_inputs")
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedReviewOnlyFinalization:
+    """Exact unchanged-graph inputs for the shared terminal SQL writer."""
+
+    assistant: ComposerOperationAssistantWrite
+    audit_cohort: tuple[AuditMessageDraft, ...]
+    state_response: CompositionStateResponse | None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "audit_cohort")
+
+
+def prepare_review_only_finalization(
+    inputs: ComposerFinalizationInputs,
+    result: ComposerResult,
+    *,
+    cohort_calls: tuple[ComposerLLMCall, ...],
+) -> PreparedReviewOnlyFinalization:
+    """Use the ordinary no-save review projection before a terminal transaction.
+
+    The caller still rechecks the graph review, state and proposals under the
+    actual terminal lock. This function changes no state or SQL row.
+    """
+    state = inputs.state
+    if state is None or result.pipeline_commit_intent is not None or result.graph_recovery_intent is not None:
+        raise AuditIntegrityError("Review-only finalization requires its original no-save result")
+    gate_changed = completion_gate_decision_changes(inputs.prior_completion_gates_facts, result.advisor_gate_decision, result.state)
+    if result.state.version != state.version or composition_content_hash(result.state) != composition_content_hash(state):
+        raise AuditIntegrityError("Unversioned authored graph change cannot be a review-only projection")
+    identity = result.graph_review_identity
+    if gate_changed and identity is None:
+        raise AuditIntegrityError("Changed graph review decision lost its final owned review identity")
+    state_response: CompositionStateResponse | None = None
+    graph_review_draft: AuditMessageDraft | None = None
+    if identity is not None:
+        fact = AdvisorGraphReviewFact(
+            session_id=inputs.session.id,
+            state_id=inputs.compose_base_state_id,
+            content_hash=composition_content_hash(result.state),
+            operation_id=inputs.lease.context.fence.operation_id,
+            terminal_operation_id=inputs.running.claim.operation_id,
+            operation_epoch=inputs.lease.context.fence.operation_epoch,
+            identity=identity,
+            action="passed"
+            if type(result.advisor_gate_decision) is AdvisorGatePassed
+            else "blocked"
+            if type(result.advisor_gate_decision) is AdvisorGateBlocked
+            else "unchanged",
+            gates=resolve_completion_gate_facts(inputs.prior_completion_gates_facts, result.advisor_gate_decision, result.state),
+        )
+        envelope = fact.to_envelope()
+        graph_review_draft = AuditMessageDraft(
+            role="audit",
+            content=canonical_json(envelope),
+            tool_calls=(envelope,),
+            composition_state_id=str(fact.state_id) if fact.state_id is not None else None,
+        )
+        if inputs.state_record is not None:
+            stored = (
+                inputs.state_record.review_projection.stored if inputs.state_record.review_projection is not None else inputs.state_record
+            )
+            state_response = _state_response(project_committed_graph_review(stored, fact))
+    parent_assistant_id = uuid4()
+    turn_end = composer_turn_end_assistant_row(result)
+    assistant = ComposerOperationAssistantWrite(
+        message_id=parent_assistant_id,
+        content=turn_end.content,
+        raw_content=turn_end.raw_content,
+        composition_state_id=inputs.compose_base_state_id,
+    )
+    audit_cohort, _pipeline_bindings = _turn_audit_cohort_drafts(
+        result.tool_invocations if not result.persisted_tool_call_turn else (),
+        cohort_calls,
+        tool_composition_state_id=inputs.compose_base_state_id,
+        llm_composition_state_id=inputs.compose_base_state_id,
+        parent_assistant_id=parent_assistant_id,
+        session_operation_context=inputs.lease.context,
+    )
+    if graph_review_draft is not None:
+        audit_cohort = (*audit_cohort, graph_review_draft)
+    return PreparedReviewOnlyFinalization(assistant, audit_cohort, state_response)
+
+
 def _message_with_state_response(
     assistant: ChatMessageRecord,
     proposals: tuple[CompositionProposalRecord, ...],
@@ -367,6 +450,7 @@ async def settle_composer_result(
     route_settlement: PipelineRouteSettlement | None = None
     publication_projection: PublicationProjectionInput | None = None
     graph_review_draft: AuditMessageDraft | None = None
+    prepared_review: PreparedReviewOnlyFinalization | None = None
     if result.pipeline_commit_intent is not None:
         original_result = result
         # E14: auto-commit settlement gets what is left of the job budget.
@@ -530,43 +614,19 @@ async def settle_composer_result(
             raise
         checkpoint_projection.complete_owned()
     else:
-        gate_changed = completion_gate_decision_changes(prior_completion_gates_facts, result.advisor_gate_decision, result.state)
-        if composition_content_hash(result.state) != composition_content_hash(state):
-            raise AuditIntegrityError("Unversioned authored graph change cannot be a review-only projection")
-        identity = result.graph_review_identity
-        if gate_changed and identity is None:
-            raise AuditIntegrityError("Changed graph review decision lost its final owned review identity")
-        if identity is not None:
-            fact = AdvisorGraphReviewFact(
-                session_id=session.id,
-                state_id=compose_base_state_id,
-                content_hash=composition_content_hash(result.state),
-                operation_id=lease.context.fence.operation_id,
-                terminal_operation_id=running.claim.operation_id,
-                operation_epoch=lease.context.fence.operation_epoch,
-                identity=identity,
-                action="passed"
-                if type(result.advisor_gate_decision) is AdvisorGatePassed
-                else "blocked"
-                if type(result.advisor_gate_decision) is AdvisorGateBlocked
-                else "unchanged",
-                gates=resolve_completion_gate_facts(prior_completion_gates_facts, result.advisor_gate_decision, result.state),
-            )
-            envelope = fact.to_envelope()
-            graph_review_draft = AuditMessageDraft(
-                role="audit",
-                content=canonical_json(envelope),
-                tool_calls=(envelope,),
-                composition_state_id=str(fact.state_id) if fact.state_id is not None else None,
-            )
-            if state_record is not None:
-                stored = state_record.review_projection.stored if state_record.review_projection is not None else state_record
-                state_response = _state_response(project_committed_graph_review(stored, fact))
+        prepared_review = prepare_review_only_finalization(inputs, result, cohort_calls=cohort_calls)
+        state_response = prepared_review.state_response
     # R2: the assistant row (unless the settlement wrote it), the turn audit
     # cohort, the pending proposals and the terminal CAS in ONE transaction.
     assistant_write: ComposerOperationAssistantWrite | None
     parent_assistant_id: UUID
-    if assistant_record is None:
+    if prepared_review is not None:
+        if assistant_record is not None:
+            raise AuditIntegrityError("Review-only terminal unexpectedly reused an assistant")
+        assistant_write = prepared_review.assistant
+        parent_assistant_id = prepared_review.assistant.message_id
+        audit_cohort = prepared_review.audit_cohort
+    elif assistant_record is None:
         parent_assistant_id = uuid4()
         assistant_write = ComposerOperationAssistantWrite(
             message_id=parent_assistant_id,
@@ -577,16 +637,17 @@ async def settle_composer_result(
     else:
         assistant_write = None
         parent_assistant_id = assistant_record.id
-    audit_cohort, _pipeline_bindings = _turn_audit_cohort_drafts(
-        result.tool_invocations if not result.persisted_tool_call_turn else (),
-        cohort_calls,
-        tool_composition_state_id=post_compose_state_id,
-        llm_composition_state_id=compose_base_state_id,
-        parent_assistant_id=parent_assistant_id,
-        session_operation_context=lease.context,
-    )
-    if graph_review_draft is not None:
-        audit_cohort = (*audit_cohort, graph_review_draft)
+    if prepared_review is None:
+        audit_cohort, _pipeline_bindings = _turn_audit_cohort_drafts(
+            result.tool_invocations if not result.persisted_tool_call_turn else (),
+            cohort_calls,
+            tool_composition_state_id=post_compose_state_id,
+            llm_composition_state_id=compose_base_state_id,
+            parent_assistant_id=parent_assistant_id,
+            session_operation_context=lease.context,
+        )
+        if graph_review_draft is not None:
+            audit_cohort = (*audit_cohort, graph_review_draft)
     # Joined through cancellation: a lease-loss cancel of this child must not
     # leave the composite's worker thread committing while the frame decides
     # the terminal and persists the cancelled-turn audit. Its own outcome is

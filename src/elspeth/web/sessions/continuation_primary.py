@@ -21,6 +21,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
 from elspeth.contracts.json_parser import parse_json_strict
+from elspeth.contracts.prompt_guard import PromptGuardDecision
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _CallModelOutcome
 from elspeth.web.composer.audit import llm_call_audit_envelope
@@ -44,6 +45,7 @@ from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer,
 from elspeth.web.composer.continuation_provider_outcomes import require_successful_response_audit
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness, require_retained_v4_provider_metadata_credentials
 from elspeth.web.coordination.database_clock import database_now
@@ -1113,10 +1115,14 @@ class _PrimaryNoSdkRefusalData(BaseModel):
         "integrity_refused",
         "cancelled_before_sdk",
         "retained_tail_unbounded",
+        "guard_unsupported_input",
+        "guard_blocked",
+        "guard_unavailable",
     ]
     public_error_json: str
     undispatched_attempt_id: str | None
     undispatched_model: str | None
+    guard_audit_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1161,6 +1167,84 @@ def _primary_no_sdk_event(data: _PrimaryNoSdkRefusalData, result_chunk_key: str)
     )
 
 
+def require_primary_guard_refusal_audit_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    operation_epoch: int,
+    reason: PrimaryNoSdkRefusalReason,
+    audit_id: str,
+) -> PromptGuardDecision:
+    """A guard refusal must name its committed, fenced original audit row."""
+    expected = {
+        PrimaryNoSdkRefusalReason.GUARD_UNSUPPORTED_INPUT: ("unavailable", "unsupported_input"),
+        PrimaryNoSdkRefusalReason.GUARD_BLOCKED: ("blocked", None),
+        PrimaryNoSdkRefusalReason.GUARD_UNAVAILABLE: ("unavailable", None),
+    }.get(reason)
+    if expected is None or type(audit_id) is not str or not audit_id:
+        raise AuditIntegrityError("PRIMARY guard refusal lacks its nominal audit identity")
+    # The writer retains exactly one envelope in tool_calls[0]. Match the
+    # original audit identity in SQL and return at most two rows, so duplicate
+    # identities remain detectable without decoding the session transcript.
+    rows = conn.execute(
+        select(messages.c.content, messages.c.tool_calls)
+        .where(
+            messages.c.session_id == session_id,
+            messages.c.role == "audit",
+            messages.c.writer_principal == "compose_loop",
+            messages.c.tool_calls[0]["_kind"].as_string() == "prompt_guard_audit",
+            messages.c.tool_calls[0]["check"]["audit_id"].as_string() == audit_id,
+        )
+        .limit(2)
+    ).all()
+    matches = []
+    for row in rows:
+        if type(row.tool_calls) is not list or len(row.tool_calls) != 1:
+            raise AuditIntegrityError("PRIMARY guard audit lost its single retained envelope")
+        envelope = row.tool_calls[0]
+        if type(envelope) is not dict or set(envelope) != {"_kind", "check"} or envelope["_kind"] != "prompt_guard_audit":
+            raise AuditIntegrityError("PRIMARY guard audit lost its original envelope kind")
+        check = envelope["check"]
+        if type(check) is not dict or check.get("audit_id") != audit_id:
+            raise AuditIntegrityError("PRIMARY guard audit changed its original identity")
+        retained, parse_error = parse_json_strict(row.content)
+        if parse_error is not None or retained != envelope:
+            raise AuditIntegrityError("PRIMARY guard audit content differs from its retained envelope")
+        matches.append(check)
+    if len(matches) != 1:
+        raise AuditIntegrityError("PRIMARY guard refusal lost its unique committed audit")
+    check = matches[0]
+    if (
+        type(check.get("operation_epoch")) is not int
+        or type(check.get("schema_version")) is not int
+        or check.get("schema_version") != 2
+        or (check.get("role"), check.get("operation_id"), check.get("operation_epoch")) != ("composer", operation_id, operation_epoch)
+        or check.get("disposition") != expected[0]
+        or (expected[1] is not None and check.get("reason") != expected[1])
+        or (reason is PrimaryNoSdkRefusalReason.GUARD_UNAVAILABLE and check.get("reason") == "unsupported_input")
+    ):
+        raise AuditIntegrityError("PRIMARY guard refusal disagrees with its original fenced audit")
+    disposition, guard_reason = check.get("disposition"), check.get("reason")
+    if type(disposition) is not str or type(guard_reason) is not str:
+        raise AuditIntegrityError("PRIMARY guard refusal audit lost its closed decision")
+    match (disposition, guard_reason):
+        case ("blocked", "policy_blocked"):
+            return PromptGuardDecision("blocked", "policy_blocked")
+        case ("unavailable", "service_error"):
+            return PromptGuardDecision("unavailable", "service_error")
+        case ("unavailable", "timeout"):
+            return PromptGuardDecision("unavailable", "timeout")
+        case ("unavailable", "invalid_response"):
+            return PromptGuardDecision("unavailable", "invalid_response")
+        case ("unavailable", "unsupported_input"):
+            return PromptGuardDecision("unavailable", "unsupported_input")
+        case ("unavailable", "guard_not_configured"):
+            return PromptGuardDecision("unavailable", "guard_not_configured")
+        case _:
+            raise AuditIntegrityError("PRIMARY guard refusal audit lost its closed decision")
+
+
 def refuse_primary_no_sdk_on_connection(conn: Connection, permit: PrimaryNoSdkRefusalPermit) -> PrimaryNoSdkRefusalReceipt:
     """One fenced transaction for the proved unentered effect and failed terminal."""
     from elspeth.web.coordination.composer_operation_authority import (
@@ -1198,6 +1282,15 @@ def refuse_primary_no_sdk_on_connection(conn: Connection, permit: PrimaryNoSdkRe
     parent = _read(conn, running.claim.session_id, running.claim.operation_id)
     if parent is None or parent.status != "running":
         raise AuditIntegrityError("PRIMARY no-SDK writer lost its current terminal owner")
+    if type(permit.original_failure) is PromptGuardRefused:
+        require_primary_guard_refusal_audit_on_connection(
+            conn,
+            session_id=str(running.claim.session_id),
+            operation_id=running.session_operation_context.fence.operation_id,
+            operation_epoch=running.session_operation_context.fence.operation_epoch,
+            reason=permit.reason,
+            audit_id=permit.original_failure.audit_id,
+        )
     if permit.reason in (PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED, PrimaryNoSdkRefusalReason.PRE_SDK_DEADLINE):
         observed_allowance = (
             issuer.clock.policy.preparation if permit.reason is PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED else issuer.clock.policy.total
@@ -1205,6 +1298,10 @@ def refuse_primary_no_sdk_on_connection(conn: Connection, permit: PrimaryNoSdkRe
         original_error = deadline_expired_error(request_id=parent.request_id, timeout_seconds=observed_allowance)
     else:
         original_error = project_composer_operation_error(permit.original_failure, request_id=parent.request_id)
+        if type(permit.original_failure) is PromptGuardRefused:
+            # The synchronous PromptGuardRefused route is an HTTPException;
+            # preserve its public {detail: payload} envelope in async replay.
+            original_error = original_error.model_copy(update={"body": {"detail": original_error.body}})
     selected_error = _select_failure_on_connection(parent, original_error, authoritative_failure=False)
     data = _PrimaryNoSdkRefusalData(
         version=1,
@@ -1224,8 +1321,11 @@ def refuse_primary_no_sdk_on_connection(conn: Connection, permit: PrimaryNoSdkRe
         public_error_json=canonical_json(selected_error.model_dump(mode="json")),
         undispatched_attempt_id=permit.undispatched_attempt_id,
         undispatched_model=permit.undispatched_model,
+        guard_audit_id=permit.original_failure.audit_id if type(permit.original_failure) is PromptGuardRefused else None,
     )
-    chunk = encode_private_chunk(codec="composer.primary-no-sdk-refusal.v1", canonical=canonical_json(data.model_dump(mode="json")))
+    chunk = encode_private_chunk(
+        codec="composer.primary-no-sdk-refusal.v1", canonical=canonical_json(data.model_dump(mode="json", exclude_unset=True))
+    )
     result_chunk_key = private_chunk_key(chunk)
     put_chunk(
         conn,
@@ -1340,7 +1440,7 @@ def read_primary_no_sdk_refusal_on_connection(
         raise AuditIntegrityError("PRIMARY no-SDK receipt violates its closed result codec") from error
     if (
         private_chunk_key(chunk) != effect.result_chunk_key
-        or canonical_json(data.model_dump(mode="json")) != canonical
+        or canonical_json(data.model_dump(mode="json", exclude_unset=True)) != canonical
         or canonical_json(failure.model_dump(mode="json")) != data.public_error_json
         or terminal.result_json != data.public_error_json
         or terminal.failure_code != failure.failure_code
@@ -1354,6 +1454,43 @@ def read_primary_no_sdk_refusal_on_connection(
         or terminal.journal_cursor != data.source_cursor + 2
     ):
         raise AuditIntegrityError("PRIMARY no-SDK receipt contradicts its terminal/effect identity")
+    reason = PrimaryNoSdkRefusalReason(data.reason)
+    if reason in (
+        PrimaryNoSdkRefusalReason.GUARD_UNSUPPORTED_INPUT,
+        PrimaryNoSdkRefusalReason.GUARD_BLOCKED,
+        PrimaryNoSdkRefusalReason.GUARD_UNAVAILABLE,
+    ):
+        audit_id = data.guard_audit_id
+        if type(audit_id) is not str:
+            raise AuditIntegrityError("PRIMARY guard refusal terminal lost its audit locator")
+        terminal_operation_id = terminal.session_operation_id
+        terminal_operation_epoch = terminal.session_operation_epoch
+        if type(terminal_operation_id) is not str or type(terminal_operation_epoch) is not int:
+            raise AuditIntegrityError("PRIMARY guard refusal terminal lost its fenced operation")
+        if terminal.cancel_requested_at is not None:
+            from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
+
+            if failure != request_cancelled_error(request_id=terminal.request_id):
+                raise AuditIntegrityError("PRIMARY concurrent Stop changed its selected public result")
+        decision = require_primary_guard_refusal_audit_on_connection(
+            conn,
+            session_id=sid,
+            operation_id=terminal_operation_id,
+            operation_epoch=terminal_operation_epoch,
+            reason=reason,
+            audit_id=audit_id,
+        )
+        if terminal.cancel_requested_at is None:
+            from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
+
+            projected = project_composer_operation_error(
+                PromptGuardRefused(decision=decision, audit_id=audit_id), request_id=terminal.request_id
+            )
+            expected = projected.model_copy(update={"body": {"detail": projected.body}})
+            if failure != expected:
+                raise AuditIntegrityError("PRIMARY guard refusal terminal changed its public result")
+    elif data.guard_audit_id is not None:
+        raise AuditIntegrityError("PRIMARY non-guard refusal invented guard evidence")
     source_row = conn.execute(
         select(checkpoints).where(
             checkpoints.c.session_id == sid,

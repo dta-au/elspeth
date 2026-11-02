@@ -14,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.coordination.quota_authority import ProviderAttempt
 from elspeth.web.required_work import RequiredWorkBinding
@@ -34,6 +35,21 @@ class PrimaryNoSdkRefusalReason(Enum):
     INTEGRITY_REFUSED = "integrity_refused"
     CANCELLED_BEFORE_SDK = "cancelled_before_sdk"
     RETAINED_TAIL_UNBOUNDED = "retained_tail_unbounded"
+    GUARD_UNSUPPORTED_INPUT = "guard_unsupported_input"
+    GUARD_BLOCKED = "guard_blocked"
+    GUARD_UNAVAILABLE = "guard_unavailable"
+
+
+def primary_guard_refusal_reason(error: BaseException) -> PrimaryNoSdkRefusalReason | None:
+    """Classify only the guard's nominal refusal, never a lookalike exception."""
+    if type(error) is not PromptGuardRefused:
+        return None
+    kind = error.to_payload()["error_type"]
+    return {
+        "prompt_guard_unsupported_input": PrimaryNoSdkRefusalReason.GUARD_UNSUPPORTED_INPUT,
+        "prompt_guard_blocked": PrimaryNoSdkRefusalReason.GUARD_BLOCKED,
+        "prompt_guard_unavailable": PrimaryNoSdkRefusalReason.GUARD_UNAVAILABLE,
+    }.get(kind)
 
 
 class ContinuationRetainedTailUnbounded(Exception):
@@ -250,6 +266,12 @@ class PrimaryNoSdkIssuer:
                 or self._cancelled_attempt
                 or self._permit is not None
                 or type(reason) is not PrimaryNoSdkRefusalReason
+                or reason
+                in (
+                    PrimaryNoSdkRefusalReason.GUARD_UNSUPPORTED_INPUT,
+                    PrimaryNoSdkRefusalReason.GUARD_BLOCKED,
+                    PrimaryNoSdkRefusalReason.GUARD_UNAVAILABLE,
+                )
                 or (
                     reason in (PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED, PrimaryNoSdkRefusalReason.PRE_SDK_DEADLINE)
                     and type(original_failure) is not TimeoutError
@@ -262,6 +284,15 @@ class PrimaryNoSdkIssuer:
                 or (
                     reason is PrimaryNoSdkRefusalReason.RETAINED_TAIL_UNBOUNDED
                     and type(original_failure) is not ContinuationRetainedTailUnbounded
+                )
+                or (
+                    reason
+                    in (
+                        PrimaryNoSdkRefusalReason.GUARD_UNSUPPORTED_INPUT,
+                        PrimaryNoSdkRefusalReason.GUARD_BLOCKED,
+                        PrimaryNoSdkRefusalReason.GUARD_UNAVAILABLE,
+                    )
+                    and primary_guard_refusal_reason(original_failure) is not reason
                 )
             ):
                 raise AuditIntegrityError("V4 PRIMARY no-SDK refusal lacks proved unentered admitted custody")
@@ -331,6 +362,15 @@ class PrimaryNoSdkIssuer:
                 or (
                     reason is PrimaryNoSdkRefusalReason.RETAINED_TAIL_UNBOUNDED
                     and type(original_failure) is not ContinuationRetainedTailUnbounded
+                )
+                or (
+                    reason
+                    in (
+                        PrimaryNoSdkRefusalReason.GUARD_UNSUPPORTED_INPUT,
+                        PrimaryNoSdkRefusalReason.GUARD_BLOCKED,
+                        PrimaryNoSdkRefusalReason.GUARD_UNAVAILABLE,
+                    )
+                    and primary_guard_refusal_reason(original_failure) is not reason
                 )
                 or (self._attempt_id is not None and not self._cancelled_attempt)
                 or self._permit is not None

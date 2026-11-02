@@ -130,7 +130,7 @@ def read_v4_primary_no_sdk_refusal_on_connection(
     except (UnicodeDecodeError, ValueError, ValidationError) as error:
         raise AuditIntegrityError("V4 PRIMARY zero-use refusal lost its closed receipt") from error
     if (
-        canonical_json(data.model_dump(mode="json")) != receipt_text
+        canonical_json(data.model_dump(mode="json", exclude_unset=True)) != receipt_text
         or data.source_disposition != "dispatched"
         or (data.session_id, data.operation_id, data.effect_key, data.input_sha256) != (sid, operation_id, effect_key, effect.input_sha256)
         or (data.creator_sequence, data.creator_generation) != (source.creator_sequence, source.creator_generation)

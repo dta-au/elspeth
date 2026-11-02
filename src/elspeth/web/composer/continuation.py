@@ -97,6 +97,7 @@ class PrivateChunkRef(ContinuationValue):
         "composer.title-input.v1",
         "composer.title-no-sdk-refusal.v1",
         "composer.tool-no-execution-refusal.v1",
+        "composer.preview-observation.v1",
         "composer.title-provider-result.v1",
         "composer.classifier-primary-source.v1",
         "composer.checkpoint-end-input.v1",

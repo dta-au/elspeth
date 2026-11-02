@@ -179,7 +179,9 @@ def _failure_state(harness, operation_id, sdk, timing, driver_trace, owner_trace
     }
 
 
-async def _settle_with_bounded_failure_state(harness, body, sdk, timing, driver_trace, owner_trace, proof_profile=None):
+async def _settle_with_bounded_failure_state(
+    harness, body, sdk, timing, driver_trace, owner_trace, proof_profile=None, *, expected_status="completed"
+):
     try:
         terminal = await submit_and_settle(harness, body, rounds=200)
     except AssertionError as original:
@@ -188,13 +190,43 @@ async def _settle_with_bounded_failure_state(harness, body, sdk, timing, driver_
                 f"bounded owner state: {_failure_state(harness, body['operation_id'], sdk, timing, driver_trace, owner_trace, proof_profile)!r}"
             )
         raise
-    if terminal.status != "completed":
+    if terminal.status != expected_status:
         pytest.fail(
             f"continuation terminal failed: {(terminal.status, terminal.error.failure_code if terminal.error else None)!r}; "
             f"{_failure_state(harness, body['operation_id'], sdk, timing, driver_trace, owner_trace, proof_profile)!r}",
             pytrace=False,
         )
     return terminal
+
+
+def _stop_after_committed_primary(monkeypatch, harness, operation_id, *, sequence: int, generation_at_least: int, count: int):
+    """Request the real durable Stop only after the selected PRIMARY is committed."""
+    observed = []
+    original_advance = _SegmentDriver.advance
+
+    async def advance_then_stop(driver, stored, selected):
+        result = await original_advance(driver, stored, selected)
+        if (
+            driver.running.claim.operation_id != operation_id
+            or driver.running.claim.segment_sequence != sequence
+            or driver.running.claim.ownership_generation < generation_at_least
+            or observed
+            or type(selected.stack.frames[-1]) is not ComposeFrame
+            or selected.stack.frames[-1].phase != "action_ready"
+        ):
+            return result
+        primary = tuple(row for row in effects(harness.app, operation_id) if row.effect_key.startswith("provider:0:"))
+        if len(primary) != count or any(row.disposition != "committed" for row in primary):
+            return result
+        stopped = harness.app.state.composer_async_operation_authority.request_cancel(
+            session_id=harness.session_id, operation_id=operation_id
+        )
+        assert stopped is not None and stopped.cancel_requested_at is not None
+        observed.append((driver.running.claim.segment_sequence, driver.running.claim.ownership_generation, primary))
+        return result
+
+    monkeypatch.setattr(_SegmentDriver, "advance", advance_then_stop)
+    return observed
 
 
 @pytest.mark.asyncio
@@ -323,6 +355,115 @@ async def test_unconsumed_first_compose_action_fit_renews_same_sequence_without_
             proof_profile,
         )
         assert observed_first and sdk.roles == ["primary", "semantic", "semantic", "end", "semantic"] and not sdk.steps
+        with harness.app.state.session_engine.connect() as conn:
+            (segment,) = conn.execute(select(segments).where(segments.c.operation_id == operation_id)).all()
+            tags = tuple(row.tag for row in conn.execute(select(events.c.tag).where(events.c.operation_id == operation_id)))
+        assert (segment.sequence, segment.state) == (1, "settled") and segment.generation >= 2
+        assert "recovered" in tags and "yielded" not in tags
+        primary = tuple(row for row in effects(harness.app, operation_id) if row.effect_key.startswith("provider:0:"))
+        assert len(primary) == 1 and primary[0].creator_sequence == 1 and primary[0].disposition == "committed"
+
+
+@pytest.mark.asyncio
+async def test_later_compose_action_fit_successor_retains_primary_before_durable_stop(tmp_path, monkeypatch):
+    sdk = ScriptedSDK(
+        [
+            ("primary", ("Continue this same request at the retained checkpoint.", [_control()])),
+            ("semantic", semantic_primary_response),
+            ("primary", ("The retained request continues with one new PRIMARY.", None)),
+        ]
+    )
+    install_sdk(monkeypatch, sdk)
+    operation_id = str(uuid4())
+    async with continuation_app(tmp_path, monkeypatch, composer_continuation_action_bounds=_advisor_preparation_probe_bounds()) as harness:
+        sdk.app_ref.append(harness.app)
+        driver_trace = observe_original_driver_failures(monkeypatch, operation_id, session_id=harness.session_id)
+        owner_trace = _observe_owner_errors(monkeypatch, operation_id)
+        stopped_after_primary = _stop_after_committed_primary(
+            monkeypatch, harness, operation_id, sequence=3, generation_at_least=3, count=2
+        )
+        actual_timing = ComposerAsyncOperationAuthority.read_continuation_timing
+        observed_fit = []
+
+        def observe_action_fit(owner, running, *, deadline=None):
+            timing = actual_timing(owner, running, deadline=deadline)
+            if running.claim.operation_id != operation_id or running.claim.segment_sequence != 2 or observed_fit:
+                return timing
+            with harness.app.state.session_engine.connect() as conn:
+                selected = load_snapshot(conn, session_id=str(harness.session_id), operation_id=operation_id)
+                top = decode_continuation_snapshot(selected.payload_json).frames[-1]
+            if type(top) is not ComposeFrame or top.phase != "action_ready" or sdk.roles != ["primary"]:
+                return timing
+            observed_fit.append((timing.sequence, timing.generation, selected.checkpoint_id))
+            return replace(timing, hard_remaining_seconds=0.0, cooperative_remaining_seconds=0.0, yield_pending=True)
+
+        monkeypatch.setattr(ComposerAsyncOperationAuthority, "read_continuation_timing", observe_action_fit)
+        terminal = await _settle_with_bounded_failure_state(
+            harness,
+            message_body("Explain this pipeline.", operation_id=operation_id),
+            sdk,
+            observed_fit,
+            driver_trace,
+            owner_trace,
+            expected_status="failed",
+        )
+        assert terminal.error is not None and terminal.error.error_type == "request_cancelled"
+        assert observed_fit and len(stopped_after_primary) == 1
+        assert sdk.roles == ["primary", "semantic", "primary"] and not sdk.steps
+        with harness.app.state.session_engine.connect() as conn:
+            control, predecessor, successor = conn.execute(
+                select(segments).where(segments.c.operation_id == operation_id).order_by(segments.c.sequence)
+            ).all()
+            yielded = conn.execute(select(events).where(events.c.operation_id == operation_id, events.c.tag == "yielded")).all()
+        assert (control.sequence, control.state, control.rollover_reason) == (1, "yielded", "model_request")
+        assert (predecessor.sequence, predecessor.state, predecessor.rollover_reason) == (2, "yielded", "action_fit")
+        assert (successor.sequence, successor.predecessor_sequence, successor.state) == (3, 2, "settled")
+        assert successor.generation == predecessor.generation + 1 and len(yielded) == 2
+        primary = tuple(row for row in effects(harness.app, operation_id) if row.effect_key.startswith("provider:0:"))
+        assert len(primary) == 2 and [row.creator_sequence for row in primary] == [1, 3]
+        assert all(row.disposition == "committed" for row in primary)
+
+
+@pytest.mark.asyncio
+async def test_first_compose_action_fit_recovers_once_before_durable_stop(tmp_path, monkeypatch):
+    sdk = ScriptedSDK([("primary", ("The original Compose produces one retained PRIMARY.", None))])
+    install_sdk(monkeypatch, sdk)
+    operation_id = str(uuid4())
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        sdk.app_ref.append(harness.app)
+        driver_trace = observe_original_driver_failures(monkeypatch, operation_id, session_id=harness.session_id)
+        owner_trace = _observe_owner_errors(monkeypatch, operation_id)
+        stopped_after_primary = _stop_after_committed_primary(
+            monkeypatch, harness, operation_id, sequence=1, generation_at_least=2, count=1
+        )
+        actual_timing = ComposerAsyncOperationAuthority.read_continuation_timing
+        observed_first = []
+
+        def observe_first_action_fit(owner, running, *, deadline=None):
+            timing = actual_timing(owner, running, deadline=deadline)
+            if running.claim.operation_id != operation_id or running.claim.segment_sequence != 1 or observed_first:
+                return timing
+            with harness.app.state.session_engine.connect() as conn:
+                selected = load_snapshot(conn, session_id=str(harness.session_id), operation_id=operation_id)
+                top = decode_continuation_snapshot(selected.payload_json).frames[-1]
+            if type(top) is not ComposeFrame or top.phase != "action_ready":
+                return timing
+            observed_first.append((timing.sequence, timing.generation, selected.checkpoint_id))
+            return replace(timing, hard_remaining_seconds=0.0, cooperative_remaining_seconds=0.0, yield_pending=True)
+
+        monkeypatch.setattr(ComposerAsyncOperationAuthority, "read_continuation_timing", observe_first_action_fit)
+        terminal = await _settle_with_bounded_failure_state(
+            harness,
+            message_body("Explain this pipeline.", operation_id=operation_id),
+            sdk,
+            observed_first,
+            driver_trace,
+            owner_trace,
+            expected_status="failed",
+        )
+        assert terminal.error is not None and terminal.error.error_type == "request_cancelled"
+        assert observed_first and len(stopped_after_primary) == 1
+        assert sdk.roles == ["primary"] and not sdk.steps
         with harness.app.state.session_engine.connect() as conn:
             (segment,) = conn.execute(select(segments).where(segments.c.operation_id == operation_id)).all()
             tags = tuple(row.tag for row in conn.execute(select(events.c.tag).where(events.c.operation_id == operation_id)))

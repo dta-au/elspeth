@@ -11,10 +11,13 @@ guard is still inspecting. Both must leave ``litellm.acompletion`` unentered.
 from __future__ import annotations
 
 import asyncio
+import json
 from uuid import uuid4
 
+import httpx
 import litellm
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import select, text
 from sqlalchemy.exc import InternalError, OperationalError, SQLAlchemyError
 from tests.fixtures.identities import grant_test_pipeline_user
@@ -35,7 +38,9 @@ from elspeth.contracts.prompt_guard import PromptGuardDecision
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -94,7 +99,7 @@ def _quota_attempts(engine):
         return connection.execute(select(quota_provider_attempts_table)).all()
 
 
-def _gateway_call(custody, client):
+def _gateway_call(custody, client, *, messages=None):
     return provider_gateway._litellm_acompletion(
         provider_custody=custody,
         prompt_guard_mount=PromptGuardMount(client),
@@ -102,8 +107,65 @@ def _gateway_call(custody, client):
         prompt_guard_mode="required",
         prompt_guard_user_prompt="Compare the two neutral columns.",
         model="test/model",
-        messages=[{"role": "user", "content": "Compare the two neutral columns."}],
+        messages=messages if messages is not None else [{"role": "user", "content": "Compare the two neutral columns."}],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("document_characters", [10_000, 10_001])
+async def test_postgres_exact_guard_document_limit_keeps_whole_original_before_sdk(authority, monkeypatch, document_characters):
+    engine, _service, owner, coordinator = authority
+    # The untrusted assistant message is a single JSON shadow document. Derive
+    # the payload size from its complete wrapper, so these are exact adapter
+    # boundaries rather than approximate lengths of its inner scalar.
+    empty_shadow = json.dumps({"role": "assistant", "content": ""}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    original = "x" * (document_characters - len(empty_shadow))
+    message = {"role": "assistant", "content": original}
+    exact_document = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    assert len(exact_document) == document_characters
+    sent_to_shield: list[dict[str, object]] = []
+    entered_sdk: list[dict[str, object]] = []
+
+    def shield(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["userPrompt"] == "Compare the two neutral columns."
+        assert payload["documents"] == [exact_document]
+        sent_to_shield.append(payload)
+        return httpx.Response(
+            200,
+            json={"userPromptAnalysis": {"attackDetected": False}, "documentsAnalysis": [{"attackDetected": False}]},
+        )
+
+    settings = PromptGuardSettings(endpoint="https://exact-guard.example.test", subscription_key=SecretStr("offline-exact-guard"))
+    client = AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(shield))
+
+    async def completion(**kwargs):
+        checks = _checks(engine)  # A new PostgreSQL connection sees the committed guard audit.
+        assert len(checks) == 1 and (checks[0]["disposition"], checks[0]["reason"]) == ("allow", "clean")
+        assert kwargs["messages"] == [message]
+        entered_sdk.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    if document_characters == 10_000:
+        await _gateway_call(custody, client, messages=[message])
+        assert len(sent_to_shield) == len(entered_sdk) == 1
+        assert custody.attempt is not None
+    else:
+        with pytest.raises(PromptGuardRefused) as refused:
+            await _gateway_call(custody, client, messages=[message])
+        assert refused.value.http_status == 422
+        assert sent_to_shield == entered_sdk == []
+        assert _quota_attempts(engine) == []
+        assert custody.attempt is None and custody.call is None
+    checks = _checks(engine)
+    assert len(checks) == 1
+    assert checks[0]["operation_id"] == custody.context.fence.operation_id
+    assert (checks[0]["disposition"], checks[0]["reason"]) == (
+        ("allow", "clean") if document_characters == 10_000 else ("unavailable", "unsupported_input")
+    )
+    coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
