@@ -13,19 +13,20 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "work-at-risk.sh"
+SCANNER = SCRIPT.with_name("work_at_risk_scan.py")
 THIRTEEN_HOURS = 13 * 3600
 
 
 def _fail_report_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str) -> Path:
     """Fail a real producer after emitting its otherwise successful output."""
-    command = "git" if operation in {"ignored-directories", "worktree-inventory"} else "find"
+    command = "git" if operation in {"ignored-directories", "worktree-inventory"} else "python3"
     binary = shutil.which(command)
     assert binary is not None
     predicate = {
         "ignored-directories": "'ls-files' in args and '--ignored' in args",
         "worktree-inventory": "'worktree' in args and 'list' in args and inventory_call == 2",
-        "source-walk": "'-name' in args and '__init__.py' in args",
-        "lanes-walk": "'-printf' in args",
+        "source-walk": "'sources' in args",
+        "lanes-walk": "'lanes' in args",
     }[operation]
     marker = tmp_path / "failed-read-observed"
     counter = tmp_path / "inventory-read-count"
@@ -94,7 +95,7 @@ def _lane(repo: Path) -> Path:
 
 
 def _report(repo: Path, *options: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["bash", str(SCRIPT), *options], cwd=repo, capture_output=True, text=True, check=False)
+    return subprocess.run(["bash", str(SCRIPT), *options], cwd=repo, capture_output=True, text=True, check=False, timeout=30)
 
 
 def _row(output: str, path: Path) -> list[str]:
@@ -321,3 +322,79 @@ def test_unknown_option_is_a_usage_error(repo: Path) -> None:
     result = _report(repo, "--execute")
     assert result.returncode == 2
     assert "unknown option: --execute" in result.stderr
+
+
+def _scan(mode: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, str(SCANNER), mode, *args], capture_output=True, text=True, check=False, timeout=5)
+
+
+@pytest.mark.parametrize("mode", ["sources", "lanes"])
+def test_no_match_scan_stops_at_entry_budget(tmp_path: Path, mode: str) -> None:
+    """A sparse tree cannot force an exhaustive traversal to establish zero."""
+    root = tmp_path / "many-ordinary-files"
+    root.mkdir()
+    for index in range(12):
+        (root / f"notes-{index}.txt").write_text("small notes\n")
+    bounded = _scan(mode, "--threshold", "50", "--max-entries", "3", str(root))
+    assert bounded.returncode == 1
+    assert bounded.stdout == ""
+    assert "entry budget exhausted (3 entries)" in bounded.stderr
+    complete = _scan(mode, "--threshold", "5000", "--max-entries", "0", "--max-seconds", "0", str(root))
+    assert complete.returncode == 0, complete.stderr
+    assert int(complete.stdout) == (0 if mode == "sources" else 12 * len("small notes\n"))
+
+
+def test_source_cap_stops_before_opening_later_root(tmp_path: Path) -> None:
+    source = tmp_path / "a-copy/src/elspeth/__init__.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("")
+    missing = tmp_path / "z-missing"
+    capped = _scan("sources", "--threshold", "1", str(tmp_path / "a-copy"), str(missing))
+    assert (capped.returncode, capped.stdout) == (0, "1\n"), capped.stderr
+    complete = _scan("sources", "--threshold", "0", str(tmp_path / "a-copy"), str(missing))
+    assert complete.returncode == 1
+    assert complete.stdout == ""  # The earlier match does not conceal the unreadable root.
+    assert "scan incomplete" in complete.stderr
+
+
+def test_source_scanner_prunes_roots_and_deduplicates_nested_roots(tmp_path: Path) -> None:
+    for prefix in ("ordinary", ".venv", "node_modules", "__pycache__", ".git", "registered"):
+        source = tmp_path / prefix / "src/elspeth/__init__.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("")
+    # Also check a separately supplied pruned root and a symlink into a source tree.
+    (tmp_path / "linked").symlink_to(tmp_path / "ordinary", target_is_directory=True)
+    result = _scan(
+        "sources",
+        "--threshold",
+        "0",
+        "--exclude",
+        str(tmp_path / "registered"),
+        str(tmp_path),
+        str(tmp_path / "ordinary"),
+        str(tmp_path / ".venv"),
+    )
+    assert (result.returncode, result.stdout) == (0, "1\n"), result.stderr
+
+
+def test_elapsed_budget_interrupts_a_stalled_directory_read(tmp_path: Path) -> None:
+    """The timer covers a scan that makes no entry-count progress."""
+    code = (
+        "import runpy, os, time\n"
+        "original = os.scandir\n"
+        "def stalled(path):\n"
+        "    time.sleep(10)\n"
+        "    return original(path)\n"
+        "os.scandir = stalled\n"
+        f"runpy.run_path({str(SCANNER)!r}, run_name='__main__')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, "sources", "--threshold", "50", "--max-seconds", "0.05", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "elapsed-time budget exhausted" in result.stderr

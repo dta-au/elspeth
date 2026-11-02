@@ -29,35 +29,38 @@
 #   - Gitignored source is probed separately from `git status`: the copies
 #     were invisible to every dirty-tree check. The probe lists ignored
 #     directories with `git ls-files --others --ignored --exclude-standard
-#     --directory`, then finds src/elspeth/__init__.py beneath them. It prunes
+#     --directory`, then scans for src/elspeth/__init__.py beneath them. It prunes
 #     every other registered worktree (the main checkout's ignored
 #     .claude/worktrees/ holds them, and their tracked src/ is not a copy) and
 #     .venv, node_modules, __pycache__ and .git by name.
 #   - A `git status` that FAILS classifies UNKNOWN and WARNs, never CLEAN:
 #     empty output from a failed command is not evidence.
 #   - Failed ignored-directory or traversal reads report UNKNOWN and WARN.
-#     Copy caps and lane-size cutoffs remain honest lower bounds; only an
-#     observed cutoff can admit its producer's expected SIGPIPE.
+#     Exhausted scan budgets also report UNKNOWN and WARN, never zero.
 #   - Every git read goes through `git --no-optional-locks`, so the report does
 #     not rewrite any worktree's index stat-cache.
 #   - LANES is a sum of apparent file sizes that stops at the 10 GB limit and
-#     prints ">10.0G". A full `du` of the main checkout's 141 GB lanes took 26 s;
-#     the early exit took 2.2 s.
+#     prints ">10.0G".
 #   - SRC-COPIES stops counting at 50 and prints "50+" unless --count-all is
-#     given. Walking the main checkout's 4.4 M lane files with GNU find took
-#     23 s for the exact count of 954 and 2.2 s to reach 50. The WARN needs only
-#     one copy. (Timings taken with an interactive `find` may be a parallel bfs
-#     the agent harness substitutes; this script runs GNU find.)
+#     given. The scanner stops directly at the match, without a buffered
+#     find/head pipeline that can keep walking after its consumer has exited.
+#   - Default source/size probes each examine at most 20,000 directory entries
+#     and have a 2-second elapsed-time budget. Ignored-directory discovery also
+#     has a 2-second timeout. A blocked kernel I/O call may delay cancellation;
+#     these limits prevent continued traversal, not a hard report deadline.
+#     --count-all explicitly removes these budgets (potentially expensive).
+#     Source scans use directory-entry types and never read file contents.
 #   - Deleted paths count as DIRTY but have no mtime; OLDEST-H covers the paths
 #     that still exist.
 #
-# Cost, measured 2026-10-24 over 66 registered worktrees: 25.6 s, of which
-# about 15 s is the walk over the two lanes directories that hold the
-# incident's copies (141 GB and 66 GB). Pruning them shrinks the run.
+# The old hit-count-only cap did not bound a sparse/no-match walk. On
+# 2026-11-02 its find ran for over four minutes and read 22.6 MiB/s during
+# host I/O pressure. Default probes now stop incomplete instead of exhausting
+# a large ignored tree. Python 3 and GNU timeout are required.
 #
 # Usage:
 #   scripts/work-at-risk.sh               # run at session start and before any handover
-#   scripts/work-at-risk.sh --count-all   # exact SRC-COPIES (slow on a large lanes dir)
+#   scripts/work-at-risk.sh --count-all   # unlimited scans; exact SRC-COPIES (expensive)
 #
 # Exit codes:  0 no WARN · 1 at least one WARN · 2 usage error or not a git tree
 
@@ -66,11 +69,14 @@ set -euo pipefail
 AGE_LIMIT_H=12
 LANES_LIMIT_BYTES=$((10 * 1024 * 1024 * 1024))
 COPY_CAP=50
+SCAN_ENTRIES=20000
+SCAN_SECONDS=2
+SCANNER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/work_at_risk_scan.py"
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do
     case "$1" in
-        --count-all) COPY_CAP=0 ;;
+        --count-all) COPY_CAP=0; SCAN_ENTRIES=0; SCAN_SECONDS=0 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -112,82 +118,30 @@ oldest_mtime() {
 
 # source_copies <tree>: count src/elspeth/__init__.py under the tree's ignored dirs.
 source_copies() {
-    local tree="$1" entry listing_pid count read_rc
+    local tree="$1" entry listing_pid
     local -a starts=() prune=()
+    local -a discovery=()
+    [ "$SCAN_SECONDS" -gt 0 ] && discovery=(timeout --kill-after=1s "${SCAN_SECONDS}s")
     while IFS= read -r -d '' entry; do
         [[ "$entry" == */ ]] && starts+=("$tree/${entry%/}")
-    done < <(git --no-optional-locks -C "$tree" ls-files -z --others --ignored --exclude-standard --directory 2>/dev/null)
+    done < <("${discovery[@]}" git --no-optional-locks -C "$tree" ls-files -z --others --ignored --exclude-standard --directory 2>/dev/null)
     listing_pid=$!
     if ! wait "$listing_pid"; then return 1; fi
     [ ${#starts[@]} -gt 0 ] || { echo 0; return; }
-    # The listing can name a directory and its children (`.claude/` and
-    # `.claude/lanes/`); walking both counts every copy twice. Keep only
-    # starts with no listed ancestor.
-    local -A listed=()
-    local -a top=()
-    local s anc
-    for s in "${starts[@]}"; do listed["$s"]=1; done
-    for s in "${starts[@]}"; do
-        anc="${s%/*}"
-        while [ "${#anc}" -gt "${#tree}" ] && [ -z "${listed[$anc]:-}" ]; do anc="${anc%/*}"; done
-        [ "${#anc}" -gt "${#tree}" ] || top+=("$s")
+    local w
+    for w in "${WTS[@]}"; do
+        [ "$w" = "$tree" ] || prune+=(--exclude "$w")
     done
-    starts=("${top[@]}")
-    # A -path test per registered worktree on every file made one run take 241 s,
-    # so worktree prunes apply only to the ignored dirs that contain a worktree.
-    local -a plain=() nested=()
-    local w inner
-    for s in "${starts[@]}"; do
-        inner=0
-        for w in "${WTS[@]}"; do
-            [ "$w" = "$tree" ] && continue
-            [[ "$w" == "$s" || "$w" == "$s"/* ]] && { inner=1; prune+=(-path "$w" -o); }
-        done
-        if [ "$inner" = 1 ]; then nested+=("$s"); else plain+=("$s"); fi
-    done
-    local -a names=(-name .venv -o -name node_modules -o -name __pycache__ -o -name .git)
-    # One byte per match makes the cap/count independent of filename newlines.
-    local -a match=(-name __init__.py -path '*/src/elspeth/__init__.py' -printf '.')
-    local -a limit=(cat)
-    [ "$COPY_CAP" -gt 0 ] && limit=(head -c "$COPY_CAP")
-    if count="$(
-        {
-            if [ ${#plain[@]} -gt 0 ]; then
-                find "${plain[@]}" -type d \( "${names[@]}" \) -prune -o "${match[@]}" 2>/dev/null || exit "$?"
-            fi
-            if [ ${#nested[@]} -gt 0 ]; then
-                find "${nested[@]}" -type d \( "${prune[@]}" "${names[@]}" \) -prune -o "${match[@]}" 2>/dev/null || exit "$?"
-            fi
-        } | "${limit[@]}" | wc -c
-    )"; then
-        printf '%s\n' "$count"
-    else
-        read_rc=$?
-        # Only this expected downstream cutoff preserves a measured lower
-        # bound. An arbitrary producer error stays incomplete even at the cap.
-        if [ "$read_rc" = 141 ] && [ "$COPY_CAP" -gt 0 ] && [ "$count" -ge "$COPY_CAP" ]; then
-            printf '%s\n' "$count"
-        else
-            return 1
-        fi
-    fi
+    python3 "$SCANNER" sources --threshold "$COPY_CAP" \
+        --max-entries "$SCAN_ENTRIES" --max-seconds "$SCAN_SECONDS" "${prune[@]}" -- "${starts[@]}"
 }
 
 # lanes_bytes <tree>: apparent size of .claude/lanes, stopping once past the limit.
 lanes_bytes() {
-    local dir="$1/.claude/lanes" measured read_rc
+    local dir="$1/.claude/lanes"
     [ -d "$dir" ] || { echo 0; return; }
-    if measured="$(find "$dir" -type f -printf '%s\n' 2>/dev/null \
-        | awk -v lim="$LANES_LIMIT_BYTES" '{ s += $1; if (s > lim) { print s; exit } } END { if (s <= lim) print s + 0 }')"; then
-        printf '%s\n' "$measured"
-    else
-        read_rc=$?
-        if [ "$read_rc" = 141 ] && [ -n "$measured" ] && [ "$measured" -gt "$LANES_LIMIT_BYTES" ]; then
-            printf '%s\n' "$measured"
-        else
-            return 1
-        fi
-    fi
+    python3 "$SCANNER" lanes --threshold "$LANES_LIMIT_BYTES" \
+        --max-entries "$SCAN_ENTRIES" --max-seconds "$SCAN_SECONDS" -- "$dir"
 }
 
 gb() { awk -v b="$1" 'BEGIN { printf "%.1fG", b / 1073741824 }'; }
@@ -237,22 +191,22 @@ for wt in "${WTS[@]}"; do
         if [ "$copies" -gt 0 ]; then
             [ "$COPY_CAP" -gt 0 ] && [ "$copies" -ge "$COPY_CAP" ] && copies="${COPY_CAP}+"
             warn "$wt" "$copies src/elspeth/__init__.py under gitignored paths (source outside git)" \
-                "git ls-files --others --ignored --directory; find"
+                "git ls-files --others --ignored --directory; bounded scandir"
         fi
     else
         copies="UNKNOWN"
-        warn "$wt" "ignored-source-copy probe failed; count UNKNOWN" "git ls-files --others --ignored --directory; find"
+        warn "$wt" "ignored-source-copy probe failed or exhausted its budget; count UNKNOWN" "git ls-files; bounded scandir (use --count-all for an unlimited scan)"
     fi
 
     if lb="$(lanes_bytes "$wt")"; then
         lanes="$(gb "$lb")"
         if [ "$lb" -gt "$LANES_LIMIT_BYTES" ]; then
             lanes=">$(gb "$LANES_LIMIT_BYTES")"
-            warn "$wt" ".claude/lanes exceeds $(gb "$LANES_LIMIT_BYTES")" "find -printf %s"
+            warn "$wt" ".claude/lanes exceeds $(gb "$LANES_LIMIT_BYTES")" "bounded scandir; stat apparent size"
         fi
     else
         lanes="UNKNOWN"
-        warn "$wt" ".claude/lanes size probe failed; size UNKNOWN" "find -printf %s"
+        warn "$wt" ".claude/lanes size probe failed or exhausted its budget; size UNKNOWN" "bounded scandir (use --count-all for an unlimited scan)"
     fi
 
     printf '%-8s %-6s %6s %8s %8s %10s %8s  %s\n' "$state" "$use" "$ndirty" "$oldest_h" "$commit_h" "$copies" "$lanes" "$wt"
