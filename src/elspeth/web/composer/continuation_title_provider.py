@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
@@ -14,16 +15,25 @@ from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import _read_current_env_names, materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_initialization import _registered, _sessions
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
+from elspeth.web.composer.continuation_policy import (
+    ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
+    decode_continuation_policy,
+)
 from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.continuation_title_no_sdk import TitleNoSdkIssuer, TitleNoSdkRefusalReason
 from elspeth.web.composer.continuation_title_values import capture_title_provider_result
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
-from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
-from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
+from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
+from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions._auto_title import _maybe_auto_title_session_required
+from elspeth.web.sessions.auto_title_outcome import _AutoTitleCapture
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     StoredContinuationSnapshot,
@@ -49,7 +59,117 @@ from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.schemas import SendMessageRequest
 
 if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+    from elspeth.web.sessions.continuation_title_no_sdk_terminal import VerifiedTitleNoSdkTerminal
     from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
+
+
+@dataclass(frozen=True, slots=True)
+class TitlePaidIncompleteResult:
+    verified: VerifiedPaidIncompleteTerminal
+    deferred_cancellations: tuple[asyncio.CancelledError, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TitleNoSdkTerminalResult:
+    verified: VerifiedTitleNoSdkTerminal
+    deferred_cancellations: tuple[asyncio.CancelledError, ...]
+
+
+def _title_no_sdk_reason(error: BaseException) -> TitleNoSdkRefusalReason | None:
+    reasons: dict[type[BaseException], TitleNoSdkRefusalReason] = {
+        PromptGuardRefused: TitleNoSdkRefusalReason.GUARD_REFUSED,
+        CommonProviderCostRefused: TitleNoSdkRefusalReason.COST_REFUSED,
+        ChargeableAdmissionRefused: TitleNoSdkRefusalReason.CHARGEABLE_REFUSED,
+        TimeoutError: TitleNoSdkRefusalReason.PRE_SDK_DEADLINE,
+        asyncio.CancelledError: TitleNoSdkRefusalReason.CANCELLED_BEFORE_SDK,
+    }
+    return reasons.get(type(error))
+
+
+async def _close_v4_title_no_sdk(
+    *, prepared: PreparedTitleProvider, custody: ProviderCallCustody, issuer: TitleNoSdkIssuer, error: BaseException
+) -> TitleNoSdkTerminalResult | None:
+    from elspeth.web.sessions.continuation_title_no_sdk_terminal import (
+        VerifiedTitleNoSdkTerminal,
+        read_v4_title_no_sdk_terminal_on_connection,
+    )
+    from elspeth.web.sessions.continuation_title_provider import V4TitleProviderAdmission
+
+    reason = _title_no_sdk_reason(error)
+    admission = custody.continuation_title_v4_admission
+    if reason is None or type(admission) is not V4TitleProviderAdmission or not custody.has_v4_unentered_hold():
+        return None
+    custody.require_v4_title_unentered(admission)
+    issuer.note_original_failure(custody, error)
+    permit = issuer.reserve_refusal(reason=reason, original_failure=error)
+    deadline_owner = prepared.work.coordinator.sql_deadline_owner
+    if deadline_owner is not None:
+        deadline_owner.begin_settlement()
+    ticket = prepared.work.coordinator.reserve(
+        RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,
+        transition_ordinal=prepared.work.transition_ordinal,
+        semantic_ordinal=prepared.work.semantic_ordinal,
+    )
+    outcome = await _sessions(prepared.composer).cancel_v4_continuation_title_unentered(permit=permit, required_work=ticket)
+    prepared.work.coordinator.validate_undispatched_cancellation_sql_outcome(ticket=ticket, actual_outcome=outcome)
+    cancellations = list(outcome.deferred_cancellations)
+    if type(error) is asyncio.CancelledError and all(error is not prior for prior in cancellations):
+        cancellations.insert(0, error)
+    verified: VerifiedTitleNoSdkTerminal | None = None
+    if type(outcome) is RequiredSQLReturned:
+        verified = outcome.value
+    elif type(outcome) is RequiredSQLRaised:
+        read_sql, projection = prepared.work.reserve_pair(
+            RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION
+        )
+
+        def readback() -> VerifiedTitleNoSdkTerminal | None:
+            with locked_session_transaction(prepared.authority._engine, str(prepared.running.claim.session_id)) as conn:
+                return read_v4_title_no_sdk_terminal_on_connection(
+                    conn,
+                    session_id=prepared.running.claim.session_id,
+                    operation_id=prepared.running.claim.operation_id,
+                    names=prepared.names,
+                )
+
+        try:
+            observed = await run_required_sql_finish_once(read_sql, readback)
+            prepared.work.coordinator.validate_continuation_sql_outcome(
+                ticket=read_sql, expected_source=RequiredWorkSource.CONTINUATION_READ_SQL, actual_outcome=observed
+            )
+        except BaseException:
+            projection.complete_without_submission()
+            raise
+        if type(observed) is RequiredSQLRaised:
+            projection.complete_without_submission()
+            raise BaseExceptionGroup("V4 TITLE no-SDK settlement and cold readback failed", [outcome.error, observed.error])
+        if type(observed) is not RequiredSQLReturned:
+            projection.complete_without_submission()
+            raise AuditIntegrityError("V4 TITLE no-SDK readback lost its owned SQL outcome")
+        projection.begin_projection()
+        try:
+            if observed.value is not None and type(observed.value) is not VerifiedTitleNoSdkTerminal:
+                raise AuditIntegrityError("V4 TITLE no-SDK readback returned a foreign terminal")
+            verified = observed.value
+        except BaseException as projection_error:
+            projection.complete_owned(projection_error)
+            raise
+        projection.complete_owned()
+        cancellations.extend(item for item in observed.deferred_cancellations if all(item is not prior for prior in cancellations))
+        if verified is None:
+            raise outcome.error
+    else:
+        raise AuditIntegrityError("V4 TITLE no-SDK settlement lost its owned SQL outcome")
+    if (
+        type(verified) is not VerifiedTitleNoSdkTerminal
+        or verified.source != admission.hold
+        or verified.provider_attempt_id != admission.attempt.attempt_id
+        or verified.hold_state != "consumed"
+        or verified.reason is not reason
+    ):
+        raise AuditIntegrityError("V4 TITLE no-SDK closure changed its original paid admission")
+    return TitleNoSdkTerminalResult(verified, tuple(cancellations))
 
 
 def _running(work: RequiredWorkBinding) -> ComposerOperationRunning:
@@ -106,7 +226,7 @@ async def prepare_current_title_provider(
 
 async def run_prepared_title_provider(
     *, prepared: PreparedTitleProvider, invocation_owner: ProviderInvocationOwner
-) -> TitleAuditSettlementRequest | VerifiedTitlePaidOverflowTerminal | None:
+) -> TitleAuditSettlementRequest | VerifiedTitlePaidOverflowTerminal | TitlePaidIncompleteResult | TitleNoSdkTerminalResult | None:
     if type(prepared) is not PreparedTitleProvider or type(invocation_owner) is not ProviderInvocationOwner:
         raise AuditIntegrityError("TITLE execution requires its actual prepared/current invocation owners")
     if invocation_owner.required_work is not prepared.work or invocation_owner.service is not _sessions(prepared.composer):
@@ -133,6 +253,10 @@ async def run_prepared_title_provider(
         return None
     custody = invocation_owner.mint(ProviderInvocationFamily.TITLE)
     custody.bind_continuation_title(prepared)
+    no_sdk_issuer: TitleNoSdkIssuer | None = None
+    if type(policy) is ContinuationAdmissionPolicyV4:
+        no_sdk_issuer = TitleNoSdkIssuer(prepared)
+        custody.bind_title_no_sdk_issuer(no_sdk_issuer)
     settings = prepared.composer._settings
     request = prepared.request
     from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
@@ -151,22 +275,61 @@ async def run_prepared_title_provider(
             return original_request.content
 
     user = await _registered(work=prepared.work, source=RequiredWorkSource.CONTINUATION_READ_SQL, operation=original_user, expected=str)
-    await _maybe_auto_title_session_required(
-        service=_sessions(prepared.composer),
-        session_id=prepared.running.claim.session_id,
-        model=request.kwargs["model"],
-        temperature=request.kwargs.get("temperature"),
-        seed=request.kwargs.get("seed"),
-        session_operation_context=prepared.running.session_operation_context,
-        kwargs=request.kwargs,
-        audit_messages=request.audit_messages,
-        provider_custody=custody,
-        prompt_guard_mount=prepared.composer.composer_prompt_guard_mount,
-        prompt_guard_mode=settings.composer_prompt_guard_mode,
-        user_message=user,
-        max_prepared_request_bytes=settings.composer_max_prepared_request_bytes,
-        prepared_input=prepared.provider_input,
-    )
+    if type(policy) is ContinuationAdmissionPolicyV4:
+        from elspeth.web.sessions.continuation_title_provider import V4TitleProviderAdmission
+
+        async def finish_returned_incomplete(
+            incomplete: V4ProviderResultIncomplete, sql: RequiredWorkTicket
+        ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+            admission = custody.continuation_title_v4_admission
+            if type(incomplete) is not V4ProviderResultIncomplete or type(admission) is not V4TitleProviderAdmission:
+                raise AuditIntegrityError("V4 TITLE returned-incomplete finalizer lost its original paid admission")
+            names = await current_title_names(service=prepared.composer, running=prepared.running, work=prepared.work)
+            return await run_required_sql_finish_once(
+                sql,
+                _sessions(prepared.composer).settle_v4_title_paid_incomplete_sync,
+                prepared=prepared,
+                admission=admission,
+                incomplete=incomplete,
+                custody=custody,
+                names=names,
+            )
+
+        custody.bind_v4_returned_incomplete_finalizer(finish_returned_incomplete)
+    capture = _AutoTitleCapture() if type(policy) is ContinuationAdmissionPolicyV4 else None
+    try:
+        await _maybe_auto_title_session_required(
+            service=_sessions(prepared.composer),
+            session_id=prepared.running.claim.session_id,
+            model=request.kwargs["model"],
+            temperature=request.kwargs.get("temperature"),
+            seed=request.kwargs.get("seed"),
+            session_operation_context=prepared.running.session_operation_context,
+            kwargs=request.kwargs,
+            audit_messages=request.audit_messages,
+            provider_custody=custody,
+            prompt_guard_mount=prepared.composer.composer_prompt_guard_mount,
+            prompt_guard_mode=settings.composer_prompt_guard_mode,
+            user_message=user,
+            max_prepared_request_bytes=settings.composer_max_prepared_request_bytes,
+            prepared_input=prepared.provider_input,
+            _outcome=capture,
+        )
+    except V4ProviderResultIncomplete as incomplete:
+        if type(policy) is not ContinuationAdmissionPolicyV4:
+            raise
+        result = await custody.finalize_v4_returned_incomplete(incomplete)
+        return TitlePaidIncompleteResult(result.verified, result.deferred_cancellations)
+    except BaseException as original:
+        if no_sdk_issuer is not None:
+            terminal = await _close_v4_title_no_sdk(prepared=prepared, custody=custody, issuer=no_sdk_issuer, error=original)
+            if terminal is not None:
+                return terminal
+        raise
+    if capture is not None and capture.handled_error is not None and no_sdk_issuer is not None:
+        terminal = await _close_v4_title_no_sdk(prepared=prepared, custody=custody, issuer=no_sdk_issuer, error=capture.handled_error)
+        if terminal is not None:
+            return terminal
     if custody.continuation_title_v4_terminal is not None:
         return custody.continuation_title_v4_terminal
     return custody.continuation_title_result
@@ -260,7 +423,9 @@ async def _retain_current_title_v4_once(custody: ProviderCallCustody, completion
         if type(observation) is TitleCompleteObservation:
             return service.complete_v4_title_result_sync(prepared=prepared, admission=admission, captured=observation.captured, names=names)
         if type(observation) is TitleOverflowObservation:
-            return service.settle_v4_title_overflow_sync(prepared=prepared, admission=admission, observation=observation, names=names)
+            return service.settle_v4_title_overflow_sync(
+                prepared=prepared, admission=admission, observation=observation, names=names, custody=custody
+            )
         raise AuditIntegrityError("V4 TITLE observation has no closed paid-result disposition")
 
     sql, projection = prepared.work.reserve_pair(

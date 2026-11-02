@@ -125,6 +125,33 @@ def test_title_moved_source_wrappers_keep_exact_original_arguments_after_body_re
         (title.SQL, "title_source_chain_data_on_connection", "physical_ids !="),
         (title.SQL, "_require_physical_data", "physical_row.lease_token"),
         (title.SQL, "read_title_result_data_on_connection", "effect.receipt_key"),
+        (
+            "src/elspeth/web/composer/continuation_title_values.py",
+            "_issue_v4_title_stored_source",
+            "parent.continuation_policy_version",
+        ),
+        (title.SQL, "_require_title_admission_source", "effect.disposition"),
+        (title.SQL, "retain_title_response_on_connection", "original_v4_completion is None"),
+        (
+            "src/elspeth/web/composer/continuation_title_values.py",
+            "capture_title_provider_result",
+            "type(witness) is not V4ProviderResultCompleteness",
+        ),
+        (
+            "src/elspeth/web/composer/continuation_title_values.py",
+            "decode_title_provider_result",
+            "original_v4_completion is not None and stored_v4_source is not None",
+        ),
+        (
+            "src/elspeth/web/composer/continuation_title_values.py",
+            "decode_title_provider_result",
+            "snapshot.logical.session_id != stored_v4_source.session_id",
+        ),
+        (
+            "src/elspeth/web/composer/continuation_title_values.py",
+            "decode_title_provider_result",
+            "encode_continuation_response(original, audit_call=audit_call) != response",
+        ),
         (title.SQL, "_require_audit_cohort_data", "call.call_id is None"),
         (title.BOOTSTRAP, "pretitle_recovery_origin_data_on_connection", "previous_attempt.revoked_at"),
         (title.BOOTSTRAP, "require_pretitle_publication_data_on_connection", "creator.sequence"),
@@ -138,6 +165,34 @@ def test_title_moved_source_guards_remain_complete_owned_supplier_bodies(path, s
     guards = [node for node in ast.walk(owner) if isinstance(node, ast.If) and guard in ast.unparse(node.test)]
     assert len(guards) == 1
     guards[0].test = ast.Constant(value=False)
+    failures, receipt = title.title_provider_local_contracts(units)
+    assert failures == ["TITLE transfer: complete current source contract changed " + path + ":" + symbol]
+    assert receipt is None
+
+
+@pytest.mark.parametrize(
+    "path,symbol,target",
+    (
+        ("src/elspeth/web/composer/provider_gateway.py", "_litellm_acompletion", "provider_custody.note_v4_sdk_returned"),
+        ("src/elspeth/web/composer/continuation_initialization.py", "_registered", "work.coordinator.validate_continuation_sql_outcome"),
+        ("src/elspeth/web/required_work.py", "RequiredWorkCoordinator.validate_continuation_sql_outcome", "self._registered"),
+        ("src/elspeth/web/composer/continuation_title_values.py", "capture_title_provider_result", "witness.require_result"),
+        (
+            "src/elspeth/web/composer/continuation_title_values.py",
+            "_issue_v4_title_stored_source",
+            "title_source_chain_data_on_connection",
+        ),
+    ),
+)
+def test_title_refreshed_dependencies_reject_foreign_supplier(path, symbol, target):
+    units = _units()
+    _positive(units)
+    owner = _definition(units, path, symbol)
+    calls = [node for node in ast.walk(owner) if isinstance(node, ast.Call) and ast.unparse(node.func) == target]
+    assert calls
+    # Mutate every occurrence so shared retry paths cannot mask the lost source.
+    for call in calls:
+        call.func = ast.Name(id="foreign_supplier", ctx=ast.Load())
     failures, receipt = title.title_provider_local_contracts(units)
     assert failures == ["TITLE transfer: complete current source contract changed " + path + ":" + symbol]
     assert receipt is None
@@ -211,7 +266,10 @@ def test_title_prepared_owner_and_limit_keep_exact_forwarding_after_body_rebind(
     assert receipt is None
 
 
-@pytest.mark.parametrize("fault", ("prepared", "owner", "service", "running", "work", "reorder", "cancel", "frame", "extra"))
+@pytest.mark.parametrize(
+    "fault",
+    ("prepared", "owner", "service", "running", "work", "reorder", "cancel", "frame", "extra", "v3-return", "v4-names", "v4-type"),
+)
 def test_title_actual_driver_keeps_both_owned_transitions_after_body_rebind(monkeypatch, fault):
     units = _units()
     _positive(units)
@@ -240,6 +298,24 @@ def test_title_actual_driver_keeps_both_owned_transitions_after_body_rebind(monk
             node for node in owner.body if isinstance(node, ast.If) and ast.unparse(node.test) == "type(top) is InitializeFrame"
         )
         initialize.test = ast.Constant(value=True)
+    elif fault == "v3-return":
+        refused = next(
+            node
+            for node in branch.body
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "isinstance(prepared, V3UnboundedTailRefusal)"
+        )
+        refused.body[0].value = ast.Constant(value=None)
+    elif fault == "v4-names":
+        terminal = title._one_call(owner, "_TitlePaidTerminalResult")
+        assert terminal is not None and ast.unparse(terminal.args[1]) == "prepared.names"
+        terminal.args[1] = ast.Name(id="foreign", ctx=ast.Load())
+    elif fault == "v4-type":
+        terminal_guard = next(
+            node
+            for node in branch.body
+            if isinstance(node, ast.If) and ast.unparse(node.test) == "type(title_result) is VerifiedTitlePaidOverflowTerminal"
+        )
+        terminal_guard.test = ast.Constant(value=True)
     else:
         branch.body.append(ast.parse("await run_prepared_title_provider(prepared=prepared, invocation_owner=self.provider)").body[0])
     monkeypatch.setitem(title.CONTRACTS, title.DRIVER + ":_SegmentDriver.advance", ast.unparse(owner))

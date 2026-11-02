@@ -21,6 +21,7 @@ from elspeth.web.sessions.continuation_primary_paid_overflow_no_sdk import prepa
 from elspeth.web.sessions.continuation_primary_paid_overflow_source import require_original_v4_primary_physical_source_on_connection
 from elspeth.web.sessions.continuation_primary_paid_overflow_tail import prepare_primary_paid_overflow_tail_plan
 from elspeth.web.sessions.continuation_primary_paid_overflow_terminal import _bounded_bytes, _stored_hold_source
+from elspeth.web.sessions.continuation_primary_terminal_reservation import primary_terminal_reservation
 from elspeth.web.sessions.continuation_retained_capacity import _require_historical_hold_source, _require_hold_fields
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_events_table as events
@@ -145,19 +146,9 @@ def read_v4_primary_admission_on_connection(
         operation_epoch=source.session_operation_epoch,
         action_chunk=action_chunk,
     )
-    reserved = max(paid.reserved_bytes, no_sdk.reserved_bytes)
-    combined = sha256(
-        canonical_json(
-            {
-                "version": "composer.primary-v4-combined-tail.v1",
-                "paid": paid.fallback_contract_sha256,
-                "no_sdk": no_sdk.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    incomplete_tail, reserved, combined = primary_terminal_reservation(paid, no_sdk)
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined:
         raise AuditIntegrityError("V4 PRIMARY admission read changed its original combined H")
     return V4PrimaryProviderAdmission(
-        ProviderAttempt(effect.provider_attempt_id, restore_utc(attempt.started_at)), selected, source, paid, no_sdk
+        ProviderAttempt(effect.provider_attempt_id, restore_utc(attempt.started_at)), selected, source, paid, no_sdk, incomplete_tail
     )

@@ -125,7 +125,8 @@ def prepare_metadata_transitions_on_connection(
     call = prepared.batch.current_call
     if (
         len(calls) != 1
-        or calls[0].function.name != "set_metadata"
+        or calls[0].function.name not in ("set_metadata", "set_pipeline")
+        or (calls[0].function.name == "set_pipeline" and type(policy) is not ContinuationAdmissionPolicyV4)
         or prepared.calls != calls
         or finished.calls != calls
         or call is None

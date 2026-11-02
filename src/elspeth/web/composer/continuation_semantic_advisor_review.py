@@ -13,6 +13,12 @@ from typing import TYPE_CHECKING
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.advisor_output import ReviewContinuationAction
 from elspeth.web.composer.continuation import EndFrame
+from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
+    EndCheckpointNoSdkTerminal,
+    EndCheckpointPaidOverflowTerminal,
+    EndCheckpointUnboundRefusalTerminal,
+)
+from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointPaidIncompleteTerminal
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
 from elspeth.web.composer.continuation_end_effects import semantic_end_effect_key
 from elspeth.web.composer.continuation_initialization import _registered
@@ -91,7 +97,13 @@ def _retain_review_result(
 
 async def review_prescribed_continuation_end(
     phases: ContinuationLivePhases, services: ComposerAppServices, selected: SelectedContinuationState
-) -> None:
+) -> (
+    EndCheckpointPaidIncompleteTerminal
+    | EndCheckpointPaidOverflowTerminal
+    | EndCheckpointNoSdkTerminal
+    | EndCheckpointUnboundRefusalTerminal
+    | None
+):
     """Retain a real END Review result without claiming final publication."""
     running = phases.work.running
     top = selected.stack.frames[-1]
@@ -115,8 +127,18 @@ async def review_prescribed_continuation_end(
     if candidate is None or admitted.action_key is None:
         raise AuditIntegrityError("prescribed Review lost its original paid END candidate")
     execution = await execute_continuation_end_review(phases, selected)
+    if isinstance(
+        execution,
+        (
+            EndCheckpointPaidIncompleteTerminal,
+            EndCheckpointPaidOverflowTerminal,
+            EndCheckpointNoSdkTerminal,
+            EndCheckpointUnboundRefusalTerminal,
+        ),
+    ):
+        return execution
     if type(execution) is EndReviewContinued:
-        return
+        return None
     if type(execution) is not EndReviewExecution:
         raise AuditIntegrityError("prescribed Review returned an unfamiliar shared END result")
     captured = await capture_continuation_runtime_owners(
@@ -138,3 +160,4 @@ async def review_prescribed_continuation_end(
         ),
         expected=SemanticReviewCommitted,
     )
+    return None

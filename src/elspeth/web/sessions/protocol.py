@@ -2021,6 +2021,7 @@ class SessionOperationSessionMutations(Protocol):
         planner_payload: str,
         composition_state_id: str | None,
         created_at: datetime,
+        rejection_id: UUID | None = None,
     ) -> None: ...
 
     def decide_and_soft_archive(

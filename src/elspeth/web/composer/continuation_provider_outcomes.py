@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
@@ -14,6 +15,9 @@ from elspeth.web.composer.continuation_codec import owned_json
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 
 _PHYSICAL_AUDIT = TypeAdapter(ComposerLLMCall)
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 
 
 def _physical_audit_json_value(call: ComposerLLMCall) -> JsonValue:
@@ -94,3 +98,33 @@ def require_successful_response_audit(
         != canonical_json(owned_json((metadata.reasoning_content, metadata.reasoning_details, metadata.thinking_blocks)))
     ):
         raise AuditIntegrityError("received response changed its actual physical identity, finish, usage or native audit")
+
+
+def require_v4_successful_response_audit(
+    call: ComposerLLMCall,
+    metadata: _AdmittedLLMProviderMetadata,
+    *,
+    policy: ContinuationAdmissionPolicyV4,
+    attempt_id: str,
+    started_at: datetime,
+    finished_at: datetime,
+) -> None:
+    """Compare V4 original DATA to its bounded diagnostic audit projection.
+
+    Policy selects representation only. The caller must first prove the live
+    issued result or actual retained V4 source/receipt; neither projection nor
+    nominal policy grants custody, SDK origin or SQL/application permission.
+    Full original metadata remains the credential/retention/replay input.
+    """
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
+    from elspeth.web.composer.provider_result_admission import project_v4_provider_diagnostic_metadata
+
+    if type(policy) is not ContinuationAdmissionPolicyV4:
+        raise AuditIntegrityError("V4 audit comparison requires its explicit admitted policy")
+    require_successful_response_audit(
+        call,
+        project_v4_provider_diagnostic_metadata(metadata),
+        attempt_id=attempt_id,
+        started_at=started_at,
+        finished_at=finished_at,
+    )

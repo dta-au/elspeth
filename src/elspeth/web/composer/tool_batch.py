@@ -208,6 +208,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.secrets import WebSecretResolver
     from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
     from elspeth.web.composer.continuation_tool_failure import ContinuationDispatchFailureObservation, ContinuationToolFailureCustody
+    from elspeth.web.composer.continuation_value_batch_computation import ObservedValueBatchComputation
     from elspeth.web.composer.pipeline_custody import PipelineCustodyPreparation
     from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
@@ -1823,8 +1824,13 @@ async def _execute_continuation_call_live(
     call: ContinuationCallState,
     retained_attachment: AttachmentResultCheckpoint | None = None,
     failure_custody: ContinuationToolFailureCustody | None = None,
+    value_computation: ObservedValueBatchComputation | None = None,
 ) -> Literal["applied"]:
     """Execute the original suffix with the actual caller's revocation owner."""
+    if value_computation is not None:
+        from elspeth.web.composer.continuation_value_batch_computation import require_value_batch_execution
+
+        require_value_batch_execution(value_computation, call_model=call_model, ctx=ctx, acc=acc, batch=batch, call=call)
     if retained_attachment is not None:
         from elspeth.web.sessions.continuation_attachment_result import AttachmentResultCheckpoint
 
@@ -1895,9 +1901,10 @@ async def _execute_continuation_call_live(
     publication = None
     if ctx.message_producers is not None:
         ctx.message_producers.require_context(session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id)
-        publication = ContinuationToolMessagePublication(
-            ctx.message_producers, call_model.completion, batch, call, recorder, llm_messages, ctx.policy_catalog
-        )
+        if value_computation is None:
+            publication = ContinuationToolMessagePublication(
+                ctx.message_producers, call_model.completion, batch, call, recorder, llm_messages, ctx.policy_catalog
+            )
 
     def _append_issued_feedback(serialized: str) -> None:
         message = {
@@ -2086,6 +2093,10 @@ async def _execute_continuation_call_live(
                         result=cached_admitted if cached_admitted is not None else cached_result,
                         serialized=cached_json,
                     )
+                    if value_computation is not None:
+                        from elspeth.web.composer.continuation_value_batch_computation import record_value_batch_cached_result
+
+                        record_value_batch_cached_result(value_computation, result=cached_result, admitted=cached_admitted)
                     if ctx.message_producers is not None and tool_name == "get_plugin_schema":
                         ctx.message_producers.require_context(
                             session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id
@@ -2182,7 +2193,7 @@ async def _execute_continuation_call_live(
             # and continue through the ordinary repair path; in particular, the
             # server never launders a provider-authored reserved disclosure into
             # an internal one merely by attempting finalization.
-            if tool_name == "set_pipeline" and not explicit_approval_required:
+            if tool_name == "set_pipeline" and not explicit_approval_required and value_computation is None:
                 try:
                     candidate_prior_validation = (
                         last_validation if last_validation is not None else ctx.policy_catalog.validate_composition_state(state).validation
@@ -3586,6 +3597,12 @@ async def _execute_continuation_call_live(
             ) -> Any:
                 if _preproposal_exception is not None:
                     raise _preproposal_exception
+                if value_computation is not None:
+                    from elspeth.web.composer.continuation_value_batch_computation import consume_value_batch_computation
+
+                    return consume_value_batch_computation(
+                        value_computation, call_model=call_model, ctx=ctx, acc=acc, batch=batch, call=call
+                    )
                 if _prevalidated_unapplied_result is not None:
                     return _prevalidated_unapplied_result
                 if _retained_attachment is not None:
@@ -3984,7 +4001,11 @@ async def _execute_continuation_call_live(
                 ctx.message_producers.register_attachment_message(
                     response=response_source, call=tool_call, result=admitted_result.to_tool_result(), message=result_message
                 )
-            elif ctx.message_producers is not None and not (tool_name == "get_plugin_schema" and result.success):
+            elif (
+                ctx.message_producers is not None
+                and value_computation is None
+                and not (tool_name == "get_plugin_schema" and result.success)
+            ):
                 ctx.message_producers.require_context(session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id)
                 ctx.message_producers.register_tool_result_message(
                     completion=call_model.completion,

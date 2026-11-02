@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
+from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.attachment_admission import AttachmentInspectionPolicy
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, owned_json
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
@@ -54,6 +55,7 @@ def _execute_current_attachment_read(
     tool_name: str,
     arguments: Mapping[str, Any],
     state: CompositionState,
+    expected_catalog: PolicyCatalogView | None = None,
 ) -> CurrentAttachmentRead:
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -75,7 +77,7 @@ def _execute_current_attachment_read(
         or session_service._data_dir is None
     ):
         raise AuditIntegrityError("attachment read requires one actual session store and storage root")
-    if tool_name not in {"read_attachment", "get_blob_content"}:
+    if tool_name not in {"read_attachment", "get_blob_content", "inspect_source"}:
         raise AuditIntegrityError("current attachment owner received another selected tool")
     running = inventory.running
     sid = str(running.claim.session_id)
@@ -98,6 +100,10 @@ def _execute_current_attachment_read(
         if actor != principal.user_id or principal.archived_at is not None:
             raise AuditIntegrityError("attachment read changed its current session principal")
     snapshot, catalog = service._policy_context.build(actor)
+    if expected_catalog is not None:
+        if type(expected_catalog) is not PolicyCatalogView or expected_catalog.snapshot.snapshot_hash != snapshot.snapshot_hash:
+            raise AuditIntegrityError("attachment read changed its original current policy catalog")
+        catalog, snapshot = expected_catalog, expected_catalog.snapshot
     observations = ContinuationReadObservations()
     policy = AttachmentInspectionPolicy(service._settings.composer_attachment_inspection_max_bytes, env_ref_names=names)
     context = ToolContext(
@@ -145,6 +151,7 @@ async def read_current_attachment(
     arguments: Mapping[str, Any],
     state: CompositionState,
     required_work: RequiredWorkBinding,
+    expected_catalog: PolicyCatalogView | None = None,
 ) -> CurrentAttachmentRead:
     if type(required_work) is not RequiredWorkBinding or type(inventory) is not CurrentContinuationEnvInventory:
         raise AuditIntegrityError("attachment read requires its actual required-work inventory")
@@ -174,6 +181,7 @@ async def read_current_attachment(
             tool_name=tool_name,
             arguments=captured_arguments,
             state=state,
+            expected_catalog=expected_catalog,
         )
     except BaseException:
         projection.complete_without_submission()

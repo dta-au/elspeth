@@ -27,13 +27,28 @@ from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.sessions import test_continuation_initialization as bootstrap_fixture
 from tests.unit.web.sessions import test_continuation_live_phases as phase_fixture
 from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
+from tests.unit.web.sessions.test_continuation_prompt_producers import current_service
 
 operation_store = phase_fixture.operation_store
 
 
 @asynccontextmanager
-async def _v4_tool_case(store, tmp_path, monkeypatch, *, tool="set_metadata"):
-    settings = continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
+async def _v4_tool_case(
+    store,
+    tmp_path,
+    monkeypatch,
+    *,
+    tool="set_metadata",
+    arguments=None,
+    following_tool_call=None,
+    available_plugins=None,
+    primary_preparation_probe_15s=False,
+    retained_payload_bytes=16 * 1_048_576,
+):
+    from tests.helpers.continuation_policy import classifier_15s_probe_settings
+
+    settings_factory = classifier_15s_probe_settings if primary_preparation_probe_15s else continuation_test_settings
+    settings = settings_factory(composer_continuation_max_retained_payload_bytes=retained_payload_bytes)
     policy = continuation_policy_v4_from_settings(settings)
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
@@ -42,16 +57,42 @@ async def _v4_tool_case(store, tmp_path, monkeypatch, *, tool="set_metadata"):
     # The normal fixture's actual admitting owner retains this exact V4 seed;
     # no historical policy rewrite or fabricated paid response is used.
     monkeypatch.setattr(bootstrap_fixture, "minimal_continuation_policy", lambda: policy)
+    if available_plugins is not None:
+
+        def configured_service(current_store, *, secret_service=None, settings_overrides=None):
+            return current_service(
+                current_store,
+                secret_service=secret_service,
+                settings_overrides=settings_overrides,
+                available_plugins=available_plugins,
+            )
+
+        # Configure the admitting service before bootstrap and PRIMARY. This
+        # supplies its real policy/snapshot factory, never a retained rewrite.
+        monkeypatch.setattr(bootstrap_fixture, "current_service", configured_service)
     current_store = (store[0], store[1], authority, store[3], store[4])
-    arguments = {"patch": {"name": "V4 original model metadata"}} if tool == "set_metadata" else {}
+    if arguments is None:
+        arguments = {"patch": {"name": "V4 original model metadata"}} if tool == "set_metadata" else {}
     async with phase_fixture._phase_case(
         current_store,
         tmp_path,
         monkeypatch,
         tool_call=("original_v4_tool", tool, arguments),
-        settings_overrides={"composer_continuation_max_retained_payload_bytes": policy.max_retained_payload_bytes},
+        following_tool_call=following_tool_call,
+        settings_overrides={
+            "composer_continuation_max_retained_payload_bytes": policy.max_retained_payload_bytes,
+            **(
+                {"composer_continuation_action_bounds": settings.composer_continuation_action_bounds}
+                if primary_preparation_probe_15s
+                else {}
+            ),
+        },
     ) as (owner, running, primary, sdk):
         assert len(sdk) == 1 and primary.outcome.completion.tool_batch.calls[0].function.name == tool
+        assert owner.runtime is not None
+        if available_plugins is not None:
+            snapshot = owner.runtime.bindings.plugin_snapshot
+            assert snapshot.available == available_plugins and owner.runtime.bindings.policy_catalog.snapshot is snapshot
         yield current_store, owner, running, sdk
 
 

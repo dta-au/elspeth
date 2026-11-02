@@ -58,6 +58,16 @@ def continuation_test_settings(**overrides: Any) -> WebSettings:
     return WebSettings(**{**required, **overrides})
 
 
+def classifier_15s_probe_settings(**overrides: Any) -> WebSettings:
+    """Pin the measured 15 s PRIMARY allowance in authentic classifier trials."""
+    defaults = continuation_test_settings(**overrides)
+    bounds = defaults.composer_continuation_action_bounds
+    probe_bounds = ContinuationActionBoundsSettings.model_validate(
+        {**bounds.model_dump(), "primary": {**bounds.primary.model_dump(), "preparation": 15.0}}
+    )
+    return continuation_test_settings(**{**overrides, "composer_continuation_action_bounds": probe_bounds})
+
+
 def minimal_continuation_policy(**setting_overrides: Any) -> ContinuationAdmissionPolicy:
     return continuation_policy_from_settings(continuation_test_settings(**setting_overrides))
 

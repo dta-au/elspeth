@@ -23,6 +23,8 @@ describe("durable composer observation policy", () => {
     expect(composer.isComposeRefreshOnlyFailureCode("context_unsupported")).toBe(false);
   });
   it("never offers an automatic paid retry after incomplete provider evidence", () => {
+    expect(composer.isComposePermanentRefusal("paid_result_incomplete")).toBe(true);
+    expect(composer.isComposeRefreshOnlyFailureCode("paid_result_incomplete")).toBe(false);
     expect(composer.isComposePermanentRefusal("paid_result_overflow")).toBe(true);
     expect(composer.isComposeRefreshOnlyFailureCode("paid_result_overflow")).toBe(false);
   });

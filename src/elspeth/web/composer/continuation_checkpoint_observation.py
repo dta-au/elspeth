@@ -27,10 +27,12 @@ from elspeth.web.composer.advisor_output import AdvisorCheckpointResponse, Advis
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_continuation_text_response, measure_continuation_response_size
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_provider_outcomes import (
     _physical_audit_json_value,
     measure_physical_audit_call_size,
     require_successful_response_audit,
+    require_v4_successful_response_audit,
 )
 from elspeth.web.composer.provider_audit_source import (
     ProviderAuditSource,
@@ -150,6 +152,21 @@ def observe_checkpoint_returned_response(
     context: SessionOperationContext,
     env_ref_names: frozenset[str],
 ) -> CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation:
+    return _observe_checkpoint_returned_response(
+        observation, phase=phase, trigger=trigger, attempt=attempt, context=context, env_ref_names=env_ref_names, v4_policy=None
+    )
+
+
+def _observe_checkpoint_returned_response(
+    observation: AdvisorInvocationObservation,
+    *,
+    phase: AdvisorCheckpointPhase,
+    trigger: str,
+    attempt: ProviderAttempt,
+    context: SessionOperationContext,
+    env_ref_names: frozenset[str],
+    v4_policy: ContinuationAdmissionPolicyV4 | None,
+) -> CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation:
     """Measure a real returned text response before scheduling a format retry.
 
     Provider errors, absent content and rejected SDK frames are deliberately
@@ -193,9 +210,14 @@ def observe_checkpoint_returned_response(
     )
     # The quota attempt begins on the database clock; this call has its own
     # worker timestamp. Bind their shared attempt ID without equating clocks.
-    require_successful_response_audit(
-        call, metadata, attempt_id=attempt.attempt_id, started_at=call.started_at, finished_at=call.finished_at
-    )
+    if v4_policy is None:
+        require_successful_response_audit(
+            call, metadata, attempt_id=attempt.attempt_id, started_at=call.started_at, finished_at=call.finished_at
+        )
+    else:
+        require_v4_successful_response_audit(
+            call, metadata, policy=v4_policy, attempt_id=attempt.attempt_id, started_at=call.started_at, finished_at=call.finished_at
+        )
     completion = _AdmittedLLMCompletion(message, _AdmittedToolBatch((), frozenset()), metadata)
     measure_continuation_response_size(completion)
     source = capture_provider_audit_source(context)
@@ -289,6 +311,7 @@ def observe_v4_checkpoint_returned_response(
     observation: AdvisorInvocationObservation,
     *,
     custody: ProviderCallCustody,
+    policy: ContinuationAdmissionPolicyV4,
     phase: AdvisorCheckpointPhase,
     trigger: str,
     attempt: ProviderAttempt,
@@ -312,8 +335,8 @@ def observe_v4_checkpoint_returned_response(
         raise AuditIntegrityError("V4 checkpoint response lacks original raw-result completeness")
     custody.require_v4_result_completeness(witness)
     witness.require_result(observation.provider_metadata, content=observation.message.content, tool_calls=())
-    result = observe_checkpoint_returned_response(
-        observation, phase=phase, trigger=trigger, attempt=attempt, context=context, env_ref_names=env_ref_names
+    result = _observe_checkpoint_returned_response(
+        observation, phase=phase, trigger=trigger, attempt=attempt, context=context, env_ref_names=env_ref_names, v4_policy=policy
     )
     if observation.audit_call.messages_hash != custody.continuation_checkpoint_v4_admission.hold.source_input_sha256:
         raise AuditIntegrityError("V4 checkpoint result changed its original admitted request")
@@ -358,3 +381,32 @@ def require_original_v4_checkpoint_returned_response(
             raise AuditIntegrityError("V4 checkpoint overflow substituted its original physical source")
     else:
         raise AuditIntegrityError("V4 checkpoint result lost its nominal returned type")
+
+
+def original_v4_checkpoint_returned_audit_call(
+    result: CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation,
+    *,
+    attempt_id: str,
+    request_sha256: str,
+) -> ComposerLLMCall:
+    """Recover the issued audit call for SQL retention, never reconstruct a receipt.
+
+    Overflow observations deliberately contain no private audit payload. Their
+    original call remains available only through the live SDK-return issuer.
+    """
+    require_original_v4_checkpoint_returned_response(result, attempt_id=attempt_id, request_sha256=request_sha256)
+    source = _v4_returns[result]
+    call = source.original.audit_call
+    message = source.original.message
+    metadata = source.original.provider_metadata
+    if (
+        type(call) is not ComposerLLMCall
+        or type(message) is not _AdmittedAssistantMessage
+        or type(metadata) is not _AdmittedLLMProviderMetadata
+        or source.custody.call is not call
+        or call.call_id != attempt_id
+        or call.messages_hash != request_sha256
+    ):
+        raise AuditIntegrityError("V4 checkpoint audit call lost its original physical return custody")
+    source.witness.require_result(metadata, content=message.content, tool_calls=())
+    return call

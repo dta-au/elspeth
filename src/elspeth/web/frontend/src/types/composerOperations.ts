@@ -14,7 +14,16 @@ export type ObserverCustody = Readonly<{
 export type OperationCustody = SubmittedCustody | ObserverCustody;
 export type SessionCustody = Readonly<{ foreground: OperationCustody | null; unresolvedSubmissions: ReadonlyMap<string, SubmittedCustody> }>;
 export interface ComposerOperationError { http_status: number; body: Record<string, unknown>; error_type: string | null; failure_code: "http_error" | "operation_failed" | "worker_lost" | "request_cancelled" | "deadline_expired"; diagnostic_id: string | null }
-export type ComposerOperationPublicFailureType = "request_cancelled" | "composer_operation_deadline_expired" | "composer_operation_worker_lost" | "operation_failed" | "audit_integrity_error" | "database_unavailable" | "executor_unavailable" | "storage_unavailable" | "stale_compose_state" | "fingerprint_key_missing" | "secret_decryption_failed" | "composer_mutation_authority_revoked" | "composer_admission_refused" | "paid_result_overflow";
+export type PaidResultIncompleteCost = { status: "known"; amount: string } | { status: "unknown"; amount: null };
+export interface PaidResultIncompleteBody {
+  error_type: "paid_result_incomplete";
+  detail: string;
+  evidence_status: "incomplete";
+  retryable: false;
+  cost: PaidResultIncompleteCost;
+  request_id: string | null;
+}
+export type ComposerOperationPublicFailureType = "request_cancelled" | "composer_operation_deadline_expired" | "composer_operation_worker_lost" | "operation_failed" | "audit_integrity_error" | "database_unavailable" | "executor_unavailable" | "storage_unavailable" | "stale_compose_state" | "fingerprint_key_missing" | "secret_decryption_failed" | "composer_mutation_authority_revoked" | "composer_admission_refused" | "paid_result_overflow" | "paid_result_incomplete";
 export interface ComposerOperationSavedRevisions {
   attribution: "fenced" | "unstarted" | "unavailable";
   count: number | null;

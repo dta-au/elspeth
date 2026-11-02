@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy import Connection, select
@@ -21,10 +22,21 @@ from elspeth.web.sessions.composer_operations import (
     composer_operation_result_hash,
 )
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, _effect_snapshot, load_snapshot
+from elspeth.web.sessions.continuation_checkpoint_paid_audit import require_checkpoint_paid_public_audit_on_connection
+from elspeth.web.sessions.continuation_checkpoint_paid_incomplete_tail import (
+    CheckpointPaidIncompleteTailBatch,
+    CheckpointPaidIncompleteTailPlan,
+    build_checkpoint_paid_incomplete_tail_batch,
+)
+from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import require_checkpoint_paid_private_audit_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_tail import (
+    CheckpointPaidOverflowTailBatch,
+    CheckpointPaidOverflowTailPlan,
     build_checkpoint_paid_overflow_tail_batch,
 )
 from elspeth.web.sessions.continuation_checkpoint_terminal_hold import prepare_checkpoint_terminal_hold_plan
+from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt, decode_paid_incomplete_receipt
+from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal, paid_incomplete_error
 from elspeth.web.sessions.continuation_paid_overflow import (
     PaidOverflowCost,
     PaidOverflowIdentity,
@@ -54,6 +66,17 @@ from elspeth.web.sessions.time_normalization import restore_utc
 class VerifiedCheckpointPaidOverflowTerminal:
     source: ProviderTerminalHoldSource
     receipt: PaidOverflowReceipt
+    terminal: StoredContinuationSnapshot
+    provider_attempt_id: str
+    hold_state: str
+    phase: str
+    outer_effect_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointPaidIncompleteTerminalEvidence:
+    source: ProviderTerminalHoldSource
+    receipt: PaidIncompleteReceipt
     terminal: StoredContinuationSnapshot
     provider_attempt_id: str
     hold_state: str
@@ -143,9 +166,15 @@ def _event_at(conn: Connection, source: ProviderTerminalHoldSource, cursor: int)
     return row.tag, _bounded_bytes(conn, source, row.payload_chunk_key, "event.v2").decode("utf-8", errors="strict")
 
 
-def read_v4_checkpoint_paid_overflow_terminal_on_connection(
-    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, names: frozenset[str] | None = None
-) -> VerifiedCheckpointPaidOverflowTerminal | None:
+def _read_v4_checkpoint_terminal_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    effect_key: str,
+    disposition: Literal["paid_overflow", "paid_incomplete"],
+    names: frozenset[str] | None = None,
+) -> VerifiedCheckpointPaidOverflowTerminal | CheckpointPaidIncompleteTerminalEvidence | None:
     """Verify source, child, outer unknowns, journal, quota and H together."""
     if type(session_id) is not UUID or type(operation_id) is not str or type(effect_key) is not str:
         raise TypeError("checkpoint cold terminal requires exact original coordinates")
@@ -160,7 +189,7 @@ def read_v4_checkpoint_paid_overflow_terminal_on_connection(
     effect = conn.execute(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation_id, effects.c.effect_key == effect_key)
     ).one()
-    if effect.disposition != "paid_overflow":
+    if effect.disposition != disposition:
         return None
     if (
         effect.owner != "provider"
@@ -367,8 +396,12 @@ def read_v4_checkpoint_paid_overflow_terminal_on_connection(
         source_cursor=source.source_cursor,
         source_snapshot_sha256=source.source_snapshot_sha256,
     )
-    receipt_text = _bounded_bytes(conn, source, effect.result_chunk_key, "composer.paid-overflow.v1").decode("utf-8", errors="strict")
-    receipt = decode_paid_overflow_receipt(receipt_text, expected=identity)
+    codec = "composer.paid-overflow.v1" if disposition == "paid_overflow" else "composer.paid-incomplete.v1"
+    receipt_text = _bounded_bytes(conn, source, effect.result_chunk_key, codec).decode("utf-8", errors="strict")
+    if disposition == "paid_overflow":
+        receipt: PaidOverflowReceipt | PaidIncompleteReceipt = decode_paid_overflow_receipt(receipt_text, expected=identity)
+    else:
+        receipt = decode_paid_incomplete_receipt(receipt_text, expected=identity)
     if receipt.producer != "checkpoint_advisor":
         raise AuditIntegrityError("checkpoint paid overflow borrowed another producer receipt")
     combined = prepare_checkpoint_terminal_hold_plan(
@@ -380,7 +413,17 @@ def read_v4_checkpoint_paid_overflow_terminal_on_connection(
     )
     if source.reserved_bytes != combined.reserved_bytes or source.fallback_contract_sha256 != combined.contract_sha256:
         raise AuditIntegrityError("checkpoint paid overflow changed its original pre-SDK H bound")
-    plan = combined.paid_overflow
+    plan = combined.paid_overflow if disposition == "paid_overflow" else combined.paid_incomplete
+    terminal_event_tag, terminal_event_text = _event_at(conn, source, admitted.cursor + 1)
+    terminal_event, terminal_event_error = parse_json_strict(terminal_event_text)
+    if (
+        terminal_event_tag != "checkpoint"
+        or terminal_event_error is not None
+        or type(terminal_event) is not dict
+        or type(terminal_event.get("private_audit_sha256")) is not str
+    ):
+        raise AuditIntegrityError("checkpoint paid terminal lost its private audit event commitment")
+    private_audit_sha256 = terminal_event["private_audit_sha256"]
     terminal = load_snapshot(conn, session_id=sid, operation_id=operation_id)
     terminal_row = conn.execute(
         select(checkpoints).where(
@@ -389,7 +432,19 @@ def read_v4_checkpoint_paid_overflow_terminal_on_connection(
             checkpoints.c.checkpoint_id == terminal.checkpoint_id,
         )
     ).one()
-    batch = build_checkpoint_paid_overflow_tail_batch(plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))
+    batch: CheckpointPaidOverflowTailBatch | CheckpointPaidIncompleteTailBatch
+    if type(plan) is CheckpointPaidOverflowTailPlan and type(receipt) is PaidOverflowReceipt:
+        batch = build_checkpoint_paid_overflow_tail_batch(
+            plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at), private_audit_sha256=private_audit_sha256
+        )
+        expected_error = checkpoint_paid_overflow_error(parent.request_id, receipt.cost)
+    elif type(plan) is CheckpointPaidIncompleteTailPlan and type(receipt) is PaidIncompleteReceipt:
+        batch = build_checkpoint_paid_incomplete_tail_batch(
+            plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at), private_audit_sha256=private_audit_sha256
+        )
+        expected_error = paid_incomplete_error(parent.request_id, receipt.cost)
+    else:
+        raise AuditIntegrityError("checkpoint terminal crossed returned result dispositions")
     if (
         terminal_row.kind != "transition"
         or effect.receipt_key != batch.receipt_key
@@ -404,7 +459,7 @@ def read_v4_checkpoint_paid_overflow_terminal_on_connection(
         or parent.checkpoint_id != terminal.checkpoint_id
         or parent.journal_cursor != terminal.cursor
         or parent.result_schema != COMPOSER_OPERATION_RESULT_SCHEMA_ERROR
-        or parent.result_json != canonical_json(checkpoint_paid_overflow_error(parent.request_id, receipt.cost).model_dump(mode="json"))
+        or parent.result_json != canonical_json(expected_error.model_dump(mode="json"))
         or parent.result_sha256 != composer_operation_result_hash(parent.result_json)
     ):
         raise AuditIntegrityError("checkpoint paid overflow lost its exact failed terminal result")
@@ -470,6 +525,23 @@ def read_v4_checkpoint_paid_overflow_terminal_on_connection(
         or restore_utc(physical_row.settled_at) < restore_utc(entry.recorded_at)
     ):
         raise AuditIntegrityError("checkpoint paid overflow lost its original quota ledger")
+    require_checkpoint_paid_public_audit_on_connection(
+        conn,
+        source=source,
+        attempt_id=identity.attempt_id,
+        requested_model=effect.requested_model,
+        physical_started_at=physical_row.started_at,
+        physical_settled_at=physical_row.settled_at,
+        response_finished_at=effect.response_finished_at,
+        receipt=receipt,
+    )
+    require_checkpoint_paid_private_audit_on_connection(
+        conn,
+        source=source,
+        attempt_id=identity.attempt_id,
+        private_sha256=private_audit_sha256,
+        incomplete=disposition == "paid_incomplete",
+    )
     segment = conn.execute(
         select(segments).where(
             segments.c.session_id == sid, segments.c.operation_id == operation_id, segments.c.sequence == source.creator_sequence
@@ -492,6 +564,57 @@ def read_v4_checkpoint_paid_overflow_terminal_on_connection(
         or parent.ownership_generation != source.creator_generation
     ):
         raise AuditIntegrityError("checkpoint paid overflow lost its closed original segment")
-    return VerifiedCheckpointPaidOverflowTerminal(
+    if type(receipt) is PaidOverflowReceipt:
+        return VerifiedCheckpointPaidOverflowTerminal(
+            source, receipt, terminal, identity.attempt_id, hold.state, preparation["phase"], preparation["outer_effect_key"]
+        )
+    if type(receipt) is not PaidIncompleteReceipt:
+        raise AuditIntegrityError("checkpoint incomplete terminal lost its distinct receipt")
+    return CheckpointPaidIncompleteTerminalEvidence(
         source, receipt, terminal, identity.attempt_id, hold.state, preparation["phase"], preparation["outer_effect_key"]
     )
+
+
+def read_v4_checkpoint_paid_overflow_terminal_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, names: frozenset[str] | None = None
+) -> VerifiedCheckpointPaidOverflowTerminal | None:
+    result = _read_v4_checkpoint_terminal_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        effect_key=effect_key,
+        disposition="paid_overflow",
+        names=names,
+    )
+    if result is None or type(result) is VerifiedCheckpointPaidOverflowTerminal:
+        return result
+    raise AuditIntegrityError("checkpoint overflow reader crossed its terminal disposition")
+
+
+def read_v4_checkpoint_paid_incomplete_terminal_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, names: frozenset[str] | None = None
+) -> CheckpointPaidIncompleteTerminalEvidence | None:
+    result = _read_v4_checkpoint_terminal_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        effect_key=effect_key,
+        disposition="paid_incomplete",
+        names=names,
+    )
+    if result is None or type(result) is CheckpointPaidIncompleteTerminalEvidence:
+        return result
+    raise AuditIntegrityError("checkpoint incomplete reader crossed its terminal disposition")
+
+
+def read_v4_checkpoint_paid_incomplete_verified_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, names: frozenset[str] | None = None
+) -> VerifiedPaidIncompleteTerminal | None:
+    evidence = read_v4_checkpoint_paid_incomplete_terminal_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, effect_key=effect_key, names=names
+    )
+    if evidence is None:
+        return None
+    if evidence.hold_state != "consumed":
+        raise AuditIntegrityError("checkpoint incomplete terminal has not consumed original H")
+    return VerifiedPaidIncompleteTerminal(evidence.source, evidence.receipt, evidence.terminal, evidence.provider_attempt_id, "consumed")

@@ -55,3 +55,10 @@ describe("operation outcome notice", () => {
     expect(screen.getByRole("note")).not.toHaveTextContent("Saved draft changes remain available.");
   });
 });
+
+it("names paid incomplete evidence honestly when history carries no cost", () => {
+  render(<ComposerOperationOutcomeNotice outcome={{ ...outcome, failure_code: "http_error", error_type: "paid_result_incomplete" }} />);
+  expect(screen.getByText(/without using or retrying that result/)).toBeInTheDocument();
+  expect(screen.getByText(/Cost information is unavailable in this history notice/)).toBeInTheDocument();
+  expect(screen.queryByRole("button")).not.toBeInTheDocument();
+});

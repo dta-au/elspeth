@@ -21,8 +21,10 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import _usage_entry_id
 from elspeth.web.required_work import required_failure_leaves
@@ -41,13 +43,37 @@ from elspeth.web.sessions.models import composer_continuation_provider_ordinals_
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.time_normalization import restore_utc
-from tests.helpers.continuation_policy import continuation_test_settings
+from tests.helpers.continuation_policy import classifier_15s_probe_settings, continuation_test_settings
 from tests.unit.web.sessions import test_continuation_composition_initialization as initialization
+from tests.unit.web.sessions import test_continuation_initialization as bootstrap_fixture
+from tests.unit.web.sessions import test_continuation_live_phases as live_fixture
 from tests.unit.web.sessions.test_continuation_iteration_stages import _applied_case
 from tests.unit.web.sessions.test_continuation_iteration_stages import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 
 operation_store = _operation_store
+
+
+@asynccontextmanager
+async def _classifier_15s_case(store, tmp_path, monkeypatch):
+    """Admit an authentic V2 classifier with one explicit test-only PRIMARY bound."""
+    settings = classifier_15s_probe_settings()
+    policy = continuation_policy_from_settings(settings)
+    assert policy.actions.primary.preparation == 15.0
+    authority = ComposerAsyncOperationAuthority(
+        store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
+    )
+    original_input = live_fixture.initialized_primary_input
+
+    async def with_primary_probe(current_store, current_tmp_path, current_monkeypatch, *, settings_overrides=None):
+        overrides = {**(settings_overrides or {}), "composer_continuation_action_bounds": settings.composer_continuation_action_bounds}
+        return await original_input(current_store, current_tmp_path, current_monkeypatch, settings_overrides=overrides)
+
+    monkeypatch.setattr(bootstrap_fixture, "minimal_continuation_policy", lambda: policy)
+    monkeypatch.setattr(live_fixture, "initialized_primary_input", with_primary_probe)
+    probe_store = (store[0], store[1], authority, store[3], store[4])
+    async with _classifier_case(probe_store, tmp_path, monkeypatch) as case:
+        yield case
 
 
 @asynccontextmanager
@@ -142,7 +168,7 @@ async def _invoke(issuer, runtime, prepared, *, branch="composition_last_chance"
 @pytest.mark.asyncio
 @pytest.mark.parametrize("branch", ("staged_review", "composition_last_chance"))
 async def test_classifier_retains_actual_sdk_source_cost_and_next_shared_primary_ordinal(operation_store, tmp_path, monkeypatch, branch):
-    async with _classifier_case(operation_store, tmp_path, monkeypatch) as (phases, running, runtime, issuer, prepared, prior_sdk):
+    async with _classifier_15s_case(operation_store, tmp_path, monkeypatch) as (phases, running, runtime, issuer, prepared, prior_sdk):
         assert len(prior_sdk) == 1
         physical = []
         with operation_store[0].connect() as conn:
@@ -261,6 +287,7 @@ async def test_classifier_fresh_clock_cannot_renew_expired_original_action(opera
         monkeypatch.setattr(litellm, "acompletion", forbidden)
         timing = phases.work.coordinator.sql_deadline_owner
         assert type(timing) is ContinuationSQLDeadlineOwner
+        assert timing.policy.actions.primary.preparation == 15.0
         timing.begin_action(timing.policy.actions.primary, started_at=time.monotonic() - timing.policy.actions.primary.total - 1)
         before = stored_rows(operation_store[0])
         with pytest.raises(TimeoutError, match="expired before preparation"):

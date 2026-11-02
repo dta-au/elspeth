@@ -14,7 +14,7 @@ from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy import insert, select, update
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, RootTransaction
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
@@ -99,6 +99,49 @@ class SemanticActionAdmission:
     owner_effect_key: str | None = None
     review_candidate: EndContinuationCandidate | None = None
     review_candidate_source: PrivateChunkRef | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentTransactionReviewProof:
+    """One already re-proved installed source, valid only in its SQL transaction."""
+
+    connection: Connection
+    transaction: RootTransaction
+    installed: StoredContinuationSnapshot
+    effect_key: str
+    admission: SemanticActionAdmission
+
+
+def _require_same_review_transaction(
+    conn: Connection,
+    source_connection: Connection,
+    source_transaction: RootTransaction,
+    source_snapshot: StoredContinuationSnapshot,
+    current_snapshot: StoredContinuationSnapshot,
+    source_effect_key: str,
+    current_effect_key: str,
+) -> None:
+    if (
+        conn is not source_connection
+        or conn.get_transaction() is not source_transaction
+        or source_snapshot != current_snapshot
+        or source_effect_key != current_effect_key
+    ):
+        raise AuditIntegrityError("semantic Review cannot reuse proof outside its original current transaction and source")
+
+
+def _capture_current_review_proof(
+    conn: Connection, selected: StoredContinuationSnapshot, effect_key: str, admission: SemanticActionAdmission
+) -> _CurrentTransactionReviewProof:
+    transaction = conn.get_transaction()
+    if (
+        transaction is None
+        or type(admission) is not SemanticActionAdmission
+        or admission.paid.selected != selected
+        or admission.paid.source.effect_key != effect_key
+    ):
+        raise AuditIntegrityError("semantic Review cannot capture an unproved original current source")
+    return _CurrentTransactionReviewProof(conn, transaction, selected, effect_key, admission)
 
 
 @dataclass(frozen=True, slots=True)
@@ -802,13 +845,29 @@ def _consumed_review_from_snapshot(
     operation_id: str,
     selected: StoredContinuationSnapshot,
     effect_key: str,
+    *,
+    current_transaction_proof: _CurrentTransactionReviewProof | None = None,
 ) -> SemanticActionAdmission:
     """Reprove one immutable Advisor-to-END bridge at its exact checkpoint."""
     sid, operation = str(session_id), operation_id
     if selected.cursor < 1:
         raise AuditIntegrityError("semantic Review has no installed paid predecessor")
     installed = _historical_snapshot(conn, sid, operation, cursor=selected.cursor - 1)
-    admission = _reprove_installed_snapshot(conn, session_id, operation, installed, effect_key)
+    if current_transaction_proof is None:
+        admission = _reprove_installed_snapshot(conn, session_id, operation, installed, effect_key)
+    else:
+        _require_same_review_transaction(
+            conn,
+            current_transaction_proof.connection,
+            current_transaction_proof.transaction,
+            current_transaction_proof.installed,
+            installed,
+            current_transaction_proof.effect_key,
+            effect_key,
+        )
+        admission = current_transaction_proof.admission
+        if type(admission) is not SemanticActionAdmission or admission.paid.selected != installed:
+            raise AuditIntegrityError("semantic Review reused an unproved original installed source")
     if type(admission.action) is not ReviewContinuationAction or admission.action_key is None:
         raise AuditIntegrityError("semantic Review bridge lacks its original paid action")
     frames = admission.expected_root.frames

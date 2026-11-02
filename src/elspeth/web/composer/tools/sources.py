@@ -89,6 +89,7 @@ from elspeth.web.composer.tools._common import (
 from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
     _blob_id_uuid_validation_error,
+    _blob_record_to_tool_dict,
     _blob_row_to_tool_dict,
     _fenced_blob_reader,
     _locked_read_ready_blob,
@@ -1927,6 +1928,8 @@ def _execute_inspect_source(
         return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
 
     record = verified.record
+    if context.continuation_read_observations is not None:
+        context.continuation_read_observations.observe_blob(_blob_record_to_tool_dict(record))
     data = verified.prefix
     facts = inspect_blob_content(
         content=data,

@@ -446,19 +446,18 @@ entries:
 - path: tests/helpers/web_reserve_composer_receiver.py
   qualname: composer_receiver_local_contracts
   kind: getattr
-  occurrences: 5
+  occurrences: 4
   probe_shapes:
   - 2ba15a6635ab31b24a18fd9f2bae50e5ca18443a6fb75d9a7bd33256ec4222b1
   - 3afb895646b5c99cc78885be596ee26113c950c26c71bc75ca93d7de5c2e979d
   - 679332bdd2da5a52df751bfd301bc6a5398cfee314e08e5dc61a4abc2d40e547
-  - 9ba2120b9748d639f6653118d8bac302816f7903b808af37c2b3878773d4091e
   - ad9c0ba16d3778b1e821aa832a44def9fdd21892f4d7d93797915bb22e8370e1
   classification: approved-introspection
-  justification: Five source-tree probes reject generic AST app, DTO factory and turn
-    definitions and inspect nullable exception/pattern name and mapping rest binders
-    on nominally selected AST kinds. These detect noncanonical definitions or producer
-    rebinding and do not classify runtime service objects. Both selected coroutine
-    descriptors now read their AST type_params directly.
+  justification: Four source-tree probes reject generic AST app and DTO factory definitions
+    and inspect nullable exception/pattern name and mapping rest binders on nominally
+    selected AST kinds. The retired V1 turn probe is absent; actual_code checks generic
+    metadata for the current driver and phase invocation owners. These checks inspect
+    parsed source, not runtime service objects.
 - path: tests/helpers/web_reserve_composer_receiver.py
   qualname: immediate
   kind: getattr
@@ -490,16 +489,6 @@ entries:
   justification: After a nominal ClassDef check, reads AST generic metadata and rejects
     nonempty type_params before the separate DTO field, decorator and ordinary-method
     checks.
-- path: tests/helpers/web_reserve_composer_receiver.py
-  qualname: receiver_transfer_prefix
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 52d04c94bd5cac64b6de59183414b5aa55ab77e6875df86d788cb3c996049eea
-  classification: approved-introspection
-  justification: Checks optional type_params on the parsed deferred settle_post_provider
-    AsyncFunctionDef while pinning its parameters, decorators, and transfer prefix.
-    A generic definition fails the source-only contract.
 - path: tests/helpers/web_reserve_composer_receiver.py
   qualname: runtime_walk
   kind: getattr
@@ -1546,14 +1535,14 @@ entries:
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_captured_composer_receiver
   kind: getattr
-  occurrences: 2
+  occurrences: 1
   probe_shapes:
-  - 1c4ed2b681fe11d2555d0b880f73507df1cc14a60f776a470d2246233582e146
   - ee41cba02edf969d1e4ba5c5ea13012e9000dd8b02e4e6617ca73f3877f743b8
   classification: approved-introspection
-  justification: Reads AST generic metadata on the parsed registry ClassDef and deferred
-    AsyncFunctionDef. Nonempty type_params rejects the source interval and constructor
-    grammar; complete DTO capture and same-AST call checks remain required.
+  justification: Reads AST generic metadata on the parsed lock-registry ClassDef.
+    Nonempty type_params rejects its source constructor grammar. The retired deferred
+    V1 coroutine interval is absent; current driver capture and phase dispatch are
+    independently checked by the receiver contract and exact same-AST receipt identity.
 - path: tests/unit/architecture/test_web_landscape_mutation_fencing.py
   qualname: _reserve_dominating_direct_statement
   kind: getattr

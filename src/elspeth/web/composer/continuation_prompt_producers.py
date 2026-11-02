@@ -97,13 +97,18 @@ from elspeth.web.sessions.transcript_reads import non_private_message_predicate,
 
 if TYPE_CHECKING:
     from elspeth.web.catalog.policy_view import PolicyCatalogView
+    from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
     from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
     from elspeth.web.composer.continuation_control_transitions import ControlResultToolMessage
     from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
     from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
     from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot
     from elspeth.web.composer.continuation_metadata_preparation import PreparedMetadataToolCall
+    from elspeth.web.composer.continuation_pipeline_preparation import PreparedPipelineToolCall
     from elspeth.web.composer.continuation_retention import OrderedObjectJSON
+    from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+    from elspeth.web.composer.continuation_value_batch_computation import ObservedValueBatchComputation
+    from elspeth.web.composer.continuation_value_batch_preparation import PreparedValueBatchCall
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.tool_batch import ContinuationBatchState, ContinuationCallState
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -867,13 +872,247 @@ class CurrentContinuationMessageProducers:
         detached graph. Every later source reader still proves the actual SQL
         issue and completion through the ordinary tool-result recipe.
         """
+        self._register_prepared_value_result_message(prepared=prepared, result=result, serialized=serialized)
+
+    def register_prepared_pipeline_result_message(
+        self,
+        *,
+        prepared: PreparedPipelineToolCall,
+        result: ToolResult,
+        serialized: str,
+    ) -> None:
+        """Record exact V4 pipeline result DATA before whole-tail admission."""
+        self._register_prepared_value_result_message(prepared=prepared, result=result, serialized=serialized)
+
+    def _prepared_value_batch_message_source(
+        self,
+        *,
+        runtime: RestoredContinuationRuntime,
+        call_model: _CallModelOutcome,
+        index: int,
+    ) -> tuple[object, _AdmittedToolCall, _ToolOutcome, ComposerToolInvocation, PrivateToolAuthoring, PrivateChunkRef]:
+        """Read the one actual detached message and its completed recorder entry."""
+        from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+        from elspeth.web.composer.continuation_batch_data import RestoredBatchData
+        from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+        from elspeth.web.composer.tool_batch import ContinuationCallState
+
+        self._require_compose_family()
+        if (
+            type(runtime) is not RestoredContinuationRuntime
+            or type(call_model) is not _CallModelOutcome
+            or type(index) is not int
+            or runtime.materialization is not self
+            or runtime.source.selected is not self.selected
+            or runtime.env_ref_names != self.inventory.names
+        ):
+            raise AuditIntegrityError("value-batch message crossed its original detached producer")
+        data = runtime.graph.batch
+        top = self.selected.stack.frames[-1]
+        if (
+            type(data) is not RestoredBatchData
+            or type(top) is not ToolBatchFrame
+            or top.phase != "tool_ready"
+            or top.accumulator.codec != "composer.coupled-batch-data.v1"
+            or not 0 <= index < len(data.calls)
+            or len(call_model.completion.tool_batch.calls) != len(data.calls)
+            or any(original is not observed for original, observed in zip(data.calls, call_model.completion.tool_batch.calls, strict=True))
+        ):
+            raise AuditIntegrityError("value-batch message changed its original ready tool batch")
+        batch = data.batch
+        call = batch.current_call
+        if (
+            type(call) is not ContinuationCallState
+            or call.index != index
+            or call.tool_call is not data.calls[index]
+            or len(batch.tool_outcomes) != index + 1
+            or batch.tool_outcomes[index].call is not call.tool_call
+        ):
+            raise AuditIntegrityError("value-batch message has no exact completed call")
+        candidate = runtime.live.llm_messages[-1] if runtime.live.llm_messages else None
+        if (
+            type(candidate) is not dict
+            or tuple(candidate) != ("role", "tool_call_id", "content", PROMPT_GUARD_CONTENT_PARTS_KEY)
+            or candidate["role"] != "tool"
+            or candidate["tool_call_id"] != call.tool_call.id
+            or sum(type(message) is dict and message.get("tool_call_id") == call.tool_call.id for message in runtime.live.llm_messages) != 1
+        ):
+            raise AuditIntegrityError("value-batch message lost its one actual appended feedback")
+        authoring = batch.private_authorings_by_call[call.tool_call.id]
+        matching = tuple(invocation for invocation in runtime.live.recorder.invocations if invocation.tool_call_id == call.tool_call.id)
+        if type(authoring) is not PrivateToolAuthoring or len(matching) != 1 or matching[0].private_authoring is not authoring:
+            raise AuditIntegrityError("value-batch message lost its original invocation and authoring")
+        return candidate, call.tool_call, batch.tool_outcomes[index], matching[0], authoring, top.response
+
+    def register_prepared_value_batch_preparation_error(
+        self,
+        *,
+        runtime: RestoredContinuationRuntime,
+        call_model: _CallModelOutcome,
+        index: int,
+    ) -> None:
+        """Register the actual ARG_ERROR appended by the original preparation loop."""
+        from elspeth.contracts.composer_audit import ComposerToolStatus
+        from elspeth.web.composer.continuation_batch_data import RestoredBatchData
+        from elspeth.web.composer.tool_batch import ContinuationCallState
+
+        message, tool_call, outcome, invocation, authoring, response = self._prepared_value_batch_message_source(
+            runtime=runtime, call_model=call_model, index=index
+        )
+        if type(message) is not dict:
+            raise AuditIntegrityError("value-batch early feedback lost its actual mutable message")
+        data = runtime.graph.batch
+        if type(data) is not RestoredBatchData:
+            raise AuditIntegrityError("value-batch early feedback lost its original batch")
+        call = data.batch.current_call
+        if (
+            type(call) is not ContinuationCallState
+            or call.audit is not None
+            or invocation.status is not ComposerToolStatus.ARG_ERROR
+            or outcome.response is not None
+        ):
+            raise AuditIntegrityError("value-batch early feedback changed its original preparation error")
+        recipe = capture_tool_feedback_recipe(
+            response=response,
+            completion=call_model.completion,
+            tool_index=index,
+            call=tool_call,
+            invocation=invocation,
+            authoring=authoring,
+            serialized=message["content"],
+            message=message,
+            outcome=outcome,
+        )
+        self._remember_feedback_provenance(
+            message=message, recipe=recipe, call=tool_call, invocation=invocation, authoring=authoring, outcome=outcome
+        )
+
+    def register_prepared_value_batch_messages(
+        self,
+        *,
+        prepared: PreparedValueBatchCall,
+        computation: ObservedValueBatchComputation,
+    ) -> None:
+        """Bind the actual ordinary worker's one value/result feedback object."""
+        from elspeth.contracts.composer_audit import ComposerToolStatus
+        from elspeth.web.composer.continuation_value_batch_computation import (
+            ObservedValueBatchComputation,
+            original_value_batch_result_source,
+        )
+        from elspeth.web.composer.continuation_value_batch_preparation import PreparedValueBatchCall
+        from elspeth.web.composer.discovery_cache import make_cache_key, serialize_tool_result
+
+        if type(prepared) is not PreparedValueBatchCall or type(computation) is not ObservedValueBatchComputation:
+            raise AuditIntegrityError("value-batch result lacks original nominal preparation and computation")
+        original, computed, admitted, error, cached = original_value_batch_result_source(computation)
+        if (
+            original is not prepared
+            or prepared.runtime.materialization is not self
+            or prepared.context.message_producers is not self
+            or prepared.runtime.source.selected is not self.selected
+            or not 0 <= prepared.call.index < len(prepared.call_model.completion.tool_batch.calls)
+            or prepared.call_model.completion.tool_batch.calls[prepared.call.index] is not prepared.call.tool_call
+            or prepared.call.audit is not prepared.original_audit
+            or prepared.call.audit != prepared.original_audit_fields
+        ):
+            raise AuditIntegrityError("value-batch result changed its original detached source")
+        message, tool_call, outcome, invocation, authoring, response = self._prepared_value_batch_message_source(
+            runtime=prepared.runtime, call_model=prepared.call_model, index=prepared.call.index
+        )
+        if type(message) is not dict:
+            raise AuditIntegrityError("value-batch result lost its actual mutable message")
+        if cached is not None and (
+            prepared.call.arguments is None
+            or prepared.context.discovery_cache.get(make_cache_key(prepared.call.tool_name, prepared.call.arguments)) is not cached
+        ):
+            raise AuditIntegrityError("value-batch result changed its original cached observation")
+        if error is not None:
+            if (
+                computed is not None
+                or cached is not None
+                or invocation.status is not ComposerToolStatus.ARG_ERROR
+                or outcome.response is not None
+            ):
+                raise AuditIntegrityError("value-batch argument feedback contradicted its original worker")
+            feedback_recipe = capture_tool_feedback_recipe(
+                response=response,
+                completion=prepared.call_model.completion,
+                tool_index=prepared.call.index,
+                call=tool_call,
+                invocation=invocation,
+                authoring=authoring,
+                serialized=message["content"],
+                message=message,
+                outcome=outcome,
+            )
+            self._remember_feedback_provenance(
+                message=message, recipe=feedback_recipe, call=tool_call, invocation=invocation, authoring=authoring, outcome=outcome
+            )
+            return
+        result = outcome.response
+        if type(result) is not ToolResult or computed is None:
+            raise AuditIntegrityError("value-batch result lost its actual nominal worker output")
+        if admitted is None:
+            if result is not computed.result:
+                raise AuditIntegrityError("value-batch result replaced its original computed worker object")
+            original_result: ToolResult | AdmittedDiscoveryResult = computed.result
+            serialized = serialize_tool_result(computed.result)
+        else:
+            if admitted.result is not computed.result or result != admitted.to_tool_result():
+                raise AuditIntegrityError("value-batch result changed its original admitted discovery output")
+            original_result = admitted
+            serialized = serialize_admitted_discovery_result(admitted)
+        if message["content"] != serialized:
+            raise AuditIntegrityError("value-batch result changed the original serialized worker output")
+        if tool_call.function.name == "get_plugin_schema" and result.success:
+            registrations = tuple((recipe, wire) for actual, recipe, wire in self._produced if actual is message)
+            if (
+                len(registrations) != 1
+                or type(registrations[0][0]) is not PluginSchemaMessageRecipe
+                or registrations[0][1] != _wire(message)
+            ):
+                raise AuditIntegrityError("value-batch schema result lost its original registered producer")
+            return
+        if result.plugin_schemas is not None:
+            raise AuditIntegrityError("value-batch result needs its existing schema-aware producer")
+        if any(actual is message for actual, *_rest in self._produced) or any(item.message is message for item in self._feedback_produced):
+            raise AuditIntegrityError("value-batch result was already registered by another source")
+        result_recipe = capture_tool_result_recipe(
+            response=response,
+            completion=prepared.call_model.completion,
+            tool_index=prepared.call.index,
+            call=tool_call,
+            result=original_result,
+            serialized=message["content"],
+            message=message,
+        )
+        registered = self._register(message, result_recipe)
+        self._remember_tool_result_provenance(registered)
+
+    def _register_prepared_value_result_message(
+        self,
+        *,
+        prepared: PreparedMetadataToolCall | PreparedPipelineToolCall,
+        result: ToolResult,
+        serialized: str,
+    ) -> None:
         from elspeth.web.composer.continuation_batch_data import decode_coupled_batch_chunk
         from elspeth.web.composer.continuation_metadata_preparation import PreparedMetadataToolCall
-        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
+        from elspeth.web.composer.continuation_pipeline_preparation import PreparedPipelineToolCall
+        from elspeth.web.composer.continuation_policy import (
+            ContinuationAdmissionPolicyV3,
+            ContinuationAdmissionPolicyV4,
+            decode_continuation_policy,
+        )
 
+        if type(prepared) is PreparedMetadataToolCall:
+            tool_name = "set_metadata"
+        elif type(prepared) is PreparedPipelineToolCall:
+            tool_name = "set_pipeline"
+        else:
+            raise AuditIntegrityError("value recipe lost its original nominal preparation")
         if (
-            type(prepared) is not PreparedMetadataToolCall
-            or prepared.runtime.materialization is not self
+            prepared.runtime.materialization is not self
             or prepared.context.message_producers is not self
             or prepared.runtime.source.selected is not self.selected
         ):
@@ -887,7 +1126,8 @@ class CurrentContinuationMessageProducers:
         top = selected.stack.frames[-1]
         policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
         if (
-            type(policy) is not ContinuationAdmissionPolicyV3
+            type(policy) not in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
+            or (tool_name == "set_pipeline" and type(policy) is not ContinuationAdmissionPolicyV4)
             or type(top) is not ToolBatchFrame
             or top.phase != "tool_ready"
             or top.accumulator.codec != "composer.coupled-batch-data.v1"
@@ -895,7 +1135,7 @@ class CurrentContinuationMessageProducers:
             or top.next_tool_index != 0
             or len(completion.tool_batch.calls) != 1
             or completion.tool_batch.calls[0] is not call
-            or call.function.name != "set_metadata"
+            or call.function.name != tool_name
             or type(result) is not ToolResult
             or result.plugin_schemas is not None
         ):

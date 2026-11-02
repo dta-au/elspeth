@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 from uuid import UUID
 
 from sqlalchemy import Connection, select
@@ -15,10 +14,12 @@ from elspeth.web.composer.continuation_iteration_transitions import applied_batc
 from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_RESULT_SCHEMA_ERROR, composer_operation_result_hash
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, load_snapshot
 from elspeth.web.sessions.continuation_classifier_primary import _chain, _read_source
+from elspeth.web.sessions.continuation_classifier_primary_incomplete_tail import prepare_classifier_paid_incomplete_tail_plan
 from elspeth.web.sessions.continuation_classifier_primary_paid_tail import (
     build_classifier_paid_overflow_tail_batch,
     prepare_classifier_paid_overflow_tail_plan,
 )
+from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import classifier_terminal_reservation
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity, PaidOverflowReceipt, decode_paid_overflow_receipt
 from elspeth.web.sessions.continuation_primary import _input_value
 from elspeth.web.sessions.continuation_primary_paid_overflow_source import require_original_v4_primary_physical_source_on_connection
@@ -143,6 +144,9 @@ def read_v4_classifier_paid_overflow_terminal_on_connection(
     receipt_bytes = _bounded_bytes(conn, source, effect.result_chunk_key, "composer.paid-overflow.v1")
     receipt = decode_paid_overflow_receipt(receipt_bytes.decode("utf-8", errors="strict"), expected=identity)
     paid_plan = prepare_classifier_paid_overflow_tail_plan(identity=identity, admitted=admitted, creator_sequence=source.creator_sequence)
+    incomplete_plan = prepare_classifier_paid_incomplete_tail_plan(
+        identity=identity, admitted=admitted, creator_sequence=source.creator_sequence
+    )
     from elspeth.web.sessions.continuation_classifier_primary_no_sdk import prepare_classifier_no_sdk_tail_plan
 
     no_sdk_plan = prepare_classifier_no_sdk_tail_plan(
@@ -156,18 +160,15 @@ def read_v4_classifier_paid_overflow_terminal_on_connection(
         claim_attempt=source.claim_attempt,
         operation_epoch=source.session_operation_epoch,
     )
-    reserved = max(paid_plan.reserved_bytes, no_sdk_plan.reserved_bytes)
-    combined = sha256(
-        canonical_json(
-            {
-                "version": "composer.classifier-primary-v4-combined-tail.v1",
-                "paid": paid_plan.fallback_contract_sha256,
-                "no_sdk": no_sdk_plan.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
-    if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined:
+    reservation = classifier_terminal_reservation(
+        paid_contract=paid_plan.fallback_contract_sha256,
+        paid_bytes=paid_plan.reserved_bytes,
+        incomplete_contract=incomplete_plan.fallback_contract_sha256,
+        incomplete_bytes=incomplete_plan.reserved_bytes,
+        no_sdk_contract=no_sdk_plan.contract_sha256,
+        no_sdk_bytes=no_sdk_plan.reserved_bytes,
+    )
+    if source.reserved_bytes != reservation.reserved_bytes or source.fallback_contract_sha256 != reservation.contract_sha256:
         raise AuditIntegrityError("classifier PRIMARY paid terminal changed original combined H")
     batch = build_classifier_paid_overflow_tail_batch(paid_plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))
     if (

@@ -58,6 +58,7 @@ def _terminal_shape(
     phase: Literal["early", "end"],
     creator_sequence: int,
     receipt_digest: str,
+    private_audit_sha256: str,
 ) -> tuple[str, tuple[ContinuationEvent, ...], tuple[str, ...], str, str]:
     root = decode_continuation_snapshot(admitted.payload_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
@@ -78,6 +79,8 @@ def _terminal_shape(
         or phase not in ("early", "end")
         or len(receipt_digest) != 64
         or any(character not in "0123456789abcdef" for character in receipt_digest)
+        or len(private_audit_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in private_audit_sha256)
     ):
         raise AuditIntegrityError("checkpoint overflow tail lost its original dispatched child")
     receipt_key = f"paid-overflow:{receipt_digest}"
@@ -113,6 +116,7 @@ def _terminal_shape(
                     "receipt_key": receipt_key,
                     "result_chunk_key": receipt_chunk_key,
                     "source_result_complete": True,
+                    "private_audit_sha256": private_audit_sha256,
                     "source_checkpoint_id": identity.source_checkpoint_id,
                     "source_cursor": identity.source_cursor,
                 }
@@ -143,14 +147,18 @@ def prepare_checkpoint_paid_overflow_tail_plan(
     creator_sequence: int,
 ) -> CheckpointPaidOverflowTailPlan:
     """Reserve the closed receipt envelope and exact event/root byte shapes."""
-    terminal_json, events, _unresolved, _key, _chunk_key = _terminal_shape(admitted, identity, phase, creator_sequence, "0" * 64)
+    terminal_json, events, _unresolved, _key, _chunk_key = _terminal_shape(admitted, identity, phase, creator_sequence, "0" * 64, "0" * 64)
     # The shared closed-schema envelope currently writes the TITLE producer.
     # This tail's exact producer is longer; account for that JSON field's byte
     # delta before any physical call can reserve H.
     producer_delta = len(canonical_json("checkpoint_advisor").encode("utf-8")) - len(canonical_json("title").encode("utf-8"))
     maximum = _maximum_receipt_bytes(identity) + producer_delta
     event_bytes = tuple(len(event.payload_json.encode("utf-8")) for event in events)
-    root_bytes = len(terminal_json.encode("utf-8"))
+    root_bytes = len(
+        encode_continuation_snapshot(
+            decode_continuation_snapshot(terminal_json).model_copy(update={"cursor": admitted.cursor + len(events)})
+        ).encode("utf-8")
+    )
     reserved = maximum + sum(event_bytes) + root_bytes
     contract = sha256(
         canonical_json(
@@ -174,7 +182,11 @@ def prepare_checkpoint_paid_overflow_tail_plan(
 
 
 def build_checkpoint_paid_overflow_tail_batch(
-    plan: CheckpointPaidOverflowTailPlan, *, receipt: PaidOverflowReceipt, published_at: datetime
+    plan: CheckpointPaidOverflowTailPlan,
+    *,
+    receipt: PaidOverflowReceipt,
+    published_at: datetime,
+    private_audit_sha256: str = "0" * 64,
 ) -> CheckpointPaidOverflowTailBatch:
     """Build one exact replacement of H after a returned incomplete result."""
     if type(plan) is not CheckpointPaidOverflowTailPlan or type(receipt) is not PaidOverflowReceipt:
@@ -190,7 +202,7 @@ def build_checkpoint_paid_overflow_tail_batch(
     receipt_json = encode_paid_overflow_receipt(receipt, expected=plan.identity)
     receipt_digest = sha256(receipt_json.encode("utf-8")).hexdigest()
     terminal_json, events, _unresolved, receipt_key, receipt_chunk_key = _terminal_shape(
-        plan.admitted, plan.identity, plan.phase, plan.creator_sequence, receipt_digest
+        plan.admitted, plan.identity, plan.phase, plan.creator_sequence, receipt_digest, private_audit_sha256
     )
     append = prepare_snapshot_append(plan.admitted, snapshot_json=terminal_json, events=events, published_at=published_at)
     prospective = (

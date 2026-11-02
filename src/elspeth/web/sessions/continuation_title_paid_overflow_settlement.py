@@ -21,9 +21,15 @@ from elspeth.web.composer.continuation_title_observation import (
     TitleOverflowUsageObservation,
     _cost_observation,
     _usage_observation,
+    observe_title_provider_result,
 )
 from elspeth.web.composer.continuation_title_values import CapturedTitleProviderResult, decode_title_provider_result
-from elspeth.web.composer.provider_audit_source import ProviderAuditSource, audit_drafts_json, capture_provider_audit_source
+from elspeth.web.composer.provider_audit_source import (
+    ProviderAuditSource,
+    audit_drafts_json,
+    capture_provider_audit_source,
+    provider_attempt_audit_drafts,
+)
 from elspeth.web.coordination.composer_operation_authority import _terminal_values
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import settle_provider_attempt_on_connection
@@ -97,13 +103,15 @@ def _receipt(
         if not 0 < limit_bytes < CANONICAL_INTEGER_MAX:
             raise AuditIntegrityError("TITLE aggregate overflow lost its original bounded allowance")
         observed_bytes = limit_bytes + 1
-    else:
+    elif type(observation) is TitleOverflowObservation:
         cost = observation.cost
         usage = observation.usage
         reason = "private_document_bytes"
         representation = observation.representation
         limit_bytes = observation.limit_bytes
         observed_bytes = observation.observed_bytes
+    else:
+        raise AuditIntegrityError("TITLE paid overflow has no closed receipt observation")
     if type(observation) is TitleOverflowObservation and (
         (observation.representation == "physical_audit" and observation.document_codec != "composer.physical-audit.v1")
         or (
@@ -248,7 +256,7 @@ def settle_v4_title_paid_overflow_on_connection(
         captured = observation.captured
         if type(captured) is not CapturedTitleProviderResult or type(observation.batch) is not V4TitleCompleteBatch:
             raise AuditIntegrityError("TITLE aggregate overflow requires its original complete result and full batch")
-        decoded = decode_title_provider_result(captured.chunk, env_ref_names=prepared.names)
+        decoded = decode_title_provider_result(captured.chunk, env_ref_names=prepared.names, original_v4_completion=captured.completion)
         if (
             decoded.snapshot != captured.snapshot
             or decoded.completion != captured.completion
@@ -275,6 +283,27 @@ def settle_v4_title_paid_overflow_on_connection(
             pass
         else:
             raise AuditIntegrityError("TITLE aggregate overflow misclassified a retainable complete result")
+    elif type(observation) is TitleOverflowObservation:
+        call = observation.audit_call
+        observed = observe_title_provider_result(
+            logical=decode_continuation_snapshot(selected.payload_json).logical,
+            actor_user_id=parent.actor_user_id,
+            effect_key="provider:3:0",
+            input_sha256=descriptor.input_sha256,
+            creator_sequence=source.creator_sequence,
+            creator_generation=source.creator_generation,
+            completion=observation.completion,
+            audit_call=call,
+            context=running.session_operation_context,
+            audit_drafts=provider_attempt_audit_drafts(call, running.session_operation_context),
+            env_ref_names=prepared.names,
+            require_source_issued_v4=True,
+        )
+        if type(observed) is not TitleOverflowObservation or observed != observation or call.call_id != identity.attempt_id:
+            raise AuditIntegrityError("TITLE paid overflow changed its original source-issued response observation")
+        _require_physical_data(conn, running.claim.session_id, operation, effect, call, observation.source, descriptor)
+    else:
+        raise AuditIntegrityError("TITLE paid overflow has no closed original observation")
     observed_at = database_now(conn)
     if observed_at < restore_utc(physical_row.started_at):
         raise AuditIntegrityError("V4 TITLE terminal database observation predates paid admission")
@@ -298,7 +327,14 @@ def settle_v4_title_paid_overflow_on_connection(
         requested_model=requested_model,
         observed_at=observed_at,
     )
-    with admit_v4_title_paid_tail_on_connection(conn, source=source, plan=admission.tail, batch=batch):
+    with admit_v4_title_paid_tail_on_connection(
+        conn,
+        source=source,
+        plan=admission.tail,
+        incomplete_plan=admission.incomplete_tail,
+        no_sdk_plan=admission.no_sdk_tail,
+        batch=batch,
+    ):
         put_chunk(
             conn,
             session_id=sid,

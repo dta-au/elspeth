@@ -22,7 +22,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
-from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _CallModelOutcome
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.audit_storage import private_diagnostic_drafts
 from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, PrivateChunkRef
@@ -45,6 +45,7 @@ from elspeth.web.composer.continuation_provider_outcomes import require_successf
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness, require_retained_v4_provider_metadata_credentials
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
     ProviderAttempt,
@@ -72,13 +73,16 @@ from elspeth.web.sessions.continuation import (
     read_chunk,
     require_snapshot_cas,
 )
+from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity, PaidOverflowReceipt
 from elspeth.web.sessions.continuation_paid_overflow_quota import preflight_v4_requested_model
+from elspeth.web.sessions.continuation_primary_paid_incomplete_tail import PrimaryPaidIncompleteTailPlan
 from elspeth.web.sessions.continuation_primary_paid_overflow_no_sdk import PrimaryNoSdkTailPlan, prepare_primary_no_sdk_tail_plan
 from elspeth.web.sessions.continuation_primary_paid_overflow_tail import (
     PrimaryPaidOverflowTailPlan,
     prepare_primary_paid_overflow_tail_plan,
 )
+from elspeth.web.sessions.continuation_primary_terminal_reservation import primary_terminal_reservation
 from elspeth.web.sessions.continuation_retained_capacity import (
     ProspectiveContinuationChunk,
     ProviderTerminalHoldSource,
@@ -124,12 +128,20 @@ class PrimaryPaidOverflowTerminal:
 
 
 @dataclass(frozen=True, slots=True)
+class PrimaryPaidIncompleteTerminal:
+    receipt: PaidIncompleteReceipt
+    snapshot: StoredContinuationSnapshot
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
+
+
+@dataclass(frozen=True, slots=True)
 class V4PrimaryProviderAdmission:
     attempt: ProviderAttempt
     selected: StoredContinuationSnapshot
     hold: ProviderTerminalHoldSource
     tail: PrimaryPaidOverflowTailPlan
     no_sdk_tail: PrimaryNoSdkTailPlan
+    incomplete_tail: PrimaryPaidIncompleteTailPlan
 
 
 def finalize_v4_primary_provider_on_connection(
@@ -258,7 +270,7 @@ def _require_primary_effect_action_on_connection(
     # A lost terminal may mark a dispatched physical effect unknown. The
     # action history retains the last witnessed dispatch; it is never a
     # completion claim or permission to issue the physical call again.
-    witnessed_disposition = "dispatched" if effect.disposition in ("unknown", "paid_overflow") else effect.disposition
+    witnessed_disposition = "dispatched" if effect.disposition in ("unknown", "paid_overflow", "paid_incomplete") else effect.disposition
     if len(matching) != 1 or (matching[0].owner_receipt_id, matching[0].disposition) != (
         effect.effect_key,
         witnessed_disposition,
@@ -740,15 +752,17 @@ def selected_primary_effect_data_on_connection(
             )
         ):
             raise AuditIntegrityError("refused primary lost its terminal no-SDK receipt shape")
-    elif effect.disposition == "paid_overflow":
+    elif effect.disposition in ("paid_overflow", "paid_incomplete"):
+        receipt_prefix = "paid-overflow:" if effect.disposition == "paid_overflow" else "paid-incomplete:"
+        chunk_prefix = "value:composer.paid-overflow.v1:" if effect.disposition == "paid_overflow" else "value:composer.paid-incomplete.v1:"
         if (
             not v4
             or frame.phase != "awaiting_response"
             or frame.pending_response is not None
             or type(effect.receipt_key) is not str
-            or not effect.receipt_key.startswith("paid-overflow:")
+            or not effect.receipt_key.startswith(receipt_prefix)
             or type(effect.result_chunk_key) is not str
-            or not effect.result_chunk_key.startswith("value:composer.paid-overflow.v1:")
+            or not effect.result_chunk_key.startswith(chunk_prefix)
             or type(effect.provider_attempt_id) is not str
             or effect.physical_sequence != effect.creator_sequence
             or effect.physical_generation != effect.creator_generation
@@ -987,17 +1001,7 @@ def admit_v4_primary_provider_on_connection(
         operation_epoch=fence.operation_epoch,
         action_chunk=no_sdk_action_chunk,
     )
-    reserved_bytes = max(tail.reserved_bytes, no_sdk_tail.reserved_bytes)
-    fallback_contract_sha256 = sha256(
-        canonical_json(
-            {
-                "version": "composer.primary-v4-combined-tail.v1",
-                "paid": tail.fallback_contract_sha256,
-                "no_sdk": no_sdk_tail.contract_sha256,
-                "reserved_bytes": reserved_bytes,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    incomplete_tail, reserved_bytes, fallback_contract_sha256 = primary_terminal_reservation(tail, no_sdk_tail)
     hold = ProviderTerminalHoldSource(
         session_id=identity.session_id,
         operation_id=identity.operation_id,
@@ -1081,7 +1085,7 @@ def admit_v4_primary_provider_on_connection(
         raise AuditIntegrityError("V4 PRIMARY dispatch changed its reserved complete snapshot")
     no_sdk_issuer.clock.require_preparation_time()
     no_sdk_issuer.note_dispatched_candidate(admitted)
-    return V4PrimaryProviderAdmission(attempt, admitted, hold, tail, no_sdk_tail)
+    return V4PrimaryProviderAdmission(attempt, admitted, hold, tail, no_sdk_tail, incomplete_tail)
 
 
 class _PrimaryNoSdkRefusalData(BaseModel):
@@ -1527,6 +1531,61 @@ def _physical_source(conn: Connection, running: ComposerOperationRunning, effect
     return _physical_source_data(conn, running.claim.session_id, running.claim.operation_id, effect, call)
 
 
+def _require_primary_response_audit(stack: ContinuationFrameStack, completion: _AdmittedLLMCompletion, call: ComposerLLMCall) -> None:
+    """Compare diagnostics only after the caller has proved the original source."""
+    if call.call_id is None:
+        raise AuditIntegrityError("PRIMARY response lost its original call identity")
+    policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
+    if type(policy) is ContinuationAdmissionPolicyV4:
+        from elspeth.web.composer.continuation_provider_outcomes import require_v4_successful_response_audit
+
+        require_retained_v4_provider_metadata_credentials(completion, surface="composer_primary_response")
+        require_v4_successful_response_audit(
+            call,
+            completion.provider_metadata,
+            policy=policy,
+            attempt_id=call.call_id,
+            started_at=call.started_at,
+            finished_at=call.finished_at,
+        )
+    else:
+        require_successful_response_audit(
+            call,
+            completion.provider_metadata,
+            attempt_id=call.call_id,
+            started_at=call.started_at,
+            finished_at=call.finished_at,
+        )
+
+
+def _require_v4_complete_hold_consumed_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    stack: ContinuationFrameStack,
+    effect: Row[Any],
+    call: ComposerLLMCall,
+) -> None:
+    if type(decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)) is not ContinuationAdmissionPolicyV4:
+        return
+    from elspeth.web.sessions.continuation_primary_paid_overflow_terminal import _stored_hold_source
+    from elspeth.web.sessions.continuation_retained_capacity import _require_hold_fields, load_continuation_read_contract
+
+    source = _stored_hold_source(conn, session_id=str(session_id), operation_id=operation_id, effect_key=effect.effect_key)
+    if source is None:
+        raise AuditIntegrityError("V4 PRIMARY cold complete result lost its original H")
+    contract = load_continuation_read_contract(conn, session_id=str(session_id), operation_id=operation_id)
+    hold = _require_hold_fields(conn, source=source, contract=contract)
+    if (
+        source.policy_sha256 != stack.policy_hash
+        or source.source_input_sha256 != effect.input_sha256
+        or hold.state != "consumed"
+        or hold.provider_attempt_id != call.call_id
+    ):
+        raise AuditIntegrityError("V4 PRIMARY cold complete result changed its consumed original H")
+
+
 def _physical_source_data(conn: Connection, session_id: UUID, operation_id: str, effect: Row[Any], call: ComposerLLMCall) -> str:
     if type(call) is not ComposerLLMCall or call.call_id is None:
         raise AuditIntegrityError("primary result requires the actual original physical audit")
@@ -1710,19 +1769,19 @@ def publish_primary_provider_on_connection(
     call = outcome.audit_call
     if call.call_id is None:
         raise AuditIntegrityError("primary publication requires its original physical identity")
-    require_successful_response_audit(
-        call,
-        outcome.completion.provider_metadata,
-        attempt_id=call.call_id,
-        started_at=call.started_at,
-        finished_at=call.finished_at,
-    )
+    if v4:
+        metadata = outcome.completion.provider_metadata
+        witness = metadata.v4_completeness
+        if type(witness) is not V4ProviderResultCompleteness or witness.sdk_return.attempt_id != call.call_id:
+            raise AuditIntegrityError("V4 PRIMARY publication lost its original complete SDK return")
+        witness.require_result(metadata, content=outcome.completion.message.content, tool_calls=outcome.completion.tool_batch.calls)
     # Publication still owns the original selected input. A later audit read
     # instead joins immutable paid-input DATA after the transcript has grown.
     stored_primary_input_data_on_connection(
         conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, effect=effect, frame=frame
     )
     _physical_source(conn, running, effect, call)
+    _require_primary_response_audit(root, outcome.completion, call)
     previous = decode_recorder_snapshot(_chunk(conn, running, frame.audit_buffer))
     if replace(previous, llm_calls=(*previous.llm_calls, call)) != recorder or not recorder.llm_calls or recorder.llm_calls[-1] is not call:
         raise AuditIntegrityError("primary publication changed its complete original recorder prefix/channels")
@@ -1869,10 +1928,16 @@ def read_primary_provider_on_connection(
         or call.call_id is None
     ):
         raise AuditIntegrityError("primary result changed its actual committed physical source tuple")
-    require_successful_response_audit(
-        call, completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
-    )
     _physical_source(conn, running, effect, call)
+    _require_v4_complete_hold_consumed_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        stack=_root,
+        effect=effect,
+        call=call,
+    )
+    _require_primary_response_audit(_root, completion, call)
     audit = _chunk(conn, running, frame.audit_buffer)
     snapshot = decode_recorder_snapshot(audit)
     matches = tuple(item for item in snapshot.llm_calls if item.call_id == call.call_id)
@@ -2094,8 +2159,9 @@ def _verify_committed_primary_response_data_on_connection(
         or restore_utc(effect.response_finished_at) != call.finished_at
     ):
         raise AuditIntegrityError("historical primary response changed its original complete physical tuple")
-    require_successful_response_audit(
-        call, completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
-    )
     _physical_source_data(conn, session_id, operation_id, effect, call)
+    _require_v4_complete_hold_consumed_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, stack=selected.stack, effect=effect, call=call
+    )
+    _require_primary_response_audit(selected.stack, completion, call)
     return response

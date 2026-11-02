@@ -24,6 +24,12 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer._compose_loop_carriers import _EndCompletionDisposition
 from elspeth.web.composer.continuation import ComposeFrame, EndFrame
 from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
+from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
+    EndCheckpointNoSdkTerminal,
+    EndCheckpointPaidOverflowTerminal,
+    EndCheckpointUnboundRefusalTerminal,
+)
+from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointPaidIncompleteTerminal, observe_end_checkpoint_terminal
 from elspeth.web.composer.continuation_end_transitions import EndTransition, end_candidate_for, retain_end_transition
 from elspeth.web.composer.continuation_end_values import encode_end_candidate
 from elspeth.web.composer.continuation_initialization import _registered
@@ -140,11 +146,28 @@ async def enter_continuation_end(
 
 async def review_continuation_end(
     phases: ContinuationLivePhases, services: ComposerAppServices, selected: SelectedContinuationState
-) -> ComposerOperationRecord | None:
+) -> (
+    ComposerOperationRecord
+    | EndCheckpointPaidIncompleteTerminal
+    | EndCheckpointPaidOverflowTerminal
+    | EndCheckpointNoSdkTerminal
+    | EndCheckpointUnboundRefusalTerminal
+    | None
+):
     """Run the shared terminal gates; publish, or return the next turn to the provider."""
     if selected.stack.active_action_json is not None:
         raise AuditIntegrityError("prescribed END review requires its owned action consumer")
     execution = await execute_continuation_end_review(phases, selected)
+    if isinstance(
+        execution,
+        (
+            EndCheckpointPaidIncompleteTerminal,
+            EndCheckpointPaidOverflowTerminal,
+            EndCheckpointNoSdkTerminal,
+            EndCheckpointUnboundRefusalTerminal,
+        ),
+    ):
+        return execution
     if type(execution) is EndReviewContinued:
         return None
     if not isinstance(execution, EndReviewExecution):
@@ -154,7 +177,14 @@ async def review_continuation_end(
 
 async def execute_continuation_end_review(
     phases: ContinuationLivePhases, selected: SelectedContinuationState
-) -> EndReviewExecution | EndReviewContinued:
+) -> (
+    EndReviewExecution
+    | EndReviewContinued
+    | EndCheckpointPaidIncompleteTerminal
+    | EndCheckpointPaidOverflowTerminal
+    | EndCheckpointNoSdkTerminal
+    | EndCheckpointUnboundRefusalTerminal
+):
     """Execute the one shared review without granting publication authority.
 
     A prescribed Review must retain its actual action result and coverage before
@@ -204,38 +234,50 @@ async def execute_continuation_end_review(
     # The shared gates read the request's quota scope and genuine user input
     # from task-local scope, exactly as the shared loop binds them.
     with composer_quota_scope(service._require_sessions_service(), context), prompt_guard_user_scope(bindings.message):
-        terminate = await service._completion._try_terminate_no_tools(
-            assistant_message=completion.message,
-            turn_evidence=live.turn_evidence,
-            session_operation_context=bindings.session_operation_context,
-            message=bindings.message,
-            llm_messages=live.llm_messages,
-            state=live.state,
-            session_id=bindings.session_id,
-            current_state_id=live.current_state_id,
-            initial_version=live.initial_version,
-            user_id=bindings.user_id,
-            last_runtime_preflight=live.last_runtime_preflight,
-            runtime_preflight_cache=live.runtime_preflight_cache,
-            session_scope=bindings.session_scope,
-            mutation_success_seen=live.mutation_success_seen,
-            recorder=live.recorder,
-            progress=bindings.progress,
-            repair_turns_used=live.repair_turns_used,
-            persisted_assistant_message_id=live.persisted_assistant_message_id,
-            persisted_assistant_content=live.persisted_assistant_content,
-            persisted_tool_call_turn=live.persisted_tool_call_turn,
-            advisor_checkpoint_passes_used=live.advisor_checkpoint_passes_used,
-            plugin_snapshot=bindings.plugin_snapshot,
-            advisor_review_state=live.advisor_review_state,
-            deadline=bindings.deadline,
-            composition_turns_used=live.composition_turns_used,
-            discovery_turns_used=live.discovery_turns_used,
-            failed_turn=live.failed_turn,
-            completion_gates=bindings.completion_gates,
-            provider_owner=bindings.provider_owner,
-            checkpoint_phase_owner=checkpoint_phase_owner,
+        terminate = await observe_end_checkpoint_terminal(
+            service._completion._try_terminate_no_tools(
+                assistant_message=completion.message,
+                turn_evidence=live.turn_evidence,
+                session_operation_context=bindings.session_operation_context,
+                message=bindings.message,
+                llm_messages=live.llm_messages,
+                state=live.state,
+                session_id=bindings.session_id,
+                current_state_id=live.current_state_id,
+                initial_version=live.initial_version,
+                user_id=bindings.user_id,
+                last_runtime_preflight=live.last_runtime_preflight,
+                runtime_preflight_cache=live.runtime_preflight_cache,
+                session_scope=bindings.session_scope,
+                mutation_success_seen=live.mutation_success_seen,
+                recorder=live.recorder,
+                progress=bindings.progress,
+                repair_turns_used=live.repair_turns_used,
+                persisted_assistant_message_id=live.persisted_assistant_message_id,
+                persisted_assistant_content=live.persisted_assistant_content,
+                persisted_tool_call_turn=live.persisted_tool_call_turn,
+                advisor_checkpoint_passes_used=live.advisor_checkpoint_passes_used,
+                plugin_snapshot=bindings.plugin_snapshot,
+                advisor_review_state=live.advisor_review_state,
+                deadline=bindings.deadline,
+                composition_turns_used=live.composition_turns_used,
+                discovery_turns_used=live.discovery_turns_used,
+                failed_turn=live.failed_turn,
+                completion_gates=bindings.completion_gates,
+                provider_owner=bindings.provider_owner,
+                checkpoint_phase_owner=checkpoint_phase_owner,
+            )
         )
+    if isinstance(
+        terminate,
+        (
+            EndCheckpointPaidIncompleteTerminal,
+            EndCheckpointPaidOverflowTerminal,
+            EndCheckpointNoSdkTerminal,
+            EndCheckpointUnboundRefusalTerminal,
+        ),
+    ):
+        return terminate
     return await continue_end_after_terminal_review(
         phases,
         current=current,

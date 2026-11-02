@@ -10,6 +10,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_checkpoint_observation import (
     CheckpointIncompleteResponseObservation,
     CheckpointOverflowUsageObservation,
+    original_v4_checkpoint_returned_audit_call,
     require_original_v4_checkpoint_returned_response,
 )
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
@@ -23,6 +24,10 @@ from elspeth.web.sessions.continuation_checkpoint_paid import (
     PreparedCheckpointProvider,
     V4CheckpointProviderAdmission,
     require_current_checkpoint_dispatched_on_connection,
+)
+from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
+    checkpoint_paid_audit_cohort,
+    write_checkpoint_paid_audit_cohort_on_connection,
 )
 from elspeth.web.sessions.continuation_checkpoint_paid_tail import build_checkpoint_paid_overflow_tail_batch
 from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
@@ -115,6 +120,7 @@ def _receipt(
 def settle_v4_checkpoint_returned_overflow_on_connection(
     conn: Connection,
     *,
+    service: object,
     prepared: PreparedCheckpointProvider,
     admission: V4CheckpointProviderAdmission,
     observation: CheckpointIncompleteResponseObservation,
@@ -132,6 +138,9 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
         observation,
         attempt_id=admission.attempt.attempt_id,
         request_sha256=prepared.request_sha256,
+    )
+    call = original_v4_checkpoint_returned_audit_call(
+        observation, attempt_id=admission.attempt.attempt_id, request_sha256=prepared.request_sha256
     )
     running = prepared.running
     selected = require_current_checkpoint_dispatched_on_connection(conn, running, admission)
@@ -178,7 +187,10 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
     if observed_at < restore_utc(physical_row.started_at):
         raise AuditIntegrityError("checkpoint overflow observation predates its original paid admission")
     receipt = _receipt(admission, observation, observed_at)
-    batch = build_checkpoint_paid_overflow_tail_batch(admission.paid_tail, receipt=receipt, published_at=observed_at)
+    cohort = checkpoint_paid_audit_cohort(call, running.session_operation_context)
+    batch = build_checkpoint_paid_overflow_tail_batch(
+        admission.paid_tail, receipt=receipt, published_at=observed_at, private_audit_sha256=cohort.private_sha256
+    )
     error = checkpoint_paid_overflow_error(parent.request_id, receipt.cost)
     carrier = OriginalPaidOverflowPhysicalAttempt(
         attempt_id=physical_row.attempt_id,
@@ -265,6 +277,9 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
             now=observed_at,
         )
         settle_provider_attempt_on_connection(conn, session_id=sid, attempt_id=identity.attempt_id, entry=entry)
+        write_checkpoint_paid_audit_cohort_on_connection(
+            conn, service=service, context=running.session_operation_context, cohort=cohort, observed_at=observed_at
+        )
         verified = read_v4_checkpoint_paid_overflow_terminal_on_connection(
             conn,
             session_id=running.claim.session_id,

@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from hashlib import sha256
 
 from sqlalchemy import Connection, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkRefusalPermit
 from elspeth.web.coordination.composer_operation_authority import _record_from_row, _terminal_values
@@ -40,6 +38,7 @@ from elspeth.web.sessions.continuation_primary_paid_overflow_no_sdk import (
     prepare_primary_no_sdk_tail_plan,
 )
 from elspeth.web.sessions.continuation_primary_paid_overflow_tail import prepare_primary_paid_overflow_tail_plan
+from elspeth.web.sessions.continuation_primary_terminal_reservation import primary_terminal_reservation
 from elspeth.web.sessions.continuation_retained_capacity import _require_historical_hold_source, _require_hold_fields
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -143,18 +142,13 @@ def refuse_v4_primary_unentered_on_connection(
         operation_epoch=source.session_operation_epoch,
         action_chunk=action_chunk,
     )
-    reserved = max(paid.reserved_bytes, no_sdk.reserved_bytes)
-    combined_hash = sha256(
-        canonical_json(
-            {
-                "version": "composer.primary-v4-combined-tail.v1",
-                "paid": paid.fallback_contract_sha256,
-                "no_sdk": no_sdk.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
-    if no_sdk != admission.no_sdk_tail or source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined_hash:
+    incomplete_tail, reserved, combined_hash = primary_terminal_reservation(paid, no_sdk)
+    if (
+        no_sdk != admission.no_sdk_tail
+        or incomplete_tail != admission.incomplete_tail
+        or source.reserved_bytes != reserved
+        or source.fallback_contract_sha256 != combined_hash
+    ):
         raise AuditIntegrityError("V4 PRIMARY zero-use refusal changed its combined original tail reserve")
     segment = conn.execute(
         select(segments).where(

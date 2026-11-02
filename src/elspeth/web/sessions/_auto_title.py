@@ -53,6 +53,7 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.composer.provider_quota import ProviderCallCustody, provider_call_scope, required_provider_audit_scope
+from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.request_limits import DEFAULT_MAX_PREPARED_REQUEST_BYTES
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.required_work import RequiredWorkRole, RequiredWorkSource
@@ -588,8 +589,6 @@ async def _maybe_auto_title_session_required(
                     # weather. HTTP-shaped parser faults remain first party.
                     raise _AutoTitleProviderTransportError from exc
                 if provider_custody.continuation_title_v4_admission is not None:
-                    from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
-
                     try:
                         full_completion = provider_gateway._admit_composer_llm_completion(
                             response, pricing_model=model, provider_custody=provider_custody
@@ -647,6 +646,11 @@ async def _maybe_auto_title_session_required(
                 status = ComposerLLMCallStatus.MALFORMED_RESPONSE
                 error_class = type(exc).__name__
                 error_message = "malformed_response"
+                raise
+            except V4ProviderResultIncomplete as exc:
+                status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                error_class = type(exc).__name__
+                error_message = "returned_paid_result_incomplete"
                 raise
             except Exception as exc:
                 failure = classify_provider_failure(exc)

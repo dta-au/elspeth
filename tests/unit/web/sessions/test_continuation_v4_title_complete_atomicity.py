@@ -4,24 +4,32 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import timedelta
 
 import pytest
+from litellm import ModelResponse
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _AdmittedToolBatch
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
-from elspeth.web.composer.continuation_title_values import capture_title_provider_result
+from elspeth.web.composer.continuation_title_values import capture_title_provider_result, decode_title_provider_result
+from elspeth.web.composer.llm_response_parsing import admit_v4_provider_result
 from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
 from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.composer.provider_result_admission import V4ProviderSdkReturn, diagnostic_provider_metadata
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.continuation import ContinuationEvent, prepare_snapshot_append
 from elspeth.web.sessions.continuation_title_paid_overflow_terminal import (
     read_v4_title_paid_overflow_terminal_on_connection,
 )
-from elspeth.web.sessions.continuation_title_provider import CurrentTitleNames, _descriptor, admit_v4_title_provider_on_connection
+from elspeth.web.sessions.continuation_title_provider import (
+    CurrentTitleNames,
+    _descriptor,
+    _verified_v4_title_stored_source_on_connection,
+    admit_v4_title_provider_on_connection,
+)
 from elspeth.web.sessions.continuation_v4_title_complete_tail import (
     build_v4_title_complete_batch,
     require_v4_title_complete_batch_matches_capture,
@@ -39,6 +47,39 @@ from tests.unit.web.sessions import test_continuation_initialization as initiali
 from tests.unit.web.sessions.test_continuation_v3_title_paid_tail_preflight import _historical_prepared_title
 
 operation_store = operations.operation_store
+
+
+def _issued_title_completion(attempt_id: str, *, reasoning: str = "Retained reasoning") -> _AdmittedLLMCompletion:
+    response = ModelResponse(
+        id="request-original",
+        model="model-actual",
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Pipeline title",
+                    "tool_calls": [],
+                    "reasoning_content": reasoning,
+                    "reasoning_details": [{"text": "safe detail"}],
+                },
+            }
+        ],
+        usage={"prompt_tokens": 13, "completion_tokens": 5, "total_tokens": 18},
+    )
+    choice = response.choices[0]
+    admitted = admit_v4_provider_result(
+        response,
+        choice=choice,
+        message=choice.message,
+        sdk_return=V4ProviderSdkReturn(attempt_id, id(response)),
+    )
+    return _AdmittedLLMCompletion(
+        admitted.message,
+        _AdmittedToolBatch(admitted.tool_calls, frozenset(call.id for call in admitted.tool_calls)),
+        admitted.metadata,
+    )
 
 
 @pytest.mark.asyncio
@@ -63,7 +104,8 @@ async def test_v4_title_complete_result_commits_received_settled_ledger_and_hold
     descriptor = _descriptor(prepared.input)
     wire = json.loads(descriptor.wire_json)
     root = decode_continuation_snapshot(admission.selected.payload_json)
-    completion = values["completion"]
+    completion = _issued_title_completion(admission.attempt.attempt_id)
+    diagnostic = diagnostic_provider_metadata(completion.provider_metadata)
     initial = values["audit_call"]
     call = replace(
         initial,
@@ -73,9 +115,16 @@ async def test_v4_title_complete_result_commits_received_settled_ledger_and_hold
         temperature=wire["options"].get("temperature"),
         seed=wire["options"].get("seed"),
         started_at=restore_utc(physical.started_at),
-        finished_at=restore_utc(physical.started_at) + timedelta(seconds=1),
+        # This direct SQL fixture has no live SDK elapsed time. Its audit
+        # completion must precede the database-clock response observation.
+        finished_at=restore_utc(physical.started_at),
         call_id=admission.attempt.attempt_id,
         private_diagnostics=(),
+        model_returned=diagnostic.model_returned,
+        provider_request_id=diagnostic.provider_request_id,
+        finish_reason=diagnostic.finish_reason,
+        reasoning_content=diagnostic.reasoning_content,
+        reasoning_details=diagnostic.reasoning_details,
     )
     captured = capture_title_provider_result(
         logical=root.logical,
@@ -102,6 +151,20 @@ async def test_v4_title_complete_result_commits_received_settled_ledger_and_hold
         require_v4_title_complete_batch_matches_capture(
             prepared=prepared, admission=admission, captured=captured, batch=replace(batch, received=forged_received)
         )
+    altered_private = replace(
+        captured,
+        completion=replace(
+            captured.completion,
+            provider_metadata=replace(captured.completion.provider_metadata, reasoning_details=[{"text": "changed private detail"}]),
+        ),
+    )
+    with pytest.raises(AuditIntegrityError, match="original issued metadata capture"):
+        store[3].complete_v4_title_result_sync(
+            prepared=prepared,
+            admission=admission,
+            captured=altered_private,
+            names=CurrentTitleNames(running, admission.selected, prepared.names),
+        )
     result = store[3].complete_v4_title_result_sync(
         prepared=prepared,
         admission=admission,
@@ -119,6 +182,24 @@ async def test_v4_title_complete_result_commits_received_settled_ledger_and_hold
     assert hold.state == "consumed" and hold.provider_attempt_id == admission.attempt.attempt_id
     assert physical.ledger_entry_id is not None and len(ledger) == 1
     assert ledger[0].model == completion.provider_metadata.model_returned
+    with store[0].connect() as conn:
+        nested = conn.begin_nested()
+        proof = _verified_v4_title_stored_source_on_connection(
+            conn,
+            session_id=running.claim.session_id,
+            operation_id=operation,
+            sequence=running.claim.segment_sequence,
+            generation=running.claim.ownership_generation,
+            selected=result.selected,
+            names=prepared.names,
+            title_reference=result.result.reference,
+        )
+        assert proof is not None
+        with pytest.raises(AuditIntegrityError, match="verified stored V4 source"):
+            decode_title_provider_result(result.result, env_ref_names=prepared.names, stored_v4_source=replace(proof))
+        nested.rollback()
+        with pytest.raises(AuditIntegrityError, match="verified stored V4 source"):
+            decode_title_provider_result(result.result, env_ref_names=prepared.names, stored_v4_source=proof)
 
 
 @pytest.mark.asyncio
@@ -143,10 +224,8 @@ async def test_v4_title_complete_result_exceeding_aggregate_cap_settles_honest_t
     wire = json.loads(descriptor.wire_json)
     root = decode_continuation_snapshot(admission.selected.payload_json)
     reasoning = "r" * 100_000
-    completion = replace(
-        values["completion"],
-        provider_metadata=replace(values["completion"].provider_metadata, reasoning_content=reasoning),
-    )
+    completion = _issued_title_completion(admission.attempt.attempt_id, reasoning=reasoning)
+    diagnostic = diagnostic_provider_metadata(completion.provider_metadata)
     initial = values["audit_call"]
     call = replace(
         initial,
@@ -156,10 +235,16 @@ async def test_v4_title_complete_result_exceeding_aggregate_cap_settles_honest_t
         temperature=wire["options"].get("temperature"),
         seed=wire["options"].get("seed"),
         started_at=restore_utc(physical.started_at),
-        finished_at=restore_utc(physical.started_at) + timedelta(seconds=1),
+        # This direct SQL fixture has no live SDK elapsed time. Its audit
+        # completion must precede the database-clock response observation.
+        finished_at=restore_utc(physical.started_at),
         call_id=admission.attempt.attempt_id,
         private_diagnostics=(),
-        reasoning_content=reasoning,
+        model_returned=diagnostic.model_returned,
+        provider_request_id=diagnostic.provider_request_id,
+        finish_reason=diagnostic.finish_reason,
+        reasoning_content=diagnostic.reasoning_content,
+        reasoning_details=diagnostic.reasoning_details,
     )
     captured = capture_title_provider_result(
         logical=root.logical,

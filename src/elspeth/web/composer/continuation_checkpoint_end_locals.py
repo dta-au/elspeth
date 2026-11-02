@@ -9,8 +9,14 @@ from weakref import WeakKeyDictionary
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.prompt_guard import GuardedProviderMessage
+from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.prompt_guard import (
+    GuardedProviderMessage,
+    PromptGuardContentPart,
+    PromptGuardThinkingParts,
+    PromptGuardToolArgumentParts,
+    detach_prompt_guard_evidence,
+)
 from elspeth.contracts.readonly_json import JsonValue
 from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage, _AdvisorReviewState
 from elspeth.web.composer.continuation_classifier_handoff import ClassifyPostPrimary
@@ -95,6 +101,49 @@ class CheckpointEndGateLocals:
 
 
 @dataclass(frozen=True, slots=True)
+class _EndDialogueProof:
+    """Detached wire bytes and deeply immutable original producer provenance."""
+
+    messages_json: str
+    trusted_message_indexes: frozenset[int]
+    content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...]
+    tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...]
+    thinking_parts: tuple[PromptGuardThinkingParts | None, ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "trusted_message_indexes", "content_parts", "tool_argument_parts", "thinking_parts")
+
+    @classmethod
+    def capture(cls, messages: Sequence[GuardedProviderMessage]) -> _EndDialogueProof:
+        detached = detach_prompt_guard_evidence(messages)
+        return cls(
+            canonical_json(detached.messages),
+            detached.trusted_message_indexes,
+            detached.content_parts,
+            detached.tool_argument_parts,
+            detached.thinking_parts,
+        )
+
+
+class _BorrowedEndDialogue:
+    """Warm live alias with a detached proof; deliberately not an immutable value.
+
+    Copying the live list would prevent detection of later caller mutation.
+    Only the separate proof is frozen, and it never shares mutable wire data.
+    """
+
+    __slots__ = ("_messages", "_proof")
+
+    def __init__(self, messages: Sequence[GuardedProviderMessage]) -> None:
+        self._messages = messages
+        self._proof = _EndDialogueProof.capture(messages)
+
+    def require_unchanged(self) -> None:
+        if _EndDialogueProof.capture(self._messages) != self._proof:
+            raise AuditIntegrityError("END gate dialogue or its owned provenance changed after local capture")
+
+
+@dataclass(frozen=True, slots=True)
 class _OriginalEndGateLocals:
     phase_owner: CheckpointPhaseOwner
     state: CompositionState
@@ -103,8 +152,7 @@ class _OriginalEndGateLocals:
     session_id: str | None
     request: str
     publication_binding: str
-    dialogue: Sequence[GuardedProviderMessage] | None
-    dialogue_sha256: str | None
+    dialogue: _BorrowedEndDialogue | None
 
 
 _issued: WeakKeyDictionary[CheckpointEndGateLocals, _OriginalEndGateLocals] = WeakKeyDictionary()
@@ -170,8 +218,7 @@ def capture_checkpoint_end_gate_locals(
         session_id,
         request,
         publication.binding,
-        dialogue,
-        None if dialogue is None else stable_hash(dialogue),
+        None if dialogue is None else _BorrowedEndDialogue(dialogue),
     )
     return value
 
@@ -183,8 +230,8 @@ def require_original_checkpoint_end_gate_locals(value: CheckpointEndGateLocals, 
         raise AuditIntegrityError("END gate input requires its original caller-local capture")
     if stable_hash(source.state.to_dict()) != value.orphan_observation.state_sha256:
         raise AuditIntegrityError("END gate state changed after local capture")
-    if source.dialogue is not None and stable_hash(source.dialogue) != source.dialogue_sha256:
-        raise AuditIntegrityError("END gate dialogue changed after local capture")
+    if source.dialogue is not None:
+        source.dialogue.require_unchanged()
     require_original_pending_review_observation(
         value.orphan_observation, owner=source.surfacing, state=source.state, session_id=source.session_id
     )

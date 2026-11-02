@@ -84,7 +84,9 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # preserve them unchanged rather than retrofitting a hold or changing a parent.
 # Epoch 84 adds the distinct paid_overflow effect and private receipt codec.
 # Published epoch-83 stores have the older effect CHECK and are refused intact.
-SESSION_SCHEMA_EPOCH = 84
+# Epoch 85 adds the distinct returned paid_incomplete effect and private receipt.
+# Published epoch-84 stores lack its effect CHECK and are refused intact.
+SESSION_SCHEMA_EPOCH = 85
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -4001,13 +4003,17 @@ composer_continuation_effects_table = Table(
         ["provider_attempt_id"], ["quota_provider_attempts.attempt_id"], name="fk_composer_effects_attempt", ondelete="RESTRICT"
     ),
     CheckConstraint(
-        "disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown', 'paid_overflow')",
+        "disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown', 'paid_overflow', 'paid_incomplete')",
         name="ck_composer_effects_disposition",
     ),
     CheckConstraint(_CONTINUATION_EFFECT_OWNER_CHECK, name="ck_composer_effects_owner"),
     CheckConstraint(
-        "disposition NOT IN ('committed', 'refused', 'paid_overflow') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
+        "disposition NOT IN ('committed', 'refused', 'paid_overflow', 'paid_incomplete') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
         name="ck_composer_effects_receipt",
+    ),
+    CheckConstraint(
+        "disposition != 'paid_incomplete' OR (owner = 'provider' AND provider_attempt_id IS NOT NULL)",
+        name="ck_composer_effects_paid_incomplete_original_attempt",
     ),
     *_lower_sha256_constraints("input_sha256", name="ck_composer_effects_input_sha256"),
     *_lower_sha256_constraints("graph_sha256", name="ck_composer_effects_graph_sha256", nullable=True),

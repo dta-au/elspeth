@@ -40,6 +40,8 @@ from elspeth.web.composer.continuation_provider_input import continuation_provid
 from elspeth.web.composer.continuation_title_values import (
     CapturedTitleProviderResult,
     DecodedTitleProviderResult,
+    VerifiedV4TitleStoredSource,
+    _issue_v4_title_stored_source,
     decode_title_provider_result,
 )
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput, prepare_provider_input
@@ -76,6 +78,12 @@ from elspeth.web.sessions.continuation_retained_capacity import (
     ProviderTerminalHoldSource,
     bind_provider_terminal_hold_attempt,
     reserve_provider_terminal_hold,
+)
+from elspeth.web.sessions.continuation_title_no_sdk_tail import TitleNoSdkTailPlan, prepare_title_no_sdk_tail_plan
+from elspeth.web.sessions.continuation_title_paid_incomplete_tail import (
+    TitlePaidIncompleteTailPlan,
+    prepare_title_paid_incomplete_tail_plan,
+    title_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_title_paid_overflow_tail import (
     TitlePaidOverflowTailPlan,
@@ -171,6 +179,8 @@ class V4TitleProviderAdmission:
     selected: StoredContinuationSnapshot
     hold: ProviderTerminalHoldSource
     tail: TitlePaidOverflowTailPlan
+    incomplete_tail: TitlePaidIncompleteTailPlan
+    no_sdk_tail: TitleNoSdkTailPlan
 
 
 class TitleNoSdkRefusal(ContinuationValue):
@@ -722,12 +732,15 @@ def title_source_chain_data_on_connection(
             principal = conn.execute(select(sessions.c.user_id, sessions.c.archived_at).where(sessions.c.id == sid)).one()
             if terminal_failed_request:
                 original_request_json = bootstrap_values(snapshot).request.model_dump_json()
+                terminal_root = decode_continuation_snapshot(selected.payload_json)
+                terminal_policy = decode_continuation_policy(terminal_root.admission_policy_json, terminal_root.policy_hash)
                 request_matches = (
-                    parent.status == "failed"
+                    type(terminal_policy) is ContinuationAdmissionPolicyV4
+                    and parent.status == "failed"
                     and parent.phase == "settled"
                     and parent.settled_by == "owner_terminal"
                     and parent.request_json is None
-                    and effect.disposition == "paid_overflow"
+                    and effect.disposition in ("paid_overflow", "paid_incomplete", "refused")
                     and before_frame.request_json == original_request_json
                 )
             else:
@@ -1473,6 +1486,16 @@ def admit_v4_title_provider_on_connection(
         source_snapshot_sha256=sha256(selected.payload_json.encode("utf-8")).hexdigest(),
     )
     tail = prepare_title_paid_overflow_tail_plan(identity=identity, admitted=admitted, creator_sequence=running.claim.segment_sequence)
+    incomplete_tail = prepare_title_paid_incomplete_tail_plan(
+        identity=identity, admitted=admitted, creator_sequence=running.claim.segment_sequence
+    )
+    no_sdk_tail = prepare_title_no_sdk_tail_plan(
+        identity=identity,
+        admitted=admitted,
+        creator_sequence=running.claim.segment_sequence,
+        requested_model=requested_model.value,
+    )
+    reserved_bytes, fallback_contract_sha256 = title_combined_terminal_hold_contract(tail, incomplete_tail, no_sdk_tail)
     hold = ProviderTerminalHoldSource(
         session_id=sid,
         operation_id=operation,
@@ -1489,8 +1512,8 @@ def admit_v4_title_provider_on_connection(
         session_operation_id=fence.operation_id,
         session_operation_epoch=fence.operation_epoch,
         lease_sha256=identity.lease_sha256,
-        reserved_bytes=tail.reserved_bytes,
-        fallback_contract_sha256=tail.fallback_contract_sha256,
+        reserved_bytes=reserved_bytes,
+        fallback_contract_sha256=fallback_contract_sha256,
     )
     reserve_provider_terminal_hold(
         conn,
@@ -1534,7 +1557,127 @@ def admit_v4_title_provider_on_connection(
     )
     if stored != admitted:
         raise AuditIntegrityError("V4 TITLE dispatch changed its reserved complete snapshot")
-    return V4TitleProviderAdmission(attempt, stored, hold, tail)
+    return V4TitleProviderAdmission(attempt, stored, hold, tail, incomplete_tail, no_sdk_tail)
+
+
+def read_v4_title_admission_on_connection(conn: Connection, *, prepared: PreparedTitleProvider) -> V4TitleProviderAdmission | None:
+    """Recover only the exact committed, still-pending V4 TITLE admission.
+
+    This reader does not prove SDK non-entry. The original invocation custody
+    and no-SDK issuer retain that separate transient authority.
+    """
+    from elspeth.web.sessions.continuation_retained_capacity import _require_historical_hold_source, _require_hold_fields
+    from elspeth.web.sessions.continuation_title_paid_overflow_source import (
+        require_original_v4_title_physical_source_on_connection,
+    )
+    from elspeth.web.sessions.continuation_title_paid_overflow_terminal import _stored_hold_source
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    if type(prepared) is not PreparedTitleProvider:
+        raise AuditIntegrityError("V4 TITLE admission replay requires its original prepared service")
+    service = prepared.composer._require_sessions_service()
+    if type(service) is not SessionServiceImpl or service._engine is not conn.engine or prepared.authority._engine is not conn.engine:
+        raise AuditIntegrityError("V4 TITLE admission replay changed its original service/authority engine")
+    running, predecessor = prepared.running, prepared.selected
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    current = load_snapshot(conn, session_id=sid, operation_id=operation)
+    if current == predecessor:
+        return None
+    if current.cursor != predecessor.cursor + 1:
+        raise AuditIntegrityError("V4 TITLE admission replay found another continuation head")
+    prior = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation,
+            checkpoints.c.checkpoint_id == predecessor.checkpoint_id,
+        )
+    ).one_or_none()
+    if (
+        prior is None
+        or prior.cursor != predecessor.cursor
+        or read_chunk(conn, session_id=sid, operation_id=operation, key=prior.snapshot_chunk_key)
+        != predecessor.payload_json.encode("utf-8")
+    ):
+        raise AuditIntegrityError("V4 TITLE admission replay changed its original prepared predecessor")
+    descriptor, reference, stage, _source = title_source_chain_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=operation,
+        sequence=running.claim.segment_sequence,
+        generation=running.claim.ownership_generation,
+        selected=current,
+        names=prepared.names,
+    )
+    if (
+        stage != "admitted"
+        or reference != prepared.input.reference
+        or descriptor.input_sha256 != _descriptor(prepared.input).input_sha256
+        or title_input_descriptor(prepared.composer, prepared.request, prepared_input=prepared.provider_input) != prepared.input
+    ):
+        raise AuditIntegrityError("V4 TITLE admission replay changed its original prepared request")
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
+    effect = conn.execute(
+        select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == "provider:3:0")
+    ).one()
+    source = _stored_hold_source(conn, session_id=sid, operation_id=operation)
+    if source is None or effect.provider_attempt_id is None:
+        raise AuditIntegrityError("V4 TITLE admission replay lost its original physical hold")
+    physical_row = conn.execute(select(physical).where(physical.c.attempt_id == effect.provider_attempt_id)).one_or_none()
+    if (
+        physical_row is None
+        or effect.disposition != "dispatched"
+        or effect.receipt_key is not None
+        or effect.result_chunk_key is not None
+        or effect.response_finished_at is not None
+        or physical_row.settled_at is not None
+        or physical_row.ledger_entry_id is not None
+        or parent.status != "running"
+        or parent.current_segment_sequence != running.claim.segment_sequence
+        or parent.ownership_generation != running.claim.ownership_generation
+        or parent.attempt != running.claim.attempt
+        or source.source_checkpoint_id != predecessor.checkpoint_id
+        or source.source_cursor != predecessor.cursor
+        or source.source_snapshot_sha256 != sha256(predecessor.payload_json.encode("utf-8")).hexdigest()
+    ):
+        raise AuditIntegrityError("V4 TITLE admission replay changed its one unsettled original owner")
+    contract = _require_historical_hold_source(conn, source)
+    hold_row = _require_hold_fields(conn, source=source, contract=contract)
+    if hold_row.state != "active" or hold_row.provider_attempt_id != effect.provider_attempt_id:
+        raise AuditIntegrityError("V4 TITLE admission replay lost its active original hold")
+    requested_model = require_original_v4_title_physical_source_on_connection(
+        conn, source=source, descriptor=descriptor, effect=effect, physical=physical_row, parent=parent
+    )
+    if requested_model != prepared.request.kwargs["model"]:
+        raise AuditIntegrityError("V4 TITLE admission replay changed its original requested model")
+    root = decode_continuation_snapshot(current.payload_json)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if type(policy) is not ContinuationAdmissionPolicyV4 or source.allowance_bytes != policy.max_retained_payload_bytes:
+        raise AuditIntegrityError("V4 TITLE admission replay lost its original policy allowance")
+    identity = PaidOverflowIdentity(
+        session_id=sid,
+        operation_id=operation,
+        effect_key=source.effect_key,
+        attempt_id=effect.provider_attempt_id,
+        session_operation_id=source.session_operation_id,
+        session_operation_epoch=source.session_operation_epoch,
+        ownership_generation=source.creator_generation,
+        lease_sha256=source.lease_sha256,
+        policy_sha256=source.policy_sha256,
+        source_checkpoint_id=source.source_checkpoint_id,
+        source_cursor=source.source_cursor,
+        source_snapshot_sha256=source.source_snapshot_sha256,
+    )
+    tail = prepare_title_paid_overflow_tail_plan(identity=identity, admitted=current, creator_sequence=source.creator_sequence)
+    incomplete_tail = prepare_title_paid_incomplete_tail_plan(identity=identity, admitted=current, creator_sequence=source.creator_sequence)
+    no_sdk_tail = prepare_title_no_sdk_tail_plan(
+        identity=identity, admitted=current, creator_sequence=source.creator_sequence, requested_model=requested_model
+    )
+    reserved_bytes, contract_sha256 = title_combined_terminal_hold_contract(tail, incomplete_tail, no_sdk_tail)
+    if source.reserved_bytes != reserved_bytes or source.fallback_contract_sha256 != contract_sha256:
+        raise AuditIntegrityError("V4 TITLE admission replay lost its original three-tail contract")
+    attempt = ProviderAttempt(effect.provider_attempt_id, restore_utc(physical_row.started_at))
+    return V4TitleProviderAdmission(attempt, current, source, tail, incomplete_tail, no_sdk_tail)
 
 
 def retain_title_response_on_connection(
@@ -1555,7 +1698,12 @@ def retain_title_response_on_connection(
     effect = conn.execute(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == "provider:3:0")
     ).one()
-    result = decode_title_provider_result(captured.chunk, env_ref_names=names)
+    root = decode_continuation_snapshot(selected.payload_json)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    original_v4_completion = captured.completion if type(policy) is ContinuationAdmissionPolicyV4 else None
+    if original_v4_completion is None and captured.completion.provider_metadata.v4_completeness is not None:
+        raise AuditIntegrityError("TITLE legacy response cannot claim a V4 source-issued return")
+    result = decode_title_provider_result(captured.chunk, env_ref_names=names, original_v4_completion=original_v4_completion)
     if result.completion.tool_batch.calls:
         raise AuditIntegrityError("TITLE response cannot introduce an unrequested tool batch")
     _require_physical(conn, running, effect, result.audit_call, result.source, descriptor)
@@ -1733,6 +1881,30 @@ def _read_title_result_data_on_connection(
     )
 
 
+def _verified_v4_title_stored_source_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    generation: int | None,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str],
+    title_reference: PrivateChunkRef,
+) -> VerifiedV4TitleStoredSource | None:
+    """Issue a V4-only diagnostic comparison grant from the stored parent/root."""
+    return _issue_v4_title_stored_source(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        generation=generation,
+        selected=selected,
+        names=names,
+        title_reference=title_reference,
+    )
+
+
 def read_title_result_data_on_connection(
     conn: Connection,
     *,
@@ -1759,7 +1931,17 @@ def read_title_result_data_on_connection(
     if frame.title_response is None:
         raise AuditIntegrityError("TITLE committed result lost its selected response")
     chunk = _chunk_data(conn, session_id, operation_id, frame.title_response)
-    result = decode_title_provider_result(chunk, env_ref_names=names)
+    stored_v4_source = _verified_v4_title_stored_source_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        generation=generation,
+        selected=selected,
+        names=names,
+        title_reference=frame.title_response,
+    )
+    result = decode_title_provider_result(chunk, env_ref_names=names, stored_v4_source=stored_v4_source)
     if result.completion.tool_batch.calls:
         raise AuditIntegrityError("TITLE retained result cannot introduce an unrequested tool batch")
     sid, operation = str(session_id), operation_id
@@ -1783,6 +1965,10 @@ def read_title_result_data_on_connection(
         or restore_utc(effect.response_finished_at) != result.audit_call.finished_at
     ):
         raise AuditIntegrityError("TITLE current result changed its complete response/receipt/source/actor")
+    if stored_v4_source is not None:
+        from elspeth.web.composer.provider_result_admission import require_retained_v4_provider_metadata_credentials
+
+        require_retained_v4_provider_metadata_credentials(result.completion, surface="composer_title_complete_cold")
     settled = stage == "settled"
     return chunk, result, settled
 
@@ -1932,9 +2118,21 @@ class AdmittedTitleAuditSource:
         actual = _read_title_result_source_on_connection(
             conn, self.request.running, selected=self.request.selected, inventory=self.request.inventory
         )
-        decoded = decode_title_provider_result(actual.settlement.result, env_ref_names=self.request.inventory.names)
-        _value, descriptor, _stage, _source = _source_chain(
+        _source_descriptor, descriptor, _stage, _source = _source_chain(
             conn, self.request.running, self.request.selected, names=self.request.inventory.names
+        )
+        stored_v4_source = _verified_v4_title_stored_source_on_connection(
+            conn,
+            session_id=self.request.running.claim.session_id,
+            operation_id=self.request.running.claim.operation_id,
+            sequence=self.request.running.claim.segment_sequence,
+            generation=self.request.running.claim.ownership_generation,
+            selected=self.request.selected,
+            names=self.request.inventory.names,
+            title_reference=actual.settlement.result.reference,
+        )
+        decoded = decode_title_provider_result(
+            actual.settlement.result, env_ref_names=self.request.inventory.names, stored_v4_source=stored_v4_source
         )
         if descriptor != self.descriptor:
             raise AuditIntegrityError("TITLE capability changed its original input descriptor")
@@ -1962,14 +2160,24 @@ def admit_title_audit_source_on_connection(
     if type(request.inventory) is not CurrentTitleNames:
         raise AuditIntegrityError("TITLE accounting requires its actual current names producer")
     current = read_title_result_on_connection(conn, request.running, selected=request.selected, inventory=request.inventory)
-    result = decode_title_provider_result(request.result, env_ref_names=names)
+    _source_descriptor, descriptor, _stage, _source = _source_chain(conn, request.running, request.selected, names=names)
+    stored_v4_source = _verified_v4_title_stored_source_on_connection(
+        conn,
+        session_id=request.running.claim.session_id,
+        operation_id=request.running.claim.operation_id,
+        sequence=request.running.claim.segment_sequence,
+        generation=request.running.claim.ownership_generation,
+        selected=request.selected,
+        names=names,
+        title_reference=request.result.reference,
+    )
+    result = decode_title_provider_result(request.result, env_ref_names=names, stored_v4_source=stored_v4_source)
     if (
         current.settlement.result != request.result
         or current.settlement.audit_call != request.audit_call
         or audit_drafts_json(current.settlement.audit_drafts) != audit_drafts_json(request.audit_drafts)
     ):
         raise AuditIntegrityError("TITLE audit writer changed its immutable original cohort")
-    _descriptor_value, descriptor, _stage, _source = _source_chain(conn, request.running, request.selected, names=names)
     return AdmittedTitleAuditSource(conn, conn.get_transaction(), context, request, result.source, descriptor, current.settled)
 
 

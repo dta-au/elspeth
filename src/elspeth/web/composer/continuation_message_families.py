@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_batch_data import RestoredBatchData
     from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, TurnEvidenceSnapshot
     from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.tools._common import ToolResult
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -66,6 +67,7 @@ class _MessageFamilySources:
     tool_results: tuple[_ToolResultFamilySource, ...] = ()
     tool_feedback: tuple[_ToolFeedbackFamilySource, ...] = ()
     control_results: tuple[tuple[ControlResultMessageRecipe, str], ...] = ()
+    v4_policy: ContinuationAdmissionPolicyV4 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,7 +432,21 @@ def _read_current_sources(
         for recipe in evidence.transcript.producer_recipes or ()
         if type(recipe) is ControlResultMessageRecipe
     )
-    return _MessageFamilySources(evidence, recorder, tuple(responses), tuple(batches), result_sources, feedback_sources, control_results)
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+
+    # Select representation only after the actual selected response/effect,
+    # immutable source and recorder proofs above. Policy alone grants no custody.
+    policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+    return _MessageFamilySources(
+        evidence,
+        recorder,
+        tuple(responses),
+        tuple(batches),
+        result_sources,
+        feedback_sources,
+        control_results,
+        policy if type(policy) is ContinuationAdmissionPolicyV4 else None,
+    )
 
 
 def _require_completed_tool_source_on_connection(
@@ -499,15 +515,61 @@ def _require_completed_tool_source_on_connection(
         raise AuditIntegrityError("tool result recipe has no actual selected completed result")
     data = matches[0].data
     key = f"tool:{recipe.response.digest}:{recipe.tool_index}"
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    effect = conn.execute(
+        select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == key)
+    ).one_or_none()
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+
+    if (
+        type(recipe) is ToolFeedbackMessageRecipe
+        and recipe.source == "arg_error"
+        and type(decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash))
+        is ContinuationAdmissionPolicyV4
+        and effect is not None
+        and effect.owner == "tool_dispatch"
+        and effect.disposition == "refused"
+    ):
+        from elspeth.web.sessions.continuation_value_batch_refusal import read_value_batch_preparation_refusal_on_connection
+
+        refusal = read_value_batch_preparation_refusal_on_connection(
+            conn, session_id=running.claim.session_id, operation_id=operation, effect_key=key, env_ref_names=names
+        )
+        if (refusal.response, refusal.tool_index, refusal.tool_call_id) != (
+            recipe.response,
+            recipe.tool_index,
+            recipe.tool_call_id,
+        ) or refusal.cursor > selected.stack.cursor:
+            raise AuditIntegrityError("argument feedback changed its original refused source selector")
+        validate_tool_effects_on_connection(conn, running, selected=selected, env_ref_names=names)
+        completed = decode_coupled_batch_chunk(_actual_chunk(conn, running, refusal.result), env_ref_names=names)
+        if completed.calls != data.calls or completed.batch.tool_outcomes != data.batch.tool_outcomes[: recipe.tool_index + 1]:
+            raise AuditIntegrityError("argument feedback changed its actual original refused outcome")
+        refusal_checkpoint = conn.execute(
+            select(checkpoints).where(
+                checkpoints.c.session_id == sid,
+                checkpoints.c.operation_id == operation,
+                checkpoints.c.cursor == refusal.cursor,
+            )
+        ).one()
+        root = decode_continuation_snapshot(
+            read_chunk(conn, session_id=sid, operation_id=operation, key=refusal_checkpoint.snapshot_chunk_key).decode(
+                "utf-8", errors="strict"
+            )
+        )
+        historical = SelectedContinuationState(
+            refusal_checkpoint.checkpoint_id, root, load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root)
+        )
+        historical.__post_init__()
+        original = require_admitted_turn_evidence(
+            read_selected_turn_evidence_graph_on_connection(conn, running, selected=historical, names=names), env_ref_names=names
+        )
+        return _CompletedToolSource(data, original)
     issue = read_tool_issue_source_on_connection(conn, running, effect_key=key, env_ref_names=names)
     require_same_sequence_issue_history_on_connection(conn, running, selected=selected, issue=issue)
     if (issue.response, issue.tool_index, issue.tool_call_id) != (recipe.response, recipe.tool_index, recipe.tool_call_id):
         raise AuditIntegrityError("tool result source changed its actual immutable issue selector")
     validate_tool_effects_on_connection(conn, running, selected=selected, env_ref_names=names)
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
-    effect = conn.execute(
-        select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == key)
-    ).one_or_none()
     cursor = issue.cursor + 1
     event = conn.execute(
         select(events).where(events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == cursor)
@@ -756,6 +818,7 @@ def _require_response_audit_source(sources: _MessageFamilySources, response: Pri
         decode_physical_audit_call,
         encode_physical_audit_call,
         require_successful_response_audit,
+        require_v4_successful_response_audit,
     )
 
     retained = RetainedCompletion.model_validate_json(response.canonical)
@@ -768,13 +831,23 @@ def _require_response_audit_source(sources: _MessageFamilySources, response: Pri
     if len(actual) != 1 or encode_physical_audit_call(actual[0]) != retained.audit_call_json:
         raise AuditIntegrityError("native message source differs from its actual original recorder call")
     completion = decode_continuation_response(response)
-    require_successful_response_audit(
-        audit,
-        completion.provider_metadata,
-        attempt_id=audit.call_id,
-        started_at=audit.started_at,
-        finished_at=audit.finished_at,
-    )
+    if sources.v4_policy is None:
+        require_successful_response_audit(
+            audit,
+            completion.provider_metadata,
+            attempt_id=audit.call_id,
+            started_at=audit.started_at,
+            finished_at=audit.finished_at,
+        )
+    else:
+        require_v4_successful_response_audit(
+            audit,
+            completion.provider_metadata,
+            policy=sources.v4_policy,
+            attempt_id=audit.call_id,
+            started_at=audit.started_at,
+            finished_at=audit.finished_at,
+        )
 
 
 def _require_native_audit_source(sources: _MessageFamilySources, response: PrivateChunk) -> None:

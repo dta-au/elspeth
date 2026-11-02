@@ -183,7 +183,11 @@ def prepare_checkpoint_no_sdk_tail_plan(
         for reason in CheckpointNoSdkRefusalReason
     )
     event_bytes = tuple(len(item.payload_json.encode("utf-8")) for item in events)
-    root_bytes = len(root_json.encode("utf-8"))
+    root_bytes = len(
+        encode_continuation_snapshot(
+            decode_continuation_snapshot(root_json).model_copy(update={"cursor": admitted.cursor + len(events)})
+        ).encode("utf-8")
+    )
     reserved = maximum + sum(event_bytes) + root_bytes
     contract = sha256(
         canonical_json(

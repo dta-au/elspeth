@@ -46,7 +46,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
     InterpretationSurfaceOrigin,
 )
-from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
@@ -430,6 +430,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
     from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
+    from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointUnboundRefusalPermit
     from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkRefusalPermit
     from elspeth.web.composer.continuation_checkpoint_observation import (
         CheckpointIncompleteResponseObservation,
@@ -444,11 +445,14 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
     from elspeth.web.composer.continuation_semantic_observation import SemanticProviderResponseObservation
+    from elspeth.web.composer.continuation_title_no_sdk import TitleNoSdkRefusalPermit
     from elspeth.web.composer.continuation_title_observation import TitleOverflowObservation
     from elspeth.web.composer.continuation_title_values import CapturedTitleProviderResult
     from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.protocol import ComposerResult, PipelineCommitIntent
+    from elspeth.web.composer.provider_quota import ProviderCallCustody
+    from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -466,6 +470,7 @@ if TYPE_CHECKING:
         V4CheckpointProviderAdmission,
     )
     from elspeth.web.sessions.continuation_checkpoint_paid_terminal import VerifiedCheckpointPaidOverflowTerminal
+    from elspeth.web.sessions.continuation_checkpoint_unbound_refusal import VerifiedCheckpointUnboundRefusal
     from elspeth.web.sessions.continuation_classifier_primary import (
         ClassifierPrimaryResult,
         PreparedClassifierPrimaryProvider,
@@ -478,6 +483,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
     from elspeth.web.sessions.continuation_p4 import P4WriterObservation
     from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
+    from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
     from elspeth.web.sessions.continuation_primary import (
         PrimaryNoSdkRefusalReceipt,
         PrimaryPaidOverflowTerminal,
@@ -487,6 +493,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_publication_projection import PipelinePublicationReplayData, PublicationProjectionInput
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, V4SemanticProviderAdmission
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
+    from elspeth.web.sessions.continuation_title_no_sdk_terminal import VerifiedTitleNoSdkTerminal
     from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
     from elspeth.web.sessions.continuation_title_provider import CurrentTitleNames, V4TitleProviderAdmission
     from elspeth.web.sessions.continuation_tool_failure import CommittedContinuationFailure, ContinuationFailureObservation
@@ -1979,6 +1986,7 @@ class SessionServiceImpl:
             decode_audit_outcome_data,
             historical_checkpoint_columns_json,
         )
+        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
         from elspeth.web.composer.continuation_prepared_p4 import prepared_p4_members
 
         context = running.session_operation_context
@@ -1996,7 +2004,12 @@ class SessionServiceImpl:
             raise AuditIntegrityError("prepared metadata publication changed its original creator or planned identities")
         if (
             len(members.redacted_calls) != 1
-            or members.redacted_calls[0]["function"]["name"] != "set_metadata"
+            or members.redacted_calls[0]["function"]["name"] not in ("set_metadata", "set_pipeline")
+            or (
+                members.redacted_calls[0]["function"]["name"] == "set_pipeline"
+                and type(decode_continuation_policy(original_selected.stack.admission_policy_json, original_selected.stack.policy_hash))
+                is not ContinuationAdmissionPolicyV4
+            )
             or len(members.redacted_rows) != 1
             or len(members.invocations) != 1
             or members.invocations[0].status is not ComposerToolStatus.SUCCESS
@@ -8453,6 +8466,87 @@ class SessionServiceImpl:
             raise outcome.refusal
         return outcome
 
+    async def begin_v4_continuation_title_attempt(
+        self,
+        *,
+        prepared: PreparedTitleProvider,
+        requested_model: str,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[V4TitleProviderAdmission | _ProviderAdmissionRefused]:
+        from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+        from elspeth.web.sessions.continuation_title_provider import PreparedTitleProvider, admit_v4_title_provider_on_connection
+
+        if type(prepared) is not PreparedTitleProvider or type(requested_model) is not str or not requested_model:
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 TITLE admission requires its original prepared model"))
+        context = prepared.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> V4TitleProviderAdmission | _ProviderAdmissionRefused:
+            try:
+                with (
+                    self._session_process_locked_begin(context.fence.session_id) as conn,
+                    self._session_write_lock(conn, context.fence.session_id),
+                ):
+                    self._require_session_operation_context_on_connection(
+                        conn,
+                        context,
+                        session_id=context.fence.session_id,
+                        expected_kind=SessionOperationKind.COMPOSE,
+                        now=database_now(conn),
+                    )
+                    root = decode_continuation_snapshot(prepared.selected.payload_json)
+                    if type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is not ContinuationAdmissionPolicyV4:
+                        raise AuditIntegrityError("V4 TITLE admission lost its exact selected V4 policy")
+                    return admit_v4_title_provider_on_connection(conn, self, prepared, model=requested_model)
+            except ChargeableAdmissionRefused as refusal:
+                try:
+                    self._record_provider_attempt_quota_refusal_sync(context, "auto_title", refusal)
+                except BaseException as recorder_error:
+                    raise BaseExceptionGroup("provider admission refusal recording failed", [refusal, recorder_error]) from None
+                return _ProviderAdmissionRefused(refusal)
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def read_v4_continuation_title_admission(
+        self,
+        *,
+        prepared: PreparedTitleProvider,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[V4TitleProviderAdmission | None]:
+        from elspeth.web.sessions.continuation_title_provider import PreparedTitleProvider, read_v4_title_admission_on_connection
+
+        if type(prepared) is not PreparedTitleProvider:
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 TITLE admission read requires its original prepared source"))
+        context = prepared.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.CONTINUATION_READ_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> V4TitleProviderAdmission | None:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+            ):
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    context,
+                    session_id=context.fence.session_id,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=database_now(conn),
+                )
+                return read_v4_title_admission_on_connection(conn, prepared=prepared)
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
     async def begin_v4_continuation_primary_attempt(
         self,
         *,
@@ -8873,6 +8967,136 @@ class SessionServiceImpl:
 
         return await run_required_sql_finish_once(required_work, _sync)
 
+    async def finalize_v4_continuation_primary_incomplete(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        admission: V4PrimaryProviderAdmission,
+        incomplete: V4ProviderResultIncomplete,
+        call: ComposerLLMCall,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+        from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission
+        from elspeth.web.sessions.continuation_primary_paid_incomplete_finalization import finalize_v4_primary_incomplete_on_connection
+        from elspeth.web.sessions.continuation_primary_paid_incomplete_terminal import (
+            read_v4_primary_paid_incomplete_verified_on_connection,
+        )
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        if (
+            type(prepared) is not PreparedContinuationProvider
+            or type(admission) is not V4PrimaryProviderAdmission
+            or type(incomplete) is not V4ProviderResultIncomplete
+            or type(call) is not ComposerLLMCall
+        ):
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 PRIMARY incomplete finalizer requires its original paid source"))
+        context = prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> VerifiedPaidIncompleteTerminal:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=context.fence.session_id,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+                written = finalize_v4_primary_incomplete_on_connection(
+                    conn, prepared=prepared, admission=admission, incomplete=incomplete, call=call, session_service=self
+                )
+            with locked_session_transaction(self._engine, str(context.fence.session_id)) as conn:
+                cold = read_v4_primary_paid_incomplete_verified_on_connection(
+                    conn,
+                    session_id=prepared.binding.running.claim.session_id,
+                    operation_id=prepared.binding.running.claim.operation_id,
+                    effect_key=admission.hold.effect_key,
+                )
+            if type(written) is not VerifiedPaidIncompleteTerminal or type(cold) is not VerifiedPaidIncompleteTerminal or cold != written:
+                raise AuditIntegrityError("V4 PRIMARY incomplete finalizer lost its committed cold terminal")
+            return cold
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def finalize_v4_continuation_classifier_incomplete(
+        self,
+        *,
+        prepared: PreparedClassifierPrimaryProvider,
+        admission: V4ClassifierProviderAdmission,
+        incomplete: V4ProviderResultIncomplete,
+        call: ComposerLLMCall,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+        from elspeth.web.sessions.continuation_classifier_primary import PreparedClassifierPrimaryProvider, V4ClassifierProviderAdmission
+        from elspeth.web.sessions.continuation_classifier_primary_incomplete_finalization import (
+            finalize_v4_classifier_incomplete_on_connection,
+        )
+        from elspeth.web.sessions.continuation_classifier_primary_incomplete_terminal import (
+            read_v4_classifier_paid_incomplete_terminal_on_connection,
+        )
+        from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        if (
+            type(prepared) is not PreparedClassifierPrimaryProvider
+            or type(admission) is not V4ClassifierProviderAdmission
+            or type(incomplete) is not V4ProviderResultIncomplete
+            or type(call) is not ComposerLLMCall
+        ):
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 classifier incomplete finalizer requires its original paid source"))
+        context = prepared.prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> VerifiedPaidIncompleteTerminal:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=context.fence.session_id,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+                written = finalize_v4_classifier_incomplete_on_connection(
+                    conn,
+                    session_service=self,
+                    prepared=prepared,
+                    admission=admission,
+                    incomplete=incomplete,
+                    call=call,
+                )
+            with locked_session_transaction(self._engine, str(context.fence.session_id)) as conn:
+                cold = read_v4_classifier_paid_incomplete_terminal_on_connection(
+                    conn,
+                    session_id=prepared.prepared.binding.running.claim.session_id,
+                    operation_id=prepared.prepared.binding.running.claim.operation_id,
+                    effect_key=admission.hold.effect_key,
+                )
+            if type(written) is not VerifiedPaidIncompleteTerminal or type(cold) is not VerifiedPaidIncompleteTerminal or cold != written:
+                raise AuditIntegrityError("V4 classifier incomplete finalizer lost its committed cold terminal")
+            return cold
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
     async def finalize_v4_continuation_classifier(
         self,
         *,
@@ -8929,6 +9153,67 @@ class SessionServiceImpl:
                     recorder=recorder,
                     permit=permit,
                 )
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def cancel_v4_continuation_title_unentered(
+        self, *, permit: TitleNoSdkRefusalPermit, required_work: RequiredWorkTicket
+    ) -> RequiredSQLFinishOnce[VerifiedTitleNoSdkTerminal]:
+        from elspeth.web.composer.continuation_title_no_sdk import TitleNoSdkRefusalPermit
+        from elspeth.web.sessions.continuation_title_no_sdk_close import refuse_v4_title_no_sdk_on_connection
+        from elspeth.web.sessions.continuation_title_no_sdk_terminal import (
+            VerifiedTitleNoSdkTerminal,
+            read_v4_title_no_sdk_terminal_on_connection,
+        )
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        if type(permit) is not TitleNoSdkRefusalPermit:
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 TITLE zero-use refusal requires its original permit"))
+        try:
+            permit.issuer.require_refusal_permit(permit)
+        except AuditIntegrityError as error:
+            _refuse_required_sql(required_work, error)
+        prepared = permit.prepared
+        context = prepared.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+        sid = context.fence.session_id
+
+        def _sync() -> VerifiedTitleNoSdkTerminal:
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+                written = refuse_v4_title_no_sdk_on_connection(conn, service=self, permit=permit)
+            with locked_session_transaction(self._engine, sid) as conn:
+                cold = read_v4_title_no_sdk_terminal_on_connection(
+                    conn,
+                    session_id=prepared.running.claim.session_id,
+                    operation_id=prepared.running.claim.operation_id,
+                    names=prepared.names,
+                )
+            if (
+                type(cold) is not VerifiedTitleNoSdkTerminal
+                or written.status != "failed"
+                or (written.checkpoint_id, written.journal_cursor) != (cold.terminal.checkpoint_id, cold.terminal.cursor)
+                or cold.source != permit.admission.hold
+                or cold.provider_attempt_id != permit.admission.attempt.attempt_id
+                or cold.hold_state != "consumed"
+                or cold.reason is not permit.reason
+            ):
+                raise AuditIntegrityError("V4 TITLE zero-use refusal lost its committed cold terminal")
+            return cold
 
         return await run_required_sql_finish_once(required_work, _sync)
 
@@ -11443,6 +11728,62 @@ class SessionServiceImpl:
             session_mutations.mark_session_updated(updated_at=now)
         return tuple(active_drafts)
 
+    def _write_v4_title_terminal_public_audit_on_connection(
+        self,
+        conn: Connection,
+        *,
+        running: ComposerOperationRunning,
+        call: ComposerLLMCall,
+        status: ComposerLLMCallStatus,
+    ) -> None:
+        """Retain the original public call without a second quota settlement."""
+        from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
+        from elspeth.web.composer.visible_tool_event import validate_visible_audit_row
+
+        context = running.session_operation_context
+        sid = str(running.claim.session_id)
+        if (
+            type(call) is not ComposerLLMCall
+            or call.call_id is None
+            or call.status is not status
+            or context.operation_kind is not SessionOperationKind.COMPOSE
+        ):
+            raise AuditIntegrityError("TITLE terminal public audit lost its original physical call")
+        public = provider_attempt_audit_drafts(call, context)[0]
+        if (
+            public.role != "audit"
+            or public.content != "Provider call result recorded."
+            or len(canonical_json(public.tool_calls).encode("utf-8")) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        ):
+            raise AuditIntegrityError("TITLE terminal public audit exceeds its unchanged document bound")
+        validate_visible_audit_row(
+            envelopes=tuple(public.tool_calls or ()),
+            content=public.content,
+            role=public.role,
+            writer_principal="compose_loop",
+            session_id=sid,
+            context=context,
+        )
+        self._assert_session_write_lock_held(conn, sid, caller="_write_v4_title_terminal_public_audit_on_connection")
+        sequence = self._reserve_sequence_range(conn, sid, count=1)
+        self._insert_chat_message(
+            conn,
+            session_id=sid,
+            role=public.role,
+            content=public.content,
+            raw_content=None,
+            tool_calls=deep_thaw(public.tool_calls),
+            sequence_no=sequence,
+            writer_principal="compose_loop",
+            composition_state_id=None,
+            tool_call_id=public.tool_call_id,
+            parent_assistant_id=public.parent_assistant_id,
+            created_at=self._now(),
+            session_operation_context=context,
+            audit_only=True,
+        )
+
     def settle_v4_title_overflow_sync(
         self,
         *,
@@ -11450,9 +11791,12 @@ class SessionServiceImpl:
         admission: V4TitleProviderAdmission,
         observation: TitleOverflowObservation,
         names: CurrentTitleNames,
+        custody: ProviderCallCustody,
     ) -> VerifiedTitlePaidOverflowTerminal:
         """Settle one observed over-limit paid TITLE result under its original lock."""
         from elspeth.web.composer.continuation_title_observation import TitleOverflowObservation
+        from elspeth.web.composer.provider_quota import ProviderCallCustody
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
         from elspeth.web.sessions.continuation_title_paid_overflow_settlement import settle_v4_title_paid_overflow_on_connection
         from elspeth.web.sessions.continuation_title_paid_overflow_terminal import read_v4_title_paid_overflow_terminal_on_connection
         from elspeth.web.sessions.continuation_title_provider import CurrentTitleNames, V4TitleProviderAdmission
@@ -11466,8 +11810,17 @@ class SessionServiceImpl:
             or names.running is not prepared.running
             or names.selected != admission.selected
             or admission.attempt.attempt_id != observation.attempt_id
+            or type(custody) is not ProviderCallCustody
+            or custody.continuation_title is not prepared
+            or custody.continuation_title_v4_admission is not admission
+            or custody.attempt is not admission.attempt
+            or custody.call is not observation.audit_call
         ):
             raise AuditIntegrityError("V4 TITLE overflow settlement changed its original producer or service")
+        witness = observation.completion.provider_metadata.v4_completeness
+        if type(witness) is not V4ProviderResultCompleteness:
+            raise AuditIntegrityError("V4 TITLE overflow lost its source-issued complete provider return")
+        custody.require_v4_result_completeness(witness)
         running = prepared.running
         sid, operation = str(running.claim.session_id), running.claim.operation_id
         with (
@@ -11482,12 +11835,82 @@ class SessionServiceImpl:
             ),
         ):
             names.require(conn)
+            self._write_v4_title_terminal_public_audit_on_connection(
+                conn, running=running, call=observation.audit_call, status=ComposerLLMCallStatus.SUCCESS
+            )
             receipt = settle_v4_title_paid_overflow_on_connection(conn, prepared=prepared, admission=admission, observation=observation)
             terminal = read_v4_title_paid_overflow_terminal_on_connection(
                 conn, session_id=running.claim.session_id, operation_id=operation, names=names.names
             )
             if terminal is None or terminal.receipt != receipt or terminal.hold_state != "consumed":
                 raise AuditIntegrityError("V4 TITLE paid overflow lost its cold terminal after settlement")
+            return terminal
+
+    def settle_v4_title_paid_incomplete_sync(
+        self,
+        *,
+        prepared: PreparedTitleProvider,
+        admission: V4TitleProviderAdmission,
+        incomplete: V4ProviderResultIncomplete,
+        custody: ProviderCallCustody,
+        names: CurrentTitleNames,
+    ) -> VerifiedPaidIncompleteTerminal:
+        """Close one original parser-issued returned TITLE failure in SQL."""
+        from elspeth.web.composer.provider_quota import ProviderCallCustody
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+        from elspeth.web.sessions.continuation_title_paid_incomplete_settlement import (
+            settle_v4_title_paid_incomplete_on_connection,
+        )
+        from elspeth.web.sessions.continuation_title_paid_incomplete_terminal import (
+            read_v4_title_paid_incomplete_terminal_on_connection,
+        )
+        from elspeth.web.sessions.continuation_title_provider import CurrentTitleNames, V4TitleProviderAdmission
+
+        if (
+            type(prepared) is not PreparedTitleProvider
+            or type(admission) is not V4TitleProviderAdmission
+            or type(incomplete) is not V4ProviderResultIncomplete
+            or type(custody) is not ProviderCallCustody
+            or type(names) is not CurrentTitleNames
+            or prepared.composer._require_sessions_service() is not self
+            or custody.continuation_title is not prepared
+            or custody.continuation_title_v4_admission is not admission
+            or custody.attempt is not admission.attempt
+            or custody.call is None
+            or names.running is not prepared.running
+            or names.selected != admission.selected
+        ):
+            raise AuditIntegrityError("V4 TITLE paid-incomplete settlement changed original provider custody")
+        custody.require_v4_result_incomplete(incomplete)
+        running = prepared.running
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn,
+                session_id=sid,
+                session_operation_context=running.session_operation_context,
+                expected_kind=SessionOperationKind.COMPOSE,
+                audit_only=True,
+            ),
+        ):
+            names.require(conn)
+            self._write_v4_title_terminal_public_audit_on_connection(
+                conn, running=running, call=custody.call, status=ComposerLLMCallStatus.MALFORMED_RESPONSE
+            )
+            terminal = settle_v4_title_paid_incomplete_on_connection(
+                conn,
+                prepared=prepared,
+                admission=admission,
+                incomplete=incomplete,
+                audit_call=custody.call,
+            )
+            cold = read_v4_title_paid_incomplete_terminal_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=operation, names=names.names
+            )
+            if cold != terminal:
+                raise AuditIntegrityError("V4 TITLE paid-incomplete settlement lost its cold terminal")
             return terminal
 
     def complete_v4_title_result_sync(
@@ -11504,7 +11927,9 @@ class SessionServiceImpl:
         the committed locator before delivering deferred cancellation. This
         synchronous owner remains dormant until that worker is connected.
         """
+        from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _AdmittedLLMProviderMetadata
         from elspeth.web.composer.continuation_title_values import CapturedTitleProviderResult
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness, V4ProviderSdkReturn
         from elspeth.web.sessions.continuation import StoredContinuationSnapshot
         from elspeth.web.sessions.continuation_retained_capacity import (
             ContinuationRetainedCapacityExceeded,
@@ -11544,6 +11969,21 @@ class SessionServiceImpl:
             or admission.attempt.attempt_id != captured.audit_call.call_id
         ):
             raise AuditIntegrityError("V4 TITLE complete settlement changed its original producer or service")
+        completion = captured.completion
+        if type(completion) is not _AdmittedLLMCompletion or type(completion.provider_metadata) is not _AdmittedLLMProviderMetadata:
+            raise AuditIntegrityError("V4 TITLE complete settlement lacks its owned provider result")
+        witness = completion.provider_metadata.v4_completeness
+        if (
+            type(witness) is not V4ProviderResultCompleteness
+            or type(witness.sdk_return) is not V4ProviderSdkReturn
+            or witness.sdk_return.attempt_id != admission.attempt.attempt_id
+        ):
+            raise AuditIntegrityError("V4 TITLE complete settlement lacks its original source-issued provider return")
+        witness.require_result(
+            completion.provider_metadata,
+            content=completion.message.content,
+            tool_calls=completion.tool_batch.calls,
+        )
         running = prepared.running
         sid, operation = str(running.claim.session_id), running.claim.operation_id
         context = running.session_operation_context
@@ -11570,6 +12010,9 @@ class SessionServiceImpl:
             else:
                 aggregate_capacity_exceeded = False
             if aggregate_capacity_exceeded:
+                self._write_v4_title_terminal_public_audit_on_connection(
+                    conn, running=running, call=captured.audit_call, status=ComposerLLMCallStatus.SUCCESS
+                )
                 receipt = settle_v4_title_paid_overflow_on_connection(
                     conn,
                     prepared=prepared,
@@ -11779,6 +12222,152 @@ class SessionServiceImpl:
             )
             return persist_v4_semantic_complete_on_connection(conn, prepared=prepared, admission=admission, batch=complete)
 
+    def complete_v4_semantic_paid_incomplete_sync(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        admission: V4SemanticProviderAdmission,
+        incomplete: V4ProviderResultIncomplete,
+        no_sdk_issuer: SemanticAdvisorNoSdkIssuer,
+    ) -> VerifiedPaidIncompleteTerminal:
+        """Settle one genuine returned parser loss, original attempt and H atomically."""
+        from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+        from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+        from elspeth.web.composer.visible_tool_event import validate_visible_audit_row
+        from elspeth.web.sessions.continuation import (
+            PreparedContinuationProvider,
+            _require_current_continuation_running,
+            require_snapshot_cas,
+        )
+        from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission, _descriptor_data
+        from elspeth.web.sessions.continuation_semantic_paid_incomplete_settlement import (
+            settle_v4_semantic_paid_incomplete_on_connection,
+        )
+        from elspeth.web.sessions.models import composer_async_operations_table as semantic_jobs
+        from elspeth.web.sessions.models import composer_continuation_effects_table as semantic_effects
+        from elspeth.web.sessions.models import quota_provider_attempts_table as semantic_physical
+
+        if (
+            type(prepared) is not PreparedContinuationProvider
+            or type(admission) is not V4SemanticProviderAdmission
+            or type(incomplete) is not V4ProviderResultIncomplete
+            or type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer
+            or no_sdk_issuer.running is not prepared.binding.running
+            or admission.hold.effect_key != prepared.binding.effect_key
+            or admission.hold.source_input_sha256 != prepared.binding.input_sha256
+        ):
+            raise AuditIntegrityError("V4 semantic paid-incomplete result changed original prepared owner")
+        running = prepared.binding.running
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn,
+                session_id=sid,
+                session_operation_context=running.session_operation_context,
+                expected_kind=SessionOperationKind.COMPOSE,
+                audit_only=True,
+            ),
+        ):
+            _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+            selected = require_snapshot_cas(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                expected_checkpoint_id=admission.selected.checkpoint_id,
+                expected_cursor=admission.selected.cursor,
+            )
+            if selected != admission.selected:
+                raise AuditIntegrityError("V4 semantic paid-incomplete result changed original dispatched root")
+            effect = conn.execute(
+                select(semantic_effects).where(
+                    semantic_effects.c.session_id == sid,
+                    semantic_effects.c.operation_id == operation,
+                    semantic_effects.c.effect_key == prepared.binding.effect_key,
+                )
+            ).one()
+            _stored, source, _physical_input = _descriptor_data(conn, sid, operation, effect)
+            original = no_sdk_issuer.require_original_v4_incomplete_capture(prepared, admission.selected, incomplete)
+            if original.source != source.invocation or original.request_sha256 != prepared.binding.input_sha256:
+                raise AuditIntegrityError("V4 semantic paid-incomplete result changed original invocation")
+            audit_call = original.audit_call
+            if type(audit_call) is not ComposerLLMCall:
+                raise AuditIntegrityError("V4 semantic paid-incomplete result lost its actual original paid audit")
+            physical = conn.execute(select(semantic_physical).where(semantic_physical.c.attempt_id == admission.attempt.attempt_id)).one()
+            parent = conn.execute(
+                select(semantic_jobs).where(semantic_jobs.c.session_id == sid, semantic_jobs.c.operation_id == operation)
+            ).one()
+            # This terminal owns the original physical ledger below. The
+            # generic audit cohort writer also settles usage, using the
+            # returned model and its own clock; that would conflict with this
+            # receipt's requested-model/observed-at ledger. Retain the exact
+            # public/private audit cohort under the same writer fence, then
+            # let the semantic terminal settle its one physical attempt.
+            audit_context = running.session_operation_context
+            drafts = provider_attempt_audit_drafts(audit_call, audit_context)
+            for draft in drafts:
+                validate_visible_audit_row(
+                    envelopes=tuple(draft.tool_calls or ()),
+                    content=draft.content,
+                    role=draft.role,
+                    writer_principal="compose_loop",
+                    session_id=sid,
+                    context=audit_context,
+                )
+            self._assert_session_write_lock_held(conn, sid, caller="complete_v4_semantic_paid_incomplete_sync")
+            drafts = self._deduplicate_private_audit_drafts(
+                conn,
+                session_id=sid,
+                drafts=drafts,
+                writer_principal="compose_loop",
+                session_operation_context=audit_context,
+                composition_state_id=None,
+            )
+            active_drafts = []
+            for draft in drafts:
+                if draft.tool_calls:
+                    envelopes = uncheckpointed_envelopes(conn, session_id=sid, envelopes=draft.tool_calls)
+                    if not envelopes and draft.role == "audit":
+                        continue
+                    draft = replace(draft, tool_calls=envelopes)
+                active_drafts.append(draft)
+            public = tuple(draft for draft in active_drafts if draft.role == "audit" and draft.content == "Provider call result recorded.")
+            if len(public) != 1:
+                raise AuditIntegrityError("V4 semantic paid-incomplete result lost its original one public audit")
+            now = self._now()
+            base_seq = self._reserve_sequence_range(conn, sid, count=len(active_drafts))
+            for offset, draft in enumerate(active_drafts):
+                self._insert_chat_message(
+                    conn,
+                    session_id=sid,
+                    role=draft.role,
+                    content=draft.content,
+                    raw_content=None,
+                    tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
+                    sequence_no=base_seq + offset,
+                    writer_principal="compose_loop",
+                    composition_state_id=draft.effective_composition_state_id(None),
+                    tool_call_id=draft.tool_call_id,
+                    parent_assistant_id=draft.parent_assistant_id,
+                    created_at=now,
+                    session_operation_context=audit_context,
+                    audit_only=True,
+                )
+            with self._session_mutations(conn, session_id=sid, session_operation_context=audit_context) as session_mutations:
+                session_mutations.mark_session_updated(updated_at=now)
+            return settle_v4_semantic_paid_incomplete_on_connection(
+                conn,
+                admission=admission,
+                incomplete=incomplete,
+                audit_call=audit_call,
+                running=running,
+                effect=effect,
+                physical_row=physical,
+                parent=parent,
+            )
+
     def prepare_v4_checkpoint_source_sync(self, *, prepared: PreparedCheckpointSource) -> CheckpointPreparedSource:
         """Retain the original EARLY/END pre-call capture before paid admission.
 
@@ -11878,7 +12467,82 @@ class SessionServiceImpl:
                 audit_only=True,
             ),
         ):
-            return settle_v4_checkpoint_returned_overflow_on_connection(conn, prepared=prepared, admission=admission, observation=observed)
+            return settle_v4_checkpoint_returned_overflow_on_connection(
+                conn, service=self, prepared=prepared, admission=admission, observation=observed
+            )
+
+    async def finalize_v4_continuation_checkpoint_incomplete(
+        self,
+        *,
+        prepared: PreparedCheckpointProvider,
+        admission: V4CheckpointProviderAdmission,
+        custody: ProviderCallCustody,
+        incomplete: V4ProviderResultIncomplete,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+        """Use one original settlement ticket and reprove the committed terminal cold."""
+        from elspeth.web.composer.provider_quota import ProviderCallCustody
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+        from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
+        from elspeth.web.sessions.continuation_checkpoint_paid_incomplete_settlement import (
+            settle_v4_checkpoint_returned_incomplete_on_connection,
+        )
+        from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
+            read_v4_checkpoint_paid_incomplete_verified_on_connection,
+        )
+        from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        if (
+            type(prepared) is not PreparedCheckpointProvider
+            or type(admission) is not V4CheckpointProviderAdmission
+            or type(custody) is not ProviderCallCustody
+            or type(incomplete) is not V4ProviderResultIncomplete
+            or custody.continuation_checkpoint_v4 is not prepared
+            or custody.continuation_checkpoint_v4_admission is not admission
+        ):
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 checkpoint incomplete changed its original paid owner"))
+        context = prepared.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> VerifiedPaidIncompleteTerminal:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=context.fence.session_id,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+                written = settle_v4_checkpoint_returned_incomplete_on_connection(
+                    conn,
+                    service=self,
+                    prepared=prepared,
+                    admission=admission,
+                    custody=custody,
+                    incomplete=incomplete,
+                )
+            with locked_session_transaction(self._engine, str(context.fence.session_id)) as conn:
+                cold = read_v4_checkpoint_paid_incomplete_verified_on_connection(
+                    conn,
+                    session_id=prepared.running.claim.session_id,
+                    operation_id=prepared.running.claim.operation_id,
+                    effect_key=admission.hold.effect_key,
+                    names=prepared.env_ref_names,
+                )
+            if type(cold) is not VerifiedPaidIncompleteTerminal or cold != written:
+                raise AuditIntegrityError("V4 checkpoint incomplete finalizer lost its committed cold terminal")
+            return cold
+
+        return await run_required_sql_finish_once(required_work, _sync)
 
     def refuse_v4_checkpoint_no_sdk_sync(self, *, permit: CheckpointNoSdkRefusalPermit) -> ComposerOperationRecord:
         """Close one original checkpoint admission proven unentered by custody."""
@@ -11901,6 +12565,31 @@ class SessionServiceImpl:
             ),
         ):
             return refuse_v4_checkpoint_no_sdk_on_connection(conn, service=self, permit=permit)
+
+    def refuse_v4_checkpoint_unbound_source_sync(self, *, permit: CheckpointUnboundRefusalPermit) -> VerifiedCheckpointUnboundRefusal:
+        """Close an original END source before any provider request or attempt binds."""
+        from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointUnboundRefusalPermit
+        from elspeth.web.sessions.continuation_checkpoint_unbound_refusal import refuse_v4_checkpoint_unbound_source_on_connection
+
+        if type(permit) is not CheckpointUnboundRefusalPermit:
+            raise AuditIntegrityError("V4 checkpoint unbound refusal requires its original nominal permit")
+        running = permit.source.phase_owner.phases.work.running
+        if running is None:
+            raise AuditIntegrityError("V4 checkpoint unbound refusal lost its original running owner")
+        context = running.session_operation_context
+        sid = str(running.claim.session_id)
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn,
+                session_id=sid,
+                session_operation_context=context,
+                expected_kind=SessionOperationKind.COMPOSE,
+                audit_only=True,
+            ),
+        ):
+            return refuse_v4_checkpoint_unbound_source_on_connection(conn, permit=permit)
 
     async def add_messages_atomic(
         self,

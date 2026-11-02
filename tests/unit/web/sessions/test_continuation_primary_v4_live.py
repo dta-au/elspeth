@@ -150,7 +150,7 @@ async def test_v4_primary_oversized_actual_response_is_one_cold_paid_terminal_wi
     sdk = []
     measured = []
 
-    original_observe = primary_module.observe_primary_provider_result
+    original_observe = primary_module.observe_v4_primary_provider_result
 
     def observe_with_original_boundary(**values):
         outcome = values["outcome"]
@@ -183,7 +183,7 @@ async def test_v4_primary_oversized_actual_response_is_one_cold_paid_terminal_wi
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    monkeypatch.setattr(primary_module, "observe_primary_provider_result", observe_with_original_boundary)
+    monkeypatch.setattr(primary_module, "observe_v4_primary_provider_result", observe_with_original_boundary)
     work = kwargs["required_work"]
     with prompt_guard_user_scope(REQUEST):
         result = await run_continuation_primary(

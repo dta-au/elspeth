@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateToolAuthoring
 from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.readonly_json import JsonValue
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer._compose_loop_carriers import (
@@ -266,6 +266,9 @@ class PreparedTurnAuditRows:
     redacted_calls: tuple[Mapping[str, JsonValue], ...]
     redacted_rows: tuple[RedactedToolRow, ...]
     revoked_rows: tuple[RedactedToolRow, ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "redacted_calls")
 
 
 def prepare_turn_audit_rows(

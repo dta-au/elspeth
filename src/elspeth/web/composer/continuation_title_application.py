@@ -11,7 +11,6 @@ from elspeth.web.composer.continuation_env_inventory import _read_current_env_na
 from elspeth.web.composer.continuation_initialization import _registered, _sessions
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_title_provider import _running
-from elspeth.web.composer.continuation_title_values import decode_title_provider_result
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions._auto_title import _join_auto_title_custody_task, _record_auto_title_rejection
@@ -136,6 +135,5 @@ async def apply_current_title_success(
         rejection = published.decision.rejection_class
         if rejection is None:
             raise AuditIntegrityError("TITLE rejection lost its actual gate classification")
-        result = decode_title_provider_result(published.result, env_ref_names=published.inventory.names)
-        _record_auto_title_rejection(rejection, result.completion.provider_metadata.finish_reason)
+        _record_auto_title_rejection(rejection, published.finish_reason)
     return published

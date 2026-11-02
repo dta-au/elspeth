@@ -352,3 +352,41 @@ it("closes the progress vocabulary and bounds its text", () => {
   expect(() => decode({ evidence: ["a", "b", "c", "d", "e"] })).toThrow("Unbounded progress evidence");
   expect(() => decode({ request_id: "r".repeat(129) })).toThrow("Unbounded progress text");
 });
+
+
+describe("paid incomplete terminal admission", () => {
+  const body = { error_type: "paid_result_incomplete", detail: "The returned paid result could not be fully retained. It was not used or retried.", evidence_status: "incomplete", retryable: false, cost: { status: "unknown", amount: null }, request_id: null };
+  const error = { http_status: 507, body, error_type: "paid_result_incomplete", failure_code: "http_error", diagnostic_id: null };
+  const terminal = { ...envelope, status: "failed", result: null, error };
+
+  it("accepts bounded known and unknown costs and retained failure taxonomy", () => {
+    for (const cost of [{ status: "unknown", amount: null }, { status: "known", amount: "0" }, { status: "known", amount: "0.0012300" }, { status: "known", amount: "5e-324" }]) {
+      expect(decodeComposerOperationSnapshot({ ...terminal, error: { ...error, body: { ...body, cost } } }, sid, id).error?.body.cost).toEqual(cost);
+    }
+    const outcome = { session_id: sid, operation_id: id, kind: "compose_message", user_message_id: id, settled_at: "2026-10-14T08:00:00Z", failure_code: "http_error", error_type: "paid_result_incomplete", diagnostic_id: null, request_id: null, saved_revisions: { attribution: "fenced", count: 0, latest_state_id: null, latest_version: null } };
+    expect(decodeComposerOperationFailurePage({ session_id: sid, items: [outcome], next_cursor: null }, sid, id).items[0]).toEqual(outcome);
+    expect(() => decodeComposerOperationFailurePage({ session_id: sid, items: [{ ...outcome, failure_code: "worker_lost" }], next_cursor: null }, sid, id)).toThrow();
+  });
+  it("rejects mismatched HTTP or error identity and any response attached to the failure", () => {
+    for (const changed of [{ http_status: 500 }, { failure_code: "worker_lost" }, { error_type: null }, { error_type: "paid_result_overflow" }, { diagnostic_id: id }]) {
+      expect(() => decodeComposerOperationSnapshot({ ...terminal, error: { ...error, ...changed } }, sid, id)).toThrow();
+    }
+    expect(() => decodeComposerOperationSnapshot({ ...terminal, result: {} }, sid, id)).toThrow();
+  });
+  it("rejects extra graph/tool/recovery fields, incomplete schemas, retry claims and malformed cost observations", () => {
+    for (const changed of [
+      { retryable: true }, { evidence_status: "complete" }, { detail: "provider text" }, { error_type: "other" },
+      { partial_state: null }, { tool_calls: [] }, { response: {} }, { request_id: "x".repeat(129) },
+      { cost: { status: "unknown", amount: "0" } }, { cost: { status: "known", amount: null } },
+      { cost: { status: "known", amount: 0 } }, { cost: { status: "known", amount: "NaN" } },
+      ...["1e999", "1e-325", "1e-6", "1.0e21", "1e021", "1.8e308"].map((amount) => ({ cost: { status: "known", amount } })),
+      { cost: { status: "known", amount: "-1" } }, { cost: { status: "known", amount: "1".repeat(129) } },
+      { cost: { status: "known", amount: "1", source: "provider" } },
+    ]) expect(() => decodeComposerOperationSnapshot({ ...terminal, error: { ...error, body: { ...body, ...changed } } }, sid, id)).toThrow();
+    for (const key of Object.keys(body)) {
+      const incomplete: Record<string, unknown> = { ...body };
+      delete incomplete[key];
+      expect(() => decodeComposerOperationSnapshot({ ...terminal, error: { ...error, body: incomplete } }, sid, id)).toThrow();
+    }
+  });
+});

@@ -30,6 +30,10 @@ from elspeth.web.sessions.continuation_retained_capacity import (
     _require_hold_fields,
     read_bounded_retained_chunk,
 )
+from elspeth.web.sessions.continuation_semantic_paid_incomplete_tail import (
+    prepare_semantic_paid_incomplete_tail_plan,
+    semantic_combined_terminal_hold_contract,
+)
 from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import prepare_semantic_no_sdk_tail_plan
 from elspeth.web.sessions.continuation_semantic_paid_overflow_tail import (
     build_semantic_paid_overflow_tail_batch,
@@ -223,17 +227,10 @@ def read_v4_semantic_paid_overflow_terminal_on_connection(
         creator_sequence=source.creator_sequence,
         creator_generation=source.creator_generation,
     )
-    reserved = max(paid_plan.reserved_bytes, no_sdk_plan.reserved_bytes)
-    combined_hash = sha256(
-        canonical_json(
-            {
-                "version": "composer.semantic-v4-combined-tail.v1",
-                "paid": paid_plan.fallback_contract_sha256,
-                "no_sdk": no_sdk_plan.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    incomplete_plan = prepare_semantic_paid_incomplete_tail_plan(
+        identity=identity, admitted=admitted, creator_sequence=source.creator_sequence
+    )
+    reserved, combined_hash = semantic_combined_terminal_hold_contract(paid_plan, incomplete_plan, no_sdk_plan)
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("Semantic paid overflow changed original combined terminal H")
     batch = build_semantic_paid_overflow_tail_batch(paid_plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))

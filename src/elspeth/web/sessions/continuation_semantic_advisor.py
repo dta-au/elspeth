@@ -67,6 +67,7 @@ from elspeth.web.composer.continuation_provider_outcomes import (
     decode_physical_audit_call,
     encode_physical_audit_call,
     require_successful_response_audit,
+    require_v4_successful_response_audit,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.continuation_semantic_advisor import (
@@ -125,6 +126,11 @@ from elspeth.web.sessions.continuation_retained_capacity import (
 )
 from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource, read_runtime_source_on_connection
 from elspeth.web.sessions.continuation_selection import load_private_chunks
+from elspeth.web.sessions.continuation_semantic_paid_incomplete_tail import (
+    SemanticPaidIncompleteTailPlan,
+    prepare_semantic_paid_incomplete_tail_plan,
+    semantic_combined_terminal_hold_contract,
+)
 from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import (
     SemanticNoSdkTailPlan,
     prepare_semantic_no_sdk_tail_plan,
@@ -268,6 +274,7 @@ class V4SemanticProviderAdmission:
     selected: StoredContinuationSnapshot
     hold: ProviderTerminalHoldSource
     tail: SemanticPaidOverflowTailPlan
+    incomplete_tail: SemanticPaidIncompleteTailPlan
     no_sdk_tail: SemanticNoSdkTailPlan
 
 
@@ -980,6 +987,9 @@ def admit_v4_semantic_provider_on_connection(
         tail = prepare_semantic_paid_overflow_tail_plan(
             identity=identity, admitted=admitted, creator_sequence=running.claim.segment_sequence
         )
+        incomplete_tail = prepare_semantic_paid_incomplete_tail_plan(
+            identity=identity, admitted=admitted, creator_sequence=running.claim.segment_sequence
+        )
         no_sdk_tail = prepare_semantic_no_sdk_tail_plan(
             admitted=admitted,
             attempt_id=attempt.attempt_id,
@@ -989,17 +999,7 @@ def admit_v4_semantic_provider_on_connection(
             creator_sequence=running.claim.segment_sequence,
             creator_generation=running.claim.ownership_generation,
         )
-        reserved_bytes = max(tail.reserved_bytes, no_sdk_tail.reserved_bytes)
-        contract_sha256 = sha256(
-            canonical_json(
-                {
-                    "version": "composer.semantic-v4-combined-tail.v1",
-                    "paid": tail.fallback_contract_sha256,
-                    "no_sdk": no_sdk_tail.contract_sha256,
-                    "reserved_bytes": reserved_bytes,
-                }
-            ).encode("utf-8")
-        ).hexdigest()
+        reserved_bytes, contract_sha256 = semantic_combined_terminal_hold_contract(tail, incomplete_tail, no_sdk_tail)
         hold = ProviderTerminalHoldSource(
             session_id=sid,
             operation_id=operation,
@@ -1059,7 +1059,7 @@ def admit_v4_semantic_provider_on_connection(
             raise AuditIntegrityError("V4 semantic dispatch changed its reserved complete snapshot")
         no_sdk_issuer.clock.require_preparation_time()
         no_sdk_issuer.note_dispatched_candidate(stored)
-        return V4SemanticProviderAdmission(attempt, stored, hold, tail, no_sdk_tail)
+        return V4SemanticProviderAdmission(attempt, stored, hold, tail, incomplete_tail, no_sdk_tail)
 
 
 def _original_input(
@@ -1666,13 +1666,28 @@ def retain_semantic_advisor_outcome_on_connection(
             or observed.decision is None
         ):
             raise AuditIntegrityError("Semantic successful outcome lost its original admitted response")
-        require_successful_response_audit(
-            call,
-            observed.provider_metadata,
-            attempt_id=observed.attempt.attempt_id,
-            started_at=call.started_at,
-            finished_at=call.finished_at,
-        )
+        policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+        if type(policy) is ContinuationAdmissionPolicyV4:
+            completeness = observed.provider_metadata.v4_completeness
+            if completeness is None:
+                raise AuditIntegrityError("V4 semantic paid retention lost its original complete SDK witness")
+            completeness.require_result(observed.provider_metadata, content=observed.message.content, tool_calls=())
+            require_v4_successful_response_audit(
+                call,
+                observed.provider_metadata,
+                policy=policy,
+                attempt_id=observed.attempt.attempt_id,
+                started_at=call.started_at,
+                finished_at=call.finished_at,
+            )
+        else:
+            require_successful_response_audit(
+                call,
+                observed.provider_metadata,
+                attempt_id=observed.attempt.attempt_id,
+                started_at=call.started_at,
+                finished_at=call.finished_at,
+            )
         decision = parse_continuation_advisor_decision(observed.message.content, actual_advisor_call_id=_call_id(call))
         if decision != observed.decision:
             raise AuditIntegrityError("Semantic decision differs from its one original physical response")
@@ -1874,9 +1889,27 @@ def _paid_result_data(
         if response is None or response.reference.codec != "composer.response.v1" or call.status is not ComposerLLMCallStatus.SUCCESS:
             raise AuditIntegrityError("Semantic decision requires its genuine original successful physical response")
         decoded = decode_continuation_response(response)
-        require_successful_response_audit(
-            call, decoded.provider_metadata, attempt_id=_call_id(call), started_at=call.started_at, finished_at=call.finished_at
-        )
+        policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+        if type(policy) is ContinuationAdmissionPolicyV4:
+            from elspeth.web.composer.provider_result_admission import require_retained_v4_provider_metadata_credentials
+
+            require_retained_v4_provider_metadata_credentials(decoded, surface="composer_advisor_response")
+            require_v4_successful_response_audit(
+                call,
+                decoded.provider_metadata,
+                policy=policy,
+                attempt_id=_call_id(call),
+                started_at=call.started_at,
+                finished_at=call.finished_at,
+            )
+        else:
+            require_successful_response_audit(
+                call,
+                decoded.provider_metadata,
+                attempt_id=_call_id(call),
+                started_at=call.started_at,
+                finished_at=call.finished_at,
+            )
         if type(decoded.message.content) is not str:
             raise AuditIntegrityError("Semantic decision lost its complete original response text")
         decision = parse_continuation_advisor_decision(decoded.message.content, actual_advisor_call_id=_call_id(call))
@@ -3432,13 +3465,15 @@ def consume_semantic_advisor_review_on_connection(
 ) -> StoredContinuationSnapshot:
     """Return the original paid Review action to its genuine retained END owner."""
     from elspeth.web.sessions.continuation_semantic_actions import (
+        _capture_current_review_proof,
+        _consumed_review_from_snapshot,
         installed_action_json,
-        require_consumed_semantic_review_on_connection,
         require_installed_semantic_action_on_connection,
     )
 
     root = _current(conn, running, selected)
     admission = require_installed_semantic_action_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    current_proof = _capture_current_review_proof(conn, selected, effect_key, admission)
     if (
         type(admission.action) is not ReviewContinuationAction
         or admission.action_key is None
@@ -3530,7 +3565,19 @@ def consume_semantic_advisor_review_on_connection(
             event_batch=(ContinuationEvent("checkpoint", event),),
             handoff=False,
         )
-        require_consumed_semantic_review_on_connection(conn, running, selected=consumed, effect_key=effect_key)
+        # The paid installed source was fully re-proved above in this same
+        # locked transaction. Recheck the current fence/head and every newly
+        # appended candidate, bridge and journal byte without replaying that
+        # expensive immutable predecessor proof a second time.
+        _current(conn, running, consumed)
+        _consumed_review_from_snapshot(
+            conn,
+            running.claim.session_id,
+            running.claim.operation_id,
+            consumed,
+            effect_key,
+            current_transaction_proof=current_proof,
+        )
         return consumed
 
 

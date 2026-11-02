@@ -331,6 +331,66 @@ async def test_a_stage_cannot_replenish_the_same_action_clock() -> None:
 
 
 @pytest.mark.asyncio
+async def test_quota_admission_uses_completed_preparation_and_live_stage_after_valid_delayed_guard() -> None:
+    policy = ContinuationActionPolicy(preparation=0.1, guard=1, quota=1, physical=1, retention=1)
+    clock = ContinuationActionClock(policy)
+    clock.finish_preparation()
+
+    async def guard() -> None:
+        await asyncio.sleep(0.12)
+        assert time.monotonic() > clock.preparation_deadline_monotonic
+
+    await clock.run("guard", guard)
+
+    async def quota() -> None:
+        clock.require_active_quota_time()
+
+    await clock.run("quota", quota)
+    with pytest.raises(ValueError, match="active stage"):
+        clock.require_active_quota_time()
+
+
+@pytest.mark.asyncio
+async def test_quota_admission_refuses_expired_original_action_and_quota_bounds() -> None:
+    policy = ContinuationActionPolicy(preparation=1, guard=1, quota=1, physical=1, retention=1)
+    clock = ContinuationActionClock(policy)
+    clock.finish_preparation()
+
+    async def guard() -> None:
+        return None
+
+    await clock.run("guard", guard)
+
+    async def quota() -> None:
+        clock.require_active_quota_time()
+        with pytest.raises(TimeoutError, match="original action allowance"):
+            clock.require_active_quota_time(monotonic_now=clock.started_monotonic + policy.total + 1.0)
+        assert clock._active_stage_deadline_monotonic is not None
+        with pytest.raises(TimeoutError, match="quota or original action"):
+            clock.require_active_quota_time(monotonic_now=clock._active_stage_deadline_monotonic + 1.0)
+
+    await clock.run("quota", quota)
+
+
+@pytest.mark.asyncio
+async def test_quota_admission_refuses_an_unfinished_guard() -> None:
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=1, quota=1, physical=1, retention=1))
+    clock.finish_preparation()
+
+    async def failing_guard() -> None:
+        raise RuntimeError("guard refused")
+
+    with pytest.raises(RuntimeError, match="guard refused"):
+        await clock.run("guard", failing_guard)
+
+    async def quota() -> None:
+        with pytest.raises(ValueError, match="active stage"):
+            clock.require_active_quota_time()
+
+    await clock.run("quota", quota)
+
+
+@pytest.mark.asyncio
 async def test_physical_timeout_is_its_declared_bound_not_segment_remainder() -> None:
     clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=None, quota=None, physical=0.01, retention=1))
     clock.finish_preparation()

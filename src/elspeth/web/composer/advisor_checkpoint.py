@@ -116,11 +116,13 @@ from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
     ProviderInvocationFamily,
     ProviderInvocationOwner,
+    V4PaidIncompleteCommitted,
     composer_quota_scope,
     provider_call_scope,
     quota_provider_calls,
     required_provider_audit_scope,
 )
+from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
@@ -132,6 +134,7 @@ from elspeth.web.execution.schemas import ValidationResult
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_checkpoint_end_locals import CheckpointEndGateLocals
+    from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointEndPhysicalSource
     from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
     from elspeth.web.composer.continuation_tool_failure import ContinuationDispatchFailureObservation
     from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -534,6 +537,7 @@ class AdvisorCheckpointOwner:
         continuation_budget: PlannerContinuationBudget | None = None,
         _outcome: _AdvisorInvocationCapture | None = None,
         failure_observation: ContinuationDispatchFailureObservation | None = None,
+        checkpoint_end_source: CheckpointEndPhysicalSource | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -653,6 +657,17 @@ class AdvisorCheckpointOwner:
                 max_bytes=self._settings.composer_max_prepared_request_bytes,
                 advisor_content=advisor_content,
             )
+        except ComposerContextUnsupported as refused:
+            attach_llm_calls(refused, recorder)
+            if checkpoint_end_source is None or refused.reason != "prepared_request_bytes":
+                raise
+            from elspeth.web.composer.continuation_checkpoint_end_physical import (
+                _CheckpointUnboundRefusalObserved,
+                observe_checkpoint_end_unbound_refusal,
+            )
+
+            permit = observe_checkpoint_end_unbound_refusal(checkpoint_end_source, failure=refused)
+            raise _CheckpointUnboundRefusalObserved(permit) from refused
         except (ComposerAdmissionRefused, AuditIntegrityError, TypeError, ValueError, RecursionError) as refused:
             attach_llm_calls(refused, recorder)
             raise
@@ -665,6 +680,18 @@ class AdvisorCheckpointOwner:
         private_request = capture_provider_context(messages=messages, tools=prepared_input.tools)
         if abandonment_review and private_request.disposition != "retained":
             raise AdvisorAbandonmentContextUnavailable("Abandonment evidence exceeds an existing safe-input boundary")
+        if checkpoint_end_source is not None:
+            from elspeth.web.composer.continuation_checkpoint_end_physical import bind_checkpoint_end_physical_request
+            from elspeth.web.composer.continuation_checkpoint_end_producer import checkpoint_end_request_identity
+
+            if checkpoint_phase != "end" or provider_custody is None or _outcome is not checkpoint_end_source.capture:
+                raise AuditIntegrityError("END physical adapter lost its original structured invocation")
+            if private_request.disposition != "retained":
+                raise AuditIntegrityError("END physical adapter requires its complete original request capture")
+            bind_checkpoint_end_physical_request(checkpoint_end_source, custody=provider_custody, prepared_input=prepared_input)
+            # This full request continuity proof is distinct from the audit
+            # messages_hash retained by checkpoint SQL and its terminal hold.
+            kwargs["continuation_input_sha256"] = checkpoint_end_request_identity(kwargs)
         # Reserve only a successfully prepared attempt. A graph/allowance
         # refusal above has no physical request and spends no continuation
         # allowance. The physical dispatch callback retains deadline/cost checks.
@@ -695,6 +722,12 @@ class AdvisorCheckpointOwner:
                 credential_surface="composer_advisor_response",
                 require_tool_calls_field=structured_output,
             )
+            if checkpoint_end_source is not None:
+                witness = response_metadata.v4_completeness
+                if witness is None or provider_custody is None:
+                    raise AuditIntegrityError("END physical result lost its original complete SDK witness")
+                provider_custody.require_v4_result_completeness(witness)
+                witness.require_result(response_metadata, content=message.content, tool_calls=tool_calls)
             # F4: validate content BEFORE marking SUCCESS. None / empty /
             # whitespace-only content (content-filter triggered, malformed
             # provider output, tool-call-only response) must classify as
@@ -751,6 +784,11 @@ class AdvisorCheckpointOwner:
             return guidance, metadata
         except (PromptGuardRefused, ComposerContextUnsupported):
             raise
+        except V4PaidIncompleteCommitted:
+            # Custody already committed the paid incomplete terminal. Preserve
+            # its nominal control for the END owner; do not fabricate a second
+            # API-error audit from the discarded oversized SDK response.
+            raise
         except TimeoutError:
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
@@ -767,6 +805,16 @@ class AdvisorCheckpointOwner:
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            raise
+        except V4ProviderResultIncomplete as exc:
+            if provider_custody is None:
+                raise AuditIntegrityError("V4 incomplete Advisor result lacks its original paid custody") from exc
+            provider_custody.require_v4_result_incomplete(exc)
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            response_metadata = exc.metadata
+            error_class = type(exc).__name__
+            error_message = "paid_result_incomplete"
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
@@ -885,7 +933,47 @@ class AdvisorCheckpointOwner:
         continuation_budget: PlannerContinuationBudget | None = None,
         _outcome: _AdvisorInvocationCapture | None = None,
         failure_observation: ContinuationDispatchFailureObservation | None = None,
+        checkpoint_end_source: CheckpointEndPhysicalSource | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        if checkpoint_end_source is not None:
+            from elspeth.web.composer.continuation_checkpoint_end_physical import require_original_checkpoint_end_physical_source
+
+            require_original_checkpoint_end_physical_source(checkpoint_end_source)
+            phase_owner = checkpoint_end_source.phase_owner
+            if (
+                _outcome is not checkpoint_end_source.capture
+                or provider_owner is not phase_owner.phases.provider_owner
+                or recorder is not phase_owner.runtime.live.recorder
+                or self is not phase_owner.phases.service._advisor_checkpoint
+                or not structured_output
+                or failure_observation is not None
+                or continuation_budget is not None
+            ):
+                raise AuditIntegrityError("END physical call changed its original invocation owners")
+            bindings = phase_owner.runtime.bindings
+            if bindings.session_id is None or bindings.session_operation_context is None:
+                raise AuditIntegrityError("END physical call lost its original graph authority")
+            current_env_names = await self._current_env_ref_names(bindings.session_id)
+            if current_env_names != phase_owner.runtime.env_ref_names:
+                raise AuditIntegrityError("END physical call changed its original credential-reference inventory")
+            content_scope = composition_scope_for_operation(
+                phase_owner.runtime.live.state,
+                session_id=bindings.session_id,
+                session_operation_context=bindings.session_operation_context,
+                session_operation_authority=self._require_sessions_service().session_operation_authority,
+            )
+            original_arguments = self._build_checkpoint_arguments(
+                phase="end",
+                state=phase_owner.runtime.live.state,
+                content_scope=content_scope,
+                env_ref_names=current_env_names,
+                user_message=bindings.message,
+                advisor_review_state=checkpoint_end_source.gate_locals.review_state,
+                publication_review=checkpoint_end_source.gate_locals.publication_review,
+            )
+            self._require_complete_graph_summary(original_arguments["_elspeth_advisor_summary_parts"])
+            if arguments != original_arguments:
+                raise AuditIntegrityError("END physical call substituted its original gate request")
         if _outcome is not None:
             if type(_outcome) is not _AdvisorInvocationCapture or _outcome.claimed or provider_owner is None:
                 raise AuditIntegrityError("Advisor observation requires one fresh explicitly owned invocation")
@@ -902,6 +990,39 @@ class AdvisorCheckpointOwner:
                 continuation_budget=continuation_budget,
             )
         provider_custody = self._new_advisor_custody(provider_owner)
+        if checkpoint_end_source is not None:
+            from elspeth.web.composer.continuation_checkpoint_end_dispositions import _EndCheckpointDispositionControl
+            from elspeth.web.composer.continuation_checkpoint_end_physical import (
+                _CheckpointUnboundRefusalObserved,
+                note_checkpoint_end_physical_failure,
+            )
+            from elspeth.web.composer.continuation_checkpoint_unbound_finalizer import finalize_checkpoint_end_unbound_refusal
+
+            async with provider_call_scope(provider_custody):
+                try:
+                    return await self._call_advisor_with_audit_body(
+                        arguments,
+                        recorder=recorder,
+                        timeout=timeout,
+                        structured_output=structured_output,
+                        on_provider_dispatch=on_provider_dispatch,
+                        provider_custody=provider_custody,
+                        _outcome=_outcome,
+                        checkpoint_end_source=checkpoint_end_source,
+                    )
+                except _CheckpointUnboundRefusalObserved as refusal:
+                    terminal = await finalize_checkpoint_end_unbound_refusal(refusal, source=checkpoint_end_source)
+                    raise _EndCheckpointDispositionControl(terminal) from None
+                except V4PaidIncompleteCommitted:
+                    raise
+                except V4ProviderResultIncomplete as incomplete:
+                    if not provider_custody.has_v4_returned_incomplete_finalizer():
+                        raise
+                    finalization = await provider_custody.finalize_v4_returned_incomplete(incomplete)
+                    raise V4PaidIncompleteCommitted(finalization) from None
+                except BaseException as original:
+                    note_checkpoint_end_physical_failure(checkpoint_end_source, original)
+                    raise
         if failure_observation is not None:
             if recorder is not failure_observation.owner.recorder or failure_observation.provider_custody is not None:
                 raise AuditIntegrityError("Advisor failure observation changed its actual invocation owners")

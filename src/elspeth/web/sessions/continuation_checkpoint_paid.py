@@ -31,7 +31,7 @@ from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntim
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import ProviderAttempt, begin_provider_attempt_on_connection
-from elspeth.web.required_work import RequiredWorkBinding
+from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkRole
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationEvent,
@@ -389,7 +389,15 @@ def _require_prepared_checkpoint_source_on_connection(conn: Connection, prepared
         or type(prepared.running) is not ComposerOperationRunning
         or type(prepared.prepared_source) is not CheckpointPreparedSource
         or type(prepared.work) is not RequiredWorkBinding
-        or prepared.work.running is not prepared.running
+        # The ADVISOR owner mints a new provider-ordinal binding from the
+        # original TURN coordinator. Unlike source-preparation work, that
+        # minted binding deliberately has no `running` field.
+        or prepared.work.running is not None
+        or prepared.work.role is not RequiredWorkRole.TURN
+        or prepared.work.coordinator.authority.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE
+        or prepared.work.coordinator.authority.context is not prepared.running.session_operation_context
+        or prepared.work.coordinator.authority.durable_operation_id != prepared.running.claim.operation_id
+        or prepared.work.coordinator.authority.claim_attempt != prepared.running.claim.attempt
         or type(prepared.retry_ordinal) is not int
         or prepared.retry_ordinal < 0
         or not is_lower_sha256_hex(prepared.request_sha256)

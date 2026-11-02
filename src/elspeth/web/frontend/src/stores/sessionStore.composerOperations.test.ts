@@ -184,6 +184,29 @@ describe("terminal publication before optional reads", () => {
     expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps an unsent draft and suppresses Retry when the attached winner has paid incomplete", async () => {
+    const winnerId = "66666666-6666-4666-8666-666666666666";
+    const refusal = { status: 409, error_type: "composer_operation_active", operation_id: winnerId, kind: "compose_message" };
+    const body = { error_type: "paid_result_incomplete", detail: "The returned paid result could not be fully retained. It was not used or retried.", evidence_status: "incomplete", retryable: false, cost: { status: "unknown" as const, amount: null }, request_id: null };
+    vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(refusal);
+    vi.mocked(api.composerActiveOperation).mockImplementation((error) => error === refusal ? { operation_id: winnerId, kind: "compose_message" } : null);
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 507, detail: body.detail, error_type: "paid_result_incomplete", paid_result_incomplete_cost: body.cost });
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...snapshot(winnerId), status: "failed", result: null, error: { http_status: 507, failure_code: "http_error", error_type: "paid_result_incomplete", diagnostic_id: null, body } });
+    vi.mocked(api.fetchComposerOperationFailures).mockResolvedValue({ session_id: sid, items: [{ session_id: sid, operation_id: winnerId, kind: "compose_message", user_message_id: null, settled_at: "2026-10-14T08:00:00Z", failure_code: "http_error", error_type: "paid_result_incomplete", diagnostic_id: null, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 } }], next_cursor: null });
+    await useSessionStore.getState().sendMessage("my unsent draft");
+    const state = useSessionStore.getState();
+    const loser = state.messages.find((row) => row.content === "my unsent draft")!;
+    expect(loser.operation_id).not.toBe(winnerId);
+    expect(loser.local_status).toBe("failed");
+    expect(loser.local_failure_code).toBe("paid_result_incomplete");
+    expect(loser.local_error).toContain("unsent content remains a draft");
+    expect(loser.local_error).toContain("may have incurred a charge");
+    expect(state.composerFailureOutcomes[0].operation_id).toBe(winnerId);
+    expect(state.composerFailureOutcomes[0].saved_revisions).toEqual({ attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 });
+    await useSessionStore.getState().retryMessage(loser.id);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  });
+
   it.each([false, true])("keeps fresh same-ID tool projections; genuine intervening update=%s", async (intervening) => {
     const tool = { id: userId, type: "function", function: { name: "set_metadata", arguments: "{}" } };
     const old = { ...assistant, content: "older assistant", tool_calls: [tool] };
@@ -370,6 +393,29 @@ describe("durable composer store integration", () => {
     expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
     await useSessionStore.getState().retryMessage(row.id);
     expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    { status: "unknown", amount: null } as const,
+    { status: "known", amount: "0.0012300" } as const,
+  ])("stops paid incomplete with exact $status cost and no retry or resume", async (cost) => {
+    const body = { error_type: "paid_result_incomplete", detail: "The returned paid result could not be fully retained. It was not used or retried.", evidence_status: "incomplete", retryable: false, cost, request_id: null };
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 507, error_type: "paid_result_incomplete", detail: body.detail, paid_result_incomplete_cost: cost });
+    vi.mocked(api.fetchComposerOperation).mockImplementationOnce(async (_session, operationId) => ({ ...snapshot(operationId), status: "failed", result: null, error: { http_status: 507, failure_code: "http_error", error_type: "paid_result_incomplete", diagnostic_id: null, body } }));
+    await useSessionStore.getState().sendMessage("hello");
+    const state = useSessionStore.getState();
+    const row = state.messages.find((item) => item.role === "user")!;
+    expect(row.local_status).toBe("failed");
+    expect(row.local_failure_code).toBe("paid_result_incomplete");
+    expect(row.local_error).toContain("without using or retrying that result");
+    expect(row.local_error).toContain(cost.status === "known" ? "observed cost is 0.0012300" : "cost is unknown");
+    expect(state.isComposing).toBe(false);
+    expect(state.messages.some((item) => item.role === "assistant")).toBe(false);
+    expect(state.compositionProposals).toEqual([]);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    await useSessionStore.getState().retryMessage(row.id);
+    await useSessionStore.getState().resumeComposerOperation(sid);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+    expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1);
   });
   it("a delayed terminal reload cannot overwrite a newer state or proposal decisions", async () => {
     let release!: (messages: ChatMessage[]) => void;

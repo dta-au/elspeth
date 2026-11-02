@@ -4,19 +4,22 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import litellm
 import pytest
-from sqlalchemy import select
+from litellm import ModelResponse
+from sqlalchemy import delete, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
-from elspeth.web.composer.continuation_title_observation import TitleOverflowObservation, TitleOverflowUsageObservation
-from elspeth.web.composer.provider_audit_source import capture_provider_audit_source
+from elspeth.web.composer.continuation_title_provider import run_prepared_title_provider
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions import continuation_title_provider as title_provider
-from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowCost
-from elspeth.web.sessions.continuation_title_paid_overflow_terminal import read_v4_title_paid_overflow_terminal_on_connection
-from elspeth.web.sessions.continuation_title_provider import CurrentTitleNames, admit_v4_title_provider_on_connection
-from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.continuation_title_paid_overflow_terminal import (
+    VerifiedTitlePaidOverflowTerminal,
+    read_v4_title_paid_overflow_terminal_on_connection,
+)
+from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
@@ -42,29 +45,32 @@ async def test_v4_title_paid_overflow_is_one_terminal_and_cold_proved(operation_
     )
     monkeypatch.setattr(initialization_cases, "minimal_continuation_policy", lambda: policy)
     store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
-    running, composer_service, _work, prepared, _guard_requests = await _historical_prepared_title(store, policy, tmp_path, monkeypatch)
+    running, _composer_service, work, prepared, _guard_requests = await _historical_prepared_title(store, policy, tmp_path, monkeypatch)
     sid, operation = str(running.claim.session_id), running.claim.operation_id
-    with locked_session_transaction(store[0], sid) as conn:
-        with pytest.raises(AuditIntegrityError, match="actual prepared owner"):
-            admit_v4_title_provider_on_connection(conn, composer_service, prepared, model=prepared.request.kwargs["model"])
-        admission = admit_v4_title_provider_on_connection(conn, store[3], prepared, model=prepared.request.kwargs["model"])
-    observation = TitleOverflowObservation(
-        source=capture_provider_audit_source(running.session_operation_context),
-        attempt_id=admission.attempt.attempt_id,
-        representation="response",
-        document_codec="composer.response.v1",
-        measurement="at_least",
-        observed_bytes=1_048_577,
-        limit_bytes=1_048_576,
-        cost=PaidOverflowCost(status="unknown", amount=None, source="not_available"),
-        usage=TitleOverflowUsageObservation("unavailable", None, None, None, None, None),
+
+    async def completion(**kwargs):
+        return ModelResponse(
+            id="actual-overflow-title",
+            model=kwargs["model"],
+            choices=[
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "z" * 230_000,
+                        "reasoning_details": [{"text": "y" * 60_000} for _ in range(8)],
+                    },
+                }
+            ],
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    committed = await run_prepared_title_provider(
+        prepared=prepared, invocation_owner=ProviderInvocationOwner(service=store[3], required_work=work)
     )
-    committed = store[3].settle_v4_title_overflow_sync(
-        prepared=prepared,
-        admission=admission,
-        observation=observation,
-        names=CurrentTitleNames(running, admission.selected, prepared.names),
-    )
+    assert type(committed) is VerifiedTitlePaidOverflowTerminal
     receipt = committed.receipt
     with store[0].connect() as conn:
         verified = read_v4_title_paid_overflow_terminal_on_connection(
@@ -73,19 +79,47 @@ async def test_v4_title_paid_overflow_is_one_terminal_and_cold_proved(operation_
         parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
         effect = conn.execute(select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation)).one()
         hold = conn.execute(select(holds).where(holds.c.session_id == sid, holds.c.operation_id == operation)).one()
-        physical = conn.execute(select(attempts).where(attempts.c.attempt_id == admission.attempt.attempt_id)).one()
+        physical = conn.execute(select(attempts).where(attempts.c.attempt_id == receipt.identity.attempt_id)).one()
         ledgers = conn.execute(select(usage).where(usage.c.session_id == sid)).all()
     assert verified == committed and verified.receipt == receipt and verified.hold_state == "consumed"
-    assert verified.terminal.cursor == admission.selected.cursor + 2
+    assert verified.terminal.cursor == prepared.selected.cursor + 3
     assert (parent.status, parent.failure_code, parent.journal_cursor) == ("failed", "http_error", verified.terminal.cursor)
     assert parent.result_json is not None and '"error_type":"paid_result_overflow"' in parent.result_json
-    assert effect.disposition == "paid_overflow" and effect.provider_attempt_id == admission.attempt.attempt_id
-    assert hold.state == "consumed" and hold.provider_attempt_id == admission.attempt.attempt_id
+    assert effect.disposition == "paid_overflow" and effect.provider_attempt_id == receipt.identity.attempt_id
+    assert hold.state == "consumed" and hold.provider_attempt_id == receipt.identity.attempt_id
     assert physical.ledger_entry_id is not None and len(ledgers) == 1
     assert ledgers[0].model == prepared.request.kwargs["model"]
-    assert all(
-        ledgers[0]._mapping[name] is None for name in ("prompt_tokens", "completion_tokens", "cached_prompt_tokens", "reasoning_tokens")
+    assert (ledgers[0].prompt_tokens, ledgers[0].completion_tokens, ledgers[0].cached_prompt_tokens, ledgers[0].reasoning_tokens) == (
+        7,
+        3,
+        None,
+        None,
     )
+
+    with store[0].connect() as conn:
+        public_rows = conn.execute(
+            select(messages).where(
+                messages.c.session_id == sid,
+                messages.c.role == "audit",
+                messages.c.content == "Provider call result recorded.",
+            )
+        ).all()
+        assert len(public_rows) == 1
+        trigger = conn.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_chat_messages_no_delete'"
+        ).scalar_one()
+        deleted = conn.begin_nested()
+        conn.exec_driver_sql("DROP TRIGGER trg_chat_messages_no_delete")
+        conn.execute(delete(messages).where(messages.c.id == public_rows[0].id))
+        with pytest.raises(AuditIntegrityError, match="one bounded original public call"):
+            read_v4_title_paid_overflow_terminal_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=operation, names=prepared.names
+            )
+        deleted.rollback()
+        assert (
+            conn.exec_driver_sql("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_chat_messages_no_delete'").scalar_one()
+            == trigger
+        )
 
     # Simulate a changed decoded bootstrap request after the settled parent has
     # deliberately cleared request_json. Cold proof must still bind the original

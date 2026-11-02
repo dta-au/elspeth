@@ -73,6 +73,8 @@ class TitleOverflowObservation:
     limit_bytes: int
     cost: PaidOverflowCost
     usage: TitleOverflowUsageObservation
+    completion: _AdmittedLLMCompletion
+    audit_call: ComposerLLMCall
 
 
 type TitlePaidObservation = TitleCompleteObservation | TitleOverflowObservation
@@ -139,8 +141,12 @@ def observe_title_provider_result(
         raise AuditIntegrityError("TITLE observation requires original complete nominal custody")
     if type(require_source_issued_v4) is not bool:
         raise AuditIntegrityError("TITLE source-issued capture requirement must be an exact boolean")
+    audit_metadata = completion.provider_metadata
     if require_source_issued_v4:
-        from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
+        from elspeth.web.composer.provider_result_admission import (
+            V4ProviderResultCompleteness,
+            project_v4_provider_diagnostic_metadata,
+        )
 
         witness = completion.provider_metadata.v4_completeness
         if type(witness) is not V4ProviderResultCompleteness:
@@ -150,6 +156,9 @@ def observe_title_provider_result(
             content=completion.message.content,
             tool_calls=completion.tool_batch.calls,
         )
+        # The physical audit intentionally retains bounded diagnostics while
+        # the private V4 response keeps the complete source-issued fields.
+        audit_metadata = project_v4_provider_diagnostic_metadata(completion.provider_metadata)
     source = capture_provider_audit_source(context)
     # Complete non-state chunks scan their canonical document with this same
     # 1 MiB credential bound. Scan decoded fields here because the prospective
@@ -163,7 +172,7 @@ def observe_title_provider_result(
     _require_no_credential_material_in_completion(completion, surface="composer_auto_title_response")
     require_successful_response_audit(
         audit_call,
-        completion.provider_metadata,
+        audit_metadata,
         attempt_id=audit_call.call_id,
         started_at=audit_call.started_at,
         finished_at=audit_call.finished_at,
@@ -208,6 +217,8 @@ def observe_title_provider_result(
             limit_bytes=_LIMIT,
             cost=_cost_observation(audit_call),
             usage=_usage_observation(audit_call),
+            completion=completion,
+            audit_call=audit_call,
         )
 
     if measure_physical_audit_call_size(audit_call).exceeded:

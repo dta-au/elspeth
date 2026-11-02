@@ -16,6 +16,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.credential_guard import require_no_credential_material
+from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowReceipt
 
 _REQUESTED_MODEL_MAX_UTF8_BYTES = 256
@@ -56,11 +57,11 @@ class OriginalPaidOverflowPhysicalAttempt:
     started_at: datetime
 
 
-def prepare_paid_overflow_quota_entry(
+def _prepare_paid_terminal_quota_entry(
     *,
     physical: OriginalPaidOverflowPhysicalAttempt,
     context: SessionOperationContext,
-    receipt: PaidOverflowReceipt,
+    receipt: PaidOverflowReceipt | PaidIncompleteReceipt,
     requested_model: AdmittedPaidOverflowRequestedModel,
     observed_at: datetime,
 ) -> TokenUsageEntry:
@@ -75,11 +76,14 @@ def prepare_paid_overflow_quota_entry(
         raise TypeError("paid overflow quota requires its original physical attempt")
     if type(context) is not SessionOperationContext or context.operation_kind is not SessionOperationKind.COMPOSE:
         raise AuditIntegrityError("paid overflow quota requires the original COMPOSE context")
-    if type(receipt) is not PaidOverflowReceipt or type(requested_model) is not AdmittedPaidOverflowRequestedModel:
-        raise TypeError("paid overflow quota requires owned receipt and preflight model")
+    if type(receipt) not in (PaidOverflowReceipt, PaidIncompleteReceipt) or type(requested_model) is not AdmittedPaidOverflowRequestedModel:
+        raise TypeError("paid terminal quota requires owned receipt and preflight model")
     # Revalidate unchecked dataclass/Pydantic copies before using their values.
     requested_model = AdmittedPaidOverflowRequestedModel(requested_model.value)
-    receipt = PaidOverflowReceipt.model_validate(receipt)
+    if type(receipt) is PaidOverflowReceipt:
+        receipt = PaidOverflowReceipt.model_validate(receipt)
+    else:
+        receipt = PaidIncompleteReceipt.model_validate(receipt)
     if type(observed_at) is not datetime or observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("paid overflow observation time must be an aware datetime")
     if type(physical.started_at) is not datetime or physical.started_at.tzinfo is None or physical.started_at.utcoffset() is None:
@@ -126,4 +130,20 @@ def prepare_paid_overflow_quota_entry(
         reasoning_tokens=counts[3],
         recorded_at=observed_at.astimezone(UTC),
         call_id=physical.attempt_id,
+    )
+
+
+def prepare_paid_overflow_quota_entry(
+    *,
+    physical: OriginalPaidOverflowPhysicalAttempt,
+    context: SessionOperationContext,
+    receipt: PaidOverflowReceipt,
+    requested_model: AdmittedPaidOverflowRequestedModel,
+    observed_at: datetime,
+) -> TokenUsageEntry:
+    """Preserve the published measured-overflow API and exact validation."""
+    if type(receipt) is not PaidOverflowReceipt:
+        raise TypeError("paid overflow quota requires its exact measured receipt")
+    return _prepare_paid_terminal_quota_entry(
+        physical=physical, context=context, receipt=receipt, requested_model=requested_model, observed_at=observed_at
     )

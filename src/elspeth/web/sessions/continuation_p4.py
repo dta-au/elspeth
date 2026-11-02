@@ -650,18 +650,44 @@ def _state_columns_hash(
 
 
 def _rejection_row_hash(row: Any) -> str:
+    return planned_p4_rejection_hash(
+        rejection_id=row.id,
+        session_id=row.session_id,
+        composition_state_id=row.composition_state_id,
+        tool_call_id=row.tool_call_id,
+        tool_name=row.tool_name,
+        error_code=row.error_code,
+        message=row.message,
+        planner_payload=row.planner_payload,
+        created_at=row.created_at,
+    )
+
+
+def planned_p4_rejection_hash(
+    *,
+    rejection_id: str,
+    session_id: str,
+    composition_state_id: str | None,
+    tool_call_id: str,
+    tool_name: str,
+    error_code: str | None,
+    message: str,
+    planner_payload: str,
+    created_at: datetime,
+) -> str:
+    """Hash the exact planned rejection columns using the stored-row contract."""
     return sha256(
         canonical_json(
             {
-                "id": row.id,
-                "session_id": row.session_id,
-                "composition_state_id": row.composition_state_id,
-                "tool_call_id": row.tool_call_id,
-                "tool_name": row.tool_name,
-                "error_code": row.error_code,
-                "message": row.message,
-                "planner_payload": row.planner_payload,
-                "created_at": restore_utc(row.created_at).isoformat(),
+                "id": rejection_id,
+                "session_id": session_id,
+                "composition_state_id": composition_state_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "error_code": error_code,
+                "message": message,
+                "planner_payload": planner_payload,
+                "created_at": restore_utc(created_at).isoformat(),
             }
         ).encode("utf-8")
     ).hexdigest()
@@ -958,7 +984,10 @@ def retain_p4_result_on_connection(
             raise TypeError("P4 result consumer requires its nominal prepared tail")
         prepared_tail.require_original()
         if terminal is not None or prepared_tail.result.receipt != receipt or prepared_tail.chunk.canonical != encoded:
-            raise AuditIntegrityError("P4 publication differs from its complete prepared result")
+            planned_fields = prepared_tail.result.receipt.model_dump(mode="json")
+            actual_fields = receipt.model_dump(mode="json")
+            changed_fields = tuple(name for name in planned_fields if planned_fields[name] != actual_fields[name])
+            raise AuditIntegrityError(f"P4 publication differs from its complete prepared result; changed receipt fields={changed_fields}")
     terminal_result = None
     if terminal is not None:
         terminal_result = _terminal_result_document(terminal, receipt, env_ref_names=env_ref_names)
@@ -1420,6 +1449,30 @@ def prepare_p4_on_connection(
     parent = conn.execute(select(jobs.c.cancel_requested_at).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one()
     if parent.cancel_requested_at is None:
         _require_current_continuation_running(conn, running)
+        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
+
+        if type(decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)) is ContinuationAdmissionPolicyV4 and (
+            conn.execute(
+                select(effects.c.effect_key)
+                .where(
+                    effects.c.session_id == sid,
+                    effects.c.operation_id == operation_id,
+                    effects.c.effect_key.startswith(f"tool:{frame.response.digest}:"),
+                    effects.c.owner == "tool_dispatch",
+                    effects.c.disposition == "refused",
+                )
+                .limit(1)
+            ).first()
+            is not None
+        ):
+            from elspeth.web.composer.continuation_phase_transitions import require_completed_runtime_prefix_on_connection
+            from elspeth.web.composer.continuation_selection import SelectedContinuationState
+            from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
+
+            current = SelectedContinuationState(
+                stored.checkpoint_id, stack, load_selected_private_chunks_on_connection(conn, running, stored)
+            )
+            require_completed_runtime_prefix_on_connection(conn, running, selected=current, env_ref_names=env_ref_names)
     else:
         from elspeth.web.composer.continuation_phase_transitions import require_completed_tool_prefix_on_connection
         from elspeth.web.composer.continuation_selection import SelectedContinuationState

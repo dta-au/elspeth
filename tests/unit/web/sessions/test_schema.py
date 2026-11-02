@@ -393,8 +393,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # enforces its singleton across actors; neither epoch-76 predecessor suffices.
     # Epoch 79 retains versioned continuation children and exact snapshot bytes.
     # Epoch 80 makes Continuation the one Composer lifecycle and adds run CHECKs.
-    # Epoch 83 admits the V4 provider hold; epoch 84 adds its paid-overflow effect/receipt.
-    assert SESSION_SCHEMA_EPOCH == 84
+    # Epoch 83 admits the V4 provider hold; 84 adds paid-overflow; 85 adds paid-incomplete.
+    assert SESSION_SCHEMA_EPOCH == 85
     assert "composition_graph_parks" in inspector.get_table_names()
     assert "creator_operation_id" in {column["name"] for column in inspector.get_columns("composition_states")}
     expected_tables = frozenset(
@@ -628,6 +628,34 @@ def test_epoch_61_is_rejected_before_reading_old_advisor_gate_grammar() -> None:
     with eng.connect() as conn:
         assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 61
         assert conn.execute(text("SELECT schema_epoch FROM elspeth_schema_identity")).scalar_one() == 61
+
+
+def test_published_epoch_84_store_is_refused_without_rewriting_its_identity_or_schema() -> None:
+    """The new paid-incomplete CHECK cannot be inferred into an old store."""
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    with eng.begin() as conn:
+        conn.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 84 WHERE store_kind = 'session'"))
+        conn.exec_driver_sql("PRAGMA user_version = 84")
+        schema_before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
+        identity_before = conn.execute(text("SELECT * FROM elspeth_schema_identity")).all()
+    assert probe_current_schema(eng) is False
+    with pytest.raises(SessionSchemaError, match=r"schema version 84.*Preserve this store unchanged"):
+        initialize_session_schema(eng)
+    with eng.connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 84
+        assert conn.execute(text("SELECT * FROM elspeth_schema_identity")).all() == identity_before
+        assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
+
+
+def test_current_sqlite_effect_checks_close_paid_incomplete_as_a_receipt_terminal() -> None:
+    eng = create_session_engine("sqlite:///:memory:")
+    initialize_session_schema(eng)
+    checks = {check["name"]: check["sqltext"] for check in inspect(eng).get_check_constraints("composer_continuation_effects")}
+    assert "'paid_incomplete'" in checks["ck_composer_effects_disposition"]
+    assert "'paid_incomplete'" in checks["ck_composer_effects_receipt"]
+    assert "receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL" in checks["ck_composer_effects_receipt"]
+    assert "owner = 'provider' AND provider_attempt_id IS NOT NULL" in checks["ck_composer_effects_paid_incomplete_original_attempt"]
 
 
 def test_epoch_36_database_is_rejected_by_epoch_44_runtime() -> None:
@@ -1539,8 +1567,8 @@ def test_runs_check_drift_refuses_current_epoch_without_rewriting_schema_identit
             schema_before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
             identities_before = conn.execute(select(schema_identity_table)).all()
             rows_before = run_rows(conn)
-            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == SESSION_SCHEMA_EPOCH == 84
-            assert identities_before[0].schema_epoch == 84
+            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == SESSION_SCHEMA_EPOCH == 85
+            assert identities_before[0].schema_epoch == 85
         with pytest.raises(SessionSchemaError) as raised:
             unexpectedly_admitted = create_session_engine(url)
             unexpectedly_admitted.dispose()
@@ -1551,7 +1579,7 @@ def test_runs_check_drift_refuses_current_epoch_without_rewriting_schema_identit
             assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
             assert conn.execute(select(schema_identity_table)).all() == identities_before
             assert run_rows(conn) == rows_before
-            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 84
+            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 85
     finally:
         stale.dispose()
 
@@ -1562,7 +1590,7 @@ def test_runs_check_reflection_is_current_idempotent_and_identity_bound(engine) 
     with engine.connect() as conn:
         before = conn.execute(select(schema_identity_table)).all()
         rows_before = run_rows(conn)
-        assert before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 84
+        assert before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 85
     initialize_session_schema(engine)
     with engine.connect() as conn:
         assert conn.execute(select(schema_identity_table)).all() == before

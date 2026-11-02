@@ -43,7 +43,9 @@ from elspeth.web.sessions.continuation import (
     put_chunk,
 )
 from elspeth.web.sessions.continuation_classifier_primary import _chain, _read_source
+from elspeth.web.sessions.continuation_classifier_primary_incomplete_tail import prepare_classifier_paid_incomplete_tail_plan
 from elspeth.web.sessions.continuation_classifier_primary_paid_tail import prepare_classifier_paid_overflow_tail_plan
+from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import classifier_terminal_reservation
 from elspeth.web.sessions.continuation_primary_paid_overflow_capacity import (
     V4PrimaryResultBatch,
     admit_v4_primary_result_batch_on_connection,
@@ -447,6 +449,9 @@ def refuse_classifier_no_sdk_on_connection(
     paid = prepare_classifier_paid_overflow_tail_plan(
         identity=admission.paid_tail.identity, admitted=selected, creator_sequence=source.creator_sequence
     )
+    incomplete = prepare_classifier_paid_incomplete_tail_plan(
+        identity=admission.incomplete_tail.identity, admitted=selected, creator_sequence=source.creator_sequence
+    )
     no_sdk = prepare_classifier_no_sdk_tail_plan(
         admitted=selected,
         attempt_id=admission.attempt.attempt_id,
@@ -458,23 +463,21 @@ def refuse_classifier_no_sdk_on_connection(
         claim_attempt=running.claim.attempt,
         operation_epoch=hold_source.session_operation_epoch,
     )
-    reserved = max(paid.reserved_bytes, no_sdk.reserved_bytes)
-    combined_hash = sha256(
-        canonical_json(
-            {
-                "version": "composer.classifier-primary-v4-combined-tail.v1",
-                "paid": paid.fallback_contract_sha256,
-                "no_sdk": no_sdk.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    reservation = classifier_terminal_reservation(
+        paid_contract=paid.fallback_contract_sha256,
+        paid_bytes=paid.reserved_bytes,
+        incomplete_contract=incomplete.fallback_contract_sha256,
+        incomplete_bytes=incomplete.reserved_bytes,
+        no_sdk_contract=no_sdk.contract_sha256,
+        no_sdk_bytes=no_sdk.reserved_bytes,
+    )
     if (
         paid != admission.paid_tail
+        or incomplete != admission.incomplete_tail
         or no_sdk != admission.no_sdk_tail
         or paid.identity.attempt_id != admission.attempt.attempt_id
-        or hold_source.reserved_bytes != reserved
-        or hold_source.fallback_contract_sha256 != combined_hash
+        or hold_source.reserved_bytes != reservation.reserved_bytes
+        or hold_source.fallback_contract_sha256 != reservation.contract_sha256
     ):
         raise AuditIntegrityError("classifier no-SDK writer changed its combined original tail reserve")
     segment = conn.execute(
@@ -695,17 +698,17 @@ def read_classifier_no_sdk_refusal_on_connection(
         admitted=admitted,
         creator_sequence=source.creator_sequence,
     )
-    reserved = max(paid.reserved_bytes, no_sdk.reserved_bytes)
-    combined_hash = sha256(
-        canonical_json(
-            {
-                "version": "composer.classifier-primary-v4-combined-tail.v1",
-                "paid": paid.fallback_contract_sha256,
-                "no_sdk": no_sdk.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    incomplete = prepare_classifier_paid_incomplete_tail_plan(
+        identity=fence_identity, admitted=admitted, creator_sequence=source.creator_sequence
+    )
+    reservation = classifier_terminal_reservation(
+        paid_contract=paid.fallback_contract_sha256,
+        paid_bytes=paid.reserved_bytes,
+        incomplete_contract=incomplete.fallback_contract_sha256,
+        incomplete_bytes=incomplete.reserved_bytes,
+        no_sdk_contract=no_sdk.contract_sha256,
+        no_sdk_bytes=no_sdk.reserved_bytes,
+    )
     projected, projected_events = _shape(
         admitted,
         receipt_key=data.receipt_key,
@@ -731,8 +734,8 @@ def read_classifier_no_sdk_refusal_on_connection(
         or type(parent.result_json) is not str
         or parent.result_sha256 != composer_operation_result_hash(parent.result_json)
         or parent.failure_code != "http_error"
-        or hold_source.reserved_bytes != reserved
-        or hold_source.fallback_contract_sha256 != combined_hash
+        or hold_source.reserved_bytes != reservation.reserved_bytes
+        or hold_source.fallback_contract_sha256 != reservation.contract_sha256
         or len(receipt_text.encode("utf-8")) > no_sdk.maximum_receipt_bytes
         or expected_terminal != terminal.payload_json
     ):

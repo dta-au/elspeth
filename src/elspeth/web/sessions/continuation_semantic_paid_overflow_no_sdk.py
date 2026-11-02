@@ -210,11 +210,16 @@ def prepare_semantic_no_sdk_tail_plan(
         creator_generation=creator_generation,
     )
     event_bytes = tuple(len(item.payload_json.encode("utf-8")) for item in events)
-    terminal_bytes = len(
+    placeholder_terminal_bytes = len(
         encode_continuation_snapshot(decode_continuation_snapshot(snapshot_json).model_copy(update={"cursor": admitted.cursor + 2})).encode(
             "utf-8"
         )
     )
+    # _shape uses a digest-shaped reference for the future receipt, whose
+    # byte_length is 2 (the temporary "{}" chunk). The real receipt digest
+    # has the same width; only the decimal byte_length can grow. Reserve its
+    # largest possible width before dispatch, then check the actual tail below.
+    terminal_bytes = placeholder_terminal_bytes + len(str(receipt_max)) - len(str(len("{}")))
     reserved = receipt_max + sum(event_bytes) + terminal_bytes
     manifest = canonical_json(
         {
@@ -302,7 +307,7 @@ def build_semantic_no_sdk_tail_batch(
     )
     if (
         tuple(len(item.payload_json.encode("utf-8")) for item in events) != plan.event_bytes
-        or len(append.snapshot_json.encode("utf-8")) != plan.terminal_snapshot_bytes
+        or len(append.snapshot_json.encode("utf-8")) > plan.terminal_snapshot_bytes
         or sum(len(item.payload) for item in prospective) > plan.reserved_bytes
     ):
         raise AuditIntegrityError("V4 semantic no-SDK batch changed its complete original tail shape")

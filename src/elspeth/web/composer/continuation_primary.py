@@ -53,8 +53,13 @@ from elspeth.web.composer.provider_cost import (
     continuation_common_cost_policy,
 )
 from elspeth.web.composer.provider_gateway import PreparedContinuationPrimaryRequest
-from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
-from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
+from elspeth.web.composer.provider_quota import (
+    ProviderCallCustody,
+    ProviderInvocationFamily,
+    ProviderInvocationOwner,
+    V4PaidIncompleteCommitted,
+)
+from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness, V4ProviderResultIncomplete
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -68,8 +73,10 @@ from elspeth.web.sessions.continuation import (
     refuse_v3_retained_tail_before_paid,
 )
 from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
+from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
 from elspeth.web.sessions.continuation_primary import (
     PrimaryNoSdkRefusalReceipt,
+    PrimaryPaidIncompleteTerminal,
     PrimaryPaidOverflowTerminal,
     PrimaryProviderResult,
     V4PrimaryProviderAdmission,
@@ -539,7 +546,7 @@ async def _run_v4_primary_after_prepared(
     deadline: float,
     env_ref_names: frozenset[str],
     on_sdk_entry: Callable[[], None] | None,
-) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal | PrimaryNoSdkRefusalReceipt:
+) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal | PrimaryPaidIncompleteTerminal | PrimaryNoSdkRefusalReceipt:
     """Keep one pre-SDK H and one in-scope paid observation on the same custody."""
     custody: ProviderCallCustody | None = None
     sessions = service._require_sessions_service()
@@ -597,7 +604,19 @@ async def _run_v4_primary_after_prepared(
                 required_work=sql,
             )
 
+        async def incomplete_finalizer(
+            incomplete: V4ProviderResultIncomplete, sql: RequiredWorkTicket
+        ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+            admission = custody.continuation_primary_v4_admission
+            if type(admission) is not V4PrimaryProviderAdmission or custody.call is None:
+                raise AuditIntegrityError("V4 PRIMARY incomplete result lost its admitted physical source")
+            custody.require_v4_result_incomplete(incomplete)
+            return await sessions.finalize_v4_continuation_primary_incomplete(
+                prepared=prepared, admission=admission, incomplete=incomplete, call=custody.call, required_work=sql
+            )
+
         custody.bind_continuation_primary_v4(prepared, finalizer)
+        custody.bind_v4_returned_incomplete_finalizer(incomplete_finalizer)
         actual = await service._provider_gateway._call_llm_outcome_with_audit(
             provider_input.evidence.messages,
             provider_input.tools if provider_input.tools is not None else [],
@@ -608,6 +627,13 @@ async def _run_v4_primary_after_prepared(
             continuation_input_sha256=invocation.request.input_sha256,
             prepared_input=provider_input,
             on_sdk_entry=on_sdk_entry,
+        )
+    except V4PaidIncompleteCommitted as control:
+        if custody is None:
+            raise AuditIntegrityError("V4 PRIMARY incomplete control lost its original custody") from control
+        finalization = custody.require_v4_paid_incomplete_committed(control)
+        return PrimaryPaidIncompleteTerminal(
+            finalization.verified.receipt, finalization.verified.terminal, finalization.deferred_cancellations
         )
     except BaseException as error:
         failure = _pre_sdk_failure(error, preparing=False)
@@ -661,7 +687,13 @@ async def run_continuation_primary(
     provider_owner: ProviderInvocationOwner,
     timeout: float,
     on_sdk_entry: Callable[[], None] | None = None,
-) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal | PrimaryNoSdkRefusalReceipt | V3UnboundedTailRefusal:
+) -> (
+    PrimaryProviderResult
+    | PrimaryPaidOverflowTerminal
+    | PrimaryPaidIncompleteTerminal
+    | PrimaryNoSdkRefusalReceipt
+    | V3UnboundedTailRefusal
+):
     _require_owners(authority, required_work)
     running = required_work.running
     if (

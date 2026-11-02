@@ -1186,6 +1186,8 @@ export interface ApiError {
   status: number;
   detail: string;
   error_type?: string;
+  /** Validated cost observation for a terminal paid result with incomplete evidence. */
+  paid_result_incomplete_cost?: import("./composerOperations").PaidResultIncompleteCost;
   /** Scalar identity of an unreadable graph; never a replacement empty graph. */
   unavailable_state_head?: { state_id: string; version: number };
   /** The server's current approval state when another approver won the decision race. */

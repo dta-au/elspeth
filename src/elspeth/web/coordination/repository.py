@@ -715,6 +715,7 @@ class _RepositorySessionMutations:
         planner_payload: str,
         composition_state_id: str | None,
         created_at: datetime,
+        rejection_id: UUID | None = None,
     ) -> None:
         """Persist one refused composer tool call's unredacted reason (elspeth-3e28029d2f).
 
@@ -734,9 +735,11 @@ class _RepositorySessionMutations:
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
         if type(created_at) is not datetime:
             raise TypeError("created_at must be an exact datetime")
+        if rejection_id is not None and type(rejection_id) is not UUID:
+            raise TypeError("planned rejection identity must be an exact UUID")
         _resolve_mutation_connection(state._connection_token).execute(
             insert(composition_rejection_events_table).values(
-                id=str(uuid4()),
+                id=str(uuid4() if rejection_id is None else rejection_id),
                 session_id=state._session_id,
                 composition_state_id=composition_state_id,
                 tool_call_id=tool_call_id,

@@ -48,9 +48,21 @@ class CheckpointNoSdkIssuer:
     """
 
     def __init__(self, prepared: PreparedCheckpointProvider) -> None:
+        from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkRole
+        from elspeth.web.sessions.composer_operations import ComposerOperationRunning
         from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
 
-        if type(prepared) is not PreparedCheckpointProvider or prepared.work.running is not prepared.running:
+        if (
+            type(prepared) is not PreparedCheckpointProvider
+            or type(prepared.running) is not ComposerOperationRunning
+            or type(prepared.work) is not RequiredWorkBinding
+            or prepared.work.running is not None
+            or prepared.work.role is not RequiredWorkRole.TURN
+            or prepared.work.coordinator.authority.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE
+            or prepared.work.coordinator.authority.context is not prepared.running.session_operation_context
+            or prepared.work.coordinator.authority.durable_operation_id != prepared.running.claim.operation_id
+            or prepared.work.coordinator.authority.claim_attempt != prepared.running.claim.attempt
+        ):
             raise AuditIntegrityError("checkpoint no-SDK issuer requires its original prepared operation")
         self.prepared = prepared
         self._lock = RLock()

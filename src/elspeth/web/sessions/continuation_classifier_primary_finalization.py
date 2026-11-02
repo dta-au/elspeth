@@ -250,7 +250,7 @@ def finalize_v4_classifier_provider_on_connection(
         result = publish_classifier_primary_on_connection(
             conn,
             original,
-            selected=selected,
+            selected=admission.dispatched,
             outcome=outcome,
             recorder=recorder,
             permit=permit,

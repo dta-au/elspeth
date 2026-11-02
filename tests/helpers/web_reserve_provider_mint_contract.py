@@ -67,7 +67,7 @@ class _SegmentDriver:
     async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> MessageWithStateResponse | None: pass
     async def pending_control(self, selected: SelectedContinuationState) -> StoredContinuationControlIntent | None: pass
     async def iteration_stage(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> IterationStageData | None: pass
-    async def yield_control(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> ContinuationSegmentOutcome: pass
+    async def yield_control(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState, *, reason: Literal["model_request", "action_fit"], action_fit: ActionFitSuccessorPlan | None = None) -> ContinuationSegmentOutcome: pass
     async def watch_stage(self, stage: asyncio.Task[MessageWithStateResponse | None], reader: ComposerOperationWatchReader) -> None: pass
     def _worker_is_draining(self) -> bool: pass
     async def run(self, adoption_failure: BaseException | None) -> ContinuationSegmentOutcome: pass

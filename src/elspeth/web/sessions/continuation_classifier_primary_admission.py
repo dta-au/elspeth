@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from sqlalchemy import Connection, select
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_classifier_no_sdk import ClassifierNoSdkIssuer
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
@@ -33,7 +32,9 @@ from elspeth.web.sessions.continuation_classifier_primary import (
     _event,
     _read_source,
 )
+from elspeth.web.sessions.continuation_classifier_primary_incomplete_tail import prepare_classifier_paid_incomplete_tail_plan
 from elspeth.web.sessions.continuation_classifier_primary_paid_tail import prepare_classifier_paid_overflow_tail_plan
+from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import classifier_terminal_reservation
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
 from elspeth.web.sessions.continuation_paid_overflow_quota import preflight_v4_requested_model
 from elspeth.web.sessions.continuation_primary import _input_value
@@ -75,7 +76,7 @@ def admit_v4_classifier_provider_on_connection(
         or no_sdk_issuer.prepared_candidate is not prepared.prepared
     ):
         raise AuditIntegrityError("V4 classifier admission requires its original prepared and unentered owners")
-    no_sdk_issuer.clock.require_preparation_time()
+    no_sdk_issuer.clock.require_active_quota_time()
     original = prepared.prepared
     binding, current = original.binding, original.snapshot
     running = binding.running
@@ -155,6 +156,9 @@ def admit_v4_classifier_provider_on_connection(
     paid_tail = prepare_classifier_paid_overflow_tail_plan(
         identity=identity, admitted=dispatched, creator_sequence=running.claim.segment_sequence
     )
+    incomplete_tail = prepare_classifier_paid_incomplete_tail_plan(
+        identity=identity, admitted=dispatched, creator_sequence=running.claim.segment_sequence
+    )
     no_sdk_tail = prepare_classifier_no_sdk_tail_plan(
         admitted=dispatched,
         attempt_id=attempt.attempt_id,
@@ -166,14 +170,13 @@ def admit_v4_classifier_provider_on_connection(
         claim_attempt=running.claim.attempt,
         operation_epoch=fence.operation_epoch,
     )
-    reserved_bytes = max(paid_tail.reserved_bytes, no_sdk_tail.reserved_bytes)
-    contract = canonical_json(
-        {
-            "version": "composer.classifier-primary-v4-combined-tail.v1",
-            "paid": paid_tail.fallback_contract_sha256,
-            "no_sdk": no_sdk_tail.contract_sha256,
-            "reserved_bytes": reserved_bytes,
-        }
+    reservation = classifier_terminal_reservation(
+        paid_contract=paid_tail.fallback_contract_sha256,
+        paid_bytes=paid_tail.reserved_bytes,
+        incomplete_contract=incomplete_tail.fallback_contract_sha256,
+        incomplete_bytes=incomplete_tail.reserved_bytes,
+        no_sdk_contract=no_sdk_tail.contract_sha256,
+        no_sdk_bytes=no_sdk_tail.reserved_bytes,
     )
     hold = ProviderTerminalHoldSource(
         session_id=identity.session_id,
@@ -191,8 +194,8 @@ def admit_v4_classifier_provider_on_connection(
         session_operation_id=fence.operation_id,
         session_operation_epoch=fence.operation_epoch,
         lease_sha256=identity.lease_sha256,
-        reserved_bytes=reserved_bytes,
-        fallback_contract_sha256=sha256(contract.encode("utf-8")).hexdigest(),
+        reserved_bytes=reservation.reserved_bytes,
+        fallback_contract_sha256=reservation.contract_sha256,
     )
     prospective = (
         ProspectiveContinuationChunk(f"event:{dispatched.cursor}", transition.payload_json.encode("utf-8"), "event.v2"),
@@ -205,8 +208,9 @@ def admit_v4_classifier_provider_on_connection(
     if actual != dispatched:
         raise AuditIntegrityError("V4 classifier admission changed its exact projected dispatch")
     bind_provider_terminal_hold_attempt(conn, source=hold, provider_attempt_id=attempt.attempt_id)
+    no_sdk_issuer.clock.require_active_quota_time()
     no_sdk_issuer.note_dispatched_candidate(actual)
-    return V4ClassifierProviderAdmission(attempt, actual, hold, paid_tail, no_sdk_tail, binding.effect_key)
+    return V4ClassifierProviderAdmission(attempt, actual, hold, paid_tail, incomplete_tail, no_sdk_tail, binding.effect_key)
 
 
 def read_v4_classifier_admission_on_connection(
@@ -280,6 +284,9 @@ def read_v4_classifier_admission_on_connection(
         source_snapshot_sha256=hold.source_snapshot_sha256,
     )
     paid_tail = prepare_classifier_paid_overflow_tail_plan(identity=identity, admitted=dispatched, creator_sequence=hold.creator_sequence)
+    incomplete_tail = prepare_classifier_paid_incomplete_tail_plan(
+        identity=identity, admitted=dispatched, creator_sequence=hold.creator_sequence
+    )
     no_sdk_tail = prepare_classifier_no_sdk_tail_plan(
         admitted=dispatched,
         attempt_id=identity.attempt_id,
@@ -291,18 +298,15 @@ def read_v4_classifier_admission_on_connection(
         claim_attempt=hold.claim_attempt,
         operation_epoch=hold.session_operation_epoch,
     )
-    reserved = max(paid_tail.reserved_bytes, no_sdk_tail.reserved_bytes)
-    combined = sha256(
-        canonical_json(
-            {
-                "version": "composer.classifier-primary-v4-combined-tail.v1",
-                "paid": paid_tail.fallback_contract_sha256,
-                "no_sdk": no_sdk_tail.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
-    if hold.reserved_bytes != reserved or hold.fallback_contract_sha256 != combined:
+    reservation = classifier_terminal_reservation(
+        paid_contract=paid_tail.fallback_contract_sha256,
+        paid_bytes=paid_tail.reserved_bytes,
+        incomplete_contract=incomplete_tail.fallback_contract_sha256,
+        incomplete_bytes=incomplete_tail.reserved_bytes,
+        no_sdk_contract=no_sdk_tail.contract_sha256,
+        no_sdk_bytes=no_sdk_tail.reserved_bytes,
+    )
+    if hold.reserved_bytes != reservation.reserved_bytes or hold.fallback_contract_sha256 != reservation.contract_sha256:
         raise AuditIntegrityError("classifier admission readback changed its original combined H")
     candidate = no_sdk_issuer.dispatched_candidate
     if candidate is None or candidate != dispatched:
@@ -312,6 +316,7 @@ def read_v4_classifier_admission_on_connection(
         candidate,
         hold,
         paid_tail,
+        incomplete_tail,
         no_sdk_tail,
         binding.effect_key,
     )

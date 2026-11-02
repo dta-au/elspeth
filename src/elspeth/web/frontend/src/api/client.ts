@@ -1,4 +1,4 @@
-import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerActiveOperation, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
+import { decodePaidResultIncompleteBody, canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerActiveOperation, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
@@ -1035,6 +1035,11 @@ export async function rejectCompositionProposal(
 export function apiErrorFromBody(status: number, body: unknown): ApiError {
   validateComposerRecoveryBody(body);
   const admitted = buildApiError(status, body, "Request failed");
+  if (admitted.error_type === "paid_result_incomplete") {
+    const incomplete = decodePaidResultIncompleteBody(body);
+    if (status !== 507) throw new Error("Invalid paid incomplete HTTP status");
+    return { ...admitted, paid_result_incomplete_cost: incomplete.cost };
+  }
   return admitted.partial_state == null ? admitted : { ...admitted, partial_state: decodeCompositionState(admitted.partial_state) };
 }
 

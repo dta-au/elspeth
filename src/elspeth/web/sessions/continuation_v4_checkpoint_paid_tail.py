@@ -12,11 +12,17 @@ from sqlalchemy import Connection
 from sqlalchemy.engine import RootTransaction
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.sessions.continuation import PreparedContinuationAppend, StoredContinuationSnapshot, load_snapshot
 from elspeth.web.sessions.continuation_checkpoint_no_sdk_tail import (
     CheckpointNoSdkTailBatch,
     CheckpointNoSdkTailPlan,
     build_checkpoint_no_sdk_tail_batch,
+)
+from elspeth.web.sessions.continuation_checkpoint_paid_incomplete_tail import (
+    CheckpointPaidIncompleteTailBatch,
+    CheckpointPaidIncompleteTailPlan,
+    build_checkpoint_paid_incomplete_tail_batch,
 )
 from elspeth.web.sessions.continuation_checkpoint_paid_tail import (
     CheckpointPaidOverflowTailBatch,
@@ -27,6 +33,7 @@ from elspeth.web.sessions.continuation_checkpoint_terminal_hold import (
     CheckpointTerminalHoldPlan,
     prepare_checkpoint_terminal_hold_plan,
 )
+from elspeth.web.sessions.continuation_paid_incomplete import decode_paid_incomplete_receipt
 from elspeth.web.sessions.continuation_paid_overflow import decode_paid_overflow_receipt
 from elspeth.web.sessions.continuation_retained_capacity import (
     ProspectiveContinuationChunk,
@@ -42,8 +49,8 @@ class _CheckpointPaidTailScope:
     connection: Connection
     transaction: RootTransaction
     source: ProviderTerminalHoldSource
-    plan: CheckpointPaidOverflowTailPlan | CheckpointNoSdkTailPlan
-    batch: CheckpointPaidOverflowTailBatch | CheckpointNoSdkTailBatch
+    plan: CheckpointPaidOverflowTailPlan | CheckpointPaidIncompleteTailPlan | CheckpointNoSdkTailPlan
+    batch: CheckpointPaidOverflowTailBatch | CheckpointPaidIncompleteTailBatch | CheckpointNoSdkTailBatch
     stage: int = 0
 
 
@@ -118,13 +125,18 @@ def admit_v4_checkpoint_paid_tail_on_connection(
     *,
     source: ProviderTerminalHoldSource,
     hold_plan: CheckpointTerminalHoldPlan,
-    batch: CheckpointPaidOverflowTailBatch,
+    batch: CheckpointPaidOverflowTailBatch | CheckpointPaidIncompleteTailBatch,
 ) -> Iterator[None]:
     """Replace H with exactly one receipt and one complete terminal append."""
     if type(source) is not ProviderTerminalHoldSource or type(hold_plan) is not CheckpointTerminalHoldPlan:
         raise AuditIntegrityError("checkpoint paid tail requires nominal original hold and plan")
-    plan = hold_plan.paid_overflow
-    if type(batch) is not CheckpointPaidOverflowTailBatch or _SCOPE_KEY in conn.info:
+    if type(batch) is CheckpointPaidOverflowTailBatch:
+        plan: CheckpointPaidOverflowTailPlan | CheckpointPaidIncompleteTailPlan = hold_plan.paid_overflow
+    elif type(batch) is CheckpointPaidIncompleteTailBatch:
+        plan = hold_plan.paid_incomplete
+    else:
+        raise AuditIntegrityError("checkpoint paid tail requires its exact returned batch type")
+    if _SCOPE_KEY in conn.info:
         raise AuditIntegrityError("checkpoint paid tail requires its sole exact batch")
     transaction = conn.get_transaction()
     if type(transaction) is not RootTransaction or not transaction.is_active:
@@ -161,8 +173,25 @@ def admit_v4_checkpoint_paid_tail_on_connection(
         raise AuditIntegrityError("checkpoint paid tail append lost its minted checkpoint identity") from error
     if checkpoint_uuid.version != 4 or str(checkpoint_uuid) != batch.append.checkpoint_id:
         raise AuditIntegrityError("checkpoint paid tail append lost its minted checkpoint identity")
-    receipt = decode_paid_overflow_receipt(batch.receipt_json, expected=plan.identity)
-    reference = build_checkpoint_paid_overflow_tail_batch(plan, receipt=receipt, published_at=batch.append.published_at)
+    if not batch.append.events or batch.append.events[0].tag != "checkpoint":
+        raise AuditIntegrityError("checkpoint paid tail lacks its exact private audit event")
+    event, event_error = parse_json_strict(batch.append.events[0].payload_json)
+    if event_error is not None or type(event) is not dict or type(event.get("private_audit_sha256")) is not str:
+        raise AuditIntegrityError("checkpoint paid tail lacks its exact private audit digest")
+    private_audit_sha256 = event["private_audit_sha256"]
+    reference: CheckpointPaidOverflowTailBatch | CheckpointPaidIncompleteTailBatch
+    if type(plan) is CheckpointPaidOverflowTailPlan and type(batch) is CheckpointPaidOverflowTailBatch:
+        receipt = decode_paid_overflow_receipt(batch.receipt_json, expected=plan.identity)
+        reference = build_checkpoint_paid_overflow_tail_batch(
+            plan, receipt=receipt, published_at=batch.append.published_at, private_audit_sha256=private_audit_sha256
+        )
+    elif type(plan) is CheckpointPaidIncompleteTailPlan and type(batch) is CheckpointPaidIncompleteTailBatch:
+        incomplete_receipt = decode_paid_incomplete_receipt(batch.receipt_json, expected=plan.identity)
+        reference = build_checkpoint_paid_incomplete_tail_batch(
+            plan, receipt=incomplete_receipt, published_at=batch.append.published_at, private_audit_sha256=private_audit_sha256
+        )
+    else:
+        raise AuditIntegrityError("checkpoint paid tail crossed terminal alternatives")
     expected = reference.append
     if (batch.receipt_json, batch.receipt_key, batch.receipt_chunk_key) != (
         reference.receipt_json,

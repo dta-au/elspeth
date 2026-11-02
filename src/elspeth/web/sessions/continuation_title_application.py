@@ -146,6 +146,7 @@ class CurrentTitleApplication:
     inventory: CurrentTitleApplicationNames
     applied: bool
     event: TitleApplicationEvent | None
+    finish_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,11 +234,13 @@ def read_title_application_on_connection(
     selected = inventory.selected
     if _frame(selected).ingress_phase == "title_pending":
         chunk, result = _settled_source(conn, running, selected, inventory.names)
-        return CurrentTitleApplication(selected, chunk, title_application_decision(result), inventory, False, None)
-    chunk, decision, event = read_applied_title_ready_data_on_connection(
+        return CurrentTitleApplication(
+            selected, chunk, title_application_decision(result), inventory, False, None, result.completion.provider_metadata.finish_reason
+        )
+    chunk, decision, event, finish_reason = read_applied_title_ready_data_on_connection(
         conn, running, selected=selected, names=inventory.names, generation=running.claim.ownership_generation
     )
-    return CurrentTitleApplication(selected, chunk, decision, inventory, True, event)
+    return CurrentTitleApplication(selected, chunk, decision, inventory, True, event, finish_reason)
 
 
 def read_applied_title_ready_data_on_connection(
@@ -247,7 +250,7 @@ def read_applied_title_ready_data_on_connection(
     selected: StoredContinuationSnapshot,
     names: frozenset[str],
     generation: int | None,
-) -> tuple[PrivateChunk, TitleApplicationDecision, TitleApplicationEvent]:
+) -> tuple[PrivateChunk, TitleApplicationDecision, TitleApplicationEvent, str | None]:
     """Historical DATA only; the caller separately proves its full current root.
 
     The original current reader above retains its actual inventory/current gate.
@@ -277,7 +280,7 @@ def read_applied_title_ready_immutable_data_on_connection(
     generation: int | None,
     selected: StoredContinuationSnapshot,
     names: frozenset[str],
-) -> tuple[PrivateChunk, TitleApplicationDecision, TitleApplicationEvent]:
+) -> tuple[PrivateChunk, TitleApplicationDecision, TitleApplicationEvent, str | None]:
     """Actual ready event and paid source; no current business grant is issued."""
     if _frame(selected).ingress_phase != "ready":
         raise AuditIntegrityError("historical TITLE application has no actual ready predecessor")
@@ -352,7 +355,7 @@ def read_applied_title_ready_immutable_data_on_connection(
         raise AuditIntegrityError("TITLE ready differs from its exact original paid result/decision/ledger")
     # No permanent equality with sessions.title: a later legitimate rename is
     # preserved on replay. The original event proves the prior atomic write.
-    return chunk, decision, event
+    return chunk, decision, event, result.completion.provider_metadata.finish_reason
 
 
 @dataclass(slots=True)

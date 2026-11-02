@@ -32,7 +32,8 @@ if TYPE_CHECKING:
         SemanticAdvisorInvocationV4Finalized,
         _SemanticAdvisorInvocationCapture,
     )
-    from elspeth.web.composer.provider_quota import ProviderCallCustody
+    from elspeth.web.composer.provider_quota import ProviderCallCustody, V4ReturnedIncompleteFinalization
+    from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
     from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission
 
 
@@ -432,6 +433,77 @@ class SemanticAdvisorNoSdkIssuer:
             ):
                 raise AuditIntegrityError("V4 semantic response lost its one original successful paid capture")
             return original
+
+    def require_original_v4_incomplete_capture(
+        self,
+        prepared: PreparedContinuationProvider,
+        selected: StoredContinuationSnapshot,
+        incomplete: V4ProviderResultIncomplete,
+    ) -> SemanticAdvisorInvocationObservation:
+        """Bind a returned parser loss to the one retained original paid audit."""
+        from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+
+        with self._lock:
+            original = self._body_observation
+            audit_call = self._captured_call
+            if (
+                self._state != "sdk_entered"
+                or prepared is not self._prepared
+                or selected is not self._dispatched
+                or type(incomplete) is not V4ProviderResultIncomplete
+                or type(audit_call) is not ComposerLLMCall
+                or self._custody is None
+                or self._custody.continuation_semantic_v4 is not prepared
+                or self._custody.attempt is None
+                or self._custody.attempt.attempt_id != self._attempt_id
+                or original is None
+                or not original.sdk_entered
+                or not original.recorder_completed
+                or original.original_failure is not incomplete
+                or original.audit_call is not audit_call
+                or self._captured_call is not audit_call
+                or audit_call.status is not ComposerLLMCallStatus.MALFORMED_RESPONSE
+                or audit_call.call_id != incomplete.sdk_return.attempt_id
+                or audit_call.call_id != self._attempt_id
+            ):
+                raise AuditIntegrityError("V4 semantic paid-incomplete capture lost its original SDK return and audit")
+            self._custody.require_v4_result_incomplete(incomplete)
+            return original
+
+    def require_v4_paid_incomplete_committed(
+        self, prepared: PreparedContinuationProvider, outcome: SemanticAdvisorInvocationRaised
+    ) -> V4ReturnedIncompleteFinalization:
+        """Release only a committed terminal from this original semantic custody."""
+        from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationRaised
+        from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+
+        with self._lock:
+            original = self._body_observation
+            if (
+                self._state != "sdk_entered"
+                or prepared is not self._prepared
+                or type(outcome) is not SemanticAdvisorInvocationRaised
+                or outcome is not self._outcome
+                or original is None
+                or outcome.observation != original
+                or type(original.original_failure) is not V4ProviderResultIncomplete
+                or type(outcome.error) is not V4PaidIncompleteCommitted
+                or self._custody is None
+                or self._attempt_id is None
+                or self._dispatched is None
+            ):
+                raise AuditIntegrityError("V4 semantic paid-incomplete release lost its original committed custody")
+            finalization = self._custody.require_v4_paid_incomplete_committed(outcome.error)
+            terminal = finalization.verified
+            if (
+                terminal.source.effect_key != prepared.binding.effect_key
+                or terminal.provider_attempt_id != self._attempt_id
+                or terminal.terminal.cursor < self._dispatched.cursor + 2
+            ):
+                raise AuditIntegrityError("V4 semantic paid-incomplete release changed original effect")
+            return finalization
 
     def require_original_v4_admission(self, prepared: PreparedContinuationProvider) -> V4SemanticProviderAdmission:
         from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission

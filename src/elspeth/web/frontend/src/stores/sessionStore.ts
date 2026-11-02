@@ -53,6 +53,11 @@ const LLM_AUTH_ERROR_MESSAGE =
   "The AI service configuration is invalid. Please contact your administrator.";
 const PAID_RESULT_OVERFLOW_MESSAGE =
   "A model call was made, but its complete result or audit record could not be retained. ELSPETH stopped without using that result. The call may have incurred a charge. Review the saved session before starting another request.";
+function paidResultIncompleteMessage(error: ApiError): string {
+  const cost = error.paid_result_incomplete_cost;
+  const costText = cost?.status === "known" ? `The observed cost is ${cost.amount}.` : "The cost is unknown; the call may have incurred a charge.";
+  return `A model call returned, but its result or audit evidence could not be fully retained. ELSPETH stopped without using or retrying that result. ${costText} Review the saved session before starting another request.`;
+}
 const GRAPH_UNAVAILABLE_MESSAGE =
   "The saved graph is unavailable. You can ask Composer to recover a saved draft.";
 
@@ -523,7 +528,10 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   const attachedTerminalError = failure instanceof ComposerActiveAttachment && failure.terminal.status === "failed"
     ? failure.terminal.error : null;
   const error = failure as ApiError | null;
-  const errorText = failure instanceof ComposerActiveAttachment
+  const incompleteError = attachedTerminalError?.error_type === "paid_result_incomplete" ? attachedTerminalError : error?.error_type === "paid_result_incomplete" ? error : null;
+  const errorText = incompleteError !== null
+    ? `${failure instanceof ComposerActiveAttachment ? `${failure.message} ` : ""}${paidResultIncompleteMessage(incompleteError)}`
+    : failure instanceof ComposerActiveAttachment
     ? attachedTerminalError?.error_type === "paid_result_overflow"
       ? `${failure.message} ${PAID_RESULT_OVERFLOW_MESSAGE}` : failure.message
     : error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "paid_result_overflow" ? PAID_RESULT_OVERFLOW_MESSAGE : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
@@ -561,7 +569,7 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
       if (!(row.id === localMessageId || (row.role === "user" && row.operation_id === descriptor.operationId))) return row;
       if (error && error.error_type !== "audit_integrity_error" && (failure instanceof ComposerActiveAttachment || !hasGenuineReplyForUser(messages, index))) {
         const failureType = attachedTerminalError?.error_type ?? error.error_type;
-        const localFailureCode = failureType === "stale_compose_state" || failureType === "paid_result_overflow" ? failureType : error.failure_code ?? error.error_type;
+        const localFailureCode = failureType === "stale_compose_state" || failureType === "paid_result_overflow" || failureType === "paid_result_incomplete" ? failureType : error.failure_code ?? error.error_type;
         return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: localFailureCode };
       }
       return { ...row, local_status: undefined, local_error: undefined, local_failure_code: undefined };

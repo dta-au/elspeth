@@ -23,6 +23,12 @@ from elspeth.web.composer._compose_loop_carriers import (
     _TerminateOutcome,
 )
 from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef
+from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
+    EndCheckpointNoSdkTerminal,
+    EndCheckpointPaidOverflowTerminal,
+    EndCheckpointUnboundRefusalTerminal,
+)
+from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointPaidIncompleteTerminal, observe_end_checkpoint_terminal
 from elspeth.web.composer.continuation_classifier_handoff import (
     ClassifyPostPrimary,
     ClassifySourceProofStop,
@@ -60,6 +66,7 @@ if TYPE_CHECKING:
         ClassifierPrimaryIssuer,
         ClassifierPrimaryResult,
         ClassifierReplyDeadline,
+        VerifiedClassifierPaidIncompleteTerminal,
         VerifiedClassifierPaidOverflowTerminal,
     )
     from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
@@ -415,11 +422,18 @@ async def observe_continuation_iteration_classification(
     selected: SelectedContinuationState,
     dispatch: _DispatchOutcome,
     persist: _PersistOutcome | ColdPostBatchPersistData,
-) -> ObservedClassification | ObservedClassifierReplyDeadline | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
+) -> (
+    ObservedClassification
+    | ObservedClassifierReplyDeadline
+    | VerifiedClassifierPaidOverflowTerminal
+    | VerifiedClassifierPaidIncompleteTerminal
+    | ClassifierNoSdkRefusalReceipt
+):
     """Observe the actual classifier; preserve its original thrown outcome."""
     from elspeth.web.sessions.continuation_classifier_primary import (
         ClassifierPrimaryIssuer,
         ClassifierReplyDeadline,
+        VerifiedClassifierPaidIncompleteTerminal,
         VerifiedClassifierPaidOverflowTerminal,
     )
     from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
@@ -491,8 +505,14 @@ async def observe_continuation_iteration_classification(
         # No await, source refresh, runtime capture or finalizer follows the
         # reached boundary. The driver owns original deadline disposition.
         return observed_deadline
-    if isinstance(outcome, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
-        if type(outcome) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+    if isinstance(
+        outcome, (VerifiedClassifierPaidOverflowTerminal, VerifiedClassifierPaidIncompleteTerminal, ClassifierNoSdkRefusalReceipt)
+    ):
+        if type(outcome) not in (
+            VerifiedClassifierPaidOverflowTerminal,
+            VerifiedClassifierPaidIncompleteTerminal,
+            ClassifierNoSdkRefusalReceipt,
+        ):
             raise AuditIntegrityError("iteration classifier returned a non-nominal terminal")
         if issuer.terminal is not outcome:
             raise AuditIntegrityError("iteration classifier lost its original terminal source")
@@ -718,7 +738,13 @@ async def observe_continuation_classifier_end(
     persist: _PersistOutcome | ColdPostBatchPersistData,
     primary_response: PrivateChunk | None,
     owned_source_json: str | None = None,
-) -> ObservedClassification:
+) -> (
+    ObservedClassification
+    | EndCheckpointPaidIncompleteTerminal
+    | EndCheckpointPaidOverflowTerminal
+    | EndCheckpointNoSdkTerminal
+    | EndCheckpointUnboundRefusalTerminal
+):
     """Observe the actual resumed shared END under its new original action."""
     source = _live_source(phases, runtime, selected, dispatch, persist)
     clock = phases.action_clock
@@ -760,16 +786,28 @@ async def observe_continuation_classifier_end(
             elide_advisor_exchange=_ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE,
         )
     with composer_quota_scope(phases.service._require_sessions_service(), context), prompt_guard_user_scope(runtime.bindings.message):
-        outcome = await phases.service.resume_continuation_classifier_end(
-            pending=pending,
-            runtime=runtime,
-            dispatch=dispatch,
-            persist=persist,
-            primary_response=primary_response,
-            completion_capture=capture,
-            deadline=_original_action_deadline(phases, runtime, clock),
-            checkpoint_phase_owner=checkpoint_phase_owner,
+        outcome = await observe_end_checkpoint_terminal(
+            phases.service.resume_continuation_classifier_end(
+                pending=pending,
+                runtime=runtime,
+                dispatch=dispatch,
+                persist=persist,
+                primary_response=primary_response,
+                completion_capture=capture,
+                deadline=_original_action_deadline(phases, runtime, clock),
+                checkpoint_phase_owner=checkpoint_phase_owner,
+            )
         )
+    if isinstance(
+        outcome,
+        (
+            EndCheckpointPaidIncompleteTerminal,
+            EndCheckpointPaidOverflowTerminal,
+            EndCheckpointNoSdkTerminal,
+            EndCheckpointUnboundRefusalTerminal,
+        ),
+    ):
+        return outcome
     if type(outcome) is not _ClassifyOutcome:
         raise AuditIntegrityError("classifier END lost its actual nominal outcome")
     return _register_classification(source, outcome, capture, resumed_from=pending)

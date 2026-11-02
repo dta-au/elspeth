@@ -65,7 +65,11 @@ class ContinuationActionBoundsSettings(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
-    primary: ContinuationProviderStageSettings = Field(default_factory=lambda: _provider(240.0))
+    # Authentic classifier V2/V4 preparation measured above the former 5 s
+    # bound; only newly admitted PRIMARY actions receive this 15 s default.
+    primary: ContinuationProviderStageSettings = Field(
+        default_factory=lambda: ContinuationProviderStageSettings(preparation=15.0, quota=10.0, physical=240.0, retention=5.0)
+    )
     advisor: ContinuationAdvisorStageSettings = Field(
         default_factory=lambda: ContinuationAdvisorStageSettings(preparation=5.0, quota=10.0, retention=5.0)
     )

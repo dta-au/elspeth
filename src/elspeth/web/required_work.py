@@ -1203,6 +1203,15 @@ class RequiredWorkCoordinator:
             self._registered(ticket, expected_source)
             self._verify_sql_outcome(ticket, actual_outcome)
 
+    def validate_provider_settlement_sql_outcome[T](self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]) -> None:
+        """Verify one registered provider settlement and its actual SQL handoff."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.PROVIDER_SETTLEMENT_SQL)
+            with ticket._lock:
+                if ticket._finish_once_handoff is not actual_outcome:
+                    raise AuditIntegrityError("Provider settlement replaced its actual finish-once carrier")
+                self._verify_sql_outcome(ticket, actual_outcome)
+
     def validate_compose_checkpoint_sql_outcome[T](self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]) -> None:
         """Verify the actual audit checkpoint bridge, including cancellations."""
         with self._lock:

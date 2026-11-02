@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from hashlib import sha256
 from uuid import UUID
 
 from sqlalchemy import Connection, select
@@ -34,6 +33,7 @@ from elspeth.web.sessions.continuation_primary_paid_overflow_tail import (
     build_primary_paid_overflow_tail_batch,
     prepare_primary_paid_overflow_tail_plan,
 )
+from elspeth.web.sessions.continuation_primary_terminal_reservation import primary_terminal_reservation
 from elspeth.web.sessions.continuation_retained_capacity import (
     ProviderTerminalHoldSource,
     _require_historical_hold_source,
@@ -226,17 +226,7 @@ def read_v4_primary_paid_overflow_terminal_on_connection(
         operation_epoch=source.session_operation_epoch,
         action_chunk=no_sdk_action_chunk,
     )
-    reserved_bytes = max(paid_plan.reserved_bytes, no_sdk_plan.reserved_bytes)
-    combined_hash = sha256(
-        canonical_json(
-            {
-                "version": "composer.primary-v4-combined-tail.v1",
-                "paid": paid_plan.fallback_contract_sha256,
-                "no_sdk": no_sdk_plan.contract_sha256,
-                "reserved_bytes": reserved_bytes,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    _incomplete_tail, reserved_bytes, combined_hash = primary_terminal_reservation(paid_plan, no_sdk_plan)
     if source.reserved_bytes != reserved_bytes or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("PRIMARY paid overflow changed its original combined terminal hold")
     batch = build_primary_paid_overflow_tail_batch(paid_plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))

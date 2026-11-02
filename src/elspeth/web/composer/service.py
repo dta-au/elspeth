@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_classifier_primary import (
         ClassifierPrimaryIssuer,
         ClassifierReplyDeadline,
+        VerifiedClassifierPaidIncompleteTerminal,
         VerifiedClassifierPaidOverflowTerminal,
     )
     from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
@@ -1115,6 +1116,7 @@ class ComposerServiceImpl:
         | ClassifySourceProofStop
         | ClassifierReplyDeadline
         | VerifiedClassifierPaidOverflowTerminal
+        | VerifiedClassifierPaidIncompleteTerminal
         | ClassifierNoSdkRefusalReceipt
     ):
         """Phase P5 of the compose loop — anti-anchor + turn accounting.
@@ -1456,11 +1458,25 @@ class ComposerServiceImpl:
                             issued = await classifier_primary_issuer.invoke(
                                 branch="staged_review", prepared_input=reply_input, recorder=recorder, deadline=deadline
                             )
-                            from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+                            from elspeth.web.sessions.continuation_classifier_primary import (
+                                VerifiedClassifierPaidIncompleteTerminal,
+                                VerifiedClassifierPaidOverflowTerminal,
+                            )
                             from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
 
-                            if isinstance(issued, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
-                                if type(issued) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+                            if isinstance(
+                                issued,
+                                (
+                                    VerifiedClassifierPaidOverflowTerminal,
+                                    VerifiedClassifierPaidIncompleteTerminal,
+                                    ClassifierNoSdkRefusalReceipt,
+                                ),
+                            ):
+                                if type(issued) not in (
+                                    VerifiedClassifierPaidOverflowTerminal,
+                                    VerifiedClassifierPaidIncompleteTerminal,
+                                    ClassifierNoSdkRefusalReceipt,
+                                ):
                                     raise AuditIntegrityError("classifier PRIMARY returned a non-nominal terminal")
                                 return issued
                             completion = issued.completion
@@ -1573,11 +1589,21 @@ class ComposerServiceImpl:
                     prepared_input=final_input,
                     classifier_primary_issuer=classifier_primary_issuer,
                 )
-                from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+                from elspeth.web.sessions.continuation_classifier_primary import (
+                    VerifiedClassifierPaidIncompleteTerminal,
+                    VerifiedClassifierPaidOverflowTerminal,
+                )
                 from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
 
-                if isinstance(last_chance_result, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
-                    if type(last_chance_result) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+                if isinstance(
+                    last_chance_result,
+                    (VerifiedClassifierPaidOverflowTerminal, VerifiedClassifierPaidIncompleteTerminal, ClassifierNoSdkRefusalReceipt),
+                ):
+                    if type(last_chance_result) not in (
+                        VerifiedClassifierPaidOverflowTerminal,
+                        VerifiedClassifierPaidIncompleteTerminal,
+                        ClassifierNoSdkRefusalReceipt,
+                    ):
                         raise AuditIntegrityError("classifier PRIMARY returned a non-nominal terminal")
                     return last_chance_result
                 completion = last_chance_result
@@ -2352,7 +2378,12 @@ class ComposerServiceImpl:
         provider_owner: ProviderInvocationOwner | None = None,
         prepared_input: PreparedProviderInput | None = None,
         classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
-    ) -> _AdmittedLLMCompletion | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
+    ) -> (
+        _AdmittedLLMCompletion
+        | VerifiedClassifierPaidOverflowTerminal
+        | VerifiedClassifierPaidIncompleteTerminal
+        | ClassifierNoSdkRefusalReceipt
+    ):
         """Preserve the completion-returning deadline boundary."""
         outcome = await self._call_llm_outcome_before_deadline(
             messages,
@@ -2368,11 +2399,20 @@ class ComposerServiceImpl:
             prepared_input=prepared_input,
             classifier_primary_issuer=classifier_primary_issuer,
         )
-        from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+        from elspeth.web.sessions.continuation_classifier_primary import (
+            VerifiedClassifierPaidIncompleteTerminal,
+            VerifiedClassifierPaidOverflowTerminal,
+        )
         from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
 
-        if isinstance(outcome, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
-            if type(outcome) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+        if isinstance(
+            outcome, (VerifiedClassifierPaidOverflowTerminal, VerifiedClassifierPaidIncompleteTerminal, ClassifierNoSdkRefusalReceipt)
+        ):
+            if type(outcome) not in (
+                VerifiedClassifierPaidOverflowTerminal,
+                VerifiedClassifierPaidIncompleteTerminal,
+                ClassifierNoSdkRefusalReceipt,
+            ):
                 raise AuditIntegrityError("classifier PRIMARY returned a non-nominal terminal")
             return outcome
         return outcome.completion
@@ -2392,7 +2432,12 @@ class ComposerServiceImpl:
         provider_owner: ProviderInvocationOwner | None = None,
         prepared_input: PreparedProviderInput | None = None,
         classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
-    ) -> _CallModelOutcome | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
+    ) -> (
+        _CallModelOutcome
+        | VerifiedClassifierPaidOverflowTerminal
+        | VerifiedClassifierPaidIncompleteTerminal
+        | ClassifierNoSdkRefusalReceipt
+    ):
         """Call the LLM with a per-call timeout derived from the deadline.
 
         The Gateway retains admitted provider accounting and joins its owned
@@ -2455,11 +2500,21 @@ class ComposerServiceImpl:
                         deadline=deadline,
                         credential_state=state,
                     )
-                    from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+                    from elspeth.web.sessions.continuation_classifier_primary import (
+                        VerifiedClassifierPaidIncompleteTerminal,
+                        VerifiedClassifierPaidOverflowTerminal,
+                    )
                     from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
 
-                    if isinstance(issued, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
-                        if type(issued) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+                    if isinstance(
+                        issued,
+                        (VerifiedClassifierPaidOverflowTerminal, VerifiedClassifierPaidIncompleteTerminal, ClassifierNoSdkRefusalReceipt),
+                    ):
+                        if type(issued) not in (
+                            VerifiedClassifierPaidOverflowTerminal,
+                            VerifiedClassifierPaidIncompleteTerminal,
+                            ClassifierNoSdkRefusalReceipt,
+                        ):
                             raise AuditIntegrityError("classifier PRIMARY returned a non-nominal terminal")
                         return issued
                     return issued.outcome

@@ -84,9 +84,11 @@ from elspeth.web.composer.provider_gateway import (
 from elspeth.web.composer.provider_quota import (
     ProviderInvocationOwner,
     SemanticV4Finalization,
+    V4PaidIncompleteCommitted,
     provider_call_scope,
     required_provider_audit_scope,
 )
+from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
@@ -94,6 +96,7 @@ from elspeth.web.required_work import RequiredWorkTicket
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.continuation import PreparedContinuationProvider
+    from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
 
@@ -463,6 +466,10 @@ async def run_semantic_advisor(
         Awaitable[RequiredSQLFinishOnce[SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal]],
     ]
     | None = None,
+    v4_incomplete_finalizer: Callable[
+        [V4ProviderResultIncomplete, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]]
+    ]
+    | None = None,
 ) -> SemanticAdvisorResult | SemanticV4Finalization:
     """One actual Advisor call; no retry, source retention or action execution."""
     if (
@@ -498,19 +505,21 @@ async def run_semantic_advisor(
         if _outcome is None:
             raise AuditIntegrityError("Semantic original issuer lost its private physical capture")
         no_sdk_issuer.bind_capture(custody, _outcome)
-    if any(value is not None for value in (v4_prepared, v4_env_ref_names, v4_finalizer)):
+    if any(value is not None for value in (v4_prepared, v4_env_ref_names, v4_finalizer, v4_incomplete_finalizer)):
         from elspeth.web.sessions.continuation import PreparedContinuationProvider
 
         if (
             type(v4_prepared) is not PreparedContinuationProvider
             or type(v4_env_ref_names) is not frozenset
             or v4_finalizer is None
+            or v4_incomplete_finalizer is None
             or no_sdk_issuer is None
             or no_sdk_issuer.prepared_candidate is not v4_prepared
             or _outcome is None
         ):
             raise AuditIntegrityError("V4 semantic physical call requires original prepared, env and SQL owners")
         custody.bind_continuation_semantic_v4(v4_prepared, v4_finalizer)
+        custody.bind_v4_returned_incomplete_finalizer(v4_incomplete_finalizer)
     options = deep_thaw(request.options)
     limit = custody.cost_completion_limit()
     expected_limit = owner._settings.composer_advisor_max_completion_tokens
@@ -539,6 +548,7 @@ async def run_semantic_advisor(
     error_message: str | None = None
     decision: ContinuationAdvisorDecision | None = None
     original_content: str | None = None
+    incomplete_return: V4ProviderResultIncomplete | None = None
     call: ComposerLLMCall | None = None
     async with provider_call_scope(custody):
         try:
@@ -623,12 +633,19 @@ async def run_semantic_advisor(
                         _outcome.decision = None
                 else:
                     metadata = original.provider_metadata
+            elif v4_prepared is not None and type(original) is V4ProviderResultIncomplete:
+                incomplete_return = original
+                status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                error_message = "paid_result_incomplete"
+                response = None
+                metadata = original.metadata
             else:
                 classified = classify_provider_failure(original) if isinstance(original, Exception) else None
                 status = classified.audit_status if classified is not None else ComposerLLMCallStatus.API_ERROR
-            if not isinstance(original, PromptGuardRefused):
+            if not isinstance(original, PromptGuardRefused) and incomplete_return is None:
                 attach_llm_calls(original, recorder)
-            raise
+            if incomplete_return is None:
+                raise
         finally:
             if _outcome is not None:
                 # Required settlement clears custody's live attempt. Capture
@@ -672,6 +689,11 @@ async def run_semantic_advisor(
                     attach_llm_calls(original_failure, recorder)
                 if no_sdk_issuer is not None and _outcome is not None:
                     no_sdk_issuer.note_original_observation(custody, _outcome)
+    if incomplete_return is not None:
+        if _outcome is None or _outcome.audit_call is None or v4_prepared is None:
+            raise AuditIntegrityError("V4 semantic returned-incomplete result lost original paid audit")
+        finalized_incomplete = await custody.finalize_v4_returned_incomplete(incomplete_return)
+        raise V4PaidIncompleteCommitted(finalized_incomplete)
     if decision is None or call is None or metadata is None or original_content is None or decision.decision_id != call.call_id:
         raise AuditIntegrityError("Semantic Advisor result lost its original decision/audit pair")
     if custody.continuation_semantic_v4 is not None:

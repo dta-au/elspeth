@@ -24,7 +24,11 @@ from elspeth.web.composer.audit_storage import private_diagnostic_drafts, privat
 from elspeth.web.composer.continuation import LogicalRequestBinding
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk
 from elspeth.web.composer.continuation_provider_outcomes import encode_physical_audit_call
-from elspeth.web.composer.continuation_title_values import capture_title_provider_result, decode_title_provider_result
+from elspeth.web.composer.continuation_title_values import (
+    VerifiedV4TitleStoredSource,
+    capture_title_provider_result,
+    decode_title_provider_result,
+)
 from elspeth.web.composer.provider_audit_source import (
     audit_drafts_json,
     capture_provider_audit_source,
@@ -125,6 +129,20 @@ def test_title_result_retains_original_objects_and_complete_cold_values():
     assert decoded.audit_drafts[1].inherit_composition_state is False
     assert decoded.audit_drafts[2].inherit_composition_state is False
     assert decoded.audit_drafts[0].inherit_composition_state is True
+
+
+def test_forged_stored_v4_source_cannot_select_diagnostic_equality_for_legacy_title():
+    captured = capture_title_provider_result(**title_result_inputs())
+    forged = VerifiedV4TitleStoredSource(
+        session_id=captured.snapshot.logical.session_id,
+        operation_id=captured.snapshot.logical.operation_id,
+        actor_user_id=captured.snapshot.actor_user_id,
+        input_sha256=captured.snapshot.input_sha256,
+        title_reference=captured.chunk.reference,
+        policy_hash="a" * 64,
+    )
+    with pytest.raises(AuditIntegrityError, match="verified stored V4 source"):
+        decode_title_provider_result(captured.chunk, env_ref_names=frozenset(), stored_v4_source=forged)
 
 
 def test_shared_projector_matches_original_finisher_and_historical_source():

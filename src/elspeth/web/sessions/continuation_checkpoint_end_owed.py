@@ -30,7 +30,8 @@ from elspeth.web.composer.continuation_codec import (
     decode_retained_physical_audit_call,
 )
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
-from elspeth.web.composer.continuation_provider_outcomes import require_successful_response_audit
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+from elspeth.web.composer.continuation_provider_outcomes import require_v4_successful_response_audit
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.continuation import (
     ContinuationEvent,
@@ -61,6 +62,7 @@ from elspeth.web.sessions.continuation_retained_capacity import (
     load_continuation_read_contract,
     read_bounded_retained_chunk,
 )
+from elspeth.web.sessions.continuation_selection import load_private_chunks
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -450,15 +452,35 @@ def read_v4_checkpoint_end_owed_on_connection(
         conn, session_id=session_id, operation_id=operation_id, cursor=prepared.cursor, allowance=contract.allowance
     )
     prepared_event, prepared_error = parse_json_strict(prepared_text)
+    prepared_fields = {
+        "owner",
+        "version",
+        "stage",
+        "phase",
+        "kind",
+        "pass_index",
+        "outer_effect_key",
+        "source_checkpoint_id",
+        "source_cursor",
+        "creator_sequence",
+        "creator_generation",
+        "end_input_chunk_key",
+        "end_input_sha256",
+        "end_env_ref_names",
+        "captured_root_sha256",
+    }
     if (
         prepared.cursor != original_event["source_cursor"]
         or prepared_tag != "checkpoint"
         or prepared_error is not None
         or type(prepared_event) is not dict
+        or set(prepared_event) != prepared_fields
         or prepared_text != canonical_json(prepared_event)
         or prepared_event.get("owner") != "composer_checkpoint_source"
+        or prepared_event.get("version") != 1
         or prepared_event.get("stage") != "source_prepared"
         or prepared_event.get("phase") != "end"
+        or prepared_event.get("kind") != original_event.get("kind")
         or prepared_event.get("pass_index") != value["pass_index"]
         or prepared_event.get("outer_effect_key") != value["outer_effect_key"]
         or prepared_event.get("end_input_chunk_key") != value["end_input_chunk_key"]
@@ -467,6 +489,27 @@ def read_v4_checkpoint_end_owed_on_connection(
         or prepared_event.get("captured_root_sha256") != sha256(prepared.payload_json.encode("utf-8")).hexdigest()
     ):
         raise AuditIntegrityError("END-owed cold source lost its original gate-input preparation")
+    if (
+        type(prepared_event["source_checkpoint_id"]) is not str
+        or type(prepared_event["source_cursor"]) is not int
+        or prepared.cursor != prepared_event["source_cursor"] + 1
+    ):
+        raise AuditIntegrityError("END-owed cold source lost its original outer checkpoint locator")
+    outer = _stored_checkpoint(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        checkpoint_id=prepared_event["source_checkpoint_id"],
+        allowance=contract.allowance,
+    )
+    prepared_root = decode_continuation_snapshot(prepared.payload_json)
+    outer_root = decode_continuation_snapshot(outer.payload_json)
+    if (
+        outer.cursor != prepared_event["source_cursor"]
+        or prepared_root.model_copy(update={"frames": outer_root.frames, "cursor": outer_root.cursor}) != outer_root
+        or not any(item.effect_id == value["outer_effect_key"] and item.disposition == "dispatched" for item in outer_root.effect_frontier)
+    ):
+        raise AuditIntegrityError("END-owed cold source changed its original outer phase root")
     end_key, end_digest = value["end_input_chunk_key"], value["end_input_sha256"]
     if type(end_key) is not str or type(end_digest) is not str or end_key != f"value:composer.checkpoint-end-input.v1:{end_digest}":
         raise AuditIntegrityError("END-owed cold source changed its END input reference")
@@ -495,6 +538,10 @@ def read_v4_checkpoint_end_owed_on_connection(
         or end_data.outer_effect_key != value["outer_effect_key"]
         or end_data.pass_index != value["pass_index"]
         or end_data.retry_ordinal != value["retry_ordinal"]
+        or end_data.runtime_chunks
+        != tuple(
+            chunk.reference for chunk in load_private_chunks(conn, session_id=session_id, operation_id=operation_id, stack=prepared_root)
+        )
         or end_data.captured_runtime_sha256
         != stable_hash(
             decode_continuation_snapshot(prepared.payload_json)
@@ -510,7 +557,11 @@ def read_v4_checkpoint_end_owed_on_connection(
             holds.c.effect_key == value["effect_key"],
         )
     ).one_or_none()
-    if hold_row is None:
+    if (
+        hold_row is None
+        or prepared_event["creator_sequence"] != hold_row.creator_sequence
+        or prepared_event["creator_generation"] != hold_row.creator_generation
+    ):
         raise AuditIntegrityError("END-owed cold source lost its active original H")
     hold_fields = {field: hold_row._mapping[field] for field in ProviderTerminalHoldSource.__dataclass_fields__}
     hold = ProviderTerminalHoldSource(**hold_fields)
@@ -577,13 +628,6 @@ def read_v4_checkpoint_end_owed_on_connection(
     )
     decoded = decode_continuation_response(response)
     call = decode_retained_physical_audit_call(response)
-    require_successful_response_audit(
-        call,
-        decoded.provider_metadata,
-        attempt_id=attempt_id,
-        started_at=call.started_at,
-        finished_at=call.finished_at,
-    )
     attempt = conn.execute(select(physical).where(physical.c.attempt_id == attempt_id)).one_or_none()
     effect = conn.execute(
         select(effects).where(
@@ -616,6 +660,20 @@ def read_v4_checkpoint_end_owed_on_connection(
         or sha256(attempt.lease_token.encode("utf-8")).hexdigest() != hold.lease_sha256
     ):
         raise AuditIntegrityError("END-owed cold response changed its original pending paid attempt")
+    policy = decode_continuation_policy(owed_root.admission_policy_json, owed_root.policy_hash)
+    if type(policy) is not ContinuationAdmissionPolicyV4 or policy.policy_hash != hold.policy_sha256:
+        raise AuditIntegrityError("END-owed cold response lost its original V4 policy source")
+    # The retained private response keeps complete original V4 metadata; the
+    # physical audit intentionally stores only its bounded diagnostic view.
+    # The explicit V4 comparator selects that view only after source proof.
+    require_v4_successful_response_audit(
+        call,
+        decoded.provider_metadata,
+        policy=policy,
+        attempt_id=attempt_id,
+        started_at=call.started_at,
+        finished_at=call.finished_at,
+    )
     return VerifiedCheckpointEndOwed(
         session_id,
         operation_id,

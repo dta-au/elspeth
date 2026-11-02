@@ -14,7 +14,7 @@ from elspeth.contracts.bounded_serialization import bounded_canonical_json_size,
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
-from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata, _CallModelOutcome
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation_application_graph import (
     capture_fresh_application_recorder_source,
@@ -41,7 +41,7 @@ from elspeth.web.composer.continuation_provider_outcomes import (
 from elspeth.web.composer.continuation_retention import retained_model_json_view
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource, capture_provider_audit_source
 from elspeth.web.composer.provider_gateway import _require_no_credential_material_in_completion
-from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
+from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness, project_v4_provider_diagnostic_metadata
 from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowCost, encode_paid_overflow_cost_amount
 
@@ -142,6 +142,28 @@ def observe_primary_provider_result(
     context: SessionOperationContext,
     env_ref_names: frozenset[str],
 ) -> PrimaryPaidObservation:
+    """Observe legacy DATA with exact original metadata/audit equality."""
+    if type(outcome) is not _CallModelOutcome:
+        raise AuditIntegrityError("PRIMARY observation requires its nominal outcome")
+    return _observe_primary_provider_result(
+        outcome=outcome,
+        recorder=recorder,
+        previous_evidence=previous_evidence,
+        context=context,
+        env_ref_names=env_ref_names,
+        audit_metadata=outcome.completion.provider_metadata,
+    )
+
+
+def _observe_primary_provider_result(
+    *,
+    outcome: _CallModelOutcome,
+    recorder: RecorderSnapshot,
+    previous_evidence: AdmittedTurnEvidence,
+    context: SessionOperationContext,
+    env_ref_names: frozenset[str],
+    audit_metadata: _AdmittedLLMProviderMetadata,
+) -> PrimaryPaidObservation:
     """Measure exact PRIMARY success projections after validating their sources.
 
     The counter saturates at limit + 1. Its excess is a lower bound even when
@@ -173,7 +195,7 @@ def observe_primary_provider_result(
         raise AuditIntegrityError("PRIMARY observation changed its original session operation")
     require_successful_response_audit(
         call,
-        outcome.completion.provider_metadata,
+        audit_metadata,
         attempt_id=attempt_id,
         started_at=call.started_at,
         finished_at=call.finished_at,
@@ -282,10 +304,11 @@ def observe_v4_primary_provider_result(
     ):
         raise AuditIntegrityError("V4 PRIMARY result lacks its original complete SDK return")
     witness.require_result(metadata, content=outcome.completion.message.content, tool_calls=outcome.completion.tool_batch.calls)
-    return observe_primary_provider_result(
+    return _observe_primary_provider_result(
         outcome=outcome,
         recorder=recorder,
         previous_evidence=previous_evidence,
         context=context,
         env_ref_names=env_ref_names,
+        audit_metadata=project_v4_provider_diagnostic_metadata(metadata),
     )

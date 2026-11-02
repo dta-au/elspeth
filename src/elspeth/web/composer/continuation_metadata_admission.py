@@ -22,10 +22,18 @@ from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_limits import ContinuationDocumentTooLarge
 from elspeth.web.composer.continuation_metadata_preparation import (
     MetadataPreparationRefused,
+    PreparedMetadataToolCall,
+    PreparedMetadataToolCompletion,
     complete_prepared_metadata_tool,
     prepare_metadata_tool_call,
 )
 from elspeth.web.composer.continuation_p4_batch import encode_p4_pending_batch_chunk
+from elspeth.web.composer.continuation_pipeline_preparation import (
+    PreparedPipelineToolCall,
+    PreparedPipelineToolCompletion,
+    complete_prepared_pipeline_tool,
+    prepare_pipeline_tool_call,
+)
 from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value, encode_prepared_p4, prepared_p4_members
 from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
@@ -134,12 +142,26 @@ async def _prepare_detached(
     )
     phase = ContinuationLivePhases(owner.service, owner.authority, owner.work, provider, owner.lease, owner.progress, runtime=detached)
     primary = await phase._primary_for_phase(detached, inventory, selected)
-    prepared = await prepare_metadata_tool_call(
-        runtime=detached,
-        original_runtime=original,
-        call_model=primary.outcome,
-        cancellation_requested=owner.cancellation_requested,
-    )
+    calls = primary.outcome.completion.tool_batch.calls
+    if len(calls) != 1:
+        raise MetadataPreparationRefused("bounded value preparation requires one original provider call")
+    prepared: PreparedMetadataToolCall | PreparedPipelineToolCall
+    if calls[0].function.name == "set_metadata":
+        prepared = await prepare_metadata_tool_call(
+            runtime=detached,
+            original_runtime=original,
+            call_model=primary.outcome,
+            cancellation_requested=owner.cancellation_requested,
+        )
+    elif calls[0].function.name == "set_pipeline":
+        prepared = await prepare_pipeline_tool_call(
+            runtime=detached,
+            original_runtime=original,
+            call_model=primary.outcome,
+            cancellation_requested=owner.cancellation_requested,
+        )
+    else:
+        raise MetadataPreparationRefused("bounded value preparation does not activate arbitrary tools")
     audit = prepared.call.audit
     if audit is None:
         raise AuditIntegrityError("metadata preparation lost its original dispatch audit")
@@ -151,7 +173,13 @@ async def _prepare_detached(
         ),
     )
     issued = await _capture_metadata(issued_runtime, selected=selected, inventory=inventory)
-    completion = await complete_prepared_metadata_tool(prepared)
+    completion: PreparedMetadataToolCompletion | PreparedPipelineToolCompletion
+    if type(prepared) is PreparedMetadataToolCall:
+        completion = await complete_prepared_metadata_tool(prepared)
+    elif type(prepared) is PreparedPipelineToolCall:
+        completion = await complete_prepared_pipeline_tool(prepared)
+    else:
+        raise AuditIntegrityError("bounded value preparation lost its original nominal call")
     data = detached.graph.batch
     if data is None:
         raise AuditIntegrityError("metadata completion lost its detached batch")

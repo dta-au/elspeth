@@ -48,9 +48,10 @@ function failureOutcome(value: unknown, sessionId: string): ComposerOperationFai
   const code = failureCode(record.failure_code);
   const diagnostic = record.diagnostic_id === null ? null : canonicalUuid(record.diagnostic_id);
   if ((code === "operation_failed") !== (diagnostic !== null)) throw new ComposerOperationDecodeError("Invalid diagnostic binding");
-  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "executor_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed", "composer_mutation_authority_revoked", "composer_admission_refused", "paid_result_overflow"];
+  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "executor_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed", "composer_mutation_authority_revoked", "composer_admission_refused", "paid_result_overflow", "paid_result_incomplete"];
   const category = record.error_type === null ? null : categories.find((item) => item === record.error_type);
   if (category === undefined) throw new ComposerOperationDecodeError("Unknown public failure category");
+  if (category === "paid_result_incomplete" && code !== "http_error") throw new ComposerOperationDecodeError("Invalid paid incomplete failure category");
   const requestId = record.request_id === null ? null : text(record.request_id);
   if (requestId !== null && (requestId.length < 1 || requestId.length > 128)) throw new ComposerOperationDecodeError("Invalid request reference");
   const saved = exactRecord(record.saved_revisions, ["attribution", "count", "latest_state_id", "latest_version"]);
@@ -104,6 +105,31 @@ export function validateComposerRecoveryBody(body: unknown, sessionId?: string):
     if (record.partial_state_save_error !== undefined && record.partial_state_save_error !== null) text(record.partial_state_save_error);
   }
 }
+export function decodePaidResultIncompleteBody(value: unknown): import("@/types/composerOperations").PaidResultIncompleteBody {
+  const body = exactRecord(value, ["error_type", "detail", "evidence_status", "retryable", "cost", "request_id"]);
+  if (body.error_type !== "paid_result_incomplete" || body.detail !== "The returned paid result could not be fully retained. It was not used or retried." || body.evidence_status !== "incomplete" || body.retryable !== false) throw new ComposerOperationDecodeError("Invalid paid incomplete body");
+  const cost = exactRecord(body.cost, ["status", "amount"]);
+  if (cost.status === "known") {
+    const amount = text(cost.amount);
+    if (amount.length > 128 || !/^(0|[1-9][0-9]*)(\.[0-9]+)?(e-?[0-9]+)?$/.test(amount)) throw new ComposerOperationDecodeError("Invalid paid incomplete cost");
+    // Scientific amounts use the backend's canonical spelling; legacy fixed
+    // decimals retain their original bytes. Never round cost through a float.
+    if (amount.includes("e")) {
+      const canonical = /^([1-9](?:\.[0-9]*[1-9])?)e(-?[1-9][0-9]*)$/.exec(amount);
+      if (canonical === null) throw new ComposerOperationDecodeError("Invalid paid incomplete cost");
+      const exponent = Number(canonical[2]);
+      const digits = canonical[1].replace(".", "");
+      const maxDigits = "17976931348623157";
+      const width = Math.max(digits.length, maxDigits.length);
+      if (exponent < -324 || exponent > 308 || (exponent >= -6 && exponent < 21) || (exponent === 308 && digits.padEnd(width, "0") > maxDigits.padEnd(width, "0"))) throw new ComposerOperationDecodeError("Invalid paid incomplete cost");
+    }
+  } else if (cost.status !== "unknown" || cost.amount !== null) throw new ComposerOperationDecodeError("Invalid paid incomplete cost");
+  if (body.request_id !== null) {
+    const requestId = text(body.request_id);
+    if (requestId.length < 1 || requestId.length > 128) throw new ComposerOperationDecodeError("Invalid request reference");
+  }
+  return body as unknown as import("@/types/composerOperations").PaidResultIncompleteBody;
+}
 export function decodeError(value: unknown, sessionId: string): ComposerOperationError {
   const record = exactRecord(value, ["http_status", "body", "error_type", "failure_code", "diagnostic_id"]);
   const status = integer(record.http_status, 400);
@@ -118,6 +144,10 @@ export function decodeError(value: unknown, sessionId: string): ComposerOperatio
   if (errorType === "paid_result_overflow" &&
       (code !== "http_error" || body.error_type !== errorType || body.evidence_status !== "incomplete" || body.retryable !== false)) {
     throw new ComposerOperationDecodeError("Invalid paid overflow terminal");
+  }
+  if (errorType === "paid_result_incomplete" || body.error_type === "paid_result_incomplete") {
+    if (status !== 507 || code !== "http_error" || diagnostic_id !== null || errorType !== "paid_result_incomplete") throw new ComposerOperationDecodeError("Invalid paid incomplete terminal");
+    decodePaidResultIncompleteBody(body);
   }
   return { http_status: status, body, error_type: errorType, failure_code: code, diagnostic_id };
 }

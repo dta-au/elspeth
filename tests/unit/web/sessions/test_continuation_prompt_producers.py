@@ -75,7 +75,7 @@ operation_store = test_composer_operation_authority.operation_store
 REQUEST = "Preserve café and exact context"
 
 
-def current_service(store, *, secret_service=None, settings_overrides=None):
+def current_service(store, *, secret_service=None, settings_overrides=None, available_plugins=None):
     engine, _repository, _authority, sessions, _sid = store
     setting_values = {
         "composer_max_composition_turns": 15,
@@ -89,7 +89,7 @@ def current_service(store, *, secret_service=None, settings_overrides=None):
         setting_values.update(settings_overrides)
     settings = WebSettings(**setting_values)
     catalog = create_catalog_service()
-    available = frozenset({PluginId("source", "csv")})
+    available = frozenset({PluginId("source", "csv")}) if available_plugins is None else available_plugins
     policy = WebPluginPolicy.create(
         required=available, configured_optional=frozenset(), preferences=(), control_modes=(), plugin_code_identities=()
     )

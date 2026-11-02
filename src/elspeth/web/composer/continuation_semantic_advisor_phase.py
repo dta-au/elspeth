@@ -48,6 +48,8 @@ from elspeth.web.composer.continuation_tool_failure import combine_failure_objec
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
+from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
+from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.composer_operations import ComposerOperationRecord, ComposerOperationRunning
@@ -57,6 +59,7 @@ from elspeth.web.sessions.continuation import (
     V3UnboundedTailRefusal,
     refuse_v3_retained_tail_before_paid,
 )
+from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
 from elspeth.web.sessions.continuation_semantic_advisor import (
     SemanticAdvisorProviderResult,
     _semantic_checkpoint_kind_data,
@@ -90,6 +93,12 @@ class SemanticAdvisorNoSdkTerminal:
 @dataclass(frozen=True, slots=True)
 class SemanticAdvisorPaidTerminal:
     verified: VerifiedSemanticPaidOverflowTerminal
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticAdvisorPaidIncompleteTerminal:
+    verified: VerifiedPaidIncompleteTerminal
     deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
 
 
@@ -263,7 +272,7 @@ async def run_prescribed_semantic_read(phases: ContinuationLivePhases, selected:
 
 async def run_continuation_semantic_advisor(
     phases: ContinuationLivePhases, selected: SelectedContinuationState
-) -> SemanticAdvisorNoSdkTerminal | SemanticAdvisorPaidTerminal | V3UnboundedTailRefusal | None:
+) -> SemanticAdvisorNoSdkTerminal | SemanticAdvisorPaidTerminal | SemanticAdvisorPaidIncompleteTerminal | V3UnboundedTailRefusal | None:
     """Execute one real action; retain paid output before a new SQL action.
 
     Stop/expiry may finish an original physical outcome, but cannot install a
@@ -401,9 +410,25 @@ async def run_continuation_semantic_advisor(
                     no_sdk_issuer=issuer,
                 ),
             )
-            phases.work.coordinator.validate_continuation_sql_outcome(
-                ticket=ticket, expected_source=RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, actual_outcome=outcome
+            phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
+            return outcome
+
+        async def finalize_incomplete(
+            incomplete: V4ProviderResultIncomplete, ticket: RequiredWorkTicket
+        ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+            deadline_owner = phases.work.coordinator.sql_deadline_owner
+            if deadline_owner is not None:
+                deadline_owner.begin_settlement()
+            outcome = await run_required_sql_finish_once(
+                ticket,
+                lambda: session_service.complete_v4_semantic_paid_incomplete_sync(
+                    prepared=prepared,
+                    admission=issuer.require_original_v4_admission(prepared),
+                    incomplete=incomplete,
+                    no_sdk_issuer=issuer,
+                ),
             )
+            phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
             return outcome
 
         observed_v4: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationV4Finalized | SemanticAdvisorInvocationRaised | None = (
@@ -422,6 +447,7 @@ async def run_continuation_semantic_advisor(
                 v4_prepared=prepared,
                 v4_env_ref_names=runtime.env_ref_names,
                 v4_finalizer=finalize_paid,
+                v4_incomplete_finalizer=finalize_incomplete,
             )
             if type(observed_v4) is SemanticAdvisorInvocationV4Finalized:
                 paid_finalization = observed_v4.finalization
@@ -441,6 +467,9 @@ async def run_continuation_semantic_advisor(
                 return None
             if type(observed_v4) is not SemanticAdvisorInvocationRaised:
                 raise AuditIntegrityError("V4 semantic Advisor lost its original physical observation")
+            if type(observed_v4.error) is V4PaidIncompleteCommitted:
+                finalized_incomplete = issuer.require_v4_paid_incomplete_committed(prepared, observed_v4)
+                return SemanticAdvisorPaidIncompleteTerminal(finalized_incomplete.verified, finalized_incomplete.deferred_cancellations)
             if observed_v4.observation.sdk_entered:
                 # A returned failure or unknown physical outcome has no approved
                 # terminal policy. Keep its original attempt and H unresolved.

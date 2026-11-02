@@ -620,6 +620,12 @@ class ContinuationLivePhases:
             if await try_admit_metadata_tool(self, runtime=runtime, selected=selected, inventory=inventory):
                 return None
 
+            if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
+                from elspeth.web.composer.continuation_value_batch_admission import try_admit_value_batch_tool
+
+                if await try_admit_value_batch_tool(self, runtime=runtime, selected=selected, inventory=inventory):
+                    return None
+
             def commit_refusal() -> ToolNoExecutionRefusal:
                 receipt = refuse_v3_tool_before_dispatch(self.authority, inventory.running, selected=selected, inventory=inventory)
                 # Record the actual committed return before the async SQL ticket

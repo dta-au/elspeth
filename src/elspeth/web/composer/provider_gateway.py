@@ -57,6 +57,7 @@ from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonP
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
+    V4PaidIncompleteCommitted,
     provider_call_scope,
     quota_provider_calls,
     required_provider_audit_scope,
@@ -1355,6 +1356,9 @@ class ProviderGateway:
             attach_llm_calls(exc, recorder)
             raise
         except V4ProviderResultIncomplete as exc:
+            if provider_custody is None:
+                raise AuditIntegrityError("V4 incomplete result lacks its original paid provider custody") from exc
+            provider_custody.require_v4_result_incomplete(exc)
             failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             response_metadata = exc.metadata
@@ -1385,6 +1389,8 @@ class ProviderGateway:
             error_message = "credential_material_rejected"
             attach_llm_calls(exc, recorder)
             raise
+        except V4PaidIncompleteCommitted:
+            raise
         except Exception as exc:
             failure_to_capture = exc
             status = ComposerLLMCallStatus.API_ERROR
@@ -1394,7 +1400,11 @@ class ProviderGateway:
             raise
         finally:
             with required_provider_audit_scope(provider_custody):
-                if status is not None and (recorder is not None or provider_custody is not None):
+                if (
+                    status is not None
+                    and (recorder is not None or provider_custody is not None)
+                    and (provider_custody is None or not provider_custody.has_v4_returned_incomplete_terminal())
+                ):
                     if provider_custody is not None and not provider_custody.needs_terminal_audit():
                         return_to_audit = False
                     else:
@@ -1591,6 +1601,8 @@ class ProviderGateway:
             error_message = "credential_material_rejected"
             attach_llm_calls(exc, recorder)
             raise
+        except V4PaidIncompleteCommitted:
+            raise
         except Exception as exc:
             failure_to_capture = exc
             status = ComposerLLMCallStatus.API_ERROR
@@ -1600,7 +1612,11 @@ class ProviderGateway:
             raise
         finally:
             with required_provider_audit_scope(provider_custody):
-                if status is not None and (recorder is not None or provider_custody is not None):
+                if (
+                    status is not None
+                    and (recorder is not None or provider_custody is not None)
+                    and (provider_custody is None or not provider_custody.has_v4_returned_incomplete_terminal())
+                ):
                     if provider_custody is not None and not provider_custody.needs_terminal_audit():
                         return_to_audit = False
                     else:
@@ -1671,15 +1687,21 @@ class ProviderGateway:
                 messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state, prepared_input=prepared_input
             )
         async with provider_call_scope(provider_custody):
-            return await self._call_llm_with_audit_body(
-                messages,
-                tools,
-                timeout=timeout,
-                recorder=recorder,
-                provider_custody=provider_custody,
-                credential_state=credential_state,
-                prepared_input=prepared_input,
-            )
+            try:
+                return await self._call_llm_with_audit_body(
+                    messages,
+                    tools,
+                    timeout=timeout,
+                    recorder=recorder,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prepared_input=prepared_input,
+                )
+            except V4ProviderResultIncomplete as incomplete:
+                if not provider_custody.has_v4_returned_incomplete_finalizer():
+                    raise
+                finalization = await provider_custody.finalize_v4_returned_incomplete(incomplete)
+                raise V4PaidIncompleteCommitted(finalization) from None
 
     async def _call_llm_outcome_with_audit(
         self,
@@ -1696,17 +1718,23 @@ class ProviderGateway:
     ) -> _CallModelOutcome:
         """Carry the original primary audit through its existing settlement."""
         async with provider_call_scope(provider_custody):
-            outcome = await self._call_llm_outcome_with_audit_body(
-                messages,
-                tools,
-                timeout=timeout,
-                recorder=recorder,
-                provider_custody=provider_custody,
-                credential_state=credential_state,
-                continuation_input_sha256=continuation_input_sha256,
-                prepared_input=prepared_input,
-                on_sdk_entry=on_sdk_entry,
-            )
+            try:
+                outcome = await self._call_llm_outcome_with_audit_body(
+                    messages,
+                    tools,
+                    timeout=timeout,
+                    recorder=recorder,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    continuation_input_sha256=continuation_input_sha256,
+                    prepared_input=prepared_input,
+                    on_sdk_entry=on_sdk_entry,
+                )
+            except V4ProviderResultIncomplete as incomplete:
+                if not provider_custody.has_v4_returned_incomplete_finalizer():
+                    raise
+                finalization = await provider_custody.finalize_v4_returned_incomplete(incomplete)
+                raise V4PaidIncompleteCommitted(finalization) from None
             if provider_custody.continuation_primary_v4 is not None:
                 await provider_custody.finalize_continuation_primary_v4(outcome)
             elif provider_custody.continuation_classifier_v4 is not None:

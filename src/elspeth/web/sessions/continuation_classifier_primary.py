@@ -20,6 +20,7 @@ from weakref import WeakKeyDictionary
 from pydantic import Field, ValidationError
 from sqlalchemy import Connection, select, update
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.async_workers import run_required_sql_finish_once
@@ -56,7 +57,10 @@ from elspeth.web.composer.continuation_policy import (
 )
 from elspeth.web.composer.continuation_primary_no_sdk import ContinuationRetainedTailUnbounded
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_json
-from elspeth.web.composer.continuation_provider_outcomes import require_successful_response_audit
+from elspeth.web.composer.continuation_provider_outcomes import (
+    require_successful_response_audit,
+    require_v4_successful_response_audit,
+)
 from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
     RestoredContinuationRuntime,
@@ -92,8 +96,10 @@ from elspeth.web.sessions.continuation import (
     read_chunk,
     require_snapshot_cas,
 )
+from elspeth.web.sessions.continuation_classifier_primary_incomplete_tail import ClassifierPaidIncompleteTailPlan
 from elspeth.web.sessions.continuation_classifier_primary_paid_tail import ClassifierPaidOverflowTailPlan
 from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
+from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowReceipt
 from elspeth.web.sessions.continuation_primary import (
     _chunk_data,
@@ -157,6 +163,7 @@ class V4ClassifierProviderAdmission:
     dispatched: StoredContinuationSnapshot
     hold: ProviderTerminalHoldSource
     paid_tail: ClassifierPaidOverflowTailPlan
+    incomplete_tail: ClassifierPaidIncompleteTailPlan
     no_sdk_tail: ClassifierNoSdkTailPlan
     effect_key: str
 
@@ -165,6 +172,12 @@ class V4ClassifierProviderAdmission:
 class VerifiedClassifierPaidOverflowTerminal:
     receipt: PaidOverflowReceipt
     snapshot: StoredContinuationSnapshot
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedClassifierPaidIncompleteTerminal:
+    verified: VerifiedPaidIncompleteTerminal
     deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
 
 
@@ -717,9 +730,23 @@ def publish_classifier_primary_on_connection(
         )
     ):
         raise AuditIntegrityError("classifier PRIMARY publication cannot replace an unresolved original result")
-    require_successful_response_audit(
-        call, outcome.completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
-    )
+    if v4_admission is not None:
+        admitted_root = decode_continuation_snapshot(current.payload_json)
+        admitted_policy = decode_continuation_policy(admitted_root.admission_policy_json, admitted_root.policy_hash)
+        if type(admitted_policy) is not ContinuationAdmissionPolicyV4:
+            raise AuditIntegrityError("classifier V4 publication changed its admitted policy")
+        require_v4_successful_response_audit(
+            call,
+            outcome.completion.provider_metadata,
+            policy=admitted_policy,
+            attempt_id=call.call_id,
+            started_at=call.started_at,
+            finished_at=call.finished_at,
+        )
+    else:
+        require_successful_response_audit(
+            call, outcome.completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
+        )
     if v4_admission is None:
         _physical_source_data(conn, source.session_id, source.operation_id, row, call)
     before = decode_recorder_snapshot(_chunk_data(conn, source.session_id, source.operation_id, source.compose.audit_buffer))
@@ -860,9 +887,21 @@ def read_original_classifier_primary_on_connection(
         or restore_utc(row.response_finished_at) != call.finished_at
     ):
         raise AuditIntegrityError("classifier PRIMARY changed its complete original physical receipt")
-    require_successful_response_audit(
-        call, completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
-    )
+    prepared_root = decode_continuation_snapshot(dispatched.payload_json)
+    admitted_policy = decode_continuation_policy(prepared_root.admission_policy_json, prepared_root.policy_hash)
+    if type(admitted_policy) is ContinuationAdmissionPolicyV4:
+        require_v4_successful_response_audit(
+            call,
+            completion.provider_metadata,
+            policy=admitted_policy,
+            attempt_id=call.call_id,
+            started_at=call.started_at,
+            finished_at=call.finished_at,
+        )
+    else:
+        require_successful_response_audit(
+            call, completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
+        )
     _physical_source_data(conn, session_id, operation_id, row, call)
     audit = _chunk_data(conn, session_id, operation_id, compose.audit_buffer)
     buffer = decode_recorder_snapshot(audit)
@@ -873,7 +912,6 @@ def read_original_classifier_primary_on_connection(
     prior = decode_recorder_snapshot(_chunk_data(conn, session_id, operation_id, source.compose.audit_buffer))
     if replace(prior, llm_calls=(*prior.llm_calls, call)) != buffer:
         raise AuditIntegrityError("classifier PRIMARY cold source changed its complete recorder/P4 prefix")
-    prepared_root = decode_continuation_snapshot(dispatched.payload_json)
     actual = SelectedContinuationState(
         dispatched.checkpoint_id,
         prepared_root,
@@ -914,6 +952,12 @@ def read_original_classifier_primary_on_connection(
         or committed_evidence.source_chunk != encode_turn_evidence(extended, env_ref_names=frozenset(source.env_ref_names))
     ):
         raise AuditIntegrityError("classifier PRIMARY changed its complete original committed root")
+    if type(admitted_policy) is ContinuationAdmissionPolicyV4:
+        from elspeth.web.sessions.continuation_classifier_primary_complete_cold import require_v4_classifier_complete_hold_on_connection
+
+        require_v4_classifier_complete_hold_on_connection(
+            conn, source=source, dispatched=dispatched, effect=row, call=call, completion=completion
+        )
     return ClassifierPrimaryResult(
         committed,
         effect_key,
@@ -992,7 +1036,9 @@ class ClassifierPrimaryIssuer:
         self._sdk_entered = False
         self._failure: BaseException | None = None
         self._result: ClassifierPrimaryResult | None = None
-        self._terminal: VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt | None = None
+        self._terminal: (
+            VerifiedClassifierPaidOverflowTerminal | VerifiedClassifierPaidIncompleteTerminal | ClassifierNoSdkRefusalReceipt | None
+        ) = None
         self._reply_deadline: float | None = None
         self._reply_deadline_observation: ClassifierReplyDeadline | None = None
         self._reply_clock = clock
@@ -1083,7 +1129,9 @@ class ClassifierPrimaryIssuer:
         return self._result
 
     @property
-    def terminal(self) -> VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt | None:
+    def terminal(
+        self,
+    ) -> VerifiedClassifierPaidOverflowTerminal | VerifiedClassifierPaidIncompleteTerminal | ClassifierNoSdkRefusalReceipt | None:
         return self._terminal
 
     @property
@@ -1157,7 +1205,12 @@ class ClassifierPrimaryIssuer:
         recorder: BufferingRecorder,
         deadline: float,
         credential_state: CompositionState | None = None,
-    ) -> ClassifierPrimaryResult | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
+    ) -> (
+        ClassifierPrimaryResult
+        | VerifiedClassifierPaidOverflowTerminal
+        | VerifiedClassifierPaidIncompleteTerminal
+        | ClassifierNoSdkRefusalReceipt
+    ):
         if self._reply_deadline_observation is not None:
             raise AuditIntegrityError("classifier reply deadline permanently closed its original dispatch")
         if self._started:
@@ -1181,7 +1234,12 @@ class ClassifierPrimaryIssuer:
         recorder: BufferingRecorder,
         deadline: float,
         credential_state: CompositionState | None,
-    ) -> ClassifierPrimaryResult | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
+    ) -> (
+        ClassifierPrimaryResult
+        | VerifiedClassifierPaidOverflowTerminal
+        | VerifiedClassifierPaidIncompleteTerminal
+        | ClassifierNoSdkRefusalReceipt
+    ):
         policy = decode_continuation_policy(self.selected.stack.admission_policy_json, self.selected.stack.policy_hash)
         if type(policy) is ContinuationAdmissionPolicyV3:
             raise ContinuationRetainedTailUnbounded("classifier PRIMARY has no proven complete retained result bound")
@@ -1359,8 +1417,15 @@ class ClassifierPrimaryIssuer:
         recorder: BufferingRecorder,
         deadline: float,
         credential_state: CompositionState | None,
-    ) -> ClassifierPrimaryResult | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
+    ) -> (
+        ClassifierPrimaryResult
+        | VerifiedClassifierPaidOverflowTerminal
+        | VerifiedClassifierPaidIncompleteTerminal
+        | ClassifierNoSdkRefusalReceipt
+    ):
         from elspeth.web.composer.continuation_primary import _pre_sdk_failure
+        from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
         from elspeth.web.sessions.service import SessionServiceImpl
 
         sessions = self.service._require_sessions_service()
@@ -1398,6 +1463,24 @@ class ClassifierPrimaryIssuer:
 
         custody.bind_continuation_classifier_v4(provider, finalizer)
 
+        async def incomplete_finalizer(
+            incomplete: V4ProviderResultIncomplete, sql: RequiredWorkTicket
+        ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+            admission = custody.continuation_classifier_v4_admission
+            call = custody.call
+            if type(admission) is not V4ClassifierProviderAdmission or type(call) is not ComposerLLMCall:
+                raise AuditIntegrityError("V4 classifier incomplete result lost its admitted physical audit/H")
+            custody.require_v4_result_incomplete(incomplete)
+            return await sessions.finalize_v4_continuation_classifier_incomplete(
+                prepared=provider,
+                admission=admission,
+                incomplete=incomplete,
+                call=call,
+                required_work=sql,
+            )
+
+        custody.bind_v4_returned_incomplete_finalizer(incomplete_finalizer)
+
         def entered() -> None:
             self._sdk_entered = True
 
@@ -1419,6 +1502,20 @@ class ClassifierPrimaryIssuer:
                 prepared_input=prepared_input,
                 on_sdk_entry=entered,
             )
+        except V4PaidIncompleteCommitted as control:
+            committed = custody.require_v4_paid_incomplete_committed(control)
+            admission = custody.continuation_classifier_v4_admission
+            verified = committed.verified
+            if (
+                type(admission) is not V4ClassifierProviderAdmission
+                or type(verified) is not VerifiedPaidIncompleteTerminal
+                or verified.source != admission.hold
+                or verified.provider_attempt_id != admission.attempt.attempt_id
+            ):
+                raise AuditIntegrityError("V4 classifier incomplete terminal lost its original paid source") from control
+            terminal = VerifiedClassifierPaidIncompleteTerminal(verified, committed.deferred_cancellations)
+            self._terminal = terminal
+            return terminal
         except BaseException as error:
             failure = _pre_sdk_failure(error, preparing=False)
             admission = custody.continuation_classifier_v4_admission
@@ -1444,9 +1541,9 @@ class ClassifierPrimaryIssuer:
             admission = custody.continuation_classifier_v4_admission
             if type(admission) is not V4ClassifierProviderAdmission or result.receipt.identity.attempt_id != admission.attempt.attempt_id:
                 raise AuditIntegrityError("V4 classifier terminal changed its original physical attempt")
-            terminal = replace(result, deferred_cancellations=custody.continuation_classifier_v4_deferred_cancellations)
-            self._terminal = terminal
-            return terminal
+            overflow_terminal = replace(result, deferred_cancellations=custody.continuation_classifier_v4_deferred_cancellations)
+            self._terminal = overflow_terminal
+            return overflow_terminal
         raise AuditIntegrityError("V4 classifier returned without its exact complete or terminal SQL result")
 
     async def _finish_v4_no_sdk(

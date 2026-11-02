@@ -195,7 +195,7 @@ def semantic_read_response(request: dict[str, Any], *, tool_name: str = "get_pip
     answer = semantic_primary_response(request)
     action = answer["prescribed_action"]
     action.pop("instruction")
-    action.update(kind="read", tool_name=tool_name, arguments_json=arguments_json)
+    action.update(kind="read_tool", tool_name=tool_name, arguments_json=arguments_json)
     answer["reason"] = "Use the real read owner to inspect an unresolved source fact before review."
     return answer
 

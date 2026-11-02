@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from hashlib import sha256
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -32,6 +31,7 @@ from elspeth.web.sessions.continuation_primary_paid_overflow_no_sdk import (
 from elspeth.web.sessions.continuation_primary_paid_overflow_source import require_original_v4_primary_physical_source_on_connection
 from elspeth.web.sessions.continuation_primary_paid_overflow_tail import prepare_primary_paid_overflow_tail_plan
 from elspeth.web.sessions.continuation_primary_paid_overflow_terminal import _bounded_bytes, _stored_hold_source
+from elspeth.web.sessions.continuation_primary_terminal_reservation import primary_terminal_reservation
 from elspeth.web.sessions.continuation_retained_capacity import (
     ProviderTerminalHoldSource,
     _require_historical_hold_source,
@@ -104,7 +104,20 @@ def read_v4_primary_no_sdk_refusal_on_connection(
         or admitted_frame.provider_effect_key != effect_key
         or admitted_frame.provider_input_sha256 != source.source_input_sha256
         or admitted_frame.phase != "awaiting_response"
-        or any(item.disposition != "dispatched" for item in admitted_root.effect_frontier if item.effect_id == effect_key)
+        or len(admitted_root.effect_frontier) != 1
+        or (
+            admitted_root.effect_frontier[0].effect_id,
+            admitted_root.effect_frontier[0].disposition,
+            admitted_root.effect_frontier[0].receipt_id,
+        )
+        != (effect_key, "dispatched", None)
+        or len(terminal_root.effect_frontier) != 1
+        or (
+            terminal_root.effect_frontier[0].effect_id,
+            terminal_root.effect_frontier[0].disposition,
+            terminal_root.effect_frontier[0].receipt_id,
+        )
+        != (effect_key, "refused", effect.receipt_key)
         or _bounded_bytes(conn, source, terminal_row.snapshot_chunk_key, "snapshot.v2") != terminal.payload_json.encode("utf-8")
     ):
         raise AuditIntegrityError("V4 PRIMARY zero-use refusal changed its original terminal/effect/H")
@@ -169,17 +182,7 @@ def read_v4_primary_no_sdk_refusal_on_connection(
         operation_epoch=source.session_operation_epoch,
         action_chunk=action_chunk,
     )
-    reserved = max(paid.reserved_bytes, no_sdk.reserved_bytes)
-    combined_hash = sha256(
-        canonical_json(
-            {
-                "version": "composer.primary-v4-combined-tail.v1",
-                "paid": paid.fallback_contract_sha256,
-                "no_sdk": no_sdk.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    _incomplete_tail, reserved, combined_hash = primary_terminal_reservation(paid, no_sdk)
     projected, projected_events = _shape(
         admitted=admitted,
         receipt_key=data.receipt_key,

@@ -8,7 +8,9 @@ can adopt any of the detached mutable owners.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from pydantic import JsonValue
 
@@ -51,7 +53,7 @@ class MetadataPreparationRefused(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedMetadataToolCall:
+class PreparedMemoryToolCall:
     call_model: _CallModelOutcome
     context: ToolBatchContext
     runtime: RestoredContinuationRuntime
@@ -63,11 +65,21 @@ class PreparedMetadataToolCall:
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedMetadataToolCompletion:
-    prepared: PreparedMetadataToolCall
+class PreparedMetadataToolCall(PreparedMemoryToolCall):
+    """The original single metadata preparation, without SQL authority."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedMemoryToolCompletion:
+    prepared: PreparedMemoryToolCall
     result: ToolResult
     receipt: RetainedToolReceipt
     memory_completion_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedMetadataToolCompletion(PreparedMemoryToolCompletion):
+    prepared: PreparedMetadataToolCall
 
 
 async def prepare_metadata_tool_call(
@@ -77,6 +89,28 @@ async def prepare_metadata_tool_call(
     call_model: _CallModelOutcome,
     cancellation_requested: asyncio.Event,
 ) -> PreparedMetadataToolCall:
+    prepared = await prepare_memory_tool_call(
+        runtime=runtime,
+        original_runtime=original_runtime,
+        call_model=call_model,
+        cancellation_requested=cancellation_requested,
+        tool_name="set_metadata",
+        prepared_type=PreparedMetadataToolCall,
+    )
+    if type(prepared) is not PreparedMetadataToolCall:
+        raise AuditIntegrityError("metadata preparation replaced its nominal prepared value")
+    return prepared
+
+
+async def prepare_memory_tool_call(
+    *,
+    runtime: RestoredContinuationRuntime,
+    original_runtime: RestoredContinuationRuntime,
+    call_model: _CallModelOutcome,
+    cancellation_requested: asyncio.Event,
+    tool_name: Literal["set_metadata", "set_pipeline"],
+    prepared_type: type[PreparedMemoryToolCall],
+) -> PreparedMemoryToolCall:
     """Prepare on an independently restored graph before any SQL issue."""
     if type(runtime) is not RestoredContinuationRuntime or type(original_runtime) is not RestoredContinuationRuntime:
         raise TypeError("metadata preparation requires its actual runtime owners")
@@ -119,7 +153,8 @@ async def prepare_metadata_tool_call(
         or len(calls) != 1
         or calls != data.calls
         or calls[0] is not data.calls[0]
-        or calls[0].function.name != "set_metadata"
+        or calls[0].function.name != tool_name
+        or (tool_name == "set_pipeline" and type(runtime.source.policy) is not ContinuationAdmissionPolicyV4)
         or batch.phase != "call_ready"
         or batch.next_tool_index != 0
         or batch.current_call is not None
@@ -146,13 +181,50 @@ async def prepare_metadata_tool_call(
     if type(call.audit) is not DispatchAudit:
         raise AuditIntegrityError("metadata preparation lost its original live audit")
     portable = decode_prepared_batch_data(encoded, env_ref_names=runtime.env_ref_names).audit
-    return PreparedMetadataToolCall(call_model, ctx, runtime, call, encoded, call.audit, replace(call.audit), portable)
+    return prepared_type(call_model, ctx, runtime, call, encoded, call.audit, replace(call.audit), portable)
 
 
 async def complete_prepared_metadata_tool(prepared: PreparedMetadataToolCall) -> PreparedMetadataToolCompletion:
     """Compute and finish once, then fold only the bound detached graph."""
     if type(prepared) is not PreparedMetadataToolCall:
         raise TypeError("metadata completion requires its original prepared DATA")
+
+    async def compute() -> ToolResult:
+        data = prepared.runtime.graph.batch
+        if type(data) is not RestoredBatchData:
+            raise AuditIntegrityError("metadata completion lost its detached coupled batch")
+        call, ctx, batch = prepared.call, prepared.context, data.batch
+        candidate = await run_sync_in_worker(
+            prepare_set_metadata_result_value,
+            call.arguments,
+            call.pre_state,
+            ctx.policy_catalog,
+            plugin_snapshot=ctx.plugin_snapshot,
+            prior_validation=batch.last_validation,
+        )
+        candidate = await _finalize_completed_incremental_mutation(
+            candidate, call.pre_state, plugin_snapshot=ctx.plugin_snapshot, policy_catalog=ctx.policy_catalog
+        )
+        if (
+            not candidate.success
+            or candidate.updated_state.version != call.pre_version + 1
+            or (candidate.updated_state.sources and candidate.updated_state.outputs and interpretation_sites(candidate.updated_state))
+        ):
+            raise MetadataPreparationRefused("metadata result requires an unsupported result or runtime preflight tail")
+        return candidate
+
+    completed = await complete_prepared_memory_tool(prepared, compute=compute)
+    return PreparedMetadataToolCompletion(prepared, completed.result, completed.receipt, completed.memory_completion_json)
+
+
+async def complete_prepared_memory_tool(
+    prepared: PreparedMemoryToolCall, *, compute: Callable[[], Awaitable[ToolResult]]
+) -> PreparedMemoryToolCompletion:
+    """Complete only a closed nominal value-tool preparation on detached owners."""
+    from elspeth.web.composer.continuation_pipeline_preparation import PreparedPipelineToolCall
+
+    if type(prepared) not in (PreparedMetadataToolCall, PreparedPipelineToolCall):
+        raise TypeError("memory completion requires its original closed prepared DATA")
     data = prepared.runtime.graph.batch
     if type(data) is not RestoredBatchData:
         raise AuditIntegrityError("metadata completion lost its detached coupled batch")
@@ -179,29 +251,9 @@ async def complete_prepared_metadata_tool(prepared: PreparedMetadataToolCall) ->
     )
     if encode_restored_prepared_batch_data(comparison, env_ref_names=names) != prepared.prepared_batch_json:
         raise AuditIntegrityError("metadata completion changed its original detached prepared graph")
-    audit, arguments = call.audit, call.arguments
+    audit = call.audit
     before = len(ctx.recorder.invocations)
     batch.all_cache_hits = False
-
-    async def compute() -> ToolResult:
-        candidate = await run_sync_in_worker(
-            prepare_set_metadata_result_value,
-            arguments,
-            call.pre_state,
-            ctx.policy_catalog,
-            plugin_snapshot=ctx.plugin_snapshot,
-            prior_validation=batch.last_validation,
-        )
-        candidate = await _finalize_completed_incremental_mutation(
-            candidate, call.pre_state, plugin_snapshot=ctx.plugin_snapshot, policy_catalog=ctx.policy_catalog
-        )
-        if (
-            not candidate.success
-            or candidate.updated_state.version != call.pre_version + 1
-            or (candidate.updated_state.sources and candidate.updated_state.outputs and interpretation_sites(candidate.updated_state))
-        ):
-            raise MetadataPreparationRefused("metadata result requires an unsupported result or runtime preflight tail")
-        return candidate
 
     def version_after(result: object) -> int:
         if type(result) is not ToolResult:
@@ -209,7 +261,7 @@ async def complete_prepared_metadata_tool(prepared: PreparedMetadataToolCall) ->
         return result.updated_state.version
 
     def error_payload(error: ToolArgumentError) -> dict[str, JsonValue]:
-        payload = owned_json(arg_error_payload(error, "set_metadata"))
+        payload = owned_json(arg_error_payload(error, call.tool_name))
         if type(payload) is not dict:
             raise AuditIntegrityError("metadata argument failure lost its owned JSON payload")
         return payload
@@ -250,7 +302,7 @@ async def complete_prepared_metadata_tool(prepared: PreparedMetadataToolCall) ->
     batch.mutation_success_observed = record_completed_tool_anchor(
         result,
         tracker=ctx.anti_anchor,
-        tool_name="set_metadata",
+        tool_name=call.tool_name,
         arguments_hash=audit.arguments_hash,
         version_before=call.pre_version,
         mutation_success_observed=batch.mutation_success_observed,
@@ -263,10 +315,15 @@ async def complete_prepared_metadata_tool(prepared: PreparedMetadataToolCall) ->
     producers = ctx.message_producers
     if producers is None:
         raise AuditIntegrityError("metadata completion lost its original-source message producer")
-    producers.register_prepared_metadata_result_message(prepared=prepared, result=result, serialized=serialized)
+    if type(prepared) is PreparedMetadataToolCall:
+        producers.register_prepared_metadata_result_message(prepared=prepared, result=result, serialized=serialized)
+    elif type(prepared) is PreparedPipelineToolCall:
+        producers.register_prepared_pipeline_result_message(prepared=prepared, result=result, serialized=serialized)
+    else:
+        raise AuditIntegrityError("memory result replaced its original nominal preparation")
     batch.turn_has_mutation = True
     call.phase = "applied"
     batch.next_tool_index = 1
     batch.current_call = None
     batch.phase = "dispatch_ready"
-    return PreparedMetadataToolCompletion(prepared, result, receipt, memory_json)
+    return PreparedMemoryToolCompletion(prepared, result, receipt, memory_json)

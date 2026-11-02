@@ -3151,7 +3151,7 @@ async def test_actual_advisor_timeout_is_retained_feedback_without_primary_termi
         assert len(sdk) == 2
 
 
-def _actual_failure_driver(store, owner, running):
+def _actual_failure_driver(store, owner, running, *, drain_signal=None):
     import threading
 
     from starlette.applications import Starlette
@@ -3180,7 +3180,7 @@ def _actual_failure_driver(store, owner, running):
         compose_locks=_SessionComposeLockRegistry(),
         composer_operation_authority=store[2],
     )
-    draining = threading.Event()
+    draining = drain_signal.draining if drain_signal is not None else threading.Event()
     worker = ComposerAsyncWorker(
         app=Starlette(),
         authority=store[2],
@@ -3191,6 +3191,7 @@ def _actual_failure_driver(store, owner, running):
         owner_instance_id=store[3].session_operation_owner_instance_id,
         process_recovery=ProcessRecovery(watchdog=OwnedTestProcessWatchdog(draining), instance_draining=draining),
         instance_draining=draining,
+        drain_signal=drain_signal,
     )
     driver = _SegmentDriver(worker, services, running, owner.lease)
     driver.phases = owner

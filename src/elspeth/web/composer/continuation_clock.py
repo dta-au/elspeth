@@ -141,6 +141,9 @@ class ContinuationActionClock:
         self.started_monotonic = time.monotonic()
         self.preparation_deadline_monotonic = self.started_monotonic + policy.preparation
         self._seen: set[str] = set()
+        self._guard_complete = False
+        self._active_stage: ContinuationTimedStage | None = None
+        self._active_stage_deadline_monotonic: float | None = None
 
     def require_preparation_time(self, *, monotonic_now: float | None = None) -> None:
         now = time.monotonic() if monotonic_now is None else monotonic_now
@@ -155,8 +158,23 @@ class ContinuationActionClock:
         self.require_preparation_time()
         self._seen.add("preparation")
 
+    def require_active_quota_time(self, *, monotonic_now: float | None = None) -> None:
+        """Prove completed preparation and the original live quota/action bounds."""
+        now = time.monotonic() if monotonic_now is None else monotonic_now
+        if type(now) is not float or not math.isfinite(now):
+            raise ValueError("quota observation must be finite monotonic time")
+        if (
+            "preparation" not in self._seen
+            or (self.policy.guard is not None and not self._guard_complete)
+            or self._active_stage != "quota"
+            or self._active_stage_deadline_monotonic is None
+        ):
+            raise ValueError("quota admission requires completed preparation and its active stage")
+        if now > min(self.started_monotonic + self.policy.total, self._active_stage_deadline_monotonic):
+            raise TimeoutError("continuation quota or original action allowance expired")
+
     async def run[T](self, stage: ContinuationTimedStage, operation: Callable[[], Awaitable[T]]) -> T:
-        if stage in self._seen or "preparation" not in self._seen:
+        if stage in self._seen or "preparation" not in self._seen or self._active_stage is not None:
             raise ValueError("continuation action stage repeated or preparation unbound")
         match stage:
             case "guard":
@@ -170,10 +188,19 @@ class ContinuationActionClock:
         if seconds is None:
             raise ValueError("an inapplicable action stage cannot execute")
         self._seen.add(stage)
+        stage_started_monotonic = time.monotonic()
         deadline = min(self.deadline, asyncio.get_running_loop().time() + seconds)
-        with retention_stage_memo_scope() if stage == "retention" else without_retention_stage_memo():
-            async with asyncio.timeout_at(deadline) as timeout:
-                result = await operation()
-                if timeout.expired() or asyncio.get_running_loop().time() >= deadline:
-                    raise TimeoutError("continuation stage expired while its actual owner was joined")
-                return result
+        self._active_stage = stage
+        self._active_stage_deadline_monotonic = min(self.started_monotonic + self.policy.total, stage_started_monotonic + seconds)
+        try:
+            with retention_stage_memo_scope() if stage == "retention" else without_retention_stage_memo():
+                async with asyncio.timeout_at(deadline) as timeout:
+                    result = await operation()
+                    if timeout.expired() or asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError("continuation stage expired while its actual owner was joined")
+                    if stage == "guard":
+                        self._guard_complete = True
+                    return result
+        finally:
+            self._active_stage = None
+            self._active_stage_deadline_monotonic = None

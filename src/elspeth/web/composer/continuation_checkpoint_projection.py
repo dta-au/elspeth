@@ -13,6 +13,7 @@ from weakref import WeakKeyDictionary
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.prompt_guard import detach_prompt_guard_evidence
 from elspeth.web.composer.advisor_audit import AdvisorCheckpointPassRecord
 from elspeth.web.composer.advisor_checkpoint import (
     AdvisorCheckpointVerdict,
@@ -149,6 +150,8 @@ def _require_capture_witness(witness: ContinuationCaptureOverflowWitness) -> Non
 def _require_detached_source(detached: RestoredContinuationRuntime, original: RestoredContinuationRuntime) -> None:
     if type(detached) is not RestoredContinuationRuntime or type(original) is not RestoredContinuationRuntime:
         raise TypeError("checkpoint projection requires its actual restored runtime owners")
+    detached_messages = detach_prompt_guard_evidence(detached.live.llm_messages)
+    original_messages = detach_prompt_guard_evidence(original.live.llm_messages)
     if (
         type(detached.source.policy) is not ContinuationAdmissionPolicyV4
         or detached.source.selected != original.source.selected
@@ -157,7 +160,8 @@ def _require_detached_source(detached: RestoredContinuationRuntime, original: Re
         or detached.bindings.provider_owner is not original.bindings.provider_owner
         or detached.bindings.session_operation_context is not original.bindings.session_operation_context
         or canonical_json(detached.live.state.to_dict()) != canonical_json(original.live.state.to_dict())
-        or canonical_json(detached.live.llm_messages) != canonical_json(original.live.llm_messages)
+        or canonical_json(detached_messages.messages) != canonical_json(original_messages.messages)
+        or detached_messages != original_messages
         or detached.live.recorder.snapshot_for_continuation(drained=detached.drained)
         != original.live.recorder.snapshot_for_continuation(drained=original.drained)
     ):

@@ -12,7 +12,10 @@ from litellm.types.utils import ModelResponse
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _AdmittedToolBatch
+from elspeth.web.composer.continuation_codec import decode_continuation_response, encode_continuation_response
 from elspeth.web.composer.llm_response_parsing import (
+    PROVIDER_STRING_TRUNCATION_MARKER,
     admit_llm_provider_metadata,
     admit_v4_provider_result,
     build_llm_call_record,
@@ -21,9 +24,12 @@ from elspeth.web.composer.provider_result_admission import (
     V4ProviderResultIncomplete,
     V4ProviderSdkReturn,
     diagnostic_provider_metadata,
+    project_v4_provider_diagnostic_metadata,
+    require_issued_v4_incomplete,
+    require_retained_v4_provider_metadata_credentials,
     require_v4_provider_metadata_credentials,
 )
-from elspeth.web.credential_guard import CredentialMaterialRefused
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_in_llm_metadata
 
 
 def _response(*, reasoning="ordinary reasoning", details=None):
@@ -101,7 +107,13 @@ def test_full_private_identifiers_keep_existing_bounded_audit_projection():
         diagnostic.provider_request_id,
         diagnostic.finish_reason,
     )
-    assert len(call.model_returned) <= 256 and len(call.provider_request_id) <= 256 and len(call.finish_reason) <= 128
+    # The existing diagnostic bound caps the payload prefix; the explicit
+    # original-length marker follows it and is part of the stored evidence.
+    expected = tuple(
+        f"{original[:limit]}{PROVIDER_STRING_TRUNCATION_MARKER}{len(original)}>"
+        for original, limit in ((response.model, 256), (response.id, 256), (response.choices[0].finish_reason, 128))
+    )
+    assert (call.model_returned, call.provider_request_id, call.finish_reason) == expected
     assert call.reasoning_content == "<provider-artifact-unavailable>" and call.provider_cost == 0.125
 
 
@@ -191,3 +203,132 @@ def test_foreign_successful_return_cannot_admit_another_sdk_object():
             message=choice.message,
             sdk_return=V4ProviderSdkReturn("attempt-other", id(_response())),
         )
+
+
+def _cold_original():
+    response = _response(reasoning="r" * 300_000, details=[{"text": "d" * 70_000}])
+    response.id = "original-id" * 40
+    admitted = _admit(response)
+    complete = _AdmittedLLMCompletion(
+        admitted.message,
+        _AdmittedToolBatch(admitted.tool_calls, frozenset(call.id for call in admitted.tool_calls)),
+        admitted.metadata,
+    )
+    chunk = encode_continuation_response(complete)
+    assert chunk.reference.byte_length <= 1_048_576
+    return admitted, decode_continuation_response(chunk)
+
+
+def test_cold_diagnostic_projection_retains_full_private_data_without_minting_witness():
+    admitted, cold = _cold_original()
+    private = cold.provider_metadata
+    assert private.v4_completeness is None
+    assert private.reasoning_content == "r" * 300_000
+    assert deep_thaw(private.reasoning_details) == [{"text": "d" * 70_000}]
+    assert diagnostic_provider_metadata(private) is private
+    projected = project_v4_provider_diagnostic_metadata(private)
+    assert projected == diagnostic_provider_metadata(admitted.metadata)
+    assert projected.v4_completeness is None and private.v4_completeness is None
+    assert private.reasoning_content == "r" * 300_000 and len(private.provider_request_id) > 256
+    with pytest.raises(AuditIntegrityError, match="original issued"):
+        admitted.metadata.v4_completeness.require_metadata(projected)
+
+
+def test_cold_provider_validation_does_not_widen_generic_metadata_guard():
+    _admitted, cold = _cold_original()
+    metadata = cold.provider_metadata
+    with pytest.raises(CredentialMaterialRefused) as generic:
+        require_no_credential_material_in_llm_metadata(
+            content=cold.message.content,
+            tool_calls=(),
+            reasoning_content=metadata.reasoning_content,
+            reasoning_details=metadata.reasoning_details,
+            thinking_blocks=metadata.thinking_blocks,
+            model_returned=metadata.model_returned,
+            provider_request_id=metadata.provider_request_id,
+            finish_reason=metadata.finish_reason,
+            provider_served=metadata.provider_served,
+            surface="test-generic-metadata",
+        )
+    assert generic.value.finding.category == "traversal_limit"
+    require_retained_v4_provider_metadata_credentials(cold, surface="test-v4-retained")
+    assert metadata.v4_completeness is None
+
+
+@pytest.mark.parametrize("mutation", ["credential", "private-limit"])
+def test_cold_provider_validation_rechecks_original_fields_and_unchanged_limit(mutation):
+    _admitted, cold = _cold_original()
+    changed = "ordinary " * 34_000 + "password=" + "original-secret" if mutation == "credential" else "r" * 1_048_577
+    substituted = replace(cold, provider_metadata=replace(cold.provider_metadata, reasoning_content=changed))
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_retained_v4_provider_metadata_credentials(substituted, surface="test-v4-retained")
+    # Pattern names are internal diagnostics; the public detector maps both
+    # connection-password and credential-assignment matches to token_shape.
+    assert caught.value.finding.category == ("token_shape" if mutation == "credential" else "traversal_limit")
+    assert caught.value.finding.location == ("mapping_value" if mutation == "credential" else "traversal_boundary")
+    if mutation == "credential":
+        neutral = changed.replace("password=", "ordinary=")
+        assert len(neutral) == len(changed)
+        ordinary = replace(cold, provider_metadata=replace(cold.provider_metadata, reasoning_content=neutral))
+        require_retained_v4_provider_metadata_credentials(ordinary, surface="test-v4-retained")
+    assert substituted.provider_metadata.v4_completeness is None
+
+
+def _issued_incomplete():
+    response = _response()
+    response.choices[0].message.reasoning_details = object()
+    with pytest.raises(V4ProviderResultIncomplete) as caught:
+        _admit(response)
+    return caught.value
+
+
+def test_original_parser_incomplete_has_issued_loss_and_accounting_proof():
+    incomplete = _issued_incomplete()
+    require_issued_v4_incomplete(incomplete, sdk_return=incomplete.sdk_return)
+    assert incomplete.losses[0].reason == "unsupported"
+    assert incomplete.metadata.provider_cost == 0.125
+    assert incomplete.metadata.usage.completion_tokens == 4
+
+
+@pytest.mark.parametrize("forgery", ["field-copy", "invented-loss"])
+def test_nominal_incomplete_cannot_borrow_original_sdk_return(forgery):
+    original = _issued_incomplete()
+    losses = original.losses if forgery == "field-copy" else (replace(original.losses[0], reason="invalid_type"),)
+    fabricated = V4ProviderResultIncomplete(sdk_return=original.sdk_return, metadata=original.metadata, losses=losses)
+    assert fabricated is not original and fabricated.sdk_return is original.sdk_return
+    with pytest.raises(AuditIntegrityError, match="original parser issuance"):
+        require_issued_v4_incomplete(fabricated, sdk_return=original.sdk_return)
+    require_issued_v4_incomplete(original, sdk_return=original.sdk_return)
+
+
+@pytest.mark.parametrize("mutation", ["loss-tuple", "loss-field", "sdk-copy", "sdk-field", "metadata-copy", "cost", "usage", "json"])
+def test_parser_incomplete_proof_rejects_changed_original_fields(mutation):
+    original = _issued_incomplete()
+    returned = original.sdk_return
+    if mutation == "loss-tuple":
+        captured_losses = original.losses
+        original.losses = (*captured_losses,)
+        assert original.losses == captured_losses and original.losses is not captured_losses
+    elif mutation == "loss-field":
+        object.__setattr__(original.losses[0], "reason", "invalid_type")
+    elif mutation == "sdk-copy":
+        original.sdk_return = replace(returned)
+    elif mutation == "sdk-field":
+        object.__setattr__(returned, "attempt_id", "changed-attempt")
+    elif mutation == "metadata-copy":
+        original.metadata = replace(original.metadata)
+    elif mutation == "cost":
+        object.__setattr__(original.metadata, "provider_cost", 0.0)
+    elif mutation == "usage":
+        object.__setattr__(original.metadata.usage, "completion_tokens", 99)
+    else:
+        object.__setattr__(original.metadata, "reasoning_details", {"text": "substituted"})
+    with pytest.raises(AuditIntegrityError, match="original parser-issued DATA"):
+        require_issued_v4_incomplete(original, sdk_return=returned)
+
+
+def test_parser_incomplete_proof_requires_same_custody_return_object():
+    original = _issued_incomplete()
+    with pytest.raises(AuditIntegrityError, match="original parser-issued DATA"):
+        require_issued_v4_incomplete(original, sdk_return=replace(original.sdk_return))
+    require_issued_v4_incomplete(original, sdk_return=original.sdk_return)

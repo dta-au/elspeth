@@ -164,6 +164,7 @@ async def test_paid_title_application_preserves_original_result_and_applies_exac
         assert after.model_copy(update={"cursor": before.cursor, "frames": before.frames}) == before
         assert published.selected.cursor == settled.selected.cursor + 1
         assert published.result == original.result and len(sdk) == len(calls) == 1
+        assert published.finish_reason == calls[0].finish_reason
         decoded = decode_title_provider_result(published.result, env_ref_names=published.inventory.names)
         assert decoded.audit_call == calls[0] and decoded.completion.message.content == content
         assert (await operation_store[3].get_session(operation_store[4])).title == (
@@ -176,8 +177,11 @@ async def test_paid_title_application_preserves_original_result_and_applies_exac
         assert ledger[0].entry_id == published.event.ledger_entry_id
         assert published.event.decision == published.decision
         assert len(rejections) == (1 if disposition == "rejected" else 0)
+        if rejections:
+            assert rejections[0][1] == published.finish_reason
         await actual_title_update(operation_store, running, work, "Later Legitimate Owner Rename")
         current_ready = await application.read_current_title_application(service=service, running=running, required_work=work)
+        assert current_ready.finish_reason == published.finish_reason
         untouched = recovery_rows(operation_store[0])
         replay_request = owner.TitleApplicationRequest(
             running, current_ready.selected, current_ready.inventory, current_ready.result, current_ready.decision

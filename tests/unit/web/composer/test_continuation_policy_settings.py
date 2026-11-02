@@ -32,7 +32,7 @@ _PROVIDER_ROLES = ("primary", "advisor", "title")
 
 # Design §4.4 production defaults: (preparation, guard, quota, physical, retention).
 _DESIGN_DEFAULTS: dict[str, tuple[float, float | None, float | None, float, float]] = {
-    "primary": (5.0, 15.0, 10.0, 240.0, 5.0),
+    "primary": (15.0, 15.0, 10.0, 240.0, 5.0),
     "advisor": (5.0, 15.0, 10.0, 60.0, 5.0),
     "title": (5.0, 15.0, 10.0, 30.0, 5.0),
     "read": (5.0, None, None, 10.0, 5.0),
@@ -96,9 +96,12 @@ def test_every_action_bound_setting_changes_the_policy(role: str, stage: str) ->
     if stage not in role_settings:
         pytest.skip(f"{role}.{stage} is derived or absent, not an operator setting")
     default = role_settings[stage]
-    changed = _policy(composer_continuation_action_bounds=_bounds_with(role, stage, default + 1.0))
+    changed = _policy(
+        composer_continuation_action_bounds=_bounds_with(role, stage, default + 1.0),
+        composer_continuation_segment_nominal_seconds=500.0,
+    )
     assert changed.actions.model_dump()[role][stage] == default + 1.0
-    assert changed != _policy()
+    assert changed != _policy(composer_continuation_segment_nominal_seconds=500.0)
 
 
 def test_advisor_physical_maps_from_composer_advisor_timeout() -> None:
@@ -158,6 +161,7 @@ def test_action_bounds_read_from_one_json_environment_object(monkeypatch: pytest
         "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "85",
         "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
         "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": "0" * 64,
+        "ELSPETH_WEB__COMPOSER_CONTINUATION_SEGMENT_NOMINAL_SECONDS": "430",
         "ELSPETH_WEB__COMPOSER_CONTINUATION_ACTION_BOUNDS": json.dumps(_bounds_with("session_sql", "retention", 7.5)),
     }.items():
         monkeypatch.setenv(key, value)
@@ -189,20 +193,20 @@ def test_policy_decode_refuses_missing_unknown_added_and_removed_fields(mutate: 
 
 
 def test_v1_policy_golden_bytes_and_hash_are_pinned() -> None:
-    current = _policy()
-    policy = ContinuationAdmissionPolicy(segment=current.segment, actions=current.actions)
+    historical = _policy(composer_continuation_action_bounds=_bounds_with("primary", "preparation", 5.0))
+    policy = ContinuationAdmissionPolicy(segment=historical.segment, actions=historical.actions)
     assert policy.schema_version == CONTINUATION_POLICY_SCHEMA_VERSION
-    # Pinned v1 encoding and identity of the production defaults. A change here
-    # is a new policy identity for every admitted operation: re-pin deliberately.
+    # Pinned historical V1 bytes remain readable after new admission defaults
+    # change; they are not reconstructed from the current PRIMARY default.
     assert policy.model_dump_json() == _GOLDEN_V1_ENCODING
     assert policy.policy_hash == "803319d4e1e6e84da9d4e609dd5743c2b6a88bde6433b9f09f38252a65f325c1"
 
 
 def test_first_segment_must_fit_title_initialization_and_the_first_primary() -> None:
-    # 275 PRIMARY + 25 reserve + 65 TITLE + 3 x 15 session SQL = 410 s.
-    assert _policy(composer_continuation_segment_nominal_seconds=410.0).segment.nominal == 410.0
+    # 285 PRIMARY + 25 reserve + 65 TITLE + 3 x 15 session SQL = 420 s.
+    assert _policy(composer_continuation_segment_nominal_seconds=420.0).segment.nominal == 420.0
     with pytest.raises(ValueError, match="must cover the first segment"):
-        _policy(composer_continuation_segment_nominal_seconds=409.0)
+        _policy(composer_continuation_segment_nominal_seconds=419.0)
 
 
 @pytest.mark.parametrize("field", ("composer_continuation_segment_nominal_seconds", "composer_continuation_quantum_seconds"))

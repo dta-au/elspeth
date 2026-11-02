@@ -136,6 +136,7 @@ type ComposerOperationPublicFailureType = Literal[
     "secret_decryption_failed",
     "composer_admission_refused",
     "paid_result_overflow",
+    "paid_result_incomplete",
 ]
 COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
     (
@@ -153,6 +154,7 @@ COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
         "secret_decryption_failed",
         "composer_admission_refused",
         "paid_result_overflow",
+        "paid_result_incomplete",
     )
 )
 

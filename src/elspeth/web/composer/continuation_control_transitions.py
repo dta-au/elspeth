@@ -378,12 +378,28 @@ def _checkpoint_payload(
     ).one_or_none()
     if row is None or row.tag != "checkpoint":
         raise AuditIntegrityError("control source lost its actual checkpoint event")
-    value, error = parse_json_strict(
-        read_chunk(
-            conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, key=row.payload_chunk_key
-        ).decode("utf-8")
-    )
-    if error is not None or type(value) is not dict or "owner" not in value:
+    payload_json = read_chunk(
+        conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, key=row.payload_chunk_key
+    ).decode("utf-8")
+    return _closed_control_payload(payload_json, invalid_message=invalid_message, expected_completion=expected_completion)
+
+
+def _closed_control_payload(
+    payload_json: str, *, invalid_message: str, expected_completion: bool
+) -> _ControlIntentPayload | _ControlCompletionPayload | None:
+    """Parse the complete closed event and classify it before control validation."""
+    value, error = parse_json_strict(payload_json)
+    if error is not None or type(value) is not dict:
+        raise AuditIntegrityError("control checkpoint lost its complete closed payload")
+    # A completed semantic PRIMARY or read can leave Compose action_ready at an
+    # ordinary checkpoint. Neither is a control completion. Only these owned
+    # checkpoint kinds may bypass the control parser; a claimed or malformed
+    # control completion still fails closed.
+    if expected_completion and value.get("kind") in ("semantic_primary_ready", "semantic_read_applied"):
+        if "owner" in value:
+            raise AuditIntegrityError(invalid_message)
+        return None
+    if "owner" not in value:
         raise AuditIntegrityError("control checkpoint lost its complete closed payload")
     if expected_completion and value["owner"] != "composer_control_completion":
         return None

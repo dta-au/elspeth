@@ -2024,7 +2024,7 @@ def test_postgres_runs_check_drift_refuses_current_epoch_without_rewriting_schem
         checks_before = Counter((check["name"], check["sqltext"]) for check in inspect(conn).get_check_constraints("runs"))
         identity_before = conn.execute(select(session_schema_identity_table)).all()
         rows_before = run_rows(conn)
-        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 84
+        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 85
     assert probe_session_schema(postgres_engine) is SchemaState.STALE
     with pytest.raises(SessionSchemaError) as raised:
         init_session_schema(postgres_engine)
@@ -2047,10 +2047,22 @@ def test_postgres_runs_check_reflection_is_current_idempotent_and_identity_bound
     with postgres_engine.connect() as conn:
         identity_before = conn.execute(select(session_schema_identity_table)).all()
         rows_before = run_rows(conn)
-        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 84
+        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 85
     init_session_schema(postgres_engine)
     with postgres_engine.connect() as conn:
         assert conn.execute(select(session_schema_identity_table)).all() == identity_before
         assert run_rows(conn) == rows_before
     reflected = inspect(postgres_engine).get_check_constraints("runs")
     assert Counter(check["name"] for check in reflected) == Counter(RUN_CHECK_NAMES), reflected
+
+
+def test_postgres_effect_checks_require_paid_incomplete_receipt_and_current_epoch(postgres_engine: Engine) -> None:
+    init_session_schema(postgres_engine)
+    checks = {check["name"]: check["sqltext"] for check in inspect(postgres_engine).get_check_constraints("composer_continuation_effects")}
+    assert "paid_incomplete" in checks["ck_composer_effects_disposition"]
+    assert "paid_incomplete" in checks["ck_composer_effects_receipt"]
+    assert "receipt_key IS NOT NULL" in checks["ck_composer_effects_receipt"]
+    assert "result_chunk_key IS NOT NULL" in checks["ck_composer_effects_receipt"]
+    assert "provider_attempt_id IS NOT NULL" in checks["ck_composer_effects_paid_incomplete_original_attempt"]
+    with postgres_engine.connect() as conn:
+        assert conn.execute(select(session_schema_identity_table.c.schema_epoch)).scalar_one() == SESSION_SCHEMA_EPOCH == 85

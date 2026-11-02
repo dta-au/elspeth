@@ -33,11 +33,17 @@ from elspeth.web.sessions.continuation_retained_capacity import (
     _require_hold_fields,
     read_bounded_retained_chunk,
 )
+from elspeth.web.sessions.continuation_title_no_sdk_tail import prepare_title_no_sdk_tail_plan
+from elspeth.web.sessions.continuation_title_paid_incomplete_tail import (
+    prepare_title_paid_incomplete_tail_plan,
+    title_combined_terminal_hold_contract,
+)
 from elspeth.web.sessions.continuation_title_paid_overflow_source import require_original_v4_title_physical_source_on_connection
 from elspeth.web.sessions.continuation_title_paid_overflow_tail import (
     build_title_paid_overflow_tail_batch,
     prepare_title_paid_overflow_tail_plan,
 )
+from elspeth.web.sessions.continuation_title_terminal_public_audit import require_title_terminal_public_audit_on_connection
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -183,7 +189,7 @@ def read_v4_title_paid_overflow_terminal_on_connection(
         or physical_row.settled_at is None
     ):
         raise AuditIntegrityError("TITLE paid overflow changed its original effect/physical/hold binding")
-    require_original_v4_title_physical_source_on_connection(
+    requested_model = require_original_v4_title_physical_source_on_connection(
         conn, source=source, descriptor=descriptor, effect=effect, physical=physical_row, parent=parent
     )
     identity = PaidOverflowIdentity(
@@ -203,7 +209,14 @@ def read_v4_title_paid_overflow_terminal_on_connection(
     receipt_bytes = _bounded_bytes(conn, source, effect.result_chunk_key, "composer.paid-overflow.v1")
     receipt = decode_paid_overflow_receipt(receipt_bytes.decode("utf-8", errors="strict"), expected=identity)
     plan = prepare_title_paid_overflow_tail_plan(identity=identity, admitted=admitted, creator_sequence=source.creator_sequence)
-    if source.reserved_bytes != plan.reserved_bytes or source.fallback_contract_sha256 != plan.fallback_contract_sha256:
+    incomplete_plan = prepare_title_paid_incomplete_tail_plan(
+        identity=identity, admitted=admitted, creator_sequence=source.creator_sequence
+    )
+    no_sdk_plan = prepare_title_no_sdk_tail_plan(
+        identity=identity, admitted=admitted, creator_sequence=source.creator_sequence, requested_model=effect.requested_model
+    )
+    reserved_bytes, contract_sha256 = title_combined_terminal_hold_contract(plan, incomplete_plan, no_sdk_plan)
+    if source.reserved_bytes != reserved_bytes or source.fallback_contract_sha256 != contract_sha256:
         raise AuditIntegrityError("TITLE paid overflow changed its original predispatch terminal hold")
     batch = build_title_paid_overflow_tail_batch(plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))
     if (
@@ -270,6 +283,17 @@ def read_v4_title_paid_overflow_terminal_on_connection(
         or restore_utc(physical_row.settled_at) < restore_utc(entry.recorded_at)
     ):
         raise AuditIntegrityError("TITLE paid overflow lost its original settled quota ledger")
+    require_title_terminal_public_audit_on_connection(
+        conn,
+        source=source,
+        descriptor=descriptor,
+        attempt_id=identity.attempt_id,
+        requested_model=requested_model,
+        physical_started_at=restore_utc(physical_row.started_at),
+        physical_settled_at=restore_utc(physical_row.settled_at),
+        response_finished_at=restore_utc(effect.response_finished_at),
+        receipt=receipt,
+    )
     segment = conn.execute(
         select(segments).where(
             segments.c.session_id == sid, segments.c.operation_id == operation_id, segments.c.sequence == source.creator_sequence

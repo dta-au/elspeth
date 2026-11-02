@@ -15,6 +15,10 @@ from elspeth.web.sessions.continuation import PreparedContinuationProvider, load
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
 from elspeth.web.sessions.continuation_retained_capacity import _require_historical_hold_source, _require_hold_fields
 from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission, _descriptor_data, _effect_data
+from elspeth.web.sessions.continuation_semantic_paid_incomplete_tail import (
+    prepare_semantic_paid_incomplete_tail_plan,
+    semantic_combined_terminal_hold_contract,
+)
 from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import prepare_semantic_no_sdk_tail_plan
 from elspeth.web.sessions.continuation_semantic_paid_overflow_tail import prepare_semantic_paid_overflow_tail_plan
 from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import _stored_hold_source
@@ -156,18 +160,11 @@ def read_v4_semantic_admission_on_connection(
         creator_sequence=source.creator_sequence,
         creator_generation=source.creator_generation,
     )
-    reserved = max(paid_tail.reserved_bytes, no_sdk_tail.reserved_bytes)
-    combined_hash = sha256(
-        canonical_json(
-            {
-                "version": "composer.semantic-v4-combined-tail.v1",
-                "paid": paid_tail.fallback_contract_sha256,
-                "no_sdk": no_sdk_tail.contract_sha256,
-                "reserved_bytes": reserved,
-            }
-        ).encode("utf-8")
-    ).hexdigest()
+    incomplete_tail = prepare_semantic_paid_incomplete_tail_plan(
+        identity=paid_tail.identity, admitted=candidate, creator_sequence=source.creator_sequence
+    )
+    reserved, combined_hash = semantic_combined_terminal_hold_contract(paid_tail, incomplete_tail, no_sdk_tail)
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("V4 semantic cold admission changed its original combined fallback")
     attempt = ProviderAttempt(effect.provider_attempt_id, restore_utc(attempt_row.started_at))
-    return V4SemanticProviderAdmission(attempt, candidate, source, paid_tail, no_sdk_tail)
+    return V4SemanticProviderAdmission(attempt, candidate, source, paid_tail, incomplete_tail, no_sdk_tail)

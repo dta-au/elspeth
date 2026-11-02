@@ -275,6 +275,25 @@ def validate_tool_effects_data_on_connection(
     ).all()
     unresolved: list[str] = []
     for effect in rows:
+        if (
+            effect.disposition == "refused"
+            and type(decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash))
+            is ContinuationAdmissionPolicyV4
+        ):
+            from elspeth.web.sessions.continuation_value_batch_refusal import read_value_batch_preparation_refusal_on_connection
+
+            refusal = read_value_batch_preparation_refusal_on_connection(
+                conn, session_id=session_id, operation_id=operation_id, effect_key=effect.effect_key, env_ref_names=env_ref_names
+            )
+            read_committed_primary_response_data_on_connection(
+                conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=refusal.response
+            )
+            frontier = tuple(entry for entry in selected.stack.effect_frontier if entry.effect_id == effect.effect_key)
+            if refusal.cursor > selected.stack.cursor or frontier != (
+                EffectFrontierEntry(effect_id=effect.effect_key, disposition="refused", receipt_id=effect.receipt_key),
+            ):
+                raise AuditIntegrityError("value preparation refusal changed its selected original frontier")
+            continue
         issue = read_tool_issue_data_on_connection(
             conn, session_id=session_id, operation_id=operation_id, effect_key=effect.effect_key, env_ref_names=env_ref_names
         )
@@ -541,6 +560,48 @@ def require_completed_runtime_prefix_on_connection(
             continue
         if effect.effect_key != native_key or effect.owner != "tool_dispatch":
             raise AuditIntegrityError("runtime native prefix lost its actual issued source")
+        if (
+            effect.disposition == "refused"
+            and type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is ContinuationAdmissionPolicyV4
+        ):
+            from elspeth.web.sessions.continuation_value_batch_refusal import read_value_batch_preparation_refusal_on_connection
+
+            refusal = read_value_batch_preparation_refusal_on_connection(
+                conn,
+                session_id=running.claim.session_id,
+                operation_id=running.claim.operation_id,
+                effect_key=native_key,
+                env_ref_names=env_ref_names,
+            )
+            refused_result = decode_coupled_batch_chunk(
+                PrivateChunk(
+                    refusal.result,
+                    read_chunk(
+                        conn,
+                        session_id=root.logical.session_id,
+                        operation_id=root.logical.operation_id,
+                        key=f"value:{refusal.result.codec}:{refusal.result.digest}",
+                    ).decode("utf-8", errors="strict"),
+                ),
+                env_ref_names=env_ref_names,
+            )
+            fence = running.session_operation_context.fence
+            # This complete value tail is atomic. A preparation refusal cannot
+            # survive as a partially published prefix owed by a later creator.
+            if (
+                (refusal.sequence, refusal.generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
+                or (refusal.creator_operation_id, refusal.creator_operation_epoch) != (fence.operation_id, fence.operation_epoch)
+                or refusal.tool_call_id != outcome.call.id
+                or refusal.tool_index != index
+                or refusal.response != frame.response
+                or refusal.cursor > root.cursor
+                or native_key not in frame.settled_effect_ids
+                or refused_result.calls != data.calls
+                or refused_result.batch.tool_outcomes != data.batch.tool_outcomes[: index + 1]
+            ):
+                raise AuditIntegrityError("runtime value preparation refusal changed its original creator or completed call")
+            keys.append(native_key)
+            continue
         issue = read_tool_issue_source_on_connection(conn, running, effect_key=native_key, env_ref_names=env_ref_names)
         require_same_sequence_issue_history_on_connection(conn, running, selected=selected, issue=issue)
         if (

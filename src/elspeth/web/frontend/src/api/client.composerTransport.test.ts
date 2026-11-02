@@ -121,3 +121,15 @@ describe("one composer lifecycle on the wire", () => {
     await expect(fetchActiveComposerOperation(sid)).rejects.toThrow("Unexpected or missing field");
   });
 });
+
+
+describe("paid incomplete public error projection", () => {
+  it("preserves exact decimal cost without inferring a currency or rounding", () => {
+    for (const cost of [{ status: "known", amount: "0.0012300" }, { status: "unknown", amount: null }]) {
+      const body = { error_type: "paid_result_incomplete", detail: "The returned paid result could not be fully retained. It was not used or retried.", evidence_status: "incomplete", retryable: false, cost, request_id: null };
+      expect(apiErrorFromBody(507, body).paid_result_incomplete_cost).toEqual(cost);
+      expect(() => apiErrorFromBody(500, body)).toThrow();
+      expect(() => apiErrorFromBody(507, { ...body, partial_state: null })).toThrow();
+    }
+  });
+});

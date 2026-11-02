@@ -97,6 +97,26 @@ def test_paid_overflow_frontier_is_v4_only_and_never_handoff_safe():
     assert not restored.is_handoff_safe
 
 
+def test_paid_incomplete_frontier_is_v4_only_and_never_handoff_safe():
+    original = initial_stack()
+    incomplete = EffectFrontierEntry(effect_id="provider:3:0", disposition="paid_incomplete", receipt_id="paid-incomplete:receipt")
+    with pytest.raises(AuditIntegrityError):
+        decode_continuation_snapshot(encode_continuation_snapshot(original.model_copy(update={"effect_frontier": (incomplete,)})))
+
+    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=4096))
+    assert policy is not None
+    v4 = original.model_copy(
+        update={
+            "policy_hash": policy.policy_hash,
+            "admission_policy_json": policy.model_dump_json(),
+            "effect_frontier": (incomplete,),
+        }
+    )
+    restored = decode_continuation_snapshot(encode_continuation_snapshot(v4))
+    assert restored.effect_frontier == (incomplete,)
+    assert not restored.is_handoff_safe
+
+
 @pytest.mark.parametrize("field,value", [("schema_version", "future"), ("cursor", True), ("extra", "ignored")])
 def test_unknown_or_mistyped_storage_is_integrity_failure(field, value):
     data = json.loads(encode_continuation_snapshot(initial_stack()))
@@ -369,7 +389,7 @@ def test_seed_entrypoints_admit_complete_original_before_snapshot_work(monkeypat
     actual = decode_continuation_snapshot(before)
     assert actual.logical.request_hash == clean_hash
     assert actual.mutation_ceiling.initial_trust_mode == "explicit_approve"
-    assert actual.provider_cost_policy.applicability == "not_applicable"
+    assert actual.provider_cost_policy.applicability == "continuation_v2"
     assert actual.frames[0].request_json == clean_json
     assert actual.frames[0].ingress_phase == "reserved"
     assert clean_seed.action_json == policy.actions.session_sql.model_dump_json()

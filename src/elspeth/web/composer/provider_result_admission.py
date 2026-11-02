@@ -10,7 +10,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
-from weakref import WeakValueDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from pydantic import JsonValue
 
@@ -20,6 +20,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import (
         _AdmittedAssistantMessage,
+        _AdmittedLLMCompletion,
         _AdmittedLLMProviderMetadata,
         _AdmittedToolCall,
     )
@@ -89,7 +90,7 @@ class V4ProviderResultCompleteness:
     def require_result(
         self, metadata: _AdmittedLLMProviderMetadata, *, content: str | None, tool_calls: tuple[_AdmittedToolCall, ...]
     ) -> None:
-        from elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall
+        from elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _AdmittedToolFunction
 
         self.require_metadata(metadata)
         if (content is not None and type(content) is not str) or content != self.content or type(tool_calls) is not tuple:
@@ -98,7 +99,8 @@ class V4ProviderResultCompleteness:
             raise AuditIntegrityError("V4 result changed its original selected tool batch")
         for actual, original in zip(tool_calls, self.tool_calls, strict=True):
             if (
-                type(actual.id) is not str
+                type(actual.function) is not _AdmittedToolFunction
+                or type(actual.id) is not str
                 or type(actual.function.name) is not str
                 or type(actual.function.arguments) is not str
                 or (actual.id, actual.function.name, actual.function.arguments)
@@ -123,6 +125,8 @@ class V4ProviderResultAdmission:
 class V4ProviderResultIncomplete(Exception):
     """One original returned paid result has unavailable mandatory evidence."""
 
+    __slots__ = ("__weakref__",)
+
     def __init__(
         self, *, sdk_return: V4ProviderSdkReturn, metadata: _AdmittedLLMProviderMetadata, losses: tuple[V4ProviderResultLoss, ...]
     ) -> None:
@@ -132,6 +136,124 @@ class V4ProviderResultIncomplete(Exception):
         self.sdk_return = sdk_return
         self.metadata = metadata
         self.losses = losses
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuedIncomplete:
+    sdk_return: V4ProviderSdkReturn
+    sdk_facts: tuple[str, int]
+    metadata: _AdmittedLLMProviderMetadata = field(repr=False)
+    metadata_atoms: tuple[object, ...] = field(repr=False)
+    reasoning_details: object = field(repr=False)
+    thinking_blocks: object = field(repr=False)
+    losses: tuple[V4ProviderResultLoss, ...]
+    loss_facts: tuple[tuple[str, str, int | None], ...]
+
+
+# The exception itself is the weak key: neither copied state nor a reused
+# numeric object ID can borrow another parser issuance. Values retain only
+# its bounded immutable DATA, never the SDK response or exception/traceback.
+_ISSUED_INCOMPLETE: WeakKeyDictionary[V4ProviderResultIncomplete, _IssuedIncomplete] = WeakKeyDictionary()
+
+
+def _incomplete_metadata_atoms(metadata: _AdmittedLLMProviderMetadata) -> tuple[object, ...]:
+    from elspeth.contracts.token_usage import TokenUsage
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
+
+    if type(metadata) is not _AdmittedLLMProviderMetadata or metadata.v4_completeness is not None or type(metadata.usage) is not TokenUsage:
+        raise AuditIntegrityError("V4 incomplete result changed its original diagnostic metadata")
+    text = (
+        metadata.model_returned,
+        metadata.provider_request_id,
+        metadata.finish_reason,
+        metadata.reasoning_content,
+        metadata.provider_served,
+    )
+    usage = metadata.usage
+    counts = (
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.reported_total,
+        usage.cached_prompt_tokens,
+        usage.cache_creation_input_tokens,
+        usage.cache_read_input_tokens,
+        usage.reasoning_tokens,
+    )
+    cost = metadata.provider_cost
+    cost_source = cast(object, metadata.provider_cost_source)
+    if (
+        any(value is not None and type(value) is not str for value in text)
+        or any(value is not None and (type(value) is not int or value < 0) for value in counts)
+        or (cost is not None and type(cost) not in (int, float))
+        or (type(cost) is float and not math.isfinite(cost))
+        or type(cost_source) is not str
+    ):
+        raise AuditIntegrityError("V4 incomplete result changed its original accounting fields")
+    return (*text, type(cost), cost, cost_source, *counts)
+
+
+def _incomplete_loss_facts(losses: tuple[V4ProviderResultLoss, ...]) -> tuple[tuple[str, str, int | None], ...]:
+    if type(losses) is not tuple or not losses:
+        raise AuditIntegrityError("V4 incomplete result changed its original loss observations")
+    facts = []
+    for loss in losses:
+        field_value = cast(object, loss.field)
+        reason = cast(object, loss.reason)
+        if (
+            type(loss) is not V4ProviderResultLoss
+            or type(field_value) is not str
+            or type(reason) is not str
+            or (loss.scalar_utf8_bytes is not None and type(loss.scalar_utf8_bytes) is not int)
+        ):
+            raise AuditIntegrityError("V4 incomplete result changed its original loss fields")
+        facts.append((field_value, reason, loss.scalar_utf8_bytes))
+    return tuple(facts)
+
+
+def _issue_v4_incomplete(
+    *, sdk_return: V4ProviderSdkReturn, metadata: _AdmittedLLMProviderMetadata, losses: tuple[V4ProviderResultLoss, ...]
+) -> V4ProviderResultIncomplete:
+    incomplete = V4ProviderResultIncomplete(sdk_return=sdk_return, metadata=metadata, losses=losses)
+    _ISSUED_INCOMPLETE[incomplete] = _IssuedIncomplete(
+        sdk_return,
+        (sdk_return.attempt_id, sdk_return.response_identity),
+        metadata,
+        _incomplete_metadata_atoms(metadata),
+        metadata.reasoning_details,
+        metadata.thinking_blocks,
+        losses,
+        _incomplete_loss_facts(losses),
+    )
+    return incomplete
+
+
+def require_issued_v4_incomplete(incomplete: V4ProviderResultIncomplete, *, sdk_return: V4ProviderSdkReturn | None = None) -> None:
+    """Require exact parser-issued loss DATA before independent SQL custody proof.
+
+    The SQL owner still proves its actual attempt/H/fence/audit and terminal
+    disposition. This check creates no SDK origin or settlement authority.
+    """
+    if type(incomplete) is not V4ProviderResultIncomplete:
+        raise AuditIntegrityError("V4 incomplete result is not its original parser issuance")
+    issued = _ISSUED_INCOMPLETE.get(incomplete)
+    if issued is None:
+        raise AuditIntegrityError("V4 incomplete result is not its original parser issuance")
+    actual = incomplete.sdk_return
+    if (
+        type(actual) is not V4ProviderSdkReturn
+        or actual is not issued.sdk_return
+        or (sdk_return is not None and actual is not sdk_return)
+        or type(actual.attempt_id) is not str
+        or type(actual.response_identity) is not int
+        or (actual.attempt_id, actual.response_identity) != issued.sdk_facts
+        or incomplete.metadata is not issued.metadata
+        or _incomplete_metadata_atoms(incomplete.metadata) != issued.metadata_atoms
+        or incomplete.metadata.reasoning_details is not issued.reasoning_details
+        or incomplete.metadata.thinking_blocks is not issued.thinking_blocks
+        or incomplete.losses is not issued.losses
+        or _incomplete_loss_facts(incomplete.losses) != issued.loss_facts
+    ):
+        raise AuditIntegrityError("V4 incomplete result changed its original parser-issued DATA")
 
 
 class _Unavailable(Exception):
@@ -225,6 +347,48 @@ def diagnostic_provider_metadata(metadata: _AdmittedLLMProviderMetadata) -> _Adm
     return witness.diagnostic_metadata
 
 
+def project_v4_provider_diagnostic_metadata(metadata: _AdmittedLLMProviderMetadata) -> _AdmittedLLMProviderMetadata:
+    """Project owned full private DATA; prove neither its source nor completeness.
+
+    A cold owner must already have proved its actual V4 retained source and
+    receipt. This projection never creates or restores a live witness.
+    """
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
+    from elspeth.web.composer.bounded_json import PROVIDER_ARTIFACT_UNAVAILABLE, JsonBoundaryError, require_bounded_text
+    from elspeth.web.composer.llm_response_parsing import (
+        _PROVIDER_IDENTIFIER_MAX_CHARS,
+        _PROVIDER_TOKEN_MAX_CHARS,
+        _bounded_provider_string,
+        _json_safe_provider_artifact,
+    )
+
+    if type(metadata) is not _AdmittedLLMProviderMetadata:
+        raise AuditIntegrityError("V4 diagnostic projection requires owned private metadata DATA")
+
+    def short(value: str | None, limit: int) -> str | None:
+        if value is not None and type(value) is not str:
+            raise AuditIntegrityError("V4 private metadata changed its original text type")
+        return _bounded_provider_string(value, limit=limit) if value is not None and value.strip() else None
+
+    reasoning = metadata.reasoning_content
+    if reasoning is not None and type(reasoning) is not str:
+        raise AuditIntegrityError("V4 private reasoning changed its original text type")
+    try:
+        reasoning = require_bounded_text(reasoning, label="provider reasoning content") if reasoning is not None else None
+    except JsonBoundaryError:
+        reasoning = PROVIDER_ARTIFACT_UNAVAILABLE
+    return replace(
+        metadata,
+        model_returned=short(metadata.model_returned, _PROVIDER_IDENTIFIER_MAX_CHARS),
+        provider_request_id=short(metadata.provider_request_id, _PROVIDER_IDENTIFIER_MAX_CHARS),
+        finish_reason=short(metadata.finish_reason, _PROVIDER_TOKEN_MAX_CHARS),
+        reasoning_content=reasoning,
+        reasoning_details=_json_safe_provider_artifact(deep_thaw(metadata.reasoning_details)),
+        v4_completeness=None,
+    )
+
+
 def _require_v4_provider_result_credentials(value: object, *, surface: str) -> None:
     """Inspect only the bounded owned V4 provider projection, never tool policy.
 
@@ -282,6 +446,75 @@ def require_v4_provider_metadata_credentials(
         from elspeth.contracts.freeze import deep_thaw
         from elspeth.web.composer.provider_thinking import native_thinking_blocks
 
+        native_thinking_blocks(deep_thaw(metadata.thinking_blocks))
+
+
+def require_retained_v4_provider_metadata_credentials(completion: _AdmittedLLMCompletion, *, surface: str) -> None:
+    """Validate retained full-result DATA without minting source authority.
+
+    The cold caller independently proves its V4 source/bytes/receipt first.
+    This function only checks the nominal decoded fields and credentials; it
+    grants no completeness, SDK, application, retry or SQL permission.
+    """
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.web.composer._compose_loop_carriers import (
+        _AdmittedAssistantMessage,
+        _AdmittedLLMCompletion,
+        _AdmittedLLMProviderMetadata,
+        _AdmittedToolBatch,
+        _AdmittedToolCall,
+        _AdmittedToolFunction,
+    )
+    from elspeth.web.composer.provider_thinking import native_thinking_blocks
+
+    if (
+        type(completion) is not _AdmittedLLMCompletion
+        or type(completion.message) is not _AdmittedAssistantMessage
+        or type(completion.provider_metadata) is not _AdmittedLLMProviderMetadata
+        or type(completion.tool_batch) is not _AdmittedToolBatch
+        or type(completion.tool_batch.calls) is not tuple
+        or type(completion.tool_batch.call_ids) is not frozenset
+        or (completion.message.content is not None and type(completion.message.content) is not str)
+    ):
+        raise AuditIntegrityError("V4 retained credential check requires an owned complete-result shape")
+    calls = completion.tool_batch.calls
+    if any(
+        type(call) is not _AdmittedToolCall
+        or type(call.function) is not _AdmittedToolFunction
+        or type(call.id) is not str
+        or type(call.function.name) is not str
+        or type(call.function.arguments) is not str
+        for call in calls
+    ) or completion.tool_batch.call_ids != frozenset(call.id for call in calls):
+        raise AuditIntegrityError("V4 retained credential check changed its original tool fields")
+    if len(completion.tool_batch.call_ids) != len(calls):
+        raise AuditIntegrityError("V4 retained credential check repeats a tool identity")
+    metadata = completion.provider_metadata
+    if any(
+        value is not None and type(value) is not str
+        for value in (
+            metadata.model_returned,
+            metadata.provider_request_id,
+            metadata.finish_reason,
+            metadata.reasoning_content,
+            metadata.provider_served,
+        )
+    ):
+        raise AuditIntegrityError("V4 retained credential check changed its original metadata text types")
+    _require_v4_provider_result_credentials(
+        {
+            "content": completion.message.content,
+            "tool_calls": [{"id": call.id, "name": call.function.name, "arguments": call.function.arguments} for call in calls],
+            "model_returned": metadata.model_returned,
+            "provider_request_id": metadata.provider_request_id,
+            "finish_reason": metadata.finish_reason,
+            "reasoning_content": metadata.reasoning_content,
+            "reasoning_details": metadata.reasoning_details,
+            "provider_served": metadata.provider_served,
+        },
+        surface=surface,
+    )
+    if metadata.thinking_blocks is not None:
         native_thinking_blocks(deep_thaw(metadata.thinking_blocks))
 
 
@@ -421,7 +654,7 @@ def admit_v4_provider_result(
         provider_served=provider,
     )
     if losses:
-        raise V4ProviderResultIncomplete(sdk_return=sdk_return, metadata=diagnostic, losses=tuple(losses))
+        raise _issue_v4_incomplete(sdk_return=sdk_return, metadata=diagnostic, losses=tuple(losses))
     _require_v4_provider_result_credentials(
         {
             "content": values.content,
