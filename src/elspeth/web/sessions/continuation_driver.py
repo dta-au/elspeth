@@ -17,7 +17,7 @@ from uuid import UUID
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.advisor_output import ReadContinuationAction
 from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame, InitializeFrame
-from elspeth.web.composer.continuation_clock import ContinuationTimingObservation, SegmentFit, admit_action
+from elspeth.web.composer.continuation_clock import ContinuationActionClock, ContinuationTimingObservation, SegmentFit, admit_action
 from elspeth.web.composer.continuation_composition_initialization import initialize_continuation_composition
 from elspeth.web.composer.continuation_control_transitions import StoredContinuationControlIntent, read_pending_control_on_connection
 from elspeth.web.composer.continuation_env_inventory import read_disposition_env_names
@@ -27,6 +27,7 @@ from elspeth.web.composer.continuation_next_action import (
     _has_committed_primary,
     _is_first_compose_iteration,
     is_consumed_semantic_stop_cut,
+    iteration_stage_action_policy,
     next_continuation_action_policy,
 )
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
@@ -81,11 +82,12 @@ from elspeth.web.sessions.continuation import (
 )
 from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, publish_semantic_continuation_result
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
+from elspeth.web.sessions.continuation_iteration_return import IterationStageData, read_iteration_stage_on_connection
 from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
 from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt
 from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
 from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
-from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.locking import locked_session_transaction, session_data_read_transaction
 from elspeth.web.sessions.schemas import SendMessageRequest
 
 if TYPE_CHECKING:
@@ -209,6 +211,8 @@ class _SegmentDriver:
         self._action_ordinal = 0
         self.progress_owner: ContinuationProgressOwner | None = None
         self._progress_cleanup_failures: list[BaseException] = []
+        self._iteration_stage: IterationStageData | None = None
+        self._action_clock: ContinuationActionClock | None = None
 
     async def start_progress(self, record: ComposerOperationRecord) -> None:
         if self.progress_owner is not None:
@@ -678,9 +682,17 @@ class _SegmentDriver:
                 return None
             return await run_continuation_semantic_advisor(self.phases, selected)
         if is_applied_batch_cut(selected):
-            # The post-batch phase either returns the next authoring
-            # transition to the provider or publishes the result it reached.
-            return await advance_continuation_iteration(self.phases, self.services, selected)
+            stage = self._iteration_stage
+            if stage is not None and stage.current != stored:
+                raise AuditIntegrityError("iteration stage changed its exact selected action source")
+            if stage is not None and stage.stage == "returned":
+                # This route preserves the actual applied root. The semantic
+                # producer must independently replay the complete return;
+                # entering the post-batch owner again would replay work.
+                return await run_continuation_semantic_advisor(self.phases, selected)
+            if stage is not None and stage.stage == "publication_ready":
+                return await publish_semantic_continuation_result(self.phases, self.services, selected)
+            return await advance_continuation_iteration(self.phases, self.services, selected, iteration_stage=stage)
         if type(top) is EndFrame:
             if root.active_action_json is not None:
                 await review_prescribed_continuation_end(self.phases, self.services, selected)
@@ -722,6 +734,23 @@ class _SegmentDriver:
         if intent is not None and type(intent) is not StoredContinuationControlIntent:
             raise AuditIntegrityError("model yield lost its actual durable intent DATA")
         return intent
+
+    async def iteration_stage(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> IterationStageData | None:
+        if not is_applied_batch_cut(selected):
+            return None
+
+        def read() -> tuple[IterationStageData | None]:
+            with session_data_read_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                return (read_iteration_stage_on_connection(conn, self.running, selected=stored),)
+
+        (stage,) = await _registered(work=self.work, source=RequiredWorkSource.CONTINUATION_READ_SQL, operation=read, expected=tuple)
+        if stage is None:
+            return None
+        if not isinstance(stage, IterationStageData) or stage.current != stored:
+            raise AuditIntegrityError("iteration stage read changed its exact current source DATA")
+        if stage.stage in ("early_dispatched", "classify_dispatched", "end_dispatched"):
+            raise AuditIntegrityError("iteration stage cannot replay unresolved paid work")
+        return stage
 
     async def yield_control(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> ContinuationSegmentOutcome:
         """Yield only after the actual phase and watcher cohorts have joined."""
@@ -862,6 +891,15 @@ class _SegmentDriver:
                 return await self.yield_control(stored, selected)
             await self.start_progress(record)
             policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+            if policy != self.sql_deadline.policy:
+                raise AuditIntegrityError("driver action changed its original SQL owner's admitted policy")
+            # Preserve the original action objects as well as their values;
+            # result-disposition facets bind that exact begun policy member.
+            policy = self.sql_deadline.policy
+            # This is a current DATA observation, followed by the fresh timing
+            # observation and actual stage writer admission. Each paid stage
+            # returns here before the next original scalar action begins.
+            self._iteration_stage = await self.iteration_stage(stored, selected)
             started_read = time.monotonic()
             timing = await _registered(
                 work=self.work,
@@ -870,7 +908,10 @@ class _SegmentDriver:
                 expected=ContinuationTimingObservation,
             )
             elapsed = time.monotonic() - started_read
-            action = next_continuation_action_policy(selected=selected, policy=policy)
+            if is_applied_batch_cut(selected):
+                action = iteration_stage_action_policy(selected=stored, stage=self._iteration_stage, policy=policy)
+            else:
+                action = next_continuation_action_policy(selected=selected, policy=policy)
             if (
                 admit_action(
                     action,
@@ -884,7 +925,10 @@ class _SegmentDriver:
                 return await self.dispose()
             if self._worker_is_draining():
                 return await self.dispose()
-            self.sql_deadline.begin_action(action, started_at=time.monotonic())
+            action_clock = ContinuationActionClock(action)
+            self._action_clock = action_clock
+            self.sql_deadline.begin_action(action, started_at=action_clock.started_monotonic)
+            self.phases.bind_action_clock(action_clock)
             self._action_ordinal += 1
             producer: RequiredWorkTicket | None = None
             signal: RequiredWorkTicket | None = None

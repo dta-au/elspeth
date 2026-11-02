@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Final, final
@@ -727,10 +728,17 @@ async def run_required_read_finish_once[T](
     from elspeth.web.sessions.locking import _READ_RESULT_ISSUER_SEAL, continuation_read_result_deadline_scope
 
     _validate_finish_once_ticket(ticket)
-    owner = ticket.sql_deadline_owner
-    if ticket.key.source is not RequiredWorkSource.CONTINUATION_READ_RESULT_SQL or owner is None:
-        raise AuditIntegrityError("Owned read finish requires its exact registered read-result ticket")
-    clock = owner.capture_read_result_deadline()
+    try:
+        owner = ticket.sql_deadline_owner
+        if ticket.key.source is not RequiredWorkSource.CONTINUATION_READ_RESULT_SQL or owner is None:
+            raise AuditIntegrityError("Owned read finish requires its exact registered read-result ticket")
+        clock = owner.capture_read_result_deadline()
+    except BaseException as original:
+        # A bound or completed ticket refuses no-submission cleanup. Its
+        # physical custody stays intact and the setup failure stays original.
+        with suppress(AuditIntegrityError):
+            ticket.complete_without_submission(original)
+        raise
 
     def execute_owned() -> T:
         # The source grants no process-drain admission. Also refuse a queued

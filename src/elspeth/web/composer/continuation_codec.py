@@ -39,6 +39,8 @@ from elspeth.web.continuation_retention_memo import (
     current_retention_stage_memo,
 )
 
+_TRUSTED_PRIVATE_CHUNK_SHA256 = sha256
+
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_progress import ContinuationFrontier
 
@@ -110,11 +112,12 @@ def encode_private_chunk(
 
     proof_key = CanonicalTextEncodingKey(canonical, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
     memo = current_retention_stage_memo()
-    encoded = (
-        memo.canonical_text_encoding(proof_key, _private_chunk_canonical_text_bytes)
+    proof = (
+        memo.canonical_text_proof(proof_key, _private_chunk_canonical_text_bytes, sha256)
         if memo is not None and type(canonical) is str
-        else _private_chunk_canonical_text_bytes(proof_key)
+        else None
     )
+    encoded = proof.encoded if proof is not None else _private_chunk_canonical_text_bytes(proof_key)
     if codec == "composer.state.v1":
         # The state constructor needs a fresh mutable tree. Only the text
         # encoding proof is retained across calls.
@@ -139,7 +142,7 @@ def encode_private_chunk(
     reference = PrivateChunkRef.model_validate(
         {
             "codec": codec,
-            "digest": sha256(encoded).hexdigest(),
+            "digest": proof.digest if proof is not None else sha256(encoded).hexdigest(),
             "byte_length": len(encoded),
         }
     )
@@ -159,12 +162,42 @@ def _private_chunk_canonical_text_bytes(key: CanonicalTextEncodingKey) -> bytes:
 
 def verify_private_chunk(reference: PrivateChunkRef, canonical: str) -> None:
     memo = current_retention_stage_memo()
-    if memo is None or type(canonical) is not str or not _private_chunk_memo_reference(reference):
+    proof = None
+    if memo is not None and type(canonical) is str and _private_chunk_memo_reference(reference):
+        full_proof_bytes = (
+            2 * reference.byte_length
+            + 64
+            + len(reference.codec.encode("utf-8"))
+            + len(reference.digest.encode("utf-8"))
+            + len(str(reference.byte_length))
+            + len(str(CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES))
+        )
+        if sha256 is not _TRUSTED_PRIVATE_CHUNK_SHA256 or full_proof_bytes > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            # A replaced crypto producer cannot reuse a digest. A valid large
+            # chunk cannot fit the bounded full proof, so preserve the old
+            # canonical-only memo while computing its binding SHA fresh.
+            memo.private_chunk(PrivateChunkVerificationKey(reference, canonical), _verify_private_chunk_canonical)
+            encoded = canonical.encode("utf-8")
+            if len(encoded) != reference.byte_length or sha256(encoded).hexdigest() != reference.digest:
+                raise AuditIntegrityError("private chunk bytes differ from their binding")
+            return
+        try:
+            proof = memo.canonical_text_proof(
+                CanonicalTextEncodingKey(canonical, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, reference),
+                _private_chunk_canonical_text_bytes,
+                sha256,
+            )
+        except AuditIntegrityError:
+            # Preserve the original canonical-before-binding refusal for
+            # malformed or oversized historical DATA on a cold read.
+            proof = None
+    if proof is None:
         _verify_private_chunk_canonical(canonical)
+        encoded = canonical.encode("utf-8")
+        length, digest = len(encoded), sha256(encoded).hexdigest()
     else:
-        memo.private_chunk(PrivateChunkVerificationKey(reference, canonical), _verify_private_chunk_canonical)
-    encoded = canonical.encode("utf-8")
-    if len(encoded) != reference.byte_length or sha256(encoded).hexdigest() != reference.digest:
+        length, digest = len(proof.encoded), proof.digest
+    if length != reference.byte_length or digest != reference.digest:
         raise AuditIntegrityError("private chunk bytes differ from their binding")
 
 

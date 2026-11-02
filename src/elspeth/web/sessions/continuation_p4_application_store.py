@@ -54,7 +54,7 @@ from elspeth.web.sessions.continuation import (
     read_private_chunk,
     require_snapshot_cas,
 )
-from elspeth.web.sessions.continuation_p4 import decode_p4_receipt, verify_p4_immutable_receipt_on_connection
+from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result, decode_p4_receipt, verify_p4_immutable_receipt_on_connection
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
@@ -192,7 +192,7 @@ def require_p4_application_journal_data_on_connection(
     selected: SelectedContinuationState,
     evidence: AdmittedTurnEvidence,
     env_ref_names: frozenset[str],
-) -> None:
+) -> tuple[ReadmittedP4Result, ...]:
     """Immutable application DATA checks after the caller's actual SQL proof.
 
     The identity grants no live read/write authority. Both current readers and
@@ -206,7 +206,7 @@ def require_p4_application_journal_data_on_connection(
     if entry is None:
         if snapshot.historical_application_count or snapshot.effect_locators:
             raise AuditIntegrityError("evidence omitted its actual historical application journal")
-        return
+        return ()
     if snapshot.logical != selected.stack.logical or entry.logical != selected.stack.logical:
         raise AuditIntegrityError("application journal changed its current logical owner")
     graph = admitted.graph
@@ -245,6 +245,7 @@ def require_p4_application_journal_data_on_connection(
         else:
             raise AuditIntegrityError("application journal has no supported selected batch cut")
     sid = str(session_id)
+    checked_results: list[ReadmittedP4Result] = []
     for index, record in enumerate(entry.applications):
         effect = conn.execute(
             select(effects).where(
@@ -384,6 +385,8 @@ def require_p4_application_journal_data_on_connection(
             effect.creator_sequence, effect.creator_generation, creator.session_operation_id, creator.session_operation_epoch
         )
         require_admitted_p4_application(admitted, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
+        checked_results.append(result)
+    return tuple(checked_results)
 
 
 def apply_p4_application_on_connection(

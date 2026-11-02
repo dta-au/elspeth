@@ -140,9 +140,12 @@ if TYPE_CHECKING:
         StoredTerminalP4Preparation,
     )
     from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, PrimaryProviderResult, RetainedPrimaryPhaseData
+    from elspeth.web.sessions.continuation_publication_projection import PublicationProjectionInput
     from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
     from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
     from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
+    from elspeth.web.sessions.protocol import ChatMessageRecord
+    from elspeth.web.sessions.service import SessionServiceImpl
 
 
 def _continuation_claim_scope() -> tuple[ColumnElement[bool], ...]:
@@ -2067,6 +2070,10 @@ def settle_composer_operation_on_connection(
     prepared_settlement: PreparedSegmentSettlement | None = None,
     terminal_recorded_at: datetime | None = None,
     publication_result: ComposerResult | None = None,
+    publication_projection: PublicationProjectionInput | None = None,
+    publication_assistant: ChatMessageRecord | None = None,
+    publication_service: SessionServiceImpl | None = None,
+    publication_actor: str | None = None,
 ) -> ComposerOperationRecord:
     """Sealed terminal CAS. Failed results cannot authorize business mutations."""
     from elspeth.web.sessions.continuation import settle_continuation_on_connection
@@ -2078,20 +2085,73 @@ def settle_composer_operation_on_connection(
         outcome = _select_failure_on_connection(current, outcome, authoritative_failure=authoritative_failure)
     if isinstance(outcome, MessageWithStateResponse):
         from elspeth.web.composer.protocol import ComposerResult
+        from elspeth.web.sessions.continuation_publication_projection import (
+            PublicationProjectionInput,
+            require_publication_projection_on_connection,
+        )
         from elspeth.web.sessions.continuation_semantic_actions import require_semantic_publication_on_connection
-        from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
+        from elspeth.web.sessions.continuation_semantic_advisor import require_semantic_iteration_publication_on_connection
+        from elspeth.web.sessions.protocol import ChatMessageRecord
+        from elspeth.web.sessions.routes._helpers import _message_response, composer_turn_end_assistant_row
+        from elspeth.web.sessions.service import SessionServiceImpl
 
         selected = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
-        proof = require_semantic_publication_on_connection(conn, running, selected=selected)
-        if proof is not None:
+        iteration_proof = require_semantic_iteration_publication_on_connection(conn, running, selected=selected)
+        review_proof = require_semantic_publication_on_connection(conn, running, selected=selected) if iteration_proof is None else None
+        if publication_projection is not None and iteration_proof is None and review_proof is None:
+            raise AuditIntegrityError("publication projection lacks the original paid whole-request Stop")
+        if iteration_proof is not None or review_proof is not None:
             if type(publication_result) is not ComposerResult:
                 raise AuditIntegrityError("semantic publication lost its actual shared finalizer result")
-            original = proof.review_result.result
-            expected = replace(original, llm_calls=(*original.llm_calls, proof.admission.paid.audit_call))
-            if publication_result != expected:
-                raise AuditIntegrityError("semantic publication replaced its original reviewed result or paid Stop audit")
-            if outcome.message.content != composer_turn_end_assistant_row(expected).content:
-                raise AuditIntegrityError("semantic publication changed its committed assistant result")
+            if iteration_proof is not None:
+                original = iteration_proof.returned.result
+                audit_call = iteration_proof.admission.paid.audit_call
+            else:
+                if review_proof is None:
+                    raise AuditIntegrityError("semantic publication lost both original paid Stop sources")
+                original = review_proof.review_result.result
+                audit_call = review_proof.admission.paid.audit_call
+            expected = replace(original, llm_calls=(*original.llm_calls, audit_call))
+            if publication_projection is None:
+                if publication_result != expected:
+                    raise AuditIntegrityError("semantic publication replaced its original reviewed result or paid Stop audit")
+                if outcome.message.content != composer_turn_end_assistant_row(expected).content:
+                    raise AuditIntegrityError("semantic publication changed its committed assistant result")
+            else:
+                if (
+                    type(publication_projection) is not PublicationProjectionInput
+                    or type(publication_assistant) is not ChatMessageRecord
+                    or type(publication_service) is not SessionServiceImpl
+                    or type(publication_actor) is not str
+                    or not publication_actor
+                    or publication_projection.original_result != expected
+                ):
+                    raise AuditIntegrityError("publication projection lost its actual SQL, assistant or actor owner")
+                require_publication_projection_on_connection(
+                    conn,
+                    running,
+                    publication_service,
+                    original_result=expected,
+                    publication_result=publication_result,
+                    assistant=publication_assistant,
+                    actor=publication_actor,
+                    settlement=publication_projection.settlement,
+                    revocation=publication_projection.revocation,
+                )
+                assistant_row = conn.execute(
+                    select(chat_messages_table).where(
+                        chat_messages_table.c.id == str(publication_assistant.id),
+                        chat_messages_table.c.session_id == str(running.claim.session_id),
+                    )
+                ).one_or_none()
+                if (
+                    assistant_row is None
+                    or publication_service._row_to_chat_message_record(assistant_row) != publication_assistant
+                    or outcome.message != _message_response(publication_assistant)
+                ):
+                    raise AuditIntegrityError("publication projection substituted its actual assistant or public response")
+        elif publication_assistant is not None or publication_service is not None or publication_actor is not None:
+            raise AuditIntegrityError("publication proof inputs were supplied without an original whole-request Stop")
     settle_continuation_on_connection(
         conn,
         running,

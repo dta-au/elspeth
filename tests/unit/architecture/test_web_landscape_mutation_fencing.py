@@ -11333,14 +11333,24 @@ def _reserve_selected_origin_effect_failures(
     consumers; unsupported relevant forms remain an explicit NO_GO.
     """
     receiver_members = {owner: set(members) for owner, members in (receiver_members or {}).items()}
+    recompose_failures, recompose = _reserve_recompose_initialization_receipt(units)
+    if not recompose_failures and recompose is not None:
+        original_nodes = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+        if (recompose["returns"] | recompose["lambdas"]) <= original_nodes:
+            validated_transfer_nodes = validated_transfer_nodes | recompose["returns"]
+            validated_immediate_lambdas = validated_immediate_lambdas | recompose["lambdas"]
     # These actual constructors precede the wider boundary proof. Their local
     # receipts admit only original same-AST transfers, independently of an
     # unrelated TITLE or six-method contract failing later in that proof.
     driver_failures, driver_owner = _reserve_provider_mint_contract.provider_driver_constructor_contract(units)
     if not driver_failures and driver_owner is not None:
         driver_nodes = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
-        if (driver_owner["owner_constructor_stores"] | driver_owner["owner_constructor_calls"]) <= driver_nodes:
-            validated_transfer_nodes = validated_transfer_nodes | driver_owner["owner_constructor_stores"]
+        if (
+            driver_owner["owner_constructor_stores"] | driver_owner["owner_constructor_calls"] | driver_owner["binding_constructor_stores"]
+        ) <= driver_nodes:
+            validated_transfer_nodes = (
+                validated_transfer_nodes | driver_owner["owner_constructor_stores"] | driver_owner["binding_constructor_stores"]
+            )
             protected_supplier_bindings = protected_supplier_bindings | driver_owner["class_origins"]
             extra_roots = extra_roots | driver_owner["class_origins"]
     start_failures, started_owner = _reserve_worker_six.continuation_start_owner_contract(units)
@@ -16755,24 +16765,562 @@ def _reserve_selected_origin_effect_failures(
     return unresolved
 
 
+def _reserve_recompose_initialization_receipt(units):
+    """The one awaited Recompose DATA return, with both callbacks consumed here."""
+    path = "src/elspeth/web/composer/continuation_initialization.py"
+    clock_path = "src/elspeth/web/composer/continuation_clock.py"
+    result_path = "src/elspeth/web/sessions/continuation_recompose_source.py"
+    selected = {candidate: [unit for unit in units if unit.path == candidate] for candidate in (path, clock_path, result_path)}
+    if any(len(matches) != 1 for matches in selected.values()):
+        return ["Recompose initialization source is missing or duplicated"], None
+    unit, clock = selected[path][0], selected[clock_path][0]
+    result_source = selected[result_path][0]
+    result_record = _reserve_node_at(result_source, "RecomposeOriginalSource")
+    expected_record = ast.parse(
+        """
+@dataclass(frozen=True, slots=True)
+class RecomposeOriginalSource:
+    selected: StoredContinuationSnapshot
+    request: RecomposeRequest
+    actor_user_id: str
+    records: tuple[ChatMessageRecord, ...]
+    original_session_title: str
+    receipt: RecomposeOriginalReceipt | None
+"""
+    ).body[0]
+    if (
+        result_record is None
+        or stable_ast_dump(result_record) != stable_ast_dump(expected_record)
+        or not _reserve_proposal_child_transfers.owned_origin(result_source.tree, "RecomposeOriginalSource", result_record)
+    ):
+        return ["Recompose initialization nominal DATA record changed"], None
+    expected = ast.parse(
+        """
+def _sessions(service: ComposerServiceImpl) -> SessionServiceImpl:
+    sessions = service._require_sessions_service()
+    if type(sessions) is not SessionServiceImpl:
+        raise AuditIntegrityError("pre-title bootstrap requires the actual sessions owner")
+    return sessions
+
+def _adopt_recompose(
+    service: ComposerServiceImpl, running: ComposerOperationRunning, selected: StoredContinuationSnapshot
+) -> RecomposeOriginalSource:
+    sessions = _sessions(service)
+    with locked_session_transaction(sessions._engine, str(running.claim.session_id)) as conn:
+        return publish_recompose_original_on_connection(conn, running, selected=selected)
+
+async def adopt_recompose_original(
+    *, service: ComposerServiceImpl, selected: StoredContinuationSnapshot, required_work: RequiredWorkBinding
+) -> RecomposeOriginalSource:
+    running = required_work.running
+    root = decode_continuation_snapshot(selected.payload_json)
+    if (
+        type(service) is not ComposerServiceImpl
+        or type(running) is not ComposerOperationRunning
+        or type(selected) is not StoredContinuationSnapshot
+        or root.logical.kind != "compose_recompose"
+        or len(root.frames) != 1
+        or type(root.frames[0]) is not InitializeFrame
+        or root.frames[0].ingress_phase != "reserved"
+    ):
+        raise AuditIntegrityError("Recompose adoption requires its current reserved owner")
+    required_work.validate_context(running.session_operation_context)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    clock = ContinuationActionClock(policy.actions.session_sql)
+    clock.finish_preparation()
+    return await clock.run(
+        "retention",
+        lambda: _registered(
+            work=required_work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=lambda: _adopt_recompose(service, running, selected),
+            expected=RecomposeOriginalSource,
+        ),
+    )
+
+async def _registered[T](*, work: RequiredWorkBinding, source: RequiredWorkSource, operation: Callable[[], T], expected: type[T]) -> T:
+    if source is RequiredWorkSource.CONTINUATION_READ_SQL:
+        projection_source = RequiredWorkSource.CONTINUATION_READ_PROJECTION
+    elif source is RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL:
+        projection_source = RequiredWorkSource.CONTINUATION_DISPOSITION_READ_PROJECTION
+    elif source is RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL:
+        projection_source = RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_PROJECTION
+    elif source is RequiredWorkSource.CONTINUATION_STATE_SQL:
+        projection_source = RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+    else:
+        raise AuditIntegrityError("pre-title bootstrap has no registered SQL source")
+    sql, projection = work.reserve_pair(source, projection_source)
+    try:
+        outcome = await run_required_sql_finish_once(sql, operation)
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    try:
+        work.coordinator.validate_continuation_sql_outcome(ticket=sql, expected_source=source, actual_outcome=outcome)
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    errors: list[BaseException] = []
+    result: T | None = None
+    if type(outcome) is RequiredSQLRaised:
+        projection.complete_without_submission()
+        errors.append(outcome.error)
+    elif type(outcome) is RequiredSQLReturned:
+        projection.begin_projection()
+        try:
+            if type(outcome.value) is not expected:
+                raise AuditIntegrityError("pre-title bootstrap SQL lost its actual nominal outcome")
+            result = outcome.value
+        except BaseException as error:
+            projection.complete_owned(error)
+            errors.append(error)
+        else:
+            projection.complete_owned()
+    else:
+        projection.complete_without_submission()
+        raise AuditIntegrityError("pre-title bootstrap SQL returned no owned finish-once outcome")
+    for cancellation in outcome.deferred_cancellations:
+        if all(cancellation is not original for original in errors):
+            errors.append(cancellation)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Pre-title bootstrap original SQL outcomes", errors)
+    if result is None:
+        raise AuditIntegrityError("pre-title bootstrap projection lost its complete result")
+    return result
+"""
+    )
+    actual = {}
+    for declaration in expected.body:
+        found = _reserve_node_at(unit, declaration.name)
+        if (
+            found is None
+            or stable_ast_dump(found) != stable_ast_dump(declaration)
+            or not _reserve_proposal_child_transfers.owned_origin(unit.tree, declaration.name, found)
+        ):
+            return ["Recompose initialization exact producer/return contract changed " + declaration.name], None
+        resolver = _resolver_for_unit(unit)
+        for node in ast.walk(found):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in {"type", "len", "all", "BaseException", "BaseExceptionGroup"}
+                and resolver.qualified_name(node, use=node) != node.id
+            ):
+                return ["Recompose initialization primitive supplier changed " + node.id], None
+        actual[declaration.name] = found
+    expected_clock = ast.parse(
+        """
+class ContinuationActionClock:
+    def __init__(self, policy: ContinuationActionPolicy) -> None:
+        self.policy = policy
+        self.started = asyncio.get_running_loop().time()
+        self.deadline = self.started + policy.total
+        self.started_monotonic = time.monotonic()
+        self.preparation_deadline_monotonic = self.started_monotonic + policy.preparation
+        self._seen: set[str] = set()
+
+    def require_preparation_time(self, *, monotonic_now: float | None = None) -> None:
+        now = time.monotonic() if monotonic_now is None else monotonic_now
+        if type(now) is not float or not math.isfinite(now):
+            raise ValueError("preparation observation must be finite monotonic time")
+        if now > self.preparation_deadline_monotonic:
+            raise TimeoutError("continuation preparation allowance expired")
+
+    def finish_preparation(self) -> None:
+        if self._seen:
+            raise ValueError("action preparation cannot renew or follow another stage")
+        self.require_preparation_time()
+        self._seen.add("preparation")
+
+    async def run[T](self, stage: ContinuationTimedStage, operation: Callable[[], Awaitable[T]]) -> T:
+        if stage in self._seen or "preparation" not in self._seen:
+            raise ValueError("continuation action stage repeated or preparation unbound")
+        match stage:
+            case "guard":
+                seconds = self.policy.guard
+            case "quota":
+                seconds = self.policy.quota
+            case "physical":
+                seconds = self.policy.physical
+            case "retention":
+                seconds = self.policy.retention
+        if seconds is None:
+            raise ValueError("an inapplicable action stage cannot execute")
+        self._seen.add(stage)
+        deadline = min(self.deadline, asyncio.get_running_loop().time() + seconds)
+        with retention_stage_memo_scope() if stage == "retention" else without_retention_stage_memo():
+            async with asyncio.timeout_at(deadline) as timeout:
+                result = await operation()
+                if timeout.expired() or asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("continuation stage expired while its actual owner was joined")
+                return result
+"""
+    ).body[0]
+    clock_class = _reserve_node_at(clock, "ContinuationActionClock")
+    if (
+        clock_class is None
+        or stable_ast_dump(clock_class) != stable_ast_dump(expected_clock)
+        or not _reserve_proposal_child_transfers.owned_origin(clock.tree, "ContinuationActionClock", clock_class)
+    ):
+        return ["Recompose initialization callback lifetime or clock changed"], None
+    for source, bindings in (
+        (
+            unit,
+            {
+                "ContinuationActionClock": "elspeth.web.composer.continuation_clock.ContinuationActionClock",
+                "RecomposeOriginalSource": "elspeth.web.sessions.continuation_recompose_source.RecomposeOriginalSource",
+                "publish_recompose_original_on_connection": "elspeth.web.sessions.continuation_recompose_source.publish_recompose_original_on_connection",
+                "run_required_sql_finish_once": "elspeth.web.async_workers.run_required_sql_finish_once",
+                "RequiredWorkBinding": "elspeth.web.required_work.RequiredWorkBinding",
+                "RequiredWorkSource": "elspeth.web.required_work.RequiredWorkSource",
+                "RequiredSQLRaised": "elspeth.web.required_sql_outcomes.RequiredSQLRaised",
+                "RequiredSQLReturned": "elspeth.web.required_sql_outcomes.RequiredSQLReturned",
+                "ComposerServiceImpl": "elspeth.web.composer.service.ComposerServiceImpl",
+                "SessionServiceImpl": "elspeth.web.sessions.service.SessionServiceImpl",
+                "ComposerOperationRunning": "elspeth.web.sessions.composer_operations.ComposerOperationRunning",
+                "StoredContinuationSnapshot": "elspeth.web.sessions.continuation.StoredContinuationSnapshot",
+                "InitializeFrame": "elspeth.web.composer.continuation.InitializeFrame",
+                "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+                "locked_session_transaction": "elspeth.web.sessions.locking.locked_session_transaction",
+                "decode_continuation_policy": "elspeth.web.composer.continuation_policy.decode_continuation_policy",
+                "decode_continuation_snapshot": "elspeth.web.composer.continuation_codec.decode_continuation_snapshot",
+            },
+        ),
+        (result_source, {"dataclass": "dataclasses.dataclass"}),
+        (clock, {"asyncio": "asyncio", "time": "time", "math": "math"}),
+    ):
+        resolver = _resolver_for_unit(source)
+        for node in ast.walk(source.tree):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in bindings
+                and resolver.qualified_name(node, use=node) != bindings[node.id]
+            ):
+                return ["Recompose initialization canonical supplier changed " + node.id], None
+    adopted = actual["adopt_recompose_original"]
+    returned = adopted.body[-1]
+    lambdas = frozenset((path, id(node)) for node in ast.walk(returned) if isinstance(node, ast.Lambda))
+    if not isinstance(returned, ast.Return) or len(lambdas) != 2:
+        return ["Recompose initialization actual return/callback inventory changed"], None
+    return [], {"returns": frozenset({(path, id(returned))}), "lambdas": lambdas}
+
+
+@pytest.mark.parametrize(
+    "path, original, replacement",
+    [
+        pytest.param(
+            "src/elspeth/web/sessions/composer_operations.py",
+            "if type(self.attempt) is not int or self.attempt < 1:",
+            "if self.attempt < 1:",
+            id="boolean-attempt",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/composer_operations.py",
+            "any(type(value) is not int or value < 1 for value in (self.segment_sequence, self.ownership_generation))",
+            "any(value < 0 for value in (self.segment_sequence, self.ownership_generation))",
+            id="zero-or-boolean-segment",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/composer_operations.py",
+            "if type(self.claim) is not ComposerOperationClaim or type(self.session_operation_context) is not SessionOperationContext:",
+            "if type(self.session_operation_context) is not SessionOperationContext:",
+            id="foreign-claim",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/composer_operations.py",
+            "from dataclasses import dataclass",
+            "from dataclasses import dataclass\nint = object",
+            id="claim-integer-primitive-rebound",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "context is not self.running.session_operation_context",
+            "context != self.running.session_operation_context",
+            id="equal-foreign-context",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "or operation_id != self.running.claim.operation_id",
+            "or False",
+            id="foreign-operation",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "or attempt != self.running.claim.attempt",
+            "or False",
+            id="foreign-attempt",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "return ContinuationReadResultDeadline(self, self._action_expires_at, self._settlement_expires_at)",
+            "return ContinuationReadResultDeadline(self, self.hard_expires_at, self.hard_expires_at)",
+            id="read-clock-renewed-to-hard-bound",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "if self._active_action is not self.policy.actions.read:",
+            "if self._active_action is not self.policy.actions.session_sql:",
+            id="original-read-action-substituted",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "or read_result.owner is not self",
+            "or False",
+            id="foreign-read-owner",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "or read_result.expires_at != self._settlement_expires_at",
+            "or False",
+            id="substituted-read-reserve",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "if remaining <= 0:",
+            "if remaining < -1:",
+            id="expired-read-allowed",
+        ),
+    ],
+)
+def test_reserve_sql_deadline_requires_positive_nominal_claim_and_original_read_bounds(path, original, replacement):
+    paths = (
+        "src/elspeth/web/sessions/composer_operations.py",
+        "src/elspeth/web/sessions/continuation_sql_deadline.py",
+        "src/elspeth/web/required_work.py",
+    )
+    units = tuple(_read_source(candidate) for candidate in paths)
+    work = units[-1]
+    assert _reserve_sql_deadline_owner_failures(units, work) == []
+    selected = next(unit for unit in units if unit.path == path)
+    assert selected.source.count(original) == 1
+    changed = _parse_source(path, selected.source.replace(original, replacement))
+    modified = tuple(changed if unit is selected else unit for unit in units)
+    assert _reserve_sql_deadline_owner_failures(modified, work)
+    assert _reserve_sql_deadline_owner_failures(units, work) == []
+
+
+@pytest.mark.parametrize(
+    "path, original, replacement",
+    [
+        pytest.param(
+            "src/elspeth/web/composer/continuation_initialization.py",
+            'return await clock.run(\n        "retention",\n        lambda: _registered(',
+            'return required_work\n    return await clock.run(\n        "retention",\n        lambda: _registered(',
+            id="returned-capability",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_initialization.py",
+            "expected=RecomposeOriginalSource,",
+            "expected=RequiredWorkBinding,",
+            id="substituted-capability-result",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_initialization.py",
+            "for cancellation in outcome.deferred_cancellations:",
+            "for cancellation in ():",
+            id="cancellation-originals-dropped",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_initialization.py",
+            "projection.begin_projection()",
+            "projection.complete_owned()",
+            id="projection-completed-without-begin",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_clock.py",
+            "result = await operation()",
+            "self.retained_operation = operation\n                result = await operation()",
+            id="stored-callback",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_clock.py",
+            "result = await operation()",
+            "result = operation",
+            id="returned-callback",
+        ),
+        pytest.param(
+            "src/elspeth/web/composer/continuation_clock.py",
+            "if timeout.expired() or asyncio.get_running_loop().time() >= deadline:",
+            "if False:",
+            id="expired-return-accepted",
+        ),
+    ],
+)
+def test_reserve_recompose_return_receipt_refuses_capability_and_callback_substitution(path, original, replacement):
+    paths = (
+        "src/elspeth/web/composer/continuation_initialization.py",
+        "src/elspeth/web/composer/continuation_clock.py",
+        "src/elspeth/web/sessions/continuation_recompose_source.py",
+    )
+    units = tuple(_read_source(candidate) for candidate in paths)
+    failures, receipt = _reserve_recompose_initialization_receipt(units)
+    assert failures == [] and receipt is not None
+    assert len(receipt["returns"]) == 1 and len(receipt["lambdas"]) == 2
+    actual_nodes = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert receipt["returns"] | receipt["lambdas"] <= actual_nodes
+    selected = next(unit for unit in units if unit.path == path)
+    assert selected.source.count(original) == 1
+    changed = _parse_source(path, selected.source.replace(original, replacement))
+    failures, rejected = _reserve_recompose_initialization_receipt(tuple(changed if unit is selected else unit for unit in units))
+    assert failures and rejected is None
+    assert _reserve_recompose_initialization_receipt(units) == ([], receipt)
+
+
+@pytest.mark.parametrize(
+    "original, replacement",
+    [
+        pytest.param(
+            "RequiredWorkBinding(lease.required_work, 0, 0, RequiredWorkRole.TURN, running)",
+            "RequiredWorkBinding(lease.required_work, 0, 0, RequiredWorkRole.TURN, foreign)",
+            id="foreign-running",
+        ),
+        pytest.param(
+            "ProviderInvocationOwner(service=services.session_service, required_work=self.work)",
+            "ProviderInvocationOwner(service=services.session_service, required_work=foreign)",
+            id="foreign-provider-binding",
+        ),
+        pytest.param(
+            "self.phases = ContinuationLivePhases(self.service, self.authority, self.work, self.provider, lease)",
+            "self.phases = foreign",
+            id="foreign-phases",
+        ),
+        pytest.param(
+            "if lease.context is not running.session_operation_context:",
+            "if lease.context != running.session_operation_context:",
+            id="equal-foreign-context",
+        ),
+        pytest.param(
+            "    async def start_progress(self, record: ComposerOperationRecord) -> None:\n",
+            "    async def start_progress(self, record: ComposerOperationRecord) -> None:\n        self.work = foreign\n",
+            id="retained-binding-reassigned",
+        ),
+    ],
+)
+def test_reserve_driver_storage_receipt_preserves_exact_context_binding_provider_and_phases(original, replacement):
+    unit = _read_source("src/elspeth/web/sessions/continuation_driver.py")
+    failures, receipt = _reserve_provider_mint_contract.provider_driver_constructor_contract((unit,))
+    assert failures == [] and receipt is not None
+    assert len(receipt["owner_constructor_stores"]) == 1
+    assert len(receipt["binding_constructor_stores"]) == 2
+    assert unit.source.count(original) == 1
+    changed = _parse_source(unit.path, unit.source.replace(original, replacement))
+    failures, rejected = _reserve_provider_mint_contract.provider_driver_constructor_contract((changed,))
+    assert failures and rejected is None
+    assert _reserve_provider_mint_contract.provider_driver_constructor_contract((unit,)) == ([], receipt)
+
+
+def test_reserve_recompose_receipt_does_not_admit_other_returned_or_stored_capabilities():
+    path = "src/elspeth/web/composer/continuation_initialization.py"
+    units = tuple(
+        _read_source(candidate)
+        for candidate in (
+            path,
+            "src/elspeth/web/composer/continuation_clock.py",
+            "src/elspeth/web/sessions/continuation_recompose_source.py",
+            "src/elspeth/web/required_work.py",
+        )
+    )
+    original = units[0]
+    injected = _parse_source(
+        path,
+        original.source
+        + "\nfrom elspeth.web.required_work import RequiredWorkCoordinator\n"
+        + "def unreviewed_return():\n    return RequiredWorkCoordinator\n"
+        + "class UnreviewedHolder:\n"
+        + "    def __init__(self, authority):\n        self.work = RequiredWorkCoordinator(authority)\n",
+    )
+    modified = (injected, *units[1:])
+    failures, receipt = _reserve_recompose_initialization_receipt(modified)
+    assert failures == [] and receipt is not None
+    returned = _reserve_node_at(injected, "unreviewed_return").body[0]
+    stored = _reserve_node_at(injected, "UnreviewedHolder.__init__").body[0]
+    assert (path, id(returned)) not in receipt["returns"]
+    violations = _reserve_selected_origin_effect_failures(modified)
+    assert f"selected capability escaped by return/yield {path}:{returned.lineno}" in violations
+    assert f"selected constructed instance stored outside local binding {path}:{stored.lineno}" in violations
+
+
 def _reserve_sql_deadline_owner_failures(units, work):
     """Close the timing-data dependency without granting it reservation authority."""
     selected = [unit for unit in units if unit.path == "src/elspeth/web/sessions/continuation_sql_deadline.py"]
     if len(selected) != 1:
         return ["owned SQL deadline source is missing or duplicated"]
     deadline = selected[0]
+    running_sources = [unit for unit in units if unit.path == "src/elspeth/web/sessions/composer_operations.py"]
+    if len(running_sources) != 1:
+        return ["owned SQL deadline claim source is missing or duplicated"]
+    running_source = running_sources[0]
+    # The deadline owner accepts only nominal Running. Its frozen Claim now
+    # requires positive segment/generation integers at construction; a second
+    # nullable-segment check here would describe the retired lifecycle.
+    expected_running = ast.parse(
+        """
+@final
+@dataclass(frozen=True, slots=True)
+class ComposerOperationClaim:
+    session_id: UUID
+    operation_id: str
+    claim_token: str
+    attempt: int
+    segment_sequence: int
+    ownership_generation: int
+
+    def __post_init__(self) -> None:
+        if type(self.session_id) is not UUID:
+            raise TypeError("Composer claim session_id must be UUID")
+        require_canonical_operation_id(self.operation_id)
+        if type(self.claim_token) is not str or not 1 <= len(self.claim_token) <= 256:
+            raise ValueError("Composer claim token must be bounded and nonempty")
+        if type(self.attempt) is not int or self.attempt < 1:
+            raise ValueError("Composer claim attempt must be positive")
+        if any(type(value) is not int or value < 1 for value in (self.segment_sequence, self.ownership_generation)):
+            raise ValueError("invalid continuation segment claim")
+
+@final
+@dataclass(frozen=True, slots=True)
+class ComposerOperationRunning:
+    claim: ComposerOperationClaim
+    session_operation_context: SessionOperationContext
+
+    def __post_init__(self) -> None:
+        if type(self.claim) is not ComposerOperationClaim or type(self.session_operation_context) is not SessionOperationContext:
+            raise TypeError("Composer running custody requires owned claim and context")
+        if (self.session_operation_context.fence.session_id != str(self.claim.session_id)
+            or self.session_operation_context.operation_kind is not SessionOperationKind.COMPOSE):
+            raise ValueError("Composer running custody disagrees with its COMPOSE fence")
+"""
+    )
+    for expected in expected_running.body:
+        actual = _reserve_node_at(running_source, expected.name)
+        if (
+            actual is None
+            or stable_ast_dump(actual) != stable_ast_dump(expected)
+            or not _reserve_proposal_child_transfers.owned_origin(running_source.tree, expected.name, actual)
+        ):
+            return ["owned SQL deadline nominal positive claim contract changed"]
+        resolver = _resolver_for_unit(running_source)
+        for node in ast.walk(actual):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in {"type", "int", "any", "str", "len", "ValueError", "TypeError"}
+                and resolver.qualified_name(node, use=node) != node.id
+            ):
+                return ["owned SQL deadline claim primitive binding changed"]
     # These finite statements describe the actual identity check, not merely a
     # method spelling or a newly refreshed source digest. The remaining timing
     # methods are retained by the class recipe, not granted new permissions.
     expected_owner = ast.parse(
         """
 class ContinuationSQLDeadlineOwner:
-    def __init__(self, running: ComposerOperationRunning, *, policy: ContinuationAdmissionPolicy,
+    def __init__(self, running: ComposerOperationRunning, *,
+                 policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
                  drain_signal: ComposerDrainSignal, drain_seconds: float, hard_expires_at: float) -> None:
         if (type(running) is not ComposerOperationRunning
-            or running.claim.segment_sequence is None
-            or running.claim.ownership_generation is None
-            or type(policy) is not ContinuationAdmissionPolicy
+            or type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3)
             or type(drain_signal) is not ComposerDrainSignal
             or type(drain_seconds) not in (float, int)
             or not math.isfinite(drain_seconds)
@@ -16787,6 +17335,7 @@ class ContinuationSQLDeadlineOwner:
         self._action_expires_at = self.hard_expires_at
         self._settlement_expires_at = self.hard_expires_at
         self._settling = False
+        self._active_action = None
         self._lock = threading.RLock()
 
     def validate_context(self, context: SessionOperationContext, *, operation_id: str | None, attempt: int | None) -> None:
@@ -16794,9 +17343,93 @@ class ContinuationSQLDeadlineOwner:
             or operation_id != self.running.claim.operation_id
             or attempt != self.running.claim.attempt):
             raise AuditIntegrityError("SQL timing crossed its actual physical/logical owner")
+
+    def begin_action(self, action: ContinuationActionPolicy, *, started_at: float) -> None:
+        if (
+            type(action) is not ContinuationActionPolicy
+            or action not in (
+                self.policy.actions.primary, self.policy.actions.advisor, self.policy.actions.title,
+                self.policy.actions.read, self.policy.actions.session_sql, self.policy.actions.blob, self.policy.actions.external,
+            )
+            or type(started_at) not in (float, int)
+            or not math.isfinite(started_at)
+        ):
+            raise AuditIntegrityError("SQL timing substituted an unretained action or clock")
+        with self._lock:
+            self._active_action = action
+            self._action_expires_at = min(self.hard_expires_at, started_at + action.total)
+            self._settlement_expires_at = min(self.hard_expires_at, self._action_expires_at + self.policy.segment.reserve)
+            self._settling = False
+
+    def begin_settlement(self) -> None:
+        with self._lock:
+            self._settling = True
+
+    def capture_read_result_deadline(self) -> ContinuationReadResultDeadline:
+        with self._lock:
+            if self._active_action is not self.policy.actions.read:
+                raise AuditIntegrityError("Read result timing requires the original begun read action")
+            return ContinuationReadResultDeadline(self, self._action_expires_at, self._settlement_expires_at)
+
+    def remaining_statement(
+        self, *, session_id: str, deadline: ComposerDrainDeadline | None = None,
+        lifecycle: bool = False, paid_settlement: bool = False, read_result: ContinuationReadResultDeadline | None = None,
+    ) -> float:
+        if session_id != str(self.running.claim.session_id):
+            raise AuditIntegrityError("SQL timing cannot cover another session")
+        if type(paid_settlement) is not bool or (paid_settlement and lifecycle):
+            raise AuditIntegrityError("SQL timing cannot combine paid settlement with lifecycle scope")
+        now = time.monotonic()
+        with self._lock:
+            if read_result is not None and (
+                type(read_result) is not ContinuationReadResultDeadline
+                or read_result.owner is not self
+                or self._active_action is not self.policy.actions.read
+                or lifecycle
+                or paid_settlement
+                or read_result.action_expires_at != self._action_expires_at
+                or read_result.expires_at != self._settlement_expires_at
+            ):
+                raise AuditIntegrityError("Read disposition changed its original action timing")
+            settlement = paid_settlement or self._settling
+            disposition = lifecycle or settlement or read_result is not None
+            expires_at = (
+                read_result.expires_at if read_result is not None
+                else self.hard_expires_at if lifecycle
+                else self._settlement_expires_at if settlement
+                else self._action_expires_at
+            )
+        signal_start = self.drain_signal.started_at
+        statement_cap = self.statement_cap
+        if signal_start is not None:
+            if disposition:
+                expires_at = min(expires_at, signal_start + self.drain_seconds)
+                statement_cap = min(statement_cap, COMPOSER_DRAIN_DISPOSITION_SECONDS / 2)
+            else:
+                expires_at = min(expires_at, signal_start + self.drain_seconds - self.drain_finish_reserve_seconds)
+        if deadline is not None:
+            expires_at = min(expires_at, deadline.expires_at)
+        remaining = min(statement_cap, expires_at - now)
+        if remaining <= 0:
+            raise TimeoutError("Continuation SQL exhausted its original action/drain deadline")
+        return remaining
 """
     ).body[0]
     owner = _reserve_node_at(deadline, "ContinuationSQLDeadlineOwner")
+    read_deadline = _reserve_node_at(deadline, "ContinuationReadResultDeadline")
+    expected_read_deadline = ast.parse(
+        '''
+@final
+@dataclass(frozen=True, slots=True)
+class ContinuationReadResultDeadline:
+    """Snapshot of original finite read timing, never permission to read/write."""
+    owner: ContinuationSQLDeadlineOwner
+    action_expires_at: float
+    expires_at: float
+'''
+    ).body[0]
+    if read_deadline is None or stable_ast_dump(read_deadline) != stable_ast_dump(expected_read_deadline):
+        return ["owned SQL deadline original Read timing record changed"]
     ticket = _reserve_node_at(work, "RequiredWorkTicket")
     for cls in (owner, ticket):
         if (
@@ -16900,10 +17533,33 @@ def sql_deadline_owner(self) -> ContinuationSQLDeadlineOwner | None:
     for unit, bindings in (
         (work, {"ContinuationSQLDeadlineOwner": "elspeth.web.sessions.continuation_sql_deadline.ContinuationSQLDeadlineOwner"}),
         (
+            running_source,
+            {
+                "UUID": "uuid.UUID",
+                "dataclass": "dataclasses.dataclass",
+                "final": "typing.final",
+                "SessionOperationContext": "elspeth.contracts.session_operation.SessionOperationContext",
+                "SessionOperationKind": "elspeth.contracts.session_operation.SessionOperationKind",
+            },
+        ),
+        (
             deadline,
             {
                 "ComposerOperationRunning": "elspeth.web.sessions.composer_operations.ComposerOperationRunning",
                 "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+                "ContinuationAdmissionPolicy": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicy",
+                "ContinuationAdmissionPolicyV2": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV2",
+                "ContinuationAdmissionPolicyV3": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV3",
+                "ContinuationActionPolicy": "elspeth.web.composer.continuation_policy.ContinuationActionPolicy",
+                "ComposerDrainSignal": "elspeth.web.sessions.composer_drain.ComposerDrainSignal",
+                "ComposerDrainDeadline": "elspeth.web.sessions.composer_drain.ComposerDrainDeadline",
+                "COMPOSER_DRAIN_FINISH_RESERVE_SECONDS": "elspeth.web.sessions.composer_drain.COMPOSER_DRAIN_FINISH_RESERVE_SECONDS",
+                "COMPOSER_DRAIN_DISPOSITION_SECONDS": "elspeth.web.sessions.composer_drain.COMPOSER_DRAIN_DISPOSITION_SECONDS",
+                "dataclass": "dataclasses.dataclass",
+                "final": "typing.final",
+                "math": "math",
+                "time": "time",
+                "threading": "threading",
             },
         ),
     ):

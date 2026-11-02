@@ -17,21 +17,28 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_classifier_handoff import ClassifyPostPrimary, ClassifySourceProofStop
+    from elspeth.web.composer.continuation_codec import PrivateChunk
+    from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchPersistData
     from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-    from elspeth.web.composer.continuation_runtime import _CurrentPhaseRead
+    from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime, _CurrentPhaseRead
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.composer.continuation_semantic_advisor_return import _ClassifyEndInvocationCapture
     from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.composer.turn_effects import BlobDeliveryAttempt, TurnEvidence
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer
     from elspeth.web.sessions.protocol import (
         SessionServiceProtocol,
     )
@@ -74,7 +81,9 @@ from elspeth.web.composer._compose_loop_carriers import (
     _CallModelOutcome,
     _ClassifyOutcome,
     _DispatchOutcome,
+    _EndCompletionDisposition,
     _PersistOutcome,
+    _TerminateOutcome,
     _ToolOutcome,
 )
 from elspeth.web.composer.advisor_checkpoint import (
@@ -91,6 +100,7 @@ from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.composition_completion import (
     CompositionCompletion,
     _append_interpretation_review_handoff_message,
+    _end_disposition_after_terminal_barriers,
     _with_advisor_gate_decision,
 )
 from elspeth.web.composer.continuation_message_builders import (
@@ -454,6 +464,35 @@ def _chat_ingress_inputs_for_compose(
 # so the mechanism can be reverted independently without touching the
 # threading that carries the injection index.
 _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE: Final[bool] = True
+
+
+@dataclass(frozen=True, slots=True)
+class _ClassifierCompletionContext:
+    """Live original inputs shared by inline and retained classifier END."""
+
+    dispatch: _DispatchOutcome
+    persist: _PersistOutcome | ColdPostBatchPersistData
+    turn_evidence: TurnEvidence
+    recorder: BufferingRecorder
+    progress: ComposerProgressSink | None
+    message: str
+    initial_version: int
+    deadline: float
+    runtime_preflight_cache: _RuntimePreflightCache
+    session_scope: str
+    session_id: str | None
+    user_id: str | None
+    mutation_success_seen: bool
+    repair_turns_used: int
+    composition_turns_used: int
+    discovery_turns_used: int
+    advisor_checkpoint_passes_used: int
+    session_operation_context: SessionOperationContext | None
+    plugin_snapshot: PluginAvailabilitySnapshot | None
+    advisor_review_state: _AdvisorReviewState | None
+    completion_gates: CompletionGateFacts | None
+    provider_owner: ProviderInvocationOwner | None
+    completion_capture: _ClassifyEndInvocationCapture | None
 
 
 class ComposerServiceImpl:
@@ -1031,7 +1070,7 @@ class ComposerServiceImpl:
         *,
         dispatch: _DispatchOutcome,
         turn_evidence: TurnEvidence,
-        persist: _PersistOutcome,
+        persist: _PersistOutcome | ColdPostBatchPersistData,
         llm_messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         recorder: BufferingRecorder,
@@ -1056,7 +1095,9 @@ class ComposerServiceImpl:
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
-    ) -> _ClassifyOutcome:
+        classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
+        completion_capture: _ClassifyEndInvocationCapture | None = None,
+    ) -> _ClassifyOutcome | ClassifyPostPrimary | ClassifySourceProofStop:
         """Phase P5 of the compose loop — anti-anchor + turn accounting.
 
         Three concerns share this phase because their decision flow is
@@ -1087,9 +1128,32 @@ class ComposerServiceImpl:
         turn_has_discovery = dispatch.turn_has_discovery
         all_cache_hits = dispatch.all_cache_hits
         persisted_tool_call_turn = persist.persisted_tool_call_turn
-        persisted_assistant_message_id = persist.persisted_assistant_message_id
-        persisted_assistant_content = persist.persisted_assistant_content
         failed_turn = persist.failed_turn
+        completion_context = _ClassifierCompletionContext(
+            dispatch=dispatch,
+            persist=persist,
+            turn_evidence=turn_evidence,
+            recorder=recorder,
+            progress=progress,
+            message=message,
+            initial_version=initial_version,
+            deadline=deadline,
+            runtime_preflight_cache=runtime_preflight_cache,
+            session_scope=session_scope,
+            session_id=session_id,
+            user_id=user_id,
+            mutation_success_seen=mutation_success_seen,
+            repair_turns_used=repair_turns_used,
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+            session_operation_context=session_operation_context,
+            plugin_snapshot=plugin_snapshot,
+            advisor_review_state=advisor_review_state,
+            completion_gates=completion_gates,
+            provider_owner=provider_owner,
+            completion_capture=completion_capture,
+        )
 
         # P4 and original failure/cancellation primacy have completed. Reuse
         # the current preview's observation without resolving the blob again:
@@ -1113,44 +1177,22 @@ class ComposerServiceImpl:
             if type(assessment) in (ProofUnavailable, MalformedSourceProofClaim):
                 source_stop = cast(ProofUnavailable | MalformedSourceProofClaim, assessment)
         if source_stop is not None:
-            stopped = await self._completion._terminate_source_proof(
-                proof=source_stop,
-                state=state,
-                assistant_message=dispatch.assistant_message,
-                turn_evidence=turn_evidence,
-                message=message,
-                session_id=session_id,
-                current_state_id=persist.current_state_id,
-                session_operation_context=session_operation_context,
-                user_id=user_id,
-                initial_version=initial_version,
-                session_scope=session_scope,
-                runtime_preflight_cache=runtime_preflight_cache,
-                last_runtime_preflight=last_runtime_preflight,
-                recorder=recorder,
-                progress=progress,
-                repair_turns_used=repair_turns_used,
-                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
-                advisor_review_state=advisor_review_state or _AdvisorReviewState(),
-                persisted_assistant_message_id=persisted_assistant_message_id,
-                persisted_assistant_content=persisted_assistant_content,
-                persisted_tool_call_turn=persisted_tool_call_turn,
-                plugin_snapshot=plugin_snapshot,
-                deadline=deadline,
-                composition_turns_used=composition_turns_used + int(turn_has_mutation),
-                discovery_turns_used=discovery_turns_used + int(turn_has_discovery and not turn_has_mutation),
-                failed_turn=failed_turn,
-                completion_gates=completion_gates,
-                provider_owner=provider_owner,
-            )
-            return _ClassifyOutcome(
-                action="return",
-                result=stopped.result,
-                composition_turns_delta=int(turn_has_mutation),
-                discovery_turns_delta=int(turn_has_discovery and not turn_has_mutation),
-                advisor_passes_delta=stopped.advisor_passes_delta,
-                publication_binding=stopped.publication_binding,
-            )
+            if classifier_primary_issuer is not None:
+                from elspeth.web.composer.continuation_classifier_handoff import (
+                    ClassifySourceProofStop,
+                    encode_classifier_source_stop_proof,
+                )
+
+                return ClassifySourceProofStop(
+                    source_checkpoint_id=classifier_primary_issuer.selected.checkpoint_id,
+                    source_cursor=classifier_primary_issuer.selected.stack.cursor,
+                    proof_json=encode_classifier_source_stop_proof(source_stop),
+                    composition_turns_used=composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    composition_turns_delta=int(turn_has_mutation),
+                    discovery_turns_delta=int(turn_has_discovery and not turn_has_mutation),
+                )
+            return await self._complete_classifier_source_stop(context=completion_context, proof=source_stop)
 
         # §7.7 anti-anchor hint: if the last 3 failed tool calls share the
         # same tool (with identical or different argument hashes), report
@@ -1322,15 +1364,26 @@ class ComposerServiceImpl:
                         ),
                     )
                     try:
-                        completion = await self._provider_gateway._call_llm_with_audit(
-                            selected_reply_messages,
-                            selected_reply_tools,
-                            timeout=remaining,
-                            recorder=recorder,
-                            provider_custody=self._new_primary_custody(provider_owner),
-                            prepared_input=reply_input,
-                        )
+                        if classifier_primary_issuer is None:
+                            completion = await self._provider_gateway._call_llm_with_audit(
+                                selected_reply_messages,
+                                selected_reply_tools,
+                                timeout=remaining,
+                                recorder=recorder,
+                                provider_custody=self._new_primary_custody(provider_owner),
+                                prepared_input=reply_input,
+                            )
+                        else:
+                            issued = await classifier_primary_issuer.invoke(
+                                branch="staged_review", prepared_input=reply_input, recorder=recorder, deadline=deadline
+                            )
+                            completion = issued.completion
                     except provider_failures:
+                        if classifier_primary_issuer is not None:
+                            # An entered physical attempt owns its original
+                            # failure; this branch cannot hide it and dispatch
+                            # an END call under the classifier's action clock.
+                            raise
                         # The call audit retains the failure; a trusted notice
                         # below reports the unavailable reply to the user.
                         reply = None
@@ -1339,7 +1392,10 @@ class ComposerServiceImpl:
                             completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
                         )
                         if recovery_result is not None:
-                            return _ClassifyOutcome(action="return", result=recovery_result)
+                            classified = _ClassifyOutcome(action="return", result=recovery_result)
+                            if completion_capture is not None:
+                                completion_capture.record_original_owned_terminal("owned_recovery", classified)
+                            return classified
                         reply = completion.message
                         if _reply_only_protocol_echo(
                             reply.content or "",
@@ -1349,146 +1405,31 @@ class ComposerServiceImpl:
                             reply = None
                         if reply is not None and not completion.tool_batch.calls and reply_delivery is not None:
                             turn_evidence.confirm_delivery(reply_delivery, recorder.llm_calls)
-                advisor_gate = None
-                if reply is not None:
-                    try:
-                        advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
-                            state=state,
-                            turn_evidence=turn_evidence,
-                            session_operation_context=session_operation_context,
-                            session_id=session_id,
-                            current_state_id=persist.current_state_id,
-                            assistant_message=reply,
-                            llm_messages=llm_messages,
-                            recorder=recorder,
-                            progress=progress,
-                            advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
-                            repair_turns_used=repair_turns_used,
-                            persisted_assistant_message_id=persisted_assistant_message_id,
-                            persisted_assistant_content=persisted_assistant_content,
-                            persisted_tool_call_turn=persisted_tool_call_turn,
-                            allow_repair_continue=False,
-                            runtime_preflight=runtime_result,
-                            user_message=message,
-                            user_id=user_id,
-                            runtime_preflight_cache=runtime_preflight_cache,
-                            initial_version=initial_version,
-                            session_scope=session_scope,
-                            plugin_snapshot=plugin_snapshot,
-                            advisor_review_state=advisor_review_state or _AdvisorReviewState(),
-                            deadline=deadline,
-                            completion_gates=completion_gates,
-                            provider_owner=provider_owner,
-                        )
-                    except _AdvisorCheckpointComposeDeadlineExpired:
-                        await self._completion._persist_withheld_reply(
-                            "compose_deadline_expired",
-                            reply.content or "",
-                            session_id=session_id,
-                            session_operation_context=session_operation_context,
-                        )
-                        raise ComposerConvergenceError.capture(
-                            max_turns=composition_turns_used + discovery_turns_used,
-                            budget_exhausted="timeout",
-                            state=state,
-                            initial_version=initial_version,
-                            tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
-                            llm_calls=recorder.llm_calls,
-                            failed_turn=failed_turn,
-                        ) from None
-                if advisor_gate is not None and advisor_gate.action == "return":
-                    if advisor_gate.result is None:
-                        raise InvariantError("Staged reply review omitted its terminal result")
-                    result = advisor_gate.result
-                else:
-                    result = await self._completion._surface_and_finalize_no_tools(
-                        session_operation_context=session_operation_context,
-                        assistant_message=reply if reply is not None else _AdmittedAssistantMessage(content=""),
-                        state=state,
-                        session_id=session_id,
-                        current_state_id=persist.current_state_id,
-                        progress=progress,
-                        recorder=recorder,
-                        initial_version=initial_version,
-                        user_id=user_id,
-                        last_runtime_preflight=runtime_result,
-                        runtime_preflight_cache=runtime_preflight_cache,
-                        session_scope=session_scope,
-                        message=message,
-                        mutation_success_seen=mutation_success_seen,
-                        repair_turns_used=repair_turns_used,
-                        plugin_snapshot=plugin_snapshot,
-                        deadline=deadline,
+                if classifier_primary_issuer is not None and reply is not None:
+                    if completion.tool_batch.calls:
+                        raise AuditIntegrityError("classifier handoff requires its actual committed no-tool reply")
+                    from elspeth.web.composer.continuation_classifier_handoff import (
+                        ClassifyPostPrimary,
+                        encode_classifier_runtime_preflight,
                     )
-                # ``_surface_and_finalize_no_tools`` now owns the announcement
-                # (with its outstanding-findings qualification) for the
-                # pending-handoff preflight shape on EVERY caller
-                # (elspeth-c5350d93fd). What is left here is the residue the
-                # shared tail cannot see: this branch's trigger is the TOOL
-                # BATCH — ``request_interpretation_review`` succeeded and
-                # terminated the batch — which is ground truth that a review was
-                # staged even when the preflight was not computed this turn
-                # (None), came back green, or came back red for an unrelated
-                # reason. The one exclusion is the pending-handoff shape: the
-                # shared tail in ``_surface_and_finalize_no_tools`` appends the
-                # suffix for exactly that shape, so this predicate is its exact
-                # complement — one side always announces the staged card, never
-                # both. Re-appending on the pending-handoff shape would emit the
-                # suffix TWICE and pass
-                # ``_enforce_augmentation_prefix_invariant`` silently, since a
-                # doubled suffix still keeps the prose as a strict prefix.
-                #
-                # Which SHAPE the announcement takes — and how it avoids
-                # stacking on a suffix the tail already appended on the
-                # cross-turn red arm — belongs to
-                # ``_announce_staged_review_handoff`` (elspeth-2ed41f0a4a R1).
-                handoff_result = (
-                    _announce_staged_review_handoff(
-                        result,
-                        (result.raw_assistant_content or "")
-                        if advisor_gate is not None and advisor_gate.action == "return"
-                        else reply.content
-                        if reply is not None
-                        else "",
+
+                    original = classifier_primary_issuer.result
+                    if original is None or original.completion is not completion:
+                        raise AuditIntegrityError("classifier handoff lost its original physical reply")
+                    return ClassifyPostPrimary(
+                        branch="staged_review",
+                        source_checkpoint_id=original.source_checkpoint_id,
+                        source_cursor=original.source_cursor,
+                        primary_effect_key=original.effect_key,
+                        primary_input_sha256=original.input_sha256,
+                        response=original.response.reference,
+                        runtime_preflight_json=encode_classifier_runtime_preflight(runtime_result),
+                        composition_turns_used=composition_turns_used,
+                        discovery_turns_used=discovery_turns_used,
+                        composition_turns_delta=int(turn_has_mutation),
+                        discovery_turns_delta=int(turn_has_discovery),
                     )
-                    if (result.runtime_preflight is None or not _is_pending_interpretation_handoff(result.runtime_preflight))
-                    else result
-                )
-                handoff_result = _with_advisor_gate_decision(
-                    handoff_result,
-                    completion_gates,
-                    result.advisor_gate_decision
-                    if advisor_gate is not None and advisor_gate.action == "return"
-                    else advisor_gate.advisor_gate_decision
-                    if advisor_gate is not None
-                    else None,
-                    advisor_gate.graph_review_identity if advisor_gate is not None else None,
-                )
-                if reply is None:
-                    handoff_result = replace(
-                        handoff_result,
-                        message=_no_tool_policy.compose_review_reply_unavailable_message(handoff_result.message),
-                        raw_assistant_content=(
-                            "" if handoff_result.raw_assistant_content is None else handoff_result.raw_assistant_content
-                        ),
-                    )
-                threaded = replace(
-                    handoff_result,
-                    repair_turns_used=repair_turns_used,
-                    persisted_assistant_message_id=persisted_assistant_message_id,
-                    persisted_assistant_content=persisted_assistant_content,
-                    persisted_tool_call_turn=persisted_tool_call_turn,
-                    # The fresh reply is not P4's persisted tool-call narration.
-                    persisted_assistant_matches_terminal_model_turn=False,
-                )
-                return _ClassifyOutcome(
-                    action="return",
-                    result=threaded,
-                    composition_turns_delta=1 if turn_has_mutation else 0,
-                    discovery_turns_delta=1 if turn_has_discovery else 0,
-                    advisor_passes_delta=advisor_gate.advisor_passes_delta if advisor_gate is not None else 0,
-                    publication_binding=advisor_gate.publication_binding if advisor_gate is not None else None,
-                )
+                return await self._complete_staged_classifier_reply(context=completion_context, reply=reply, runtime_result=runtime_result)
 
         # Classify turns. Discovery counts are diagnostic; the request deadline
         # and cancellation bound acquisition rather than a fixed page/tool count.
@@ -1519,12 +1460,16 @@ class ComposerServiceImpl:
                     failed_turn=failed_turn,
                     provider_owner=provider_owner,
                     prepared_input=final_input,
+                    classifier_primary_issuer=classifier_primary_issuer,
                 )
                 recovery_result = self._terminal_recovery_result(
                     completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
                 )
                 if recovery_result is not None:
-                    return _ClassifyOutcome(action="return", result=recovery_result)
+                    classified = _ClassifyOutcome(action="return", result=recovery_result)
+                    if completion_capture is not None:
+                        completion_capture.record_original_owned_terminal("owned_recovery", classified)
+                    return classified
                 self._enforce_tool_call_cap(
                     assistant_tool_calls=completion.tool_batch.calls,
                     state=state,
@@ -1539,118 +1484,43 @@ class ComposerServiceImpl:
                 if not completion.tool_batch.calls:
                     if final_delivery is not None:
                         turn_evidence.confirm_delivery(final_delivery, recorder.llm_calls)
-                    try:
-                        advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
+                    if classifier_primary_issuer is not None:
+                        from elspeth.web.composer.continuation_classifier_handoff import (
+                            ClassifyPostPrimary,
+                            encode_classifier_runtime_preflight,
+                        )
+
+                        original = classifier_primary_issuer.result
+                        if original is None or original.completion is not completion:
+                            raise AuditIntegrityError("classifier handoff lost its original physical reply")
+                        runtime_result = await self._preflight.turn_runtime_preflight(
                             state=state,
-                            turn_evidence=turn_evidence,
-                            session_operation_context=session_operation_context,
-                            session_id=session_id,
-                            current_state_id=persist.current_state_id,
-                            assistant_message=assistant_message,
-                            llm_messages=llm_messages,
-                            recorder=recorder,
-                            progress=progress,
-                            advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
-                            repair_turns_used=repair_turns_used,
-                            persisted_assistant_message_id=persisted_assistant_message_id,
-                            persisted_assistant_content=persisted_assistant_content,
-                            persisted_tool_call_turn=persisted_tool_call_turn,
-                            allow_repair_continue=False,
-                            user_message=message,
-                            runtime_preflight=await self._preflight.turn_runtime_preflight(
-                                state=state,
-                                user_id=user_id,
-                                session_id=session_id,
-                                last_runtime_preflight=last_runtime_preflight,
-                                runtime_preflight_cache=runtime_preflight_cache,
-                                initial_version=initial_version,
-                                session_scope=session_scope,
-                                recorder=recorder,
-                                plugin_snapshot=plugin_snapshot,
-                                session_operation_context=session_operation_context,
-                            ),
                             user_id=user_id,
+                            session_id=session_id,
+                            last_runtime_preflight=last_runtime_preflight,
                             runtime_preflight_cache=runtime_preflight_cache,
                             initial_version=initial_version,
                             session_scope=session_scope,
+                            recorder=recorder,
                             plugin_snapshot=plugin_snapshot,
-                            advisor_review_state=advisor_review_state or _AdvisorReviewState(),
-                            deadline=deadline,
-                            completion_gates=completion_gates,
-                            provider_owner=provider_owner,
-                        )
-                    except _AdvisorCheckpointComposeDeadlineExpired:
-                        # The model had already replied; the timeout envelope
-                        # carries no prose, so keep the finished reply.
-                        await self._completion._persist_withheld_reply(
-                            "compose_deadline_expired",
-                            assistant_message.content or "",
-                            session_id=session_id,
                             session_operation_context=session_operation_context,
                         )
-                        raise ComposerConvergenceError.capture(
-                            max_turns=new_composition_turns_used + discovery_turns_used,
-                            budget_exhausted="timeout",
-                            state=state,
-                            initial_version=initial_version,
-                            tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
-                            llm_calls=recorder.llm_calls,
-                            failed_turn=failed_turn,
-                        ) from None
-                    if advisor_gate.action == "return":
-                        advisor_result = advisor_gate.result
-                        return _ClassifyOutcome(
-                            action="return",
-                            result=advisor_result,
+                        return ClassifyPostPrimary(
+                            branch="composition_last_chance",
+                            source_checkpoint_id=original.source_checkpoint_id,
+                            source_cursor=original.source_cursor,
+                            primary_effect_key=original.effect_key,
+                            primary_input_sha256=original.input_sha256,
+                            response=original.response.reference,
+                            runtime_preflight_json=encode_classifier_runtime_preflight(runtime_result),
+                            composition_turns_used=composition_turns_used,
+                            discovery_turns_used=discovery_turns_used,
                             composition_turns_delta=1,
-                            advisor_passes_delta=advisor_gate.advisor_passes_delta,
+                            discovery_turns_delta=0,
                         )
-                    # B-4D-3 budget-exhaustion last-chance finalize is a SECOND
-                    # no-tool finalize path. Route it through the SHARED
-                    # ``_surface_and_finalize_no_tools`` (Task 7 HIGH-1) so the
-                    # backend PT auto-surface AND the fail-closed orphan gate are
-                    # UNIVERSAL — a prior mutation can leave a required PT review
-                    # orphaned, and this reply can no longer surface it through
-                    # tools. The loop persists any mutation BEFORE
-                    # classify (dispatch -> persist -> ``current_state_id =
-                    # persist.current_state_id`` -> classify), so ``state`` matches
-                    # ``persist.current_state_id`` and the create_pending gate
-                    # holds. Thread the already-consumed repair budget through
-                    # this alternate terminal return just as P2 does.
-                    result = await self._completion._surface_and_finalize_no_tools(
-                        session_operation_context=session_operation_context,
+                    return await self._complete_last_chance_classifier_reply(
+                        context=completion_context,
                         assistant_message=assistant_message,
-                        state=state,
-                        session_id=session_id,
-                        current_state_id=persist.current_state_id,
-                        progress=progress,
-                        recorder=recorder,
-                        initial_version=initial_version,
-                        user_id=user_id,
-                        last_runtime_preflight=last_runtime_preflight,
-                        runtime_preflight_cache=runtime_preflight_cache,
-                        session_scope=session_scope,
-                        message=message,
-                        mutation_success_seen=mutation_success_seen,
-                        repair_turns_used=repair_turns_used,
-                        plugin_snapshot=plugin_snapshot,
-                        deadline=deadline,
-                    )
-                    result = _with_advisor_gate_decision(
-                        result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
-                    )
-                    threaded = replace(
-                        result,
-                        repair_turns_used=repair_turns_used,
-                        persisted_assistant_message_id=persisted_assistant_message_id,
-                        persisted_assistant_content=persisted_assistant_content,
-                        persisted_tool_call_turn=persisted_tool_call_turn,
-                    )
-                    return _ClassifyOutcome(
-                        action="return",
-                        result=threaded,
-                        composition_turns_delta=1,
-                        publication_binding=advisor_gate.publication_binding,
                     )
                 raise ComposerConvergenceError.capture(
                     max_turns=new_composition_turns_used + discovery_turns_used,
@@ -1669,6 +1539,571 @@ class ComposerServiceImpl:
         # has its own per-compose budget above, so give the primary
         # model the returned guidance instead of charging discovery.
         return _ClassifyOutcome(action="continue")
+
+    async def _complete_classifier_source_stop(
+        self, *, context: _ClassifierCompletionContext, proof: ProofUnavailable | MalformedSourceProofClaim
+    ) -> _ClassifyOutcome:
+        """Resume the original source refusal without inventing a PRIMARY."""
+        turn_evidence = context.turn_evidence
+        recorder = context.recorder
+        progress = context.progress
+        message = context.message
+        initial_version = context.initial_version
+        deadline = context.deadline
+        runtime_preflight_cache = context.runtime_preflight_cache
+        session_scope = context.session_scope
+        session_id = context.session_id
+        user_id = context.user_id
+        repair_turns_used = context.repair_turns_used
+        composition_turns_used = context.composition_turns_used
+        discovery_turns_used = context.discovery_turns_used
+        advisor_checkpoint_passes_used = context.advisor_checkpoint_passes_used
+        session_operation_context = context.session_operation_context
+        plugin_snapshot = context.plugin_snapshot
+        advisor_review_state = context.advisor_review_state
+        completion_gates = context.completion_gates
+        provider_owner = context.provider_owner
+        dispatch, persist = context.dispatch, context.persist
+        state, last_runtime_preflight = dispatch.state, dispatch.last_runtime_preflight
+        turn_has_mutation, turn_has_discovery = dispatch.turn_has_mutation, dispatch.turn_has_discovery
+        persisted_assistant_message_id = persist.persisted_assistant_message_id
+        persisted_assistant_content = persist.persisted_assistant_content
+        persisted_tool_call_turn = persist.persisted_tool_call_turn
+        failed_turn = persist.failed_turn
+        source_stop = proof
+        stopped = await self._completion._terminate_source_proof(
+            proof=source_stop,
+            state=state,
+            assistant_message=dispatch.assistant_message,
+            turn_evidence=turn_evidence,
+            message=message,
+            session_id=session_id,
+            current_state_id=persist.current_state_id,
+            session_operation_context=session_operation_context,
+            user_id=user_id,
+            initial_version=initial_version,
+            session_scope=session_scope,
+            runtime_preflight_cache=runtime_preflight_cache,
+            last_runtime_preflight=last_runtime_preflight,
+            recorder=recorder,
+            progress=progress,
+            repair_turns_used=repair_turns_used,
+            advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+            advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+            plugin_snapshot=plugin_snapshot,
+            deadline=deadline,
+            composition_turns_used=composition_turns_used + int(turn_has_mutation),
+            discovery_turns_used=discovery_turns_used + int(turn_has_discovery and not turn_has_mutation),
+            failed_turn=failed_turn,
+            completion_gates=completion_gates,
+            provider_owner=provider_owner,
+        )
+        classified = _ClassifyOutcome(
+            action="return",
+            result=stopped.result,
+            composition_turns_delta=int(turn_has_mutation),
+            discovery_turns_delta=int(turn_has_discovery and not turn_has_mutation),
+            advisor_passes_delta=stopped.advisor_passes_delta,
+            publication_binding=stopped.publication_binding,
+        )
+        if context.completion_capture is not None:
+            context.completion_capture.record_original_owned_terminal("owned_refusal", classified, terminal=stopped)
+        return classified
+
+    async def resume_continuation_classifier_end(
+        self,
+        *,
+        pending: ClassifyPostPrimary | ClassifySourceProofStop,
+        runtime: RestoredContinuationRuntime,
+        dispatch: _DispatchOutcome,
+        persist: _PersistOutcome | ColdPostBatchPersistData,
+        primary_response: PrivateChunk | None,
+        completion_capture: _ClassifyEndInvocationCapture,
+        deadline: float,
+    ) -> _ClassifyOutcome:
+        """Run the original tail after its independently proved pending cut.
+
+        The caller admits the actual current pending source and original paid
+        response in SQL. These complete DATA inputs never grant replay or a
+        publication; the observer seals this invocation and SQL authenticates
+        its original model pass before accepting a clean returned result.
+        """
+        from elspeth.web.composer.continuation_classifier_handoff import (
+            ClassifyPostPrimary,
+            ClassifySourceProofStop,
+            decode_classifier_runtime_preflight,
+            decode_classifier_source_stop_proof,
+        )
+        from elspeth.web.composer.continuation_codec import (
+            PrivateChunk,
+            decode_continuation_response,
+            decode_retained_physical_audit_call,
+            verify_private_chunk,
+        )
+        from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchPersistData
+        from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+        from elspeth.web.composer.continuation_semantic_advisor_return import _ClassifyEndInvocationCapture
+        from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+
+        if (
+            type(runtime) is not RestoredContinuationRuntime
+            or type(pending) not in (ClassifyPostPrimary, ClassifySourceProofStop)
+            or runtime.materialization.service is not self
+            or type(dispatch) is not _DispatchOutcome
+            or type(persist) not in (_PersistOutcome, ColdPostBatchPersistData)
+            or dispatch.state is not runtime.live.state
+            or type(completion_capture) is not _ClassifyEndInvocationCapture
+            or runtime.bindings.session_operation_context is None
+            or runtime.bindings.required_work is None
+            or runtime.bindings.provider_owner is None
+            or runtime.bindings.required_work.running is not runtime.materialization.inventory.running
+            or runtime.bindings.provider_owner.required_work is not runtime.bindings.required_work
+            or type(deadline) not in (int, float)
+            or not math.isfinite(deadline)
+        ):
+            raise AuditIntegrityError("classifier END changed its actual runtime, work or original batch")
+        live, bindings = runtime.live, runtime.bindings
+        work = bindings.required_work
+        if work is None:
+            raise AuditIntegrityError("classifier END lost its original required work")
+        owner = work.coordinator.sql_deadline_owner
+        if type(owner) is not ContinuationSQLDeadlineOwner or owner.running is not runtime.materialization.inventory.running:
+            raise AuditIntegrityError("classifier END lost its original current action deadline owner")
+        sampled_at = time.monotonic()
+        deadline = min(deadline, bindings.deadline, sampled_at + owner.remaining_dispatch(monotonic_now=sampled_at))
+        context = _ClassifierCompletionContext(
+            dispatch=dispatch,
+            persist=persist,
+            turn_evidence=live.turn_evidence,
+            recorder=live.recorder,
+            progress=bindings.progress,
+            message=bindings.message,
+            initial_version=live.initial_version,
+            deadline=deadline,
+            runtime_preflight_cache=live.runtime_preflight_cache,
+            session_scope=bindings.session_scope,
+            session_id=bindings.session_id,
+            user_id=bindings.user_id,
+            mutation_success_seen=live.mutation_success_seen,
+            repair_turns_used=live.repair_turns_used,
+            composition_turns_used=pending.composition_turns_used,
+            discovery_turns_used=pending.discovery_turns_used,
+            advisor_checkpoint_passes_used=live.advisor_checkpoint_passes_used,
+            session_operation_context=bindings.session_operation_context,
+            plugin_snapshot=bindings.plugin_snapshot,
+            advisor_review_state=live.advisor_review_state,
+            completion_gates=bindings.completion_gates,
+            provider_owner=bindings.provider_owner,
+            completion_capture=completion_capture,
+        )
+        if type(pending) is ClassifySourceProofStop:
+            if primary_response is not None or (
+                pending.composition_turns_delta,
+                pending.discovery_turns_delta,
+            ) != (int(dispatch.turn_has_mutation), int(dispatch.turn_has_discovery and not dispatch.turn_has_mutation)):
+                raise AuditIntegrityError("classifier source stop changed its no-PRIMARY branch or original charge")
+            return await self._complete_classifier_source_stop(
+                context=context, proof=decode_classifier_source_stop_proof(pending.proof_json)
+            )
+        if type(pending) is not ClassifyPostPrimary or type(primary_response) is not PrivateChunk:
+            raise AuditIntegrityError("classifier END lost its original closed post-PRIMARY source")
+        verify_private_chunk(pending.response, primary_response.canonical)
+        if primary_response.reference != pending.response:
+            raise AuditIntegrityError("classifier END changed its original physical response reference")
+        completion = decode_continuation_response(primary_response)
+        audit = decode_retained_physical_audit_call(primary_response)
+        if (
+            completion.tool_batch.calls
+            or audit is None
+            or tuple(call for call in live.recorder.llm_calls if call.call_id == audit.call_id) != (audit,)
+        ):
+            raise AuditIntegrityError("classifier END lost its exact paid no-tool response and recorder source")
+        runtime_result = decode_classifier_runtime_preflight(pending.runtime_preflight_json)
+        if pending.branch == "staged_review":
+            if not _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes) or (
+                pending.composition_turns_delta,
+                pending.discovery_turns_delta,
+            ) != (int(dispatch.turn_has_mutation), int(dispatch.turn_has_discovery)):
+                raise AuditIntegrityError("classifier END changed its actual staged-review trigger")
+            return await self._complete_staged_classifier_reply(context=context, reply=completion.message, runtime_result=runtime_result)
+        if not dispatch.turn_has_mutation or pending.composition_turns_used + 1 < self._max_composition_turns:
+            raise AuditIntegrityError("classifier END changed its actual last-chance budget trigger")
+        return await self._complete_last_chance_classifier_reply(context=context, assistant_message=completion.message, retained=pending)
+
+    async def _complete_staged_classifier_reply(
+        self,
+        *,
+        context: _ClassifierCompletionContext,
+        reply: _AdmittedAssistantMessage | None,
+        runtime_result: ValidationResult | None,
+    ) -> _ClassifyOutcome:
+        """Run the original staged-reply tail under its actual END action."""
+        turn_evidence = context.turn_evidence
+        recorder = context.recorder
+        progress = context.progress
+        message = context.message
+        initial_version = context.initial_version
+        deadline = context.deadline
+        runtime_preflight_cache = context.runtime_preflight_cache
+        session_scope = context.session_scope
+        session_id = context.session_id
+        user_id = context.user_id
+        mutation_success_seen = context.mutation_success_seen
+        repair_turns_used = context.repair_turns_used
+        composition_turns_used = context.composition_turns_used
+        discovery_turns_used = context.discovery_turns_used
+        advisor_checkpoint_passes_used = context.advisor_checkpoint_passes_used
+        session_operation_context = context.session_operation_context
+        plugin_snapshot = context.plugin_snapshot
+        advisor_review_state = context.advisor_review_state
+        completion_gates = context.completion_gates
+        provider_owner = context.provider_owner
+        persist = context.persist
+        state = context.dispatch.state
+        persisted_assistant_message_id = persist.persisted_assistant_message_id
+        persisted_assistant_content = persist.persisted_assistant_content
+        persisted_tool_call_turn = persist.persisted_tool_call_turn
+        failed_turn = persist.failed_turn
+        turn_has_mutation = context.dispatch.turn_has_mutation
+        turn_has_discovery = context.dispatch.turn_has_discovery
+        advisor_gate = None
+        if reply is not None:
+            try:
+                advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
+                    state=state,
+                    turn_evidence=turn_evidence,
+                    session_operation_context=session_operation_context,
+                    session_id=session_id,
+                    current_state_id=persist.current_state_id,
+                    assistant_message=reply,
+                    llm_messages=None,
+                    recorder=recorder,
+                    progress=progress,
+                    advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                    repair_turns_used=repair_turns_used,
+                    persisted_assistant_message_id=persisted_assistant_message_id,
+                    persisted_assistant_content=persisted_assistant_content,
+                    persisted_tool_call_turn=persisted_tool_call_turn,
+                    allow_repair_continue=False,
+                    runtime_preflight=runtime_result,
+                    user_message=message,
+                    user_id=user_id,
+                    runtime_preflight_cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    plugin_snapshot=plugin_snapshot,
+                    advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                    deadline=deadline,
+                    completion_gates=completion_gates,
+                    provider_owner=provider_owner,
+                )
+            except _AdvisorCheckpointComposeDeadlineExpired:
+                await self._completion._persist_withheld_reply(
+                    "compose_deadline_expired",
+                    reply.content or "",
+                    session_id=session_id,
+                    session_operation_context=session_operation_context,
+                )
+                raise ComposerConvergenceError.capture(
+                    max_turns=composition_turns_used + discovery_turns_used,
+                    budget_exhausted="timeout",
+                    state=state,
+                    initial_version=initial_version,
+                    tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=failed_turn,
+                ) from None
+        if advisor_gate is not None and advisor_gate.action == "return":
+            if advisor_gate.result is None:
+                raise InvariantError("Staged reply review omitted its terminal result")
+            result = advisor_gate.result
+        else:
+            result = await self._completion._surface_and_finalize_no_tools(
+                session_operation_context=session_operation_context,
+                assistant_message=reply if reply is not None else _AdmittedAssistantMessage(content=""),
+                state=state,
+                session_id=session_id,
+                current_state_id=persist.current_state_id,
+                progress=progress,
+                recorder=recorder,
+                initial_version=initial_version,
+                user_id=user_id,
+                last_runtime_preflight=runtime_result,
+                runtime_preflight_cache=runtime_preflight_cache,
+                session_scope=session_scope,
+                message=message,
+                mutation_success_seen=mutation_success_seen,
+                repair_turns_used=repair_turns_used,
+                plugin_snapshot=plugin_snapshot,
+                deadline=deadline,
+            )
+        # ``_surface_and_finalize_no_tools`` now owns the announcement
+        # (with its outstanding-findings qualification) for the
+        # pending-handoff preflight shape on EVERY caller
+        # (elspeth-c5350d93fd). What is left here is the residue the
+        # shared tail cannot see: this branch's trigger is the TOOL
+        # BATCH — ``request_interpretation_review`` succeeded and
+        # terminated the batch — which is ground truth that a review was
+        # staged even when the preflight was not computed this turn
+        # (None), came back green, or came back red for an unrelated
+        # reason. The one exclusion is the pending-handoff shape: the
+        # shared tail in ``_surface_and_finalize_no_tools`` appends the
+        # suffix for exactly that shape, so this predicate is its exact
+        # complement — one side always announces the staged card, never
+        # both. Re-appending on the pending-handoff shape would emit the
+        # suffix TWICE and pass
+        # ``_enforce_augmentation_prefix_invariant`` silently, since a
+        # doubled suffix still keeps the prose as a strict prefix.
+        #
+        # Which SHAPE the announcement takes — and how it avoids
+        # stacking on a suffix the tail already appended on the
+        # cross-turn red arm — belongs to
+        # ``_announce_staged_review_handoff`` (elspeth-2ed41f0a4a R1).
+        handoff_result = (
+            _announce_staged_review_handoff(
+                result,
+                (result.raw_assistant_content or "")
+                if advisor_gate is not None and advisor_gate.action == "return"
+                else reply.content
+                if reply is not None
+                else "",
+            )
+            if (result.runtime_preflight is None or not _is_pending_interpretation_handoff(result.runtime_preflight))
+            else result
+        )
+        handoff_result = _with_advisor_gate_decision(
+            handoff_result,
+            completion_gates,
+            result.advisor_gate_decision
+            if advisor_gate is not None and advisor_gate.action == "return"
+            else advisor_gate.advisor_gate_decision
+            if advisor_gate is not None
+            else None,
+            advisor_gate.graph_review_identity if advisor_gate is not None else None,
+        )
+        if reply is None:
+            handoff_result = replace(
+                handoff_result,
+                message=_no_tool_policy.compose_review_reply_unavailable_message(handoff_result.message),
+                raw_assistant_content=("" if handoff_result.raw_assistant_content is None else handoff_result.raw_assistant_content),
+            )
+        threaded = replace(
+            handoff_result,
+            repair_turns_used=repair_turns_used,
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+            # The fresh reply is not P4's persisted tool-call narration.
+            persisted_assistant_matches_terminal_model_turn=False,
+        )
+        classified = _ClassifyOutcome(
+            action="return",
+            result=threaded,
+            composition_turns_delta=1 if turn_has_mutation else 0,
+            discovery_turns_delta=1 if turn_has_discovery else 0,
+            advisor_passes_delta=advisor_gate.advisor_passes_delta if advisor_gate is not None else 0,
+            publication_binding=advisor_gate.publication_binding if advisor_gate is not None else None,
+        )
+        if context.completion_capture is not None:
+            if advisor_gate is None:
+                context.completion_capture.record_original_owned_terminal("owned_refusal", classified)
+            else:
+                terminal = _TerminateOutcome(
+                    action="return",
+                    result=threaded,
+                    advisor_passes_delta=advisor_gate.advisor_passes_delta,
+                    advisor_review_state=advisor_gate.advisor_review_state,
+                    publication_binding=advisor_gate.publication_binding,
+                    end_disposition=(
+                        _end_disposition_after_terminal_barriers(threaded, advisor_gate)
+                        if advisor_gate.action == "fall_through"
+                        else _EndCompletionDisposition.BLOCKED
+                    ),
+                )
+                context.completion_capture.record_original_model_end(terminal, classified)
+        return classified
+
+    async def _complete_last_chance_classifier_reply(
+        self,
+        *,
+        context: _ClassifierCompletionContext,
+        assistant_message: _AdmittedAssistantMessage,
+        retained: ClassifyPostPrimary | None = None,
+    ) -> _ClassifyOutcome:
+        """Run the original last-chance tail after its paid reply settled."""
+        turn_evidence = context.turn_evidence
+        recorder = context.recorder
+        progress = context.progress
+        message = context.message
+        initial_version = context.initial_version
+        deadline = context.deadline
+        runtime_preflight_cache = context.runtime_preflight_cache
+        session_scope = context.session_scope
+        session_id = context.session_id
+        user_id = context.user_id
+        mutation_success_seen = context.mutation_success_seen
+        repair_turns_used = context.repair_turns_used
+        composition_turns_used = context.composition_turns_used
+        discovery_turns_used = context.discovery_turns_used
+        advisor_checkpoint_passes_used = context.advisor_checkpoint_passes_used
+        session_operation_context = context.session_operation_context
+        plugin_snapshot = context.plugin_snapshot
+        advisor_review_state = context.advisor_review_state
+        completion_gates = context.completion_gates
+        provider_owner = context.provider_owner
+        persist = context.persist
+        state = context.dispatch.state
+        persisted_assistant_message_id = persist.persisted_assistant_message_id
+        persisted_assistant_content = persist.persisted_assistant_content
+        persisted_tool_call_turn = persist.persisted_tool_call_turn
+        failed_turn = persist.failed_turn
+        last_runtime_preflight = context.dispatch.last_runtime_preflight
+        new_composition_turns_used = composition_turns_used + 1
+        try:
+            if retained is None:
+                runtime_result = await self._preflight.turn_runtime_preflight(
+                    state=state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    last_runtime_preflight=last_runtime_preflight,
+                    runtime_preflight_cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    recorder=recorder,
+                    plugin_snapshot=plugin_snapshot,
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                from elspeth.web.composer.continuation_classifier_handoff import decode_classifier_runtime_preflight
+
+                runtime_result = decode_classifier_runtime_preflight(retained.runtime_preflight_json)
+            advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
+                state=state,
+                turn_evidence=turn_evidence,
+                session_operation_context=session_operation_context,
+                session_id=session_id,
+                current_state_id=persist.current_state_id,
+                assistant_message=assistant_message,
+                llm_messages=None,
+                recorder=recorder,
+                progress=progress,
+                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                repair_turns_used=repair_turns_used,
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+                allow_repair_continue=False,
+                user_message=message,
+                runtime_preflight=runtime_result,
+                user_id=user_id,
+                runtime_preflight_cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                plugin_snapshot=plugin_snapshot,
+                advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                deadline=deadline,
+                completion_gates=completion_gates,
+                provider_owner=provider_owner,
+            )
+        except _AdvisorCheckpointComposeDeadlineExpired:
+            # The model had already replied; the timeout envelope
+            # carries no prose, so keep the finished reply.
+            await self._completion._persist_withheld_reply(
+                "compose_deadline_expired",
+                assistant_message.content or "",
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
+            raise ComposerConvergenceError.capture(
+                max_turns=new_composition_turns_used + discovery_turns_used,
+                budget_exhausted="timeout",
+                state=state,
+                initial_version=initial_version,
+                tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                llm_calls=recorder.llm_calls,
+                failed_turn=failed_turn,
+            ) from None
+        if advisor_gate.action == "return":
+            advisor_result = advisor_gate.result
+            classified = _ClassifyOutcome(
+                action="return",
+                result=advisor_result,
+                composition_turns_delta=1,
+                advisor_passes_delta=advisor_gate.advisor_passes_delta,
+                publication_binding=advisor_gate.publication_binding,
+            )
+            if context.completion_capture is not None:
+                terminal = _TerminateOutcome(
+                    action="return",
+                    result=advisor_result,
+                    advisor_passes_delta=advisor_gate.advisor_passes_delta,
+                    advisor_review_state=advisor_gate.advisor_review_state,
+                    publication_binding=advisor_gate.publication_binding,
+                )
+                context.completion_capture.record_original_model_end(terminal, classified)
+            return classified
+        # B-4D-3 budget-exhaustion last-chance finalize is a SECOND
+        # no-tool finalize path. Route it through the SHARED
+        # ``_surface_and_finalize_no_tools`` (Task 7 HIGH-1) so the
+        # backend PT auto-surface AND the fail-closed orphan gate are
+        # UNIVERSAL — a prior mutation can leave a required PT review
+        # orphaned, and this reply can no longer surface it through
+        # tools. The loop persists any mutation BEFORE
+        # classify (dispatch -> persist -> ``current_state_id =
+        # persist.current_state_id`` -> classify), so ``state`` matches
+        # ``persist.current_state_id`` and the create_pending gate
+        # holds. Thread the already-consumed repair budget through
+        # this alternate terminal return just as P2 does.
+        result = await self._completion._surface_and_finalize_no_tools(
+            session_operation_context=session_operation_context,
+            assistant_message=assistant_message,
+            state=state,
+            session_id=session_id,
+            current_state_id=persist.current_state_id,
+            progress=progress,
+            recorder=recorder,
+            initial_version=initial_version,
+            user_id=user_id,
+            last_runtime_preflight=last_runtime_preflight,
+            runtime_preflight_cache=runtime_preflight_cache,
+            session_scope=session_scope,
+            message=message,
+            mutation_success_seen=mutation_success_seen,
+            repair_turns_used=repair_turns_used,
+            plugin_snapshot=plugin_snapshot,
+            deadline=deadline,
+        )
+        result = _with_advisor_gate_decision(
+            result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
+        )
+        threaded = replace(
+            result,
+            repair_turns_used=repair_turns_used,
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+        )
+        classified = _ClassifyOutcome(
+            action="return",
+            result=threaded,
+            composition_turns_delta=1,
+            advisor_passes_delta=advisor_gate.advisor_passes_delta,
+            publication_binding=advisor_gate.publication_binding,
+        )
+        if context.completion_capture is not None:
+            terminal = _TerminateOutcome(
+                action="return",
+                result=threaded,
+                advisor_passes_delta=advisor_gate.advisor_passes_delta,
+                advisor_review_state=advisor_gate.advisor_review_state,
+                publication_binding=advisor_gate.publication_binding,
+                end_disposition=_end_disposition_after_terminal_barriers(threaded, advisor_gate),
+            )
+            context.completion_capture.record_original_model_end(terminal, classified)
+        return classified
 
     async def advance_continuation_phase(
         self,
@@ -1717,6 +2152,7 @@ class ComposerServiceImpl:
         failed_turn: FailedTurnMetadata | None,
         provider_owner: ProviderInvocationOwner | None = None,
         prepared_input: PreparedProviderInput | None = None,
+        classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
     ) -> _AdmittedLLMCompletion:
         """Preserve the completion-returning deadline boundary."""
         outcome = await self._call_llm_outcome_before_deadline(
@@ -1731,6 +2167,7 @@ class ComposerServiceImpl:
             failed_turn=failed_turn,
             provider_owner=provider_owner,
             prepared_input=prepared_input,
+            classifier_primary_issuer=classifier_primary_issuer,
         )
         return outcome.completion
 
@@ -1748,6 +2185,7 @@ class ComposerServiceImpl:
         failed_turn: FailedTurnMetadata | None,
         provider_owner: ProviderInvocationOwner | None = None,
         prepared_input: PreparedProviderInput | None = None,
+        classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
     ) -> _CallModelOutcome:
         """Call the LLM with a per-call timeout derived from the deadline.
 
@@ -1786,7 +2224,7 @@ class ComposerServiceImpl:
         def _captured_llm_calls() -> tuple[ComposerLLMCall, ...]:
             return recorder.llm_calls if recorder is not None else ()
 
-        provider_custody = self._new_primary_custody(provider_owner)
+        provider_custody = self._new_primary_custody(provider_owner) if classifier_primary_issuer is None else None
         attempt = 0
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -1801,6 +2239,17 @@ class ComposerServiceImpl:
                     failed_turn=failed_turn,
                 )
             try:
+                if classifier_primary_issuer is not None:
+                    if type(prepared_input) is not PreparedProviderInput or type(recorder) is not BufferingRecorder:
+                        raise AuditIntegrityError("classifier PRIMARY lost its original prepared request or recorder")
+                    issued = await classifier_primary_issuer.invoke(
+                        branch="composition_last_chance",
+                        prepared_input=prepared_input,
+                        recorder=recorder,
+                        deadline=deadline,
+                        credential_state=state,
+                    )
+                    return issued.outcome
                 if attempt and prepared_input is not None:
                     prepared_input = self._provider_gateway.reprepare_input(prepared_input)
                     messages = prepared_input.evidence.messages
@@ -1871,6 +2320,10 @@ class ComposerServiceImpl:
                 attach_llm_calls(exc, recorder)
                 raise
             except OpenAIError as exc:
+                if classifier_primary_issuer is not None:
+                    # Its one actual attempt has durable custody; original
+                    # failure propagation must precede the legacy retry loop.
+                    raise
                 failure = classify_provider_failure(exc)
                 if failure is not None and failure.kind == "timeout":
                     raise ComposerConvergenceError.capture(

@@ -33,6 +33,7 @@ from elspeth.web.composer.continuation_env_inventory import (
     materialize_continuation_env_inventory,
 )
 from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchPersistData, project_cold_finished_batch_data
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
 from elspeth.web.composer.continuation_message_family_recipes import ControlResultMessageRecipe
@@ -73,6 +74,7 @@ from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
 from elspeth.web.sessions.locking import locked_session_transaction
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.state import CompositionState
 
@@ -126,7 +128,16 @@ class ContinuationLivePhases:
     terminal_completion: TerminalServiceCompletion | None = None
     # The warm post-batch source: this batch's dispatch fold, its committed
     # P4 publication and the batch entry state, for the post-batch owner.
-    finished_batch: tuple[_DispatchOutcome, _PersistOutcome, CompositionState] | None = None
+    finished_batch: tuple[_DispatchOutcome, _PersistOutcome | ColdPostBatchPersistData, CompositionState] | None = None
+    action_clock: ContinuationActionClock | None = None
+
+    def bind_action_clock(self, clock: ContinuationActionClock) -> None:
+        """Bind the driver's original action clock, without starting a new one."""
+        from elspeth.web.composer.continuation_clock import ContinuationActionClock
+
+        if type(clock) is not ContinuationActionClock or self.work.running is None or self.lease.closed:
+            raise AuditIntegrityError("phase action clock lost its actual driver/work/lease owner")
+        self.action_clock = clock
 
     def observe_stop(self) -> None:
         self.cancellation_requested.set()
@@ -379,7 +390,47 @@ class ContinuationLivePhases:
             raise AuditIntegrityError("live phase read lost its actual fresh selection")
         if finish_read is not None:
             finish_read.require_selection(selected, inventory)
-        return _CurrentPhaseRead(self.runtime, selected, inventory, finish_read, self.lease)
+        phase_read = _CurrentPhaseRead(self.runtime, selected, inventory, finish_read, self.lease)
+
+        return phase_read
+
+    async def restore_finished_batch(
+        self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None
+    ) -> _CurrentPhaseRead:
+        """Project clean applied P4 DATA only for an actual post-batch consumer."""
+        if phase_read is None:
+            phase_read = await self._current_phase_read(selected)
+        self._require_phase_read(selected, phase_read)
+        runtime, inventory = phase_read.runtime, phase_read.inventory
+        running = inventory.running
+        if self.finished_batch is None:
+            from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cut
+
+            if is_applied_batch_cut(selected):
+                from elspeth.web.sessions.continuation_iteration_return import (
+                    AppliedIterationP4Data,
+                    read_iteration_applied_p4_result_on_connection,
+                )
+
+                def read_applied() -> AppliedIterationP4Data:
+                    with locked_session_transaction(self.authority._engine, str(running.claim.session_id)) as conn:
+                        return read_iteration_applied_p4_result_on_connection(conn, running, selected=selected, inventory=inventory)
+
+                applied = await _registered_read(self.work, AppliedIterationP4Data, read_applied)
+                primary = await self._primary_for_phase(runtime, inventory, selected)
+                if type(primary) is not RetainedPrimaryPhaseData:
+                    raise AuditIntegrityError("cold finished batch cannot replace a live paid PRIMARY owner")
+                context = await self._tool_context(runtime, phase_read=phase_read)
+                finished = project_cold_finished_batch_data(
+                    runtime=runtime,
+                    selected=selected,
+                    primary=primary,
+                    p4_result=applied.result,
+                    iteration_stage=applied.stage,
+                    context=context,
+                )
+                self.finished_batch = finished.dispatch, finished.persist, finished.pre_batch_state
+        return phase_read
 
     async def _retain(
         self, captured: CapturedContinuationRuntime, inventory: CurrentContinuationEnvInventory, transition: BatchTransition

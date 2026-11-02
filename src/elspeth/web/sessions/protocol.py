@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
     from elspeth.web.sessions.continuation_p4 import P4WriterObservation
     from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
+    from elspeth.web.sessions.continuation_publication_projection import PublicationProjectionInput
     from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
     from elspeth.web.sessions.continuation_tool_failure import CommittedContinuationFailure
     from elspeth.web.sessions.graph_recovery import (
@@ -3149,6 +3150,7 @@ class SessionServiceProtocol(Protocol):
         recovery: GraphRecoverySettlement | None = None,
         provider_audit_calls: tuple[ComposerLLMCall, ...] = (),
         publication_result: ComposerResult | None = None,
+        publication_projection: PublicationProjectionInput | None = None,
     ) -> ComposerOperationRecord: ...
 
     async def load_graph_recovery_context(

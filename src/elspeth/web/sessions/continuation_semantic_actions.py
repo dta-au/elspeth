@@ -1040,39 +1040,18 @@ def read_original_semantic_review_for_advisor_on_connection(
     source, decision_json = original_candidate.semantic_source, original_candidate.semantic_decision_json
     if source is None or decision_json is None:
         raise AuditIntegrityError("semantic Stop candidate lacks its original paid Review source")
-    sid = str(session_id)
-    checkpoint_rows = tuple(
-        conn.execute(
-            select(events.c.sequence, events.c.payload_chunk_key).where(
-                events.c.session_id == sid, events.c.operation_id == operation_id, events.c.tag == "checkpoint"
-            )
-        ).all()
-    )
-    installed_cursors: list[int] = []
-    for row in checkpoint_rows:
-        payload = read_chunk(conn, session_id=sid, operation_id=operation_id, key=row.payload_chunk_key).decode("utf-8", errors="strict")
-        event, error = parse_json_strict(payload)
-        if error is not None or type(event) is not dict or canonical_json(event) != payload:
-            raise AuditIntegrityError("semantic Stop found a malformed original Review checkpoint")
-        if event.get("kind") == "semantic_decision_extended" and event.get("effect_key") == source.effect_key:
-            installed_cursors.append(row.sequence)
-    if len(installed_cursors) != 1:
-        raise AuditIntegrityError("semantic Stop lost its one original installed Review decision")
-    installed = _historical_snapshot(conn, sid, operation_id, cursor=installed_cursors[0])
-    admission = _reprove_installed_snapshot(conn, session_id, operation_id, installed, source.effect_key)
-    if (
-        type(admission.action) is not ReviewContinuationAction
-        or admission.action_key is None
-        or admission.paid.source != source
-        or admission.paid.decision_json != decision_json
-    ):
-        raise AuditIntegrityError("semantic Stop changed its original paid Review action")
-    owner_key = semantic_end_effect_key(original_candidate.response, admission.action_key)
-    from elspeth.web.sessions.continuation_semantic_review_result import read_original_semantic_review_result_on_connection
+    from elspeth.web.sessions.continuation_semantic_review_result import locate_original_semantic_review_result_on_connection
 
-    review = read_original_semantic_review_result_on_connection(
-        conn, session_id=session_id, operation_id=operation_id, review_effect_key=owner_key
+    review = locate_original_semantic_review_result_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        semantic_effect_key=source.effect_key,
+        response_digest=original_candidate.response.digest,
     )
+    if review.original_source != source or review.original_decision_json != decision_json:
+        raise AuditIntegrityError("semantic Stop changed its original paid Review source or decision")
+    owner_key = semantic_end_effect_key(original_candidate.response, review.action_key)
     completed_root = decode_continuation_snapshot(review.completed.payload_json)
     if len(completed_root.frames) != 2:
         raise AuditIntegrityError("semantic Stop lost its original completed Review END")
@@ -1081,9 +1060,7 @@ def read_original_semantic_review_for_advisor_on_connection(
         type(completed_end) is not EndFrame
         or completed_end.candidate != encode_end_candidate(original_candidate).reference
         or review.owner_effect_key != owner_key
-        or review.action_key != admission.action_key
         or review.semantic_effect_key != source.effect_key
-        or review.completed.cursor <= installed.cursor
     ):
         raise AuditIntegrityError("semantic Stop changed its one original completed Review result")
     return review

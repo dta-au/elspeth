@@ -9,6 +9,7 @@ import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer import continuation_audit_buffer as audit_buffer
 from elspeth.web.composer.continuation_audit_buffer import (
     _deduplicate_request,
     _prepared_request_text,
@@ -121,12 +122,22 @@ def test_warm_transfer_reparses_mutated_return_values_and_rejects_changed_digest
         _transfer_prepared_request_text(damaged, _RecorderBlocks())
 
 
-def test_aggregate_oversize_skips_cache_without_changing_valid_projection():
+def test_aggregate_oversize_skips_cache_without_changing_valid_projection(monkeypatch):
     canonical = canonical_json(
         {"schema_version": "x", "capture_boundary": "x", "messages": [{"role": "user", "content": "x" * 600_000}], "tools": None}
     )
     request = _receipt(canonical)
     cold = _deduplicate_request(request, _RecorderBlocks())
-    with retention_stage_memo_scope() as memo:
-        assert _deduplicate_request(request, _RecorderBlocks()) == cold
-        assert memo.cached_entry_count == 0
+    produced = []
+
+    def observe_request_text(key):
+        produced.append(key)
+        return _prepared_request_text(key)
+
+    monkeypatch.setattr(audit_buffer, "_prepared_request_text", observe_request_text)
+    with retention_stage_memo_scope():
+        for _ in range(2):
+            assert _deduplicate_request(request, _RecorderBlocks()) == cold
+    # The complete request key plus proof still exceeds its original bound.
+    # Independent bounded block-hash DATA may be retained by another family.
+    assert produced == [RecorderRequestTextKey(canonical, 1_048_576)] * 2

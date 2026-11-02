@@ -430,7 +430,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
     from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
-    from elspeth.web.composer.protocol import ComposerResult
+    from elspeth.web.composer.protocol import ComposerResult, PipelineCommitIntent
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -438,6 +438,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
     from elspeth.web.sessions.continuation_p4 import P4WriterObservation
     from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
+    from elspeth.web.sessions.continuation_publication_projection import PipelinePublicationReplayData, PublicationProjectionInput
     from elspeth.web.sessions.continuation_tool_failure import CommittedContinuationFailure, ContinuationFailureObservation
 
 
@@ -4747,57 +4748,173 @@ class SessionServiceImpl:
             type(item) is not PreparedInterpretationEventDraft for item in prepared_interpretations
         ):
             _refuse_required_sql(required_work, TypeError("pipeline replay requires an exact prepared tuple"))
-        sid, pid = str(authority.row.session_id), str(authority.row.id)
+        from elspeth.web.sessions.continuation_publication_projection import PipelinePublicationReplayData
+
+        replay = PipelinePublicationReplayData(authority.row.id, authority.proposal.draft_hash, prepared_interpretations)
 
         def _sync() -> PipelineProposalSettlementResult:
             with self._engine.connect() as conn:
-                row = conn.execute(
-                    select(composition_proposals_table).where(
-                        composition_proposals_table.c.session_id == sid,
-                        composition_proposals_table.c.id == pid,
-                    )
-                ).one_or_none()
-                creations = conn.execute(
-                    select(proposal_events_table).where(
-                        proposal_events_table.c.session_id == sid,
-                        proposal_events_table.c.proposal_id == pid,
-                        proposal_events_table.c.event_type == "proposal.created",
-                    )
-                ).all()
-                if row is None or len(creations) != 1:
-                    raise AuditIntegrityError("pipeline replay creation authority missing or ambiguous")
-                current = _restore_authoritative_pipeline_proposal(
-                    row=_proposal_record_from_row(row), creation_event=_proposal_event_record_from_row(creations[0])
-                )
-                if current != authority or current.row.status != "committed" or current.row.committed_state_id is None:
-                    raise AuditIntegrityError("pipeline replay proposal authority changed")
-                _verify_pipeline_lifecycle_authority(conn, service=self, authority=current)
-                candidate_row = conn.execute(
-                    select(composition_states_table).where(
-                        composition_states_table.c.session_id == sid,
-                        composition_states_table.c.id == str(current.row.committed_state_id),
-                    )
-                ).one_or_none()
-                terminals = conn.execute(
-                    select(proposal_events_table).where(
-                        proposal_events_table.c.session_id == sid,
-                        proposal_events_table.c.proposal_id == pid,
-                        proposal_events_table.c.event_type == "proposal.accepted",
-                    )
-                ).all()
-                if candidate_row is None or len(terminals) != 1:
-                    raise AuditIntegrityError("pipeline replay committed authority missing or ambiguous")
-                return self._read_pipeline_settlement_replay(
-                    conn,
-                    authority=current,
-                    accepted_payload=terminals[0].payload,
-                    candidate=self._row_to_state_record(candidate_row),
-                    prepared_interpretations=prepared_interpretations,
-                    transition_assistant=None,
-                    verify_requested_assistant=False,
+                return self.read_pipeline_publication_replay_on_connection(
+                    conn, session_id=authority.row.session_id, replay=replay, expected_authority=authority
                 )
 
         return await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
+
+    def read_pipeline_publication_replay_on_connection(
+        self,
+        conn: Connection,
+        *,
+        session_id: UUID,
+        replay: PipelinePublicationReplayData,
+        expected_authority: AuthoritativePipelineProposal | None = None,
+    ) -> PipelineProposalSettlementResult:
+        """Replay the original accepted cohort on the caller's actual connection."""
+        from elspeth.web.sessions.continuation_publication_projection import PipelinePublicationReplayData
+
+        if type(replay) is not PipelinePublicationReplayData or type(session_id) is not UUID or conn.engine is not self._engine:
+            raise AuditIntegrityError("pipeline publication replay changed its actual SQL/source owners")
+        replay.__post_init__()
+        sid, pid = str(session_id), str(replay.proposal_id)
+        row = conn.execute(
+            select(composition_proposals_table).where(
+                composition_proposals_table.c.session_id == sid, composition_proposals_table.c.id == pid
+            )
+        ).one_or_none()
+        creations = conn.execute(
+            select(proposal_events_table).where(
+                proposal_events_table.c.session_id == sid,
+                proposal_events_table.c.proposal_id == pid,
+                proposal_events_table.c.event_type == "proposal.created",
+            )
+        ).all()
+        if row is None or len(creations) != 1:
+            raise AuditIntegrityError("pipeline replay creation authority missing or ambiguous")
+        current = _restore_authoritative_pipeline_proposal(
+            row=_proposal_record_from_row(row), creation_event=_proposal_event_record_from_row(creations[0])
+        )
+        if (
+            (expected_authority is not None and current != expected_authority)
+            or current.proposal.draft_hash != replay.draft_hash
+            or current.row.status != "committed"
+            or current.row.committed_state_id is None
+        ):
+            raise AuditIntegrityError("pipeline replay proposal authority changed")
+        _verify_pipeline_lifecycle_authority(conn, service=self, authority=current)
+        candidate_row = conn.execute(
+            select(composition_states_table).where(
+                composition_states_table.c.session_id == sid, composition_states_table.c.id == str(current.row.committed_state_id)
+            )
+        ).one_or_none()
+        terminals = conn.execute(
+            select(proposal_events_table).where(
+                proposal_events_table.c.session_id == sid,
+                proposal_events_table.c.proposal_id == pid,
+                proposal_events_table.c.event_type == "proposal.accepted",
+            )
+        ).all()
+        if candidate_row is None or len(terminals) != 1:
+            raise AuditIntegrityError("pipeline replay committed authority missing or ambiguous")
+        return self._read_pipeline_settlement_replay(
+            conn,
+            authority=current,
+            accepted_payload=terminals[0].payload,
+            candidate=self._row_to_state_record(candidate_row),
+            prepared_interpretations=replay.prepared_interpretations,
+            transition_assistant=None,
+            verify_requested_assistant=False,
+        )
+
+    def read_auto_commit_revocation_on_connection(
+        self,
+        conn: Connection,
+        *,
+        running: ComposerOperationRunning,
+        intent: PipelineCommitIntent,
+        actor: str,
+        required: str = "auto_commit",
+        current: str = "explicit_approve",
+    ) -> ComposerRevocationSQLResult:
+        """Read the original sealed outcome; never insert missing evidence."""
+        from elspeth.contracts.composer_audit import ComposerToolStatus
+        from elspeth.web.composer.protocol import PipelineCommitIntent
+
+        if (
+            conn.engine is not self._engine
+            or type(intent) is not PipelineCommitIntent
+            or required != "auto_commit"
+            or current != "explicit_approve"
+        ):
+            raise AuditIntegrityError("revocation replay changed its actual source/SQL owners")
+        sid, pid = str(running.claim.session_id), str(intent.proposal_id)
+        proposal = conn.execute(
+            select(composition_proposals_table).where(
+                composition_proposals_table.c.session_id == sid, composition_proposals_table.c.id == pid
+            )
+        ).one_or_none()
+        creations = conn.execute(
+            select(proposal_events_table).where(
+                proposal_events_table.c.session_id == sid,
+                proposal_events_table.c.proposal_id == pid,
+                proposal_events_table.c.event_type == "proposal.created",
+            )
+        ).all()
+        rows = conn.execute(
+            select(proposal_events_table).where(
+                proposal_events_table.c.session_id == sid,
+                proposal_events_table.c.proposal_id == pid,
+                proposal_events_table.c.event_type == "auto_commit.revoked",
+            )
+        ).all()
+        if proposal is None or len(creations) != 1 or len(rows) != 1:
+            raise AuditIntegrityError("revocation replay lost its unique original proposal/creation/outcome")
+        authority = _restore_authoritative_pipeline_proposal(
+            row=_proposal_record_from_row(proposal), creation_event=_proposal_event_record_from_row(creations[0])
+        )
+        _verify_pipeline_lifecycle_authority(conn, service=self, authority=authority)
+        record = _proposal_event_record_from_row(rows[0])
+        try:
+            payload = ComposerRevocationEvidence.model_validate(deep_thaw(record.payload))
+        except (ValidationError, TypeError, ValueError) as error:
+            raise AuditIntegrityError("revocation replay lost its closed original evidence") from error
+        if (
+            authority.creation_schema != "pipeline_proposal_created.v3"
+            or authority.row.status != "pending"
+            or authority.proposal.draft_hash != intent.draft_hash
+            or authority.row.user_message_id is None
+            or authority.composer_operation != payload.composer_operation
+            or payload.proposal_id != pid
+            or payload.user_message_id != str(authority.row.user_message_id)
+            or payload.tool_call_id != authority.row.tool_call_id
+            or record.actor != actor
+            or payload.required_trust_mode != required
+            or payload.current_trust_mode != current
+        ):
+            raise AuditIntegrityError("revocation replay substituted its original intent/actor/proposal binding")
+        verify_historical_proposal_composer_binding_on_connection(
+            conn,
+            binding=payload.composer_operation,
+            session_id=running.claim.session_id,
+            user_message_id=authority.row.user_message_id,
+            actor=authority.creation_actor,
+        )
+        require_composer_settlement_actor_on_connection(conn, running, actor=actor)
+        dispatch = PipelineDispatchAuditBinding(
+            payload.dispatch.tool_call_id,
+            payload.dispatch.tool_name,
+            ComposerToolStatus.SUCCESS,
+            payload.dispatch.arguments_hash,
+            payload.dispatch.result_hash,
+        )
+        hashes = _persisted_pipeline_dispatch_content_hashes(conn, session_id=sid, dispatch=dispatch)
+        if (
+            dispatch.tool_call_id != authority.row.tool_call_id
+            or dispatch.arguments_hash != semantic_redacted_pipeline_arguments_hash(authority.row.arguments_redacted_json)
+            or len(hashes) != 1
+        ):
+            raise AuditIntegrityError("revocation replay lost its actual unique successful pipeline dispatch")
+        result = ComposerRevocationSQLResult(record, ComposerRevocationExpected(sid, pid, actor, payload))
+        decode_composer_revocation_result(result)
+        return result
 
     async def get_pipeline_dispatch_recovery(
         self,
@@ -9676,6 +9793,7 @@ class SessionServiceImpl:
         recovery: GraphRecoverySettlement | None = None,
         provider_audit_calls: tuple[ComposerLLMCall, ...] = (),
         publication_result: ComposerResult | None = None,
+        publication_projection: PublicationProjectionInput | None = None,
     ) -> ComposerOperationRecord:
         """Publish final assistant/audit/snapshot/result in one exact COMPOSE transaction."""
         if (assistant is None) == (assistant_record is None):
@@ -9873,7 +9991,28 @@ class SessionServiceImpl:
                     )
                 response = MessageWithStateResponse.model_validate(response.model_dump(mode="python"), strict=True)
                 attempted_response = response
-                result = settle_composer_operation_on_connection(conn, running, outcome=response, publication_result=publication_result)
+                projection_actor = None
+                if publication_projection is not None:
+                    from elspeth.web.composer.protocol import ComposerResult
+                    from elspeth.web.sessions.continuation_publication_projection import PublicationProjectionInput
+
+                    if (
+                        type(publication_projection) is not PublicationProjectionInput
+                        or type(publication_result) is not ComposerResult
+                        or current_job.actor_user_id is None
+                    ):
+                        raise AuditIntegrityError("terminal projection lost its actual original result or job actor")
+                    projection_actor = f"user:{current_job.actor_user_id}"
+                result = settle_composer_operation_on_connection(
+                    conn,
+                    running,
+                    outcome=response,
+                    publication_result=publication_result,
+                    publication_projection=publication_projection,
+                    publication_assistant=message if publication_projection is not None else None,
+                    publication_service=self if publication_projection is not None else None,
+                    publication_actor=projection_actor,
+                )
             # Telemetry is after commit and cannot change the stored terminal.
             for draft in active_drafts:
                 record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)

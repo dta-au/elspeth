@@ -1,6 +1,7 @@
 """Actual read returns borrow only their original finite disposition reserve."""
 
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass, replace
 
 import pytest
@@ -182,6 +183,62 @@ async def test_finish_failure_keeps_original_error_and_resets_scopes(operation_s
 async def test_ordinary_source_cannot_enter_read_disposition(operation_store):
     running, owner, _signal = _owners(operation_store)
     owner.begin_action(owner.policy.actions.read, started_at=time.monotonic())
-    ticket = _coordinator(running, owner).reserve(RequiredWorkSource.CONTINUATION_STATE_SQL)
-    with pytest.raises(AuditIntegrityError, match="exact registered"):
+    coordinator = _coordinator(running, owner)
+    ticket = coordinator.reserve(RequiredWorkSource.CONTINUATION_STATE_SQL)
+    with pytest.raises(AuditIntegrityError, match="exact registered") as raised:
         await run_required_read_finish_once(ticket, _actual_read, lambda produced: produced)
+    assert ticket.complete and ticket.errors == (raised.value,)
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("setup", "message"), (("missing_owner", "exact registered"), ("wrong_action", "original begun read")))
+async def test_read_setup_refusal_closes_only_unsubmitted_sql_ticket(operation_store, setup, message):
+    running, owner, _signal = _owners(operation_store)
+    if setup == "missing_owner":
+        coordinator = _coordinator(running, None)
+    else:
+        owner.begin_action(owner.policy.actions.primary, started_at=time.monotonic())
+        coordinator = _coordinator(running, owner)
+    ticket = coordinator.reserve(RequiredWorkSource.CONTINUATION_READ_RESULT_SQL)
+    calls = []
+
+    def produce():
+        calls.append("produce")
+        return _actual_read()
+
+    def finish(produced):
+        calls.append("finish")
+        return produced
+
+    with pytest.raises(AuditIntegrityError, match=message) as raised:
+        await run_required_read_finish_once(ticket, produce, finish)
+    assert ticket.complete and ticket.errors == (raised.value,)
+    assert calls == []
+    coordinator.assert_completed()
+    with pytest.raises(AuditIntegrityError, match="cannot be reused"):
+        await run_required_read_finish_once(ticket, produce, finish)
+    assert ticket.errors == (raised.value,) and calls == []
+
+
+@pytest.mark.asyncio
+async def test_read_setup_refusal_preserves_an_already_bound_future(operation_store):
+    running, owner, _signal = _owners(operation_store)
+    owner.begin_action(owner.policy.actions.primary, started_at=time.monotonic())
+    coordinator = _coordinator(running, owner)
+    ticket = coordinator.reserve(RequiredWorkSource.CONTINUATION_READ_RESULT_SQL)
+    future: Future[object] = Future()
+    ticket.bind_future(future)
+    calls = []
+
+    def produce():
+        calls.append("produce")
+        return _actual_read()
+
+    with pytest.raises(AuditIntegrityError, match="begun read"):
+        await run_required_read_finish_once(ticket, produce, lambda produced: produced)
+    assert not ticket.complete and ticket.errors == () and not future.done()
+    assert calls == []
+    future.set_result(None)
+    ticket.observe_actual_outcome()
+    coordinator.assert_completed()

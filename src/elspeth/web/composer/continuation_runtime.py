@@ -763,6 +763,23 @@ def _capture_owners(
     frames[index] = changed
     added: tuple[PrivateChunk, ...] = (messages, tools, state, evidence, transcript, audit, caches, iteration)
     batch_indexes = tuple(i for i, value in enumerate(frames) if type(value) is ToolBatchFrame)
+    if batch_indexes and data is not None and data.batch.phase == "complete":
+        from elspeth.web.composer.continuation_evidence_application_data import require_selected_applied_batch_chunk
+
+        if len(batch_indexes) != 1 or shelf.application_entry is None:
+            raise AuditIntegrityError("runtime capture lost its one complete applied batch source")
+        batch_index = batch_indexes[0]
+        applied_frame = frames[batch_index]
+        if type(applied_frame) is not ToolBatchFrame or applied_frame.phase != "result_retained":
+            raise AuditIntegrityError("runtime capture changed its actual applied batch frame")
+        require_selected_applied_batch_chunk(
+            runtime_chunk(selected, applied_frame.accumulator), evidence=source.admitted_evidence, env_ref_names=names
+        )
+        applied = encode_private_chunk(
+            codec="composer.applied-p4-batch.v2", canonical=shelf.application_entry.graph_json, env_ref_names=names
+        )
+        frames[batch_index] = applied_frame.model_copy(update={"accumulator": applied.reference})
+        added = (*added, applied)
     if batch_indexes and data is not None and data.batch.phase not in ("p4_pending", "complete"):
         captured_graph = admitted.graph
         if captured_graph is None:

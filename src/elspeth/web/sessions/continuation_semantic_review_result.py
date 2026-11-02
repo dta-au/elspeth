@@ -29,7 +29,7 @@ from elspeth.web.composer.advisor_audit import (
 )
 from elspeth.web.composer.advisor_decision import AdvisorGateDecision
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
-from elspeth.web.composer.continuation import ComposeFrame, EndFrame
+from elspeth.web.composer.continuation import ComposeFrame, ContinuationActionSource, EndFrame
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     decode_continuation_snapshot,
@@ -61,6 +61,7 @@ from elspeth.web.sessions.continuation import (
     retain_action_execution_receipt_on_connection,
 )
 from elspeth.web.sessions.continuation_end import EndReviewExecution
+from elspeth.web.sessions.continuation_end_pass_source import read_original_accepted_end_pass_on_connection
 from elspeth.web.sessions.continuation_semantic_actions import (
     installed_action_json,
     read_original_dispatched_semantic_review_on_connection,
@@ -186,6 +187,8 @@ class SemanticReviewCommitted:
     action_key: str
     semantic_effect_key: str
     outcome: Literal["clean", "blocked"]
+    original_source: ContinuationActionSource
+    original_decision_json: str
 
 
 def _commit_chunk_key(canonical: str) -> str:
@@ -218,6 +221,20 @@ def _require_original_clean_end_pass_audit(
     message_id: str | None = None,
 ) -> str:
     """Read the actual persisted model pass used by the shared END gate."""
+    if message_id is not None:
+        try:
+            original_session_id = UUID(session_id)
+        except ValueError as error:
+            raise AuditIntegrityError("semantic Review result lost its original session identity") from error
+        if str(original_session_id) != session_id:
+            raise AuditIntegrityError("semantic Review result changed its original session identity")
+        return read_original_accepted_end_pass_on_connection(
+            conn,
+            session_id=original_session_id,
+            message_id=message_id,
+            pass_index=pass_index,
+            publication_binding=publication_binding,
+        ).message_id
     query = select(chat_messages).where(
         chat_messages.c.session_id == session_id,
         chat_messages.c.role == "audit",
@@ -741,4 +758,76 @@ def read_original_semantic_review_result_on_connection(
         action_key=commit.action_key,
         semantic_effect_key=commit.semantic_effect_key,
         outcome=commit.outcome,
+        original_source=admission.paid.source,
+        original_decision_json=admission.paid.decision_json,
     )
+
+
+def locate_original_semantic_review_result_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    semantic_effect_key: str,
+    response_digest: str,
+) -> SemanticReviewCommitted:
+    """Locate original Review DATA, then run its complete cold proof once.
+
+    Closed result chunks are only locators. The selected effect and its paid
+    source, bridge, action, END result and receipt are all proved by the cold
+    reader before any of their data is returned.
+    """
+    if (
+        type(session_id) is not UUID
+        or type(operation_id) is not str
+        or type(semantic_effect_key) is not str
+        or type(response_digest) is not str
+        or len(response_digest) != 64
+        or any(digit not in "0123456789abcdef" for digit in response_digest)
+    ):
+        raise TypeError("semantic Review locator requires its exact original source and response")
+    sid = str(session_id)
+    rows = conn.execute(
+        select(effects.c.effect_key, effects.c.result_chunk_key).where(
+            effects.c.session_id == sid,
+            effects.c.operation_id == operation_id,
+            effects.c.effect_key.like("end:review:%"),
+            effects.c.disposition == "committed",
+        )
+    ).all()
+    matches: list[str] = []
+    for row in rows:
+        if type(row.result_chunk_key) is not str or not row.result_chunk_key.startswith("semantic-review-result:"):
+            raise AuditIntegrityError("semantic Review locator found an unbound committed result")
+        raw = read_chunk(conn, session_id=sid, operation_id=operation_id, key=row.result_chunk_key)
+        canonical = raw.decode("utf-8", errors="strict")
+        codec = conn.execute(
+            select(chunks.c.codec).where(
+                chunks.c.session_id == sid,
+                chunks.c.operation_id == operation_id,
+                chunks.c.chunk_key == row.result_chunk_key,
+            )
+        ).scalar_one_or_none()
+        if codec != "composer.semantic-review-result.v1" or _commit_chunk_key(canonical) != row.result_chunk_key:
+            raise AuditIntegrityError("semantic Review locator changed an original private result chunk")
+        try:
+            commit = _ReviewResultCommit.model_validate_json(canonical, strict=True)
+        except ValidationError as error:
+            raise AuditIntegrityError("semantic Review locator found a malformed closed result") from error
+        if (
+            canonical_json(commit.model_dump(mode="json")) != canonical
+            or commit.session_id != session_id
+            or commit.operation_id != operation_id
+            or commit.owner_effect_key != row.effect_key
+        ):
+            raise AuditIntegrityError("semantic Review locator changed an original result identity")
+        if commit.semantic_effect_key == semantic_effect_key and commit.candidate_digest == response_digest:
+            matches.append(row.effect_key)
+    if len(matches) != 1:
+        raise AuditIntegrityError("semantic Review locator lost its one original completed result")
+    review = read_original_semantic_review_result_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, review_effect_key=matches[0]
+    )
+    if review.semantic_effect_key != semantic_effect_key:
+        raise AuditIntegrityError("semantic Review locator changed its original paid source")
+    return review

@@ -78,6 +78,8 @@ from elspeth.web.composer import (
 from elspeth.web.composer import continuation_composition_initialization as composition_initialization
 from elspeth.web.composer.continuation import PrivateChunkRef
 from elspeth.web.continuation_retention_memo import (
+    CanonicalTextEncodingKey,
+    CanonicalTextProof,
     CredentialInputToken,
     CredentialPolicyKey,
     CredentialScanKey,
@@ -102,16 +104,16 @@ _CREDENTIAL_REQUEST = credential_guard._retention_credential_finding.__code__
 _STATE_REQUEST = credential_guard._retention_state_options_finding.__code__
 _LOW_CODE_OBJECTS = (
     (continuation_codec._decode_continuation_snapshot_uncached.__code__, "snapshot_work"),
-    (continuation_codec._verify_private_chunk_canonical.__code__, "chunk_work"),
+    (continuation_codec._private_chunk_canonical_text_bytes.__code__, "chunk_work"),
     (credential_material.find_credential_material.__code__, "detector_work"),
 )
 _LOW_CODES = {id(code): label for code, label in _LOW_CODE_OBJECTS}
 _PARSE = json_parser.parse_json_strict.__code__
 _STRICT_PARSE = json_parser.parse_json_strict
-_CHUNK_PRODUCER = continuation_codec._verify_private_chunk_canonical
+_CHUNK_PRODUCER = continuation_codec._private_chunk_canonical_text_bytes
 _CHUNK_PUBLIC = continuation_codec.verify_private_chunk
-_CHUNK_QUERY = RetentionStageMemo.private_chunk
-_CHUNK_VALUE = retention_memo._chunk_value
+_CHUNK_QUERY = RetentionStageMemo.canonical_text_proof
+_CHUNK_VALUE = _CHUNK_QUERY
 _CHUNK_REFERENCE = continuation_codec._private_chunk_memo_reference
 _CHUNK_WORK_CODE = _CHUNK_PRODUCER.__code__
 _CHUNK_QUERY_CODE = _CHUNK_QUERY.__code__
@@ -2739,6 +2741,31 @@ def _direct_call_site(
     return range(call.offset, instructions[index + 1].offset), call.positions.lineno
 
 
+def _direct_target_call_sites(
+    code: CodeType, symbol: str, *, load_op: str = "LOAD_GLOBAL", arguments: int, expected: int
+) -> tuple[tuple[range, int], ...]:
+    """Bind actual callee positions, excluding argument/tuple loads of that name."""
+    instructions = tuple(dis.get_instructions(code))
+    sites = []
+    for load in instructions:
+        named = load.opname == load_op and load.argval == symbol
+        combined = load_op == "LOAD_FAST" and load.opname == "LOAD_FAST_LOAD_FAST" and type(load.argval) is tuple and symbol in load.argval
+        if not (named or combined):
+            continue
+        for index, call in enumerate(instructions):
+            if call.opname != "CALL" or (call.positions.lineno, call.positions.col_offset) != (
+                load.positions.lineno,
+                load.positions.col_offset,
+            ):
+                continue
+            assert call.arg == arguments and call.positions.lineno is not None, "original direct target signature changed"
+            site = (range(call.offset, instructions[index + 1].offset), call.positions.lineno)
+            assert site not in sites, "original direct target has duplicate load ownership"
+            sites.append(site)
+    assert len(sites) == expected, "original direct target callsites changed"
+    return tuple(sites)
+
+
 def _structure_row_callback_site() -> tuple[frozenset[int], int, int]:
     """One original six-argument listener CALL and its two-local assignment."""
     code = _STRUCTURE_SINGLE_CONTEXT.__code__
@@ -2807,7 +2834,7 @@ _TITLE_REJECT_SITE = _direct_call_site(_TITLE_SHAPE, "reject_credential_material
 _TITLE_FIND_SITE = _direct_call_site(_TITLE_REJECT, "find_credential_material", arguments=1)
 _SNAPSHOT_SOURCE_SITE = _direct_call_site(_LOAD_SNAPSHOT, "decode_continuation_snapshot", arguments=1, load_op="LOAD_FAST")
 _CHUNK_SOURCE_SITE = _direct_call_site(_LOAD_CHUNKS, "verify_private_chunk", arguments=2)
-_CHUNK_PARSE_SITE = _direct_call_site(continuation_codec._verify_private_chunk_canonical.__code__, "parse_json_strict", arguments=1)
+_CHUNK_PARSE_SITE = _direct_call_site(_CHUNK_WORK_CODE, "parse_json_strict", arguments=1)
 _SNAPSHOT_PARSE_SITE = _direct_call_site(
     continuation_codec._decode_continuation_snapshot_uncached.__code__, "parse_json_strict", arguments=1
 )
@@ -2823,13 +2850,15 @@ _CHUNK_SUCCESS_RETURNS = frozenset(
 )
 _SNAPSHOT_DECODE_BYTES_SITE = _direct_call_site(_LOAD_SNAPSHOT, "decode", arguments=2, load_op="LOAD_ATTR", keywords=("errors",))
 _CHUNK_DECODE_BYTES_SITE = _direct_call_site(_LOAD_CHUNKS, "decode", arguments=2, load_op="LOAD_ATTR", keywords=("errors",))
-_CHUNK_LENGTH_SITE = _direct_call_site(_CHUNK_REQUEST, "len", arguments=1)
-_CHUNK_DIGEST_SITE = _direct_call_site(_CHUNK_REQUEST, "sha256", arguments=1)
+# Two real encoded-buffer branches (canonical-only and cold fallback), plus
+# the retained-proof length check. Both direct SHA branches stay observable.
+_CHUNK_LENGTH_SITES = _direct_target_call_sites(_CHUNK_REQUEST, "len", arguments=1, expected=3)
+_CHUNK_DIGEST_SITES = _direct_target_call_sites(_CHUNK_REQUEST, "sha256", arguments=1, expected=2)
 _SNAPSHOT_WORK_SITE = _direct_call_site(_SNAPSHOT_VALUE_CODE, "producer", arguments=1, load_op="LOAD_FAST")
-_CHUNK_WORK_SITE = _direct_call_site(_CHUNK_VALUE_CODE, "producer", arguments=1, load_op="LOAD_FAST")
+(_CHUNK_WORK_SITE,) = _direct_target_call_sites(_CHUNK_VALUE_CODE, "producer", arguments=1, load_op="LOAD_FAST", expected=1)
 
 
-def _artifact_query_site(code: CodeType, attribute: str, family: ArtifactFamily) -> tuple[range, int]:
+def _artifact_query_site(code: CodeType, attribute: str, family: ArtifactFamily, *, arguments: int = 2) -> tuple[range, int]:
     """Select the outer query CALL, not its nested complete-key CALL."""
     instructions = tuple(dis.get_instructions(code))
     loads = [item for item in instructions if item.opname == "LOAD_ATTR" and item.argval == attribute]
@@ -2841,7 +2870,7 @@ def _artifact_query_site(code: CodeType, attribute: str, family: ArtifactFamily)
         if item.opname == "CALL"
         and (item.positions.lineno, item.positions.col_offset) == (load.positions.lineno, load.positions.col_offset)
     ]
-    assert len(calls) == 1 and calls[0][1].arg == 2, f"{family} artifact original query callsite changed"
+    assert len(calls) == 1 and calls[0][1].arg == arguments, f"{family} artifact original query callsite changed"
     index, call = calls[0]
     assert call.positions.lineno is not None
     return range(call.offset, instructions[index + 1].offset), call.positions.lineno
@@ -2852,7 +2881,7 @@ def _snapshot_query_site() -> tuple[range, int]:
 
 
 _SNAPSHOT_QUERY_SITE = _snapshot_query_site()
-_CHUNK_QUERY_SITE = _artifact_query_site(_CHUNK_REQUEST, "private_chunk", "chunk")
+_CHUNK_QUERY_SITE = _artifact_query_site(_CHUNK_REQUEST, "canonical_text_proof", "chunk", arguments=3)
 
 
 def _snapshot_source_utf8_extent(encoded: str) -> int:
@@ -3197,7 +3226,9 @@ assert _CONTEXT_POLICY_KEY is not None, "provider context policy lost its closed
 def _safe_key(key: object) -> bool:
     if type(key) is SnapshotDecodeKey:
         return type(key.encoded) is str
-    if type(key) is PrivateChunkVerificationKey:
+    if type(key) in (PrivateChunkVerificationKey, CanonicalTextEncodingKey):
+        if type(key) is CanonicalTextEncodingKey and (type(key.max_utf8_bytes) is not int or key.max_utf8_bytes != _PRIVATE_UTF8_LIMIT):
+            return False
         reference = key.reference
         if type(reference) is not PrivateChunkRef or type(key.canonical) is not str:
             return False
@@ -5454,15 +5485,15 @@ class RetentionMemoTrace:
         return (
             continuation_codec.verify_private_chunk is _CHUNK_PUBLIC
             and _CHUNK_PUBLIC.__code__ is _CHUNK_REQUEST
-            and RetentionStageMemo.private_chunk is _CHUNK_QUERY
+            and RetentionStageMemo.canonical_text_proof is _CHUNK_QUERY
             and _CHUNK_QUERY.__code__ is _CHUNK_QUERY_CODE
-            and retention_memo._chunk_value is _CHUNK_VALUE
+            and RetentionStageMemo.canonical_text_proof is _CHUNK_VALUE
             and _CHUNK_VALUE.__code__ is _CHUNK_VALUE_CODE
-            and continuation_codec._verify_private_chunk_canonical is _CHUNK_PRODUCER
+            and continuation_codec._private_chunk_canonical_text_bytes is _CHUNK_PRODUCER
             and _CHUNK_PRODUCER.__code__ is _CHUNK_WORK_CODE
             and continuation_codec._private_chunk_memo_reference is _CHUNK_REFERENCE
             and _CHUNK_REFERENCE.__code__ is _CHUNK_REFERENCE_CODE
-            and continuation_codec.PrivateChunkVerificationKey is PrivateChunkVerificationKey
+            and continuation_codec.CanonicalTextEncodingKey is CanonicalTextEncodingKey
             and continuation_codec.PrivateChunkRef is PrivateChunkRef
             and continuation_codec.parse_json_strict is _STRICT_PARSE
             and json_parser.parse_json_strict is _STRICT_PARSE
@@ -5480,7 +5511,7 @@ class RetentionMemoTrace:
         if family == "snapshot":
             return key.encoded if type(key) is SnapshotDecodeKey and type(key.encoded) is str else None
         assert family == "chunk"
-        return key.canonical if type(key) is PrivateChunkVerificationKey and _safe_key(key) else None
+        return key.canonical if type(key) in (PrivateChunkVerificationKey, CanonicalTextEncodingKey) and _safe_key(key) else None
 
     @staticmethod
     def _artifact_record(record: MemoInspection, family: ArtifactFamily) -> tuple[bool, int]:
@@ -5617,7 +5648,7 @@ class RetentionMemoTrace:
             ):
                 errors.append(f"{family} artifact {noun} lost its original body/callsite/globals")
                 return
-            ancestor = parent.f_back
+            ancestor = parent if family == "chunk" else parent.f_back
             for _ in range(64):
                 if ancestor is None or ancestor.f_code is query_code:
                     break
@@ -5648,7 +5679,7 @@ class RetentionMemoTrace:
                 or parent.f_locals.get("producer") is not producer
                 or ancestor.f_locals.get("key") is not key
                 or ancestor.f_locals.get("self") is not memo
-                or frame.f_locals.get("encoded" if family == "snapshot" else "canonical") is not text
+                or (frame.f_locals.get("encoded") is not text if family == "snapshot" else frame.f_locals.get("key") is not key)
                 or not self._artifact_input_matches(key, high, family)
                 or state.memo_id != id(memo)
                 or state.thread_id != get_ident()
@@ -6472,16 +6503,18 @@ class RetentionMemoTrace:
             if code is _CHUNK_REQUEST:
                 if callable_ is builtins.len:
                     channel = "chunk_length"
-                    site = _CHUNK_LENGTH_SITE
+                    sites = _CHUNK_LENGTH_SITES
                 elif callable_ is _SHA256:
                     channel = "chunk_digest"
-                    site = _CHUNK_DIGEST_SITE
+                    sites = _CHUNK_DIGEST_SITES
                 else:
                     return
-                if not self._at_site(frame, _CHUNK_REQUEST, site):
+                if not any(self._at_site(frame, _CHUNK_REQUEST, site) for site in sites):
                     self._byte_error("chunk binding lost its original callsite", frame, self._byte_threads.get(get_ident()))
                     return
-                if operand is not frame.f_locals.get("encoded"):
+                proof = frame.f_locals.get("proof")
+                encoded = proof.encoded if type(proof) is CanonicalTextProof else frame.f_locals.get("encoded")
+                if operand is not encoded:
                     self._byte_error("chunk binding operand differs from its native buffer", frame, self._byte_threads.get(get_ident()))
                     return
                 owner = self._frames.get(id(frame))
@@ -6670,7 +6703,7 @@ class RetentionMemoTrace:
                         "snapshot"
                         if type(key) is SnapshotDecodeKey
                         else "chunk"
-                        if type(key) is PrivateChunkVerificationKey
+                        if type(key) in (PrivateChunkVerificationKey, CanonicalTextEncodingKey)
                         else "credential"
                     )
                     if record.family not in (expected_family, "state"):

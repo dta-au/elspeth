@@ -15,7 +15,30 @@ CONTRACTS = {
     "elspeth.web.composer.service:ComposerServiceImpl._new_primary_custody": "def _new_primary_custody(self, provider_owner: ProviderInvocationOwner | None) -> ProviderCallCustody | None:\n    if provider_owner is None:\n        return None\n    if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():\n        raise AuditIntegrityError('Primary invocation owner belongs to another exact service')\n    return provider_owner.mint(ProviderInvocationFamily.PRIMARY)",
     "elspeth.web.composer.advisor_checkpoint:AdvisorCheckpointOwner._new_advisor_custody": "def _new_advisor_custody(self, provider_owner: ProviderInvocationOwner) -> ProviderCallCustody:\n    if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():\n        raise AuditIntegrityError('Advisor invocation owner belongs to another exact service')\n    return provider_owner.mint(ProviderInvocationFamily.ADVISOR)",
     "elspeth.web.execution.routes:create_execution_router.evaluate_run_diagnostics": "@router.post('/api/runs/{run_id}/diagnostics/evaluate', response_model=RunDiagnosticsEvaluationResponse)\nasync def evaluate_run_diagnostics(run_id: UUID, request: Request, user: Annotated[UserIdentity, Depends(require_pipeline_user)], limit: int=Query(50, ge=1, le=100), service: ExecutionService=Depends(_get_execution_service)) -> RunDiagnosticsEvaluationResponse:\n    \"\"\"Ask the configured LLM to explain the current diagnostics snapshot.\"\"\"\n    run = await _verify_run_ownership(run_id, user, request)\n    rate_limiter = await get_rate_limiter(request)\n    await rate_limiter.check(user.user_id)\n    try:\n        status = await _load_run_status_with_accounting(run_id, app=request.app, service=service)\n    except _RunStatusNotFoundError:\n        raise _run_not_found_http() from None\n    except (ValidationError, _RunStatusIntegrityError) as exc:\n        raise _run_integrity_http(exc) from exc\n    try:\n        diagnostics = await run_sync_in_worker(load_run_diagnostics_for_settings, request.app.state.settings, run_id=status.run_id, landscape_run_id=status.landscape_run_id, run_status=status.status, cancel_requested=status.cancel_requested, limit=limit)\n    except RunDiagnosticsAuditUnavailableError as exc:\n        raise HTTPException(status_code=503, detail={'error_type': 'run_diagnostics_audit_unavailable', 'landscape_run_id': exc.landscape_run_id, 'audit_location': exc.audit_location}) from exc\n    composer: ComposerService = request.app.state.composer_service\n    settings: WebSettings = request.app.state.settings\n    recorder = BufferingRecorder()\n    audit_authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=run.session_id, state_id=run.state_id)\n\n    async def _persist_diagnostics_llm_calls(*, plugin_crash_pending: bool) -> None:\n        compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(run.session_id))\n        async with compose_lock:\n            await _persist_run_diagnostics_llm_calls(request.app.state.session_service, audit_authority, recorder.llm_calls, plugin_crash_pending=plugin_crash_pending)\n    try:\n        session_service: SessionServiceProtocol = request.app.state.session_service\n        async with await SessionOperationLease.acquire(session_service.session_operation_authority, session_id=run.session_id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id=session_service.session_operation_owner_instance_id, lease_seconds=session_service.session_operation_lease_seconds) as diagnostics_lease:\n            coordinator = RequiredWorkCoordinator(RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, diagnostics_lease.context, invocation_id=str(uuid4())))\n            owner = ProviderInvocationOwner(service=session_service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))\n            try:\n                explanation = await composer.explain_run_diagnostics(llm_safe_diagnostics_snapshot(diagnostics), recorder=recorder, session_operation_context=diagnostics_lease.context, provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY))\n            finally:\n                coordinator.assert_completed()\n    except PromptGuardRefused as exc:\n        await _persist_diagnostics_llm_calls(plugin_crash_pending=True)\n        raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc\n    except _BadRequestLLMError as exc:\n        await _persist_diagnostics_llm_calls(plugin_crash_pending=True)\n        raise HTTPException(status_code=502, detail=_litellm_error_detail('run_diagnostics_explanation_failed', exc, expose_provider_error=settings.composer_expose_provider_errors)) from exc\n    except ComposerContextUnsupported as exc:\n        await _persist_diagnostics_llm_calls(plugin_crash_pending=False)\n        raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc\n    except ComposerAdmissionRefused as exc:\n        if isinstance(exc, CredentialMaterialRefused):\n            raise HTTPException(status_code=422, detail=exc.to_payload()) from exc\n        raise HTTPException(status_code=403, detail={'error_type': 'composer_admission_refused', 'failure_code': 'admission_refused', 'detail': str(exc)}) from exc\n    except ComposerServiceError as exc:\n        await _persist_diagnostics_llm_calls(plugin_crash_pending=True)\n        raise HTTPException(status_code=502, detail={'error_type': 'run_diagnostics_explanation_failed', 'detail': str(exc)}) from exc\n    except BaseException:\n        await _persist_diagnostics_llm_calls(plugin_crash_pending=True)\n        raise\n    else:\n        try:\n            await _persist_diagnostics_llm_calls(plugin_crash_pending=False)\n        except RunDiagnosticsAuthorityLostError as lost:\n            raise HTTPException(status_code=409, detail={'error_type': 'run_diagnostics_audit_authority_lost', 'detail': f'Run diagnostics audit authority lost ({lost.reason}); the explanation was discarded because its audit row could not be written.'}) from lost\n    explanation, working_view = _parse_run_diagnostics_working_view(explanation, diagnostics)\n    return RunDiagnosticsEvaluationResponse(run_id=status.run_id, generated_at=datetime.now(UTC), explanation=explanation, working_view=working_view)",
-    "elspeth.web.sessions.continuation_driver:_SegmentDriver.__init__": "def __init__(self, worker: ComposerAsyncWorker, services: ComposerAppServices, running: ComposerOperationRunning, lease: SessionOperationLease):\n    if type(services.composer_service) is not ComposerServiceImpl or type(lease.required_work) is not RequiredWorkCoordinator:\n        raise AuditIntegrityError('V2 driver requires its actual Composer and required-work owners')\n    if lease.context is not running.session_operation_context:\n        raise AuditIntegrityError('V2 driver changed its exact started context')\n    self.worker, self.services, self.running, self.lease = (worker, services, running, lease)\n    self.service = services.composer_service\n    self.authority = services.composer_operation_authority\n    self.work = RequiredWorkBinding(lease.required_work, 0, 0, RequiredWorkRole.TURN, running)\n    self.provider = ProviderInvocationOwner(service=services.session_service, required_work=self.work)\n    self.phases = ContinuationLivePhases(self.service, self.authority, self.work, self.provider, lease)\n    sql_deadline = lease.required_work.sql_deadline_owner\n    if sql_deadline is None:\n        raise AuditIntegrityError('V2 driver lost its actual SQL timing owner')\n    self.sql_deadline = sql_deadline\n    self._consumed_native: list[BaseException] = []\n    self._committed_failure: CommittedContinuationFailure | None = None",
+    "elspeth.web.sessions.continuation_driver:_SegmentDriver.__init__": """
+def __init__(self, worker: ComposerAsyncWorker, services: ComposerAppServices, running: ComposerOperationRunning, lease: SessionOperationLease):
+    if type(services.composer_service) is not ComposerServiceImpl or type(lease.required_work) is not RequiredWorkCoordinator:
+        raise AuditIntegrityError('V2 driver requires its actual Composer and required-work owners')
+    if lease.context is not running.session_operation_context:
+        raise AuditIntegrityError('V2 driver changed its exact started context')
+    self.worker, self.services, self.running, self.lease = (worker, services, running, lease)
+    self.service = services.composer_service
+    self.authority = services.composer_operation_authority
+    self.work = RequiredWorkBinding(lease.required_work, 0, 0, RequiredWorkRole.TURN, running)
+    self.provider = ProviderInvocationOwner(service=services.session_service, required_work=self.work)
+    self.phases = ContinuationLivePhases(self.service, self.authority, self.work, self.provider, lease)
+    sql_deadline = lease.required_work.sql_deadline_owner
+    if sql_deadline is None:
+        raise AuditIntegrityError('V2 driver lost its actual SQL timing owner')
+    self.sql_deadline = sql_deadline
+    self._consumed_native: list[BaseException] = []
+    self._committed_failure: CommittedContinuationFailure | None = None
+    self._action_ordinal = 0
+    self.progress_owner: ContinuationProgressOwner | None = None
+    self._progress_cleanup_failures: list[BaseException] = []
+    self._iteration_stage: IterationStageData | None = None
+    self._action_clock: ContinuationActionClock | None = None
+""",
 }
 
 
@@ -26,7 +49,26 @@ FAMILY = QUOTA + ".ProviderInvocationFamily"
 BINDING = "elspeth.web.required_work.RequiredWorkBinding"
 TITLE = "elspeth.web.composer.continuation_title_provider"
 DRIVER = "elspeth.web.sessions.continuation_driver"
-DRIVER_CLASS_HEADER = "class _SegmentDriver:\n\n    def __init__(self, worker: ComposerAsyncWorker, services: ComposerAppServices, running: ComposerOperationRunning, lease: SessionOperationLease):\n        pass\n\n    def join_failure(self, error: BaseException, *additional: BaseException) -> BaseException:\n        pass\n\n    async def record(self) -> ComposerOperationRecord:\n        pass\n\n    async def selected(self) -> tuple[StoredContinuationSnapshot, SelectedContinuationState]:\n        pass\n\n    async def settle(self, record: ComposerOperationRecord, original: BaseException | None=None) -> ContinuationSegmentSettled:\n        pass\n\n    async def read_failure(self, names: frozenset[str]) -> ContinuationToolFailureRead:\n        pass\n\n    async def dispose(self, original: BaseException | None=None) -> ContinuationSegmentOutcome:\n        pass\n\n    async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> MessageWithStateResponse | None:\n        pass\n\n    async def watch_stage(self, stage: asyncio.Task[MessageWithStateResponse | None], reader: ComposerOperationWatchReader) -> None:\n        pass\n\n    async def run(self, adoption_failure: BaseException | None) -> ContinuationSegmentOutcome:\n        pass"
+DRIVER_CLASS_HEADER = """
+class _SegmentDriver:
+    def __init__(self, worker: ComposerAsyncWorker, services: ComposerAppServices, running: ComposerOperationRunning, lease: SessionOperationLease): pass
+    async def start_progress(self, record: ComposerOperationRecord) -> None: pass
+    async def close_progress(self, *, retain_failure: bool = False) -> None: pass
+    def join_failure(self, error: BaseException, *additional: BaseException) -> BaseException: pass
+    async def record(self) -> ComposerOperationRecord: pass
+    async def selected(self) -> tuple[StoredContinuationSnapshot, SelectedContinuationState]: pass
+    async def settle(self, record: ComposerOperationRecord, original: BaseException | None = None, *, expired_failure: ComposerOperationError | None = None) -> ContinuationSegmentSettled: pass
+    async def settle_expired(self, original: BaseException | None, *, timeout_seconds: float) -> ContinuationSegmentSettled: pass
+    async def read_failure(self, names: frozenset[str]) -> ContinuationToolFailureRead: pass
+    async def dispose(self, original: BaseException | None = None) -> ContinuationSegmentOutcome: pass
+    async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> MessageWithStateResponse | None: pass
+    async def pending_control(self, selected: SelectedContinuationState) -> StoredContinuationControlIntent | None: pass
+    async def iteration_stage(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> IterationStageData | None: pass
+    async def yield_control(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> ContinuationSegmentOutcome: pass
+    async def watch_stage(self, stage: asyncio.Task[MessageWithStateResponse | None], reader: ComposerOperationWatchReader) -> None: pass
+    def _worker_is_draining(self) -> bool: pass
+    async def run(self, adoption_failure: BaseException | None) -> ContinuationSegmentOutcome: pass
+"""
 
 
 def _module(unit):
@@ -301,9 +343,22 @@ def provider_driver_constructor_contract(units):
     if len(store_matches) != 1 or _shape(store_matches[0]) != _shape(expected_store) or len(forwarding) != 1 or len(work) != 1:
         return ["provider driver exact work/owner/phase transfer changed"], None
     store = store_matches[0]
+    stores = (store, work[0], forwarding[0])
+    targets = {id(statement.targets[0]) for statement in stores}
+    if any(
+        isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        and node.attr in {"work", "provider", "phases"}
+        and id(node) not in targets
+        for node in ast.walk(cls)
+    ):
+        return ["provider driver retained work/owner/phase field rebound"], None
     return [], {
         "owner_constructor_stores": frozenset({(driver.path, id(store))}),
         "owner_constructor_calls": frozenset({(driver.path, id(store.value))}),
+        "binding_constructor_stores": frozenset((driver.path, id(statement)) for statement in (work[0], forwarding[0])),
         "caller_regions": frozenset({(driver.path, id(init))}),
         "class_origins": frozenset({DRIVER + "._SegmentDriver"}),
     }

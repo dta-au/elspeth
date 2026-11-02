@@ -7,19 +7,22 @@ from dataclasses import replace
 from hashlib import sha256
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
-from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot
+from elspeth.web.composer.continuation_end_values import decode_end_candidate
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.continuation import load_snapshot, put_chunk, read_chunk
+from elspeth.web.sessions.continuation_semantic_actions import read_original_semantic_review_for_advisor_on_connection
 from elspeth.web.sessions.continuation_semantic_review_result import (
     RetainedSemanticReviewResult,
     decode_semantic_review_result,
     encode_semantic_review_result,
+    locate_original_semantic_review_result_on_connection,
     read_original_semantic_review_result_on_connection,
     retain_semantic_review_result_on_connection,
 )
@@ -118,8 +121,69 @@ async def test_actual_paid_review_result_commits_full_gate_and_cold_refuses_subs
             end = decode_continuation_snapshot(retained.payload_json).frames[-1]
             assert end.phase == ("publication_ready" if outcome == "clean" else "repair_needed")
             assert end.publication_binding == cold.publication_binding
+            candidate_ref = end.candidate
+            candidate = decode_end_candidate(
+                PrivateChunk(
+                    candidate_ref,
+                    read_chunk(
+                        conn,
+                        session_id=sid,
+                        operation_id=operation,
+                        key=f"value:{candidate_ref.codec}:{candidate_ref.digest}",
+                    ).decode("utf-8", errors="strict"),
+                )
+            )
+            located = read_original_semantic_review_for_advisor_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=operation, original_candidate=candidate
+            )
+            assert located == cold
+            assert located.original_source == candidate.semantic_source
+            assert located.original_decision_json == candidate.semantic_decision_json
+            assert candidate.semantic_source is not None
+            foreign_source = candidate.semantic_source.model_copy(update={"effect_key": "foreign-semantic-source"})
+            with pytest.raises(AuditIntegrityError):
+                read_original_semantic_review_for_advisor_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=operation,
+                    original_candidate=candidate.model_copy(update={"semantic_source": foreign_source}),
+                )
+            assert candidate.response.digest != "0" * 64
+            with pytest.raises(AuditIntegrityError):
+                locate_original_semantic_review_result_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=operation,
+                    semantic_effect_key=case["semantic_effect_key"],
+                    response_digest="0" * 64,
+                )
             effect = conn.execute(select(effects).where(effects.c.session_id == sid, effects.c.effect_key == owner_key)).one()
             assert effect.disposition == "committed" and effect.receipt_key == owner_key and effect.result_chunk_key is not None
+            duplicate = conn.begin_nested()
+            try:
+                duplicate_key = "end:review:" + "f" * 64
+                assert duplicate_key != owner_key
+                duplicate_commit = json.loads(read_chunk(conn, session_id=sid, operation_id=operation, key=effect.result_chunk_key))
+                duplicate_commit["owner_effect_key"] = duplicate_key
+                duplicate_canonical = canonical_json(duplicate_commit)
+                duplicate_chunk_key = "semantic-review-result:" + sha256(duplicate_canonical.encode("utf-8")).hexdigest()
+                put_chunk(
+                    conn,
+                    session_id=sid,
+                    operation_id=operation,
+                    key=duplicate_chunk_key,
+                    payload=duplicate_canonical.encode("utf-8"),
+                    codec="composer.semantic-review-result.v1",
+                )
+                duplicate_effect = dict(effect._mapping)
+                duplicate_effect.update(effect_key=duplicate_key, receipt_key=duplicate_key, result_chunk_key=duplicate_chunk_key)
+                conn.execute(insert(effects).values(**duplicate_effect))
+                with pytest.raises(AuditIntegrityError):
+                    read_original_semantic_review_for_advisor_on_connection(
+                        conn, session_id=running.claim.session_id, operation_id=operation, original_candidate=candidate
+                    )
+            finally:
+                duplicate.rollback()
             savepoint = conn.begin_nested()
             try:
                 altered = json.loads(read_chunk(conn, session_id=sid, operation_id=operation, key=effect.result_chunk_key))
@@ -147,6 +211,10 @@ async def test_actual_paid_review_result_commits_full_gate_and_cold_refuses_subs
                         session_id=running.claim.session_id,
                         operation_id=operation,
                         review_effect_key=owner_key,
+                    )
+                with pytest.raises(AuditIntegrityError):
+                    read_original_semantic_review_for_advisor_on_connection(
+                        conn, session_id=running.claim.session_id, operation_id=operation, original_candidate=candidate
                     )
             finally:
                 savepoint.rollback()

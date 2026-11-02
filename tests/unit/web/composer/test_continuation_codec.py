@@ -187,6 +187,64 @@ def test_equal_length_changed_bytes_are_rejected_by_digest():
         verify_private_chunk(chunk.reference, '{"text":"bravo"}')
 
 
+def test_stage_reuses_exact_interleaved_chunk_sha_but_rechecks_reference_and_text(monkeypatch):
+    original_producer = codec._private_chunk_canonical_text_bytes
+    produced: list[tuple[str, object]] = []
+
+    def counted_producer(key):
+        produced.append((key.canonical, key.reference))
+        return original_producer(key)
+
+    monkeypatch.setattr(codec, "_private_chunk_canonical_text_bytes", counted_producer)
+    first_text = '{"text":"first"}'
+    second_text = '{"text":"second"}'
+    with retention_stage_memo_scope():
+        first = encode_private_chunk(codec="composer.messages.v1", canonical=first_text)
+        second = encode_private_chunk(codec="composer.messages.v1", canonical=second_text)
+        verify_private_chunk(first.reference, first_text)
+        verify_private_chunk(second.reference, second_text)
+        assert encode_private_chunk(codec="composer.messages.v1", canonical=first_text) == first
+        assert produced == [
+            (first_text, None),
+            (second_text, None),
+            (first_text, first.reference),
+            (second_text, second.reference),
+        ]
+        with pytest.raises(AuditIntegrityError, match="bytes differ"):
+            verify_private_chunk(first.reference, second_text)
+        with pytest.raises(AuditIntegrityError, match="bytes differ"):
+            verify_private_chunk(first.reference.model_copy(update={"digest": "0" * 64}), first_text)
+        with pytest.raises(AuditIntegrityError, match="bytes differ"):
+            verify_private_chunk(first.reference.model_copy(update={"byte_length": None}), first_text)
+        with pytest.raises(AuditIntegrityError, match="bytes differ"):
+            verify_private_chunk(first.reference.model_copy(update={"byte_length": len(first_text) + 1}), first_text)
+    earlier_proofs = len(produced)
+    with retention_stage_memo_scope():
+        encode_private_chunk(codec="composer.messages.v1", canonical=first_text)
+    assert len(produced) == earlier_proofs + 1 and produced[-1] == (first_text, None)
+
+
+def test_stage_sha_hit_still_runs_changed_credential_policy(monkeypatch):
+    from elspeth.web import credential_guard
+
+    original_guard = credential_guard.require_no_credential_material
+    seen: list[frozenset[str]] = []
+
+    def guarded(value, *, surface, env_ref_names, max_string_bytes):
+        seen.append(env_ref_names)
+        if env_ref_names == frozenset({"DENY"}):
+            raise ValueError("changed credential policy")
+        return original_guard(value, surface=surface, env_ref_names=env_ref_names, max_string_bytes=max_string_bytes)
+
+    monkeypatch.setattr(credential_guard, "require_no_credential_material", guarded)
+    text = '{"safe":true}'
+    with retention_stage_memo_scope():
+        encode_private_chunk(codec="composer.messages.v1", canonical=text, env_ref_names=frozenset({"ALLOW"}))
+        with pytest.raises(ValueError, match="changed credential policy"):
+            encode_private_chunk(codec="composer.messages.v1", canonical=text, env_ref_names=frozenset({"DENY"}))
+    assert seen == [frozenset({"ALLOW"}), frozenset({"DENY"})]
+
+
 @pytest.mark.parametrize("canonical", ['{"b":2,"a":1}', '{"a":1,"a":2}', "NaN", '{"a": 1}'])
 def test_chunk_codec_requires_canonical_strict_json(canonical):
     with pytest.raises(AuditIntegrityError, match="canonical strict JSON"):
@@ -334,6 +392,24 @@ def test_chunk_warm_hit_rechecks_the_actual_digest(monkeypatch):
     assert hashes == [chunk.canonical.encode("utf-8")] * 2
 
 
+def test_large_valid_chunk_keeps_canonical_only_stage_proof_without_raising_bound(monkeypatch):
+    canonical = canonical_json({"text": "x" * (codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES // 2 + 1024)})
+    chunk = encode_private_chunk(codec="composer.messages.v1", canonical=canonical)
+    original = codec._verify_private_chunk_canonical
+    parses: list[str] = []
+
+    def counted(text):
+        parses.append(text)
+        return original(text)
+
+    monkeypatch.setattr(codec, "_verify_private_chunk_canonical", counted)
+    with retention_stage_memo_scope() as memo:
+        verify_private_chunk(chunk.reference, canonical)
+        verify_private_chunk(chunk.reference, canonical)
+        assert memo.cached_entry_count == 1
+    assert parses == [canonical]
+
+
 def test_chunk_canonical_refusal_precedes_binding_refusal_in_a_stage(monkeypatch):
     chunk = encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}')
     original_hash = codec.sha256
@@ -354,14 +430,14 @@ def test_chunk_canonical_refusal_precedes_binding_refusal_in_a_stage(monkeypatch
 
 def test_chunk_reference_fields_are_part_of_the_pure_verification_key(monkeypatch):
     chunk = encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}')
-    original = codec._verify_private_chunk_canonical
+    original = codec._private_chunk_canonical_text_bytes
     parses = []
 
-    def verify(encoded):
-        parses.append(encoded)
-        original(encoded)
+    def verify(key):
+        parses.append(key.canonical)
+        return original(key)
 
-    monkeypatch.setattr(codec, "_verify_private_chunk_canonical", verify)
+    monkeypatch.setattr(codec, "_private_chunk_canonical_text_bytes", verify)
     changed_codec = chunk.reference.model_copy(update={"codec": "composer.state.v1"})
     changed_digest = chunk.reference.model_copy(update={"digest": "0" * 64})
     changed_length = chunk.reference.model_copy(update={"byte_length": chunk.reference.byte_length + 1})

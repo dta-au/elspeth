@@ -46,6 +46,7 @@ from elspeth.web.execution.completion_gates import (
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite
+from elspeth.web.sessions.continuation_publication_projection import PublicationProjectionInput
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.routes._helpers import (
     _composition_proposal_response,
@@ -61,7 +62,7 @@ from elspeth.web.sessions.routes._helpers import (
     llm_call_audit_summary,
     merge_composer_meta_updates,
 )
-from elspeth.web.sessions.routes.composer.pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
+from elspeth.web.sessions.routes.composer.pipeline_settlement import AutoCommitRevoked, PipelineRouteSettlement, settle_auto_commit_intent
 from elspeth.web.sessions.schemas import MessageWithStateResponse
 
 if TYPE_CHECKING:
@@ -99,6 +100,7 @@ if TYPE_CHECKING:
 class _ProviderAuditFinalizationKwargs(TypedDict, total=False):
     provider_audit_calls: tuple[ComposerLLMCall, ...]
     publication_result: ComposerResult
+    publication_projection: PublicationProjectionInput
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,8 +363,10 @@ async def settle_composer_result(
     post_compose_state_id: UUID | None = compose_base_state_id
     assistant_record: ChatMessageRecord | None = None
     route_settlement: PipelineRouteSettlement | None = None
+    publication_projection: PublicationProjectionInput | None = None
     graph_review_draft: AuditMessageDraft | None = None
     if result.pipeline_commit_intent is not None:
+        original_result = result
         # E14: auto-commit settlement gets what is left of the job budget.
         commit_timeout_seconds = budget_anchor.remaining_seconds(monotonic_now=time.monotonic())
         if commit_timeout_seconds <= 0:
@@ -383,7 +387,11 @@ async def settle_composer_result(
         )
         if type(settlement_outcome) is PipelineRouteSettlement:
             route_settlement = settlement_outcome
+            publication_projection = PublicationProjectionInput(original_result, settlement=settlement_outcome)
         else:
+            if type(settlement_outcome) is not AutoCommitRevoked:
+                raise AuditIntegrityError("auto-commit settlement returned an unfamiliar original disposition")
+            publication_projection = PublicationProjectionInput(original_result, revocation=settlement_outcome)
             # Auto-commit authority was durably revoked (elspeth-01d4c6e683).
             result = replace(result, message=PIPELINE_STAGED_REVIEW_MESSAGE, pipeline_commit_intent=None)
     # Below the revoked branch on purpose (elspeth-d581b3da7f).
@@ -584,6 +592,8 @@ async def settle_composer_result(
     # ComposerOperationCancelledDuringTurn / a fence loss having written nothing.
     if type(inputs.budget_anchor) is ContinuationFinalizationBudget:
         provider_options["publication_result"] = result
+        if publication_projection is not None:
+            provider_options["publication_projection"] = publication_projection
     record = await _join_shielded_task_after_cancellation(
         asyncio.create_task(
             service.complete_composer_async_operation(

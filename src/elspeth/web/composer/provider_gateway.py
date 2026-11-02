@@ -797,6 +797,17 @@ class ProviderGateway:
     ) -> PreparedContinuationPrimaryRequest:
         """Freeze ordinary physical-input identity without guard/quota/SDK clearance."""
         prepared = self.prepare_loop_input(messages, tools, user_prompt=user_prompt)
+        return self.prepare_continuation_primary_from_input(prepared, cost_budget=cost_budget)
+
+    def prepare_continuation_primary_from_input(
+        self,
+        prepared: PreparedProviderInput,
+        *,
+        cost_budget: CommonProviderCostBudget | None = None,
+    ) -> PreparedContinuationPrimaryRequest:
+        """Use the original prepared PRIMARY input for its physical kwargs/hash."""
+        if type(prepared) is not PreparedProviderInput:
+            raise AuditIntegrityError("PRIMARY preparation requires its original guarded input")
         kwargs = build_composer_loop_request_kwargs(
             model=self._model,
             messages=prepared.evidence.messages,

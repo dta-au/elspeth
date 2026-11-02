@@ -458,7 +458,7 @@ async def test_actual_manual_executor_failure_keeps_original_custody_and_safe_pr
     async def fail_candidate(**kwargs):
         raise body
 
-    def observe_generation(executor, ticket, finalizer):
+    def observe_generation(executor, ticket, finalizer, *, claim_release=None, watch_reader=None, progress_cleanup=None):
         nonlocal pending_admission
         if ticket is not None and ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL:
             assert not reached
@@ -466,7 +466,14 @@ async def test_actual_manual_executor_failure_keeps_original_custody_and_safe_pr
             if executor_type is RequiredGenerationUnavailable:
                 raise original
             pending_admission = True
-        return actual_generation(executor, ticket, finalizer)
+        return actual_generation(
+            executor,
+            ticket,
+            finalizer,
+            claim_release=claim_release,
+            watch_reader=watch_reader,
+            progress_cleanup=progress_cleanup,
+        )
 
     async def observe_admission():
         nonlocal pending_admission

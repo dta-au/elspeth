@@ -39,6 +39,8 @@ from elspeth.web.composer.continuation_selection import SelectedContinuationStat
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
     from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+    from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation_iteration_return import IterationStageData
 
 
 def validate_continuation_structure_on_connection(
@@ -494,6 +496,44 @@ def is_consumed_semantic_stop_cut(selected: SelectedContinuationState) -> bool:
     return decision.decision == "STOP_CONFIRMED" and decision.scope == "whole_request" and decision.prescribed_action is None
 
 
+def iteration_stage_action_policy(
+    *,
+    selected: StoredContinuationSnapshot,
+    stage: IterationStageData | None,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+) -> ContinuationActionPolicy:
+    """Size an original source stage; this DATA grants no paid execution."""
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+    from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
+    from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation_iteration_return import IterationStageData
+
+    if type(selected) is not StoredContinuationSnapshot or type(policy) not in (
+        ContinuationAdmissionPolicy,
+        ContinuationAdmissionPolicyV2,
+        ContinuationAdmissionPolicyV3,
+    ):
+        raise TypeError("iteration allowance requires its nominal selected source and original policy")
+    root = decode_continuation_snapshot(selected.payload_json)
+    applied_batch_cut(root.frames)
+    if root.cursor != selected.cursor or decode_continuation_policy(root.admission_policy_json, root.policy_hash) != policy:
+        raise AuditIntegrityError("iteration allowance changed its original admitted policy")
+    if stage is None:
+        require_resumable_cut(root)
+        return policy.actions.session_sql
+    if type(stage) is not IterationStageData or stage.current != selected:
+        raise AuditIntegrityError("iteration allowance changed its exact original stage source")
+    if stage.stage in ("early_ready", "returned"):
+        return policy.actions.advisor
+    if stage.stage == "end_ready":
+        return policy.actions.advisor
+    if stage.stage == "publication_ready":
+        return policy.actions.session_sql
+    if stage.stage == "classify_ready":
+        return policy.actions.primary
+    raise AuditIntegrityError("iteration allowance cannot replay unsupported dispatched work")
+
+
 def next_continuation_action_policy(
     *,
     selected: SelectedContinuationState,
@@ -542,8 +582,16 @@ def next_continuation_action_policy(
             or (
                 len(root.frames) == 3
                 and (
-                    type(root.frames[1]) is not EndFrame
-                    or root.frames[1].phase not in ("review_needed", "repair_needed", "publication_ready")
+                    not (
+                        type(root.frames[1]) is EndFrame and root.frames[1].phase in ("review_needed", "repair_needed", "publication_ready")
+                    )
+                    and not (
+                        type(root.frames[1]) is ToolBatchFrame
+                        and root.frames[1].phase == "result_retained"
+                        and root.frames[1].accumulator.codec == "composer.applied-p4-batch.v2"
+                        and root.frames[1].response == root.frames[0].pending_response
+                        and f"batch:{root.frames[1].response.digest}:p4" in root.frames[1].settled_effect_ids
+                    )
                 )
             )
             or top.provider_effect_key is None

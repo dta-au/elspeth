@@ -7,10 +7,10 @@ import json
 import threading
 from dataclasses import replace
 from datetime import timedelta
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import event, func, select, update
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.chargeable_admission import (
@@ -29,6 +29,7 @@ from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PresentBase
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -46,6 +47,8 @@ from elspeth.web.sessions.models import (
     quota_provider_attempts_table,
     token_usage_ledger_table,
 )
+from elspeth.web.sessions.models import composer_operation_segments_table as segments
+from elspeth.web.sessions.models import session_operation_fences_table as fences
 from elspeth.web.sessions.pipeline_finish_once import (
     ComposerPipelineBusinessReturned,
     ComposerPipelineRaised,
@@ -64,8 +67,9 @@ from elspeth.web.sessions.protocol import (
     TrustModeAutoCommitRevokedError,
 )
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+from elspeth.web.sessions.time_normalization import restore_utc
 from tests.fixtures.identities import grant_test_pipeline_user
-from tests.unit.web.coordination.test_composer_operation_authority import failed, start
+from tests.unit.web.coordination.test_composer_operation_authority import _ingress, failed, start
 from tests.unit.web.sessions.test_interpretation_events_service import _llm_node
 from tests.unit.web.sessions.test_token_usage_adapters import _call
 
@@ -692,25 +696,16 @@ async def test_sealed_revocation_rechecks_actual_authority_after_eligibility_cap
         repository.release(running.session_operation_context)
 
 
-async def _prepared_pipeline(store, *, with_review=False, opted_out=False, older_review=False, deadline_seconds=180.0):
+async def _prepared_pipeline(store, *, with_review=False, opted_out=False, older_review=False):
     _engine, _repository, _authority, service, sid = store
-    record, running = start(store, deadline_seconds=deadline_seconds)
+    record, running = start(store)
     if opted_out:
         await service.record_session_interpretation_opt_out(
             session_id=sid,
             actor="user:alice",
             session_operation_context=running.session_operation_context,
         )
-    user = await service.add_message_with_transcript(
-        sid,
-        "user",
-        "Build",
-        operation_id=UUID(record.operation_id),
-        requested_state_id=None,
-        writer_principal="route_user_message",
-        session_operation_context=running.session_operation_context,
-        running=running,
-    )
+    user = await _ingress(store, running)
     state = CompositionStateData(
         sources={}, nodes=[_llm_node()] if with_review else [], edges=[], outputs=[], metadata_={"name": "Atomic review", "description": ""}
     )
@@ -1118,11 +1113,9 @@ async def test_atomic_candidate_supersedes_older_identical_pending_review(operat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signal", ["stop", "deadline"])
 @pytest.mark.parametrize("identity", ["exact", "actor", "attempt"])
-async def test_sealed_trust_revocation_crosses_signal_only_for_exact_authority(operation_store, monkeypatch, signal, identity):
-    import elspeth.web.coordination.composer_operation_authority as authority_module
-
+async def test_sealed_trust_revocation_crosses_signal_only_for_exact_authority(operation_store, signal, identity):
     engine, repository, authority, service, sid = operation_store
-    row, arguments, _drafts, record, running = await _prepared_pipeline(operation_store, deadline_seconds=10.0)
+    row, arguments, _drafts, record, running = await _prepared_pipeline(operation_store)
     await service.update_composer_preferences(sid, trust_mode="auto_commit", density_default="medium", actor="user:alice")
     await service.update_composer_preferences(sid, trust_mode="explicit_approve", density_default="medium", actor="user:alice")
     arguments["required_trust_mode"] = "auto_commit"
@@ -1133,8 +1126,37 @@ async def test_sealed_trust_revocation_crosses_signal_only_for_exact_authority(o
             cancelled_failure=lambda request_id: pytest.fail("running Stop must retain its owned action"),
         )
     else:
-        current = authority.get(session_id=sid, operation_id=record.operation_id)
-        monkeypatch.setattr(authority_module, "database_now", lambda conn: current.deadline_at + timedelta(microseconds=1))
+        with engine.begin() as conn:
+            now = database_now(conn)
+            # Expire only this actual segment, retaining a live session lease.
+            # Keep its complete timestamp ordering valid under the SQL CHECK.
+            assert (
+                conn.execute(
+                    update(segments)
+                    .where(
+                        segments.c.session_id == str(sid),
+                        segments.c.operation_id == record.operation_id,
+                        segments.c.sequence == running.claim.segment_sequence,
+                        segments.c.generation == running.claim.ownership_generation,
+                    )
+                    .values(
+                        started_at=now - timedelta(seconds=3),
+                        cooperative_at=now - timedelta(seconds=2),
+                        deadline_at=now - timedelta(seconds=1),
+                    )
+                ).rowcount
+                == 1
+            )
+            segment_deadline = conn.execute(
+                select(segments.c.deadline_at).where(
+                    segments.c.session_id == str(sid),
+                    segments.c.operation_id == record.operation_id,
+                    segments.c.sequence == running.claim.segment_sequence,
+                    segments.c.generation == running.claim.ownership_generation,
+                )
+            ).scalar_one()
+            lease_deadline = conn.execute(select(fences.c.lease_expires_at).where(fences.c.session_id == str(sid))).scalar_one()
+            assert restore_utc(segment_deadline) < database_now(conn) < restore_utc(lease_deadline)
     if identity == "actor":
         arguments["actor"] = "user:mallory"
     elif identity == "attempt":

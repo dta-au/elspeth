@@ -22,7 +22,12 @@ from elspeth.web.composer.continuation_codec import (
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply
-from elspeth.web.continuation_retention_memo import RecorderRequestTextKey, RecorderRequestTextProof, current_retention_stage_memo
+from elspeth.web.continuation_retention_memo import (
+    RecorderBlockHashKey,
+    RecorderRequestTextKey,
+    RecorderRequestTextProof,
+    current_retention_stage_memo,
+)
 
 
 @dataclass(frozen=True, slots=True, config=ConfigDict(extra="forbid", strict=True))
@@ -77,6 +82,7 @@ _BUFFER_CODEC = TypeAdapter(RecorderSnapshot)
 
 
 RECORDER_CODEC: Final[Literal["composer.audit-buffer.v2"]] = "composer.audit-buffer.v2"
+_TRUSTED_RECORDER_BLOCK_SHA256: Final = hashlib.sha256
 _DOCUMENT_KEYS = frozenset({"blocks", "snapshot"})
 _CONTEXT_KEYS = frozenset({"capture_boundary", "messages", "schema_version", "tools"})
 _STORED_REQUEST_KEYS = frozenset({"disposition", "capture_boundary", "messages", "schema_version", "tools"})
@@ -185,13 +191,25 @@ def _transfer_prepared_request_text(proof: RecorderRequestTextProof, blocks: _Re
     if any(type(item) is not str for item in expected) or set(expected) != {key for key, _ in proof.blocks}:
         raise AuditIntegrityError("recorder request lost its complete block references")
     for key, canonical in proof.blocks:
-        if type(key) is not str or type(canonical) is not str or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != key:
+        if type(key) is not str or type(canonical) is not str:
             raise AuditIntegrityError("recorder request block text differs from its content address")
+        hash_key = RecorderBlockHashKey(key, canonical)
+        memo = current_retention_stage_memo()
+        if memo is None or hashlib.sha256 is not _TRUSTED_RECORDER_BLOCK_SHA256:
+            _require_recorder_block_hash(hash_key)
+        else:
+            memo.recorder_block_hash(hash_key, _require_recorder_block_hash)
         value, error = parse_json_strict(canonical)
         if error is not None:
             raise AuditIntegrityError("recorder request block is not strict JSON")
         blocks.store_proven_text(key, value)
     return stored
+
+
+def _require_recorder_block_hash(key: RecorderBlockHashKey) -> None:
+    """Prove only immutable text binding; each transfer still parses fresh values."""
+    if hashlib.sha256(key.canonical.encode("utf-8")).hexdigest() != key.expected_digest:
+        raise AuditIntegrityError("recorder request block text differs from its content address")
 
 
 def _restore_request(stored: object, blocks: _RecorderBlocks) -> object:

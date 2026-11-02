@@ -45,7 +45,7 @@ from elspeth.web.composer.advisor_output import (
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.continuation import EndFrame
+from elspeth.web.composer.continuation import EndFrame, PrivateChunkRef
 from elspeth.web.composer.continuation_advisor import (
     ContinuationAdvisorInvocation,
     decode_continuation_advisor_invocation,
@@ -159,6 +159,17 @@ class SemanticAdvisorReviewInput:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticAdvisorIterationReturnInput:
+    """Original complete classified result, without inventing an END reply."""
+
+    result_json: str
+    owner_effect_key: str
+    completed_checkpoint_id: str
+    completed_cursor: int
+    recorder: PrivateChunkRef
+
+
+@dataclass(frozen=True, slots=True)
 class SemanticAdvisorRetainedInputs:
     session_id: str
     operation_id: str
@@ -166,6 +177,7 @@ class SemanticAdvisorRetainedInputs:
     cursor: int
     reads: tuple[SemanticAdvisorReadInput, ...] = ()
     review: SemanticAdvisorReviewInput | None = None
+    iteration_return: SemanticAdvisorIterationReturnInput | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -174,6 +186,8 @@ class SemanticAdvisorRetainedInputs:
             or type(self.reads) is not tuple
             or any(type(item) is not SemanticAdvisorReadInput for item in self.reads)
             or (self.review is not None and type(self.review) is not SemanticAdvisorReviewInput)
+            or (self.iteration_return is not None and type(self.iteration_return) is not SemanticAdvisorIterationReturnInput)
+            or (self.review is not None and self.iteration_return is not None)
         ):
             raise AuditIntegrityError("Semantic retained inputs lost their nominal complete DATA")
 
@@ -360,6 +374,8 @@ def prepare_semantic_advisor_request(
             retained_values["read_results"] = [semantic_retained_json(item.semantic_result_json) for item in retained_inputs.reads]
         if retained_inputs.review is not None:
             retained_values["review_result"] = semantic_retained_json(retained_inputs.review.result_json)
+        if retained_inputs.iteration_return is not None:
+            retained_values["iteration_return"] = semantic_retained_json(retained_inputs.iteration_return.result_json)
     retained = canonical_json(retained_values)
     messages: list[PromptGuardTextMessage] = [
         {

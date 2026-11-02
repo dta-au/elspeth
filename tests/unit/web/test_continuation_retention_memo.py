@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
@@ -29,6 +30,7 @@ from elspeth.web.continuation_retention_memo import (
     CredentialPolicyKey,
     CredentialScanKey,
     PrivateChunkVerificationKey,
+    RecorderBlockHashKey,
     RecorderRequestTextKey,
     RecorderRequestTextProof,
     RetentionStageMemo,
@@ -138,6 +140,70 @@ def test_canonical_text_proof_never_retains_more_than_existing_private_document_
     assert len(memo.canonical_text_encoding(oversized, encode)) == CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES + 1
     assert memo.cached_entry_count == 0
     memo.close()
+
+
+def test_canonical_sha_proofs_are_exact_and_share_one_existing_byte_budget() -> None:
+    calls: list[str] = []
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls.append(key.canonical[:1])
+        return key.canonical.encode("utf-8")
+
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    first = CanonicalTextEncodingKey("a" * 250_000, bound)
+    second = CanonicalTextEncodingKey("b" * 250_000, bound)
+    third = CanonicalTextEncodingKey("c" * 250_000, bound)
+    with retention_stage_memo_scope() as memo:
+        first_proof = memo.canonical_text_proof(first, encode, hashlib.sha256)
+        assert first_proof.digest == hashlib.sha256(first.canonical.encode()).hexdigest()
+        memo.canonical_text_proof(second, encode, hashlib.sha256)
+        assert memo.canonical_text_proof(first, encode, hashlib.sha256) is first_proof
+        assert calls == ["a", "b"] and memo.cached_entry_count == 2
+        memo.canonical_text_proof(third, encode, hashlib.sha256)
+        assert memo.cached_entry_count == 2
+        memo.canonical_text_proof(second, encode, hashlib.sha256)
+        assert calls == ["a", "b", "c", "b"]
+    assert memo.cached_entry_count == 0
+
+
+def test_canonical_sha_proof_does_not_cache_oversize_or_foreign_producer() -> None:
+    memo = RetentionStageMemo()
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    oversized = CanonicalTextEncodingKey("x" * 600_000, bound)
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        return key.canonical.encode("utf-8")
+
+    def foreign(_key: CanonicalTextEncodingKey) -> str:
+        return "not bytes"
+
+    assert len(memo.canonical_text_proof(oversized, encode, hashlib.sha256).encoded) == 600_000
+    assert memo.cached_entry_count == 0
+    with pytest.raises(TypeError, match="exact immutable bytes"):
+        memo.canonical_text_proof(CanonicalTextEncodingKey("safe", bound), foreign, hashlib.sha256)
+    memo.close()
+
+
+def test_recorder_block_hash_memo_keeps_exact_key_producer_and_stage() -> None:
+    calls: list[str] = []
+
+    def verify(key: RecorderBlockHashKey) -> None:
+        calls.append(key.canonical)
+        if hashlib.sha256(key.canonical.encode()).hexdigest() != key.expected_digest:
+            raise ValueError("changed block address")
+
+    text = '{"safe":true}'
+    key = RecorderBlockHashKey(hashlib.sha256(text.encode()).hexdigest(), text)
+    with retention_stage_memo_scope() as memo:
+        memo.recorder_block_hash(key, verify)
+        memo.recorder_block_hash(key, verify)
+        assert calls == [text] and memo.cached_entry_count == 1
+        with pytest.raises(ValueError, match="changed block address"):
+            memo.recorder_block_hash(replace(key, expected_digest="0" * 64), verify)
+        assert calls == [text, text] and memo.cached_entry_count == 1
+    with retention_stage_memo_scope() as second_memo:
+        second_memo.recorder_block_hash(key, verify)
+    assert calls == [text, text, text]
 
 
 def test_recorder_request_proof_counts_complete_aggregate_and_one_entry() -> None:

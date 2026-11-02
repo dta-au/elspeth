@@ -285,11 +285,10 @@ async def publish_semantic_continuation_result(
 ) -> ComposerOperationRecord:
     """Derive the actual cold-reviewed result; the final transaction re-proves it."""
     from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
+    from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.continuation import load_snapshot
-    from elspeth.web.sessions.continuation_semantic_actions import (
-        SemanticPublicationProof,
-        require_semantic_publication_on_connection,
-    )
+    from elspeth.web.sessions.continuation_semantic_actions import require_semantic_publication_on_connection
+    from elspeth.web.sessions.continuation_semantic_advisor import require_semantic_iteration_publication_on_connection
     from elspeth.web.sessions.locking import locked_session_transaction
 
     runtime, _inventory = await phases.current(selected)
@@ -297,24 +296,29 @@ async def publish_semantic_continuation_result(
     if running is None or runtime.bindings.session_operation_context is not running.session_operation_context:
         raise AuditIntegrityError("semantic publication lost its actual runtime/claim owners")
 
-    def read_result() -> SemanticPublicationProof:
+    def read_result() -> ComposerResult:
         with locked_session_transaction(phases.authority._engine, str(running.claim.session_id)) as conn:
             stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
             if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(selected.stack):
                 raise AuditIntegrityError("semantic publication changed its selected source before result preparation")
-            proof = require_semantic_publication_on_connection(conn, running, selected=stored)
-            if proof is None:
-                raise AuditIntegrityError("semantic publication requires its actual retained paid Stop")
-            return proof
+            iteration = require_semantic_iteration_publication_on_connection(conn, running, selected=stored)
+            if iteration is not None:
+                original = iteration.returned.result
+                audit_call = iteration.admission.paid.audit_call
+            else:
+                review = require_semantic_publication_on_connection(conn, running, selected=stored)
+                if review is None:
+                    raise AuditIntegrityError("semantic publication requires its actual retained paid Stop")
+                original = review.review_result.result
+                audit_call = review.admission.paid.audit_call
+            return replace(original, llm_calls=(*original.llm_calls, audit_call))
 
-    proof = await _registered(
+    public_result = await _registered(
         work=phases.work,
         source=RequiredWorkSource.CONTINUATION_STATE_SQL,
         operation=read_result,
-        expected=SemanticPublicationProof,
+        expected=ComposerResult,
     )
-    original = proof.review_result.result
-    public_result = replace(original, llm_calls=(*original.llm_calls, proof.admission.paid.audit_call))
     return await publish_continuation_result(phases, services, selected, runtime, public_result)
 
 

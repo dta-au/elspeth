@@ -12,13 +12,15 @@ callable, closing it on return or error and restoring any surrounding scope.
 from __future__ import annotations
 
 import functools
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import Context, ContextVar
 from dataclasses import dataclass
+from hashlib import sha256 as _TRUSTED_SHA256
 from threading import Lock
-from types import FunctionType
-from typing import TYPE_CHECKING, Literal, cast
+from types import BuiltinFunctionType, FunctionType
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.credential_material import (
@@ -48,6 +50,24 @@ class PrivateChunkVerificationKey:
 class CanonicalTextEncodingKey:
     canonical: str
     max_utf8_bytes: int
+    reference: PrivateChunkRef | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTextProof:
+    encoded: bytes
+    digest: str
+    retained_bytes: int
+
+
+class _DigestResult(Protocol):
+    def hexdigest(self) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RecorderBlockHashKey:
+    expected_digest: str
+    canonical: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +187,13 @@ class RetentionStageMemo:
         self._snapshots: dict[tuple[Callable[[str], ContinuationFrameStack], SnapshotDecodeKey], ContinuationFrameStack] = {}
         self._chunks: dict[tuple[Callable[[str], None], PrivateChunkVerificationKey], None] = {}
         self._canonical_text: tuple[Callable[[CanonicalTextEncodingKey], bytes], CanonicalTextEncodingKey, bytes] | None = None
+        self._canonical_proofs: OrderedDict[
+            tuple[Callable[[CanonicalTextEncodingKey], bytes], Callable[[bytes], _DigestResult], CanonicalTextEncodingKey],
+            CanonicalTextProof,
+        ] = OrderedDict()
+        self._canonical_proof_bytes = 0
+        self._recorder_block_hashes: OrderedDict[tuple[Callable[[RecorderBlockHashKey], object], RecorderBlockHashKey], int] = OrderedDict()
+        self._recorder_block_hash_bytes = 0
         self._recorder_request: (
             tuple[Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None], RecorderRequestTextKey, RecorderRequestTextProof]
             | None
@@ -193,6 +220,8 @@ class RetentionStageMemo:
                 + len(self._credentials)
                 + len(self._states)
                 + int(self._canonical_text is not None)
+                + len(self._canonical_proofs)
+                + len(self._recorder_block_hashes)
                 + int(self._recorder_request is not None)
             )
 
@@ -202,6 +231,10 @@ class RetentionStageMemo:
             self._snapshots.clear()
             self._chunks.clear()
             self._canonical_text = None
+            self._canonical_proofs.clear()
+            self._canonical_proof_bytes = 0
+            self._recorder_block_hashes.clear()
+            self._recorder_block_hash_bytes = 0
             self._recorder_request = None
             self._credentials.clear()
             self._states.clear()
@@ -252,8 +285,110 @@ class RetentionStageMemo:
                 entry = self._canonical_text
                 if entry is not None and entry[0] is producer and entry[1] == key:
                     return entry[2]
+                self._canonical_proofs.clear()
+                self._canonical_proof_bytes = 0
+                self._recorder_block_hashes.clear()
+                self._recorder_block_hash_bytes = 0
                 self._canonical_text = (producer, key, value)
         return value
+
+    def canonical_text_proof(
+        self,
+        key: CanonicalTextEncodingKey,
+        producer: Callable[[CanonicalTextEncodingKey], bytes],
+        digest_producer: Callable[[bytes], _DigestResult],
+    ) -> CanonicalTextProof:
+        """Reuse only exact immutable canonical bytes and SHA, within one 1 MiB stage budget."""
+        if (
+            type(key) is not CanonicalTextEncodingKey
+            or type(key.canonical) is not str
+            or type(key.max_utf8_bytes) is not int
+            or key.max_utf8_bytes < 1
+        ):
+            raise TypeError("Canonical text proof requires its exact bounded key")
+        if key.reference is not None:
+            from elspeth.web.composer.continuation import PrivateChunkRef
+
+            if type(key.reference) is not PrivateChunkRef:
+                raise TypeError("Canonical text proof requires its exact nominal reference")
+        _require_function_producer(producer)
+        if type(digest_producer) not in (FunctionType, BuiltinFunctionType):
+            raise TypeError("Canonical text proof requires its exact digest producer")
+        cache_key = (producer, digest_producer, key)
+        trusted_digest = digest_producer is _TRUSTED_SHA256
+        with self._lock:
+            hit = self._canonical_proofs.get(cache_key) if trusted_digest and not self._closed else None
+            if hit is not None:
+                self._canonical_proofs.move_to_end(cache_key)
+                return hit
+        encoded = producer(key)
+        if type(encoded) is not bytes or encoded != key.canonical.encode("utf-8"):
+            raise TypeError("Canonical text proof requires exact immutable bytes")
+        digest = digest_producer(encoded).hexdigest()
+        if type(digest) is not str or len(digest) != 64:
+            raise TypeError("Canonical text proof requires its exact digest")
+        reference = key.reference
+        reference_bytes = (
+            len(reference.codec.encode("utf-8")) + len(reference.digest.encode("utf-8")) + len(str(reference.byte_length))
+            if reference is not None
+            else 0
+        )
+        size = len(encoded) * 2 + len(digest) + reference_bytes + len(str(key.max_utf8_bytes))
+        proof = CanonicalTextProof(encoded, digest, size)
+        # Count the retained text key, encoded bytes and digest, including
+        # distinct producer/bound entries; evict oldest proofs on pressure.
+        with self._lock:
+            if (
+                not trusted_digest
+                or self._closed
+                or len(encoded) > key.max_utf8_bytes
+                or size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+            ):
+                return proof
+            hit = self._canonical_proofs.get(cache_key)
+            if hit is not None:
+                self._canonical_proofs.move_to_end(cache_key)
+                return hit
+            self._canonical_text = None
+            while self._canonical_proof_bytes + size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+                _, evicted = self._canonical_proofs.popitem(last=False)
+                self._canonical_proof_bytes -= evicted.retained_bytes
+            while self._canonical_proof_bytes + self._recorder_block_hash_bytes + size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+                _, evicted_size = self._recorder_block_hashes.popitem(last=False)
+                self._recorder_block_hash_bytes -= evicted_size
+            self._canonical_proofs[cache_key] = proof
+            self._canonical_proof_bytes += size
+        return proof
+
+    def recorder_block_hash(self, key: RecorderBlockHashKey, producer: Callable[[RecorderBlockHashKey], object]) -> None:
+        """Retain one exact immutable block address proof; callers still parse/store fresh."""
+        if type(key) is not RecorderBlockHashKey or type(key.expected_digest) is not str or type(key.canonical) is not str:
+            raise TypeError("Recorder block hash memo requires its exact text key")
+        _require_function_producer(producer)
+        cache_key = (producer, key)
+        with self._lock:
+            if not self._closed and cache_key in self._recorder_block_hashes:
+                self._recorder_block_hashes.move_to_end(cache_key)
+                return
+        if producer(key) is not None:
+            raise TypeError("Recorder block hash producer must return no mutable value")
+        size = len(key.expected_digest.encode("utf-8")) + len(key.canonical.encode("utf-8"))
+        with self._lock:
+            if self._closed or size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+                return
+            if cache_key in self._recorder_block_hashes:
+                self._recorder_block_hashes.move_to_end(cache_key)
+                return
+            self._canonical_text = None
+            while self._canonical_proof_bytes + self._recorder_block_hash_bytes + size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+                if self._recorder_block_hashes:
+                    _, evicted_size = self._recorder_block_hashes.popitem(last=False)
+                    self._recorder_block_hash_bytes -= evicted_size
+                else:
+                    _, evicted_proof = self._canonical_proofs.popitem(last=False)
+                    self._canonical_proof_bytes -= evicted_proof.retained_bytes
+            self._recorder_block_hashes[cache_key] = size
+            self._recorder_block_hash_bytes += size
 
     def recorder_request_text(
         self, key: RecorderRequestTextKey, producer: Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None]

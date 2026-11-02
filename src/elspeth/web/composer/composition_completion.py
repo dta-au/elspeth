@@ -750,6 +750,32 @@ class _TerminalNoToolAdvisorGateOutcome:
     graph_review_identity: AdvisorGraphReviewIdentity | None = None
 
 
+def _end_disposition_after_terminal_barriers(result: ComposerResult, gate: _TerminalNoToolAdvisorGateOutcome) -> _EndCompletionDisposition:
+    """Classify only an actual gate's result after its terminal barriers ran.
+
+    This is control-flow DATA. Publication still authenticates the original
+    accepted model pass and complete retained result in its SQL transaction.
+    """
+    identity = result.graph_review_identity
+    readiness = None if result.runtime_preflight is None else result.runtime_preflight.readiness
+    if (
+        type(identity) is AdvisorGraphReviewIdentity
+        and identity.source == "model"
+        and gate.publication_binding is not None
+        and identity.binding == gate.publication_binding
+        and (
+            (_state_is_structurally_empty(result.state) and result.runtime_preflight is None)
+            or (
+                type(result.advisor_gate_decision) is AdvisorGatePassed
+                and type(readiness) is ValidationReadiness
+                and readiness.completion_ready
+            )
+        )
+    ):
+        return _EndCompletionDisposition.CLEAN
+    return _EndCompletionDisposition.BLOCKED
+
+
 def _advance_advisor_review_state(
     review_state: _AdvisorReviewState,
     *,
@@ -2001,24 +2027,7 @@ class CompositionCompletion:
         # Only this final return has crossed all proof and orphan barriers.
         # Earlier blocked returns retain the default nonpublication disposition
         # even when an earlier graph review happened to pass.
-        disposition = _EndCompletionDisposition.BLOCKED
-        identity = threaded.graph_review_identity
-        readiness = None if threaded.runtime_preflight is None else threaded.runtime_preflight.readiness
-        if (
-            type(identity) is AdvisorGraphReviewIdentity
-            and identity.source == "model"
-            and advisor_gate.publication_binding is not None
-            and identity.binding == advisor_gate.publication_binding
-            and (
-                (_state_is_structurally_empty(threaded.state) and threaded.runtime_preflight is None)
-                or (
-                    type(threaded.advisor_gate_decision) is AdvisorGatePassed
-                    and type(readiness) is ValidationReadiness
-                    and readiness.completion_ready
-                )
-            )
-        ):
-            disposition = _EndCompletionDisposition.CLEAN
+        disposition = _end_disposition_after_terminal_barriers(threaded, advisor_gate)
         return _TerminateOutcome(
             action="return",
             result=threaded,
@@ -2330,7 +2339,7 @@ class CompositionCompletion:
         session_id: str | None,
         current_state_id: str | None,
         assistant_message: _AdmittedAssistantMessage,
-        llm_messages: list[dict[str, Any]],
+        llm_messages: list[dict[str, Any]] | None,
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
         session_operation_context: SessionOperationContext | None = None,
@@ -2386,6 +2395,8 @@ class CompositionCompletion:
         any validator failures hidden behind the pending review instead of
         implying the review cards are the only remaining step.
         """
+        if allow_repair_continue and llm_messages is None:
+            raise TypeError("Authoring repair requires its original mutable message buffer")
         max_passes = self._max_advisor_checkpoint_passes
         if type(turn_evidence) is not TurnEvidence:
             raise TypeError("Terminal review requires the current request's owned evidence")
@@ -2697,6 +2708,8 @@ class CompositionCompletion:
             # Capture the append index BEFORE mutating — a stable, exact
             # handle the driver uses to elide this message later (Step 3)
             # rather than pattern-matching the prefix text.
+            if llm_messages is None:
+                raise AuditIntegrityError("Terminal-only review cannot enter authoring repair")
             injection_index = len(llm_messages)
             llm_messages.append(
                 {

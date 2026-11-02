@@ -153,7 +153,8 @@ def retain_iteration_transition(
             captured_compose, captured_batch = applied_batch_cut(captured.stack.frames)
             if (
                 captured.stack.model_copy(update={"frames": before.frames}) != before
-                or captured_batch != batch
+                or captured_batch.model_copy(update={"accumulator": batch.accumulator}) != batch
+                or captured_batch.accumulator.codec != batch.accumulator.codec
                 or captured_compose.initial_version != compose.initial_version
                 or captured_compose.slice_sequence != compose.slice_sequence
                 or captured_compose.composition_slice < compose.composition_slice
@@ -173,6 +174,20 @@ def retain_iteration_transition(
                     payload=chunk.canonical.encode("utf-8"),
                     codec=chunk.reference.codec,
                 )
+            # A completed batch may have a new graph chunk after capture.
+            # Reprove that exact full graph and every original P4 application
+            # before retiring its current frame; the old chunk stays intact.
+            from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
+            from elspeth.web.composer.continuation_runtime import _selected_chunks
+            from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection
+
+            captured_selected = SelectedContinuationState(
+                selected.checkpoint_id, captured.stack, _selected_chunks(captured.stack, captured.chunks, selected.chunks)
+            )
+            admitted = read_selected_turn_evidence_graph_on_connection(conn, running, selected=captured_selected, names=inventory.names)
+            require_p4_application_journal_on_connection(
+                conn, running, selected=captured_selected, evidence=admitted, env_ref_names=inventory.names
+            )
             following = captured_compose.model_copy(
                 update={"phase": "action_ready", "pending_response": None, "provider_effect_key": None, "provider_input_sha256": None}
             )

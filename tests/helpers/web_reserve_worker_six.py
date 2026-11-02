@@ -106,14 +106,14 @@ GRAMMARS = {
 }
 IMPORT_GRAMMAR = "3b442f921115a868c5b933f82f0681432b524512986f3ff1478cf65b97c2bc64"
 CONTINUATION_OWNER_GRAMMARS = {
-    "ComposerAsyncWorker._job": "623b90091c8d508e154869a4d4af8dbaaf411f29ba73bec97c15cdd2a9a7e535",
+    "ComposerAsyncWorker._job": "aa8d9593bc27624ba0f57d95b39cd1c9c03eb1971e1ba8dcbfd2a07a38899150",
     "ContinuationLeaseAdoption": "6c853b51d24a4cc2d73d8adc70fa44567b25eb671141e558a2cf08b0f5c7c87f",
 }
 
 _CONTINUATION_START_PREFIX = """
 running = ComposerOperationRunning(claim=claim, session_operation_context=context)
 if observation.policy is None or observation.hard_expires_at is None or self._drain_signal is None:
-    raise AuditIntegrityError("V2 start lost its actual retained timing/process signal owners")
+    raise AuditIntegrityError("segment start lost its actual retained timing/process signal owners")
 sql_deadline = ContinuationSQLDeadlineOwner(
     running,
     policy=observation.policy,

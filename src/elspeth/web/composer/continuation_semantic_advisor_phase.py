@@ -19,7 +19,7 @@ from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
 from elspeth.web.composer.advisor_output import PrimaryContinuationAction, ReadContinuationAction, ReviewContinuationAction
-from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame
+from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame, ToolBatchFrame
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
@@ -56,6 +56,7 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
     begin_semantic_advisor_on_connection,
     close_semantic_advisor_no_sdk_on_connection,
     consume_committed_semantic_read_on_connection,
+    consume_semantic_advisor_iteration_stop_on_connection,
     consume_semantic_advisor_primary_on_connection,
     consume_semantic_advisor_review_on_connection,
     consume_semantic_advisor_whole_stop_on_connection,
@@ -191,6 +192,8 @@ async def _consume_current_decision(phases: ContinuationLivePhases, selected: Se
             == "semantic_read_committed"
         ):
             return consume_committed_semantic_read_on_connection(conn, running, selected=current, effect_key=effect_key)
+        if len(root.frames) == 3 and type(root.frames[1]) is ToolBatchFrame:
+            return consume_semantic_advisor_iteration_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
         return consume_semantic_advisor_whole_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
 
     phases.latest_snapshot = await _registered(
@@ -265,8 +268,14 @@ async def run_continuation_semantic_advisor(
         and len(selected.stack.frames) == 2
         and frame.phase in ("review_needed", "repair_needed", "publication_ready")
     )
+    actual_iteration_return = (
+        type(frame) is ToolBatchFrame
+        and len(selected.stack.frames) == 2
+        and frame.phase == "result_retained"
+        and frame.accumulator.codec == "composer.applied-p4-batch.v2"
+    )
     if (
-        (not initial_compose and not actual_end)
+        (not initial_compose and not actual_end and not actual_iteration_return)
         or selected.stack.active_action_json is not None
         or selected.stack.active_action_source is not None
     ):
@@ -285,7 +294,13 @@ async def run_continuation_semantic_advisor(
             operation=lambda: refuse_v3_retained_tail_before_paid(phases.authority, running, selected=selected, inventory=inventory),
             expected=V3UnboundedTailRefusal,
         )
-    clock = ContinuationActionClock(policy.actions.advisor)
+    clock = phases.action_clock
+    if clock is None:
+        if phases.work.coordinator.sql_deadline_owner is not None:
+            raise AuditIntegrityError("Semantic live action lost its original driver clock")
+        clock = ContinuationActionClock(policy.actions.advisor)
+    if type(clock) is not ContinuationActionClock or clock.policy != policy.actions.advisor:
+        raise AuditIntegrityError("Semantic live action changed its original Advisor allowance")
     runtime, inventory = await phases.current(selected)
     current = await _registered(
         work=phases.work,

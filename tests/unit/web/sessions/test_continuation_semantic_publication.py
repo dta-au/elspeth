@@ -12,14 +12,17 @@ from sqlalchemy import select
 
 from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer import prompt_guard as original_guard
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.continuation_semantic_advisor import prepare_semantic_advisor_request
+from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationRaised
 from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
 from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.sessions.composer_finalization import _message_with_state_response
 from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite, ComposerOperationCancelledDuringTurn
 from elspeth.web.sessions.continuation import load_snapshot
@@ -95,12 +98,22 @@ async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
             obligations=[{**asdict(original_request), "status": "satisfied"}],
         )
         stop_sdk = []
+        guard_inputs = []
+        original_request_builder = original_guard._request
+
+        def record_actual_guard_request(**kwargs):
+            guarded, supported = original_request_builder(**kwargs)
+            guard_inputs.append(
+                (guarded.role, supported, len(guarded.user_prompt), len(guarded.documents), max(map(len, guarded.documents), default=0))
+            )
+            return guarded, supported
 
         async def complete_stop(**kwargs):
             stop_sdk.append(kwargs)
             return semantic_fixture._reply(json.dumps(answer))
 
         monkeypatch.setattr(litellm, "acompletion", complete_stop)
+        monkeypatch.setattr(original_guard, "_request", record_actual_guard_request)
         stop_case = {
             **case,
             "runtime": runtime,
@@ -111,6 +124,20 @@ async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
         }
         issuer, prepared, dispatched = semantic_fixture._begin(store, stop_case)
         observed = await semantic_fixture._invoke(stop_case, issuer)
+        if type(observed) is SemanticAdvisorInvocationRaised:
+            # A real pre-SDK failure is diagnostic evidence, never an original
+            # paid outcome. Preserve it instead of masking it with the paid
+            # retention owner's provenance refusal below.
+            observed.error.add_note(f"actual Stop SDK entries before original failure: {len(stop_sdk)}")
+            if type(observed.error) is PromptGuardRefused:
+                observed.error.add_note(
+                    f"actual Stop guard refusal: disposition={observed.error.disposition}; "
+                    f"reason={observed.error._decision.reason}; audit_id={observed.error.audit_id}"
+                )
+                observed.error.add_note(
+                    f"actual guard inputs (role, supported, user characters, documents, largest document characters): {guard_inputs}"
+                )
+            raise observed.error
         with locked_session_transaction(store[0], sid) as conn:
             paid = retain_semantic_advisor_outcome_on_connection(
                 conn, prepared, selected=dispatched, outcome=observed, recorder=runtime.live.recorder, issuer=issuer

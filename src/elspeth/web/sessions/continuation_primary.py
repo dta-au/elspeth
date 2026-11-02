@@ -368,6 +368,71 @@ def _original_wire(value: RetainedPrimaryInput) -> tuple[list[dict[str, Any]], l
     return messages, original_tools
 
 
+def allocate_primary_effect_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    input_sha256: str,
+    action_json: str | None,
+) -> ContinuationProviderBinding:
+    """Allocate one family-0 effect after its caller's exact source admission.
+
+    Ordinary Compose and post-P4 classifier PRIMARY share this counter. Their
+    separate callers must admit their complete source before allocation; this
+    helper neither crops a root nor grants physical dispatch permission.
+    """
+    _require_current_continuation_running(conn, running)
+    if not is_lower_sha256_hex(input_sha256):
+        raise AuditIntegrityError("primary allocation requires its exact original input digest")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    ordinal = conn.execute(
+        select(ordinals.c.next_ordinal).where(
+            ordinals.c.session_id == sid,
+            ordinals.c.operation_id == operation,
+            ordinals.c.family == 0,
+        )
+    ).scalar_one_or_none()
+    number = 0 if ordinal is None else ordinal
+    key = f"provider:0:{number}"
+    if (
+        conn.execute(
+            select(effects.c.effect_key).where(
+                effects.c.session_id == sid,
+                effects.c.operation_id == operation,
+                effects.c.effect_key == key,
+            )
+        ).one_or_none()
+        is not None
+    ):
+        raise ContinuationCASConflict("primary ordinal collides with an existing actual effect")
+    conn.execute(
+        insert(effects).values(
+            session_id=sid,
+            operation_id=operation,
+            effect_key=key,
+            input_sha256=input_sha256,
+            owner="provider",
+            disposition="prepared",
+            creator_sequence=running.claim.segment_sequence,
+            creator_generation=running.claim.ownership_generation,
+            action_json=action_json,
+        )
+    )
+    if ordinal is None:
+        conn.execute(insert(ordinals).values(session_id=sid, operation_id=operation, family=0, next_ordinal=1))
+    else:
+        conn.execute(
+            update(ordinals)
+            .where(
+                ordinals.c.session_id == sid,
+                ordinals.c.operation_id == operation,
+                ordinals.c.family == 0,
+            )
+            .values(next_ordinal=number + 1)
+        )
+    return ContinuationProviderBinding(running, key, 0, number, input_sha256)
+
+
 def prepare_primary_provider_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
@@ -402,39 +467,8 @@ def prepare_primary_provider_on_connection(
 
         action_json = require_current_prescribed_primary_action_on_connection(conn, running, root)
     _wire_input_data(conn, running.claim.session_id, running.claim.operation_id, frame, request, action_json)
-    ordinal = conn.execute(
-        select(ordinals.c.next_ordinal).where(
-            ordinals.c.session_id == sid,
-            ordinals.c.operation_id == operation,
-            ordinals.c.family == 0,
-        )
-    ).scalar_one_or_none()
-    number = 0 if ordinal is None else ordinal
-    key = f"provider:0:{number}"
-    if (
-        conn.execute(
-            select(effects.c.effect_key).where(
-                effects.c.session_id == sid,
-                effects.c.operation_id == operation,
-                effects.c.effect_key == key,
-            )
-        ).one_or_none()
-        is not None
-    ):
-        raise ContinuationCASConflict("primary ordinal collides with an existing actual effect")
-    conn.execute(
-        insert(effects).values(
-            session_id=sid,
-            operation_id=operation,
-            effect_key=key,
-            input_sha256=input_sha256,
-            owner="provider",
-            disposition="prepared",
-            creator_sequence=running.claim.segment_sequence,
-            creator_generation=running.claim.ownership_generation,
-            action_json=action_json,
-        )
-    )
+    binding = allocate_primary_effect_on_connection(conn, running, input_sha256=input_sha256, action_json=action_json)
+    key = binding.effect_key
     put_chunk(
         conn,
         session_id=sid,
@@ -443,18 +477,6 @@ def prepare_primary_provider_on_connection(
         payload=request.canonical.encode("utf-8"),
         codec="composer.provider-input.v1",
     )
-    if ordinal is None:
-        conn.execute(insert(ordinals).values(session_id=sid, operation_id=operation, family=0, next_ordinal=1))
-    else:
-        conn.execute(
-            update(ordinals)
-            .where(
-                ordinals.c.session_id == sid,
-                ordinals.c.operation_id == operation,
-                ordinals.c.family == 0,
-            )
-            .values(next_ordinal=number + 1)
-        )
     changed = frame.model_copy(
         update={
             "phase": "awaiting_response",
@@ -495,7 +517,7 @@ def prepare_primary_provider_on_connection(
         event_batch=(ContinuationEvent("input_prepared", canonical_json({"effect_key": key, "input_sha256": input_sha256})),),
         handoff=False,
     )
-    return ContinuationProviderBinding(running, key, 0, number, input_sha256)
+    return binding
 
 
 def _selected_effect(

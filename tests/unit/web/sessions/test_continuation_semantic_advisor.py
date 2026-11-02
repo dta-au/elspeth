@@ -706,12 +706,13 @@ async def test_entered_semantic_attempt_cannot_be_closed_as_no_sdk_after_actual_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invented", ["read", "review"])
+@pytest.mark.parametrize("invented", ["read", "review", "iteration_return"])
 async def test_semantic_prepare_refuses_coherent_unowned_result_document_before_any_effect(
     operation_store, tmp_path, monkeypatch, invented
 ):
     from elspeth.web.composer.advisor_output import ContinuationEvidenceRef
     from elspeth.web.composer.continuation_semantic_advisor import (
+        SemanticAdvisorIterationReturnInput,
         SemanticAdvisorReadInput,
         SemanticAdvisorRetainedInputs,
         SemanticAdvisorReviewInput,
@@ -743,6 +744,13 @@ async def test_semantic_prepare_refuses_coherent_unowned_result_document_before_
             1,
             "clean",
         )
+        iteration_return = SemanticAdvisorIterationReturnInput(
+            canonical_json({"message": "An output the actual classifier never returned."}),
+            "advance:never_executed",
+            "not-a-returned-source",
+            1,
+            selected.stack.frames[0].audit_buffer,
+        )
         retained = SemanticAdvisorRetainedInputs(
             selected.stack.logical.session_id,
             selected.stack.logical.operation_id,
@@ -750,6 +758,7 @@ async def test_semantic_prepare_refuses_coherent_unowned_result_document_before_
             selected.stack.cursor,
             (read,) if invented == "read" else (),
             review if invented == "review" else None,
+            iteration_return if invented == "iteration_return" else None,
         )
         request = prepare_semantic_advisor_request(
             owner=runtime.materialization.service._advisor_checkpoint,
