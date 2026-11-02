@@ -133,6 +133,7 @@ from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 from elspeth.web.execution.schemas import ValidationResult
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_checkpoint_end_format_retry import CheckpointEndFormatRetrySource
     from elspeth.web.composer.continuation_checkpoint_end_locals import CheckpointEndGateLocals
     from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointEndPhysicalSource
     from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
@@ -934,12 +935,27 @@ class AdvisorCheckpointOwner:
         _outcome: _AdvisorInvocationCapture | None = None,
         failure_observation: ContinuationDispatchFailureObservation | None = None,
         checkpoint_end_source: CheckpointEndPhysicalSource | None = None,
+        checkpoint_end_retry: CheckpointEndFormatRetrySource | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        if checkpoint_end_retry is not None and checkpoint_end_source is None:
+            raise AuditIntegrityError("END format re-prompt requires its original physical source")
         if checkpoint_end_source is not None:
             from elspeth.web.composer.continuation_checkpoint_end_physical import require_original_checkpoint_end_physical_source
 
             require_original_checkpoint_end_physical_source(checkpoint_end_source)
             phase_owner = checkpoint_end_source.phase_owner
+            if checkpoint_end_retry is None:
+                if phase_owner.phase_source.completed_children:
+                    raise AuditIntegrityError("END second call requires its original retained format-reprompt source")
+            else:
+                from elspeth.web.composer.continuation_checkpoint_end_format_retry import require_original_checkpoint_end_format_retry
+
+                require_original_checkpoint_end_format_retry(checkpoint_end_retry)
+                if (
+                    checkpoint_end_retry.phase_owner is not phase_owner
+                    or checkpoint_end_retry.gate_locals is not checkpoint_end_source.gate_locals
+                ):
+                    raise AuditIntegrityError("END format re-prompt changed its original physical gate")
             if (
                 _outcome is not checkpoint_end_source.capture
                 or provider_owner is not phase_owner.phases.provider_owner
@@ -972,6 +988,10 @@ class AdvisorCheckpointOwner:
                 publication_review=checkpoint_end_source.gate_locals.publication_review,
             )
             self._require_complete_graph_summary(original_arguments["_elspeth_advisor_summary_parts"])
+            if checkpoint_end_retry is not None:
+                original_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(
+                    original_arguments, schema_valid=checkpoint_end_retry.proof.marker.first_attempt_schema_valid is True
+                )
             if arguments != original_arguments:
                 raise AuditIntegrityError("END physical call substituted its original gate request")
         if _outcome is not None:

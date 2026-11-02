@@ -131,9 +131,25 @@ async def prepare_checkpoint_end_format_retry(
         return await settle_overflow(excess)
     except AuditIntegrityError as error:
         cause = error.__cause__
-        if type(cause) is not ContinuationMandatoryCaptureOverflow or cause.witness.codec != RECORDER_CODEC:
+        if type(cause) is not ContinuationMandatoryCaptureOverflow or cause.witness.codec not in (RECORDER_CODEC, "composer.evidence.v2"):
             raise
         return await settle_overflow(cause.witness)
+    # V4 custody deliberately defers ordinary cost settlement until its SQL
+    # consequence is durable. Project this exact proved call before restoring
+    # the next runtime; its cost owner must agree with the complete ledger.
+    budget = phases.provider_owner.cost_budget
+    call = first.returned.audit_call
+    accountable = call.cost_response_accountable
+    if (
+        budget is None
+        or type(accountable) is not bool
+        or before.runtime.bindings.provider_owner is not phases.provider_owner
+        or proof.marker.attempt_id != call.call_id
+        or budget.snapshot().physical_calls != len(budget.snapshot().charges) + 1
+        or any(charge.call_id == call.call_id for charge in budget.snapshot().charges)
+    ):
+        raise AuditIntegrityError("END retry lost its original unsettled cost projection")
+    budget.consume_settled(call, response_accountable=accountable)
     phases.latest_snapshot = proof.selected
     selected = await load_selected_continuation(
         authority=phases.authority, running=running, selected=proof.selected, required_work=phases.work

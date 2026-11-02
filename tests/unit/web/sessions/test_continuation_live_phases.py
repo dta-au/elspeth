@@ -39,6 +39,7 @@ from elspeth.web.sessions.continuation_end import primary_issued_no_tools
 from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.continuation_budgets import OWNER_LEASE_SECONDS
 from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import _assert_required_guard_admitted, initialized_primary_input, stored_rows
@@ -203,8 +204,14 @@ async def _phase_case(
     following_tool_call: tuple[str, str, dict[str, Any]] | None = None,
     before_batch_initialization=None,
     settings_overrides=None,
+    base_state_data: CompositionStateData | None = None,
 ):
-    runtime, work, requests = await initialized_primary_input(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
+    if base_state_data is None:
+        runtime, work, requests = await initialized_primary_input(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
+    else:
+        runtime, work, requests = await initialized_primary_input(
+            store, tmp_path, monkeypatch, settings_overrides=settings_overrides, base_state_data=base_state_data
+        )
     service, authority = runtime.materialization.service, store[2]
     running = work.running
     assert running is not None

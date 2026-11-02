@@ -12,13 +12,13 @@ from hashlib import sha256
 from typing import Literal
 
 from pydantic import ValidationError, model_validator
-from sqlalchemy import Connection, select, update
+from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
-from elspeth.web.composer.audit import llm_call_audit_envelope, llm_call_audit_summary
+from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.continuation import (
     ComposeFrame,
     ContinuationValue,
@@ -40,6 +40,9 @@ from elspeth.web.composer.continuation_codec import (
     encode_continuation_snapshot,
     encode_private_chunk,
 )
+from elspeth.web.composer.continuation_evidence import admit_turn_evidence, decode_turn_evidence, encode_turn_evidence
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
     _usage_entry_id,
@@ -70,6 +73,7 @@ from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
     require_checkpoint_paid_private_audit_on_connection,
     write_checkpoint_paid_audit_cohort_on_connection,
 )
+from elspeth.web.sessions.continuation_cost import _closed_call
 from elspeth.web.sessions.continuation_retained_capacity import (
     ProspectiveContinuationChunk,
     admit_retained_payload_chunks,
@@ -77,6 +81,7 @@ from elspeth.web.sessions.continuation_retained_capacity import (
     load_continuation_read_contract,
     read_bounded_retained_chunk,
 )
+from elspeth.web.sessions.continuation_selection import load_private_chunks
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
@@ -87,7 +92,7 @@ from elspeth.web.sessions.time_normalization import restore_utc
 
 class EndFormatRetryMarker(ContinuationValue):
     owner: Literal["composer_checkpoint_end_format_retry"] = "composer_checkpoint_end_format_retry"
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     session_id: str
     operation_id: str
     attempt_id: str
@@ -101,6 +106,7 @@ class EndFormatRetryMarker(ContinuationValue):
     response_chunk_key: str
     receipt_key: str
     recorder: PrivateChunkRef
+    evidence: PrivateChunkRef
     pass_index: int
     retry_ordinal: Literal[0] = 0
     next_retry_ordinal: Literal[1] = 1
@@ -151,12 +157,39 @@ def _retry_recorder(conn: Connection, owed: VerifiedCheckpointEndOwed) -> Privat
     return encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)
 
 
-def _retry_root(owed: VerifiedCheckpointEndOwed, receipt: str, recorder: PrivateChunkRef) -> str:
+def _retry_evidence(conn: Connection, owed: VerifiedCheckpointEndOwed, recorder: PrivateChunk, *, names: frozenset[str]) -> PrivateChunk:
+    """Freshly admit the unchanged evidence graph with its exact paid recorder.
+
+    Both private references change together. This is a DATA projection from
+    the deep original H; it grants neither runtime nor provider authority.
+    """
+    root = decode_continuation_snapshot(owed.selected.payload_json)
+    compose = root.frames[0]
+    if type(compose) is not ComposeFrame:
+        raise AuditIntegrityError("END retry evidence lost its original Compose owner")
+    chunks = load_private_chunks(conn, session_id=owed.session_id, operation_id=owed.operation_id, stack=root)
+    originals = tuple(chunk for chunk in chunks if chunk.reference == compose.evidence)
+    if len(originals) != 1:
+        raise AuditIntegrityError("END retry evidence lost its complete original graph")
+    original = decode_turn_evidence(originals[0], env_ref_names=names, source_chunks=chunks)
+    if original.snapshot.recorder != compose.audit_buffer:
+        raise AuditIntegrityError("END retry evidence changed its original recorder identity")
+    refreshed = admit_turn_evidence(
+        original.snapshot.model_copy(update={"recorder": recorder.reference}),
+        env_ref_names=names,
+        mandatory_retention=True,
+        source_chunks=(*chunks, recorder),
+    )
+    return encode_turn_evidence(refreshed, env_ref_names=names, mandatory_retention=True)
+
+
+def _retry_root(owed: VerifiedCheckpointEndOwed, receipt: str, recorder: PrivateChunkRef, evidence: PrivateChunkRef) -> str:
     root = decode_continuation_snapshot(owed.selected.payload_json)
     children = tuple(item for item in root.effect_frontier if item.effect_id == owed.effect_key)
     if (
         type(root.frames[0]) is not ComposeFrame
         or recorder.codec != "composer.audit-buffer.v2"
+        or evidence.codec != "composer.evidence.v2"
         or len(children) != 1
         or children[0].disposition != "dispatched"
         or children[0].receipt_id is not None
@@ -167,7 +200,7 @@ def _retry_root(owed: VerifiedCheckpointEndOwed, receipt: str, recorder: Private
     return encode_continuation_snapshot(
         root.model_copy(
             update={
-                "frames": (root.frames[0].model_copy(update={"audit_buffer": recorder}), *root.frames[1:]),
+                "frames": (root.frames[0].model_copy(update={"audit_buffer": recorder, "evidence": evidence}), *root.frames[1:]),
                 "effect_frontier": tuple(
                     EffectFrontierEntry(effect_id=item.effect_id, disposition="committed", receipt_id=receipt)
                     if item.effect_id == owed.effect_key
@@ -238,6 +271,7 @@ def retain_end_format_retry_on_connection(
             raise AuditIntegrityError("END format retry lost its original phase/input closure")
         cohort = checkpoint_paid_audit_cohort_for_hold(call, owed.new_hold)
         recorder = _retry_recorder(conn, owed)
+        evidence = _retry_evidence(conn, owed, recorder, names=prepared.env_ref_names)
         receipt = f"checkpoint-end-format-retry:{owed.attempt_id}"
         marker = EndFormatRetryMarker(
             session_id=sid,
@@ -253,6 +287,7 @@ def retain_end_format_retry_on_connection(
             response_chunk_key=private_chunk_key(owed.response),
             receipt_key=receipt,
             recorder=recorder.reference,
+            evidence=evidence.reference,
             pass_index=owed.pass_index,
             end_env_ref_names=tuple(sorted(prepared.env_ref_names)),
             first_attempt_schema_valid=verdict.response_schema_valid,
@@ -261,7 +296,10 @@ def retain_end_format_retry_on_connection(
         event = ContinuationEvent("checkpoint", canonical_json(marker.model_dump(mode="json")))
         now = database_now(conn)
         append = prepare_snapshot_append(
-            owed.selected, snapshot_json=_retry_root(owed, receipt, recorder.reference), events=(event,), published_at=now
+            owed.selected,
+            snapshot_json=_retry_root(owed, receipt, recorder.reference, evidence.reference),
+            events=(event,),
+            published_at=now,
         )
         admit_retained_payload_chunks(
             conn,
@@ -271,6 +309,7 @@ def retain_end_format_retry_on_connection(
             consuming_hold=owed.new_hold,
             prospective=(
                 ProspectiveContinuationChunk(private_chunk_key(recorder), recorder.canonical.encode("utf-8"), recorder.reference.codec),
+                ProspectiveContinuationChunk(private_chunk_key(evidence), evidence.canonical.encode("utf-8"), evidence.reference.codec),
                 ProspectiveContinuationChunk(f"event:{owed.selected.cursor + 1}", event.payload_json.encode("utf-8"), "event.v2"),
                 ProspectiveContinuationChunk(f"snapshot:{append.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
             ),
@@ -284,14 +323,15 @@ def retain_end_format_retry_on_connection(
             cohort=cohort,
             names=prepared.env_ref_names,
         )
-        put_chunk(
-            conn,
-            session_id=sid,
-            operation_id=operation,
-            key=private_chunk_key(recorder),
-            payload=recorder.canonical.encode("utf-8"),
-            codec=recorder.reference.codec,
-        )
+        for chunk in (recorder, evidence):
+            put_chunk(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                key=private_chunk_key(chunk),
+                payload=chunk.canonical.encode("utf-8"),
+                codec=chunk.reference.codec,
+            )
         changed = conn.execute(
             update(effects)
             .where(
@@ -419,6 +459,7 @@ def read_end_format_retry_on_connection(
         )
     ).one_or_none()
     recorder = _retry_recorder(conn, owed)
+    evidence = _retry_evidence(conn, owed, recorder, names=original_names)
     stored_recorder = read_bounded_retained_chunk(
         conn,
         session_id=session_id,
@@ -433,7 +474,21 @@ def read_end_format_retry_on_connection(
         or stored_recorder.payload != recorder.canonical.encode("utf-8")
     ):
         raise AuditIntegrityError("END retry lost its complete ordered paid recorder prefix")
-    expected = decode_continuation_snapshot(_retry_root(owed, marker.receipt_key, recorder.reference))
+    stored_evidence = read_bounded_retained_chunk(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        key=private_chunk_key(evidence),
+        allowance=contract.allowance,
+    )
+    if (
+        marker.evidence != evidence.reference
+        or stored_evidence is None
+        or stored_evidence.codec != evidence.reference.codec
+        or stored_evidence.payload != evidence.canonical.encode("utf-8")
+    ):
+        raise AuditIntegrityError("END retry lost its complete refreshed evidence graph")
+    expected = decode_continuation_snapshot(_retry_root(owed, marker.receipt_key, recorder.reference, evidence.reference))
     actual = decode_continuation_snapshot(selected.payload_json)
     if (
         verdict.ok
@@ -491,22 +546,41 @@ def read_end_format_retry_on_connection(
         private_sha256=marker.private_audit_sha256,
         incomplete=False,
     )
+    public_text = cast(messages.c.tool_calls, Text)
+    if conn.dialect.name == "postgresql":
+        size = func.octet_length(public_text)
+    elif conn.dialect.name == "sqlite":
+        size = func.length(cast(messages.c.tool_calls, LargeBinary))
+    else:
+        raise AuditIntegrityError("END format retry audit has unsupported SQL dialect")
+    bounded_calls = case((size <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, messages.c.tool_calls), else_=None).label("tool_calls")
     public_rows = conn.execute(
-        select(messages.c.tool_calls, messages.c.content)
+        select(
+            messages.c.role,
+            messages.c.writer_principal,
+            messages.c.content,
+            messages.c.raw_content,
+            messages.c.tool_call_id,
+            messages.c.parent_assistant_id,
+            messages.c.composition_state_id,
+            bounded_calls,
+        )
         .where(
             messages.c.session_id == session_id,
             messages.c.role == "audit",
-            messages.c.writer_principal == "compose_loop",
             messages.c.tool_calls[0]["_kind"].as_string() == "llm_call_audit",
             messages.c.tool_calls[0]["call"]["call_id"].as_string() == marker.attempt_id,
         )
         .limit(2)
     ).all()
-    if (
-        len(public_rows) != 1
-        or public_rows[0].tool_calls != [llm_call_audit_envelope(call)]
-        or public_rows[0].content != llm_call_audit_summary(call)
-    ):
+    if len(public_rows) != 1 or public_rows[0].tool_calls is None:
+        raise AuditIntegrityError("END format retry lost its bounded original public paid audit")
+    public_call = _closed_call(
+        public_rows[0],
+        ProviderAuditSource(session_id, owed.new_hold.session_operation_id, owed.new_hold.session_operation_epoch),
+        marker.attempt_id,
+    )
+    if llm_call_audit_envelope(public_call) != llm_call_audit_envelope(call):
         raise AuditIntegrityError("END format retry changed its original public paid audit")
     return VerifiedEndFormatRetry(marker, owed, selected)
 

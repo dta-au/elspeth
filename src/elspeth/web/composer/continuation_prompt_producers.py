@@ -894,9 +894,7 @@ class CurrentContinuationMessageProducers:
     ) -> tuple[object, _AdmittedToolCall, _ToolOutcome, ComposerToolInvocation, PrivateToolAuthoring, PrivateChunkRef]:
         """Read the one actual detached message and its completed recorder entry."""
         from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
-        from elspeth.web.composer.continuation_batch_data import RestoredBatchData
         from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
-        from elspeth.web.composer.tool_batch import ContinuationCallState
 
         self._require_compose_family()
         if (
@@ -908,8 +906,21 @@ class CurrentContinuationMessageProducers:
             or runtime.env_ref_names != self.inventory.names
         ):
             raise AuditIntegrityError("value-batch message crossed its original detached producer")
+        return self._completed_value_batch_message_source(runtime=runtime, call_model=call_model, index=index)
+
+    def _completed_value_batch_message_source(
+        self,
+        *,
+        runtime: RestoredContinuationRuntime,
+        call_model: _CallModelOutcome,
+        index: int,
+    ) -> tuple[object, _AdmittedToolCall, _ToolOutcome, ComposerToolInvocation, PrivateToolAuthoring, PrivateChunkRef]:
+        """Read original ready-source DATA after the caller proves its producer."""
+        from elspeth.web.composer.continuation_batch_data import RestoredBatchData
+        from elspeth.web.composer.tool_batch import ContinuationCallState
+
         data = runtime.graph.batch
-        top = self.selected.stack.frames[-1]
+        top = runtime.source.selected.stack.frames[-1]
         if (
             type(data) is not RestoredBatchData
             or type(top) is not ToolBatchFrame
@@ -1091,13 +1102,22 @@ class CurrentContinuationMessageProducers:
         self._remember_tool_result_provenance(registered)
 
     def register_issued_preview_result_message(self, *, prepared: PreparedValueBatchCall, permit: IssuedPreviewDispatch) -> None:
-        """Bind only the original issued preview's native appended result."""
-        from elspeth.web.composer.continuation_preview_dispatch import original_adopted_preview_result
+        """Verify the original issued preview's actual registered native result."""
+        from elspeth.web.composer.continuation_preview_dispatch import (
+            original_adopted_preview_result,
+            original_preview_issued_message_source,
+        )
 
         admitted = original_adopted_preview_result(permit, prepared=prepared)
-        if prepared.runtime.materialization is not self or prepared.context.message_producers is not self:
+        issued = original_preview_issued_message_source(permit, prepared=prepared)
+        if (
+            prepared.runtime.materialization is not self
+            or prepared.context.message_producers is not self
+            or issued.selected is not self.selected
+            or prepared.runtime.source.selected.stack.cursor + 1 != issued.selected.stack.cursor
+        ):
             raise AuditIntegrityError("issued preview feedback changed its actual original materialization")
-        message, tool_call, outcome, invocation, authoring, response = self._prepared_value_batch_message_source(
+        message, tool_call, outcome, invocation, authoring, response = self._completed_value_batch_message_source(
             runtime=prepared.runtime, call_model=prepared.call_model, index=prepared.call.index
         )
         serialized = serialize_admitted_discovery_result(admitted)
@@ -1107,7 +1127,6 @@ class CurrentContinuationMessageProducers:
             or outcome.response != admitted.to_tool_result()
             or message["content"] != serialized
             or invocation.private_authoring is not authoring
-            or any(actual is message for actual, *_rest in self._produced)
             or any(item.message is message for item in self._feedback_produced)
         ):
             raise AuditIntegrityError("issued preview feedback changed its complete original native output")
@@ -1120,8 +1139,9 @@ class CurrentContinuationMessageProducers:
             serialized=serialized,
             message=message,
         )
-        registered = self._register(message, recipe)
-        self._remember_tool_result_provenance(registered)
+        registered = tuple((actual_recipe, wire) for actual, actual_recipe, wire in self._produced if actual is message)
+        if len(registered) != 1 or registered[0] != (recipe, _wire(message)):
+            raise AuditIntegrityError("issued preview feedback lost its original issued result registration")
 
     def _register_prepared_value_result_message(
         self,

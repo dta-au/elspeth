@@ -18,6 +18,7 @@ from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowReceipt
+from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource
 
 _REQUESTED_MODEL_MAX_UTF8_BYTES = 256
 
@@ -64,6 +65,7 @@ def _prepare_paid_terminal_quota_entry(
     receipt: PaidOverflowReceipt | PaidIncompleteReceipt,
     requested_model: AdmittedPaidOverflowRequestedModel,
     observed_at: datetime,
+    historical_end_hold: ProviderTerminalHoldSource | None = None,
 ) -> TokenUsageEntry:
     """Project one original physical attempt; unknown measures remain NULL.
 
@@ -90,6 +92,24 @@ def _prepare_paid_terminal_quota_entry(
         raise AuditIntegrityError("original physical attempt lost its aware admission time")
     fence = context.fence
     identity = receipt.identity
+    if historical_end_hold is not None and (
+        type(historical_end_hold) is not ProviderTerminalHoldSource
+        or type(receipt) is not PaidOverflowReceipt
+        or receipt.producer != "checkpoint_advisor"
+        or historical_end_hold.session_id != identity.session_id
+        or historical_end_hold.operation_id != identity.operation_id
+        or historical_end_hold.effect_key != identity.effect_key
+        or historical_end_hold.session_operation_id != identity.session_operation_id
+        or historical_end_hold.session_operation_epoch != identity.session_operation_epoch
+        or historical_end_hold.lease_sha256 != identity.lease_sha256
+        or historical_end_hold.creator_generation != identity.ownership_generation
+        or historical_end_hold.source_checkpoint_id != identity.source_checkpoint_id
+        or historical_end_hold.source_cursor != identity.source_cursor
+        or historical_end_hold.source_snapshot_sha256 != identity.source_snapshot_sha256
+        or fence.session_id != identity.session_id
+        or fence.operation_epoch < identity.session_operation_epoch
+    ):
+        raise AuditIntegrityError("historical END quota lost its original paid H or current session fence")
     expected_source = "auto_title" if receipt.producer == "title" else "composer"
     if (
         type(physical.attempt_id) is not str
@@ -105,10 +125,10 @@ def _prepare_paid_terminal_quota_entry(
         or physical.operation_id != identity.session_operation_id
         or physical.operation_epoch != identity.session_operation_epoch
         or sha256(physical.lease_token.encode("utf-8")).hexdigest() != identity.lease_sha256
-        or physical.session_id != fence.session_id
-        or physical.operation_id != fence.operation_id
-        or physical.operation_epoch != fence.operation_epoch
-        or physical.lease_token != fence.lease_token
+        or (historical_end_hold is None and physical.session_id != fence.session_id)
+        or (historical_end_hold is None and physical.operation_id != fence.operation_id)
+        or (historical_end_hold is None and physical.operation_epoch != fence.operation_epoch)
+        or (historical_end_hold is None and physical.lease_token != fence.lease_token)
     ):
         raise AuditIntegrityError("paid overflow quota differs from its original physical fence")
     if observed_at.astimezone(UTC) < physical.started_at.astimezone(UTC):
@@ -146,4 +166,28 @@ def prepare_paid_overflow_quota_entry(
         raise TypeError("paid overflow quota requires its exact measured receipt")
     return _prepare_paid_terminal_quota_entry(
         physical=physical, context=context, receipt=receipt, requested_model=requested_model, observed_at=observed_at
+    )
+
+
+def prepare_checkpoint_end_owed_overflow_quota_entry(
+    *,
+    physical: OriginalPaidOverflowPhysicalAttempt,
+    context: SessionOperationContext,
+    hold: ProviderTerminalHoldSource,
+    receipt: PaidOverflowReceipt,
+    requested_model: AdmittedPaidOverflowRequestedModel,
+    observed_at: datetime,
+) -> TokenUsageEntry:
+    """Charge original END paid H under an independently fenced replacement writer.
+
+    The SQL caller must deep-prove this H and its current running claim in the
+    same locked transaction. This projector never grants a replacement fence.
+    """
+    return _prepare_paid_terminal_quota_entry(
+        physical=physical,
+        context=context,
+        receipt=receipt,
+        requested_model=requested_model,
+        observed_at=observed_at,
+        historical_end_hold=hold,
     )

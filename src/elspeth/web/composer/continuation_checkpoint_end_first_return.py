@@ -118,6 +118,7 @@ async def run_v4_checkpoint_end_first_return(
         provider_owner=provider_owner,
         _outcome=source.capture,
         checkpoint_end_source=source,
+        checkpoint_end_retry=format_retry,
     )
     observed = observe_checkpoint_end_physical_return(source)
     custody = checkpoint_end_physical_custody(source)

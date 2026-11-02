@@ -59,6 +59,7 @@ from elspeth.web.sessions.models import composer_continuation_events_table as ev
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import sessions_table as sessions
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.continuation_inventory import inventory_work
 from tests.helpers.continuation_memo import RetentionMemoTrace, UncachedValidationBudget
@@ -123,18 +124,31 @@ def _paid_ready_budgets(paid, content):
 
 
 async def ready_case(
-    store, tmp_path, monkeypatch, *, paid=False, bound_base=False, content="Original Café Session Title", settings_overrides=None
+    store,
+    tmp_path,
+    monkeypatch,
+    *,
+    paid=False,
+    bound_base=False,
+    content="Original Café Session Title",
+    settings_overrides=None,
+    base_state_data: CompositionStateData | None = None,
 ):
     if paid:
-        if settings_overrides is not None:
+        if settings_overrides is not None or base_state_data is not None:
             raise ValueError("Initial settings overrides are supported only by the unpaid ready fixture")
         running, service, work, settled, original, sdk, calls = await paid_title(store, tmp_path, monkeypatch, content)
         ready = await title_application.apply_current_title_success(service=service, selected=settled.selected, required_work=work)
         assert ready.applied and ready.result == original.result and len(sdk) == len(calls) == 1
         return running, service, work, ready.selected, sdk
-    running, completed, service, _prior, _base = await bootstrap_case(
-        store, eligible=False, bound_base=bound_base, settings_overrides=settings_overrides
-    )
+    if base_state_data is None:
+        running, completed, service, _prior, _base = await bootstrap_case(
+            store, eligible=False, bound_base=bound_base, settings_overrides=settings_overrides
+        )
+    else:
+        running, completed, service, _prior, _base = await bootstrap_case(
+            store, eligible=False, bound_base=bound_base, settings_overrides=settings_overrides, base_state_data=base_state_data
+        )
     work = inventory_work(running)
     ready = await publish(store, running, completed, service, work)
     return running, service, work, ready.selected, []

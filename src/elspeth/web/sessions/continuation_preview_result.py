@@ -422,7 +422,7 @@ def _fallback_documents(root: ContinuationFrameStack, *, source: PreviewSourceDa
     """
     from typing import get_args
 
-    surface = max(get_args(PreviewByteSurface), key=lambda item: len(canonical_json(item).encode("utf-8")))
+    surface = max(get_args(PreviewByteSurface.__value__), key=lambda item: len(canonical_json(item).encode("utf-8")))
     candidate = ValidationIncompleteReceipt(
         source=source, surface=surface, returned_sha256="0" * 64, returned_at="9999-12-31T23:59:59.999999+00:00"
     )

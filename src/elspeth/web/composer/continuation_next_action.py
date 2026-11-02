@@ -255,6 +255,17 @@ def validate_continuation_structure_data_on_connection(
                 raise AuditIntegrityError("structural admission mixed a tool result with another unresolved owner")
             return ambiguous
     if type(top) is EndFrame and ambiguous:
+        from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
+
+        held_end = read_current_end_h_recovery_on_connection(conn, selected=stored, names=env_ref_names)
+        if held_end is not None:
+            if (
+                root.pending_owner_results
+                or root.pending_settlement_ids != (held_end.attempt_id,)
+                or set(ambiguous) != {held_end.effect_key, held_end.outer_effect_key}
+            ):
+                raise AuditIntegrityError("structural END H changed its exact paid pending frontier")
+            return ambiguous
         from elspeth.web.composer.continuation_end_effects import end_effect_key
         from elspeth.web.composer.continuation_end_transitions import END_EFFECT_OWNER
 

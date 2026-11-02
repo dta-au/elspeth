@@ -1423,6 +1423,7 @@ def _selected_segment_action(
         return _initial_segment_action(conn, parent=parent, segment=segment, snapshot=snapshot, stack=stack, policy=policy)
     from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
     from elspeth.web.sessions.continuation_iteration_return import read_iteration_allowance_data_on_connection
     from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
 
@@ -1435,6 +1436,11 @@ def _selected_segment_action(
         or decode_continuation_policy(stack.admission_policy_json, stack.policy_hash) != policy
     ):
         raise AuditIntegrityError("selected segment differs from its current SQL snapshot")
+    held_end = read_current_end_h_recovery_on_connection(conn, selected=snapshot)
+    if held_end is not None:
+        if type(policy) is not ContinuationAdmissionPolicyV4:
+            raise AuditIntegrityError("END H successor lost its V4 policy")
+        return policy.actions.advisor
     iteration_action = read_iteration_allowance_data_on_connection(
         conn, session_id=UUID(parent.session_id), operation_id=parent.operation_id, selected=snapshot
     )
@@ -1457,6 +1463,7 @@ def _retained_successor_action(
 ) -> tuple[str, str]:
     from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
     from elspeth.web.sessions.continuation_iteration_return import read_iteration_allowance_data_on_connection
     from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
 
@@ -1465,8 +1472,15 @@ def _retained_successor_action(
         raise ContinuationCASConflict("producer selected another retained continuation head")
     stack = decode_continuation_snapshot(actual.payload_json)
     policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
+    held_end = read_current_end_h_recovery_on_connection(conn, selected=actual)
     expected = read_iteration_allowance_data_on_connection(conn, session_id=UUID(session_id), operation_id=operation_id, selected=actual)
-    if expected is None:
+    if held_end is not None:
+        if type(policy) is not ContinuationAdmissionPolicyV4:
+            raise AuditIntegrityError("END H recovery lost its V4 action")
+        if expected is not None:
+            raise AuditIntegrityError("END H recovery also has an iteration allowance")
+        expected = policy.actions.advisor
+    elif expected is None:
         private = load_snapshot_private_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=actual)
         expected = next_continuation_action_policy(selected=SelectedContinuationState(actual.checkpoint_id, stack, private), policy=policy)
     if policy_sha256 is not None and policy_sha256 != stack.policy_hash:
@@ -1499,6 +1513,8 @@ class ComposerSegmentRecoveryReceipt:
     # Set only by the live handover transaction after releasing this exact
     # fence. Peer recovery has no current lease to release.
     released_context: SessionOperationContext | None = field(default=None, compare=False)
+    # Exact original paid END hold; no journal append is permitted for this cut.
+    held_end_attempt_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -1587,6 +1603,7 @@ def recover_segment_on_connection(
     unresolved work raises ``ContinuationCutNotResumable`` with nothing written.
     """
     from elspeth.web.composer.continuation_next_action import ContinuationCutNotResumable
+    from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
     from elspeth.web.sessions.continuation_p4 import read_lost_terminal_p4_on_connection
     from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Preparation
     from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
@@ -1605,6 +1622,16 @@ def recover_segment_on_connection(
         )
     expected_generation = segment.generation
     stored = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+    held_end = read_current_end_h_recovery_on_connection(conn, selected=stored)
+    if held_end is not None:
+        principal = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id)).one_or_none()
+        if principal is None:
+            raise AuditIntegrityError("END H recovery lost its original session")
+        if parent.cancel_requested_at is not None or principal.archived_at is not None:
+            raise ContinuationCutNotResumable(
+                "paid END H requires original child settlement before cancel or archive",
+                effect_ids=(held_end.effect_key, held_end.outer_effect_key),
+            )
     action_json, policy_hash = _retained_successor_action(
         conn,
         session_id=session_id,
@@ -1613,27 +1640,31 @@ def recover_segment_on_connection(
         next_action_json=None,
         policy_sha256=None,
     )
-    retained = append_complete_snapshot(
-        conn,
-        session_id=session_id,
-        operation_id=operation_id,
-        expected_checkpoint_id=stored.checkpoint_id,
-        expected_cursor=stored.cursor,
-        snapshot_json=stored.payload_json,
-        event_batch=(
-            ContinuationEvent(
-                "recovered",
-                canonical_json(
-                    {
-                        "version": 2,
-                        "same_sequence": segment.sequence,
-                        "previous_generation": expected_generation,
-                        "generation": expected_generation + 1,
-                    }
+    retained = (
+        stored
+        if held_end is not None
+        else append_complete_snapshot(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            expected_checkpoint_id=stored.checkpoint_id,
+            expected_cursor=stored.cursor,
+            snapshot_json=stored.payload_json,
+            event_batch=(
+                ContinuationEvent(
+                    "recovered",
+                    canonical_json(
+                        {
+                            "version": 2,
+                            "same_sequence": segment.sequence,
+                            "previous_generation": expected_generation,
+                            "generation": expected_generation + 1,
+                        }
+                    ),
                 ),
             ),
-        ),
-        handoff=False,
+            handoff=False,
+        )
     )
     previous = conn.execute(
         update(attempts)
@@ -1647,8 +1678,13 @@ def recover_segment_on_connection(
             attempts.c.session_operation_epoch == history.session_operation_epoch,
             attempts.c.session_operation_lease_token == history.session_operation_lease_token,
             attempts.c.revoked_at.is_(None),
+            attempts.c.recovered_end_h_checkpoint_id.is_(None),
         )
-        .values(revoked_at=now, outcome="interrupted")
+        .values(
+            revoked_at=now,
+            outcome="interrupted",
+            recovered_end_h_checkpoint_id=retained.checkpoint_id if held_end is not None else None,
+        )
     )
     recovered = conn.execute(
         update(segments)
@@ -1703,6 +1739,7 @@ def recover_segment_on_connection(
         retained.checkpoint_id,
         retained.cursor,
         next_eligible_at,
+        held_end_attempt_id=held_end.attempt_id if held_end is not None else None,
     )
 
 
@@ -1716,6 +1753,12 @@ def verify_recovery_on_connection(conn: Connection, receipt: ComposerSegmentReco
     """
     if type(receipt) is not ComposerSegmentRecoveryReceipt:
         raise TypeError("recovery verification requires its nominal receipt")
+    if receipt.held_end_attempt_id is not None:
+        from elspeth.web.sessions.continuation_checkpoint_end_recovery import verify_end_h_recovery_receipt_on_connection
+
+        verify_end_h_recovery_receipt_on_connection(conn, receipt)
+        _verify_released_recovery_fence_on_connection(conn, receipt)
+        return
     sid, operation = str(receipt.session_id), receipt.operation_id
     if receipt.generation != receipt.previous_generation + 1:
         raise AuditIntegrityError("recovery receipt skipped its predecessor generation")
@@ -1750,6 +1793,7 @@ def verify_recovery_on_connection(conn: Connection, receipt: ComposerSegmentReco
         or event.tag != "recovered"
         or history.revoked_at is None
         or history.outcome != "interrupted"
+        or history.recovered_end_h_checkpoint_id is not None
         or current.generation < receipt.generation
     ):
         raise AuditIntegrityError("durable recovery readback mismatch")
@@ -1783,6 +1827,21 @@ def verify_recovery_on_connection(conn: Connection, receipt: ComposerSegmentReco
         ).one_or_none()
         if later is None or later.outcome != "interrupted" or later.revoked_at is None:
             raise AuditIntegrityError("recovery advanced without its predecessor attempt history")
+    _verify_released_recovery_fence_on_connection(conn, receipt)
+
+
+def _verify_released_recovery_fence_on_connection(conn: Connection, receipt: ComposerSegmentRecoveryReceipt) -> None:
+    sid, operation = str(receipt.session_id), receipt.operation_id
+    history = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation,
+            attempts.c.sequence == receipt.sequence,
+            attempts.c.generation == receipt.previous_generation,
+        )
+    ).one_or_none()
+    if history is None:
+        raise AuditIntegrityError("recovery lost its released predecessor")
     context = receipt.released_context
     if context is not None:
         fence = context.fence
@@ -1841,6 +1900,16 @@ def validate_lost_continuation_on_connection(conn: Connection, *, session_id: st
             )
         ).scalars()
     )
+    from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
+
+    held_end = read_current_end_h_recovery_on_connection(conn, selected=stored, names=names)
+    if held_end is not None and (parent.cancel_requested_at is not None or session.archived_at is not None):
+        from elspeth.web.composer.continuation_next_action import ContinuationCutNotResumable
+
+        raise ContinuationCutNotResumable(
+            "paid END H requires its original child settlement before cancel or archive",
+            effect_ids=(held_end.effect_key, held_end.outer_effect_key),
+        )
     top = stack.frames[-1]
     from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection
     from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Preparation
@@ -1914,8 +1983,20 @@ def settle_segment_on_connection(
     stays ``queued``; moving it to ``settled`` would violate its time bundle.
     """
     from elspeth.web.coordination.composer_operation_authority import _terminal_values
+    from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
 
     stored = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+    if read_current_end_h_recovery_on_connection(conn, selected=stored) is not None:
+        from elspeth.web.composer.continuation_next_action import ContinuationCutNotResumable
+
+        raise ContinuationCutNotResumable(
+            "paid END H must settle its original child before generic segment settlement",
+            effect_ids=tuple(
+                entry.effect_id
+                for entry in decode_continuation_snapshot(stored.payload_json).effect_frontier
+                if entry.disposition in ("prepared", "dispatched", "unknown")
+            ),
+        )
     if prepared_settlement is not None:
         candidate = prepared_settlement
         candidate.append.require_original()

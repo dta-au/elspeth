@@ -11,7 +11,12 @@ stands in for the model.
 from __future__ import annotations
 
 import json
+import time
+from collections import Counter
 from collections.abc import Sequence
+from contextvars import ContextVar
+from hashlib import sha256
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -22,11 +27,19 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.composer import continuation_semantic_advisor, prompt_guard
+from elspeth.web.composer import continuation_semantic_advisor, continuation_semantic_advisor_phase, prompt_guard
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
-from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, decode_continuation_policy
 from elspeth.web.composer.continuation_progress import decode_continuation_frontier
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+from elspeth.web.continuation_retention_memo import (
+    CanonicalTextEncodingKey,
+    RetentionStageMemo,
+    current_retention_stage_memo,
+    legacy_advisor_preparation_memo_scope,
+)
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.models import (
     composer_continuation_checkpoints_table,
@@ -133,6 +146,246 @@ def _recording_guard(monkeypatch: pytest.MonkeyPatch, guard_bodies: list[dict[st
     monkeypatch.setattr(continuation_app_module, "AzurePromptGuardClient", factory)
 
 
+def _install_advisor_preparation_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], Counter[tuple[str, str, str]], list[dict[str, Any]]]:
+    """Observe exact cache entries and worker CPU without replacing producers."""
+    target_operation: list[str] = []
+    counts: Counter[tuple[str, str, str]] = Counter()
+    cuts: list[dict[str, Any]] = []
+    seen_by_operation: dict[str, set[tuple[str, int]]] = {}
+    lock = Lock()
+    stage: ContextVar[str] = ContextVar("u24_advisor_profile_stage", default="outside_sql")
+    text_families = frozenset(("canonical_text_encoding", "canonical_text_proof", "recorder_block_hash", "recorder_request_text"))
+
+    def text_entry_count(memo: RetentionStageMemo) -> int:
+        return (
+            int(memo._canonical_text is not None)
+            + len(memo._canonical_proofs)
+            + len(memo._recorder_block_hashes)
+            + int(memo._recorder_request is not None)
+        )
+
+    def entry_present(memo: RetentionStageMemo, family: str, args: tuple[Any, ...]) -> bool:
+        if memo._closed:
+            return False
+        key, producer = args[0], args[1]
+        if family == "canonical_text_encoding":
+            entry = memo._canonical_text
+            return entry is not None and entry[0] is producer and entry[1] == key
+        if family == "canonical_text_proof":
+            digest = args[2]
+            return digest is sha256 and (producer, digest, key) in memo._canonical_proofs
+        if family == "recorder_block_hash":
+            return (producer, key) in memo._recorder_block_hashes
+        if family == "recorder_request_text":
+            entry = memo._recorder_request
+            return entry is not None and entry[0] is producer and entry[1] == key
+        if family == "snapshot":
+            return (producer, key) in memo._snapshots
+        if family == "private_chunk":
+            return (producer, key) in memo._chunks
+        if family == "credential":
+            return (producer, key) in memo._credentials
+        if family == "state_credentials":
+            return (producer, key) in memo._states
+        raise AssertionError("unknown observed memo family")
+
+    def wrap_family(family: str, original):
+        def observed(memo: RetentionStageMemo, *args: Any):
+            parent = memo._text_parent
+            legacy = memo._legacy_advisor_owner is not None or (parent is not None and parent._legacy_advisor_owner is not None)
+            if not target_operation or not legacy or (parent is not None and family in text_families):
+                return original(memo, *args)
+            with memo._lock:
+                hit = entry_present(memo, family, args)
+                before_text = text_entry_count(memo)
+                before_proofs = len(memo._canonical_proofs)
+                before_blocks = len(memo._recorder_block_hashes)
+                before_canonical = memo._canonical_text is not None
+                before_request = memo._recorder_request is not None
+                before_shared_bytes = memo._canonical_proof_bytes + memo._recorder_block_hash_bytes
+                closed_before = memo._closed
+            result: Any = None
+            returned = False
+            try:
+                result = original(memo, *args)
+                returned = True
+                return result
+            finally:
+                with memo._lock:
+                    retained = entry_present(memo, family, args)
+                    after_text = text_entry_count(memo)
+                    after_proofs = len(memo._canonical_proofs)
+                    after_blocks = len(memo._recorder_block_hashes)
+                    after_canonical = memo._canonical_text is not None
+                    after_request = memo._recorder_request is not None
+                    after_proof_bytes = memo._canonical_proof_bytes
+                    after_block_bytes = memo._recorder_block_hash_bytes
+                    closed_after = memo._closed
+                disposition = (
+                    "uncached" if memo._legacy_advisor_owner is not None and family not in text_families else "hit" if hit else "miss"
+                )
+                evicted = (
+                    max(0, before_text + int(not hit and retained) - after_text)
+                    if family in text_families and not closed_before and not closed_after
+                    else 0
+                )
+                budget_evicted = 0
+                replaced = 0
+                if family in ("canonical_text_proof", "recorder_block_hash") and not closed_before and not closed_after:
+                    budget_evicted = max(0, before_proofs + before_blocks + int(not hit and retained) - after_proofs - after_blocks)
+                    replaced = int(before_canonical and not after_canonical)
+                elif family == "canonical_text_encoding" and not hit and retained and not closed_after:
+                    replaced = before_proofs + before_blocks + int(before_canonical)
+                elif family == "recorder_request_text" and not hit and retained and not closed_after:
+                    replaced = int(before_request and after_request)
+                with lock:
+                    counts[(stage.get(), family, disposition)] += 1
+                    counts[(stage.get(), family, "evicted")] += evicted
+                    counts[(stage.get(), family, "budget_evicted")] += budget_evicted
+                    counts[(stage.get(), family, "replaced")] += replaced
+                    counts[("all", "shared_budget", "highwater_bytes")] = max(
+                        counts[("all", "shared_budget", "highwater_bytes")], before_shared_bytes, after_proof_bytes + after_block_bytes
+                    )
+                    counts[("all", "shared_budget", "max_proof_bytes")] = max(
+                        counts[("all", "shared_budget", "max_proof_bytes")], after_proof_bytes
+                    )
+                    counts[("all", "shared_budget", "max_block_bytes")] = max(
+                        counts[("all", "shared_budget", "max_block_bytes")], after_block_bytes
+                    )
+                    if returned and family in text_families and target_operation:
+                        key, producer = args[0], args[1]
+                        identity = (family, hash((producer, args[2], key)) if family == "canonical_text_proof" else hash((producer, key)))
+                        seen = seen_by_operation.setdefault(target_operation[0], set())
+                        if identity not in seen and len(seen) < 512:
+                            seen.add(identity)
+                            if family == "canonical_text_proof":
+                                weight = result.retained_bytes
+                            elif family == "canonical_text_encoding":
+                                weight = len(key.canonical.encode("utf-8")) + len(result)
+                            elif family == "recorder_block_hash":
+                                weight = len(key.expected_digest.encode("utf-8")) + len(key.canonical.encode("utf-8"))
+                            elif result is None:
+                                weight = 0
+                            else:
+                                weight = (
+                                    len(key.canonical.encode("utf-8"))
+                                    + len(result.ref_document_json.encode("utf-8"))
+                                    + sum(len(digest.encode("utf-8")) + len(text.encode("utf-8")) for digest, text in result.blocks)
+                                )
+                            counts[("all", family, "distinct_keys_estimate")] += 1
+                            counts[("all", family, "distinct_bytes_estimate")] += weight
+                        elif identity not in seen:
+                            counts[("all", family, "distinct_overflow")] += 1
+
+        return observed
+
+    families = (
+        ("canonical_text_encoding", RetentionStageMemo.canonical_text_encoding),
+        ("canonical_text_proof", RetentionStageMemo.canonical_text_proof),
+        ("recorder_block_hash", RetentionStageMemo.recorder_block_hash),
+        ("recorder_request_text", RetentionStageMemo.recorder_request_text),
+        ("snapshot", RetentionStageMemo.snapshot),
+        ("private_chunk", RetentionStageMemo.private_chunk),
+        ("credential", RetentionStageMemo.credential),
+        ("state_credentials", RetentionStageMemo.state_credentials),
+    )
+    for family, original in families:
+        monkeypatch.setattr(RetentionStageMemo, family, wrap_family(family, original))
+
+    original_close = RetentionStageMemo.close
+
+    def observed_close(memo: RetentionStageMemo) -> None:
+        parent = memo._text_parent
+        legacy = memo._legacy_advisor_owner is not None or (parent is not None and parent._legacy_advisor_owner is not None)
+        if target_operation and legacy:
+            with memo._lock:
+                local = len(memo._snapshots) + len(memo._chunks) + len(memo._credentials) + len(memo._states)
+                text = text_entry_count(memo)
+            with lock:
+                counts[(stage.get(), "close", "local_cleared")] += local
+                counts[(stage.get(), "close", "text_cleared")] += text
+        original_close(memo)
+
+    monkeypatch.setattr(RetentionStageMemo, "close", observed_close)
+
+    def wrap_cut(label: str, original):
+        def observed(*args: Any, **kwargs: Any):
+            running = args[1].binding.running if label == "begin" else args[1]
+            if not target_operation or running.claim.operation_id != target_operation[0]:
+                return original(*args, **kwargs)
+            token = stage.set(label)
+            memo = current_retention_stage_memo()
+            started_wall, started_cpu = time.perf_counter_ns(), time.thread_time_ns()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                wall_ns = time.perf_counter_ns() - started_wall
+                cpu_ns = time.thread_time_ns() - started_cpu
+                with lock:
+                    cuts.append(
+                        {
+                            "cut": label,
+                            "wall_ns": wall_ns,
+                            "thread_cpu_ns": cpu_ns,
+                            "carrier_id": None if memo is None else id(memo),
+                            "carrier_kind": "legacy_text" if memo is not None and memo._legacy_advisor_owner is not None else "other",
+                        }
+                    )
+                stage.reset(token)
+
+        return observed
+
+    monkeypatch.setattr(
+        continuation_semantic_advisor_phase,
+        "select_semantic_advisor_current_graph_on_connection",
+        wrap_cut("select_current", continuation_semantic_advisor_phase.select_semantic_advisor_current_graph_on_connection),
+    )
+    monkeypatch.setattr(
+        continuation_semantic_advisor_phase,
+        "read_semantic_advisor_retained_inputs_on_connection",
+        wrap_cut("read_inputs", continuation_semantic_advisor_phase.read_semantic_advisor_retained_inputs_on_connection),
+    )
+    monkeypatch.setattr(
+        continuation_semantic_advisor_phase,
+        "prepare_semantic_advisor_on_connection",
+        wrap_cut("prepare", continuation_semantic_advisor_phase.prepare_semantic_advisor_on_connection),
+    )
+    monkeypatch.setattr(
+        continuation_semantic_advisor_phase,
+        "begin_semantic_advisor_on_connection",
+        wrap_cut("begin", continuation_semantic_advisor_phase.begin_semantic_advisor_on_connection),
+    )
+
+    # Known same-key hit, changed-key miss and proof replacement control the
+    # diagnostic itself before any live operation is observed.
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        return key.canonical.encode()
+
+    target_operation.append("instrument-control")
+    token = stage.set("control")
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=5, guard=1, quota=1, physical=1, retention=1))
+    with legacy_advisor_preparation_memo_scope(clock) as memo:
+        first = CanonicalTextEncodingKey("probe-one", 100)
+        memo.canonical_text_proof(first, encode, sha256)
+        memo.canonical_text_proof(first, encode, sha256)
+        memo.canonical_text_proof(CanonicalTextEncodingKey("probe-two", 100), encode, sha256)
+        memo.canonical_text_encoding(CanonicalTextEncodingKey("replacement", 100), encode)
+        memo.canonical_text_proof(CanonicalTextEncodingKey("a" * 300_000, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES), encode, sha256)
+        memo.canonical_text_proof(CanonicalTextEncodingKey("b" * 300_000, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES), encode, sha256)
+    assert counts[("control", "canonical_text_proof", "hit")] == 1
+    assert counts[("control", "canonical_text_proof", "miss")] == 4
+    assert counts[("control", "canonical_text_encoding", "evicted")] == 2
+    assert counts[("control", "canonical_text_encoding", "replaced")] == 2
+    assert counts[("control", "canonical_text_proof", "budget_evicted")] == 1
+    assert counts[("all", "shared_budget", "highwater_bytes")] <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    stage.reset(token)
+    target_operation.clear()
+    counts.clear()
+    return target_operation, counts, cuts
+
+
 @pytest.mark.asyncio
 async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more_is_refused(tmp_path, monkeypatch):
     pack_calls: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
@@ -144,6 +397,17 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
     semantic_scalar_lengths: list[dict[str, int]] = []
     current_session: list[Any] = []
     service_ref: list[Any] = []
+    profile_target, profile_counts, profile_cuts = _install_advisor_preparation_profile(monkeypatch)
+    profile_reports: dict[str, dict[str, Any]] = {}
+
+    def capture_profile(label: str) -> None:
+        profile_reports[label] = {
+            "cuts": profile_cuts[:12],
+            "memo_counts": [(*key, count) for key, count in sorted(profile_counts.items()) if count > 0][:80],
+        }
+        profile_cuts.clear()
+        profile_counts.clear()
+
     handoff = (
         None,
         [
@@ -244,9 +508,15 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
             assert len(first) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
             first_body = message_body(first)
             first_pack_start = len(pack_calls)
-            with monkeypatch.context() as diagnostic_patch:
-                observed_first = observe_original_driver_failures(diagnostic_patch, first_body["operation_id"], session_id=session.id)
-                first_settled = await submit(session.id, first_body)
+            seed_label = "seed_over_limit" if unit_length == PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1 else "seed_at_limit"
+            profile_target.append(first_body["operation_id"])
+            try:
+                with monkeypatch.context() as diagnostic_patch:
+                    observed_first = observe_original_driver_failures(diagnostic_patch, first_body["operation_id"], session_id=session.id)
+                    first_settled = await submit(session.id, first_body)
+            finally:
+                profile_target.clear()
+            capture_profile(seed_label)
             diagnostic_trace.extend(observed_first)
             if first_settled.status != "completed":
                 longest = sorted(
@@ -273,6 +543,7 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
                             "largest_guard_units": largest_units,
                             "sdk_roles": sdk.roles,
                             "original_driver_trace": diagnostic_trace[-12:],
+                            "advisor_preparation_profile": profile_reports[seed_label],
                         },
                         sort_keys=True,
                     ),
@@ -294,9 +565,14 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
                     settled = await submit(session.id, body)
                 diagnostic_trace.extend(observed)
             else:
-                with monkeypatch.context() as diagnostic_patch:
-                    observed = observe_original_driver_failures(diagnostic_patch, body["operation_id"], session_id=session.id)
-                    settled = await submit(session.id, body)
+                profile_target.append(body["operation_id"])
+                try:
+                    with monkeypatch.context() as diagnostic_patch:
+                        observed = observe_original_driver_failures(diagnostic_patch, body["operation_id"], session_id=session.id)
+                        settled = await submit(session.id, body)
+                finally:
+                    profile_target.clear()
+                capture_profile("target_at_limit")
                 diagnostic_trace.extend(observed)
             # The first pack belongs to the initial PRIMARY. Over-limit input
             # must refuse there, before any reply-only classifier can run.
@@ -462,6 +738,7 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
                     (check["role"], check["disposition"], check["reason"])
                     for check in _guard_checks(await service.get_messages(_session.id, limit=None))
                 ],
+                "advisor_preparation_profile": profile_reports,
             },
             sort_keys=True,
             default=str,

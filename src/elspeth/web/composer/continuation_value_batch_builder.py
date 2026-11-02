@@ -366,13 +366,18 @@ def _prepare_pending_value_batch(
 
 async def adopt_issued_preview_batch(*, prepared: PreparedValueBatchCall, permit: IssuedPreviewDispatch) -> None:
     """Run original native result/audit handling without invoking its producer."""
-    from elspeth.web.composer.continuation_preview_dispatch import original_adopted_preview_result, require_preview_adoption
+    from elspeth.web.composer.continuation_preview_dispatch import (
+        adopt_preview_issued_message_source,
+        original_adopted_preview_result,
+        require_preview_adoption,
+    )
 
     runtime, context = prepared.runtime, prepared.context
     data = _adopt_batch_state(runtime)
     require_preview_adoption(
         permit, call_model=prepared.call_model, ctx=context, acc=data.accumulator, batch=data.batch, call=prepared.call
     )
+    adopt_preview_issued_message_source(permit, prepared=prepared)
     before = len(context.recorder.invocations)
     await _execute_continuation_call_live(
         call_model=prepared.call_model,

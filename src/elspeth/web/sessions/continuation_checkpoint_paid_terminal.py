@@ -614,21 +614,33 @@ def _read_v4_checkpoint_terminal_on_connection(
             segments.c.session_id == sid, segments.c.operation_id == operation_id, segments.c.sequence == source.creator_sequence
         )
     ).one()
+    settled_generation = parent.ownership_generation if post_h else source.creator_generation
     history = conn.execute(
         select(attempts).where(
             attempts.c.session_id == sid,
             attempts.c.operation_id == operation_id,
             attempts.c.sequence == source.creator_sequence,
-            attempts.c.generation == source.creator_generation,
+            attempts.c.generation == settled_generation,
         )
     ).one()
+    if post_h:
+        from elspeth.web.sessions.continuation_checkpoint_end_recovery import require_end_h_anchored_generation_chain_on_connection
+
+        require_end_h_anchored_generation_chain_on_connection(conn, owed=owed, generation=settled_generation)
+        if (
+            history.session_operation_id != parent.session_operation_id
+            or history.session_operation_epoch != parent.session_operation_epoch
+            or history.session_operation_lease_token != parent.session_operation_lease_token
+            or history.claim_attempt != parent.attempt
+        ):
+            raise AuditIntegrityError("checkpoint END overflow lost its final replacement fence")
     if (
         segment.state != "settled"
-        or segment.generation != source.creator_generation
+        or segment.generation != settled_generation
         or history.outcome != "settled"
         or history.revoked_at is None
         or parent.current_segment_sequence != source.creator_sequence
-        or parent.ownership_generation != source.creator_generation
+        or parent.ownership_generation != settled_generation
     ):
         raise AuditIntegrityError("checkpoint paid overflow lost its closed original segment")
     if type(receipt) is PaidOverflowReceipt:

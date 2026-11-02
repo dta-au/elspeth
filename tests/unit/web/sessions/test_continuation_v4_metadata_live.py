@@ -23,6 +23,7 @@ from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionR
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composition_states_table as states
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.sessions import test_continuation_initialization as bootstrap_fixture
 from tests.unit.web.sessions import test_continuation_live_phases as phase_fixture
@@ -44,6 +45,7 @@ async def _v4_tool_case(
     available_plugins=None,
     primary_preparation_probe_15s=False,
     retained_payload_bytes=16 * 1_048_576,
+    base_state_data: CompositionStateData | None = None,
 ):
     from tests.helpers.continuation_policy import classifier_15s_probe_settings
 
@@ -73,21 +75,41 @@ async def _v4_tool_case(
     current_store = (store[0], store[1], authority, store[3], store[4])
     if arguments is None:
         arguments = {"patch": {"name": "V4 original model metadata"}} if tool == "set_metadata" else {}
-    async with phase_fixture._phase_case(
-        current_store,
-        tmp_path,
-        monkeypatch,
-        tool_call=("original_v4_tool", tool, arguments),
-        following_tool_call=following_tool_call,
-        settings_overrides={
-            "composer_continuation_max_retained_payload_bytes": policy.max_retained_payload_bytes,
-            **(
-                {"composer_continuation_action_bounds": settings.composer_continuation_action_bounds}
-                if primary_preparation_probe_15s
-                else {}
-            ),
-        },
-    ) as (owner, running, primary, sdk):
+    base_case = (
+        phase_fixture._phase_case(
+            current_store,
+            tmp_path,
+            monkeypatch,
+            tool_call=("original_v4_tool", tool, arguments),
+            following_tool_call=following_tool_call,
+            settings_overrides={
+                "composer_continuation_max_retained_payload_bytes": policy.max_retained_payload_bytes,
+                **(
+                    {"composer_continuation_action_bounds": settings.composer_continuation_action_bounds}
+                    if primary_preparation_probe_15s
+                    else {}
+                ),
+            },
+        )
+        if base_state_data is None
+        else phase_fixture._phase_case(
+            current_store,
+            tmp_path,
+            monkeypatch,
+            tool_call=("original_v4_tool", tool, arguments),
+            following_tool_call=following_tool_call,
+            settings_overrides={
+                "composer_continuation_max_retained_payload_bytes": policy.max_retained_payload_bytes,
+                **(
+                    {"composer_continuation_action_bounds": settings.composer_continuation_action_bounds}
+                    if primary_preparation_probe_15s
+                    else {}
+                ),
+            },
+            base_state_data=base_state_data,
+        )
+    )
+    async with base_case as (owner, running, primary, sdk):
         assert len(sdk) == 1 and primary.outcome.completion.tool_batch.calls[0].function.name == tool
         assert owner.runtime is not None
         if available_plugins is not None:

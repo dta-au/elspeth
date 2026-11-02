@@ -2,21 +2,26 @@
 
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import pytest
 from sqlalchemy import select
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import continuation_preview_dispatch as preview
+from elspeth.web.composer import continuation_runtime
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cut
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.models import composer_validation_terminal_holds_table as holds
@@ -84,21 +89,87 @@ async def actual_preview_case(store, tmp_path, monkeypatch):
 async def test_actual_preview_phase_issues_once_retains_original_result_and_cold_never_reexecutes(operation_store, tmp_path, monkeypatch):
     async with actual_preview_case(operation_store, tmp_path, monkeypatch) as (store, owner, running, sdk):
         actual = preview.execute_tool
+        actual_bind = preview.bind_issued_preview_dispatch_on_connection
+        actual_adopt = preview.adopt_preview_issued_message_source
+        actual_register = CurrentContinuationMessageProducers.register_tool_result_message
+        bound = []
         originals = []
+        registrations = []
+
+        def observe_bind(conn, issuing, **kwargs):
+            prepared = kwargs["prepared"]
+            current = owner.runtime
+            assert current is not None
+            assert prepared.runtime.source.selected is prepared.runtime.materialization.selected
+            assert prepared.context.message_producers is prepared.runtime.materialization
+            assert prepared.runtime.source.selected != current.source.selected
+            assert prepared.runtime.materialization is not current.materialization
+            assert prepared.runtime.live is not current.live
+            assert prepared.runtime.live.llm_messages is not current.live.llm_messages
+            assert prepared.runtime.live.recorder is not current.live.recorder
+            assert prepared.runtime.live.runtime_preflight_cache is not current.live.runtime_preflight_cache
+            permit = actual_bind(conn, issuing, **kwargs)
+            bound.append((issuing, kwargs))
+            return permit
 
         def observed(*args, **kwargs):
             with store[0].connect() as conn:
                 row = conn.execute(select(holds).where(holds.c.session_id == str(store[4]))).one()
-                effect = conn.execute(select(effects).where(effects.c.effect_key == row.effect_key)).one()
+                effect = conn.execute(
+                    select(effects).where(
+                        effects.c.session_id == str(store[4]),
+                        effects.c.operation_id == running.claim.operation_id,
+                        effects.c.effect_key == row.effect_key,
+                    )
+                ).one()
             assert row.state == "active" and effect.disposition == "dispatched"
-            assert effect.response_started_at is not None and effect.result_chunk_key is None
+            assert effect.response_finished_at is None and effect.result_chunk_key is None and effect.provider_attempt_id is None
+            assert len(bound) == 1
+            issuing, original_kwargs = bound[0]
+            with (
+                locked_session_transaction(store[0], str(store[4])) as conn,
+                pytest.raises(AuditIntegrityError, match="cannot bind its original issued source twice"),
+            ):
+                actual_bind(conn, issuing, **original_kwargs)
             result = actual(*args, **kwargs)
             originals.append(result)
             return result
 
+        def observed_adopt(permit, *, prepared):
+            producer = prepared.runtime.materialization
+            assert producer.selected is prepared.runtime.source.selected
+            actual_adopt(permit, prepared=prepared)
+            issued = preview.original_preview_issued_message_source(permit, prepared=prepared)
+            assert producer.selected is issued.selected
+            with pytest.raises(AuditIntegrityError, match="once-only returned handoff"):
+                actual_adopt(permit, prepared=prepared)
+            copied = replace(issued.selected)
+            producer.selected = copied
+            try:
+                with pytest.raises(AuditIntegrityError, match="changed its actual adopted issued selection"):
+                    preview.original_preview_issued_message_source(permit, prepared=prepared)
+            finally:
+                producer.selected = issued.selected
+
+        def observed_register(producer, **kwargs):
+            prepared = bound[0][1]["prepared"]
+            if producer is not prepared.runtime.materialization:
+                return actual_register(producer, **kwargs)
+            current = owner.runtime
+            assert current is not None
+            assert producer is prepared.runtime.materialization and producer is not current.materialization
+            assert producer.selected is current.source.selected
+            assert prepared.runtime.source.selected.stack.cursor + 1 == producer.selected.stack.cursor
+            assert len(originals) == 1 and kwargs["result"].result is originals[0]
+            registrations.append(kwargs["message"])
+            return actual_register(producer, **kwargs)
+
         monkeypatch.setattr(preview, "execute_tool", observed)
+        monkeypatch.setattr(preview, "bind_issued_preview_dispatch_on_connection", observe_bind)
+        monkeypatch.setattr(preview, "adopt_preview_issued_message_source", observed_adopt)
+        monkeypatch.setattr(CurrentContinuationMessageProducers, "register_tool_result_message", observed_register)
         await phases._advance(owner)
-        assert len(originals) == 1 and originals[0].success
+        assert len(originals) == len(registrations) == 1 and originals[0].success
         assert originals[0].runtime_preflight is not None
         assert originals[0].runtime_preflight.errors[0].error_code == "empty_pipeline"
         stored = owner.latest_snapshot
@@ -128,3 +199,32 @@ async def test_actual_preview_phase_issues_once_retains_original_result_and_cold
         assert restored.graph.batch is not None
         assert restored.graph.batch.batch.tool_outcomes[0].response is not None
         assert stored_rows(store[0]) == before and len(sdk) == 1 and len(originals) == 1
+
+
+@pytest.mark.asyncio
+async def test_actual_preview_refuses_borrowed_live_message_producer_before_issue(operation_store, tmp_path, monkeypatch):
+    async with actual_preview_case(operation_store, tmp_path, monkeypatch) as (store, owner, running, sdk):
+        selected, inventory = await phases._finish_inventory(owner, running)
+        runtime, inventory = await owner.current(selected)
+        restore = continuation_runtime.restore_metadata_preparation_runtime
+        returned = []
+
+        async def borrowed_producer(**kwargs):
+            detached = await restore(**kwargs)
+            assert detached.materialization is not runtime.materialization
+            changed = replace(detached, materialization=runtime.materialization)
+            returned.append(changed)
+            return changed
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("borrowed live message producer reached preview execution")
+
+        monkeypatch.setattr(continuation_runtime, "restore_metadata_preparation_runtime", borrowed_producer)
+        monkeypatch.setattr(preview, "execute_tool", forbidden)
+        before = stored_rows(store[0])
+        with pytest.raises(AuditIntegrityError, match="reused or changed an original mutable owner"):
+            await preview.try_admit_preview_tool(owner, runtime=runtime, selected=selected, inventory=inventory)
+        assert len(returned) == 1 and returned[0].materialization is runtime.materialization
+        assert stored_rows(store[0]) == before and len(sdk) == 1
+        with store[0].connect() as conn:
+            assert not conn.execute(select(holds).where(holds.c.session_id == str(store[4]))).all()

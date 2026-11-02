@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import litellm
 import pytest
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import PromptGuardDecision
@@ -36,16 +36,18 @@ from elspeth.web.composer.continuation_selection import load_selected_continuati
 from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.provider_cost import CommonProviderCostBudget
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
-from elspeth.web.sessions.composer_operations import ComposerOperationFenceLost, ComposerOperationRunning
-from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, load_snapshot, verify_recovery_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import require_end_complete_pass_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import persist_end_complete_repair_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_owed import (
     read_v4_checkpoint_end_owed_on_connection,
     retain_v4_checkpoint_end_owed_on_connection,
 )
+from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
     admit_checkpoint_paid_audit_source_on_connection,
     checkpoint_paid_audit_cohort_for_hold,
@@ -60,6 +62,7 @@ from elspeth.web.sessions.continuation_retained_capacity import ContinuationReta
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
+from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_advisor_checkpoint import _checkpoint_reply
@@ -224,9 +227,52 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                         names=prepared.env_ref_names,
                     )
                     assert fresh is not None and fresh.selected == owed.owed_selected
+                    assert read_current_end_h_recovery_on_connection(conn, selected=fresh.selected, names=prepared.env_ref_names) == fresh
+                    with pytest.raises(AuditIntegrityError, match="current credential inventory"):
+                        read_current_end_h_recovery_on_connection(conn, selected=fresh.selected, names=frozenset({"foreign-reference"}))
+                    predecessor = conn.execute(
+                        select(attempts).where(
+                            attempts.c.session_id == str(store[4]),
+                            attempts.c.operation_id == running.claim.operation_id,
+                            attempts.c.sequence == running.claim.segment_sequence,
+                            attempts.c.generation == running.claim.ownership_generation,
+                        )
+                    ).one()
+                    assert predecessor.outcome == "interrupted"
+                    assert predecessor.recovered_end_h_checkpoint_id == fresh.selected.checkpoint_id
+                    receipt = ComposerSegmentRecoveryReceipt(
+                        session_id=running.claim.session_id,
+                        operation_id=running.claim.operation_id,
+                        sequence=running.claim.segment_sequence,
+                        previous_generation=running.claim.ownership_generation,
+                        generation=claim.ownership_generation,
+                        checkpoint_id=fresh.selected.checkpoint_id,
+                        cursor=fresh.selected.cursor,
+                        next_eligible_at=database_now(conn),
+                        held_end_attempt_id=fresh.attempt_id,
+                    )
+                    verify_recovery_on_connection(conn, receipt)
+                    wrong_h = conn.begin_nested()
+                    conn.execute(
+                        update(attempts)
+                        .where(
+                            attempts.c.session_id == str(store[4]),
+                            attempts.c.operation_id == running.claim.operation_id,
+                            attempts.c.sequence == running.claim.segment_sequence,
+                            attempts.c.generation == running.claim.ownership_generation,
+                        )
+                        .values(recovered_end_h_checkpoint_id=prepared.prepared_source.source.checkpoint_id)
+                    )
+                    with pytest.raises(AuditIntegrityError, match="anchored claim edge"):
+                        read_current_end_h_recovery_on_connection(conn, selected=fresh.selected, names=prepared.env_ref_names)
+                    with pytest.raises(AuditIntegrityError, match=r"durable revoked edge|predecessor anchored"):
+                        verify_recovery_on_connection(conn, receipt)
+                    wrong_h.rollback()
+                    with pytest.raises(AuditIntegrityError, match="original owed event"):
+                        verify_recovery_on_connection(conn, replace(receipt, held_end_attempt_id=str(uuid4())))
                     call = decode_retained_physical_audit_call(fresh.response)
                     cohort = checkpoint_paid_audit_cohort_for_hold(call, fresh.new_hold)
-                    with pytest.raises((AuditIntegrityError, ComposerOperationFenceLost)):
+                    with pytest.raises(SessionOperationFenceLost):
                         admit_checkpoint_paid_audit_source_on_connection(
                             conn,
                             service=current_sessions,

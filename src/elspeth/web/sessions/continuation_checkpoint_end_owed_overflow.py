@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from sqlalchemy import Connection, select, update
@@ -45,6 +45,7 @@ from elspeth.web.coordination.quota_authority import settle_provider_attempt_on_
 from elspeth.web.sessions.continuation import (
     StoredContinuationSnapshot,
     _finalize_terminal_rows_after_append,
+    _require_current_continuation_running,
     append_complete_snapshot,
     put_chunk,
 )
@@ -54,6 +55,7 @@ from elspeth.web.sessions.continuation_checkpoint_end_owed import (
     CheckpointEndOwedAdmission,
     read_v4_checkpoint_end_owed_on_connection,
 )
+from elspeth.web.sessions.continuation_checkpoint_end_recovery import require_end_h_anchored_generation_chain_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
 from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
     admit_checkpoint_paid_audit_source_on_connection,
@@ -78,7 +80,7 @@ from elspeth.web.sessions.continuation_paid_overflow import (
 from elspeth.web.sessions.continuation_paid_overflow_quota import (
     OriginalPaidOverflowPhysicalAttempt,
     preflight_v4_requested_model,
-    prepare_paid_overflow_quota_entry,
+    prepare_checkpoint_end_owed_overflow_quota_entry,
 )
 from elspeth.web.sessions.continuation_retained_capacity import (
     ContinuationRetainedCapacityExceeded,
@@ -99,6 +101,9 @@ from elspeth.web.sessions.models import composer_segment_attempts_table as attem
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.time_normalization import restore_utc
 
+if TYPE_CHECKING:
+    from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+
 
 @dataclass(frozen=True, slots=True)
 class _EndOwedOverflowSource:
@@ -107,6 +112,7 @@ class _EndOwedOverflowSource:
     session_id: UUID
     operation_id: str
     context: SessionOperationContext
+    running: ComposerOperationRunning
     names: frozenset[str]
     selected: StoredContinuationSnapshot
     hold: ProviderTerminalHoldSource
@@ -231,6 +237,7 @@ def settle_v4_checkpoint_end_owed_overflow_on_connection(
         session_id=running.claim.session_id,
         operation_id=running.claim.operation_id,
         context=running.session_operation_context,
+        running=running,
         names=prepared.env_ref_names,
         selected=owed.owed_selected,
         hold=owed.owed_hold,
@@ -336,6 +343,7 @@ def settle_cold_v4_checkpoint_end_owed_overflow_on_connection(
         session_id=running.claim.session_id,
         operation_id=running.claim.operation_id,
         context=running.session_operation_context,
+        running=running,
         names=cold_source.runtime.env_ref_names,
         selected=owed.selected,
         hold=owed.new_hold,
@@ -355,6 +363,9 @@ def _settle_v4_checkpoint_end_owed_overflow_source_on_connection(
     failure: ContinuationCaptureOverflowWitness | ContinuationRetainedCapacityExceeded,
 ) -> VerifiedCheckpointPaidOverflowTerminal:
     sid, operation = str(source.session_id), source.operation_id
+    _require_current_continuation_running(conn, source.running)
+    if source.context is not source.running.session_operation_context:
+        raise AuditIntegrityError("END overflow substituted its current writer fence")
     hold = source.hold
     identity = source.tail.identity
     cold = read_v4_checkpoint_end_owed_on_connection(
@@ -383,9 +394,10 @@ def _settle_v4_checkpoint_end_owed_overflow_source_on_connection(
             attempts.c.session_id == sid,
             attempts.c.operation_id == operation,
             attempts.c.sequence == hold.creator_sequence,
-            attempts.c.generation == hold.creator_generation,
+            attempts.c.generation == source.running.claim.ownership_generation,
         )
     ).one()
+    require_end_h_anchored_generation_chain_on_connection(conn, owed=cold, generation=source.running.claim.ownership_generation)
     if (
         effect.disposition != "dispatched"
         or effect.provider_attempt_id != identity.attempt_id
@@ -398,11 +410,14 @@ def _settle_v4_checkpoint_end_owed_overflow_source_on_connection(
         or parent.checkpoint_id != source.selected.checkpoint_id
         or parent.journal_cursor != source.selected.cursor
         or parent.current_segment_sequence != hold.creator_sequence
-        or parent.ownership_generation != hold.creator_generation
-        or parent.attempt != hold.claim_attempt
+        or parent.ownership_generation != source.running.claim.ownership_generation
+        or parent.attempt != source.running.claim.attempt
         or segment.state != "running"
-        or segment.generation != hold.creator_generation
-        or history.claim_attempt != hold.claim_attempt
+        or segment.generation != source.running.claim.ownership_generation
+        or history.claim_attempt != source.running.claim.attempt
+        or history.session_operation_id != source.context.fence.operation_id
+        or history.session_operation_epoch != source.context.fence.operation_epoch
+        or history.session_operation_lease_token != source.context.fence.lease_token
         or history.revoked_at is not None
     ):
         raise AuditIntegrityError("END consequence overflow lacks one unsettled original paid owner")
@@ -434,9 +449,10 @@ def _settle_v4_checkpoint_end_owed_overflow_source_on_connection(
         lease_token=physical_row.lease_token,
         started_at=restore_utc(physical_row.started_at),
     )
-    entry = prepare_paid_overflow_quota_entry(
+    entry = prepare_checkpoint_end_owed_overflow_quota_entry(
         physical=carrier,
         context=source.context,
+        hold=hold,
         receipt=receipt,
         requested_model=preflight_v4_requested_model(effect.requested_model),
         observed_at=observed_at,

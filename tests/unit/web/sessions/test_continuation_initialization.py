@@ -64,7 +64,13 @@ def seed_observed_sql_trial_policy(monkeypatch):
     )
 
 
-async def bootstrap_case(store, *, eligible=True, bound_base=False, settings_overrides=None):
+async def bootstrap_case(
+    store, *, eligible=True, bound_base=False, settings_overrides=None, base_state_data: CompositionStateData | None = None
+):
+    if base_state_data is not None and type(base_state_data) is not CompositionStateData:
+        raise TypeError("bootstrap base requires its original owned composition DTO")
+    if base_state_data is not None:
+        bound_base = True
     engine, repository, authority, sessions, sid = store
     # An actual settled prior job, read by the real bounded history owner.
     prior, _ = await operations._settled_failure(store, stop=True)
@@ -87,7 +93,9 @@ async def bootstrap_case(store, *, eligible=True, bound_base=False, settings_ove
             )
             base = await sessions.save_composition_state(
                 sid,
-                CompositionStateData(
+                base_state_data
+                if base_state_data is not None
+                else CompositionStateData(
                     metadata_=sql_owner._initial_composition_state().to_dict()["metadata"],
                     composer_meta={"completion_gates": completion_gates_meta_from_facts(CompletionGateFacts(None))},
                 ),

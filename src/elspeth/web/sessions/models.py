@@ -89,7 +89,10 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # Epoch 86 adds source-bound unpaid preview terminal reservations and the
 # distinct validation_incomplete effect. Preserve epoch-85 stores unchanged;
 # no automatic migration or reset is authorized by this format boundary.
-SESSION_SCHEMA_EPOCH = 86
+# Epoch 87 binds each H-preserving recovery edge to its exact original paid
+# END checkpoint without adding an unreserved continuation-journal append.
+# Epoch-86 stores are preserved and refused; there is no automatic migration.
+SESSION_SCHEMA_EPOCH = 87
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3871,12 +3874,23 @@ composer_segment_attempts_table = Table(
     Column("claim_expires_at", DateTime(timezone=True), nullable=False),
     Column("revoked_at", DateTime(timezone=True)),
     Column("outcome", String(16)),
+    Column("recovered_end_h_checkpoint_id", String(36)),
     _continuation_parent_fk("fk_composer_attempts_parent"),
     ForeignKeyConstraint(
         ["session_id", "operation_id", "sequence"],
         ["composer_operation_segments.session_id", "composer_operation_segments.operation_id", "composer_operation_segments.sequence"],
         name="fk_composer_attempts_segment",
         ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "recovered_end_h_checkpoint_id"],
+        [
+            "composer_continuation_checkpoints.session_id",
+            "composer_continuation_checkpoints.operation_id",
+            "composer_continuation_checkpoints.checkpoint_id",
+        ],
+        name="fk_composer_attempts_recovered_end_h_checkpoint",
+        ondelete="NO ACTION",
     ),
     UniqueConstraint("session_id", "session_operation_epoch", name="uq_composer_attempts_epoch"),
     UniqueConstraint("session_id", "session_operation_id", name="uq_composer_attempts_fence"),
@@ -3885,6 +3899,10 @@ composer_segment_attempts_table = Table(
     ),
     CheckConstraint("outcome IS NULL OR outcome IN ('yielded', 'interrupted', 'settled')", name="ck_composer_attempts_outcome"),
     CheckConstraint("(revoked_at IS NULL) = (outcome IS NULL)", name="ck_composer_attempts_revocation"),
+    CheckConstraint(
+        "recovered_end_h_checkpoint_id IS NULL OR (revoked_at IS NOT NULL AND outcome = 'interrupted')",
+        name="ck_composer_attempts_recovered_end_h_interrupted",
+    ),
 )
 
 composer_continuation_chunks_table = Table(

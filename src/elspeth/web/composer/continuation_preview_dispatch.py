@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import Connection, select, update
+from sqlalchemy import Connection, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_preview_observation import PreviewSourceData, require_preview_source_matches
@@ -27,7 +27,6 @@ from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.composer.tools._dispatch import execute_tool
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _admit_source_proof_claims
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
-from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationRunning
 from elspeth.web.sessions.continuation import _require_current_continuation_running, load_snapshot
@@ -42,6 +41,7 @@ from elspeth.web.sessions.continuation_preview_result import (
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationPreviewResultDeadline
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from elspeth.web.sessions.models import composer_validation_terminal_holds_table as validation_holds
 
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
@@ -51,7 +51,8 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState, ToolBatchContext
     from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
-    from elspeth.web.required_work import RequiredPreviewProduced, RequiredWorkSource, RequiredWorkTicket
+    from elspeth.web.required_work import RequiredPreviewProduced, RequiredWorkCoordinator, RequiredWorkSource, RequiredWorkTicket
+    from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
@@ -66,6 +67,8 @@ class _Issued:
     prepared: PreparedValueBatchCall
     source: PreviewSourceData
     clock: ContinuationPreviewResultDeadline
+    issued_source: ContinuationRuntimeSource
+    issued_inventory: CurrentContinuationEnvInventory
     preflight_started: bool = False
     preflight_completed: bool = False
     strict: ValidationResult | None = None
@@ -76,10 +79,12 @@ class _Issued:
     returned: PreviewReturned | None = None
     original_error: BaseException | None = None
     adopted: bool = False
+    message_source_adopted: bool = False
     finish_ticket_identity: int | None = None
 
 
 _ISSUED: WeakKeyDictionary[IssuedPreviewDispatch, _Issued] = WeakKeyDictionary()
+_BOUND_SOURCES: WeakKeyDictionary[RequiredWorkCoordinator, set[tuple[str, str, str]]] = WeakKeyDictionary()
 _LOCK = threading.RLock()
 
 
@@ -108,12 +113,21 @@ def bind_issued_preview_dispatch_on_connection(
     prepared: PreparedValueBatchCall,
     source: PreviewSourceData,
     clock: ContinuationPreviewResultDeadline,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
 ) -> IssuedPreviewDispatch:
     """Bind the genuine current issue once, before original async preflight."""
+    from elspeth.web.required_work import RequiredWorkBinding
+    from elspeth.web.sessions.continuation_runtime import read_runtime_source_on_connection
+
     if type(authority) is not ComposerAsyncOperationAuthority or conn.engine is not authority._engine:
         raise AuditIntegrityError("preview dispatch changed its actual session store owner")
     if type(clock) is not ContinuationPreviewResultDeadline or clock.owner.running is not running:
         raise AuditIntegrityError("preview dispatch requires its original pre-producer action clock")
+    work = prepared.runtime.bindings.required_work
+    if type(work) is not RequiredWorkBinding or work.running is not running or work.coordinator.sql_deadline_owner is not clock.owner:
+        raise AuditIntegrityError("preview dispatch changed its actual original required-work owner")
+    work.validate_context(running.session_operation_context)
     require_preview_source_matches(source, prepared)
     _require_current_continuation_running(conn, running)
     contract = read_preview_terminal_hold_on_connection(
@@ -124,28 +138,56 @@ def bind_issued_preview_dispatch_on_connection(
         env_ref_names=prepared.runtime.env_ref_names,
     )
     stored = load_snapshot(conn, session_id=source.session_id, operation_id=source.operation_id)
-    if contract.source != source or stored.cursor != source.cursor + 1:
+    if (
+        contract.source != source
+        or stored.cursor != source.cursor + 1
+        or selected.checkpoint_id != stored.checkpoint_id
+        or selected.stack.cursor != stored.cursor
+        or inventory.running is not running
+        or inventory.names != prepared.runtime.env_ref_names
+    ):
         raise AuditIntegrityError("preview dispatch lost its exact current reserved issue")
-    record = _Issued(authority, running, prepared, source, clock)
+    issued_source = read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+    record = _Issued(authority, running, prepared, source, clock, issued_source, inventory)
     _before_producer(record)
-    changed = conn.execute(
-        update(effects)
-        .where(
+    actual = conn.execute(
+        select(effects).where(
             effects.c.session_id == source.session_id,
             effects.c.operation_id == source.operation_id,
             effects.c.effect_key == f"tool:{source.response.digest}:{source.tool_index}",
             effects.c.owner == "tool_dispatch",
             effects.c.disposition == "dispatched",
-            effects.c.response_started_at.is_(None),
             effects.c.creator_sequence == source.sequence,
             effects.c.creator_generation == source.generation,
         )
-        .values(response_started_at=database_now(conn))
-    )
-    if changed.rowcount != 1:
+    ).one_or_none()
+    hold_state = conn.execute(
+        select(validation_holds.c.state).where(
+            validation_holds.c.session_id == source.session_id,
+            validation_holds.c.operation_id == source.operation_id,
+            validation_holds.c.effect_key == f"tool:{source.response.digest}:{source.tool_index}",
+        )
+    ).scalar_one()
+    if (
+        actual is None
+        or actual.receipt_key is not None
+        or actual.result_chunk_key is not None
+        or actual.response_finished_at is not None
+        or actual.provider_attempt_id is not None
+        or hold_state != "active"
+    ):
         raise AuditIntegrityError("preview producer cannot repeat an entered or foreign issue")
     permit = IssuedPreviewDispatch()
     with _LOCK:
+        # Durable may-dispatch/UNKNOWN custody is the existing issued cut. It
+        # cannot be restored as a fresh tool_ready producer after restart. This
+        # actual coordinator additionally owns one process-local live handoff,
+        # including when its earlier permit was discarded or released.
+        key = source.operation_id, source.checkpoint_id, f"tool:{source.response.digest}:{source.tool_index}"
+        bound = _BOUND_SOURCES.setdefault(work.coordinator, set())
+        if key in bound:
+            raise AuditIntegrityError("preview cannot bind its original issued source twice")
+        bound.add(key)
         _ISSUED[permit] = record
     return permit
 
@@ -226,7 +268,15 @@ def produce_original_preview(permit: IssuedPreviewDispatch) -> RequiredPreviewPr
                 effects.c.effect_key == f"tool:{source.response.digest}:{source.tool_index}",
             )
         ).one()
-        if row.disposition != "dispatched" or row.response_started_at is None or row.response_finished_at is not None:
+        stored = load_snapshot(conn, session_id=source.session_id, operation_id=source.operation_id)
+        if (
+            row.disposition != "dispatched"
+            or row.receipt_key is not None
+            or row.result_chunk_key is not None
+            or row.response_finished_at is not None
+            or row.provider_attempt_id is not None
+            or stored.cursor != source.cursor + 1
+        ):
             raise AuditIntegrityError("preview handler changed its original entered SQL issue")
 
     def strict_callback(state: CompositionState) -> ValidationResult:
@@ -371,6 +421,38 @@ def original_adopted_preview_result(permit: IssuedPreviewDispatch, *, prepared: 
     return record.admitted
 
 
+def adopt_preview_issued_message_source(permit: IssuedPreviewDispatch, *, prepared: PreparedValueBatchCall) -> None:
+    """Advance the original producer to its exact SQL-proved issued cut.
+
+    The immutable prepared runtime still identifies the original ready source.
+    This adopts no replacement producer, response or message and grants no
+    further producer dispatch or SQL write.
+    """
+    record = _issued(permit)
+    if record.prepared is not prepared or type(record.returned) is not CompletePreviewReturn or record.message_source_adopted:
+        raise AuditIntegrityError("preview message source lacks its original once-only returned handoff")
+    require_preview_produced(permit, record.returned)
+    producer = prepared.runtime.materialization
+    if producer.selected is not prepared.runtime.source.selected or producer is not prepared.context.message_producers:
+        raise AuditIntegrityError("preview message source replaced its original ready producer")
+    producer.advance_current_from_source(record.issued_source.selected, record.issued_inventory, record.issued_source)
+    record.message_source_adopted = True
+
+
+def original_preview_issued_message_source(permit: IssuedPreviewDispatch, *, prepared: PreparedValueBatchCall) -> ContinuationRuntimeSource:
+    """Read the same original issued source after its producer has adopted it."""
+    record = _issued(permit)
+    if (
+        record.prepared is not prepared
+        or not record.message_source_adopted
+        or prepared.runtime.materialization.selected is not record.issued_source.selected
+        or prepared.runtime.materialization.inventory is not record.issued_inventory
+        or prepared.context.message_producers is not prepared.runtime.materialization
+    ):
+        raise AuditIntegrityError("preview message source changed its actual adopted issued selection")
+    return record.issued_source
+
+
 async def try_admit_preview_tool(
     owner: ContinuationLivePhases,
     *,
@@ -387,10 +469,17 @@ async def try_admit_preview_tool(
     from elspeth.web.composer.continuation_codec import PrivateChunk
     from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
     from elspeth.web.composer.continuation_initialization import _registered
+    from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
     from elspeth.web.composer.continuation_preview_observation import preview_source_data
-    from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, capture_continuation_runtime_owners
+    from elspeth.web.composer.continuation_runtime import (
+        CapturedContinuationRuntime,
+        RestoredContinuationRuntime,
+        capture_continuation_runtime_owners,
+        restore_metadata_preparation_runtime,
+    )
     from elspeth.web.composer.continuation_value_batch_builder import adopt_issued_preview_batch
     from elspeth.web.composer.continuation_value_batch_preparation import prepare_issued_preview_batch
+    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.tool_batch import ContinuationCallState, _prepare_continuation_call_live
     from elspeth.web.required_work import RequiredWorkSource
     from elspeth.web.sessions.continuation import StoredContinuationSnapshot
@@ -415,8 +504,42 @@ async def try_admit_preview_tool(
         raise AuditIntegrityError("preview requires its original driver-begun action clock")
     clock_owner.require_action_clock(owner.action_clock)
     clock = clock_owner.capture_preview_result_deadline()
-    primary = await owner._primary_for_phase(runtime, inventory, selected)
-    context = await owner._tool_context(runtime)
+    provider = ProviderInvocationOwner(service=sessions, required_work=owner.work)
+    detached = await restore_metadata_preparation_runtime(
+        service=owner.service,
+        authority=owner.authority,
+        selected=selected,
+        inventory=inventory,
+        required_work=owner.work,
+        provider_owner=provider,
+    )
+    if type(detached) is not RestoredContinuationRuntime:
+        raise AuditIntegrityError("preview preparation requires its actual restored runtime")
+    detached_data = detached.graph.batch
+    if (
+        detached.source.selected is not selected
+        or detached_data is None
+        or detached_data.calls != data.calls
+        or detached.live is runtime.live
+        or detached.materialization is runtime.materialization
+        or detached_data.batch is data.batch
+        or detached_data.accumulator is data.accumulator
+        or detached_data.batch.tool_outcomes is data.batch.tool_outcomes
+        or detached.live.recorder is runtime.live.recorder
+        or detached.live.llm_messages is runtime.live.llm_messages
+        or detached.live.turn_evidence is runtime.live.turn_evidence
+        or detached.live.discovery_cache is runtime.live.discovery_cache
+        or detached.live.runtime_preflight_cache is runtime.live.runtime_preflight_cache
+        or detached.live.anti_anchor is runtime.live.anti_anchor
+    ):
+        raise AuditIntegrityError("preview preparation reused or changed an original mutable owner")
+    phase = ContinuationLivePhases(owner.service, owner.authority, owner.work, provider, owner.lease, runtime=detached)
+    primary = await phase._primary_for_phase(detached, inventory, selected)
+    context = await phase._tool_context(detached)
+    # Retaining the issue advances the live owner's mutable producers. The
+    # independently restored preparation keeps its exact ready-cut producers
+    # through the original native result/message handling.
+    runtime, data = detached, detached_data
     call = ContinuationCallState(0, data.calls[0], data.batch.state, data.batch.state.version)
     data.batch.current_call, data.batch.phase = call, "call_active"
     preparation = await _prepare_continuation_call_live(
@@ -463,7 +586,14 @@ async def try_admit_preview_tool(
         nonlocal bound_by_sql
         with locked_session_transaction(owner.authority._engine, source.session_id) as conn:
             bound = bind_issued_preview_dispatch_on_connection(
-                conn, inventory.running, authority=owner.authority, prepared=prepared, source=source, clock=clock
+                conn,
+                inventory.running,
+                authority=owner.authority,
+                prepared=prepared,
+                source=source,
+                clock=clock,
+                selected=current_selected,
+                inventory=current_inventory,
             )
         bound_by_sql = bound
         return bound

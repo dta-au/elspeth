@@ -57,6 +57,7 @@ from elspeth.web.sessions.models import composer_continuation_events_table as ev
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.continuation_inventory import inventory_advisor, inventory_work
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
@@ -125,12 +126,19 @@ async def primary_input(store, tmp_path, monkeypatch):
     return kwargs, produced, recorder, requests
 
 
-async def initialized_primary_input(store, tmp_path, monkeypatch, *, settings_overrides=None):
+async def initialized_primary_input(
+    store, tmp_path, monkeypatch, *, settings_overrides=None, base_state_data: CompositionStateData | None = None
+):
     """Enter PRIMARY from the actual complete composition initialization owner."""
     from tests.helpers.fenced_session import seed_token_policies
     from tests.unit.web.sessions.test_continuation_composition_initialization import construct, ready_case
 
-    running, service, work, ready, title_sdk = await ready_case(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
+    if base_state_data is None:
+        running, service, work, ready, title_sdk = await ready_case(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
+    else:
+        running, service, work, ready, title_sdk = await ready_case(
+            store, tmp_path, monkeypatch, settings_overrides=settings_overrides, base_state_data=base_state_data
+        )
     assert not title_sdk
     runtime = await construct(store, running, service, work, ready)
     assert runtime.source.selected.stack.semantic_frontier is not None
