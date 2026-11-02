@@ -7,6 +7,7 @@ does not restore an issued observation, cache grant or execution permission.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Literal
@@ -103,6 +104,16 @@ def preview_source_data(prepared: PreparedValueBatchCall) -> PreviewSourceData:
         or runtime.bindings.session_operation_context is not running.session_operation_context
         or runtime.bindings.required_work is None
         or runtime.bindings.required_work.running is not running
+        or context.plugin_snapshot is not runtime.bindings.plugin_snapshot
+        or context.policy_catalog is not runtime.bindings.policy_catalog
+        or context.session_scope != runtime.bindings.session_scope
+        or context.session_id != runtime.bindings.session_id
+        or context.user_id != runtime.bindings.user_id
+        or context.actor != runtime.bindings.actor
+        or type(context.deadline) not in (int, float)
+        or not math.isfinite(context.deadline)
+        or context.deadline > runtime.bindings.deadline
+        or context.preflight is not runtime.materialization.service._preflight
         or context.policy_catalog.snapshot is not context.plugin_snapshot
     ):
         raise AuditIntegrityError("preview source changed its original prepared cohort")

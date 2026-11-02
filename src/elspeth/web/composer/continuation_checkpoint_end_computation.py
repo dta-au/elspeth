@@ -175,11 +175,22 @@ def compute_checkpoint_end_gate(
         returned, attempt_id=returned.attempt.attempt_id, request_sha256=returned.audit_call.messages_hash
     )
     verdict = _parse_advisor_checkpoint_guidance(returned.message.content, phase="end")
+    retry_ordinal = 1 if source.phase_owner.phase_source.completed_children else 0
     if not verdict.ok:
-        raise AuditIntegrityError("END unusable verdict still requires its separately admitted disposition")
+        if retry_ordinal != 1:
+            raise AuditIntegrityError("END first unusable verdict requires its retained format retry")
+        # The second complete malformed text exhausts the original bounded
+        # format retry; it is a model pass with an honest unusable verdict.
+        verdict = AdvisorCheckpointVerdict(
+            ok=False,
+            blocking=False,
+            failure_class="malformed",
+            findings_text=advisor_policy.ADVISOR_MALFORMED_USER_DETAIL,
+        )
     gate = source.gate_locals
     runtime = source.phase_owner.runtime
-    verdict = replace(verdict, publication_binding=gate.publication_review.binding)
+    if verdict.ok:
+        verdict = replace(verdict, publication_binding=gate.publication_review.binding)
     review_state = _advance_advisor_review_state(
         gate.review_state,
         verdict=verdict,

@@ -252,6 +252,118 @@ def admit_v4_checkpoint_paid_tail_on_connection(
 
 
 @contextmanager
+def admit_v4_checkpoint_end_owed_overflow_tail_on_connection(
+    conn: Connection,
+    *,
+    source: ProviderTerminalHoldSource,
+    plan: CheckpointPaidOverflowTailPlan,
+    batch: CheckpointPaidOverflowTailBatch,
+) -> Iterator[None]:
+    """Spend only the rebound H on one exact complete-response consequence overflow.
+
+    The original provider response remains in the preceding END-owed checkpoint.
+    This scope reserves the missing retained tail and enforces the same
+    chunk/append/hold-consumption sequence as the pre-H terminal scope.
+    """
+    if (
+        type(source) is not ProviderTerminalHoldSource
+        or type(plan) is not CheckpointPaidOverflowTailPlan
+        or type(batch) is not CheckpointPaidOverflowTailBatch
+        or _SCOPE_KEY in conn.info
+    ):
+        raise AuditIntegrityError("END-owed overflow requires one nominal rebound H batch")
+    transaction = conn.get_transaction()
+    if type(transaction) is not RootTransaction or not transaction.is_active:
+        raise AuditIntegrityError("END-owed overflow requires its original root transaction")
+    if (
+        plan.phase != "end"
+        or source.session_id != plan.identity.session_id
+        or source.operation_id != plan.identity.operation_id
+        or source.effect_key != plan.identity.effect_key
+        or source.policy_sha256 != plan.identity.policy_sha256
+        or source.session_operation_id != plan.identity.session_operation_id
+        or source.session_operation_epoch != plan.identity.session_operation_epoch
+        or source.creator_generation != plan.identity.ownership_generation
+        or source.creator_sequence != plan.creator_sequence
+        or source.lease_sha256 != plan.identity.lease_sha256
+        or source.source_checkpoint_id != plan.identity.source_checkpoint_id
+        or source.source_cursor != plan.identity.source_cursor
+        or source.source_snapshot_sha256 != plan.identity.source_snapshot_sha256
+        or source.reserved_bytes != plan.reserved_bytes
+        or source.fallback_contract_sha256 != plan.fallback_contract_sha256
+        or load_snapshot(conn, session_id=source.session_id, operation_id=source.operation_id) != plan.admitted
+    ):
+        raise AuditIntegrityError("END-owed overflow changed its exact rebound H contract")
+    batch.append.require_original()
+    event, error = parse_json_strict(batch.append.events[0].payload_json) if batch.append.events else (None, "missing")
+    if error is not None or type(event) is not dict or type(event.get("private_audit_sha256")) is not str:
+        raise AuditIntegrityError("END-owed overflow lost its original private audit digest")
+    receipt = decode_paid_overflow_receipt(batch.receipt_json, expected=plan.identity)
+    reference = build_checkpoint_paid_overflow_tail_batch(
+        plan, receipt=receipt, published_at=batch.append.published_at, private_audit_sha256=event["private_audit_sha256"]
+    )
+    expected = reference.append
+    if (
+        (batch.receipt_json, batch.receipt_key, batch.receipt_chunk_key)
+        != (reference.receipt_json, reference.receipt_key, reference.receipt_chunk_key)
+        or (
+            batch.append.session_id,
+            batch.append.operation_id,
+            batch.append.expected_checkpoint_id,
+            batch.append.expected_cursor,
+            batch.append.snapshot_json,
+            batch.append.events,
+            batch.append.published_at,
+            batch.append.handoff,
+            batch.append.predecessor_json,
+        )
+        != (
+            expected.session_id,
+            expected.operation_id,
+            expected.expected_checkpoint_id,
+            expected.expected_cursor,
+            expected.snapshot_json,
+            expected.events,
+            expected.published_at,
+            expected.handoff,
+            expected.predecessor_json,
+        )
+        or batch.prospective
+        != (
+            *reference.prospective[:-1],
+            ProspectiveContinuationChunk(
+                f"snapshot:{batch.append.checkpoint_id}", batch.append.snapshot_json.encode("utf-8"), "snapshot.v2"
+            ),
+        )
+        or sum(len(chunk.payload) for chunk in batch.prospective) > source.reserved_bytes
+    ):
+        raise AuditIntegrityError("END-owed overflow changed its exact bounded receipt tail")
+    admit_retained_payload_chunks(
+        conn,
+        session_id=source.session_id,
+        operation_id=source.operation_id,
+        prospective=batch.prospective,
+        retained_payload_limit_bytes=source.allowance_bytes,
+        consuming_hold=source,
+    )
+    scope = _CheckpointPaidTailScope(conn, transaction, source, plan, batch)
+    conn.info[_SCOPE_KEY] = scope
+    try:
+        yield
+        final = StoredContinuationSnapshot(
+            batch.append.snapshot_json, batch.append.expected_cursor + len(batch.append.events), batch.append.checkpoint_id
+        )
+        if scope.stage != 3 or load_snapshot(conn, session_id=source.session_id, operation_id=source.operation_id) != final:
+            raise AuditIntegrityError("END-owed overflow did not consume its complete batch and H")
+    except BaseException:
+        transaction.rollback()
+        raise
+    finally:
+        if conn.info.pop(_SCOPE_KEY, None) is not scope:
+            raise AuditIntegrityError("END-owed overflow lost its transaction scope")
+
+
+@contextmanager
 def admit_v4_checkpoint_no_sdk_tail_on_connection(
     conn: Connection,
     *,

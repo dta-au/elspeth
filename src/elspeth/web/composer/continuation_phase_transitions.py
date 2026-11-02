@@ -7,7 +7,7 @@ session lock used by Stop, after rechecking the complete selected predecessor.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from pydantic import Field
@@ -32,6 +32,7 @@ from elspeth.web.composer.continuation_policy import (
 from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationEvent,
@@ -53,6 +54,9 @@ from elspeth.web.sessions.continuation_primary import (
     read_committed_primary_response_on_connection,
 )
 from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, refuse_v3_tool_no_execution_on_connection
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_preview_observation import PreviewSourceData
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
@@ -100,6 +104,7 @@ class ToolIssueSource(ContinuationValue):
     tool_index: int = Field(ge=0)
     tool_call_id: str
     input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    preview_source_json: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def read_tool_issue_source_on_connection(
@@ -665,6 +670,7 @@ def retain_batch_transition(
     captured: CapturedContinuationRuntime,
     inventory: CurrentContinuationEnvInventory,
     transition: BatchTransition,
+    preview_source: PreviewSourceData | None = None,
 ) -> StoredContinuationSnapshot:
     if transition not in (
         "batch_initialized",
@@ -719,9 +725,28 @@ def retain_batch_transition(
         stored = load_snapshot(conn, session_id=before.logical.session_id, operation_id=before.logical.operation_id)
         if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(before):
             raise AuditIntegrityError("batch transition replaced its actual selected predecessor")
-        if transition in ("tool_issued", "attachment_prepared", "attachment_reprepared") and type(
-            decode_continuation_policy(before.admission_policy_json, before.policy_hash)
-        ) in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
+        bounded_policy = decode_continuation_policy(before.admission_policy_json, before.policy_hash)
+        if preview_source is not None:
+            from hashlib import sha256
+
+            from elspeth.web.composer.continuation_preview_observation import PreviewSourceData
+
+            if (
+                type(preview_source) is not PreviewSourceData
+                or type(bounded_policy) is not ContinuationAdmissionPolicyV4
+                or transition != "tool_issued"
+                or preview_source.checkpoint_id != selected.checkpoint_id
+                or preview_source.cursor != before.cursor
+                or preview_source.snapshot_sha256 != sha256(encode_continuation_snapshot(before).encode("utf-8")).hexdigest()
+                or preview_source.policy_sha256 != before.policy_hash
+                or (preview_source.session_id, preview_source.operation_id) != (before.logical.session_id, before.logical.operation_id)
+            ):
+                raise AuditIntegrityError("preview issue lost its exact original source/policy")
+        if (
+            preview_source is None
+            and transition in ("tool_issued", "attachment_prepared", "attachment_reprepared")
+            and type(bounded_policy) in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
+        ):
             raise AuditIntegrityError("bounded tool issue requires a complete finite result envelope before dispatch")
         response = (
             read_committed_primary_response_for_settlement_on_connection(conn, running, selected=selected, reference=frame.response)
@@ -835,6 +860,18 @@ def retain_batch_transition(
             )
             if call.effect_key is not None:
                 raise AuditIntegrityError("tool issue injected a SQL-owner locator into prepared DATA")
+            if preview_source is not None and (
+                len(data.calls) != 1
+                or call.tool_name != "preview_pipeline"
+                or call.arguments != {}
+                or call.index != preview_source.tool_index
+                or call.tool_call.id != preview_source.tool_call_id
+                or frame.response != preview_source.response
+                or preview_source.prepared_batch_sha256 != sha256(_selected_chunk(following, frame).canonical.encode("utf-8")).hexdigest()
+                or preview_source.raw_arguments_sha256 != sha256(call.tool_call.function.arguments.encode("utf-8")).hexdigest()
+                or preview_source.state_sha256 != sha256(canonical_json(call.pre_state.to_dict()).encode("utf-8")).hexdigest()
+            ):
+                raise AuditIntegrityError("preview issue changed its actual single prepared call")
             issue = ToolIssueSource(
                 previous_checkpoint_id=stored.checkpoint_id,
                 cursor=stored.cursor + 1,
@@ -847,6 +884,7 @@ def retain_batch_transition(
                 tool_index=call.index,
                 tool_call_id=call.tool_call.id,
                 input_sha256=input_hash,
+                preview_source_json=None if preview_source is None else canonical_json(preview_source.model_dump(mode="json")),
             )
             expected = (*before.effect_frontier, EffectFrontierEntry(effect_id=key, disposition="dispatched", receipt_id=None))
             if after.effect_frontier != expected or after.pending_owner_results or after.pending_settlement_ids:
@@ -995,4 +1033,10 @@ def retain_batch_transition(
 
         current = SelectedContinuationState(retained.checkpoint_id, decode_continuation_snapshot(retained.payload_json), captured.chunks)
         read_selected_turn_evidence_graph_on_connection(conn, running, selected=current, names=names)
+        if preview_source is not None:
+            from elspeth.web.sessions.continuation_preview_result import reserve_preview_terminal_hold_on_connection
+
+            reserve_preview_terminal_hold_on_connection(
+                conn, running, source=preview_source, env_ref_names=names, created_at=database_now(conn)
+            )
         return retained

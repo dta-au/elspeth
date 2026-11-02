@@ -94,15 +94,25 @@ def project_end_complete_terminal(
     detached = physical.detached
     live = detached.live
     caller = gate.caller
+    malformed_final = (
+        not computation.verdict.ok
+        and computation.verdict.failure_class == "malformed"
+        and bool(owner.phase_source.completed_children)
+        and computation.is_last_pass
+    )
+    flagged_final = (
+        computation.verdict.ok
+        and computation.verdict.blocking
+        and computation.verdict.publication_verdict == "WITHHOLD"
+        and computation.is_last_pass
+    )
     missed = tuple(
         name
         for name, failed in (
             ("ordinary_caller", type(caller) is not OrdinaryEndCallerLocals),
             ("proof_override", type(caller) is OrdinaryEndCallerLocals and caller.proof_runtime_preflight is not None),
             ("blocked_action", computation.action != "blocked_or_orphan_terminal"),
-            ("usable_verdict", not computation.verdict.ok),
-            ("blocking_verdict", not computation.verdict.blocking),
-            ("withheld_verdict", computation.verdict.publication_verdict != "WITHHOLD"),
+            ("completed_verdict", not (flagged_final or malformed_final)),
             ("publication_admitted", computation.publication_admitted),
             ("last_pass", not computation.is_last_pass),
             ("genuine_orphans", bool(computation.genuine_orphans)),
@@ -139,7 +149,7 @@ def project_end_complete_terminal(
     saved_scope = live.turn_evidence.render_saved_scope()
     withheld = computation.candidate if computation.candidate.strip() else None
     blocked = advisor._advisor_blocked_result(
-        reason="flagged_final_pass",
+        reason="malformed" if malformed_final else "flagged_final_pass",
         verdict=computation.verdict,
         state=live.state,
         assistant_message=_AdmittedAssistantMessage(content=saved_scope),

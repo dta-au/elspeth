@@ -17,6 +17,7 @@ from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.continuation import (
     ContinuationFrameStack,
     ContinuationProviderCostPolicyV2,
+    EndFrame,
     PrivateChunkRef,
 )
 from elspeth.web.composer.continuation_policy import (
@@ -223,7 +224,9 @@ def _require_undispatched_cancellation(conn: Connection, attempt: Row[Any], sour
     return True
 
 
-def read_continuation_cost_snapshot_on_connection(conn: Connection, stack: ContinuationFrameStack) -> CommonProviderCostSnapshot | None:
+def read_continuation_cost_snapshot_on_connection(
+    conn: Connection, stack: ContinuationFrameStack, *, pending_end_owed_names: frozenset[str] | None = None
+) -> CommonProviderCostSnapshot | None:
     """Read all physical fences for one original logical operation, in audit order."""
     if type(stack) is not ContinuationFrameStack:
         raise AuditIntegrityError("Continuation cost source requires its actual selected root")
@@ -238,6 +241,28 @@ def read_continuation_cost_snapshot_on_connection(conn: Connection, stack: Conti
     ):
         raise AuditIntegrityError("Continuation cost source differs from its admitted immutable policy")
     logical = stack.logical
+    pending_end_attempt_id: str | None = None
+    if pending_end_owed_names is not None:
+        from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+        from elspeth.web.sessions.continuation_checkpoint_end_owed import read_v4_checkpoint_end_owed_on_connection
+
+        if (
+            type(policy) is not ContinuationAdmissionPolicyV4
+            or type(pending_end_owed_names) is not frozenset
+            or len(stack.pending_settlement_ids) != 1
+            or type(stack.frames[-1]) is not EndFrame
+        ):
+            raise AuditIntegrityError("Continuation pending cost projection lacks one exact V4 END H")
+        pending_end_attempt_id = stack.pending_settlement_ids[0]
+        owed = read_v4_checkpoint_end_owed_on_connection(
+            conn,
+            session_id=logical.session_id,
+            operation_id=logical.operation_id,
+            attempt_id=pending_end_attempt_id,
+            names=pending_end_owed_names,
+        )
+        if owed is None or decode_continuation_snapshot(owed.selected.payload_json) != stack:
+            raise AuditIntegrityError("Continuation pending cost projection differs from its current complete END H")
     principal = conn.execute(select(sessions.c.user_id).where(sessions.c.id == logical.session_id)).scalar_one()
     fences = conn.execute(
         select(segments).where(segments.c.session_id == logical.session_id, segments.c.operation_id == logical.operation_id)
@@ -287,9 +312,17 @@ def read_continuation_cost_snapshot_on_connection(conn: Connection, stack: Conti
         _require_ledger(conn, attempt, call)
         _require_primary_effect_if_present(conn, stack, attempt_id, call)
         audited[attempt_id] = (row.sequence_no, call)
+    pending_seen = False
     for attempt_id, (attempt, source) in attempts_by_id.items():
+        if attempt_id == pending_end_attempt_id:
+            if attempt_id in audited or attempt.settled_at is not None or attempt.ledger_entry_id is not None:
+                raise AuditIntegrityError("Continuation pending END cost source gained a settled or audited call")
+            pending_seen = True
+            continue
         if attempt_id not in audited and not _require_undispatched_cancellation(conn, attempt, source):
             raise AuditIntegrityError("Continuation cost source has an unresolved physical attempt")
+    if pending_end_attempt_id is not None and not pending_seen:
+        raise AuditIntegrityError("Continuation pending END cost source lost its original physical attempt")
     budget = CommonProviderCostBudget(
         CommonProviderCostSnapshot(
             logical.session_id,
@@ -305,4 +338,9 @@ def read_continuation_cost_snapshot_on_connection(conn: Connection, stack: Conti
             raise AuditIntegrityError("Continuation cost call lost its response accountability")
         budget.dispatched()
         budget.consume_settled(call, response_accountable=response_accountable)
+    if pending_seen:
+        # This is a read-only projection of an already dispatched paid H.  Keep
+        # its call in-flight so no downstream budget can dispatch another paid
+        # call before the consequence writer settles its ledger and audit.
+        budget.dispatched()
     return budget.snapshot()

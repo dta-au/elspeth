@@ -11,11 +11,17 @@ from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, or_, sel
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.audit_storage import private_diagnostic_drafts_for_source
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
+from elspeth.web.composer.continuation_codec import decode_retained_physical_audit_call
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
-from elspeth.web.composer.provider_audit_source import audit_drafts_json, capture_provider_audit_source, provider_attempt_audit_drafts
+from elspeth.web.composer.provider_audit_source import (
+    ProviderAuditSource,
+    audit_drafts_json,
+    capture_provider_audit_source,
+    provider_attempt_audit_drafts_for_source,
+)
 from elspeth.web.composer.visible_tool_event import validate_visible_audit_row
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource
@@ -37,8 +43,78 @@ class CheckpointPaidAuditCohort:
     private_sha256: str
 
 
+@dataclass(slots=True)
+class AdmittedCheckpointAuditSource:
+    """One transaction's original paid evidence under its current write fence."""
+
+    connection: Connection
+    transaction: object
+    context: SessionOperationContext
+    source: ProviderAuditSource
+    cohort: CheckpointPaidAuditCohort
+    attempt_id: str
+    active: bool = True
+
+    def require(self, conn: Connection, context: SessionOperationContext, drafts: tuple[AuditMessageDraft, ...]) -> None:
+        if (
+            not self.active
+            or conn is not self.connection
+            or conn.get_transaction() is not self.transaction
+            or context is not self.context
+            or type(self.source) is not ProviderAuditSource
+            or type(self.cohort) is not CheckpointPaidAuditCohort
+            or audit_drafts_json(drafts) != audit_drafts_json(self.cohort.drafts)
+        ):
+            raise AuditIntegrityError("checkpoint paid audit escaped its admitted SQL transaction or original cohort")
+
+
+def admit_checkpoint_paid_audit_source_on_connection(
+    conn: Connection,
+    *,
+    service: object,
+    context: SessionOperationContext,
+    owed: object,
+    call: ComposerLLMCall,
+    cohort: CheckpointPaidAuditCohort,
+    names: frozenset[str],
+) -> AdmittedCheckpointAuditSource:
+    """Bind one deep current H and original call before any consequence writes."""
+    from elspeth.web.sessions.continuation_checkpoint_end_owed import VerifiedCheckpointEndOwed, read_v4_checkpoint_end_owed_on_connection
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    if (
+        type(service) is not SessionServiceImpl
+        or type(context) is not SessionOperationContext
+        or context.operation_kind is not SessionOperationKind.COMPOSE
+        or type(owed) is not VerifiedCheckpointEndOwed
+        or type(call) is not ComposerLLMCall
+        or type(cohort) is not CheckpointPaidAuditCohort
+        or type(names) is not frozenset
+        or context.fence.session_id != owed.session_id
+        or call.call_id != owed.attempt_id
+    ):
+        raise AuditIntegrityError("checkpoint paid audit lacks its actual current and original owners")
+    service._assert_session_write_lock_held(conn, owed.session_id, caller="checkpoint_paid_audit_admission")
+    service._require_session_write_authority_on_connection(conn, context, session_id=owed.session_id)
+    fresh = read_v4_checkpoint_end_owed_on_connection(
+        conn,
+        session_id=owed.session_id,
+        operation_id=owed.operation_id,
+        attempt_id=owed.attempt_id,
+        names=names,
+    )
+    if (
+        fresh != owed
+        or decode_retained_physical_audit_call(owed.response) != call
+        or checkpoint_paid_audit_cohort_for_hold(call, owed.new_hold) != cohort
+    ):
+        raise AuditIntegrityError("checkpoint paid audit changed its deep original H or provider cohort")
+    source = ProviderAuditSource(owed.new_hold.session_id, owed.new_hold.session_operation_id, owed.new_hold.session_operation_epoch)
+    return AdmittedCheckpointAuditSource(conn, conn.get_transaction(), context, source, cohort, owed.attempt_id)
+
+
 def _private_kind(
-    draft: AuditMessageDraft, *, source: ProviderTerminalHoldSource | None, call_id: str, context: SessionOperationContext
+    draft: AuditMessageDraft, *, source: ProviderTerminalHoldSource | None, call_id: str, provider_source: ProviderAuditSource
 ) -> str:
     if (
         type(draft) is not AuditMessageDraft
@@ -52,11 +128,13 @@ def _private_kind(
         or draft.inherit_composition_state is not False
     ):
         raise AuditIntegrityError("checkpoint private audit changed its closed draft shape")
-    fence = context.fence
     evidence = ComposerDiagnosticEvidence.from_envelope(
-        draft.tool_calls[0], expected_session_id=fence.session_id, expected_operation_id=fence.operation_id, expected_tool_call_id=call_id
+        draft.tool_calls[0],
+        expected_session_id=provider_source.session_id,
+        expected_operation_id=provider_source.operation_id,
+        expected_tool_call_id=call_id,
     )
-    if evidence.operation_epoch != fence.operation_epoch or (
+    if evidence.operation_epoch != provider_source.operation_epoch or (
         source is not None and source.session_operation_epoch != evidence.operation_epoch
     ):
         raise AuditIntegrityError("checkpoint private audit crossed its original operation epoch")
@@ -99,9 +177,25 @@ def _require_outer_row_bound(draft: AuditMessageDraft) -> None:
 
 def checkpoint_paid_audit_cohort(call: ComposerLLMCall, context: SessionOperationContext) -> CheckpointPaidAuditCohort:
     """Derive exact original private members before the terminal event exists."""
+    if type(context) is not SessionOperationContext:
+        raise AuditIntegrityError("checkpoint paid audit requires its original COMPOSE context")
+    return _checkpoint_paid_audit_cohort_for_source(call, capture_provider_audit_source(context), hold=None)
+
+
+def checkpoint_paid_audit_cohort_for_hold(call: ComposerLLMCall, hold: ProviderTerminalHoldSource) -> CheckpointPaidAuditCohort:
+    """Project original paid evidence from deep H, without borrowing a live context."""
+    if type(hold) is not ProviderTerminalHoldSource:
+        raise AuditIntegrityError("checkpoint paid audit requires its original terminal hold")
+    source = ProviderAuditSource(hold.session_id, hold.session_operation_id, hold.session_operation_epoch)
+    return _checkpoint_paid_audit_cohort_for_source(call, source, hold=hold)
+
+
+def _checkpoint_paid_audit_cohort_for_source(
+    call: ComposerLLMCall, source: ProviderAuditSource, *, hold: ProviderTerminalHoldSource | None
+) -> CheckpointPaidAuditCohort:
     if (
         type(call) is not ComposerLLMCall
-        or type(context) is not SessionOperationContext
+        or type(source) is not ProviderAuditSource
         or type(call.call_id) is not str
         or call.private_request is None
         or call.private_request.disposition != "retained"
@@ -112,19 +206,24 @@ def checkpoint_paid_audit_cohort(call: ComposerLLMCall, context: SessionOperatio
     incomplete = call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE
     if (call.private_failure is not None) != incomplete:
         raise AuditIntegrityError("checkpoint paid audit failure membership changed its original result")
-    source = capture_provider_audit_source(context)
     private = private_diagnostic_drafts_for_source(call, source=source)
     expected = ("request", "failure") if incomplete else ("request",)
-    kinds = tuple(_private_kind(draft, source=None, call_id=call.call_id, context=context) for draft in private)
+    kinds = tuple(_private_kind(draft, source=hold, call_id=call.call_id, provider_source=source) for draft in private)
     if kinds != expected:
         raise AuditIntegrityError("checkpoint paid audit changed its original closed member order")
     return CheckpointPaidAuditCohort(
-        provider_attempt_audit_drafts(call, context), sha256(audit_drafts_json(private).encode("utf-8")).hexdigest()
+        provider_attempt_audit_drafts_for_source(call, source), sha256(audit_drafts_json(private).encode("utf-8")).hexdigest()
     )
 
 
 def write_checkpoint_paid_audit_cohort_on_connection(
-    conn: Connection, *, service: object, context: SessionOperationContext, cohort: CheckpointPaidAuditCohort, observed_at: datetime
+    conn: Connection,
+    *,
+    service: object,
+    context: SessionOperationContext,
+    cohort: CheckpointPaidAuditCohort,
+    observed_at: datetime,
+    admitted: AdmittedCheckpointAuditSource | None = None,
 ) -> None:
     """Persist the original visible/private drafts without a second usage owner."""
     from elspeth.web.sessions.service import SessionServiceImpl
@@ -133,15 +232,22 @@ def write_checkpoint_paid_audit_cohort_on_connection(
         raise AuditIntegrityError("checkpoint paid audit changed its original SQL writer")
     sid = context.fence.session_id
     service._assert_session_write_lock_held(conn, sid, caller="checkpoint_paid_audit")
-    for draft in cohort.drafts:
-        validate_visible_audit_row(
-            envelopes=tuple(draft.tool_calls or ()),
-            content=draft.content,
-            role=draft.role,
-            writer_principal="compose_loop",
-            session_id=sid,
-            context=context,
-        )
+    if admitted is not None:
+        if type(admitted) is not AdmittedCheckpointAuditSource or admitted.cohort != cohort:
+            raise AuditIntegrityError("checkpoint paid audit lost its admitted original cohort")
+        admitted.require(conn, context, cohort.drafts)
+        if admitted.source.session_id != sid:
+            raise AuditIntegrityError("checkpoint paid audit crossed its original session")
+    else:
+        for draft in cohort.drafts:
+            validate_visible_audit_row(
+                envelopes=tuple(draft.tool_calls or ()),
+                content=draft.content,
+                role=draft.role,
+                writer_principal="compose_loop",
+                session_id=sid,
+                context=context,
+            )
     active = service._deduplicate_private_audit_drafts(
         conn,
         session_id=sid,
@@ -149,6 +255,7 @@ def write_checkpoint_paid_audit_cohort_on_connection(
         writer_principal="compose_loop",
         session_operation_context=context,
         composition_state_id=None,
+        admitted_checkpoint_source=admitted,
     )
     # This owner already settled its original physical attempt with the
     # requested-model terminal quota entry. `uncheckpointed_envelopes` would
@@ -175,6 +282,8 @@ def write_checkpoint_paid_audit_cohort_on_connection(
         )
     with service._session_mutations(conn, session_id=sid, session_operation_context=context) as mutations:
         mutations.mark_session_updated(updated_at=observed_at)
+    if admitted is not None:
+        admitted.active = False
 
 
 def require_checkpoint_paid_private_audit_on_connection(

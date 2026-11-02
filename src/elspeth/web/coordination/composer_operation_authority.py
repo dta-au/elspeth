@@ -2210,6 +2210,7 @@ def settle_composer_operation_on_connection(
         from elspeth.web.sessions.continuation_semantic_actions import require_semantic_publication_on_connection
         from elspeth.web.sessions.continuation_semantic_advisor import (
             require_semantic_iteration_publication_on_connection,
+            require_semantic_ordinary_recovery_publication_on_connection,
             require_semantic_owned_iteration_publication_on_connection,
         )
         from elspeth.web.sessions.protocol import ChatMessageRecord
@@ -2221,14 +2222,25 @@ def settle_composer_operation_on_connection(
         iteration_proof = (
             require_semantic_iteration_publication_on_connection(conn, running, selected=selected) if owned_proof is None else None
         )
-        review_proof = (
-            require_semantic_publication_on_connection(conn, running, selected=selected)
+        recovery_proof = (
+            require_semantic_ordinary_recovery_publication_on_connection(conn, running, selected=selected)
             if owned_proof is None and iteration_proof is None
             else None
         )
-        if publication_projection is not None and owned_proof is None and iteration_proof is None and review_proof is None:
+        review_proof = (
+            require_semantic_publication_on_connection(conn, running, selected=selected)
+            if owned_proof is None and iteration_proof is None and recovery_proof is None
+            else None
+        )
+        if (
+            publication_projection is not None
+            and owned_proof is None
+            and iteration_proof is None
+            and recovery_proof is None
+            and review_proof is None
+        ):
             raise AuditIntegrityError("publication projection lacks the original paid whole-request Stop")
-        if owned_proof is not None or iteration_proof is not None or review_proof is not None:
+        if owned_proof is not None or iteration_proof is not None or recovery_proof is not None or review_proof is not None:
             if type(publication_result) is not ComposerResult:
                 raise AuditIntegrityError("semantic publication lost its actual shared finalizer result")
             if owned_proof is not None:
@@ -2237,6 +2249,9 @@ def settle_composer_operation_on_connection(
             elif iteration_proof is not None:
                 original = iteration_proof.returned.result
                 audit_call = iteration_proof.admission.paid.audit_call
+            elif recovery_proof is not None:
+                original = recovery_proof.result
+                audit_call = recovery_proof.admission.paid.audit_call
             else:
                 if review_proof is None:
                     raise AuditIntegrityError("semantic publication lost both original paid Stop sources")
@@ -2270,12 +2285,18 @@ def settle_composer_operation_on_connection(
                 if assistant_row is None or publication_service._row_to_chat_message_record(assistant_row) != publication_assistant:
                     raise AuditIntegrityError("publication projection substituted its actual assistant or public response")
                 if type(publication_projection) is GraphRecoveryProjectionInput:
-                    if (
-                        owned_proof is None
-                        or owned_proof.outcome_kind != "owned_recovery"
-                        or owned_proof.source_kind != "graph_recovery"
-                        or owned_proof.recovery_context != publication_projection.original_context
-                    ):
+                    classifier_recovery = (
+                        owned_proof is not None
+                        and owned_proof.outcome_kind == "owned_recovery"
+                        and owned_proof.source_kind == "graph_recovery"
+                        and owned_proof.recovery_context == publication_projection.original_context
+                    )
+                    ordinary_recovery = (
+                        recovery_proof is not None
+                        and recovery_proof.recovery_context == publication_projection.original_context
+                        and recovery_proof.result.graph_recovery_intent == publication_projection.recovery.intent
+                    )
+                    if not classifier_recovery and not ordinary_recovery:
                         raise AuditIntegrityError("graph recovery projection lacks its original owned recovery source")
                     recovery = publication_projection.recovery
                     retained_head = (

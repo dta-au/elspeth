@@ -37,7 +37,7 @@ from elspeth.web.composer.continuation_next_action import (
     iteration_stage_action_policy,
     next_continuation_action_policy,
 )
-from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_progress import decode_prescribed_continuation_action
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
@@ -726,12 +726,70 @@ class _SegmentDriver:
         await self.worker._verify_terminal_before_release(self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal))
         return ContinuationSegmentSettled(terminal)
 
+    async def consume_preview_terminal(self) -> ContinuationSegmentSettled:
+        from hashlib import sha256
+
+        from elspeth.web.sessions.composer_async_worker import _StartedSettlement
+        from elspeth.web.sessions.continuation_preview_result import (
+            PreviewValidationIncompleteTerminal,
+            read_preview_validation_incomplete_on_connection,
+        )
+
+        expected = self.phases.preview_terminal
+        if type(expected) is not PreviewValidationIncompleteTerminal or self.phases.latest_snapshot != expected.snapshot:
+            raise AuditIntegrityError("Preview terminal lost its actual committing observation")
+        source = expected.receipt.source
+        fence = self.running.session_operation_context.fence
+        if (source.session_id, source.operation_id, source.sequence, source.generation, source.claim_attempt) != (
+            str(self.running.claim.session_id),
+            self.running.claim.operation_id,
+            self.running.claim.segment_sequence,
+            self.running.claim.ownership_generation,
+            self.running.claim.attempt,
+        ) or (source.creator_operation_id, source.creator_operation_epoch, source.lease_sha256) != (
+            fence.operation_id,
+            fence.operation_epoch,
+            sha256(fence.lease_token.encode("utf-8")).hexdigest(),
+        ):
+            raise AuditIntegrityError("Preview terminal changed its actual original claim")
+
+        def verify() -> PreviewValidationIncompleteTerminal:
+            with locked_session_transaction(self.authority._engine, source.session_id) as conn:
+                actual = read_preview_validation_incomplete_on_connection(
+                    conn,
+                    session_id=source.session_id,
+                    operation_id=source.operation_id,
+                    effect_key=f"tool:{source.response.digest}:{source.tool_index}",
+                    env_ref_names=expected.env_ref_names,
+                )
+            if actual is None or actual != expected:
+                raise AuditIntegrityError("Preview terminal lost its exact full cold source")
+            return actual
+
+        self.sql_deadline.begin_settlement()
+        await _registered(
+            work=self.work,
+            source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+            operation=verify,
+            expected=PreviewValidationIncompleteTerminal,
+        )
+        terminal = await self.record()
+        if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+            expected.snapshot.checkpoint_id,
+            expected.snapshot.cursor,
+        ):
+            raise AuditIntegrityError("Preview terminal lost its actual sealed parent")
+        await self.worker._verify_terminal_before_release(self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal))
+        return ContinuationSegmentSettled(terminal)
+
     async def dispose(self, original: BaseException | None = None) -> ContinuationSegmentOutcome:
         if original is not None and not any(original is item for item in self._consumed_native):
             self._consumed_native.append(original)
         await self.close_progress(retain_failure=True)
         self.sql_deadline.begin_settlement()
         record = await self.record()
+        if record.status == "failed" and self.phases.preview_terminal is not None:
+            return await self.consume_preview_terminal()
         if record.status == "failed" and self.phases.tool_refusal is not None:
             return await self.consume_tool_refusal(self.phases.tool_refusal.receipt)
         if record.cancel_requested_at is not None:
@@ -956,6 +1014,14 @@ class _SegmentDriver:
                 return await publish_semantic_continuation_result(self.phases, self.services, selected)
             return await advance_continuation_iteration(self.phases, self.services, selected, iteration_stage=stage)
         if type(top) is EndFrame:
+            if type(self.sql_deadline.policy) is ContinuationAdmissionPolicyV4 and root.pending_settlement_ids:
+                # The warm Review entry would replay PRIMARY over a paid H.
+                # Only independently rederived first usable consequences can
+                # consume this cut; unsupported H dispositions fail closed.
+                from elspeth.web.composer.continuation_checkpoint_end_cold_resume import resume_first_cold_end_repair
+
+                await resume_first_cold_end_repair(phases=self.phases, selected=selected)
+                return None
             if root.active_action_json is not None:
                 return await review_prescribed_continuation_end(self.phases, self.services, selected)
             if is_consumed_semantic_stop_cut(selected):
@@ -1336,6 +1402,8 @@ class _SegmentDriver:
                 # The old action is closed. The loop re-reads current ownership
                 # and independently admits the retained SQL refusal tail.
                 continue
+            if self.phases.preview_terminal is not None:
+                return await self.consume_preview_terminal()
             if expiry.expired:
                 from elspeth.web.sessions.composer_async_worker import _terminal_completion_unknown
 

@@ -175,6 +175,32 @@ class _ReviewResultCommit(BaseModel):
     pass_index: int | None
 
 
+class V4ReviewResultCommit(BaseModel):
+    """A paid END checkpoint Review retains its rebound H before the result."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    schema_version: Literal["composer.semantic-review-result.v2"] = "composer.semantic-review-result.v2"
+    session_id: UUID
+    operation_id: str
+    semantic_effect_key: str
+    owner_effect_key: str
+    dispatch_checkpoint_id: str
+    dispatch_cursor: int = Field(ge=0)
+    action_key: str
+    candidate_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_json: str
+    outcome: Literal["clean", "blocked"]
+    owed_checkpoint_id: str
+    owed_cursor: int = Field(ge=1)
+    provider_attempt_id: str
+    physical_effect_key: str
+    checkpoint_call_id: str
+    private_audit_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pass_audit_message_id: str
+    pass_index: int = Field(ge=1)
+
+
 @dataclass(frozen=True, slots=True)
 class SemanticReviewCommitted:
     """Cold-proved result of one real END review, without publication grant."""
@@ -595,6 +621,17 @@ def read_original_semantic_review_result_on_connection(
         )
     ).scalar_one_or_none()
     canonical = raw.decode("utf-8", errors="strict")
+    if codec == "composer.semantic-review-result.v2":
+        from elspeth.web.sessions.continuation_checkpoint_end_complete_review_cold import (
+            read_original_v4_end_complete_review_on_connection,
+        )
+
+        return read_original_v4_end_complete_review_on_connection(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            review_effect_key=review_effect_key,
+        )
     if codec != "composer.semantic-review-result.v1" or _commit_chunk_key(canonical) != effect.result_chunk_key:
         raise AuditIntegrityError("semantic Review cold result changed its exact private chunk")
     try:
@@ -808,10 +845,17 @@ def locate_original_semantic_review_result_on_connection(
                 chunks.c.chunk_key == row.result_chunk_key,
             )
         ).scalar_one_or_none()
-        if codec != "composer.semantic-review-result.v1" or _commit_chunk_key(canonical) != row.result_chunk_key:
+        if (
+            codec not in ("composer.semantic-review-result.v1", "composer.semantic-review-result.v2")
+            or _commit_chunk_key(canonical) != row.result_chunk_key
+        ):
             raise AuditIntegrityError("semantic Review locator changed an original private result chunk")
         try:
-            commit = _ReviewResultCommit.model_validate_json(canonical, strict=True)
+            commit = (
+                V4ReviewResultCommit.model_validate_json(canonical, strict=True)
+                if codec == "composer.semantic-review-result.v2"
+                else _ReviewResultCommit.model_validate_json(canonical, strict=True)
+            )
         except ValidationError as error:
             raise AuditIntegrityError("semantic Review locator found a malformed closed result") from error
         if (

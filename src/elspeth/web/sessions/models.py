@@ -86,7 +86,10 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # Published epoch-83 stores have the older effect CHECK and are refused intact.
 # Epoch 85 adds the distinct returned paid_incomplete effect and private receipt.
 # Published epoch-84 stores lack its effect CHECK and are refused intact.
-SESSION_SCHEMA_EPOCH = 85
+# Epoch 86 adds source-bound unpaid preview terminal reservations and the
+# distinct validation_incomplete effect. Preserve epoch-85 stores unchanged;
+# no automatic migration or reset is authorized by this format boundary.
+SESSION_SCHEMA_EPOCH = 86
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3953,7 +3956,7 @@ composer_continuation_effects_table = Table(
     Column("input_sha256", String(64), nullable=False),
     Column("owner", String(32), nullable=False),
     Column("action_json", Text),
-    Column("disposition", String(16), nullable=False),
+    Column("disposition", String(32), nullable=False),
     Column("receipt_key", String(256)),
     Column("result_chunk_key", String(128)),
     Column("provider_attempt_id", String),
@@ -4003,17 +4006,21 @@ composer_continuation_effects_table = Table(
         ["provider_attempt_id"], ["quota_provider_attempts.attempt_id"], name="fk_composer_effects_attempt", ondelete="RESTRICT"
     ),
     CheckConstraint(
-        "disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown', 'paid_overflow', 'paid_incomplete')",
+        "disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown', 'paid_overflow', 'paid_incomplete', 'validation_incomplete')",
         name="ck_composer_effects_disposition",
     ),
     CheckConstraint(_CONTINUATION_EFFECT_OWNER_CHECK, name="ck_composer_effects_owner"),
     CheckConstraint(
-        "disposition NOT IN ('committed', 'refused', 'paid_overflow', 'paid_incomplete') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
+        "disposition NOT IN ('committed', 'refused', 'paid_overflow', 'paid_incomplete', 'validation_incomplete') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
         name="ck_composer_effects_receipt",
     ),
     CheckConstraint(
         "disposition != 'paid_incomplete' OR (owner = 'provider' AND provider_attempt_id IS NOT NULL)",
         name="ck_composer_effects_paid_incomplete_original_attempt",
+    ),
+    CheckConstraint(
+        "disposition != 'validation_incomplete' OR (owner = 'tool_dispatch' AND provider_attempt_id IS NULL)",
+        name="ck_composer_effects_validation_incomplete_unpaid",
     ),
     *_lower_sha256_constraints("input_sha256", name="ck_composer_effects_input_sha256"),
     *_lower_sha256_constraints("graph_sha256", name="ck_composer_effects_graph_sha256", nullable=True),
@@ -4084,6 +4091,49 @@ composer_provider_terminal_holds_table = Table(
     *_lower_sha256_constraints("source_input_sha256", name="ck_composer_provider_holds_input"),
     *_lower_sha256_constraints("lease_sha256", name="ck_composer_provider_holds_lease"),
     *_lower_sha256_constraints("fallback_contract_sha256", name="ck_composer_provider_holds_fallback"),
+)
+
+composer_validation_terminal_holds_table = Table(
+    "composer_validation_terminal_holds",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("effect_key", String(128), primary_key=True),
+    Column("policy_sha256", String(64), nullable=False),
+    Column("allowance_bytes", BigInteger, nullable=False),
+    Column("source_checkpoint_id", String(36), nullable=False),
+    Column("source_cursor", BigInteger, nullable=False),
+    Column("source_json", Text, nullable=False),
+    Column("source_sha256", String(64), nullable=False),
+    Column("reserved_bytes", BigInteger, nullable=False),
+    Column("fallback_contract_sha256", String(64), nullable=False),
+    Column("state", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True)),
+    _continuation_parent_fk("fk_composer_validation_holds_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "effect_key"],
+        [
+            "composer_continuation_effects.session_id",
+            "composer_continuation_effects.operation_id",
+            "composer_continuation_effects.effect_key",
+        ],
+        name="fk_composer_validation_holds_effect",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint(
+        "allowance_bytes > 0 AND reserved_bytes > 0 AND reserved_bytes <= allowance_bytes AND source_cursor >= 0",
+        name="ck_composer_validation_holds_bounds",
+    ),
+    CheckConstraint("state IN ('active', 'consumed')", name="ck_composer_validation_holds_state"),
+    CheckConstraint(
+        "(state = 'active' AND consumed_at IS NULL) OR (state = 'consumed' AND consumed_at IS NOT NULL AND consumed_at >= created_at)",
+        name="ck_composer_validation_holds_consumption",
+    ),
+    CheckConstraint("length(source_checkpoint_id) = 36", name="ck_composer_validation_holds_checkpoint"),
+    *_lower_sha256_constraints("policy_sha256", name="ck_composer_validation_holds_policy"),
+    *_lower_sha256_constraints("source_sha256", name="ck_composer_validation_holds_source"),
+    *_lower_sha256_constraints("fallback_contract_sha256", name="ck_composer_validation_holds_fallback"),
 )
 
 composer_continuation_provider_ordinals_table = Table(

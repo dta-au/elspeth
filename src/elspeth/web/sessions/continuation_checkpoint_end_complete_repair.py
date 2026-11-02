@@ -17,6 +17,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, EffectFrontierEntry, EndFrame
+from elspeth.web.composer.continuation_checkpoint_end_cold_repair import ColdProjectedEndRepair, require_original_cold_end_repair
 from elspeth.web.composer.continuation_checkpoint_end_complete_repair import (
     ProjectedEndCompleteRepair,
     require_original_end_complete_repair,
@@ -26,7 +27,11 @@ from elspeth.web.composer.continuation_checkpoint_observation import (
     CheckpointReturnedResponseObservation,
     original_v4_checkpoint_returned_audit_call,
 )
-from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
+from elspeth.web.composer.continuation_codec import (
+    decode_continuation_snapshot,
+    decode_retained_physical_audit_call,
+    encode_continuation_snapshot,
+)
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.coordination.database_clock import database_now
@@ -46,14 +51,18 @@ from elspeth.web.sessions.continuation import (
     private_chunk_key,
     put_chunk,
 )
+from elspeth.web.sessions.continuation_checkpoint_end_cold_pending import require_end_pending_cohort_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_action import (
     EndCompleteActionPreview,
     consume_end_complete_action_preview_on_connection,
+    prepare_cold_end_complete_action_preview_on_connection,
     prepare_end_complete_action_preview_on_connection,
+    require_original_end_outer_creator_on_connection,
 )
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import (
     PreparedEndCompletePass,
     prepare_end_complete_pass,
+    prepare_first_cold_end_complete_pass,
     write_end_complete_pass_on_connection,
 )
 from elspeth.web.sessions.continuation_checkpoint_end_complete_repair_cold import require_end_complete_repair_postwrite_on_connection
@@ -62,7 +71,8 @@ from elspeth.web.sessions.continuation_checkpoint_end_owed import CheckpointEndO
 from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
 from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
     CheckpointPaidAuditCohort,
-    checkpoint_paid_audit_cohort,
+    admit_checkpoint_paid_audit_source_on_connection,
+    checkpoint_paid_audit_cohort_for_hold,
     write_checkpoint_paid_audit_cohort_on_connection,
 )
 from elspeth.web.sessions.continuation_retained_capacity import (
@@ -78,7 +88,7 @@ _OWNER = "composer_checkpoint_end_complete"
 
 @dataclass(frozen=True, slots=True)
 class EndCompleteRepairBatch:
-    projected: ProjectedEndCompleteRepair
+    projected: ProjectedEndCompleteRepair | ColdProjectedEndRepair
     owed: VerifiedCheckpointEndOwed
     append: PreparedContinuationAppend
     prospective: tuple[ProspectiveContinuationChunk, ...]
@@ -98,25 +108,49 @@ class EndCompleteRepairBatch:
 def prepare_end_complete_repair_batch_on_connection(
     conn: Connection,
     *,
-    physical: CheckpointEndPhysicalSource,
-    prepared: PreparedCheckpointProvider,
-    owed_admission: CheckpointEndOwedAdmission,
+    physical: CheckpointEndPhysicalSource | None,
+    prepared: PreparedCheckpointProvider | None,
+    owed_admission: CheckpointEndOwedAdmission | None,
     owed: VerifiedCheckpointEndOwed,
     selected: SelectedContinuationState,
-    returned: CheckpointReturnedResponseObservation,
-    projected: ProjectedEndCompleteRepair,
+    returned: CheckpointReturnedResponseObservation | None,
+    projected: ProjectedEndCompleteRepair | ColdProjectedEndRepair,
     published_at: datetime,
 ) -> EndCompleteRepairBatch:
     """Measure every retained byte against the rebound original paid H."""
-    require_original_end_complete_repair(
-        projected,
-        physical=physical,
-        prepared=prepared,
-        owed=owed_admission,
-        selected=selected,
-        returned=returned,
-    )
-    running = prepared.running
+    if type(projected) is ColdProjectedEndRepair:
+        require_original_cold_end_repair(projected)
+        cold_source = projected.source
+        work = cold_source.runtime.bindings.required_work
+        running = None if work is None else work.running
+        if (
+            running is None
+            or prepared is not None
+            or physical is not None
+            or owed_admission is not None
+            or returned is not None
+            or cold_source.owed != owed
+            or cold_source.selected is not selected
+        ):
+            raise AuditIntegrityError("cold END repair replaced its original deep-H source")
+    else:
+        if (
+            type(projected) is not ProjectedEndCompleteRepair
+            or type(physical) is not CheckpointEndPhysicalSource
+            or type(prepared) is not PreparedCheckpointProvider
+            or type(owed_admission) is not CheckpointEndOwedAdmission
+            or type(returned) is not CheckpointReturnedResponseObservation
+        ):
+            raise AuditIntegrityError("warm END repair lost its original physical source")
+        require_original_end_complete_repair(
+            projected,
+            physical=physical,
+            prepared=prepared,
+            owed=owed_admission,
+            selected=selected,
+            returned=returned,
+        )
+        running = prepared.running
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     before = decode_continuation_snapshot(owed.selected.payload_json)
     captured = projected.captured
@@ -124,10 +158,17 @@ def prepare_end_complete_repair_batch_on_connection(
         type(owed) is not VerifiedCheckpointEndOwed
         or owed.session_id != sid
         or owed.operation_id != operation
-        or owed.attempt_id != owed_admission.original.attempt.attempt_id
-        or owed.selected != owed_admission.owed_selected
-        or owed.new_hold != owed_admission.owed_hold
-        or owed.response != returned.response
+        or (
+            type(projected) is ProjectedEndCompleteRepair
+            and (
+                owed_admission is None
+                or returned is None
+                or owed.attempt_id != owed_admission.original.attempt.attempt_id
+                or owed.selected != owed_admission.owed_selected
+                or owed.new_hold != owed_admission.owed_hold
+                or owed.response != returned.response
+            )
+        )
         or captured.selected is not selected
         or selected.stack != before
         or captured.stack.model_copy(update={"frames": before.frames}) != before
@@ -174,19 +215,32 @@ def prepare_end_complete_repair_batch_on_connection(
         for item in before.effect_frontier
     )
     after_base = captured.stack.model_copy(update={"frames": (following,), "effect_frontier": frontier, "pending_settlement_ids": ()})
-    action_preview = prepare_end_complete_action_preview_on_connection(conn, prepared=prepared, owed=owed, after_base=after_base)
+    if type(projected) is ColdProjectedEndRepair:
+        action_preview = prepare_cold_end_complete_action_preview_on_connection(conn, running=running, owed=owed, after_base=after_base)
+    else:
+        if prepared is None:
+            raise AuditIntegrityError("warm END repair lost its original prepared provider")
+        action_preview = prepare_end_complete_action_preview_on_connection(conn, prepared=prepared, owed=owed, after_base=after_base)
     after = decode_continuation_snapshot(action_preview.successor_json) if action_preview is not None else after_base
     policy = decode_continuation_policy(before.admission_policy_json, before.policy_hash)
     if type(policy) is not ContinuationAdmissionPolicyV4:
         raise AuditIntegrityError("END complete repair lost its original V4 next-action policy")
-    original_call = original_v4_checkpoint_returned_audit_call(returned, attempt_id=owed.attempt_id, request_sha256=prepared.request_sha256)
+    if type(projected) is ColdProjectedEndRepair:
+        original_call = decode_retained_physical_audit_call(owed.response)
+        pass_audit = prepare_first_cold_end_complete_pass(gate=projected.gate)
+    else:
+        if prepared is None or returned is None or physical is None:
+            raise AuditIntegrityError("warm END repair lost its original pass producer")
+        original_call = original_v4_checkpoint_returned_audit_call(
+            returned, attempt_id=owed.attempt_id, request_sha256=prepared.request_sha256
+        )
+        pass_audit = prepare_end_complete_pass(physical=physical, computation=projected.computation, owed=owed)
     if original_call.status is not ComposerLLMCallStatus.SUCCESS:
         raise AuditIntegrityError("END complete repair cannot settle an incomplete original response")
     quota_entry = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(original_call))
     if quota_entry is None or quota_entry.call_id != owed.attempt_id:
         raise AuditIntegrityError("END complete repair lost original paid accounting")
-    cohort = checkpoint_paid_audit_cohort(original_call, running.session_operation_context)
-    pass_audit = prepare_end_complete_pass(physical=physical, computation=projected.computation)
+    cohort = checkpoint_paid_audit_cohort_for_hold(original_call, owed.new_hold)
     response_key = private_chunk_key(owed.response)
     event = ContinuationEvent(
         "checkpoint",
@@ -261,12 +315,12 @@ def persist_end_complete_repair_on_connection(
     conn: Connection,
     *,
     service: object,
-    physical: CheckpointEndPhysicalSource,
-    prepared: PreparedCheckpointProvider,
-    owed_admission: CheckpointEndOwedAdmission,
+    physical: CheckpointEndPhysicalSource | None,
+    prepared: PreparedCheckpointProvider | None,
+    owed_admission: CheckpointEndOwedAdmission | None,
     selected: SelectedContinuationState,
-    returned: CheckpointReturnedResponseObservation,
-    projected: ProjectedEndCompleteRepair,
+    returned: CheckpointReturnedResponseObservation | None,
+    projected: ProjectedEndCompleteRepair | ColdProjectedEndRepair,
 ) -> EndCompleteRepairBatch:
     """Settle one original call and repair successor in one locked transaction."""
     from elspeth.web.sessions.continuation_checkpoint_end_owed import read_v4_checkpoint_end_owed_on_connection
@@ -274,7 +328,26 @@ def persist_end_complete_repair_on_connection(
 
     if type(service) is not SessionServiceImpl or not conn.in_transaction():
         raise AuditIntegrityError("END complete repair requires its original session SQL transaction")
-    running = prepared.running
+    if type(projected) is ColdProjectedEndRepair:
+        require_original_cold_end_repair(projected)
+        work = projected.source.runtime.bindings.required_work
+        running = None if work is None else work.running
+        names = projected.source.runtime.env_ref_names
+        attempt_id = projected.source.owed.attempt_id
+        if running is None or any(value is not None for value in (physical, prepared, owed_admission, returned)):
+            raise AuditIntegrityError("cold END repair mixed original warm provider authority")
+    else:
+        if (
+            type(projected) is not ProjectedEndCompleteRepair
+            or type(physical) is not CheckpointEndPhysicalSource
+            or type(prepared) is not PreparedCheckpointProvider
+            or type(owed_admission) is not CheckpointEndOwedAdmission
+            or type(returned) is not CheckpointReturnedResponseObservation
+        ):
+            raise AuditIntegrityError("warm END repair lost its original physical issuer")
+        running = prepared.running
+        names = prepared.env_ref_names
+        attempt_id = owed_admission.original.attempt.attempt_id
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     with service._session_write_lock(conn, sid):
         _require_current_continuation_running(conn, running)
@@ -283,11 +356,18 @@ def persist_end_complete_repair_on_connection(
             conn,
             session_id=sid,
             operation_id=operation,
-            attempt_id=owed_admission.original.attempt.attempt_id,
-            names=prepared.env_ref_names,
+            attempt_id=attempt_id,
+            names=names,
         )
-        if owed is None or current != owed.selected or owed.selected != owed_admission.owed_selected:
+        if (
+            owed is None
+            or current != owed.selected
+            or (type(projected) is ColdProjectedEndRepair and owed != projected.source.owed)
+            or (type(projected) is ProjectedEndCompleteRepair and (owed_admission is None or owed.selected != owed_admission.owed_selected))
+        ):
             raise AuditIntegrityError("END complete repair lost its rebound original paid head")
+        require_end_pending_cohort_on_connection(conn, owed=owed)
+        outer_creator_sequence, outer_creator_generation, _outer_action = require_original_end_outer_creator_on_connection(conn, owed=owed)
         now = database_now(conn)
         batch = prepare_end_complete_repair_batch_on_connection(
             conn,
@@ -299,6 +379,15 @@ def persist_end_complete_repair_on_connection(
             returned=returned,
             projected=projected,
             published_at=now,
+        )
+        admitted_audit = admit_checkpoint_paid_audit_source_on_connection(
+            conn,
+            service=service,
+            context=running.session_operation_context,
+            owed=owed,
+            call=batch.original_call,
+            cohort=batch.audit_cohort,
+            names=names,
         )
         admit_retained_payload_chunks(
             conn,
@@ -347,8 +436,8 @@ def persist_end_complete_repair_on_connection(
                 effects.c.effect_key == owed.outer_effect_key,
                 effects.c.owner == "composer_end",
                 effects.c.disposition == "dispatched",
-                effects.c.creator_sequence == running.claim.segment_sequence,
-                effects.c.creator_generation == running.claim.ownership_generation,
+                effects.c.creator_sequence == outer_creator_sequence,
+                effects.c.creator_generation == outer_creator_generation,
                 effects.c.receipt_key.is_(None),
             )
             .values(
@@ -406,6 +495,7 @@ def persist_end_complete_repair_on_connection(
             context=running.session_operation_context,
             cohort=batch.audit_cohort,
             observed_at=now,
+            admitted=admitted_audit,
         )
         withheld_sequence = (
             write_end_repair_withheld_reply_on_connection(
@@ -426,6 +516,8 @@ def persist_end_complete_repair_on_connection(
             withheld_sequence=withheld_sequence,
             observed_at=now,
             hold_state="active",
+            cold_running=running if type(projected) is ColdProjectedEndRepair else None,
+            cold_names=names if type(projected) is ColdProjectedEndRepair else None,
         )
         consume_provider_terminal_hold_after_complete_result(
             conn, source=owed.new_hold, provider_attempt_id=owed.attempt_id, consumed_at=database_now(conn)
@@ -438,5 +530,27 @@ def persist_end_complete_repair_on_connection(
             withheld_sequence=withheld_sequence,
             observed_at=now,
             hold_state="consumed",
+            cold_running=running if type(projected) is ColdProjectedEndRepair else None,
+            cold_names=names if type(projected) is ColdProjectedEndRepair else None,
         )
         return batch
+
+
+def persist_first_cold_end_complete_repair_on_connection(
+    conn: Connection,
+    *,
+    service: object,
+    projected: ColdProjectedEndRepair,
+) -> EndCompleteRepairBatch:
+    """Consume one first usable H without reissuing the original SDK owner."""
+    require_original_cold_end_repair(projected)
+    return persist_end_complete_repair_on_connection(
+        conn,
+        service=service,
+        physical=None,
+        prepared=None,
+        owed_admission=None,
+        selected=projected.source.selected,
+        returned=None,
+        projected=projected,
+    )

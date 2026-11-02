@@ -29,9 +29,11 @@ from elspeth.web.sessions.pipeline_publication import (
 from elspeth.web.sessions.pipeline_rejection import PipelineRejectionSQLResult
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_preview_dispatch import IssuedPreviewDispatch
     from elspeth.web.composer.tools._common import ToolResult
     from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRunning
     from elspeth.web.sessions.continuation_owner_results import ContinuationReadOwnerResult
+    from elspeth.web.sessions.continuation_preview_result import PreviewReturned
     from elspeth.web.sessions.manual_proposal_failure import ComposerManualProposalFailure, _ClosedInvocation
     from elspeth.web.sessions.pipeline_revocation import ComposerRevocationSQLResult
     from elspeth.web.sessions.protocol import CompositionProposalRecord
@@ -74,6 +76,22 @@ class RequiredReadProduced:
         actual = encode_tool_result_value(self.owned_result.tool_name, self.result, env_ref_names=self.env_ref_names)
         if canonical_json(actual.model_dump(mode="json")) != self.owned_result.tool_result_json:
             raise AuditIntegrityError("Read disposition replaced the actual returned ToolResult")
+
+
+@dataclass(frozen=True, slots=True)
+class RequiredPreviewProduced:
+    """The actual issued preview return, never a new producer/write grant."""
+
+    permit: IssuedPreviewDispatch
+    returned: PreviewReturned
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        from elspeth.web.composer.continuation_preview_dispatch import require_preview_produced
+
+        require_preview_produced(self.permit, self.returned)
 
 
 class ComposerRequiredStage(IntEnum):
@@ -172,10 +190,30 @@ class RequiredWorkSource(IntEnum):
     CONTINUATION_HANDOFF_READBACK_PROJECTION = 63
     CONTINUATION_READ_RESULT_SQL = 64
     CONTINUATION_READ_RESULT_PROJECTION = 65
+    CONTINUATION_PREVIEW_PRODUCER_SQL = 66
+    CONTINUATION_PREVIEW_PRODUCER_PROJECTION = 67
+    CONTINUATION_PREVIEW_RESULT_SQL = 68
+    CONTINUATION_PREVIEW_RESULT_PROJECTION = 69
 
 
 SOURCE_MAPPING = MappingProxyType(
     {
+        RequiredWorkSource.CONTINUATION_PREVIEW_PRODUCER_SQL: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.SQL_INITIAL,
+        ),
+        RequiredWorkSource.CONTINUATION_PREVIEW_PRODUCER_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
+        RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.SQL_INITIAL,
+        ),
+        RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
         RequiredWorkSource.CONTINUATION_READ_RESULT_SQL: (
             ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
             RequiredWorkSubphase.SQL_INITIAL,
@@ -620,6 +658,15 @@ class RequiredWorkTicket:
 
     @property
     def permits_process_drain(self) -> bool:
+        if self.key.source is RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL:
+            from elspeth.web.async_workers import require_preview_finish_admission
+
+            produced = require_preview_finish_admission(self)
+            from elspeth.web.composer.continuation_preview_dispatch import require_preview_produced
+
+            clock = require_preview_produced(produced.permit, produced.returned)
+            clock.owner.remaining_statement(session_id=self.key.authority.context.fence.session_id, preview_result=clock)
+            return True
         if self.key.source in (
             RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
             RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
@@ -1194,6 +1241,8 @@ class RequiredWorkCoordinator:
         if type(expected_source) is not RequiredWorkSource or expected_source not in (
             RequiredWorkSource.CONTINUATION_STATE_SQL,
             RequiredWorkSource.CONTINUATION_READ_RESULT_SQL,
+            RequiredWorkSource.CONTINUATION_PREVIEW_PRODUCER_SQL,
+            RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL,
             RequiredWorkSource.CONTINUATION_READ_SQL,
             RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
             RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,

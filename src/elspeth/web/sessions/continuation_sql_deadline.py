@@ -42,6 +42,18 @@ class ContinuationReadResultDeadline:
     expires_at: float
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class ContinuationPreviewResultDeadline:
+    """Original unpaid action/reserve snapshot, never producer authority."""
+
+    owner: ContinuationSQLDeadlineOwner
+    action: ContinuationActionPolicy
+    started_at: float
+    action_expires_at: float
+    expires_at: float
+
+
 class ContinuationSQLDeadlineOwner:
     running: ComposerOperationRunning
     policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4
@@ -154,6 +166,28 @@ class ContinuationSQLDeadlineOwner:
                 raise AuditIntegrityError("Read result timing requires the original begun read action")
             return ContinuationReadResultDeadline(self, self._action_expires_at, self._settlement_expires_at)
 
+    def capture_preview_result_deadline(self) -> ContinuationPreviewResultDeadline:
+        with self._lock:
+            if (
+                type(self.policy) is not ContinuationAdmissionPolicyV4
+                or self._active_action is None
+                or self._action_started_at is None
+                or not any(
+                    self._active_action is action
+                    for action in (
+                        self.policy.actions.read,
+                        self.policy.actions.session_sql,
+                        self.policy.actions.blob,
+                        self.policy.actions.external,
+                    )
+                )
+                or self._action_expires_at != min(self.hard_expires_at, self._action_started_at + self._active_action.total)
+            ):
+                raise AuditIntegrityError("Preview result timing requires the original begun unpaid action")
+            return ContinuationPreviewResultDeadline(
+                self, self._active_action, self._action_started_at, self._action_expires_at, self._settlement_expires_at
+            )
+
     def remaining_action(self, *, monotonic_now: float) -> float:
         """Observe the original action/hard/drain bound for a nested action."""
         if type(monotonic_now) is not float or not math.isfinite(monotonic_now):
@@ -181,6 +215,7 @@ class ContinuationSQLDeadlineOwner:
         lifecycle: bool = False,
         paid_settlement: bool = False,
         read_result: ContinuationReadResultDeadline | None = None,
+        preview_result: ContinuationPreviewResultDeadline | None = None,
     ) -> float:
         if session_id != str(self.running.claim.session_id):
             raise AuditIntegrityError("SQL timing cannot cover another session")
@@ -188,6 +223,18 @@ class ContinuationSQLDeadlineOwner:
             raise AuditIntegrityError("SQL timing cannot combine paid settlement with lifecycle scope")
         now = time.monotonic()
         with self._lock:
+            if preview_result is not None and (
+                type(preview_result) is not ContinuationPreviewResultDeadline
+                or preview_result.owner is not self
+                or self._active_action is not preview_result.action
+                or self._action_started_at != preview_result.started_at
+                or self._action_expires_at != preview_result.action_expires_at
+                or self._settlement_expires_at != preview_result.expires_at
+                or lifecycle
+                or paid_settlement
+                or read_result is not None
+            ):
+                raise AuditIntegrityError("Preview disposition changed its original action timing")
             if read_result is not None and (
                 type(read_result) is not ContinuationReadResultDeadline
                 or read_result.owner is not self
@@ -199,9 +246,11 @@ class ContinuationSQLDeadlineOwner:
             ):
                 raise AuditIntegrityError("Read disposition changed its original action timing")
             settlement = paid_settlement or self._settling
-            disposition = lifecycle or settlement or read_result is not None
+            disposition = lifecycle or settlement or read_result is not None or preview_result is not None
             expires_at = (
-                read_result.expires_at
+                preview_result.expires_at
+                if preview_result is not None
+                else read_result.expires_at
                 if read_result is not None
                 else self.hard_expires_at
                 if lifecycle

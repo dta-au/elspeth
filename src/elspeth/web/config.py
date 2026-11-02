@@ -447,17 +447,18 @@ class WebSettings(BaseModel):
     composer_continuation_quantum_seconds: float = Field(default=180.0, gt=0, le=86_400, allow_inf_nan=False)
     composer_continuation_settlement_reserve_seconds: float = Field(default=25.0, gt=0, le=86_400, allow_inf_nan=False)
     composer_continuation_action_bounds: ContinuationActionBoundsSettings = Field(default_factory=ContinuationActionBoundsSettings)
-    # No production value is inferred. A fresh V3 operation requires an
-    # explicit operator-selected allowance; stored V1/V2 policy is unchanged.
+    # Operator-approved aggregate default for new retained-capacity policies.
+    # Stored operations keep their originally admitted allowance.
     composer_continuation_max_retained_payload_bytes: int | None = Field(
-        default=None,
+        default=16 * 1_048_576,
         strict=True,
         ge=1,
         le=_CANONICAL_SAFE_INTEGER_MAX,
         description=(
             "Maximum actual retained chunk payload bytes for one new Composer logical operation, "
-            "including historical and off-head keys. Omission disables fresh V3 admission; "
-            "it does not mean unlimited storage."
+            "including historical and off-head keys. Defaults to 16 MiB. Explicit null disables "
+            "fresh V3/V4 policy construction; it does not mean unlimited storage. "
+            "Separate private-document and evidence limits still apply."
         ),
     )
 

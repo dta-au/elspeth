@@ -58,6 +58,7 @@ from elspeth.web.sessions.models import composer_continuation_effects_table as e
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_value_batch_preparation import PreparedValueBatch
+    from elspeth.web.required_work import RequiredPreviewProduced
 
 
 def value_batch_chunk(selected: SelectedContinuationState) -> PrivateChunk:
@@ -397,6 +398,7 @@ def consume_value_batch_transitions_on_connection(
     *,
     plan: PreparedValueBatchTransitions,
     env_ref_names: frozenset[str],
+    issued_preview: RequiredPreviewProduced | None = None,
 ) -> StoredContinuationSnapshot:
     """Consume exact actual issue/result prefixes under full-tail reservation."""
     from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
@@ -404,7 +406,13 @@ def consume_value_batch_transitions_on_connection(
     if type(plan) is not PreparedValueBatchTransitions:
         raise TypeError("value-batch consumption requires its nominal original plan")
     plan.require_original()
-    _require_current_continuation_running(conn, running)
+    if issued_preview is None:
+        _require_current_continuation_running(conn, running)
+    else:
+        from elspeth.web.composer.continuation_value_batch_preparation import require_prepared_issued_preview_batch
+
+        require_prepared_issued_preview_batch(plan.prepared, issued_preview)
+        _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
     sid, operation = plan.original.stack.logical.session_id, plan.original.stack.logical.operation_id
     if env_ref_names != plan.prepared.inventory.names or plan.prepared.inventory.running is not running:
         raise AuditIntegrityError("value-batch consumption changed its original inventory owner")
@@ -418,7 +426,7 @@ def consume_value_batch_transitions_on_connection(
         for prefix in step.prefixes:
             if not require_prepared_tail_append(conn, session_id=sid, operation_id=operation, append=prefix.append):
                 raise AuditIntegrityError("value-batch issue requires its complete pre-admitted P4 tail")
-            is_issue = step.issue is not None and prefix is step.prefixes[0]
+            is_issue = issued_preview is None and step.issue is not None and prefix is step.prefixes[0]
             key = f"tool:{original_frame.response.digest}:{step.index}"
             if is_issue:
                 if step.issue is None:
@@ -494,6 +502,18 @@ def consume_value_batch_transitions_on_connection(
             if selected is None:
                 raise AuditIntegrityError("value batch lost its exact retained selection")
             read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=env_ref_names)
+            if issued_preview is not None:
+                from elspeth.web.sessions.continuation_preview_result import consume_preview_terminal_hold_on_connection
+
+                consume_preview_terminal_hold_on_connection(
+                    conn,
+                    session_id=sid,
+                    operation_id=operation,
+                    effect_key=key,
+                    returned=issued_preview.returned,
+                    env_ref_names=env_ref_names,
+                    consumed_at=prefix.append.published_at,
+                )
             if (
                 step.refusal is not None
                 and read_value_batch_preparation_refusal_on_connection(
@@ -505,3 +525,131 @@ def consume_value_batch_transitions_on_connection(
     if retained != _stored(plan.completed):
         raise AuditIntegrityError("value batch did not consume its exact complete prefix")
     return retained
+
+
+def prepare_issued_preview_transitions_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    prepared: PreparedValueBatch,
+    produced: RequiredPreviewProduced,
+    published_at: datetime,
+) -> PreparedValueBatchTransitions:
+    """Plan the actual already-issued result, never create another issue."""
+    from elspeth.web.composer.continuation_tool_batch import encode_tool_result_value
+    from elspeth.web.composer.continuation_value_batch_preparation import require_prepared_issued_preview_batch
+    from elspeth.web.composer.tools._common import ToolResult
+    from elspeth.web.sessions.continuation_preview_result import CompletePreviewReturn, read_preview_terminal_hold_on_connection
+
+    require_prepared_issued_preview_batch(prepared, produced)
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    if type(produced.returned) is not CompletePreviewReturn:
+        raise AuditIntegrityError("preview result tail substituted an incomplete return")
+    returned = produced.returned
+    source = returned.original.source
+    original, inventory = prepared.selected, prepared.inventory
+    root, top = original.stack, original.stack.frames[-1]
+    key = f"tool:{source.response.digest}:{source.tool_index}"
+    contract = read_preview_terminal_hold_on_connection(
+        conn, session_id=source.session_id, operation_id=source.operation_id, effect_key=key, env_ref_names=inventory.names
+    )
+    if (
+        contract.source != source
+        or inventory.running is not running
+        or inventory.selection.checkpoint_id != original.checkpoint_id
+        or inventory.selection.cursor != root.cursor
+        or inventory.selection.snapshot_json != encode_continuation_snapshot(root)
+        or type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is not ContinuationAdmissionPolicyV4
+        or type(top) is not ToolBatchFrame
+        or top.phase != "effect_reconciling"
+        or top.response != source.response
+        or root.cursor != source.cursor + 1
+        or root.logical.session_id != source.session_id
+        or root.logical.operation_id != source.operation_id
+        or len(prepared.steps) != 1
+        or source.tool_index != 0
+        or key in top.settled_effect_ids
+        or root.active_action_json is not None
+        or root.active_action_source is not None
+        or load_snapshot(conn, session_id=source.session_id, operation_id=source.operation_id) != _stored(original)
+    ):
+        raise AuditIntegrityError("preview result lost its actual reserved issued source")
+    issue = require_tool_issue_on_connection(conn, running, effect_key=key, env_ref_names=inventory.names)
+    prior = decode_prepared_batch_data(value_batch_chunk(original).canonical, env_ref_names=inventory.names)
+    call = prior.batch.current_call
+    step = prepared.steps[0]
+    if (
+        call is None
+        or prior.calls != prepared.requested_calls
+        or len(prior.calls) != 1
+        or call.tool_name != "preview_pipeline"
+        or call.tool_call.id != source.tool_call_id
+        or call.arguments != {}
+        or step.index != 0
+        or step.issued is not None
+        or step.memory_completion is not None
+        or step.source_chunks != (returned.chunk,)
+    ):
+        raise AuditIntegrityError("preview result replaced its exact original prepared call")
+    captured = _capture_selection(step.completed, original=original, preceding=original)
+    frame = captured.stack.frames[-1]
+    if type(frame) is not ToolBatchFrame:
+        raise AuditIntegrityError("preview result lost its complete actual frame")
+    completed = decode_coupled_batch_chunk(value_batch_chunk(captured), env_ref_names=inventory.names)
+    response = completed.batch.tool_outcomes[0].response if len(completed.batch.tool_outcomes) == 1 else None
+    members = prepared_p4_members(prepared.prepared, env_ref_names=inventory.names)
+    if (
+        completed.calls != prior.calls
+        or completed.batch.phase != "dispatch_ready"
+        or completed.batch.current_call is not None
+        or completed.batch.next_tool_index != 1
+        or len(completed.batch.tool_outcomes) != 1
+        or completed.batch.tool_outcomes[0].call != prior.calls[0]
+        or type(response) is not ToolResult
+        or len(members.invocations) != 1
+        or members.invocations[0].tool_call_id != source.tool_call_id
+        or encode_tool_result_value("preview_pipeline", response, env_ref_names=inventory.names) != returned.original.data.result
+    ):
+        raise AuditIntegrityError("preview result changed its complete original returned DTO or audit")
+    expected_frontier = tuple(entry for entry in root.effect_frontier if entry.effect_id == key)
+    if expected_frontier != (EffectFrontierEntry(effect_id=key, disposition="dispatched", receipt_id=None),):
+        raise AuditIntegrityError("preview result replaced its original unresolved effect")
+    frontier = tuple(
+        EffectFrontierEntry(effect_id=key, disposition="committed", receipt_id=f"tool-result:{frame.accumulator.digest}")
+        if entry.effect_id == key
+        else entry
+        for entry in root.effect_frontier
+    )
+    completed_root = captured.stack.model_copy(
+        update={
+            "frames": (
+                *captured.stack.frames[:-1],
+                frame.model_copy(update={"phase": "tool_ready", "settled_effect_ids": (*top.settled_effect_ids, key)}),
+            ),
+            "effect_frontier": frontier,
+        }
+    )
+    append = prepare_snapshot_append(
+        _stored(original),
+        snapshot_json=encode_continuation_snapshot(completed_root),
+        published_at=published_at,
+        events=(
+            ContinuationEvent(
+                "checkpoint",
+                canonical_json(
+                    {
+                        "owner": "composer_tool_phase",
+                        "transition": "tool_completed",
+                        "effect_key": key,
+                        "response": top.response.digest,
+                        "batch": frame.accumulator.digest,
+                    }
+                ),
+            ),
+        ),
+    )
+    following = SelectedContinuationState(append.checkpoint_id, decode_continuation_snapshot(append.snapshot_json), captured.chunks)
+    prefix = PreparedTailPrefix(append, (*_prospective(captured.chunks), *_prospective(step.source_chunks)))
+    planned = PreparedValueStepTransition(0, original, issue, None, None, following, (prefix,))
+    values = original, prepared, (planned,), (prefix,), following
+    return PreparedValueBatchTransitions(*values, original_values=values)

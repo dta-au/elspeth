@@ -10,6 +10,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_checkpoint_observation import (
     CheckpointIncompleteResponseObservation,
     CheckpointOverflowUsageObservation,
+    CheckpointReturnedResponseObservation,
     original_v4_checkpoint_returned_audit_call,
     require_original_v4_checkpoint_returned_response,
 )
@@ -35,13 +36,25 @@ from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
     checkpoint_paid_overflow_error,
     read_v4_checkpoint_paid_overflow_terminal_on_connection,
 )
-from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowReceipt, PaidOverflowUsage
+from elspeth.web.sessions.continuation_paid_overflow import (
+    CANONICAL_INTEGER_MAX,
+    LEDGER_TOKENS_MAX,
+    MODEL_MAX_LENGTH,
+    PaidOverflowCost,
+    PaidOverflowReceipt,
+    PaidOverflowUsage,
+    encode_paid_overflow_cost_amount,
+)
 from elspeth.web.sessions.continuation_paid_overflow_quota import (
     OriginalPaidOverflowPhysicalAttempt,
     preflight_v4_requested_model,
     prepare_paid_overflow_quota_entry,
 )
-from elspeth.web.sessions.continuation_retained_capacity import _require_historical_hold_source, _require_hold_fields
+from elspeth.web.sessions.continuation_retained_capacity import (
+    ContinuationRetainedCapacityExceeded,
+    _require_historical_hold_source,
+    _require_hold_fields,
+)
 from elspeth.web.sessions.continuation_v4_checkpoint_paid_tail import (
     admit_v4_checkpoint_paid_tail_on_connection,
     record_checkpoint_paid_tail_hold_consumed,
@@ -56,10 +69,76 @@ from elspeth.web.sessions.time_normalization import restore_utc
 
 
 def _receipt(
-    admission: V4CheckpointProviderAdmission, observation: CheckpointIncompleteResponseObservation, observed_at: datetime
+    admission: V4CheckpointProviderAdmission,
+    observation: CheckpointIncompleteResponseObservation | CheckpointReturnedResponseObservation,
+    observed_at: datetime,
+    overflow: ContinuationRetainedCapacityExceeded | None,
 ) -> PaidOverflowReceipt:
+    if type(observation) is CheckpointReturnedResponseObservation:
+        if (
+            type(overflow) is not ContinuationRetainedCapacityExceeded
+            or overflow.observed_bytes <= overflow.limit_bytes
+            or overflow.limit_bytes > CANONICAL_INTEGER_MAX - 1
+            or observation.phase != admission.original_source.phase
+            or observation.attempt is not admission.attempt
+        ):
+            raise AuditIntegrityError("checkpoint complete response lacks its original measured pre-H capacity refusal")
+        call = original_v4_checkpoint_returned_audit_call(
+            observation, attempt_id=admission.attempt.attempt_id, request_sha256=admission.hold.source_input_sha256
+        )
+        cost = (
+            PaidOverflowCost(status="unknown", amount=None, source="not_available")
+            if call.provider_cost is None
+            else PaidOverflowCost(
+                status="known", amount=encode_paid_overflow_cost_amount(call.provider_cost), source=call.provider_cost_source
+            )
+        )
+        model = call.model_returned or call.model_requested
+        tokens = (call.prompt_tokens, call.completion_tokens, call.cached_prompt_tokens, call.reasoning_tokens)
+        measured_usage = (
+            PaidOverflowUsage(
+                status="observed",
+                model=model,
+                prompt_tokens=call.prompt_tokens,
+                completion_tokens=call.completion_tokens,
+                cached_prompt_tokens=call.cached_prompt_tokens,
+                reasoning_tokens=call.reasoning_tokens,
+                finished_at=observed_at.isoformat(),
+            )
+            if type(model) is str
+            and 0 < len(model) <= MODEL_MAX_LENGTH
+            and all(value is None or (type(value) is int and 0 <= value <= LEDGER_TOKENS_MAX) for value in tokens)
+            else PaidOverflowUsage(
+                status="unavailable",
+                model=None,
+                prompt_tokens=None,
+                completion_tokens=None,
+                cached_prompt_tokens=None,
+                reasoning_tokens=None,
+                finished_at=None,
+            )
+        )
+        return PaidOverflowReceipt(
+            schema_version="composer.paid-overflow.v1",
+            identity=admission.paid_tail.identity,
+            producer="checkpoint_advisor",
+            outcome="terminal_paid_overflow",
+            evidence_status="incomplete",
+            retryable=False,
+            reason="retained_payload_bytes",
+            representation="response",
+            measurement="exact" if overflow.observed_bytes <= CANONICAL_INTEGER_MAX else "at_least",
+            observed_bytes=min(
+                overflow.observed_bytes,
+                overflow.limit_bytes + 1 if overflow.observed_bytes > CANONICAL_INTEGER_MAX else CANONICAL_INTEGER_MAX,
+            ),
+            limit_bytes=overflow.limit_bytes,
+            cost=cost,
+            usage=measured_usage,
+        )
     if (
         type(observation) is not CheckpointIncompleteResponseObservation
+        or overflow is not None
         or type(observation.usage) is not CheckpointOverflowUsageObservation
         or observation.phase != admission.original_source.phase
         or observation.attempt_id != admission.attempt.attempt_id
@@ -123,15 +202,19 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
     service: object,
     prepared: PreparedCheckpointProvider,
     admission: V4CheckpointProviderAdmission,
-    observation: CheckpointIncompleteResponseObservation,
+    observation: CheckpointIncompleteResponseObservation | CheckpointReturnedResponseObservation,
+    overflow: ContinuationRetainedCapacityExceeded | None = None,
 ) -> VerifiedCheckpointPaidOverflowTerminal:
     """Commit child receipt, outer unknowns, failed parent, ledger and H once."""
     if (
         type(prepared) is not PreparedCheckpointProvider
         or type(admission) is not V4CheckpointProviderAdmission
-        or type(observation) is not CheckpointIncompleteResponseObservation
+        or type(observation) not in (CheckpointIncompleteResponseObservation, CheckpointReturnedResponseObservation)
         or prepared.prepared_source != admission.original_source
-        or observation.source != capture_provider_audit_source(prepared.running.session_operation_context)
+        or (
+            type(observation) is CheckpointIncompleteResponseObservation
+            and observation.source != capture_provider_audit_source(prepared.running.session_operation_context)
+        )
     ):
         raise AuditIntegrityError("checkpoint overflow changed its original paid invocation")
     require_original_v4_checkpoint_returned_response(
@@ -186,7 +269,7 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
     observed_at = database_now(conn)
     if observed_at < restore_utc(physical_row.started_at):
         raise AuditIntegrityError("checkpoint overflow observation predates its original paid admission")
-    receipt = _receipt(admission, observation, observed_at)
+    receipt = _receipt(admission, observation, observed_at, overflow)
     cohort = checkpoint_paid_audit_cohort(call, running.session_operation_context)
     batch = build_checkpoint_paid_overflow_tail_batch(
         admission.paid_tail, receipt=receipt, published_at=observed_at, private_audit_sha256=cohort.private_sha256

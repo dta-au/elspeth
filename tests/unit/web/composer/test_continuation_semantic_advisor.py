@@ -24,7 +24,8 @@ from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation_advisor import ContinuationAdvisorInvocation, ContinuationAdvisorPremise, nearest_compose_frame
@@ -210,6 +211,77 @@ def _reply(content):
         choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": content, "tool_calls": None}}],
         usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
     )
+
+
+def _inputs_with_frontier_description(inputs, description: str):
+    frontier = inputs["frontier"]
+    obligation = replace(frontier.obligations[0], description=description)
+    changed = replace(frontier, obligations=(obligation, *frontier.obligations[1:]))
+    source = inputs["source"]
+    premise = source.premise
+    assert premise is not None
+    rebound = source.model_copy(update={"premise": premise.model_copy(update={"frontier": encode_frontier_chunk(changed).reference})})
+    return {**inputs, "source": rebound, "frontier": changed}
+
+
+@pytest.mark.asyncio
+async def test_semantic_frontier_wrapper_partitions_without_changing_paid_wire_or_hash(operation_store, tmp_path, monkeypatch):
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, _custodies):
+        original_frontier = inputs["frontier"]
+        original_text = original_frontier.obligations[0].description
+        wrapper_overhead = len(encode_frontier_chunk(original_frontier).canonical) - len(original_text)
+        description = "u" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1 - wrapper_overhead)
+        assert 0 < len(description) < PROMPT_GUARD_MAX_TEXT_CHARACTERS - 100
+        changed_inputs = _inputs_with_frontier_description(inputs, description)
+        request = prepare_semantic_advisor_request(**changed_inputs)
+        original_request_sha256 = request.request_sha256
+        retained = request.prepared.evidence.messages[-1]["content"]
+        parts = request.prepared.evidence.content_parts[-1]
+        assert type(retained) is str and parts is not None
+        assert len(encode_frontier_chunk(changed_inputs["frontier"]).canonical) == PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1
+        assert json.loads(retained)["frontier"] == encode_frontier_chunk(changed_inputs["frontier"]).canonical
+        assert retained == canonical_json(json.loads(retained))
+        assert "".join(part.text for part in parts) == retained
+        assert sum(part.inspection_text == description for part in parts) == 1
+        request.verify()
+        dispatched = []
+
+        async def completion(**kwargs):
+            dispatched.append(kwargs)
+            return _reply(json.dumps(_answer(request)))
+
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        await run_semantic_advisor(request, provider_owner=provider, recorder=BufferingRecorder(), timeout=5)
+        assert len(dispatched) == 1 and dispatched[0]["messages"][-1]["content"] == retained
+        assert request.request_sha256 == original_request_sha256
+        checks = _checks(operation_store[0])
+        assert len(checks) == baseline["checks"] + 1 and checks[-1]["disposition"] == "allow"
+        coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_semantic_frontier_indivisible_scalar_above_limit_refuses_without_paid_call(operation_store, tmp_path, monkeypatch):
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, custodies):
+        description = "u" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1)
+        request = prepare_semantic_advisor_request(**_inputs_with_frontier_description(inputs, description))
+        parts = request.prepared.evidence.content_parts[-1]
+        assert parts is not None and sum(part.inspection_text == description for part in parts) == 1
+        sdk = []
+
+        async def completion(**kwargs):
+            sdk.append(kwargs)
+            return _reply(json.dumps(_answer(request)))
+
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        with pytest.raises(PromptGuardRefused) as refused:
+            await run_semantic_advisor(request, provider_owner=provider, recorder=BufferingRecorder(), timeout=5)
+        assert refused.value.http_status == 422 and refused.value.disposition == "unavailable"
+        assert sdk == [] and custodies[0].attempt is None
+        assert len(_ledger(operation_store[0])) == baseline["ledger"]
+        checks = _checks(operation_store[0])
+        assert len(checks) == baseline["checks"] + 1
+        assert (checks[-1]["disposition"], checks[-1]["reason"]) == ("unavailable", "unsupported_input")
+        coordinator.assert_completed()
 
 
 @pytest.mark.asyncio

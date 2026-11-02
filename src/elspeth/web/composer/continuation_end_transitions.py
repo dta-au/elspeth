@@ -1,16 +1,18 @@
 """SQL owners for the Continuation END phase (U-40).
 
 END begins after an actual, already committed PRIMARY response that issued no
-tool calls. Its candidate is the provider's own words; nothing here authors a
-reply, a graph or a proposal. Each transition is one locked session
+tool calls, or a sole provider-authored recovery control. Its candidate is the
+provider's own words; nothing here authors a reply, a graph or a proposal. Each transition is one locked session
 transaction that re-proves the current owner, the selected predecessor and the
 paid response before it writes.
 
-Two transitions exist:
+The entry transitions are:
 
 * ``end_entered``: Compose ``response_retained`` gains an ``EndFrame`` at
   ``review_needed``, retaining the exact candidate. The cut is handoff-safe and
   is sized for the END Advisor review.
+* ``recovery_entered``: the same cut retains one sole paid recovery control
+  without sending it through the graph tool dispatcher or shared END Review.
 * ``end_review_dispatched``: the END review is about to make provider calls.
   One ``end:<response digest>`` effect is recorded ``dispatched`` first, so a
   lost owner settles it as unknown instead of silently re-running the review.
@@ -39,6 +41,7 @@ from elspeth.web.composer.continuation_env_inventory import CurrentContinuationE
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.composer.recovery_controls import parse_recovery_tool_batch
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
@@ -63,7 +66,7 @@ if TYPE_CHECKING:
 
 END_EFFECT_OWNER = "composer_end"
 
-type EndTransition = Literal["end_entered", "end_review_dispatched", "end_repair_continued"]
+type EndTransition = Literal["end_entered", "recovery_entered", "end_review_dispatched", "end_repair_continued"]
 
 
 def _quiescent_compose(stack_frames: tuple[object, ...]) -> ComposeFrame:
@@ -91,6 +94,11 @@ def end_candidate_for(compose: ComposeFrame, *, candidate_text: str) -> EndConti
     )
 
 
+def recovery_candidate_for(compose: ComposeFrame, *, message: str) -> EndContinuationCandidate:
+    """The provider's paid recovery intent, retained without tool dispatch."""
+    return end_candidate_for(compose, candidate_text=message).model_copy(update={"kind": "recovery"})
+
+
 def retain_end_transition(
     authority: ComposerAsyncOperationAuthority,
     running: ComposerOperationRunning,
@@ -101,7 +109,7 @@ def retain_end_transition(
     candidate: PrivateChunk | None = None,
     captured: CapturedContinuationRuntime | None = None,
 ) -> StoredContinuationSnapshot:
-    if transition not in ("end_entered", "end_review_dispatched", "end_repair_continued"):
+    if transition not in ("end_entered", "recovery_entered", "end_review_dispatched", "end_repair_continued"):
         raise ValueError("END transition has no implemented source owner")
     if (
         type(authority) is not ComposerAsyncOperationAuthority
@@ -111,7 +119,7 @@ def retain_end_transition(
         or inventory.running is not running
     ):
         raise AuditIntegrityError("END transition lost its actual current source/claim owners")
-    if (transition == "end_entered") is (candidate is None):
+    if (transition in ("end_entered", "recovery_entered")) is (candidate is None):
         raise AuditIntegrityError("only END entry retains a new candidate")
     if (transition == "end_repair_continued") is (captured is None):
         raise AuditIntegrityError("only END repair continuation retains captured live owners")
@@ -137,7 +145,7 @@ def retain_end_transition(
             )
 
             source = before.active_action_source
-            if source is None or transition == "end_entered":
+            if source is None or transition in ("end_entered", "recovery_entered"):
                 raise AuditIntegrityError("END transition requires a quiescent selected cut")
             if transition == "end_review_dispatched":
                 review_admission = require_consumed_semantic_review_on_connection(
@@ -170,14 +178,24 @@ def retain_end_transition(
         response = decode_continuation_response(
             read_committed_primary_response_on_connection(conn, running, selected=selected, reference=paid)
         )
-        if response.tool_batch.calls:
+        if response.tool_batch.calls and transition != "recovery_entered":
             raise AuditIntegrityError("END requires a PRIMARY response that issued no tool calls")
         policy = decode_continuation_policy(before.admission_policy_json, before.policy_hash)
-        if transition == "end_entered":
+        if transition in ("end_entered", "recovery_entered"):
             if len(before.frames) != 1 or candidate is None:
                 raise AuditIntegrityError("END entry requires its exact single Compose predecessor")
             value = decode_end_candidate(candidate)
-            if value != end_candidate_for(compose, candidate_text=response.message.content or ""):
+            if transition == "recovery_entered":
+                try:
+                    intent = parse_recovery_tool_batch(response.tool_batch)
+                except (TypeError, ValueError) as error:
+                    raise AuditIntegrityError("recovery END lost its sole provider-authored control") from error
+                if intent is None:
+                    raise AuditIntegrityError("recovery END has no original provider-authored intent")
+                expected = recovery_candidate_for(compose, message=intent.message)
+            else:
+                expected = end_candidate_for(compose, candidate_text=response.message.content or "")
+            if value != expected:
                 raise AuditIntegrityError("END candidate differs from the actual paid response and its sources")
             put_chunk(
                 conn,

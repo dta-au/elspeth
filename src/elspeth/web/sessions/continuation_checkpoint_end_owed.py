@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from hashlib import sha256
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import Connection, func, select, update
 
@@ -18,7 +18,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.continuation import EndFrame, PrivateChunkRef
-from elspeth.web.composer.continuation_checkpoint_end_input import decode_checkpoint_end_input
+from elspeth.web.composer.continuation_checkpoint_end_input import CheckpointEndInputSnapshot, decode_checkpoint_end_input
 from elspeth.web.composer.continuation_checkpoint_observation import (
     CheckpointReturnedResponseObservation,
     require_original_v4_checkpoint_returned_response,
@@ -58,6 +58,7 @@ from elspeth.web.sessions.continuation_retained_capacity import (
     ProspectiveContinuationChunk,
     ProviderTerminalHoldSource,
     _require_active_provider_hold,
+    _require_hold_fields,
     admit_retained_payload_chunks,
     load_continuation_read_contract,
     read_bounded_retained_chunk,
@@ -72,6 +73,7 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as physica
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+    from elspeth.web.sessions.continuation_checkpoint_end_retry import VerifiedEndFormatRetry
 
 
 _OWNER = "composer_checkpoint_end_owed"
@@ -105,6 +107,12 @@ class VerifiedCheckpointEndOwed:
     old_hold_contract_sha256: str
     new_hold: ProviderTerminalHoldSource
     terminal_tail: CheckpointPaidOverflowTailPlan
+    phase_source: StoredContinuationSnapshot | None = None
+    end_input_ref: PrivateChunkRef | None = None
+    end_input: CheckpointEndInputSnapshot | None = None
+    prepared_selected: StoredContinuationSnapshot | None = None
+    requested_model: str | None = None
+    retry_history: VerifiedEndFormatRetry | None = None
 
 
 def _stored_checkpoint(
@@ -295,10 +303,19 @@ def retain_v4_checkpoint_end_owed_on_connection(
     return CheckpointEndOwedAdmission(admission, owed_selected, owed_hold, owed_tail, response)
 
 
-def read_v4_checkpoint_end_owed_on_connection(
-    conn: Connection, *, session_id: str, operation_id: str, attempt_id: str, names: frozenset[str] | None = None
+def _read_checkpoint_end_owed_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    attempt_id: str,
+    names: frozenset[str] | None,
+    historical_owed_checkpoint_id: str | None,
+    settled_child_disposition: Literal["committed", "paid_overflow"] | None,
+    expected_hold_state: Literal["active", "consumed"],
+    expected_retry_ordinal: Literal[0, 1] | None,
 ) -> VerifiedCheckpointEndOwed | None:
-    """Cold DATA read of one pending original return; never a retry grant."""
+    """Read one exact H; historical reads require a settled named child."""
     if any(type(value) is not str or not value for value in (session_id, operation_id, attempt_id)):
         raise TypeError("END-owed cold read requires exact SQL identities")
     if names is not None and (type(names) is not frozenset or any(type(name) is not str for name in names)):
@@ -322,10 +339,10 @@ def read_v4_checkpoint_end_owed_on_connection(
         conn,
         session_id=session_id,
         operation_id=operation_id,
-        checkpoint_id=parent.checkpoint_id,
+        checkpoint_id=historical_owed_checkpoint_id or parent.checkpoint_id,
         allowance=contract.allowance,
     )
-    if selected.cursor != parent.journal_cursor:
+    if selected.cursor > parent.journal_cursor or (historical_owed_checkpoint_id is None and selected.cursor != parent.journal_cursor):
         raise AuditIntegrityError("END-owed cold source changed its current root cursor")
     tag, text = _bounded_event_text(
         conn, session_id=session_id, operation_id=operation_id, cursor=selected.cursor, allowance=contract.allowance
@@ -365,11 +382,12 @@ def read_v4_checkpoint_end_owed_on_connection(
         or type(value["pass_index"]) is not int
         or value["pass_index"] < 0
         or type(value["retry_ordinal"]) is not int
-        or value["retry_ordinal"] < 0
+        or value["retry_ordinal"] not in (0, 1)
+        or (expected_retry_ordinal is not None and value["retry_ordinal"] != expected_retry_ordinal)
         or type(value["end_env_ref_names"]) is not list
         or any(type(name) is not str or not name for name in value["end_env_ref_names"])
         or value["end_env_ref_names"] != sorted(set(value["end_env_ref_names"]))
-        or names != frozenset(value["end_env_ref_names"])
+        or (names is not None and names != frozenset(value["end_env_ref_names"]))
         or not is_lower_sha256_hex(value["request_sha256"])
         or (value["publication_binding"] is not None and not is_lower_sha256_hex(value["publication_binding"]))
         or type(value["outer_effect_key"]) is not str
@@ -550,6 +568,39 @@ def read_v4_checkpoint_end_owed_on_connection(
         )
     ):
         raise AuditIntegrityError("END-owed cold source changed its complete gate input")
+    original_phase = outer
+    retry_history = None
+    if value["retry_ordinal"] == 1:
+        from elspeth.web.sessions.continuation_checkpoint_end_retry import read_end_format_retry_on_connection
+
+        retry = read_end_format_retry_on_connection(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            selected=outer,
+            names=frozenset(value["end_env_ref_names"]),
+        )
+        retry_history = retry
+        first_input = retry.owed.end_input
+        retry_original_phase = retry.owed.phase_source
+        if first_input is None or retry_original_phase is None:
+            raise AuditIntegrityError("END-owed retry lost its original gate source")
+        original_phase = retry_original_phase
+        if (
+            retry.marker.pass_index != end_data.pass_index
+            or retry.marker.outer_effect_key != value["outer_effect_key"]
+            or end_data.model_copy(
+                update={
+                    "original_checkpoint_id": first_input.original_checkpoint_id,
+                    "original_cursor": first_input.original_cursor,
+                    "captured_runtime_sha256": first_input.captured_runtime_sha256,
+                    "runtime_chunks": first_input.runtime_chunks,
+                    "retry_ordinal": 0,
+                }
+            )
+            != first_input
+        ):
+            raise AuditIntegrityError("END-owed retry changed its original gate, pass or caller")
     hold_row = conn.execute(
         select(holds).where(
             holds.c.session_id == session_id,
@@ -565,7 +616,11 @@ def read_v4_checkpoint_end_owed_on_connection(
         raise AuditIntegrityError("END-owed cold source lost its active original H")
     hold_fields = {field: hold_row._mapping[field] for field in ProviderTerminalHoldSource.__dataclass_fields__}
     hold = ProviderTerminalHoldSource(**hold_fields)
-    if hold_row.state != "active" or hold_row.provider_attempt_id != attempt_id or hold.source_input_sha256 != value["request_sha256"]:
+    if (
+        hold_row.state != expected_hold_state
+        or hold_row.provider_attempt_id != attempt_id
+        or hold.source_input_sha256 != value["request_sha256"]
+    ):
         raise AuditIntegrityError("END-owed cold source changed its pending original H")
     identity = PaidOverflowIdentity(
         session_id=session_id,
@@ -601,7 +656,8 @@ def read_v4_checkpoint_end_owed_on_connection(
     if (
         hold.reserved_bytes != new_plan.reserved_bytes
         or hold.fallback_contract_sha256 != new_plan.fallback_contract_sha256
-        or _require_active_provider_hold(conn, source=hold, contract=contract) != hold.reserved_bytes
+        or _require_hold_fields(conn, source=hold, contract=contract).state != expected_hold_state
+        or (expected_hold_state == "active" and _require_active_provider_hold(conn, source=hold, contract=contract) != hold.reserved_bytes)
     ):
         raise AuditIntegrityError("END-owed cold source lost its new fixed terminal H bridge")
     response_chunk = read_bounded_retained_chunk(
@@ -641,17 +697,18 @@ def read_v4_checkpoint_end_owed_on_connection(
         or call.messages_hash != value["request_sha256"]
         or effect is None
         or effect.owner != "provider"
-        or effect.disposition != "dispatched"
+        or effect.disposition != (settled_child_disposition or "dispatched")
         or effect.provider_attempt_id != attempt_id
         or effect.input_sha256 != value["request_sha256"]
         or effect.requested_model != call.model_requested
         or effect.requested_model != original_event["requested_model"]
-        or effect.receipt_key is not None
-        or effect.result_chunk_key is not None
+        or (effect.receipt_key is None) != (settled_child_disposition is None)
+        or (effect.result_chunk_key is None) != (settled_child_disposition is None)
         or type(decoded.message.content) is not str
         or not decoded.message.content.strip()
         or attempt is None
-        or attempt.settled_at is not None
+        or (attempt.settled_at is None) != (settled_child_disposition is None)
+        or (attempt.ledger_entry_id is None) != (settled_child_disposition is None)
         or attempt.source != "composer"
         or attempt.session_id != session_id
         or attempt.operation_id != hold.session_operation_id
@@ -690,4 +747,62 @@ def read_v4_checkpoint_end_owed_on_connection(
         value["old_hold_contract_sha256"],
         hold,
         new_plan,
+        original_phase,
+        PrivateChunkRef(codec="composer.checkpoint-end-input.v1", digest=end_digest, byte_length=len(end_chunk.payload)),
+        end_data,
+        prepared,
+        original_event["requested_model"],
+        retry_history,
     )
+
+
+def read_v4_checkpoint_end_owed_on_connection(
+    conn: Connection, *, session_id: str, operation_id: str, attempt_id: str, names: frozenset[str] | None = None
+) -> VerifiedCheckpointEndOwed | None:
+    """Cold DATA read of one current pending original return; never a retry grant."""
+    return _read_checkpoint_end_owed_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        attempt_id=attempt_id,
+        names=names,
+        historical_owed_checkpoint_id=None,
+        settled_child_disposition=None,
+        expected_hold_state="active",
+        expected_retry_ordinal=None,
+    )
+
+
+def read_v4_checkpoint_end_settled_owed_history_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    attempt_id: str,
+    owed_checkpoint_id: str,
+    names: frozenset[str],
+    child_disposition: Literal["committed", "paid_overflow"],
+    hold_state: Literal["active", "consumed"] = "consumed",
+    expected_retry_ordinal: Literal[0, 1] | None = None,
+) -> VerifiedCheckpointEndOwed:
+    """Cold proof of complete H after one exact child has settled.
+
+    The caller must separately prove the parent transition from this H.  This
+    reader never infers terminality or retry permission from a later head.
+    """
+    if type(owed_checkpoint_id) is not str or not owed_checkpoint_id or child_disposition not in ("committed", "paid_overflow"):
+        raise TypeError("historical END-owed proof requires an exact head and settled child")
+    result = _read_checkpoint_end_owed_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        attempt_id=attempt_id,
+        names=names,
+        historical_owed_checkpoint_id=owed_checkpoint_id,
+        settled_child_disposition=child_disposition,
+        expected_hold_state=hold_state,
+        expected_retry_ordinal=expected_retry_ordinal,
+    )
+    if result is None:
+        raise AuditIntegrityError("historical END-owed proof lost its exact complete H")
+    return result

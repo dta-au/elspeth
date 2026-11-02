@@ -27,6 +27,7 @@ from elspeth.web.sessions.protocol import StaleComposeStateError
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_value_batch_preparation import PreparedValueBatch
+    from elspeth.web.required_work import RequiredPreviewProduced
     from elspeth.web.sessions.continuation_value_batch_publication import PreparedValueBatchPublication
     from elspeth.web.sessions.service import SessionServiceImpl
 
@@ -42,6 +43,7 @@ def plan_value_batch_publication_on_connection(
     message_ids: tuple[UUID, ...] | None = None,
     state_ids: tuple[UUID, ...] | None = None,
     rejection_ids: tuple[UUID, ...] | None = None,
+    issued_preview: RequiredPreviewProduced | None = None,
 ) -> PreparedValueBatchPublication:
     """Prove the current row source before the pure planner selects any rows."""
     from elspeth.web.sessions.continuation_value_batch_publication import plan_value_batch_publication, value_batch_publication_shape
@@ -53,6 +55,19 @@ def plan_value_batch_publication_on_connection(
     service._assert_session_write_lock_held(conn, sid, caller="plan_value_batch_publication_on_connection")
     service._require_session_write_authority_on_connection(conn, context, session_id=sid)
     members = prepared_p4_members(batch.prepared, env_ref_names=batch.inventory.names)
+    if issued_preview is not None:
+        from elspeth.web.composer.continuation_value_batch_preparation import require_prepared_issued_preview_batch
+
+        require_prepared_issued_preview_batch(batch, issued_preview)
+        if (
+            len(batch.requested_calls) != 1
+            or batch.requested_calls[0].function.name != "preview_pipeline"
+            or len(members.invocations) != 1
+            or members.invocations[0].tool_name != "preview_pipeline"
+            or members.invocations[0].version_after != members.invocations[0].version_before
+            or any(row.composition_state_payload is not None for row in members.redacted_rows)
+        ):
+            raise AuditIntegrityError("issued preview publication cannot change graph or authored state")
     # This atomic value path cannot retire a review or approval as an incidental
     # effect of publishing a detached tool result.
     pending = conn.execute(
@@ -71,7 +86,7 @@ def plan_value_batch_publication_on_connection(
         )
         .limit(1)
     ).first()
-    if pending is not None or approval is not None:
+    if issued_preview is None and (pending is not None or approval is not None):
         raise AuditIntegrityError("value publication cannot silently retire pending reviews or approvals")
     current = conn.execute(
         select(composition_states_table)
@@ -94,6 +109,8 @@ def plan_value_batch_publication_on_connection(
         if locked_refusal is None:
             locked_refusal = current_refusal
     shape = value_batch_publication_shape(batch, locked_refusal=locked_refusal, env_ref_names=batch.inventory.names)
+    if issued_preview is not None and shape.state_count != 0:
+        raise AuditIntegrityError("issued preview publication cannot retire a review through authored state")
     base = service._reserve_sequence_range(conn, sid, count=shape.message_count)
     return plan_value_batch_publication(
         batch=batch,
@@ -118,6 +135,7 @@ def consume_value_batch_publication_on_connection(
     publication: PreparedValueBatchPublication,
     commit: ContinuationOwnerCommit,
     publication_append: PreparedContinuationAppend,
+    issued_preview: RequiredPreviewProduced | None = None,
 ) -> AuditOutcome:
     """Insert exact preplanned rows inside original P4 and complete-tail guards."""
     from elspeth.web.sessions.continuation_value_batch_publication import PreparedValueBatchPublication
@@ -171,6 +189,7 @@ def consume_value_batch_publication_on_connection(
             message_ids=tuple(row.id for row in publication.messages),
             state_ids=tuple(row.id for row in publication.states),
             rejection_ids=publication.rejection_ids,
+            issued_preview=issued_preview,
         )
         if expected != publication:
             raise AuditIntegrityError("value publication changed its original complete row plan")

@@ -28,6 +28,7 @@ from elspeth.web.composer.continuation_checkpoint_observation import (
 )
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope
+from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.withheld_replies import withheld_reply_envelope
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import TokenUsageEntry, token_usage_entry_from_llm_call_envelope
@@ -95,9 +96,14 @@ class EndCompleteTerminalBatch:
 
 
 def _prefix_rows(projected: ProjectedEndCompleteTerminal) -> tuple[PreparedEndTerminalAuditRow, ...]:
+    return _prefix_rows_for_result(projected.withheld_candidate, projected.result)
+
+
+def _prefix_rows_for_result(withheld_candidate: str | None, result: ComposerResult) -> tuple[PreparedEndTerminalAuditRow, ...]:
+    """Freeze the original blocked Review disclosure and publication rows."""
     rows: list[PreparedEndTerminalAuditRow] = []
-    if projected.withheld_candidate is not None:
-        content = projected.withheld_candidate
+    if withheld_candidate is not None:
+        content = withheld_candidate
         rows.append(
             PreparedEndTerminalAuditRow(
                 str(uuid4()),
@@ -113,7 +119,7 @@ def _prefix_rows(projected: ProjectedEndCompleteTerminal) -> tuple[PreparedEndTe
             AuditMessageDraft(role="audit", content=disclosure, tool_calls=(advisor_signoff_withheld_control_envelope(disclosure),)),
         )
     )
-    publication = projected.result.advisor_terminal_publication
+    publication = result.advisor_terminal_publication
     if publication is None:
         raise AuditIntegrityError("END terminal lost its original blocked publication")
     envelope = advisor_terminal_publication_audit_envelope(publication)
@@ -203,7 +209,7 @@ def prepare_end_complete_terminal_batch_on_connection(
     if quota_entry is None or quota_entry.call_id != owed.attempt_id:
         raise AuditIntegrityError("END terminal lost its original provider accounting")
     paid_audit = checkpoint_paid_audit_cohort(original_call, running.session_operation_context)
-    pass_audit = prepare_end_complete_pass(physical=physical, computation=projected.computation)
+    pass_audit = prepare_end_complete_pass(physical=physical, computation=projected.computation, owed=owed)
     prefix_rows = _prefix_rows(projected)
     child_receipt = str(uuid4())
     response_key = private_chunk_key(owed.response)

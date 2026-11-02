@@ -43,9 +43,9 @@ operation_store = semantic_fixture.operation_store
 
 
 @asynccontextmanager
-async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean"):
+async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean", timed_read=False):
     """Use original SQL/SDK custody; replace only the external model transport."""
-    async with semantic_fixture._semantic_case(store, tmp_path, monkeypatch, end_candidate=True) as case:
+    async with semantic_fixture._semantic_case(store, tmp_path, monkeypatch, end_candidate=True, timed_read=timed_read) as case:
         runtime = case["runtime"]
         original = runtime.source.selected
         end = original.stack.frames[-1]

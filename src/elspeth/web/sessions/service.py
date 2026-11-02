@@ -184,6 +184,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationRunning,
 )
 from elspeth.web.sessions.content_publication import prepare_content_publication, read_content_publication
+from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import AdmittedCheckpointAuditSource
 from elspeth.web.sessions.continuation_title_application import (
     AdmittedTitleApplication,
     TitleApplicationRequest,
@@ -430,7 +431,13 @@ if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
     from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
-    from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointUnboundRefusalPermit
+    from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness
+    from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import ColdCheckpointEndConsequenceSource
+    from elspeth.web.composer.continuation_checkpoint_end_cold_repair import ColdProjectedEndRepair, ColdProjectedEndRepairOverflow
+    from elspeth.web.composer.continuation_checkpoint_end_cold_review import ColdProjectedEndReview, ColdProjectedEndReviewOverflow
+    from elspeth.web.composer.continuation_checkpoint_end_complete_repair import ProjectedEndCompleteRepair
+    from elspeth.web.composer.continuation_checkpoint_end_complete_review import ProjectedEndCompleteReview
+    from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointEndPhysicalSource, CheckpointUnboundRefusalPermit
     from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkRefusalPermit
     from elspeth.web.composer.continuation_checkpoint_observation import (
         CheckpointIncompleteResponseObservation,
@@ -463,6 +470,8 @@ if TYPE_CHECKING:
         PreparedSegmentSettlement,
         StoredContinuationSnapshot,
     )
+    from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import EndCompleteRepairBatch
+    from elspeth.web.sessions.continuation_checkpoint_end_owed import CheckpointEndOwedAdmission
     from elspeth.web.sessions.continuation_checkpoint_paid import (
         CheckpointPreparedSource,
         PreparedCheckpointProvider,
@@ -491,8 +500,10 @@ if TYPE_CHECKING:
         V4PrimaryProviderAdmission,
     )
     from elspeth.web.sessions.continuation_publication_projection import PipelinePublicationReplayData, PublicationProjectionInput
+    from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, V4SemanticProviderAdmission
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
+    from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
     from elspeth.web.sessions.continuation_title_no_sdk_terminal import VerifiedTitleNoSdkTerminal
     from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
     from elspeth.web.sessions.continuation_title_provider import CurrentTitleNames, V4TitleProviderAdmission
@@ -7804,7 +7815,10 @@ class SessionServiceImpl:
         """Re-derive the original recovery selection before its terminal DML."""
         from elspeth.web.sessions.continuation import load_snapshot
         from elspeth.web.sessions.continuation_graph_recovery_projection import GraphRecoveryProjectionInput
-        from elspeth.web.sessions.continuation_semantic_advisor import require_semantic_owned_iteration_publication_on_connection
+        from elspeth.web.sessions.continuation_semantic_advisor import (
+            require_semantic_ordinary_recovery_publication_on_connection,
+            require_semantic_owned_iteration_publication_on_connection,
+        )
 
         if type(projection) is not GraphRecoveryProjectionInput:
             raise AuditIntegrityError("Continuation recovery requires its original source DATA")
@@ -7812,27 +7826,31 @@ class SessionServiceImpl:
         if selected is None:
             raise AuditIntegrityError("Continuation recovery lost its actual current checkpoint")
         proof = require_semantic_owned_iteration_publication_on_connection(conn, running, selected=selected)
-        if (
-            proof is None
-            or proof.outcome_kind != "owned_recovery"
-            or proof.source_kind != "graph_recovery"
-            or proof.recovery_context is None
-        ):
+        ordinary = require_semantic_ordinary_recovery_publication_on_connection(conn, running, selected=selected) if proof is None else None
+        if proof is not None:
+            if proof.outcome_kind != "owned_recovery" or proof.source_kind != "graph_recovery" or proof.recovery_context is None:
+                raise AuditIntegrityError("Continuation recovery changed its classifier-owned source")
+            retained, context = proof.returned.result, proof.recovery_context
+            audit_call = proof.admission.paid.audit_call
+        elif ordinary is not None:
+            retained, context = ordinary.result, ordinary.recovery_context
+            audit_call = ordinary.admission.paid.audit_call
+        else:
             raise AuditIntegrityError("Continuation recovery has no original recovery and paid Stop source")
-        original = replace(proof.returned.result, llm_calls=(*proof.returned.result.llm_calls, proof.admission.paid.audit_call))
-        if projection.original_result != original or projection.original_context != proof.recovery_context:
+        original = replace(retained, llm_calls=(*retained.llm_calls, audit_call))
+        if projection.original_result != original or projection.original_context != context:
             raise AuditIntegrityError("Continuation recovery substituted its original result or bootstrap context")
-        intent = proof.returned.result.graph_recovery_intent
+        intent = retained.graph_recovery_intent
         actual = projection.recovery
         if intent is None or actual.intent != intent:
             raise AuditIntegrityError("Continuation recovery changed the provider's original control")
         replay = self.prepare_graph_recovery_on_connection(
             conn,
             running.claim.session_id,
-            context=proof.recovery_context,
+            context=context,
             intent=intent,
             session_operation_context=running.session_operation_context,
-            candidate_state=proof.returned.result.state,
+            candidate_state=retained.state,
         )
         if type(actual.receipt_id) is not UUID:
             raise AuditIntegrityError("Continuation recovery requires its actual receipt identity")
@@ -11591,20 +11609,33 @@ class SessionServiceImpl:
         session_operation_context: SessionOperationContext,
         composition_state_id: str | None,
         admitted_title_source: AdmittedTitleAuditSource | None = None,
+        admitted_checkpoint_source: AdmittedCheckpointAuditSource | None = None,
     ) -> tuple[AuditMessageDraft, ...]:
         """Validate exact private replays under the held session write lock."""
         from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, is_diagnostic_evidence_envelope
 
+        if admitted_title_source is not None and admitted_checkpoint_source is not None:
+            raise AuditIntegrityError("private diagnostic audit cannot combine historical source owners")
         if admitted_title_source is not None:
             if type(admitted_title_source) is not AdmittedTitleAuditSource:
                 raise AuditIntegrityError("TITLE audit source requires its actual nominal SQL owner")
             admitted_title_source.require(conn, session_operation_context, tuple(drafts))
+        if admitted_checkpoint_source is not None:
+            if type(admitted_checkpoint_source) is not AdmittedCheckpointAuditSource:
+                raise AuditIntegrityError("checkpoint audit source requires its actual nominal SQL owner")
+            admitted_checkpoint_source.require(conn, session_operation_context, tuple(drafts))
         source_operation_id = (
-            admitted_title_source.source.operation_id if admitted_title_source is not None else session_operation_context.fence.operation_id
+            admitted_title_source.source.operation_id
+            if admitted_title_source is not None
+            else admitted_checkpoint_source.source.operation_id
+            if admitted_checkpoint_source is not None
+            else session_operation_context.fence.operation_id
         )
         source_operation_epoch = (
             admitted_title_source.source.operation_epoch
             if admitted_title_source is not None
+            else admitted_checkpoint_source.source.operation_epoch
+            if admitted_checkpoint_source is not None
             else session_operation_context.fence.operation_epoch
         )
         incoming: dict[tuple[str, int, str], tuple[str, str | None]] = {}
@@ -12503,31 +12534,312 @@ class SessionServiceImpl:
                 raise BaseExceptionGroup("V4 checkpoint quota refusal recording failed", [refusal, recorder_error]) from None
             raise
 
+    def retain_v4_checkpoint_end_owed_sync(
+        self,
+        *,
+        prepared: PreparedCheckpointProvider,
+        admission: V4CheckpointProviderAdmission,
+        returned: CheckpointReturnedResponseObservation,
+    ) -> CheckpointEndOwedAdmission:
+        """Commit the original full paid END response and rebound H before projection."""
+        from elspeth.web.composer.continuation_checkpoint_observation import CheckpointReturnedResponseObservation
+        from elspeth.web.sessions.continuation_checkpoint_end_owed import (
+            read_v4_checkpoint_end_owed_on_connection,
+            retain_v4_checkpoint_end_owed_on_connection,
+        )
+        from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        if (
+            type(prepared) is not PreparedCheckpointProvider
+            or type(admission) is not V4CheckpointProviderAdmission
+            or type(returned) is not CheckpointReturnedResponseObservation
+            or admission.original_source is not prepared.prepared_source
+        ):
+            raise AuditIntegrityError("END owed retention changed its original paid source")
+        running = prepared.running
+        sid = str(running.claim.session_id)
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE, audit_only=True
+            ),
+        ):
+            owed = retain_v4_checkpoint_end_owed_on_connection(
+                conn, running=running, prepared=prepared, admission=admission, returned=returned
+            )
+        with locked_session_transaction(self._engine, sid) as conn:
+            cold = read_v4_checkpoint_end_owed_on_connection(
+                conn,
+                session_id=sid,
+                operation_id=running.claim.operation_id,
+                attempt_id=admission.attempt.attempt_id,
+                names=prepared.env_ref_names,
+            )
+        if cold is None or cold.selected != owed.owed_selected or cold.response != owed.response:
+            raise AuditIntegrityError("END paid response changed after committed H")
+        return owed
+
+    def complete_v4_checkpoint_end_review_sync(
+        self,
+        *,
+        physical: CheckpointEndPhysicalSource,
+        prepared: PreparedCheckpointProvider,
+        owed: CheckpointEndOwedAdmission,
+        selected: SelectedContinuationState,
+        returned: CheckpointReturnedResponseObservation,
+        projected: ProjectedEndCompleteReview,
+    ) -> SemanticReviewCommitted:
+        """Settle the exact paid Review and verify it again after commit."""
+        from elspeth.web.sessions.continuation_checkpoint_end_complete_review import persist_end_complete_review_on_connection
+        from elspeth.web.sessions.continuation_semantic_review_result import read_original_semantic_review_result_on_connection
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        running = prepared.running
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE, audit_only=True
+            ),
+        ):
+            committed = persist_end_complete_review_on_connection(
+                conn,
+                service=self,
+                physical=physical,
+                prepared=prepared,
+                owed_admission=owed,
+                selected=selected,
+                returned=returned,
+                projected=projected,
+            )
+        with locked_session_transaction(self._engine, sid) as conn:
+            cold = read_original_semantic_review_result_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=operation, review_effect_key=committed.owner_effect_key
+            )
+        if cold != committed:
+            raise AuditIntegrityError("END Review committed result changed on independent cold read")
+        return cold
+
+    def complete_v4_checkpoint_end_cold_review_sync(self, *, projected: ColdProjectedEndReview) -> SemanticReviewCommitted:
+        """Settle an independently restored END H with the same Review writer."""
+        from elspeth.web.composer.continuation_checkpoint_end_cold_review import require_original_cold_end_review
+        from elspeth.web.sessions.continuation_checkpoint_end_complete_review import persist_end_complete_review_on_connection
+        from elspeth.web.sessions.continuation_semantic_review_result import read_original_semantic_review_result_on_connection
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        require_original_cold_end_review(projected)
+        work = projected.source.runtime.bindings.required_work
+        running = None if work is None else work.running
+        if running is None:
+            raise AuditIntegrityError("cold END Review lost its current fenced operation")
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE, audit_only=True
+            ),
+        ):
+            committed = persist_end_complete_review_on_connection(
+                conn,
+                service=self,
+                physical=None,
+                prepared=None,
+                owed_admission=None,
+                selected=None,
+                returned=None,
+                projected=projected,
+            )
+        with locked_session_transaction(self._engine, sid) as conn:
+            cold = read_original_semantic_review_result_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=operation, review_effect_key=committed.owner_effect_key
+            )
+        if cold != committed:
+            raise AuditIntegrityError("cold END Review changed after committed restart read")
+        return cold
+
+    def complete_v4_checkpoint_end_repair_sync(
+        self,
+        *,
+        physical: CheckpointEndPhysicalSource,
+        prepared: PreparedCheckpointProvider,
+        owed: CheckpointEndOwedAdmission,
+        selected: SelectedContinuationState,
+        returned: CheckpointReturnedResponseObservation,
+        projected: ProjectedEndCompleteRepair,
+    ) -> EndCompleteRepairBatch:
+        """Settle the original paid repair successor under one session lock."""
+        from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import persist_end_complete_repair_on_connection
+
+        running = prepared.running
+        sid = str(running.claim.session_id)
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE, audit_only=True
+            ),
+        ):
+            return persist_end_complete_repair_on_connection(
+                conn,
+                service=self,
+                physical=physical,
+                prepared=prepared,
+                owed_admission=owed,
+                selected=selected,
+                returned=returned,
+                projected=projected,
+            )
+
+    def complete_v4_checkpoint_end_cold_repair_sync(self, *, projected: ColdProjectedEndRepair) -> EndCompleteRepairBatch:
+        """Finish one rederived first-H repair under its actual current claim."""
+        from elspeth.web.composer.continuation_checkpoint_end_cold_repair import (
+            ColdProjectedEndRepair,
+            require_original_cold_end_repair,
+        )
+        from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import persist_first_cold_end_complete_repair_on_connection
+
+        if type(projected) is not ColdProjectedEndRepair:
+            raise AuditIntegrityError("cold END repair requires its original rederived projection")
+        require_original_cold_end_repair(projected)
+        work = projected.source.runtime.bindings.required_work
+        running = None if work is None else work.running
+        if running is None:
+            raise AuditIntegrityError("cold END repair lost its actual running claim")
+        sid = str(running.claim.session_id)
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE, audit_only=True
+            ),
+        ):
+            return persist_first_cold_end_complete_repair_on_connection(conn, service=self, projected=projected)
+
+    def settle_v4_checkpoint_end_owed_overflow_sync(
+        self,
+        *,
+        prepared: PreparedCheckpointProvider,
+        owed: CheckpointEndOwedAdmission,
+        returned: CheckpointReturnedResponseObservation,
+        failure: ContinuationCaptureOverflowWitness | ContinuationRetainedCapacityExceeded,
+    ) -> VerifiedCheckpointPaidOverflowTerminal:
+        """Close one paid END with complete raw response but missing required tail."""
+        from elspeth.web.sessions.continuation_checkpoint_end_owed_overflow import (
+            settle_v4_checkpoint_end_owed_overflow_on_connection,
+        )
+        from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
+            read_v4_checkpoint_end_owed_overflow_terminal_on_connection,
+        )
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        running = prepared.running
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE, audit_only=True
+            ),
+        ):
+            verified = settle_v4_checkpoint_end_owed_overflow_on_connection(
+                conn, service=self, prepared=prepared, owed=owed, returned=returned, failure=failure
+            )
+        with locked_session_transaction(self._engine, sid) as conn:
+            cold = read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
+                conn,
+                session_id=running.claim.session_id,
+                operation_id=operation,
+                effect_key=owed.owed_hold.effect_key,
+                names=prepared.env_ref_names,
+            )
+        if cold != verified:
+            raise AuditIntegrityError("END owed overflow changed on independent cold read")
+        return cold
+
+    def settle_cold_v4_checkpoint_end_owed_overflow_sync(
+        self,
+        *,
+        cold_source: ColdCheckpointEndConsequenceSource,
+        failure: ContinuationRetainedCapacityExceeded | ColdProjectedEndRepairOverflow | ColdProjectedEndReviewOverflow,
+        capacity_projection: ColdProjectedEndRepair | ColdProjectedEndReview | None = None,
+    ) -> VerifiedCheckpointPaidOverflowTerminal:
+        """Close a paid complete END whose projected consequence cannot fit after owner loss."""
+        from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
+            ColdCheckpointEndConsequenceSource,
+            require_original_cold_checkpoint_end_source,
+        )
+        from elspeth.web.sessions.continuation_checkpoint_end_owed_overflow import (
+            settle_cold_v4_checkpoint_end_owed_overflow_on_connection,
+        )
+        from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
+            read_v4_checkpoint_end_owed_overflow_terminal_on_connection,
+        )
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        if type(cold_source) is not ColdCheckpointEndConsequenceSource:
+            raise AuditIntegrityError("cold END overflow lacks its original source H")
+        require_original_cold_checkpoint_end_source(cold_source)
+        work = cold_source.runtime.bindings.required_work
+        running = None if work is None else work.running
+        if running is None:
+            raise AuditIntegrityError("cold END overflow lost its current operation claim")
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE, audit_only=True
+            ),
+        ):
+            verified = settle_cold_v4_checkpoint_end_owed_overflow_on_connection(
+                conn, service=self, cold_source=cold_source, failure=failure, capacity_projection=capacity_projection
+            )
+        with locked_session_transaction(self._engine, sid) as conn:
+            cold = read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
+                conn,
+                session_id=running.claim.session_id,
+                operation_id=operation,
+                effect_key=cold_source.owed.new_hold.effect_key,
+                names=cold_source.runtime.env_ref_names,
+            )
+        if cold != verified:
+            raise AuditIntegrityError("cold END owed overflow changed on independent restart read")
+        return cold
+
     def complete_v4_checkpoint_result_sync(
         self,
         *,
         prepared: PreparedCheckpointProvider,
         admission: V4CheckpointProviderAdmission,
         observed: CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation,
+        overflow: ContinuationRetainedCapacityExceeded | None = None,
     ) -> VerifiedCheckpointPaidOverflowTerminal:
-        """Settle an original returned-overflow checkpoint; full success is dormant.
-
-        A fitting raw response cannot be accepted until its actual full phase
-        pass/evidence/injection batch and later reserve are proved together.
-        The caller uses one registered provider-settlement SQL worker ticket.
-        """
+        """Settle an unretainable original return under its pre-SDK H."""
         from elspeth.web.composer.continuation_checkpoint_observation import (
             CheckpointIncompleteResponseObservation,
             CheckpointReturnedResponseObservation,
         )
         from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
         from elspeth.web.sessions.continuation_checkpoint_paid_settlement import settle_v4_checkpoint_returned_overflow_on_connection
+        from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
 
         if type(prepared) is not PreparedCheckpointProvider or type(admission) is not V4CheckpointProviderAdmission:
             raise AuditIntegrityError("V4 checkpoint completion changed its original prepared paid source")
         if type(observed) is CheckpointReturnedResponseObservation:
-            raise AuditIntegrityError("V4 checkpoint complete phase batch has no proved downstream retention bound")
-        if type(observed) is not CheckpointIncompleteResponseObservation:
+            if type(overflow) is not ContinuationRetainedCapacityExceeded:
+                raise AuditIntegrityError("V4 complete checkpoint needs its exact pre-H capacity refusal")
+        elif type(observed) is not CheckpointIncompleteResponseObservation or overflow is not None:
             raise AuditIntegrityError("V4 checkpoint completion requires its original returned response observation")
         context = prepared.running.session_operation_context
         sid = str(prepared.running.claim.session_id)
@@ -12543,7 +12855,7 @@ class SessionServiceImpl:
             ),
         ):
             return settle_v4_checkpoint_returned_overflow_on_connection(
-                conn, service=self, prepared=prepared, admission=admission, observation=observed
+                conn, service=self, prepared=prepared, admission=admission, observation=observed, overflow=overflow
             )
 
     async def finalize_v4_continuation_checkpoint_incomplete(

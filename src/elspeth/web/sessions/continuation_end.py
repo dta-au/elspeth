@@ -29,8 +29,18 @@ from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
     EndCheckpointPaidOverflowTerminal,
     EndCheckpointUnboundRefusalTerminal,
 )
-from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointPaidIncompleteTerminal, observe_end_checkpoint_terminal
-from elspeth.web.composer.continuation_end_transitions import EndTransition, end_candidate_for, retain_end_transition
+from elspeth.web.composer.continuation_checkpoint_end_terminal import (
+    EndCheckpointCompleteReview,
+    EndCheckpointPaidIncompleteTerminal,
+    EndCheckpointRepairContinued,
+    observe_end_checkpoint_terminal,
+)
+from elspeth.web.composer.continuation_end_transitions import (
+    EndTransition,
+    end_candidate_for,
+    recovery_candidate_for,
+    retain_end_transition,
+)
 from elspeth.web.composer.continuation_end_values import encode_end_candidate
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
@@ -144,6 +154,24 @@ async def enter_continuation_end(
     await _retain(phases, selected, "end_entered", candidate)
 
 
+async def enter_continuation_recovery_end(
+    phases: ContinuationLivePhases, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None
+) -> None:
+    """Retain one paid ordinary PRIMARY recovery as an END source for paid Stop."""
+    from elspeth.web.composer.recovery_controls import parse_recovery_tool_batch
+
+    _runtime, result = await _primary(phases, selected, phase_read=phase_read)
+    try:
+        intent = parse_recovery_tool_batch(result.outcome.completion.tool_batch)
+    except (TypeError, ValueError) as error:
+        raise AuditIntegrityError("ordinary recovery requires its sole provider-authored control") from error
+    compose = selected.stack.frames[-1]
+    if intent is None or type(compose) is not ComposeFrame:
+        raise AuditIntegrityError("ordinary recovery lost its original paid Compose source")
+    candidate = encode_end_candidate(recovery_candidate_for(compose, message=intent.message))
+    await _retain(phases, selected, "recovery_entered", candidate)
+
+
 async def review_continuation_end(
     phases: ContinuationLivePhases, services: ComposerAppServices, selected: SelectedContinuationState
 ) -> (
@@ -180,6 +208,8 @@ async def execute_continuation_end_review(
 ) -> (
     EndReviewExecution
     | EndReviewContinued
+    | EndCheckpointCompleteReview
+    | EndCheckpointRepairContinued
     | EndCheckpointPaidIncompleteTerminal
     | EndCheckpointPaidOverflowTerminal
     | EndCheckpointNoSdkTerminal
@@ -272,6 +302,8 @@ async def execute_continuation_end_review(
         terminate,
         (
             EndCheckpointPaidIncompleteTerminal,
+            EndCheckpointCompleteReview,
+            EndCheckpointRepairContinued,
             EndCheckpointPaidOverflowTerminal,
             EndCheckpointNoSdkTerminal,
             EndCheckpointUnboundRefusalTerminal,
@@ -378,6 +410,7 @@ async def publish_semantic_continuation_result(
     from elspeth.web.sessions.continuation_semantic_actions import require_semantic_publication_on_connection
     from elspeth.web.sessions.continuation_semantic_advisor import (
         require_semantic_iteration_publication_on_connection,
+        require_semantic_ordinary_recovery_publication_on_connection,
         require_semantic_owned_iteration_publication_on_connection,
     )
     from elspeth.web.sessions.locking import locked_session_transaction
@@ -394,12 +427,20 @@ async def publish_semantic_continuation_result(
                 raise AuditIntegrityError("semantic publication changed its selected source before result preparation")
             owned = require_semantic_owned_iteration_publication_on_connection(conn, running, selected=stored)
             iteration = require_semantic_iteration_publication_on_connection(conn, running, selected=stored) if owned is None else None
+            recovery = (
+                require_semantic_ordinary_recovery_publication_on_connection(conn, running, selected=stored)
+                if owned is None and iteration is None
+                else None
+            )
             if owned is not None:
                 original = owned.returned.result
                 audit_call = owned.admission.paid.audit_call
             elif iteration is not None:
                 original = iteration.returned.result
                 audit_call = iteration.admission.paid.audit_call
+            elif recovery is not None:
+                original = recovery.result
+                audit_call = recovery.admission.paid.audit_call
             else:
                 review = require_semantic_publication_on_connection(conn, running, selected=stored)
                 if review is None:

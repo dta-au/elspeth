@@ -13,6 +13,11 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import PromptGuardDecision
 from elspeth.web.composer.content_scope import composition_scope_for_operation
 from elspeth.web.composer.continuation import ComposeFrame
+from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
+    compute_first_cold_checkpoint_end_gate,
+    read_cold_checkpoint_end_consequence_source,
+)
+from elspeth.web.composer.continuation_checkpoint_end_cold_repair import ColdProjectedEndRepair, project_first_cold_end_repair
 from elspeth.web.composer.continuation_checkpoint_end_complete_repair import (
     ProjectedEndCompleteRepair,
     project_end_complete_repair,
@@ -23,18 +28,32 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
     observe_checkpoint_end_physical_return,
     prepare_checkpoint_end_physical_source,
 )
-from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, decode_retained_physical_audit_call
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import PromptGuardMount
+from elspeth.web.composer.provider_cost import CommonProviderCostBudget
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
+from elspeth.web.sessions.composer_operations import ComposerOperationFenceLost, ComposerOperationRunning
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import require_end_complete_pass_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import persist_end_complete_repair_on_connection
-from elspeth.web.sessions.continuation_checkpoint_end_owed import retain_v4_checkpoint_end_owed_on_connection
+from elspeth.web.sessions.continuation_checkpoint_end_owed import (
+    read_v4_checkpoint_end_owed_on_connection,
+    retain_v4_checkpoint_end_owed_on_connection,
+)
+from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
+    admit_checkpoint_paid_audit_source_on_connection,
+    checkpoint_paid_audit_cohort_for_hold,
+    require_checkpoint_paid_private_audit_on_connection,
+    write_checkpoint_paid_audit_cohort_on_connection,
+)
+from elspeth.web.sessions.continuation_checkpoint_paid_terminal import read_v4_checkpoint_end_owed_overflow_terminal_on_connection
+from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
 from elspeth.web.sessions.continuation_end import enter_continuation_end, execute_continuation_end_review
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
 from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
@@ -47,6 +66,7 @@ from tests.unit.web.composer.test_advisor_checkpoint import _checkpoint_reply
 from tests.unit.web.composer.test_continuation_semantic_advisor import _reply
 from tests.unit.web.composer.test_prompt_guard_admission import _GuardClient
 from tests.unit.web.coordination import test_composer_operation_authority
+from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
 from tests.unit.web.sessions import test_continuation_initialization as initialization_fixture
 from tests.unit.web.sessions.test_continuation_primary_result import initialized_primary_input
 
@@ -54,13 +74,18 @@ operation_store = test_composer_operation_authority.operation_store
 
 
 @pytest.mark.parametrize(
-    ("allowance", "reasoning_bytes", "expect_overflow"),
-    [(16 * 1_048_576, 0, False), (3_000_000, 700_000, True)],
-    ids=("fitting-complete", "constrained-allowance-rollback"),
+    ("allowance", "reasoning_bytes", "expect_overflow", "cold_resume", "replacement_audit"),
+    [
+        (16 * 1_048_576, 0, False, False, False),
+        (3_000_000, 700_000, True, False, False),
+        (3_000_000, 700_000, True, True, False),
+        (16 * 1_048_576, 0, False, False, True),
+    ],
+    ids=("fitting-complete", "constrained-allowance-rollback", "constrained-cold-overflow", "replacement-audit-source"),
 )
 @pytest.mark.asyncio
 async def test_actual_end_complete_flagged_repair_settles_original_paid_call_once(
-    operation_store, tmp_path, monkeypatch, allowance, reasoning_bytes, expect_overflow
+    operation_store, tmp_path, monkeypatch, allowance, reasoning_bytes, expect_overflow, cold_resume, replacement_audit
 ):
     policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
     assert policy is not None
@@ -169,6 +194,76 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                 owed = retain_v4_checkpoint_end_owed_on_connection(
                     conn, running=running, prepared=prepared, admission=admission, returned=returned
                 )
+            if replacement_audit:
+                await lease.close()
+                current_store = new_owners(store)
+                current_repository, current_authority, current_sessions = current_store[1:4]
+                assert current_repository.recover_composer_segment(
+                    session_id=running.claim.session_id,
+                    operation_id=running.claim.operation_id,
+                    expected_generation=running.claim.ownership_generation,
+                    actor_user_id="alice",
+                    auth_provider_type="local",
+                )
+                (claim,) = current_authority.claim_segment(limit=1)
+                context = current_repository.start_composer_segment(
+                    claim,
+                    owner_instance_id=current_authority._owner_instance_id,
+                    lease_seconds=30,
+                    auth_provider_type="local",
+                )
+                replacement = ComposerOperationRunning(claim=claim, session_operation_context=context)
+                assert replacement.claim.ownership_generation == running.claim.ownership_generation + 1
+                assert context.fence.operation_epoch > running.session_operation_context.fence.operation_epoch
+                with locked_session_transaction(store[0], str(store[4])) as conn, current_sessions._session_write_lock(conn, str(store[4])):
+                    fresh = read_v4_checkpoint_end_owed_on_connection(
+                        conn,
+                        session_id=str(store[4]),
+                        operation_id=running.claim.operation_id,
+                        attempt_id=admission.attempt.attempt_id,
+                        names=prepared.env_ref_names,
+                    )
+                    assert fresh is not None and fresh.selected == owed.owed_selected
+                    call = decode_retained_physical_audit_call(fresh.response)
+                    cohort = checkpoint_paid_audit_cohort_for_hold(call, fresh.new_hold)
+                    with pytest.raises((AuditIntegrityError, ComposerOperationFenceLost)):
+                        admit_checkpoint_paid_audit_source_on_connection(
+                            conn,
+                            service=current_sessions,
+                            context=running.session_operation_context,
+                            owed=fresh,
+                            call=call,
+                            cohort=cohort,
+                            names=prepared.env_ref_names,
+                        )
+                    savepoint = conn.begin_nested()
+                    admitted = admit_checkpoint_paid_audit_source_on_connection(
+                        conn,
+                        service=current_sessions,
+                        context=context,
+                        owed=fresh,
+                        call=call,
+                        cohort=cohort,
+                        names=prepared.env_ref_names,
+                    )
+                    write_checkpoint_paid_audit_cohort_on_connection(
+                        conn,
+                        service=current_sessions,
+                        context=context,
+                        cohort=cohort,
+                        observed_at=database_now(conn),
+                        admitted=admitted,
+                    )
+                    require_checkpoint_paid_private_audit_on_connection(
+                        conn,
+                        source=fresh.new_hold,
+                        attempt_id=fresh.attempt_id,
+                        private_sha256=cohort.private_sha256,
+                        incomplete=False,
+                    )
+                    savepoint.rollback()
+                retained.append((None, None, owed, prepared, returned, None))
+                raise CapturedBeforeEndConsequences
             selected_owed = await load_selected_continuation(
                 authority=phases.authority, running=running, selected=owed.owed_selected, required_work=work
             )
@@ -184,7 +279,10 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
             )
             assert type(projected) is ProjectedEndCompleteRepair
             if expect_overflow:
-                with pytest.raises(ContinuationRetainedCapacityExceeded), locked_session_transaction(store[0], str(store[4])) as conn:
+                with (
+                    pytest.raises(ContinuationRetainedCapacityExceeded) as excess,
+                    locked_session_transaction(store[0], str(store[4])) as conn,
+                ):
                     persist_end_complete_repair_on_connection(
                         conn,
                         service=sessions,
@@ -196,6 +294,7 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                         projected=projected,
                     )
                 batch = None
+                failure = excess.value
             else:
                 with locked_session_transaction(store[0], str(store[4])) as conn:
                     batch = persist_end_complete_repair_on_connection(
@@ -208,14 +307,17 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                         returned=returned,
                         projected=projected,
                     )
-            retained.append((batch, projected, owed))
+                failure = None
+            retained.append((batch, projected, owed, prepared, returned, failure))
             raise CapturedBeforeEndConsequences
 
         monkeypatch.setattr(phases.service._advisor_checkpoint, "_run_advisor_checkpoint", intercept_original_end_gate)
         with pytest.raises(CapturedBeforeEndConsequences):
             await execute_continuation_end_review(phases, entered.source.selected)
         assert sdk_calls == [1] and len(retained) == 1
-        batch, projected, owed = retained[0]
+        batch, projected, owed, prepared, returned, failure = retained[0]
+        if replacement_audit:
+            return
         with locked_session_transaction(store[0], str(store[4])) as conn:
             stored = load_snapshot(conn, session_id=str(store[4]), operation_id=running.claim.operation_id)
             root = decode_continuation_snapshot(stored.payload_json)
@@ -274,6 +376,76 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                 assert attempt.settled_at is not None and hold.state == "consumed"
                 assert withheld is not None and withheld.content == "An actual PRIMARY candidate requires END review."
                 assert root.cursor == stored.cursor and not root.pending_settlement_ids
+        if expect_overflow:
+            assert type(failure) is ContinuationRetainedCapacityExceeded
+            assert failure.observed_bytes > failure.limit_bytes == allowance
+            sessions = phases.service._require_sessions_service()
+            if cold_resume:
+                with locked_session_transaction(store[0], str(store[4])) as conn:
+                    with pytest.raises(AuditIntegrityError):
+                        read_continuation_cost_snapshot_on_connection(conn, root, pending_end_owed_names=frozenset({"foreign-reference"}))
+                    with pytest.raises(AuditIntegrityError, match="differs from its current complete END H"):
+                        read_continuation_cost_snapshot_on_connection(
+                            conn, root.model_copy(update={"cursor": root.cursor - 1}), pending_end_owed_names=prepared.env_ref_names
+                        )
+                    pending_cost = read_continuation_cost_snapshot_on_connection(conn, root, pending_end_owed_names=prepared.env_ref_names)
+                    assert pending_cost is not None and pending_cost.physical_calls == len(pending_cost.charges) + 1
+                    with pytest.raises(AuditIntegrityError, match="provider output lacks settled actual calls"):
+                        CommonProviderCostBudget(pending_cost).require_dispatch()
+                    extra = conn.begin_nested()
+                    original_physical = conn.execute(
+                        select(physical).where(physical.c.attempt_id == owed.original.attempt.attempt_id)
+                    ).one()
+                    extra_row = dict(original_physical._mapping)
+                    extra_row["attempt_id"] = str(uuid4())
+                    conn.execute(insert(physical).values(**extra_row))
+                    with pytest.raises(AuditIntegrityError, match="unresolved physical attempt"):
+                        read_continuation_cost_snapshot_on_connection(conn, root, pending_end_owed_names=prepared.env_ref_names)
+                    extra.rollback()
+                selected_owed = await load_selected_continuation(
+                    authority=phases.authority, running=running, selected=owed.owed_selected, required_work=work
+                )
+                cold_source = await read_cold_checkpoint_end_consequence_source(phases=phases, selected=selected_owed)
+                cold_gate = await compute_first_cold_checkpoint_end_gate(source=cold_source)
+                cold_projected = await project_first_cold_end_repair(gate=cold_gate)
+                assert type(cold_projected) is ColdProjectedEndRepair
+                with pytest.raises(AuditIntegrityError, match="measured source arithmetic"):
+                    sessions.settle_cold_v4_checkpoint_end_owed_overflow_sync(
+                        cold_source=cold_source,
+                        failure=ContinuationRetainedCapacityExceeded(
+                            observed_bytes=failure.observed_bytes + 1, limit_bytes=failure.limit_bytes
+                        ),
+                        capacity_projection=cold_projected,
+                    )
+                terminal = sessions.settle_cold_v4_checkpoint_end_owed_overflow_sync(
+                    cold_source=cold_source, failure=failure, capacity_projection=cold_projected
+                )
+            else:
+                terminal = sessions.settle_v4_checkpoint_end_owed_overflow_sync(
+                    prepared=prepared, owed=owed, returned=returned, failure=failure
+                )
+            assert terminal.receipt.representation == "retained_tail"
+            assert terminal.receipt.reason == "retained_payload_bytes"
+            assert terminal.receipt.observed_bytes == failure.observed_bytes
+            assert terminal.receipt.measurement == "exact"
+            assert terminal.hold_state == "consumed" and sdk_calls == [1]
+            with locked_session_transaction(store[0], str(store[4])) as conn:
+                cold = read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=running.claim.operation_id,
+                    effect_key=owed.original.effect_key,
+                    names=prepared.env_ref_names,
+                )
+                assert cold == terminal
+                with pytest.raises(AuditIntegrityError, match="inventory"):
+                    read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
+                        conn,
+                        session_id=running.claim.session_id,
+                        operation_id=running.claim.operation_id,
+                        effect_key=owed.original.effect_key,
+                        names=frozenset({"foreign-reference"}),
+                    )
     finally:
         await lease.close()
         work.coordinator.assert_completed()

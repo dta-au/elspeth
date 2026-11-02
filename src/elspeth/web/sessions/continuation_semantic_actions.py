@@ -224,8 +224,9 @@ def _admit_paid(conn: Connection, paid: SemanticAdvisorPaidDecisionData) -> Sema
         or action.evidence_binding != evidence.coverage.evidence_binding
         or evidence.coverage.end_candidate is None
         or evidence.coverage.candidate_source is None
+        or evidence.coverage.end_candidate.kind == "recovery"
     ):
-        raise AuditIntegrityError("semantic review changed its original selected END candidate or source")
+        raise AuditIntegrityError("semantic review cannot replace an original provider-authored recovery")
     if action is None and (paid.decision.decision != "STOP_CONFIRMED" or paid.decision.scope != "whole_request"):
         raise AuditIntegrityError("semantic action owner only admits an actual whole-request Stop")
     premise = paid.invocation.invocation.premise

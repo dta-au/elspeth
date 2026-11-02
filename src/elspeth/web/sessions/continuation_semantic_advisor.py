@@ -87,7 +87,11 @@ from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource, provider_attempt_audit_drafts_for_source
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.turn_effects import authored_state_hash
-from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+from elspeth.web.continuation_retention_memo import (
+    RetentionStageMemo,
+    borrow_legacy_advisor_inflight_memo,
+    current_legacy_advisor_preparation_memo,
+)
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
     ProviderAttempt,
@@ -154,7 +158,9 @@ from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.time_normalization import restore_utc
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext
+    from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.continuation_iteration_return import IterationReturnCommitted
     from elspeth.web.sessions.continuation_semantic_actions import SemanticActionAdmission
     from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
@@ -451,6 +457,7 @@ class _SemanticEndSourceObservation:
     candidate: EndContinuationCandidate | None
     review: SemanticReviewCommitted | None = None
     iteration_return: IterationReturnCommitted | None = None
+    recovery_response: PrivateChunk | None = None
 
 
 def _input_end_source_observation(
@@ -499,6 +506,30 @@ def _input_end_source_observation(
     ):
         raise AuditIntegrityError("Semantic END input lost its original unreviewed paid reply")
     candidate = decode_end_candidate(_ref(conn, sid, operation, end.candidate))
+    if candidate.kind == "recovery":
+        from elspeth.web.composer.continuation_end_transitions import recovery_candidate_for
+        from elspeth.web.composer.recovery_controls import parse_recovery_tool_batch
+
+        if candidate.semantic_source is not None or end.phase != "review_needed" or end.publication_binding is not None:
+            raise AuditIntegrityError("Semantic recovery END changed its original unreviewed source")
+        if parent.pending_response is None:
+            raise AuditIntegrityError("Semantic recovery END lost its paid response")
+        original = read_original_committed_primary_response_data_on_connection(
+            conn,
+            session_id=UUID(sid),
+            operation_id=operation,
+            source_checkpoint_id=checkpoint_id,
+            source_cursor=cursor,
+            response=parent.pending_response,
+        )
+        response = decode_continuation_response(original)
+        try:
+            intent = parse_recovery_tool_batch(response.tool_batch)
+        except (TypeError, ValueError) as error:
+            raise AuditIntegrityError("Semantic recovery END changed its sole original control") from error
+        if intent is None or candidate != recovery_candidate_for(parent, message=intent.message):
+            raise AuditIntegrityError("Semantic recovery END substituted its paid provider-authored intent")
+        return _SemanticEndSourceObservation(candidate, recovery_response=original)
     if candidate.semantic_source is not None:
         from elspeth.web.sessions.continuation_semantic_actions import read_original_semantic_review_for_advisor_on_connection
 
@@ -890,7 +921,16 @@ def begin_semantic_advisor_on_connection(
         != (binding.running.claim.segment_sequence, binding.running.claim.ownership_generation)
     ):
         raise ContinuationCASConflict("Semantic begin cannot retry unresolved or foreign preparation")
-    _inflight_source_data(conn, str(binding.running.claim.session_id), binding.running.claim.operation_id, prepared.snapshot, root)
+    preparation_memo = current_legacy_advisor_preparation_memo(no_sdk_issuer.clock)
+    _inflight_source_data(
+        conn,
+        str(binding.running.claim.session_id),
+        binding.running.claim.operation_id,
+        prepared.snapshot,
+        root,
+        preparation_memo=preparation_memo,
+        preparation_clock=no_sdk_issuer.clock if preparation_memo is not None else None,
+    )
     with conn.begin_nested():
         conn.execute(
             update(effects)
@@ -2086,6 +2126,12 @@ def install_semantic_advisor_decision_on_connection(
         raise AuditIntegrityError("Semantic installation requires its one uninstalled original successful decision")
     if result.decision.prescribed_action is not None and result.decision.prescribed_action.kind != "primary_turn":
         raise AuditIntegrityError("Semantic read/review actions require their separate actual execution-owner joins")
+    if result.decision.prescribed_action is not None and len(root.frames) == 3 and type(root.frames[1]) is EndFrame:
+        selected_candidate = decode_end_candidate(
+            _ref(conn, str(running.claim.session_id), running.claim.operation_id, root.frames[1].candidate)
+        )
+        if selected_candidate.kind == "recovery":
+            raise AuditIntegrityError("ordinary paid recovery requires its later whole-request Stop")
     premise = data.invocation.premise
     if premise is None:
         raise AuditIntegrityError("Semantic installation lost its original exact premise")
@@ -2279,6 +2325,58 @@ class _WholeStopSourceBridge(ContinuationValue):
     review_checkpoint_id: str
     review_cursor: int
     publication_binding: str
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticOrdinaryRecoveryPublicationProof:
+    """Original paid ordinary recovery and a later whole-request paid Stop."""
+
+    admission: SemanticActionAdmission
+    result: ComposerResult
+    recovery_context: GraphRecoveryContext
+
+
+def _original_ordinary_recovery_result(
+    conn: Connection, sid: str, operation: str, selected: StoredContinuationSnapshot
+) -> tuple[ComposerResult, GraphRecoveryContext, EndContinuationCandidate]:
+    from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
+    from elspeth.web.composer.protocol import ComposerResult
+    from elspeth.web.composer.recovery_controls import parse_recovery_tool_batch
+    from elspeth.web.composer.state import CompositionState
+
+    root = decode_continuation_snapshot(selected.payload_json)
+    observation = _input_end_source_observation(conn, sid, operation, root, checkpoint_id=selected.checkpoint_id, cursor=selected.cursor)
+    candidate, paid = observation.candidate, observation.recovery_response
+    if candidate is None or candidate.kind != "recovery" or paid is None or len(root.frames) != 2:
+        raise AuditIntegrityError("ordinary recovery lost its original paid END source")
+    compose = _parent(root)
+    if compose.pending_response is None:
+        raise AuditIntegrityError("ordinary recovery lost its retained PRIMARY result")
+    try:
+        intent = parse_recovery_tool_batch(decode_continuation_response(paid).tool_batch)
+    except (TypeError, ValueError) as error:
+        raise AuditIntegrityError("ordinary recovery changed its original control") from error
+    if intent is None or intent.message != candidate.candidate_text:
+        raise AuditIntegrityError("ordinary recovery changed its provider-authored message")
+    state_chunk = _ref(conn, sid, operation, compose.state)
+    state_document, state_error = parse_json_strict(state_chunk.canonical)
+    if state_error is not None or type(state_document) is not dict:
+        raise AuditIntegrityError("ordinary recovery lost its original state document")
+    state = CompositionState.from_dict(state_document)
+    if canonical_json(state.to_dict()) != state_chunk.canonical:
+        raise AuditIntegrityError("ordinary recovery normalized its original state")
+    recorder = decode_recorder_snapshot(_ref(conn, sid, operation, compose.audit_buffer))
+    bootstrap = decode_continuation_bootstrap(_ref(conn, sid, operation, compose.bootstrap))
+    if bootstrap.logical != root.logical:
+        raise AuditIntegrityError("ordinary recovery changed its authenticated bootstrap")
+    result = ComposerResult(
+        message=intent.message,
+        state=state,
+        graph_recovery_intent=intent,
+        tool_invocations=() if compose.persisted_tool_call_turn else recorder.invocations,
+        llm_calls=recorder.llm_calls,
+    )
+    return result, bootstrap_values(bootstrap).recovery_context, candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -2916,6 +3014,194 @@ def consume_semantic_advisor_whole_stop_on_connection(
         if require_semantic_publication_on_connection(conn, running, selected=consumed) is None:
             raise AuditIntegrityError("Semantic whole Stop lost its exact consumed final SQL proof")
         return consumed
+
+
+def consume_semantic_advisor_end_stop_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Select the cold-proved ordinary recovery or clean reviewed END Stop."""
+    from elspeth.web.sessions.continuation_semantic_actions import require_semantic_whole_stop_on_connection
+
+    admission = require_semantic_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    original = admission.evidence.coverage.end_candidate
+    if original is not None and original.kind == "recovery":
+        return consume_semantic_advisor_ordinary_recovery_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    return consume_semantic_advisor_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+
+
+def _ordinary_recovery_stop_event(
+    *, source: ContinuationActionSource, original_candidate: PrivateChunkRef, candidate: PrivateChunkRef
+) -> str:
+    return canonical_json(
+        {
+            "kind": "semantic_ordinary_recovery_stop_ready",
+            "source": source.model_dump(mode="json"),
+            "original_candidate": original_candidate.model_dump(mode="json"),
+            "candidate": candidate.model_dump(mode="json"),
+        }
+    )
+
+
+def consume_semantic_advisor_ordinary_recovery_stop_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Consume paid whole Stop over one cold-proved ordinary PRIMARY recovery."""
+    from elspeth.web.sessions.continuation_semantic_actions import require_semantic_whole_stop_on_connection
+
+    root = _current(conn, running, selected)
+    admission = require_semantic_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    if len(root.frames) != 3 or _advisor(root).phase != "decision_ready" or type(root.frames[1]) is not EndFrame:
+        raise AuditIntegrityError("ordinary recovery Stop lost its original Compose/END/Advisor stack")
+    parent, end = _parent(root), root.frames[1]
+    original = admission.evidence.coverage.end_candidate
+    source = admission.paid.source
+    input_source = admission.paid.invocation.source
+    assessed = _historical_snapshot(
+        conn, str(running.claim.session_id), running.claim.operation_id, checkpoint_id=input_source.checkpoint_id
+    )
+    if (assessed.cursor, assessed.payload_json) != (input_source.cursor, input_source.selected_snapshot_json):
+        raise AuditIntegrityError("ordinary recovery Stop changed its original assessed cut")
+    original_result, _context, proved = _original_ordinary_recovery_result(
+        conn, str(running.claim.session_id), running.claim.operation_id, assessed
+    )
+    if (
+        original is None
+        or original != proved
+        or admission.evidence.coverage.candidate_source != end.candidate
+        or end.phase != "review_needed"
+        or end.publication_binding is not None
+        or original_result.graph_recovery_intent is None
+        or (original.state, original.evidence, original.iteration)
+        != (input_source.state.reference, input_source.evidence.reference, input_source.iteration.reference)
+    ):
+        raise AuditIntegrityError("ordinary recovery Stop substituted its original paid intent or source")
+    candidate = encode_end_candidate(
+        original.model_copy(update={"semantic_source": source, "semantic_decision_json": admission.paid.decision_json})
+    )
+    ready = root.model_copy(
+        update={"frames": (parent, end.model_copy(update={"phase": "publication_ready", "candidate": candidate.reference}))}
+    )
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    event = _ordinary_recovery_stop_event(source=source, original_candidate=end.candidate, candidate=candidate.reference)
+    with conn.begin_nested():
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=private_chunk_key(candidate),
+            payload=candidate.canonical.encode("utf-8"),
+            codec=candidate.reference.codec,
+        )
+        consumed = append_complete_snapshot(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            expected_checkpoint_id=selected.checkpoint_id,
+            expected_cursor=selected.cursor,
+            snapshot_json=encode_continuation_snapshot(ready),
+            event_batch=(ContinuationEvent("checkpoint", event),),
+            handoff=False,
+        )
+        if require_semantic_ordinary_recovery_publication_on_connection(conn, running, selected=consumed) is None:
+            raise AuditIntegrityError("ordinary recovery Stop lost its consumed cold publication proof")
+        return consumed
+
+
+def require_semantic_ordinary_recovery_publication_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot
+) -> SemanticOrdinaryRecoveryPublicationProof | None:
+    """Current final-SQL admission for the cold ordinary recovery proof."""
+    _require_current_continuation_running(conn, running, allow_cancel=False, allow_expired_segment=True)
+    if _owed_continuation_p4_active(conn, running.session_operation_context):
+        raise AuditIntegrityError("ordinary recovery publication cannot borrow an active P4 finish")
+    current = require_snapshot_cas(
+        conn,
+        session_id=str(running.claim.session_id),
+        operation_id=running.claim.operation_id,
+        expected_checkpoint_id=selected.checkpoint_id,
+        expected_cursor=selected.cursor,
+    )
+    if current != selected:
+        raise ContinuationCASConflict("ordinary recovery publication changed its current selected root")
+    return _semantic_ordinary_recovery_publication_data(conn, str(running.claim.session_id), running.claim.operation_id, selected)
+
+
+def _semantic_ordinary_recovery_publication_data(
+    conn: Connection, sid: str, operation: str, selected: StoredContinuationSnapshot
+) -> SemanticOrdinaryRecoveryPublicationProof | None:
+    """Reprove original paid recovery and paid Stop from immutable history."""
+    from elspeth.web.sessions.continuation_semantic_actions import _reprove_installed_snapshot
+
+    root = decode_continuation_snapshot(selected.payload_json)
+    if len(root.frames) != 2 or type(root.frames[1]) is not EndFrame:
+        return None
+    parent, end = _parent(root), root.frames[1]
+    candidate = decode_end_candidate(_ref(conn, sid, operation, end.candidate))
+    if candidate.kind != "recovery":
+        return None
+    if selected.cursor < 1 or candidate.semantic_source is None:
+        raise AuditIntegrityError("ordinary recovery publication lacks its paid Stop source")
+    installed = _historical_snapshot(conn, sid, operation, cursor=selected.cursor - 1)
+    admission = _reprove_installed_snapshot(conn, UUID(sid), operation, installed, candidate.semantic_source.effect_key)
+    if (
+        admission.action is not None
+        or admission.action_key is not None
+        or not admission.evidence.coverage.complete
+        or admission.paid.decision.decision != "STOP_CONFIRMED"
+        or admission.paid.decision.scope != "whole_request"
+        or candidate.semantic_source != admission.paid.source
+        or candidate.semantic_decision_json != admission.paid.decision_json
+        or len(admission.expected_root.frames) != 3
+    ):
+        raise AuditIntegrityError("ordinary recovery publication changed its actual paid whole Stop")
+    original_end = admission.expected_root.frames[1]
+    if type(original_end) is not EndFrame or original_end.phase != "review_needed":
+        raise AuditIntegrityError("ordinary recovery publication changed its unreviewed original END")
+    input_source = admission.paid.invocation.source
+    assessed = _historical_snapshot(conn, sid, operation, checkpoint_id=input_source.checkpoint_id)
+    if (assessed.cursor, assessed.payload_json) != (
+        input_source.cursor,
+        input_source.selected_snapshot_json,
+    ):
+        raise AuditIntegrityError("ordinary recovery publication changed its original assessed source")
+    result, context, original = _original_ordinary_recovery_result(conn, sid, operation, assessed)
+    expected_candidate = encode_end_candidate(
+        original.model_copy(update={"semantic_source": admission.paid.source, "semantic_decision_json": admission.paid.decision_json})
+    )
+    if (
+        admission.evidence.coverage.end_candidate != original
+        or admission.evidence.coverage.candidate_source != original_end.candidate
+        or original_end.candidate != encode_end_candidate(original).reference
+        or candidate != decode_end_candidate(expected_candidate)
+        or end.candidate != expected_candidate.reference
+        or end.phase != "publication_ready"
+        or end.publication_binding is not None
+        or parent != admission.expected_root.frames[0]
+        or root
+        != admission.expected_root.model_copy(
+            update={
+                "cursor": selected.cursor,
+                "frames": (
+                    parent,
+                    original_end.model_copy(update={"phase": "publication_ready", "candidate": expected_candidate.reference}),
+                ),
+            }
+        )
+    ):
+        raise AuditIntegrityError("ordinary recovery publication substituted its retained candidate or root")
+    _journal_data(
+        conn,
+        sid,
+        operation,
+        cursor=selected.cursor,
+        tag="checkpoint",
+        payload=_ordinary_recovery_stop_event(
+            source=admission.paid.source, original_candidate=original_end.candidate, candidate=expected_candidate.reference
+        ),
+    )
+    if result.graph_recovery_intent is None:
+        raise AuditIntegrityError("ordinary recovery publication lost its provider-authored intent")
+    return SemanticOrdinaryRecoveryPublicationProof(admission, result, context)
 
 
 def _read_consumed_root(
@@ -3656,13 +3942,20 @@ def require_current_prescribed_primary_action_on_connection(
 
 
 def _inflight_source_data(
-    conn: Connection, sid: str, operation: str, selected: StoredContinuationSnapshot, root: ContinuationFrameStack
+    conn: Connection,
+    sid: str,
+    operation: str,
+    selected: StoredContinuationSnapshot,
+    root: ContinuationFrameStack,
+    *,
+    preparation_memo: RetentionStageMemo | None = None,
+    preparation_clock: ContinuationActionClock | None = None,
 ) -> Row[Any]:
     frame = _advisor(root)
     if frame.phase != "awaiting_response" or frame.provider_effect_key is None or frame.response is not None:
         raise AuditIntegrityError("Semantic in-flight source changed its original selected frame")
     effect = _effect_data(conn, sid, operation, root, frame.provider_effect_key)
-    with retention_stage_memo_scope():
+    with borrow_legacy_advisor_inflight_memo(preparation_memo, preparation_clock):
         data, _physical = _original_input_data(conn, sid, operation, root, effect)
     _creator_data(conn, sid, operation, effect)
     if effect.disposition not in ("prepared", "dispatched") or any(

@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
 
     from elspeth.contracts.secrets import WebSecretResolver
+    from elspeth.web.composer.continuation_preview_dispatch import IssuedPreviewDispatch
     from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
     from elspeth.web.composer.continuation_tool_failure import ContinuationDispatchFailureObservation, ContinuationToolFailureCustody
     from elspeth.web.composer.continuation_value_batch_computation import ObservedValueBatchComputation
@@ -1825,8 +1826,15 @@ async def _execute_continuation_call_live(
     retained_attachment: AttachmentResultCheckpoint | None = None,
     failure_custody: ContinuationToolFailureCustody | None = None,
     value_computation: ObservedValueBatchComputation | None = None,
+    issued_preview: IssuedPreviewDispatch | None = None,
 ) -> Literal["applied"]:
     """Execute the original suffix with the actual caller's revocation owner."""
+    if issued_preview is not None:
+        from elspeth.web.composer.continuation_preview_dispatch import require_preview_adoption
+
+        if value_computation is not None or retained_attachment is not None:
+            raise AuditIntegrityError("issued preview cannot borrow another returned-value owner")
+        require_preview_adoption(issued_preview, call_model=call_model, ctx=ctx, acc=acc, batch=batch, call=call)
     if value_computation is not None:
         from elspeth.web.composer.continuation_value_batch_computation import require_value_batch_execution
 
@@ -1901,7 +1909,7 @@ async def _execute_continuation_call_live(
     publication = None
     if ctx.message_producers is not None:
         ctx.message_producers.require_context(session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id)
-        if value_computation is None:
+        if value_computation is None and issued_preview is None:
             publication = ContinuationToolMessagePublication(
                 ctx.message_producers, call_model.completion, batch, call, recorder, llm_messages, ctx.policy_catalog
             )
@@ -3419,17 +3427,22 @@ async def _execute_continuation_call_live(
                     preview_claims_admitted = False
             if tool_name == "preview_pipeline" and preview_claims_admitted:
                 try:
-                    preview_preflight = await ctx.preflight.cached_runtime_preflight(
-                        state,
-                        user_id=user_id,
-                        session_id=session_id,
-                        cache=runtime_preflight_cache,
-                        initial_version=initial_version,
-                        session_scope=session_scope,
-                        llm_calls=recorder.llm_calls,
-                        plugin_snapshot=ctx.plugin_snapshot,
-                        session_operation_context=ctx.session_operation_context,
-                    )
+                    if issued_preview is not None:
+                        from elspeth.web.composer.continuation_preview_dispatch import original_preview_preflight
+
+                        preview_preflight = original_preview_preflight(issued_preview)
+                    else:
+                        preview_preflight = await ctx.preflight.cached_runtime_preflight(
+                            state,
+                            user_id=user_id,
+                            session_id=session_id,
+                            cache=runtime_preflight_cache,
+                            initial_version=initial_version,
+                            session_scope=session_scope,
+                            llm_calls=recorder.llm_calls,
+                            plugin_snapshot=ctx.plugin_snapshot,
+                            session_operation_context=ctx.session_operation_context,
+                        )
                 except asyncio.CancelledError as cancellation:
                     if observation is not None:
                         observation.observe_primary(cancellation)
@@ -3475,23 +3488,28 @@ async def _execute_continuation_call_live(
                 # turn claimed to check for.
                 if is_pending_interpretation_handoff(preview_preflight):
                     try:
-                        structural_preflight_result = await _await_started_tool_stage(
-                            ctx.preflight.cached_runtime_preflight(
-                                state,
-                                user_id=user_id,
-                                session_id=session_id,
-                                cache=runtime_preflight_cache,
-                                initial_version=initial_version,
-                                session_scope=session_scope,
-                                llm_calls=recorder.llm_calls,
-                                plugin_snapshot=ctx.plugin_snapshot,
-                                session_operation_context=ctx.session_operation_context,
-                                interpretation_tolerant=True,
-                            ),
-                            audit=audit,
-                            recorder=recorder,
-                            failure_observation=observation,
-                        )
+                        if issued_preview is not None:
+                            from elspeth.web.composer.continuation_preview_dispatch import original_preview_preflight
+
+                            structural_preflight_result = original_preview_preflight(issued_preview, tolerant=True)
+                        else:
+                            structural_preflight_result = await _await_started_tool_stage(
+                                ctx.preflight.cached_runtime_preflight(
+                                    state,
+                                    user_id=user_id,
+                                    session_id=session_id,
+                                    cache=runtime_preflight_cache,
+                                    initial_version=initial_version,
+                                    session_scope=session_scope,
+                                    llm_calls=recorder.llm_calls,
+                                    plugin_snapshot=ctx.plugin_snapshot,
+                                    session_operation_context=ctx.session_operation_context,
+                                    interpretation_tolerant=True,
+                                ),
+                                audit=audit,
+                                recorder=recorder,
+                                failure_observation=observation,
+                            )
                     except ComposerRuntimePreflightError as preflight_exc:
                         if observation is not None:
                             observation.observe_primary(preflight_exc.original_exc)
@@ -3597,6 +3615,10 @@ async def _execute_continuation_call_live(
             ) -> Any:
                 if _preproposal_exception is not None:
                     raise _preproposal_exception
+                if issued_preview is not None:
+                    from elspeth.web.composer.continuation_preview_dispatch import consume_original_preview_result
+
+                    return consume_original_preview_result(issued_preview, call_model=call_model, ctx=ctx, acc=acc, batch=batch, call=call)
                 if value_computation is not None:
                     from elspeth.web.composer.continuation_value_batch_computation import consume_value_batch_computation
 

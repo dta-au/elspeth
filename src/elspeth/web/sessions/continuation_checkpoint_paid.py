@@ -166,6 +166,7 @@ def _initial_phase_source(
     conn: Connection, *, session_id: UUID, operation_id: str, selected: StoredContinuationSnapshot
 ) -> CheckpointPhaseSource | None:
     from elspeth.web.composer.continuation_classifier_handoff import ClassifyPostPrimary, ClassifySourceProofStop
+    from elspeth.web.sessions.continuation_checkpoint_end_retry import read_end_format_retry_phase_on_connection
     from elspeth.web.sessions.continuation_iteration_return import (
         _encode_pending,
         _end_key,
@@ -175,6 +176,9 @@ def _initial_phase_source(
     sid = str(session_id)
     root = decode_continuation_snapshot(selected.payload_json)
     _effect_inventory(conn, sid, operation_id, selected)
+    retry_phase = read_end_format_retry_phase_on_connection(conn, session_id=sid, operation_id=operation_id, selected=selected)
+    if retry_phase is not None:
+        return retry_phase
     top = root.frames[-1]
     if type(top) is ToolBatchFrame:
         stage = read_iteration_stage_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=selected)
@@ -294,6 +298,8 @@ def prepare_v4_checkpoint_source_on_connection(
         )
         if gate.pass_index != prepared.pass_index:
             raise AuditIntegrityError("END checkpoint preparation changed its original pass/retry source")
+        if len(phase.completed_children) > 1 or gate.retry_ordinal != (1 if phase.completed_children else 0):
+            raise AuditIntegrityError("END checkpoint preparation changed its one original format retry")
     elif prepared.end_input is not None:
         raise AuditIntegrityError("EARLY checkpoint cannot borrow END gate input")
     before = selected.stack

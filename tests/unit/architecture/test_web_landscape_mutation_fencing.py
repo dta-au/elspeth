@@ -19157,11 +19157,237 @@ def _reserve_manual_advisor_allowance_receipt(units):
     return [], frozenset({(path, id(call))})
 
 
+def _reserve_current_v4_no_sdk_units():
+    root = _repo_root()
+    paths = {key.split(":", 1)[0] for key in _reserve_provider_mint_contract.V4_NO_SDK_SOURCE_CONTRACTS}
+    return tuple(_read_source(root / path, anchor=root) for path in sorted(paths))
+
+
+def test_reserve_v4_no_sdk_receipts_bind_exact_original_source_nodes():
+    units = _reserve_current_v4_no_sdk_units()
+    failures, receipt = _reserve_provider_mint_contract.v4_no_sdk_reserve_local_contracts(units)
+    assert failures == [] and receipt is not None
+    nodes = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+    assert len(receipt["reserve_calls"]) == 3 and len(receipt["caller_calls"]) == 4
+    assert {path for path, _node in receipt["reserve_calls"]} == {
+        "src/elspeth/web/composer/continuation_primary.py",
+        "src/elspeth/web/composer/continuation_title_provider.py",
+        "src/elspeth/web/sessions/continuation_classifier_primary.py",
+    }
+    for field in ("reserve_calls", "caller_calls", "terminal_calls", "source_nodes", "import_nodes"):
+        assert receipt[field] and receipt[field] <= nodes.keys()
+    assert all(isinstance(nodes[site], ast.Call) and nodes[site].func.attr == "reserve" for site in receipt["reserve_calls"])
+    assert receipt["remaining_premises"] == (
+        "COMMON_ORIGIN_RECEIVER_DESCRIPTOR_EFFECT_CLOSURE",
+        "CURRENT_FROZEN_SOURCE_BINDINGS",
+        "ORIGINAL_SQL_AND_COLD_READER_BEHAVIOR",
+    )
+    cloned = tuple(_parse_source(unit.path, unit.source) for unit in units)
+    clone_failures, clone_receipt = _reserve_provider_mint_contract.v4_no_sdk_reserve_local_contracts(cloned)
+    assert clone_failures == [] and clone_receipt is not None
+    assert receipt["reserve_calls"].isdisjoint(clone_receipt["reserve_calls"])
+
+
+@pytest.mark.parametrize("family", ("primary", "title", "classifier"))
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "writer_ticket",
+        "writer_identity",
+        "original_outcome",
+        "issuer_attempt",
+        "cold_identity",
+        "service_context",
+        "cold_hold",
+        "cold_zero_use",
+        "work_ordinal",
+        "early_custody",
+        "extra_reserve",
+    ),
+)
+@pytest.mark.parametrize("rebind_complete_template", (False, True), ids=("original-template", "rebound-template"))
+def test_reserve_v4_no_sdk_closure_refuses_foreign_originals_even_with_rebound_template(
+    monkeypatch, family, fault, rebind_complete_template
+):
+    helper = _reserve_provider_mint_contract
+    units = _reserve_current_v4_no_sdk_units()
+    failures, receipt = helper.v4_no_sdk_reserve_local_contracts(units)
+    assert failures == [] and receipt is not None
+    producers = {
+        "primary": ("src/elspeth/web/composer/continuation_primary.py", "_finish_v4_primary_no_sdk"),
+        "title": ("src/elspeth/web/composer/continuation_title_provider.py", "_close_v4_title_no_sdk"),
+        "classifier": ("src/elspeth/web/sessions/continuation_classifier_primary.py", "ClassifierPrimaryIssuer._finish_v4_no_sdk"),
+    }
+    issuers = {
+        "primary": ("src/elspeth/web/composer/continuation_primary_no_sdk.py", "PrimaryNoSdkIssuer", "reserve_v4_refusal"),
+        "title": ("src/elspeth/web/composer/continuation_title_no_sdk.py", "TitleNoSdkIssuer", "require_refusal_permit"),
+        "classifier": ("src/elspeth/web/composer/continuation_classifier_no_sdk.py", "ClassifierNoSdkIssuer", "reserve_v4_refusal"),
+    }
+    readers = {
+        "primary": (
+            "src/elspeth/web/sessions/continuation_primary_paid_overflow_refusal_terminal.py",
+            "read_v4_primary_no_sdk_refusal_on_connection",
+        ),
+        "title": ("src/elspeth/web/sessions/continuation_title_no_sdk_terminal.py", "read_v4_title_no_sdk_terminal_on_connection"),
+        "classifier": (
+            "src/elspeth/web/sessions/continuation_classifier_primary_no_sdk.py",
+            "read_classifier_no_sdk_refusal_on_connection",
+        ),
+    }
+    writers = {
+        "primary": (
+            "src/elspeth/web/sessions/continuation_primary_paid_overflow_refusal.py",
+            "refuse_v4_primary_unentered_on_connection",
+        ),
+        "title": (
+            "src/elspeth/web/sessions/continuation_title_no_sdk_close.py",
+            "_refuse_v4_title_no_sdk_locked_on_connection",
+        ),
+        "classifier": (
+            "src/elspeth/web/sessions/continuation_classifier_primary_no_sdk.py",
+            "refuse_classifier_no_sdk_on_connection",
+        ),
+    }
+    path, symbol = producers[family]
+    contract_symbol = symbol
+    if fault == "issuer_attempt":
+        path, contract_symbol, method = issuers[family]
+        symbol = contract_symbol + "." + method
+    elif fault == "service_context":
+        path = "src/elspeth/web/sessions/service.py"
+        symbol = contract_symbol = "SessionServiceImpl.cancel_v4_continuation_" + family + "_unentered"
+    elif fault in {"cold_hold", "cold_zero_use"}:
+        path, symbol = readers[family]
+        contract_symbol = symbol
+    elif fault == "writer_identity":
+        path, symbol = writers[family]
+        contract_symbol = symbol
+    original = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(path, original.source)
+    method = _reserve_node_at(changed, symbol)
+    assert method is not None
+    if fault == "writer_ticket":
+        call = next(
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "cancel_v4_continuation_" + family + "_unentered"
+        )
+        next(keyword for keyword in call.keywords if keyword.arg == "required_work").value = ast.Name(id="foreign_ticket", ctx=ast.Load())
+    elif fault == "original_outcome":
+        call = next(
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr.startswith("validate_")
+            and any(keyword.arg == "actual_outcome" and ast.unparse(keyword.value) == "outcome" for keyword in node.keywords)
+        )
+        next(keyword for keyword in call.keywords if keyword.arg == "actual_outcome").value = ast.Name(id="foreign_outcome", ctx=ast.Load())
+    elif fault == "writer_identity":
+        spelling = {
+            "primary": "permit.undispatched_attempt_id != admission.attempt.attempt_id",
+            "title": "child.provider_attempt_id != admission.attempt.attempt_id",
+            "classifier": "prepared.binding.running is not permit.issuer.running",
+        }[family]
+        expected_comparison = ast.parse(spelling, mode="eval").body
+        comparison = next(
+            node for node in ast.walk(method) if isinstance(node, ast.Compare) and helper._shape(node) == helper._shape(expected_comparison)
+        )
+        comparison.comparators[0] = copy.deepcopy(comparison.left)
+    elif fault == "issuer_attempt":
+        spelling = {
+            "primary": "self._attempt_id != admission.attempt.attempt_id",
+            "title": "permit.admission is not self._admission",
+            "classifier": "self._attempt is not admission.attempt",
+        }[family]
+        expected_comparison = ast.parse(spelling, mode="eval").body
+        comparison = next(
+            node for node in ast.walk(method) if isinstance(node, ast.Compare) and helper._shape(node) == helper._shape(expected_comparison)
+        )
+        comparison.comparators[0] = ast.Name(id="foreign_admission", ctx=ast.Load())
+    elif fault == "cold_identity":
+        spelling = "verified.source != admission.hold" if family == "title" else "proved != receipt"
+        expected_comparison = ast.parse(spelling, mode="eval").body
+        comparison = next(
+            node for node in ast.walk(method) if isinstance(node, ast.Compare) and helper._shape(node) == helper._shape(expected_comparison)
+        )
+        comparison.comparators[0] = ast.Name(id="foreign_terminal", ctx=ast.Load())
+    elif fault == "service_context":
+        call = next(
+            node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_validate_required_sql_ticket"
+        )
+        next(keyword for keyword in call.keywords if keyword.arg == "context").value = ast.Name(id="foreign_context", ctx=ast.Load())
+    elif fault == "cold_hold":
+        spelling = "hold.provider_attempt_id != effect.provider_attempt_id" if family == "title" else 'hold.state != "consumed"'
+        expected_comparison = ast.parse(spelling, mode="eval").body
+        comparison = next(
+            node for node in ast.walk(method) if isinstance(node, ast.Compare) and helper._shape(node) == helper._shape(expected_comparison)
+        )
+        comparison.comparators[0] = ast.Name(id="foreign_hold", ctx=ast.Load())
+    elif fault == "cold_zero_use":
+        expected_comparison = ast.parse("value != 0", mode="eval").body
+        comparison = next(
+            node for node in ast.walk(method) if isinstance(node, ast.Compare) and helper._shape(node) == helper._shape(expected_comparison)
+        )
+        comparison.ops = [ast.Lt()]
+    elif fault in {"work_ordinal", "extra_reserve"}:
+        call = next(
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "reserve"
+        )
+        if fault == "work_ordinal":
+            next(keyword for keyword in call.keywords if keyword.arg == "transition_ordinal").value = ast.Constant(value=999)
+        else:
+            method.body.append(ast.Expr(value=copy.deepcopy(call)))
+    else:
+        assert fault == "early_custody"
+        method.body.insert(0, ast.parse("custody.attempt = None").body[0])
+    ast.fix_missing_locations(changed.tree)
+    modified = tuple(changed if unit is original else unit for unit in units)
+    with monkeypatch.context() as active:
+        if rebind_complete_template:
+            active.setitem(
+                helper.V4_NO_SDK_SOURCE_CONTRACTS, path + ":" + contract_symbol, ast.unparse(_reserve_node_at(changed, contract_symbol))
+            )
+        rejected, absent = helper.v4_no_sdk_reserve_local_contracts(modified)
+        assert rejected and absent is None
+    assert helper.v4_no_sdk_reserve_local_contracts(units) == ([], receipt)
+
+
+@pytest.mark.parametrize("family", ("primary", "title", "classifier"))
+def test_reserve_v4_no_sdk_original_producer_cannot_acquire_an_extra_caller(family):
+    helper = _reserve_provider_mint_contract
+    units = _reserve_current_v4_no_sdk_units()
+    assert helper.v4_no_sdk_reserve_local_contracts(units)[0] == []
+    target = {"primary": "_finish_v4_primary_no_sdk", "title": "_close_v4_title_no_sdk", "classifier": "_finish_v4_no_sdk"}[family]
+    expression = "foreign." + target if family == "classifier" else target
+    added = _parse_source(
+        "src/elspeth/web/v4_no_sdk_foreign_caller_probe.py",
+        "async def foreign_dispatch(**inputs):\n    return await " + expression + "(**inputs)\n",
+    )
+    failures, receipt = helper.v4_no_sdk_reserve_local_contracts((*units, added))
+    assert failures == ["V4 no-SDK original producer reference universe changed"] and receipt is None
+    assert helper.v4_no_sdk_reserve_local_contracts(units)[0] == []
+
+
+def test_reserve_v4_no_sdk_source_set_cannot_return_an_empty_certificate():
+    helper = _reserve_provider_mint_contract
+    units = _reserve_current_v4_no_sdk_units()
+    assert helper.v4_no_sdk_reserve_local_contracts(units)[0] == []
+    for changed in (units[:-1], (*units, units[-1])):
+        failures, receipt = helper.v4_no_sdk_reserve_local_contracts(changed)
+        assert failures == ["V4 no-SDK source set is missing or duplicated"] and receipt is None
+
+
 def _reserve_current_call_inventory(units):
     """Refuse any unaccounted production `.reserve` Call before graph admission."""
     expected_web = {
         "src/elspeth/web/composer/continuation_initialization.py": 1,
-        "src/elspeth/web/composer/continuation_title_provider.py": 1,
+        "src/elspeth/web/composer/continuation_primary.py": 1,
+        "src/elspeth/web/composer/continuation_title_provider.py": 2,
         "src/elspeth/web/composer/provider_quota.py": 2,
         "src/elspeth/web/coordination/lifecycle.py": 3,
         "src/elspeth/web/operator_telemetry.py": 1,
@@ -19169,6 +19395,7 @@ def _reserve_current_call_inventory(units):
         "src/elspeth/web/composer/tool_batch.py": 1,
         # V1 worker/turn reserves were deleted; the current driver owns these calls.
         "src/elspeth/web/sessions/continuation_driver.py": 3,
+        "src/elspeth/web/sessions/continuation_classifier_primary.py": 1,
         "src/elspeth/web/sessions/continuation_tool_failure.py": 1,
         "src/elspeth/web/sessions/routes/_helpers.py": 3,
         "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": 8,
@@ -19181,6 +19408,9 @@ def _reserve_current_call_inventory(units):
     allowance_failures, allowance_calls = _reserve_manual_advisor_allowance_receipt(units)
     if allowance_failures:
         return allowance_failures, {}
+    v4_failures, v4 = _reserve_provider_mint_contract.v4_no_sdk_reserve_local_contracts(units)
+    if v4_failures:
+        return v4_failures, {}
     actual = {}
     other = {}
     for unit in units:
@@ -19204,6 +19434,17 @@ def _reserve_current_call_inventory(units):
         return ["selected Web reserve call inventory changed"], {}
     if actual["src/elspeth/web/composer/tool_batch.py"] != allowance_calls:
         return ["selected manual Advisor reserve identity changed"], {}
+    if (
+        v4 is None
+        or len(v4["reserve_calls"]) != 3
+        or not v4["reserve_calls"] <= frozenset().union(*actual.values())
+        or not (
+            actual["src/elspeth/web/composer/continuation_primary.py"]
+            | actual["src/elspeth/web/sessions/continuation_classifier_primary.py"]
+        )
+        <= v4["reserve_calls"]
+    ):
+        return ["V4 no-SDK reserve inventory lost its exact source receipts"], {}
     return [], actual
 
 
@@ -21415,6 +21656,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     initialization_failures, initialization = _reserve_continuation_transfers.initialization_local_transfers(units)
     record_failures, records = _reserve_continuation_transfers.closed_source_record_transfers(units)
     terminal_reserve_failures, terminal_reserves = _reserve_continuation_transfers.terminal_failure_reserve_transfers(units)
+    v4_failures, v4_no_sdk = _reserve_provider_mint_contract.v4_no_sdk_reserve_local_contracts(units)
     start_owner_failures, start_owner = _reserve_worker_six.continuation_start_owner_contract(units)
     title_transfer_failures, title_transfer = _reserve_title_transfers.title_provider_local_contracts(units)
     iteration_failures, iteration = _reserve_compose_iteration_state_receipt(units)
@@ -21446,6 +21688,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
         *initialization_failures,
         *record_failures,
         *terminal_reserve_failures,
+        *v4_failures,
         *start_owner_failures,
         *title_transfer_failures,
         *iteration_failures,
@@ -21519,7 +21762,21 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     adoption_calls = start_owner["continuation_reserve_calls"]
     if len(adoption_calls) != 1 or not adoption_calls <= actual_nodes:
         return _reserve_ProtectedBoundary(("actual continuation adoption receipt is detached or incomplete",), (), (), (), ())
-    continuation_calls = initialization["reserve_calls"] | title_transfer["reserve_calls"] | terminal_reserves["reserve_calls"]
+    if (
+        v4_no_sdk is None
+        or not (
+            v4_no_sdk["reserve_calls"]
+            | v4_no_sdk["caller_calls"]
+            | v4_no_sdk["terminal_calls"]
+            | v4_no_sdk["source_nodes"]
+            | v4_no_sdk["import_nodes"]
+        )
+        <= actual_nodes
+    ):
+        return _reserve_ProtectedBoundary(("V4 no-SDK closure receipt is detached from input AST",), (), (), (), ())
+    continuation_calls = (
+        initialization["reserve_calls"] | title_transfer["reserve_calls"] | terminal_reserves["reserve_calls"] | v4_no_sdk["reserve_calls"]
+    )
     continuation_state_writes = iteration["additional_transfers"]["state_writes"]
     transferred = frozenset(compose["validated_transfer_nodes"])
     # V1 queued/run-started/turn/error wrappers were deleted. Current transfer
@@ -21718,6 +21975,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     # New transfer receipts require the same cross-module rebinding/reflection
     # protection as every other selected supplier, not only local body pins.
     origins.update(_reserve_RETAINED_FAILURE_ORIGINS)
+    origins.update(v4_no_sdk["protected_origins"])
     origins.update(recovery_supplier["protected_origins"])
     origins.update(policy_supplier["protected_origins"])
     origins.update(title_transfer["protected_origins"])
@@ -21733,12 +21991,15 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     origins.update(sink_receipt["read_dependency_origins"])
     origins.update(batch["class_origins"] | batch["function_origins"] | batch["data_owned_origins"] | {"dataclasses.field", "builtins.set"})
     guarded_classes = {iteration["carrier_origin"], iteration["bindings_origin"], *batch["class_origins"]}
+    guarded_classes.update(v4_no_sdk["class_origins"])
+    guarded_classes.update(v4_no_sdk["owner_origins"])
     current_phase_origin = "elspeth.web.composer.continuation_live_phases.ContinuationLivePhases"
     current_driver_origin = "elspeth.web.sessions.continuation_driver._SegmentDriver"
     # These constructors and retained fields were checked above on the original ASTs.
     origins.update({current_phase_origin, current_driver_origin})
     guarded_classes.update({current_phase_origin, current_driver_origin})
     guarded_functions = set(sink_receipt["read_dependency_origins"]) | set(batch["function_origins"])
+    guarded_functions.update(v4_no_sdk["function_origins"])
     for supplier in (recovery_supplier, policy_supplier):
         guarded_classes.update(supplier["class_origins"])
         guarded_functions.update(supplier["function_origins"])

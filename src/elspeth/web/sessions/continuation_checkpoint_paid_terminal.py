@@ -22,6 +22,7 @@ from elspeth.web.sessions.composer_operations import (
     composer_operation_result_hash,
 )
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, _effect_snapshot, load_snapshot
+from elspeth.web.sessions.continuation_checkpoint_end_owed import read_v4_checkpoint_end_settled_owed_history_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_audit import require_checkpoint_paid_public_audit_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_incomplete_tail import (
     CheckpointPaidIncompleteTailBatch,
@@ -103,6 +104,26 @@ def checkpoint_paid_overflow_error(request_id: str | None, cost: PaidOverflowCos
     )
 
 
+def checkpoint_end_owed_overflow_error(request_id: str | None, cost: PaidOverflowCost) -> ComposerOperationError:
+    """The original paid response is retained; its required END tail is not."""
+    if type(cost) is not PaidOverflowCost:
+        raise TypeError("END owed overflow public error needs its bounded original cost")
+    return ComposerOperationError(
+        http_status=507,
+        failure_code="http_error",
+        error_type="paid_result_overflow",
+        body={
+            "error_type": "paid_result_overflow",
+            "detail": "The paid result was retained, but its required review consequence could not be retained. It was not used or retried.",
+            "evidence_status": "incomplete",
+            "retryable": False,
+            "cost": {"status": cost.status, "amount": cost.amount},
+            "request_id": request_id,
+        },
+        diagnostic_id=None,
+    )
+
+
 def _stored_hold_source(conn: Connection, sid: str, operation: str, effect_key: str) -> ProviderTerminalHoldSource | None:
     row = conn.execute(
         select(holds).where(holds.c.session_id == sid, holds.c.operation_id == operation, holds.c.effect_key == effect_key)
@@ -174,6 +195,8 @@ def _read_v4_checkpoint_terminal_on_connection(
     effect_key: str,
     disposition: Literal["paid_overflow", "paid_incomplete"],
     names: frozenset[str] | None = None,
+    post_h: bool = False,
+    post_h_hold_state: Literal["active", "consumed"] = "consumed",
 ) -> VerifiedCheckpointPaidOverflowTerminal | CheckpointPaidIncompleteTerminalEvidence | None:
     """Verify source, child, outer unknowns, journal, quota and H together."""
     if type(session_id) is not UUID or type(operation_id) is not str or type(effect_key) is not str:
@@ -411,10 +434,47 @@ def _read_v4_checkpoint_terminal_on_connection(
         creator_sequence=source.creator_sequence,
         requested_model=effect.requested_model,
     )
-    if source.reserved_bytes != combined.reserved_bytes or source.fallback_contract_sha256 != combined.contract_sha256:
-        raise AuditIntegrityError("checkpoint paid overflow changed its original pre-SDK H bound")
-    plan = combined.paid_overflow if disposition == "paid_overflow" else combined.paid_incomplete
-    terminal_event_tag, terminal_event_text = _event_at(conn, source, admitted.cursor + 1)
+    effective_admitted = admitted
+    plan: CheckpointPaidOverflowTailPlan | CheckpointPaidIncompleteTailPlan
+    if post_h:
+        if disposition != "paid_overflow" or preparation["phase"] != "end" or type(names) is not frozenset:
+            raise AuditIntegrityError("post-H checkpoint overflow requires its actual END inventory")
+        owed_row = conn.execute(
+            select(checkpoints.c.checkpoint_id).where(
+                checkpoints.c.session_id == sid,
+                checkpoints.c.operation_id == operation_id,
+                checkpoints.c.cursor == admitted.cursor + 1,
+            )
+        ).one_or_none()
+        if owed_row is None:
+            raise AuditIntegrityError("post-H checkpoint overflow lost its complete returned head")
+        owed = read_v4_checkpoint_end_settled_owed_history_on_connection(
+            conn,
+            session_id=sid,
+            operation_id=operation_id,
+            attempt_id=identity.attempt_id,
+            owed_checkpoint_id=owed_row.checkpoint_id,
+            names=names,
+            child_disposition="paid_overflow",
+            hold_state=post_h_hold_state,
+        )
+        overflow_receipt = receipt
+        if (
+            owed.original_selected != admitted
+            or owed.new_hold != source
+            or owed.terminal_tail.identity != identity
+            or type(overflow_receipt) is not PaidOverflowReceipt
+            or overflow_receipt.representation != "retained_tail"
+            or overflow_receipt.reason not in ("private_document_bytes", "evidence_pair_bytes", "retained_payload_bytes")
+        ):
+            raise AuditIntegrityError("post-H checkpoint overflow changed its complete response or missing tail")
+        effective_admitted = owed.selected
+        plan = owed.terminal_tail
+    else:
+        if source.reserved_bytes != combined.reserved_bytes or source.fallback_contract_sha256 != combined.contract_sha256:
+            raise AuditIntegrityError("checkpoint paid overflow changed its original pre-SDK H bound")
+        plan = combined.paid_overflow if disposition == "paid_overflow" else combined.paid_incomplete
+    terminal_event_tag, terminal_event_text = _event_at(conn, source, effective_admitted.cursor + 1)
     terminal_event, terminal_event_error = parse_json_strict(terminal_event_text)
     if (
         terminal_event_tag != "checkpoint"
@@ -437,7 +497,11 @@ def _read_v4_checkpoint_terminal_on_connection(
         batch = build_checkpoint_paid_overflow_tail_batch(
             plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at), private_audit_sha256=private_audit_sha256
         )
-        expected_error = checkpoint_paid_overflow_error(parent.request_id, receipt.cost)
+        expected_error = (
+            checkpoint_end_owed_overflow_error(parent.request_id, receipt.cost)
+            if post_h
+            else checkpoint_paid_overflow_error(parent.request_id, receipt.cost)
+        )
     elif type(plan) is CheckpointPaidIncompleteTailPlan and type(receipt) is PaidIncompleteReceipt:
         batch = build_checkpoint_paid_incomplete_tail_batch(
             plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at), private_audit_sha256=private_audit_sha256
@@ -449,7 +513,7 @@ def _read_v4_checkpoint_terminal_on_connection(
         terminal_row.kind != "transition"
         or effect.receipt_key != batch.receipt_key
         or effect.result_chunk_key != batch.receipt_chunk_key
-        or terminal.cursor != admitted.cursor + len(batch.append.events)
+        or terminal.cursor != effective_admitted.cursor + len(batch.append.events)
         or terminal.payload_json != batch.append.snapshot_json
         or terminal_row.snapshot_chunk_key != f"snapshot:{terminal.checkpoint_id}"
         or _bounded_bytes(conn, source, terminal_row.snapshot_chunk_key, "snapshot.v2") != terminal.payload_json.encode("utf-8")
@@ -464,20 +528,23 @@ def _read_v4_checkpoint_terminal_on_connection(
     ):
         raise AuditIntegrityError("checkpoint paid overflow lost its exact failed terminal result")
     successors = conn.execute(
-        select(checkpoints.c.checkpoint_id).where(
+        select(checkpoints.c.checkpoint_id)
+        .where(
             checkpoints.c.session_id == sid,
             checkpoints.c.operation_id == operation_id,
             checkpoints.c.cursor > admitted.cursor,
         )
+        .order_by(checkpoints.c.cursor)
     ).all()
-    if tuple(row.checkpoint_id for row in successors) != (terminal.checkpoint_id,):
+    expected_successors = (effective_admitted.checkpoint_id, terminal.checkpoint_id) if post_h else (terminal.checkpoint_id,)
+    if tuple(row.checkpoint_id for row in successors) != expected_successors:
         raise AuditIntegrityError("checkpoint paid overflow has another post-dispatch head")
     event_rows = conn.execute(
         select(events)
         .where(
             events.c.session_id == sid,
             events.c.operation_id == operation_id,
-            events.c.sequence > admitted.cursor,
+            events.c.sequence > effective_admitted.cursor,
         )
         .order_by(events.c.sequence)
     ).all()
@@ -589,6 +656,30 @@ def read_v4_checkpoint_paid_overflow_terminal_on_connection(
     if result is None or type(result) is VerifiedCheckpointPaidOverflowTerminal:
         return result
     raise AuditIntegrityError("checkpoint overflow reader crossed its terminal disposition")
+
+
+def read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    effect_key: str,
+    names: frozenset[str],
+    hold_state: Literal["active", "consumed"] = "consumed",
+) -> VerifiedCheckpointPaidOverflowTerminal | None:
+    result = _read_v4_checkpoint_terminal_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        effect_key=effect_key,
+        disposition="paid_overflow",
+        names=names,
+        post_h=True,
+        post_h_hold_state=hold_state,
+    )
+    if result is None or type(result) is VerifiedCheckpointPaidOverflowTerminal:
+        return result
+    raise AuditIntegrityError("END owed overflow reader crossed its terminal disposition")
 
 
 def read_v4_checkpoint_paid_incomplete_terminal_on_connection(

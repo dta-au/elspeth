@@ -42,6 +42,7 @@ from elspeth.web.sessions.models import token_usage_ledger_table as ledger
 from elspeth.web.sessions.time_normalization import restore_utc
 
 if TYPE_CHECKING:
+    from elspeth.web.sessions.composer_operations import ComposerOperationRunning
     from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import EndCompleteRepairBatch
     from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
 
@@ -49,21 +50,31 @@ if TYPE_CHECKING:
 def require_end_complete_repair_postwrite_on_connection(
     conn: Connection,
     *,
-    prepared: PreparedCheckpointProvider,
+    prepared: PreparedCheckpointProvider | None,
     batch: EndCompleteRepairBatch,
     pass_sequence: int,
     withheld_sequence: int | None,
     observed_at: datetime,
     hold_state: Literal["active", "consumed"],
+    cold_running: ComposerOperationRunning | None = None,
+    cold_names: frozenset[str] | None = None,
 ) -> SelectedContinuationState:
     """Re-read all result links before H consumption or after it in this lock."""
     from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
+    from elspeth.web.sessions.composer_operations import ComposerOperationRunning
     from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import EndCompleteRepairBatch
 
     if type(batch) is not EndCompleteRepairBatch or hold_state not in ("active", "consumed"):
         raise AuditIntegrityError("END repair cold check lost its nominal complete batch")
     sid, operation = batch.owed.session_id, batch.owed.operation_id
-    running = prepared.running
+    if prepared is None:
+        if type(cold_running) is not ComposerOperationRunning or type(cold_names) is not frozenset:
+            raise AuditIntegrityError("cold END repair postwrite lost its actual claim or names")
+        running, names = cold_running, cold_names
+    else:
+        if cold_running is not None or cold_names is not None:
+            raise AuditIntegrityError("warm END repair postwrite mixed cold owner inputs")
+        running, names = prepared.running, prepared.env_ref_names
     if sid != str(running.claim.session_id) or operation != running.claim.operation_id:
         raise AuditIntegrityError("END repair cold check changed its original running operation")
     require_end_complete_pass_on_connection(
@@ -319,5 +330,5 @@ def require_end_complete_repair_postwrite_on_connection(
     selected = SelectedContinuationState(
         stored.checkpoint_id, root, load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root)
     )
-    read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=prepared.env_ref_names)
+    read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=names)
     return selected

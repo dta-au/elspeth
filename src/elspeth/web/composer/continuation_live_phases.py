@@ -76,8 +76,10 @@ from elspeth.web.sessions.locking import locked_session_transaction
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_clock import ContinuationActionClock
+    from elspeth.web.composer.continuation_preview_observation import PreviewSourceData
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.state import CompositionState
+    from elspeth.web.sessions.continuation_preview_result import PreviewValidationIncompleteTerminal
 
 
 def _require_runtime_source_refresh(before: ContinuationRuntimeSource, fresh: ContinuationRuntimeSource) -> None:
@@ -134,6 +136,7 @@ class ContinuationLivePhases:
     failure_custody: ContinuationToolFailureCustody | None = None
     terminal_completion: TerminalServiceCompletion | None = None
     tool_refusal: CommittedToolNoExecutionRefusal | None = None
+    preview_terminal: PreviewValidationIncompleteTerminal | None = None
     # The warm post-batch source: this batch's dispatch fold, its committed
     # P4 publication and the batch entry state, for the post-batch owner.
     finished_batch: tuple[_DispatchOutcome, _PersistOutcome | ColdPostBatchPersistData, CompositionState] | None = None
@@ -441,11 +444,21 @@ class ContinuationLivePhases:
         return phase_read
 
     async def _retain(
-        self, captured: CapturedContinuationRuntime, inventory: CurrentContinuationEnvInventory, transition: BatchTransition
+        self,
+        captured: CapturedContinuationRuntime,
+        inventory: CurrentContinuationEnvInventory,
+        transition: BatchTransition,
+        *,
+        preview_source: PreviewSourceData | None = None,
     ) -> None:
         def retain() -> StoredContinuationSnapshot:
             stored = retain_batch_transition(
-                self.authority, inventory.running, captured=captured, inventory=inventory, transition=transition
+                self.authority,
+                inventory.running,
+                captured=captured,
+                inventory=inventory,
+                transition=transition,
+                preview_source=preview_source,
             )
             # Preserve the actual committing owner's return on its physical
             # thread before bridge delivery can surface a caller cancellation.
@@ -490,6 +503,12 @@ class ContinuationLivePhases:
         if type(frame) is not ComposeFrame or frame.pending_response != result.response.reference:
             raise AuditIntegrityError("batch initialization changed its exact original paid response")
         if await self._initialize_control(phase_read, result):
+            return
+        from elspeth.web.composer.recovery_controls import parse_recovery_tool_batch
+        from elspeth.web.sessions.continuation_end import enter_continuation_recovery_end
+
+        if parse_recovery_tool_batch(result.outcome.completion.tool_batch) is not None:
+            await enter_continuation_recovery_end(self, selected, phase_read=phase_read)
             return
         self.service._enforce_tool_call_cap(
             assistant_tool_calls=result.outcome.completion.tool_batch.calls,
@@ -621,8 +640,11 @@ class ContinuationLivePhases:
                 return None
 
             if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
+                from elspeth.web.composer.continuation_preview_dispatch import try_admit_preview_tool
                 from elspeth.web.composer.continuation_value_batch_admission import try_admit_value_batch_tool
 
+                if await try_admit_preview_tool(self, runtime=runtime, selected=selected, inventory=inventory):
+                    return None
                 if await try_admit_value_batch_tool(self, runtime=runtime, selected=selected, inventory=inventory):
                     return None
 

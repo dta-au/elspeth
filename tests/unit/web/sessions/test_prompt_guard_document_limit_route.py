@@ -19,11 +19,13 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.composer import prompt_guard
+from elspeth.web.composer import continuation_semantic_advisor, prompt_guard
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_progress import decode_continuation_frontier
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.models import (
@@ -39,9 +41,9 @@ from tests.helpers.continuation_app import (
     ACTOR,
     ScriptedSDK,
     continuation_app,
-    end_admit,
     install_sdk,
     observe_original_driver_failures,
+    semantic_primary_response,
     settle,
 )
 
@@ -57,9 +59,41 @@ def _history_unit(content: str) -> str:
 
 def _first_prompt(unit_length: int) -> str:
     overhead = len(_history_unit(_MARKER))
-    content = _MARKER + "u" * (unit_length - overhead)
+    # JSON escaping makes the *prior-history document* exact at the boundary
+    # while the original live request stays small enough for mandatory Advisor
+    # guard inspection on the seeding turn.
+    escaped, remainder = divmod(unit_length - overhead, 2)
+    content = _MARKER + "\\" * escaped + "u" * remainder
     assert len(_history_unit(content)) == unit_length
+    assert len(content) < PROMPT_GUARD_MAX_TEXT_CHARACTERS
     return content
+
+
+def _recovery_stop(request: dict[str, Any]) -> dict[str, Any]:
+    retained = json.loads(request["messages"][-1]["content"])
+    assert retained["end_candidate"]["kind"] == "recovery"
+    frontier = decode_continuation_frontier(retained["frontier"])
+    answer = semantic_primary_response(request)
+    answer.update(
+        decision="STOP_CONFIRMED",
+        remaining_actionable_ids=[],
+        prescribed_action=None,
+        obligation_ids=[item.obligation_id for item in frontier.obligations],
+        obligations=[
+            {
+                "obligation_id": item.obligation_id,
+                "parent_id": item.parent_id,
+                "description": item.description,
+                "original_message_id": item.original_message_id,
+                "start": item.start,
+                "end": item.end,
+                "status": "satisfied",
+            }
+            for item in frontier.obligations
+        ],
+        reason="The provider-authored handoff completes the original request.",
+    )
+    return answer
 
 
 def _assert_documents_reproduce_complete_units(units: Sequence[str], documents: Sequence[str]) -> None:
@@ -107,28 +141,76 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
     guard_http_counts_at_sdk_entry: list[int] = []
     checks_at_sdk_entry: list[list[dict[str, Any]]] = []
     diagnostic_trace: list[dict[str, Any]] = []
+    semantic_scalar_lengths: list[dict[str, int]] = []
     current_session: list[Any] = []
     service_ref: list[Any] = []
+    handoff = (
+        None,
+        [
+            {
+                "id": "seam7-handoff",
+                "type": "function",
+                "function": {
+                    "name": "handoff_to_user",
+                    "arguments": canonical_json({"action": "park", "message": "Noted."}),
+                },
+            }
+        ],
+    )
     sdk = ScriptedSDK(
         [
-            ("primary", ("Noted.", None)),
-            ("primary", ("Noted.", None)),
-            ("end", end_admit()),
-            ("primary", ("Noted.", None)),
-            ("primary", ("Noted.", None)),
-            ("end", end_admit()),
-            ("primary", ("Noted.", None)),
-            ("primary", ("Noted.", None)),
-            ("end", end_admit()),
+            ("primary", handoff),
+            ("semantic", _recovery_stop),
+            ("primary", handoff),
+            ("semantic", _recovery_stop),
+            ("primary", handoff),
+            ("semantic", _recovery_stop),
         ]
     )
 
     original_pack = prompt_guard._pack_documents
+    original_semantic_parts = continuation_semantic_advisor.json_content_parts
+
+    def observe_semantic_parts(serialized: str, **kwargs: Any) -> tuple[Any, ...]:
+        parts = original_semantic_parts(serialized, **kwargs)
+        document = json.loads(serialized)
+        if type(document) is dict and "frontier" in document:
+            lengths: dict[str, int] = {}
+
+            def scalar_lengths(value: Any, path: str) -> None:
+                if type(value) is str:
+                    lengths[path] = len(value)
+                elif type(value) is dict:
+                    for key, child in value.items():
+                        scalar_lengths(child, f"{path}.{key}")
+                elif type(value) is list:
+                    for index, child in enumerate(value):
+                        scalar_lengths(child, f"{path}[{index}]")
+
+            scalar_lengths(document, "retained")
+            semantic_scalar_lengths.append(lengths)
+        return parts
+
+    # The diagnostic observes a known scalar path and excludes a known negative.
+    observe_semantic_parts(canonical_json({"frontier": "probe"}), encoder=canonical_json)
+    assert semantic_scalar_lengths == [{"retained.frontier": 5}]
+    observe_semantic_parts(canonical_json({"other": "probe"}), encoder=canonical_json)
+    assert semantic_scalar_lengths == [{"retained.frontier": 5}]
+    semantic_scalar_lengths.clear()
 
     def observe_pack(units: Sequence[str]) -> tuple[str, ...]:
         packed: tuple[str, ...] = original_pack(units)
         pack_calls.append((tuple(units), packed))
         return packed
+
+    def safe_unit_label(unit: str) -> tuple[str, int]:
+        heading = unit.split("\n", 1)[0]
+        if heading.startswith("Message ") and ", content part " in heading and heading.endswith(":"):
+            return "message_part", len(heading) + 1
+        return "other", 0
+
+    assert safe_unit_label("Message 2, content part 10:\nprobe") == ("message_part", 28)
+    assert safe_unit_label("probe") == ("other", 0)
 
     async def completion(**kwargs):
         checks_at_sdk_entry.append(_guard_checks(await service_ref[0].get_messages(current_session[0], limit=None)))
@@ -137,9 +219,10 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
         return await sdk(**kwargs)
 
     # Only the guard's HTTP transport and the model SDK are replaced; the
-    # packer is observed through its original implementation.
+    # packer and semantic JSON partitioner are observed through their originals.
     _recording_guard(monkeypatch, guard_bodies)
     monkeypatch.setattr(prompt_guard, "_pack_documents", observe_pack)
+    monkeypatch.setattr(continuation_semantic_advisor, "json_content_parts", observe_semantic_parts)
     install_sdk(monkeypatch, completion)
 
     async with continuation_app(tmp_path, monkeypatch) as harness:
@@ -160,10 +243,41 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
             first = _first_prompt(unit_length)
             assert len(first) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
             first_body = message_body(first)
+            first_pack_start = len(pack_calls)
             with monkeypatch.context() as diagnostic_patch:
                 observed_first = observe_original_driver_failures(diagnostic_patch, first_body["operation_id"], session_id=session.id)
                 first_settled = await submit(session.id, first_body)
             diagnostic_trace.extend(observed_first)
+            if first_settled.status != "completed":
+                longest = sorted(
+                    ((path, length) for record in semantic_scalar_lengths for path, length in record.items()),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:8]
+                largest_units = sorted(
+                    (
+                        (call_index, len(unit), len(unit.encode("utf-8")), _MARKER in unit, *safe_unit_label(unit))
+                        for call_index, (units, _packed) in enumerate(pack_calls[first_pack_start:], start=first_pack_start)
+                        for unit in units
+                    ),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:8]
+                print(
+                    "first-turn guard source sizes:",
+                    json.dumps(
+                        {
+                            "first_status": first_settled.status,
+                            "first_error": None if first_settled.error is None else first_settled.error.model_dump(mode="json"),
+                            "semantic_scalars": longest,
+                            "largest_guard_units": largest_units,
+                            "sdk_roles": sdk.roles,
+                            "original_driver_trace": diagnostic_trace[-12:],
+                        },
+                        sort_keys=True,
+                    ),
+                )
+            assert first_settled.status == "completed"
             first_state = await service.get_current_state(session.id)
             before = await service.get_messages(session.id, limit=None)
             pack_calls.clear()
@@ -193,6 +307,7 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
             marked = [unit for unit in units if _MARKER in unit]
             assert marked == [_history_unit(first)]
             assert len(marked[0]) == unit_length
+            assert len(marked[0].encode("utf-8")) == unit_length
             return session, body, first, first_state, first_settled, before, settled, units, packed, marked[0]
 
         # One more character than the limit: the indivisible unit is refused, never sliced.
@@ -299,7 +414,7 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
             attempts = connection.execute(
                 select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == str(session.id))
             ).all()
-        assert len(attempts) == 1 and attempts[0].operation_id != record.session_operation_id
+        assert len(attempts) == 2 and all(attempt.operation_id != record.session_operation_id for attempt in attempts)
         assert first not in json.dumps(public) + json.dumps(checks)
 
         # Exactly at the limit: the unit is inspected whole before PRIMARY SDK entry.
@@ -334,7 +449,7 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
                     token_usage_ledger_table.c.completion_tokens,
                 )
             ).all()
-        assert [request["model"] for request in sdk_calls] == ["test/model", "test/model", "test/advisor"], json.dumps(
+        assert [request["model"] for request in sdk_calls] == ["test/model", "test/advisor"], json.dumps(
             {
                 "first_statuses": [refused_first_settled.status, at_limit_first_settled.status],
                 "status": settled.status,
@@ -363,7 +478,7 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
         assert (checks_at_sdk_entry[0][-1]["disposition"], checks_at_sdk_entry[0][-1]["reason"]) == ("allow", "clean")
 
         # Integration completion point (U-40): both first turns and the at-limit
-        # second turn complete with the model's ordinary reply, and turn 1 leaves
+        # second turn complete with the model's provider-authored handoff, and turn 1 leaves
         # a checkpoint state behind.
         for label, completed in (
             ("over_limit_first", refused_first_settled),

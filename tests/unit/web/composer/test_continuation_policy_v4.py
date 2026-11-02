@@ -1,4 +1,4 @@
-"""Versioned terminal paid-provider overflow admission stays opt-in."""
+"""Versioned paid-provider overflow policy and explicit opt-out."""
 
 from __future__ import annotations
 
@@ -25,9 +25,18 @@ from elspeth.web.composer.continuation_policy_settings import (
 from tests.helpers.continuation_policy import continuation_test_settings
 
 
-def test_unconfigured_v4_builder_preserves_current_v2_admission() -> None:
-    settings = continuation_test_settings()
+def test_explicit_null_v4_builder_preserves_current_v2_admission() -> None:
+    settings = continuation_test_settings(composer_continuation_max_retained_payload_bytes=None)
     assert continuation_policy_v4_from_settings(settings) is None
+    assert type(continuation_policy_from_settings(settings)) is ContinuationAdmissionPolicyV2
+
+
+def test_default_retained_allowance_builds_v4_without_replacing_v2_admission() -> None:
+    settings = continuation_test_settings()
+    policy = continuation_policy_v4_from_settings(settings)
+    assert type(policy) is ContinuationAdmissionPolicyV4
+    assert policy.max_retained_payload_bytes == 16 * 1_048_576
+    assert decode_continuation_policy(policy.model_dump_json(), policy.policy_hash) == policy
     assert type(continuation_policy_from_settings(settings)) is ContinuationAdmissionPolicyV2
 
 

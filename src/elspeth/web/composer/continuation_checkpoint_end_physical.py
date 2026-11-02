@@ -7,6 +7,7 @@ not return a gate verdict, complete an owed END tail, or authorize a retry.
 from __future__ import annotations
 
 from dataclasses import InitVar, dataclass, field
+from typing import Literal
 from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -178,7 +179,10 @@ async def prepare_checkpoint_end_physical_source(
     captured = await capture_continuation_runtime_owners(
         phase_owner.runtime, selected=phase_owner.selected, inventory=phase_owner.inventory
     )
-    end_input = build_checkpoint_end_input(phase_owner=phase_owner, gate_locals=gate_locals, captured=captured)
+    if len(phase_owner.phase_source.completed_children) > 1:
+        raise AuditIntegrityError("END physical source exceeded its one original format retry")
+    retry_ordinal: Literal[0, 1] = 1 if phase_owner.phase_source.completed_children else 0
+    end_input = build_checkpoint_end_input(phase_owner=phase_owner, gate_locals=gate_locals, captured=captured, retry_ordinal=retry_ordinal)
     preparation = PreparedCheckpointSource(
         running=running,
         selected=phase_owner.selected,
@@ -235,7 +239,7 @@ def bind_checkpoint_end_physical_request(
         work=custody.required_work,
         composer=owner.phases.service,
         authority=owner.phases.authority,
-        retry_ordinal=0,
+        retry_ordinal=1 if owner.phase_source.completed_children else 0,
         request_sha256=stable_hash(prepared_input.evidence.messages),
         requested_model=prepared_input.model,
         env_ref_names=owner.runtime.env_ref_names,

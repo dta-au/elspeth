@@ -24,10 +24,14 @@ from sqlalchemy.engine.interfaces import DBAPICursor, ExecutionContext
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
-from elspeth.web.sessions.continuation_sql_deadline import ContinuationReadResultDeadline, ContinuationSQLDeadlineOwner
+from elspeth.web.sessions.continuation_sql_deadline import (
+    ContinuationPreviewResultDeadline,
+    ContinuationReadResultDeadline,
+    ContinuationSQLDeadlineOwner,
+)
 
 if TYPE_CHECKING:
-    from elspeth.web.required_work import RequiredReadProduced, RequiredWorkTicket
+    from elspeth.web.required_work import RequiredPreviewProduced, RequiredReadProduced, RequiredWorkTicket
 
 
 class _ContinuationSQLDeadlineMode(Enum):
@@ -60,8 +64,13 @@ class ContinuationPaidSettlementScope:
 
 
 _READ_RESULT_ISSUER_SEAL = object()
+_PREVIEW_RESULT_ISSUER_SEAL = object()
 _CONTINUATION_SQL_DEADLINE: ContextVar[
-    tuple[ContinuationSQLDeadlineOwner, bool | _ContinuationSQLDeadlineMode | ContinuationReadResultDeadline] | None
+    tuple[
+        ContinuationSQLDeadlineOwner,
+        bool | _ContinuationSQLDeadlineMode | ContinuationReadResultDeadline | ContinuationPreviewResultDeadline,
+    ]
+    | None
 ] = ContextVar("continuation_sql_deadline", default=None)
 _CONTINUATION_METADATA_ENGINE: ContextVar[Engine | None] = ContextVar("continuation_metadata_engine", default=None)
 
@@ -148,6 +157,43 @@ def continuation_metadata_source_scope(engine: Engine) -> Iterator[None]:
 
 
 @contextlib.contextmanager
+def continuation_preview_result_deadline_scope(
+    ticket: RequiredWorkTicket,
+    produced: RequiredPreviewProduced,
+    clock: ContinuationPreviewResultDeadline,
+    *,
+    issuer: object,
+) -> Iterator[None]:
+    """Only an actual returned preview enters its original result-only tail."""
+    from elspeth.web.composer.continuation_preview_dispatch import require_preview_produced
+    from elspeth.web.required_work import RequiredPreviewProduced, RequiredWorkSource, RequiredWorkTicket
+
+    if (
+        issuer is not _PREVIEW_RESULT_ISSUER_SEAL
+        or type(ticket) is not RequiredWorkTicket
+        or ticket.key.source is not RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL
+        or ticket.complete
+        or type(produced) is not RequiredPreviewProduced
+        or type(clock) is not ContinuationPreviewResultDeadline
+        or ticket.sql_deadline_owner is not clock.owner
+        or _CONTINUATION_SQL_DEADLINE.get() != (clock.owner, False)
+        or require_preview_produced(produced.permit, produced.returned) is not clock
+    ):
+        raise AuditIntegrityError("preview disposition lost its actual returned-result worker")
+    clock.owner.validate_context(
+        ticket.key.authority.context,
+        operation_id=ticket.key.authority.durable_operation_id,
+        attempt=ticket.key.authority.claim_attempt,
+    )
+    clock.owner.remaining_statement(session_id=ticket.key.authority.context.fence.session_id, preview_result=clock)
+    token = _CONTINUATION_SQL_DEADLINE.set((clock.owner, clock))
+    try:
+        yield
+    finally:
+        _CONTINUATION_SQL_DEADLINE.reset(token)
+
+
+@contextlib.contextmanager
 def continuation_metadata_connection_deadline_scope(conn: Connection) -> Iterator[None]:
     """Install the existing clock on a metadata connection before its SELECT.
 
@@ -168,6 +214,7 @@ def continuation_metadata_connection_deadline_scope(conn: Connection) -> Iterato
         lifecycle=mode is True,
         paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
         read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
+        preview_result=mode if type(mode) is ContinuationPreviewResultDeadline else None,
     )
     with continuation_connection_deadline_scope(conn, session_id):
         yield
@@ -176,6 +223,7 @@ def continuation_metadata_connection_deadline_scope(conn: Connection) -> Iterato
         lifecycle=mode is True,
         paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
         read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
+        preview_result=mode if type(mode) is ContinuationPreviewResultDeadline else None,
     )
 
 
@@ -481,6 +529,7 @@ def continuation_connection_deadline_scope(
                 lifecycle=mode is True,
                 paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
                 read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
+                preview_result=mode if type(mode) is ContinuationPreviewResultDeadline else None,
             )
         elif deadline is not None:
             remaining = deadline.remaining_seconds(now=time.monotonic())

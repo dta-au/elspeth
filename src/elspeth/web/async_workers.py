@@ -11,6 +11,7 @@ from collections.abc import Callable
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Final, final
@@ -34,7 +35,7 @@ from elspeth.web.required_executor import (
     RequiredGenerationDrainExpired as RequiredGenerationDrainExpired,
 )
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
-from elspeth.web.required_work import RequiredReadProduced, RequiredWorkSource, RequiredWorkTicket
+from elspeth.web.required_work import RequiredPreviewProduced, RequiredReadProduced, RequiredWorkSource, RequiredWorkTicket
 
 if TYPE_CHECKING:
     from elspeth.web.composer.progress import ComposerRequestLease
@@ -760,11 +761,68 @@ async def run_required_read_finish_once[T](
     return await run_required_sql_finish_once(ticket, execute)
 
 
+_PREVIEW_FINISH_ADMISSION: ContextVar[tuple[RequiredWorkTicket, RequiredPreviewProduced] | None] = ContextVar(
+    "preview_finish_admission", default=None
+)
+
+
+def require_preview_finish_admission(ticket: RequiredWorkTicket) -> RequiredPreviewProduced:
+    admitted = _PREVIEW_FINISH_ADMISSION.get()
+    if (
+        type(ticket) is not RequiredWorkTicket
+        or ticket.key.source is not RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL
+        or admitted is None
+        or admitted[0] is not ticket
+        or type(admitted[1]) is not RequiredPreviewProduced
+    ):
+        raise AuditIntegrityError("preview finish lacks its explicit actual returned-result admission")
+    admitted[1].validate()
+    return admitted[1]
+
+
+async def run_required_preview_finish_once[T](
+    ticket: RequiredWorkTicket, produced: RequiredPreviewProduced, finish: Callable[[RequiredPreviewProduced], T]
+) -> RequiredSQLFinishOnce[T]:
+    """One owed SQL writer; no producer runs under the returned-result clock."""
+    from elspeth.web.composer.continuation_preview_dispatch import claim_preview_finish, require_preview_produced
+    from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+    from elspeth.web.sessions.locking import _PREVIEW_RESULT_ISSUER_SEAL, continuation_preview_result_deadline_scope
+
+    _validate_finish_once_ticket(ticket)
+    try:
+        if type(produced) is not RequiredPreviewProduced:
+            raise AuditIntegrityError("preview finish requires its original actual returned carrier")
+        produced.validate()
+        clock = require_preview_produced(produced.permit, produced.returned)
+        claim_preview_finish(produced.permit, produced.returned, ticket)
+    except BaseException as original:
+        try:
+            ticket.complete_without_submission(original)
+        except BaseException as cleanup:
+            raise BaseExceptionGroup("preview result setup and ticket cleanup", [original, cleanup]) from None
+        raise
+
+    def execute() -> T:
+        with (
+            retention_stage_memo_scope(),
+            continuation_preview_result_deadline_scope(ticket, produced, clock, issuer=_PREVIEW_RESULT_ISSUER_SEAL),
+        ):
+            return finish(produced)
+
+    token = _PREVIEW_FINISH_ADMISSION.set((ticket, produced))
+    try:
+        return await run_required_sql_finish_once(ticket, execute)
+    finally:
+        _PREVIEW_FINISH_ADMISSION.reset(token)
+
+
 async def run_required_sql_finish_once[**P, T](
     ticket: RequiredWorkTicket, func: Callable[P, T], *args: P.args, **kwargs: P.kwargs
 ) -> RequiredSQLFinishOnce[T]:
     """Hand off a known actual SQL outcome without discarding it on cancellation."""
     _validate_finish_once_ticket(ticket)
+    if ticket.key.source is RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL:
+        require_preview_finish_admission(ticket)
     cancellations: list[asyncio.CancelledError] = []
     operation = functools.partial(func, *args, **kwargs)
     deadline_owner = ticket.sql_deadline_owner

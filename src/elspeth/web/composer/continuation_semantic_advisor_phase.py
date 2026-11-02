@@ -27,6 +27,8 @@ from elspeth.web.composer.continuation_env_inventory import materialize_continua
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import (
+    ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
@@ -50,6 +52,7 @@ from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+from elspeth.web.continuation_retention_memo import legacy_advisor_preparation_memo_scope
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.composer_operations import ComposerOperationRecord, ComposerOperationRunning
@@ -66,10 +69,10 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
     begin_semantic_advisor_on_connection,
     close_semantic_advisor_no_sdk_on_connection,
     consume_committed_semantic_read_on_connection,
+    consume_semantic_advisor_end_stop_on_connection,
     consume_semantic_advisor_primary_on_connection,
     consume_semantic_advisor_review_on_connection,
     consume_semantic_advisor_terminal_iteration_stop_on_connection,
-    consume_semantic_advisor_whole_stop_on_connection,
     install_semantic_advisor_decision_on_connection,
     prepare_semantic_advisor_on_connection,
     read_current_paid_semantic_decision_on_connection,
@@ -219,7 +222,7 @@ async def _consume_current_decision(phases: ContinuationLivePhases, selected: Se
             return consume_committed_semantic_read_on_connection(conn, running, selected=current, effect_key=effect_key)
         if len(root.frames) == 3 and type(root.frames[1]) is ToolBatchFrame:
             return consume_semantic_advisor_terminal_iteration_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
-        return consume_semantic_advisor_whole_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
+        return consume_semantic_advisor_end_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
 
     phases.latest_snapshot = await _registered(
         work=phases.work,
@@ -326,6 +329,22 @@ async def run_continuation_semantic_advisor(
         clock = ContinuationActionClock(policy.actions.advisor)
     if type(clock) is not ContinuationActionClock or clock.policy != policy.actions.advisor:
         raise AuditIntegrityError("Semantic live action changed its original Advisor allowance")
+    if type(policy) is ContinuationAdmissionPolicyV4:
+        return await _run_semantic_advisor_preparation(phases, selected, running=running, policy=policy, clock=clock)
+    if type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2):
+        raise AuditIntegrityError("Semantic Advisor lost its original admitted policy")
+    with legacy_advisor_preparation_memo_scope(clock):
+        return await _run_semantic_advisor_preparation(phases, selected, running=running, policy=policy, clock=clock)
+
+
+async def _run_semantic_advisor_preparation(
+    phases: ContinuationLivePhases,
+    selected: SelectedContinuationState,
+    *,
+    running: ComposerOperationRunning,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+    clock: ContinuationActionClock,
+) -> SemanticAdvisorNoSdkTerminal | SemanticAdvisorPaidTerminal | SemanticAdvisorPaidIncompleteTerminal | None:
     runtime, inventory = await phases.current(selected)
     current = await _registered(
         work=phases.work,

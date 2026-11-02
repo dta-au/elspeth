@@ -44,11 +44,13 @@ from elspeth.web.sessions.continuation_value_batch_store import (
 )
 from elspeth.web.sessions.continuation_value_batch_transitions import (
     consume_value_batch_transitions_on_connection,
+    prepare_issued_preview_transitions_on_connection,
     prepare_value_batch_transitions_on_connection,
 )
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_value_batch_preparation import PreparedValueBatch
+    from elspeth.web.required_work import RequiredPreviewProduced
     from elspeth.web.sessions.service import SessionServiceImpl
 
 
@@ -76,18 +78,48 @@ def retain_value_batch_tail_on_connection(
     service: SessionServiceImpl,
     batch: PreparedValueBatch,
     published_at: datetime,
+    issued_preview: RequiredPreviewProduced | None = None,
 ) -> StoredP4Application:
     """Plan all finite prefixes, then commit only the exact original batch.
 
     This returns an in-transaction value. The service must commit and separately
     cold reread before treating it as delivered or a physical SQL completion.
     """
+    if issued_preview is None:
+        return _retain_value_batch_tail_on_connection(
+            conn, running, service=service, batch=batch, published_at=published_at, issued_preview=None
+        )
+    from elspeth.web.composer.continuation_value_batch_preparation import require_prepared_issued_preview_batch
+    from elspeth.web.sessions.continuation_preview_result import preview_returned_credit_scope
+
+    require_prepared_issued_preview_batch(batch, issued_preview)
+    with preview_returned_credit_scope(conn, running, returned=issued_preview.returned, env_ref_names=batch.inventory.names):
+        return _retain_value_batch_tail_on_connection(
+            conn, running, service=service, batch=batch, published_at=published_at, issued_preview=issued_preview
+        )
+
+
+def _retain_value_batch_tail_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    service: SessionServiceImpl,
+    batch: PreparedValueBatch,
+    published_at: datetime,
+    issued_preview: RequiredPreviewProduced | None,
+) -> StoredP4Application:
     from elspeth.web.composer.continuation_value_batch_preparation import require_prepared_value_batch
 
     require_prepared_value_batch(batch)
     names, selected = batch.inventory.names, batch.selected
     service._assert_session_write_lock_held(conn, str(running.claim.session_id), caller="retain_value_batch_tail_on_connection")
-    transitions = prepare_value_batch_transitions_on_connection(conn, running, prepared=batch, published_at=published_at)
+    transitions = (
+        prepare_value_batch_transitions_on_connection(conn, running, prepared=batch, published_at=published_at)
+        if issued_preview is None
+        else prepare_issued_preview_transitions_on_connection(
+            conn, running, prepared=batch, produced=issued_preview, published_at=published_at
+        )
+    )
     pending_root = transitions.completed.stack.model_copy(
         update={"frames": (batch.pending_capture.stack.frames[0], *transitions.completed.stack.frames[1:])}
     )
@@ -103,7 +135,7 @@ def retain_value_batch_tail_on_connection(
         env_ref_names=names,
     )
     publication = plan_value_batch_publication_on_connection(
-        conn, running, service=service, batch=batch, transitions=transitions, created_at=published_at
+        conn, running, service=service, batch=batch, transitions=transitions, created_at=published_at, issued_preview=issued_preview
     )
     p4_selected = _future(preparation.append, transitions.completed, preparation.chunks)
     ordered_rejections = tuple(sorted(publication.rejections, key=lambda rejection: str(rejection.id)))
@@ -159,7 +191,7 @@ def retain_value_batch_tail_on_connection(
         _prefix(application.append, application.chunks),
     )
     with admit_prepared_complete_tail_on_connection(conn, original=original, prefixes=prefixes):
-        consume_value_batch_transitions_on_connection(conn, running, plan=transitions, env_ref_names=names)
+        consume_value_batch_transitions_on_connection(conn, running, plan=transitions, env_ref_names=names, issued_preview=issued_preview)
         commit = prepare_p4_on_connection(
             conn,
             running,
@@ -171,7 +203,13 @@ def retain_value_batch_tail_on_connection(
             prepared_tail=preparation,
         )
         outcome = consume_value_batch_publication_on_connection(
-            conn, running, service=service, publication=publication, commit=commit, publication_append=result.append
+            conn,
+            running,
+            service=service,
+            publication=publication,
+            commit=commit,
+            publication_append=result.append,
+            issued_preview=issued_preview,
         )
         retain_p4_result_on_connection(
             conn,

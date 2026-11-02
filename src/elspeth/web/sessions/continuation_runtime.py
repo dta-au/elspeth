@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import Connection, select
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef, ToolBatchFrame
+from elspeth.web.composer.continuation import ComposeFrame, EndFrame, PrivateChunkRef, ToolBatchFrame
 from elspeth.web.composer.continuation_attachment_history import ContinuationAttachmentHistory
 from elspeth.web.composer.continuation_bootstrap import ContinuationBootstrapSnapshot, ContinuationBootstrapValues
 from elspeth.web.composer.continuation_clock import ContinuationTimingObservation, freeze_observation
@@ -186,7 +186,14 @@ def _runtime_source_from_inputs_on_connection(
     if iteration.producer_inputs != inputs.producer_inputs:
         raise AuditIntegrityError("runtime iteration differs from its actual current message inputs")
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
-    cost_snapshot = read_continuation_cost_snapshot_on_connection(conn, selected.stack)
+    pending_end_names = (
+        inventory.names
+        if type(policy) is ContinuationAdmissionPolicyV4
+        and type(selected.stack.frames[-1]) is EndFrame
+        and selected.stack.pending_settlement_ids
+        else None
+    )
+    cost_snapshot = read_continuation_cost_snapshot_on_connection(conn, selected.stack, pending_end_owed_names=pending_end_names)
     segment = conn.execute(
         select(segments).where(
             segments.c.session_id == str(running.claim.session_id),

@@ -54,7 +54,7 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # Epoch 85 adds the distinct paid_incomplete returned-result effect/receipt.
 # Published epoch-84 stores are preserved and refused unchanged.
 # Incompatible stores require a separately reviewed compatibility disposition.
-_COORDINATION_HARD_CUT_EPOCH = 85
+_COORDINATION_HARD_CUT_EPOCH = 86
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "auth_session_families": "ix_auth_session_families_expires_at",
     "web_instances": "ix_web_instances_lease_expires_at",

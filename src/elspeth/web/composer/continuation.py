@@ -98,6 +98,7 @@ class PrivateChunkRef(ContinuationValue):
         "composer.title-no-sdk-refusal.v1",
         "composer.tool-no-execution-refusal.v1",
         "composer.preview-observation.v1",
+        "composer.preview-incomplete.v1",
         "composer.title-provider-result.v1",
         "composer.classifier-primary-source.v1",
         "composer.checkpoint-end-input.v1",
@@ -114,7 +115,9 @@ class PrivateChunkRef(ContinuationValue):
 
 class EffectFrontierEntry(ContinuationValue):
     effect_id: str
-    disposition: Literal["prepared", "dispatched", "committed", "refused", "unknown", "paid_overflow", "paid_incomplete"]
+    disposition: Literal[
+        "prepared", "dispatched", "committed", "refused", "unknown", "paid_overflow", "paid_incomplete", "validation_incomplete"
+    ]
     receipt_id: str | None
 
 

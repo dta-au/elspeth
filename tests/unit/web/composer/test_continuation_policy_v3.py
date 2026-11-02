@@ -21,8 +21,8 @@ from elspeth.web.config import settings_from_env
 from tests.helpers.continuation_policy import continuation_test_settings
 
 
-def test_missing_operator_value_has_no_fresh_v3_policy_and_preserves_v2_builder() -> None:
-    settings = continuation_test_settings()
+def test_explicit_null_has_no_fresh_v3_policy_and_preserves_v2_builder() -> None:
+    settings = continuation_test_settings(composer_continuation_max_retained_payload_bytes=None)
     assert settings.composer_continuation_max_retained_payload_bytes is None
     assert continuation_policy_v3_from_settings(settings) is None
     assert type(continuation_policy_from_settings(settings)) is ContinuationAdmissionPolicyV2

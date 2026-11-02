@@ -101,9 +101,9 @@ def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmi
 
 
 def continuation_policy_v3_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicyV3 | None:
-    """Build a new-operation policy only with an explicit operator allowance.
+    """Build a new-operation policy with the configured aggregate allowance.
 
-    ``None`` means new V3 admission is unconfigured. Stored V1/V2 operations
+    Explicit ``None`` disables new V3 policy construction. Stored V1/V2 operations
     retain their original policy; the application/authority join decides how
     to project this condition publicly before new irreversible work.
     """
@@ -122,10 +122,10 @@ def continuation_policy_v3_from_settings(settings: WebSettings) -> ContinuationA
 
 
 def continuation_policy_v4_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicyV4 | None:
-    """Prepare an explicit paid-overflow policy; leave admission to its owner.
+    """Prepare a paid-overflow policy; leave admission to its owner.
 
-    Absence of a configured whole-operation allowance still means no new V4
-    policy. This builder neither changes the default V2 path nor activates V4.
+    Explicit ``None`` disables new V4 policy construction. This builder
+    neither changes the default V2 path nor activates V4.
     """
     if type(settings) is not WebSettings:
         raise TypeError("continuation policy requires the owned WebSettings")

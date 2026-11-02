@@ -90,6 +90,7 @@ from elspeth.web.composer.provider_quota import (
 )
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.continuation_retention_memo import finish_legacy_advisor_preparation_memo
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
 from elspeth.web.required_work import RequiredWorkTicket
@@ -369,9 +370,11 @@ def prepare_semantic_advisor_request(
     owner._require_complete_graph_summary(arguments["_elspeth_advisor_summary_parts"])
     arguments["problem_summary"] = _SEMANTIC_INSTRUCTIONS
     context = advisor_context.build_advisor_user_message(arguments)
+    frontier_canonical = encode_frontier_chunk(frontier).canonical
+    frontier_parts = json_content_parts(frontier_canonical, ensure_ascii=False, separators=(",", ":"), encoder=canonical_json)
     retained_values: dict[str, JsonValue] = {
         "source": source.model_dump(mode="json"),
-        "frontier": encode_frontier_chunk(frontier).canonical,
+        "frontier": frontier_canonical,
         # The complete visible transcript uses its existing owned producer
         # above; do not duplicate its private shelf as an atomic document.
         "evidence": resolved.evidence.model_dump(mode="json", by_alias=True, exclude={"transcript"}),
@@ -407,6 +410,7 @@ def prepare_semantic_advisor_request(
                 retained,
                 ensure_ascii=False,
                 separators=(",", ":"),
+                string_parts={("frontier",): frontier_parts},
                 encoder=canonical_json,
             ),
         },
@@ -554,7 +558,10 @@ async def run_semantic_advisor(
         try:
             if no_sdk_issuer is not None:
                 no_sdk_issuer.require_original_clock()
-                no_sdk_issuer.clock.finish_preparation()
+                try:
+                    no_sdk_issuer.clock.finish_preparation()
+                finally:
+                    finish_legacy_advisor_preparation_memo(no_sdk_issuer.clock)
             response = await asyncio.wait_for(
                 provider_gateway._litellm_acompletion(
                     provider_custody=custody,

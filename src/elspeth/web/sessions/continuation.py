@@ -416,7 +416,7 @@ def put_chunk(
                 or (
                     contract.version == "composer.continuation.policy.v4"
                     and scoped_credit is None
-                    and not _has_active_provider_hold(conn, session_id=session_id, operation_id=operation_id)
+                    and not _has_active_terminal_hold(conn, session_id=session_id, operation_id=operation_id)
                 )
             )
             else ()
@@ -895,6 +895,20 @@ def _has_active_provider_hold(conn: Connection, *, session_id: str, operation_id
     )
 
 
+def _has_active_terminal_hold(conn: Connection, *, session_id: str, operation_id: str) -> bool:
+    """Capacity only: actual provider and unpaid preview holds share no grants."""
+    from elspeth.web.sessions.models import composer_validation_terminal_holds_table as holds
+
+    return _has_active_provider_hold(conn, session_id=session_id, operation_id=operation_id) or (
+        conn.execute(
+            select(holds.c.effect_key).where(
+                holds.c.session_id == session_id, holds.c.operation_id == operation_id, holds.c.state == "active"
+            )
+        ).first()
+        is not None
+    )
+
+
 def continuation_unpaid_terminal_reserve_on_connection(
     conn: Connection, *, session_id: str, operation_id: str, post_root_json: str, post_cursor: int
 ) -> tuple[ProspectiveContinuationChunk, ...]:
@@ -983,7 +997,7 @@ def require_v3_unpaid_terminal_reserve_on_connection(conn: Connection, *, sessio
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
     if contract.version not in ("composer.continuation.policy.v3", "composer.continuation.policy.v4"):
         return
-    if contract.version == "composer.continuation.policy.v4" and _has_active_provider_hold(
+    if contract.version == "composer.continuation.policy.v4" and _has_active_terminal_hold(
         conn, session_id=session_id, operation_id=operation_id
     ):
         return
@@ -1277,7 +1291,7 @@ def append_complete_snapshot(
                 or (
                     type(policy) is ContinuationAdmissionPolicyV4
                     and scoped_credit is None
-                    and not _has_active_provider_hold(conn, session_id=session_id, operation_id=operation_id)
+                    and not _has_active_terminal_hold(conn, session_id=session_id, operation_id=operation_id)
                 )
             )
             and conn.info.get(_V3_TERMINAL_SCOPE_KEY) is not _V3_TERMINAL_SCOPE_SEAL
@@ -1919,6 +1933,13 @@ def settle_segment_on_connection(
         stored, segment=segment, outcome=outcome, published_at=now, settled_by=settled_by
     )
     terminal_values = _terminal_values(outcome, now=now, settled_by=settled_by)
+    preview_unknown: tuple[str, ...] = ()
+    if isinstance(outcome, ComposerOperationError):
+        from elspeth.web.sessions.continuation_preview_result import consume_preview_holds_for_failed_settlement_on_connection
+
+        preview_unknown = consume_preview_holds_for_failed_settlement_on_connection(
+            conn, session_id=session_id, operation_id=operation_id, unresolved=unresolved, consumed_at=now
+        )
     with _v3_terminal_append_scope(conn):
         retained = append_complete_snapshot(
             conn,
@@ -1931,18 +1952,19 @@ def settle_segment_on_connection(
             handoff=False,
             prepared_append=None if prepared_settlement is None else prepared_settlement.append,
         )
-    if unresolved:
+    remaining_unknown = tuple(key for key in unresolved if key not in preview_unknown)
+    if remaining_unknown:
         marked = conn.execute(
             update(effects)
             .where(
                 effects.c.session_id == session_id,
                 effects.c.operation_id == operation_id,
-                effects.c.effect_key.in_(unresolved),
+                effects.c.effect_key.in_(remaining_unknown),
                 effects.c.disposition == "dispatched",
             )
             .values(disposition="unknown")
         )
-        if marked.rowcount != len(unresolved):
+        if marked.rowcount != len(remaining_unknown):
             raise AuditIntegrityError("continuation settlement lost an unresolved effect row")
     published = _published_end_review(decode_continuation_snapshot(stored.payload_json), outcome)
     if published is not None:

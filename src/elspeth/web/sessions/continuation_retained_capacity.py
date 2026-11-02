@@ -29,8 +29,12 @@ class ContinuationRetainedCapacityExceeded(Exception):
 
     reason = "retained_history_bytes"
 
-    def __init__(self) -> None:
+    def __init__(self, *, observed_bytes: int, limit_bytes: int) -> None:
+        if type(observed_bytes) is not int or type(limit_bytes) is not int or observed_bytes <= limit_bytes or limit_bytes <= 0:
+            raise ValueError("retained capacity overflow requires its exact measured excess")
         super().__init__("continuation retained payload allowance exceeded")
+        self.observed_bytes = observed_bytes
+        self.limit_bytes = limit_bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -702,13 +706,30 @@ def admit_retained_payload_chunks(
                 raise AuditIntegrityError("immutable chunk collision")
 
     added = sum(len(item.payload) for key, item in new_by_key.items() if key not in existing_keys)
+    from elspeth.web.sessions.continuation_preview_result import (
+        live_preview_terminal_hold_bytes_on_connection,
+        preview_returned_credit_on_connection,
+    )
+
     live_holds = _live_provider_hold_bytes(conn, session_id=session_id, operation_id=operation_id, contract=contract)
+    live_holds += live_preview_terminal_hold_bytes_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        policy_version=contract.version,
+        policy_sha256=contract.policy_hash,
+        allowance=contract.allowance,
+    )
     hold_credit = 0
+    hold_credit += preview_returned_credit_on_connection(conn, session_id=session_id, operation_id=operation_id)
     if consuming_hold is not None:
+        if hold_credit:
+            raise AuditIntegrityError("preview return cannot borrow a provider terminal hold")
         hold_credit = _require_active_provider_hold(conn, source=consuming_hold, contract=contract)
         if consuming_hold.session_id != session_id or consuming_hold.operation_id != operation_id:
             raise AuditIntegrityError("provider hold credit belongs to a different operation")
-    if used + live_holds - hold_credit + _new_hold_bytes + added > retained_payload_limit_bytes:
+    observed_bytes = used + live_holds - hold_credit + _new_hold_bytes + added
+    if observed_bytes > retained_payload_limit_bytes:
         # An ordinary fresh overflow must not conceal a corrupt old digest.
         # Fetch one row at a time; never materialize the entire history here.
         for key in stored_keys:
@@ -734,4 +755,4 @@ def admit_retained_payload_chunks(
                     or sha256(row.payload).hexdigest() != row.sha256
                 ):
                     raise AuditIntegrityError("retained chunk digest or binding mismatch")
-        raise ContinuationRetainedCapacityExceeded()
+        raise ContinuationRetainedCapacityExceeded(observed_bytes=observed_bytes, limit_bytes=retained_payload_limit_bytes)

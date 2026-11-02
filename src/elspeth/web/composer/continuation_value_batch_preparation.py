@@ -6,9 +6,9 @@ current source proof and admission of every tool/P4 prefix.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -24,7 +24,10 @@ from elspeth.web.sessions.continuation_retained_capacity import ProspectiveConti
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+    from elspeth.web.composer.continuation_preview_dispatch import IssuedPreviewDispatch
     from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+    from elspeth.web.required_work import RequiredPreviewProduced
+    from elspeth.web.sessions.continuation_preview_result import PreviewReturned
 
 
 class ValueBatchPreparationRefused(ValueError):
@@ -63,6 +66,9 @@ class PreparedValueBatch:
 
 
 _ORIGINAL_BATCHES: WeakKeyDictionary[PreparedValueBatch, str] = WeakKeyDictionary()
+_ISSUED_PREVIEW_BATCHES: WeakKeyDictionary[
+    PreparedValueBatch, tuple[ReferenceType[IssuedPreviewDispatch], ReferenceType[PreviewReturned]]
+] = WeakKeyDictionary()
 
 
 def _captured_data(value: CapturedContinuationRuntime) -> tuple[str, tuple[tuple[str, str, str], ...]]:
@@ -149,3 +155,45 @@ async def prepare_value_batch(
     value = await build_prepared_value_batch(owner, runtime=runtime, selected=selected, inventory=inventory)
     _ORIGINAL_BATCHES[value] = _prepared_batch_data(value)
     return value
+
+
+def prepare_issued_preview_batch(
+    owner: ContinuationLivePhases,
+    *,
+    prepared: PreparedValueBatchCall,
+    produced: RequiredPreviewProduced,
+    runtime: RestoredContinuationRuntime,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+) -> PreparedValueBatch:
+    """Seal only the actual issued preview's newly built full original tail."""
+    from elspeth.web.composer.continuation_preview_dispatch import require_preview_produced
+    from elspeth.web.composer.continuation_value_batch_builder import build_prepared_issued_preview_batch
+    from elspeth.web.required_work import RequiredPreviewProduced
+    from elspeth.web.sessions.continuation_preview_result import CompletePreviewReturn
+
+    if type(produced) is not RequiredPreviewProduced or type(produced.returned) is not CompletePreviewReturn:
+        raise AuditIntegrityError("issued preview tail requires its actual complete original return")
+    require_preview_produced(produced.permit, produced.returned)
+    value = build_prepared_issued_preview_batch(
+        owner, prepared=prepared, permit=produced.permit, runtime=runtime, selected=selected, inventory=inventory
+    )
+    if len(value.steps) != 1:
+        raise AuditIntegrityError("issued preview tail cannot replace another batch prefix")
+    value = replace(value, steps=(replace(value.steps[0], source_chunks=(produced.returned.chunk,)),))
+    _ORIGINAL_BATCHES[value] = _prepared_batch_data(value)
+    _ISSUED_PREVIEW_BATCHES[value] = (ref(produced.permit), ref(produced.returned))
+    return value
+
+
+def require_prepared_issued_preview_batch(value: PreparedValueBatch, produced: RequiredPreviewProduced) -> None:
+    from elspeth.web.composer.continuation_preview_dispatch import require_preview_produced
+    from elspeth.web.required_work import RequiredPreviewProduced
+
+    require_prepared_value_batch(value)
+    if type(produced) is not RequiredPreviewProduced:
+        raise AuditIntegrityError("issued preview tail replaced its actual produced carrier")
+    actual = _ISSUED_PREVIEW_BATCHES.get(value)
+    if actual is None or actual[0]() is not produced.permit or actual[1]() is not produced.returned:
+        raise AuditIntegrityError("issued preview tail lacks its original returned-source seal")
+    require_preview_produced(produced.permit, produced.returned)

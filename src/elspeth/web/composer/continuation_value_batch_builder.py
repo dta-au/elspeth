@@ -15,6 +15,7 @@ from elspeth.web.composer.continuation_batch_data import (
     encode_memory_completion_batch_data,
     encode_prepared_batch_data,
 )
+from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
 from elspeth.web.composer.continuation_p4_batch import encode_p4_pending_batch_chunk
@@ -23,6 +24,7 @@ from elspeth.web.composer.continuation_prepared_p4 import encode_prepared_p4, pr
 from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
     RestoredContinuationRuntime,
+    _capture_owners,
     build_runtime_tool_batch_context,
     capture_metadata_preparation_runtime,
     restore_metadata_preparation_runtime,
@@ -57,6 +59,8 @@ from elspeth.web.sessions.service import SessionServiceImpl
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+    from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
+    from elspeth.web.composer.continuation_preview_dispatch import IssuedPreviewDispatch
     from elspeth.web.composer.tool_batch import ToolBatchContext
 
 
@@ -277,7 +281,24 @@ async def build_prepared_value_batch(
                 owner, runtime=detached, call_model=primary.outcome, context=context, selected=selected, inventory=inventory, index=index
             )
         )
-    dispatch, _passes = _finish_continuation_batch_live(call_model=primary.outcome, ctx=context, acc=data.accumulator, batch=data.batch)
+    pending_runtime, pending_chunk, prepared = _prepare_pending_value_batch(
+        owner, detached=detached, call_model=primary.outcome, context=context, inventory=inventory
+    )
+    pending_capture = await _capture(pending_runtime, selected, inventory)
+    return PreparedValueBatch(selected, inventory, data.calls, tuple(steps), pending_capture, pending_chunk, prepared)
+
+
+def _prepare_pending_value_batch(
+    owner: ContinuationLivePhases,
+    *,
+    detached: RestoredContinuationRuntime,
+    call_model: _CallModelOutcome,
+    context: ToolBatchContext,
+    inventory: CurrentContinuationEnvInventory,
+) -> tuple[RestoredContinuationRuntime, PrivateChunk, PreparedP4Value]:
+    """The unchanged original P4 projection, with no publication or SQL."""
+    data = _adopt_batch_state(detached)
+    dispatch, _passes = _finish_continuation_batch_live(call_model=call_model, ctx=context, acc=data.accumulator, batch=data.batch)
     live, batch = detached.live, data.batch
     operation = inventory.running.session_operation_context
     rows = prepare_turn_audit_rows(
@@ -340,5 +361,83 @@ async def build_prepared_value_batch(
         batch=pending, accumulator=data.accumulator, calls=data.calls, env_ref_names=inventory.names
     )
     pending_runtime = replace(detached, graph=detached.graph.with_batch(RestoredBatchData(pending, data.accumulator, data.calls)))
-    pending_capture = await _capture(pending_runtime, selected, inventory)
-    return PreparedValueBatch(selected, inventory, data.calls, tuple(steps), pending_capture, pending_chunk, prepared)
+    return pending_runtime, pending_chunk, prepared
+
+
+async def adopt_issued_preview_batch(*, prepared: PreparedValueBatchCall, permit: IssuedPreviewDispatch) -> None:
+    """Run original native result/audit handling without invoking its producer."""
+    from elspeth.web.composer.continuation_preview_dispatch import original_adopted_preview_result, require_preview_adoption
+
+    runtime, context = prepared.runtime, prepared.context
+    data = _adopt_batch_state(runtime)
+    require_preview_adoption(
+        permit, call_model=prepared.call_model, ctx=context, acc=data.accumulator, batch=data.batch, call=prepared.call
+    )
+    before = len(context.recorder.invocations)
+    await _execute_continuation_call_live(
+        call_model=prepared.call_model,
+        ctx=context,
+        acc=data.accumulator,
+        llm_messages=runtime.live.llm_messages,
+        batch=data.batch,
+        call=prepared.call,
+        issued_preview=permit,
+    )
+    original = original_adopted_preview_result(permit, prepared=prepared)
+    if (
+        len(data.calls) != 1
+        or len(context.recorder.invocations) != before + 1
+        or len(data.batch.tool_outcomes) != 1
+        or data.batch.tool_outcomes[0].call is not prepared.call.tool_call
+        or data.batch.tool_outcomes[0].response != original.to_tool_result()
+        or data.batch.stop_issued_batch
+        or data.accumulator.authority_revocation is not None
+    ):
+        raise AuditIntegrityError("issued preview changed its actual complete native result prefix")
+    runtime.materialization.register_issued_preview_result_message(prepared=prepared, permit=permit)
+    data.batch.current_call = None
+    data.batch.next_tool_index = 1
+    data.batch.phase = "dispatch_ready"
+    _adopt_batch_state(runtime)
+
+
+def build_prepared_issued_preview_batch(
+    owner: ContinuationLivePhases,
+    *,
+    prepared: PreparedValueBatchCall,
+    permit: IssuedPreviewDispatch,
+    runtime: RestoredContinuationRuntime,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+) -> PreparedValueBatch:
+    """Pure full-tail DATA from the actual issued root and returned result.
+
+    The physical result writer independently reproves the current source and
+    reserves every prefix before writing. This performs no resource read,
+    ordinary clock renewal, current SQL admission or user publication.
+    """
+    from elspeth.web.composer.continuation_preview_dispatch import original_adopted_preview_result
+
+    original_adopted_preview_result(permit, prepared=prepared)
+    if (
+        runtime.source.selected is not selected
+        or type(runtime.source.policy) is not ContinuationAdmissionPolicyV4
+        or inventory.running is not owner.work.running
+        or runtime.bindings.session_operation_context is not prepared.runtime.bindings.session_operation_context
+        or selected.stack.frames[-1].frame_kind != "tool_batch"
+    ):
+        raise AuditIntegrityError("issued preview tail changed its actual current runtime source")
+    top = selected.stack.frames[-1]
+    if type(top) is not ToolBatchFrame or top.phase != "effect_reconciling" or top.next_tool_index != 0:
+        raise AuditIntegrityError("issued preview tail requires its actual already-issued frame")
+    actual = prepared.runtime
+    data = _adopt_batch_state(actual)
+    if len(data.calls) != 1 or data.batch.phase != "dispatch_ready" or data.batch.current_call is not None:
+        raise AuditIntegrityError("issued preview tail lost its complete original native adoption")
+    completed = _capture_owners(actual, source=runtime.source, inventory=inventory)
+    pending_runtime, pending_chunk, p4 = _prepare_pending_value_batch(
+        owner, detached=actual, call_model=prepared.call_model, context=prepared.context, inventory=inventory
+    )
+    pending_capture = _capture_owners(pending_runtime, source=runtime.source, inventory=inventory)
+    step = PreparedValueBatchStep(0, None, completed, None)
+    return PreparedValueBatch(selected, inventory, data.calls, (step,), pending_capture, pending_chunk, p4)

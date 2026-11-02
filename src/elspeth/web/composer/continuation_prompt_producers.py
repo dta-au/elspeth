@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot
     from elspeth.web.composer.continuation_metadata_preparation import PreparedMetadataToolCall
     from elspeth.web.composer.continuation_pipeline_preparation import PreparedPipelineToolCall
+    from elspeth.web.composer.continuation_preview_dispatch import IssuedPreviewDispatch
     from elspeth.web.composer.continuation_retention import OrderedObjectJSON
     from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
     from elspeth.web.composer.continuation_value_batch_computation import ObservedValueBatchComputation
@@ -1087,6 +1088,39 @@ class CurrentContinuationMessageProducers:
             message=message,
         )
         registered = self._register(message, result_recipe)
+        self._remember_tool_result_provenance(registered)
+
+    def register_issued_preview_result_message(self, *, prepared: PreparedValueBatchCall, permit: IssuedPreviewDispatch) -> None:
+        """Bind only the original issued preview's native appended result."""
+        from elspeth.web.composer.continuation_preview_dispatch import original_adopted_preview_result
+
+        admitted = original_adopted_preview_result(permit, prepared=prepared)
+        if prepared.runtime.materialization is not self or prepared.context.message_producers is not self:
+            raise AuditIntegrityError("issued preview feedback changed its actual original materialization")
+        message, tool_call, outcome, invocation, authoring, response = self._prepared_value_batch_message_source(
+            runtime=prepared.runtime, call_model=prepared.call_model, index=prepared.call.index
+        )
+        serialized = serialize_admitted_discovery_result(admitted)
+        if (
+            type(message) is not dict
+            or tool_call.function.name != "preview_pipeline"
+            or outcome.response != admitted.to_tool_result()
+            or message["content"] != serialized
+            or invocation.private_authoring is not authoring
+            or any(actual is message for actual, *_rest in self._produced)
+            or any(item.message is message for item in self._feedback_produced)
+        ):
+            raise AuditIntegrityError("issued preview feedback changed its complete original native output")
+        recipe = capture_tool_result_recipe(
+            response=response,
+            completion=prepared.call_model.completion,
+            tool_index=prepared.call.index,
+            call=tool_call,
+            result=admitted,
+            serialized=serialized,
+            message=message,
+        )
+        registered = self._register(message, recipe)
         self._remember_tool_result_provenance(registered)
 
     def _register_prepared_value_result_message(

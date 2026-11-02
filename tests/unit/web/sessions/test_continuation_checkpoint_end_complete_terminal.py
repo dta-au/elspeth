@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from time import monotonic
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import litellm
 import pytest
@@ -44,12 +44,10 @@ from elspeth.web.sessions.continuation_end import enter_continuation_end, execut
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
-from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
-from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.time_normalization import restore_utc
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_advisor_checkpoint import _checkpoint_reply, simple_state
@@ -147,9 +145,7 @@ async def _original_finalization_inputs(phases, source, selected):
 
 
 @pytest.mark.asyncio
-async def test_actual_end_complete_flagged_terminal_preserves_full_finalizer_and_rejects_foreign_result(
-    operation_store, tmp_path, monkeypatch
-):
+async def test_direct_end_terminal_without_semantic_stop_refuses_and_preserves_paid_h(operation_store, tmp_path, monkeypatch):
     policy = continuation_policy_v4_from_settings(
         continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
     )
@@ -333,41 +329,15 @@ async def test_actual_end_complete_flagged_terminal_preserves_full_finalizer_and
             raise CapturedTerminal
 
         monkeypatch.setattr(phases.service._advisor_checkpoint, "_run_advisor_checkpoint", intercept_original_end_gate)
-        with pytest.raises(CapturedTerminal):
+        with pytest.raises(AuditIntegrityError, match="semantic publication lacks its actual END publication phase"):
             await execute_continuation_end_review(phases, entered.source.selected)
-        assert sdk_calls == [1] and len(retained) == 1
-        outcome, owed, projected, prepared = retained[0]
+        assert sdk_calls == [1] and not retained
         with locked_session_transaction(store[0], str(store[4])) as conn:
             parent = conn.execute(select(jobs).where(jobs.c.operation_id == running.claim.operation_id)).one()
-            attempt = conn.execute(select(physical).where(physical.c.attempt_id == owed.original.attempt.attempt_id)).one()
-            hold = conn.execute(select(holds).where(holds.c.effect_key == owed.original.effect_key)).one()
-            ledger = conn.execute(select(usage).where(usage.c.entry_id == attempt.ledger_entry_id)).one()
-            assert parent.status == "completed" and parent.result_json is not None
-            assert attempt.settled_at is not None and hold.state == "consumed" and ledger.entry_id == attempt.ledger_entry_id
-            assert outcome.record.status == "completed" and outcome.batch.projected is projected
-            assert outcome.record.result_json == parent.result_json
-            from elspeth.web.sessions.continuation_checkpoint_end_complete_terminal_cold import (
-                require_end_complete_terminal_postwrite_on_connection,
-            )
-
-            pass_sequence = conn.execute(
-                select(messages.c.sequence_no).where(messages.c.id == outcome.batch.pass_audit.message_id)
-            ).scalar_one()
-            prefix_sequences = tuple(
-                conn.execute(select(messages.c.sequence_no).where(messages.c.id == row.message_id)).scalar_one()
-                for row in outcome.batch.prefix_rows
-            )
-            foreign_message = outcome.batch.response.message.model_copy(update={"id": str(uuid4())})
-            foreign_response = outcome.batch.response.model_copy(update={"message": foreign_message})
-            with pytest.raises(AuditIntegrityError):
-                require_end_complete_terminal_postwrite_on_connection(
-                    conn,
-                    prepared=prepared,
-                    batch=replace(outcome.batch, response=foreign_response),
-                    record=outcome.record,
-                    pass_sequence=pass_sequence,
-                    prefix_sequences=prefix_sequences,
-                )
+            hold = conn.execute(select(holds).where(holds.c.session_id == str(store[4]), holds.c.state == "active")).one()
+            attempt = conn.execute(select(physical).where(physical.c.attempt_id == hold.provider_attempt_id)).one()
+            assert parent.status == "running" and parent.result_json is None
+            assert attempt.settled_at is None and hold.state == "active"
     finally:
         await lease.close()
         work.coordinator.assert_completed()
