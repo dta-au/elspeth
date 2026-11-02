@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Audit or harden the four project-owned Nyx GitHub Actions runners.
+# Audit or harden the six registered project-owned Nyx GitHub Actions runners.
+# GitHub's nyx-ci label admits only three of them to the shared CI pool; local
+# custody applies to all six, including services draining out of eligibility.
+# Label administration is separate: docs/runbooks/self-hosted-runner-hardening.md.
 #
 # The 2026-10-01 custody review found runner credentials and environment files
 # at mode 0664 and services without a restrictive umask or systemd sandboxing.
@@ -13,7 +16,7 @@ RUNNER_ROOT=/opt/actions-runner
 SERVICE_DIR=/etc/systemd/system
 OWNER=actions-runner
 GROUP=actions-runner
-EXPECTED_COUNT=4
+EXPECTED_COUNT=6
 SERVICE_PREFIX=actions.runner.dta-au-elspeth.nyx-elspeth
 
 usage() {
@@ -23,6 +26,7 @@ Usage: scripts/cicd/harden-self-hosted-runners.sh [--check|--execute]
 
 --check is read-only and is the default. --execute is allowed only for the
 live /opt/actions-runner and /etc/systemd/system paths and requires root.
+Audits all six registered services. Does not change GitHub scheduling labels.
 EOF
 }
 

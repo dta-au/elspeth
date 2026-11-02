@@ -13,22 +13,24 @@ name: CI
 
 on:
   push:
-    branches: [main, master, "RC*", "release/**"]
+    branches: [main, master, "RC*"]
   pull_request:
     branches: [main, master, "RC*", "release/**"]
+  workflow_dispatch:
 
-# Cancel in-progress runs when a new commit is pushed — except on release/**
-# refs. A release branch is landed in bursts (~12 pushes in 11 h on
-# 2026-09-04/05) and every CI run in that window was cancelled by the next
-# push, so the required check never completed on a single sha
-# (elspeth-d8749aeaa3). On a release ref the in-progress run finishes and
-# only the pending run is replaced, so the tip is always tested eventually
-# and every completed run is a verdict on a real sha. The three push
-# workflows (ci, codeql, enforce-allowlist-judge-gates) keep this expression
-# identical; tests/unit/cicd pins it.
+# Release branches run the full matrix through their open pull request only.
+# A release push and its PR previously launched two complete matrices on Nyx.
+# Keep the PR's default synthetic merge checkout: equal event head_sha values
+# do not prove that the push tree and the PR merge tree are interchangeable.
+# Release work without a PR can use workflow_dispatch; it has no automatic
+# push CI until a PR is opened. Main/master/RC pushes retain post-merge CI.
+#
+# Release work arrives in bursts (elspeth-d8749aeaa3). Let both a release-head
+# PR run and a manually dispatched release-ref run finish; only their pending
+# run is replaced. Other refs retain cancellation of obsolete active runs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') && !startsWith(github.head_ref, 'release/') }}
 
 env:
   PYTHON_VERSION: "3.13"
@@ -51,7 +53,7 @@ jobs:
   # ===========================================================================
   static-analysis:
     name: Static analysis
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
@@ -369,7 +371,7 @@ jobs:
   # ===========================================================================
   test:
     name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: ${{ matrix.ci-container-image }}
@@ -387,9 +389,10 @@ jobs:
     # Run tests even if static analysis fails, so both results are visible.
     strategy:
       fail-fast: false
-      # Four ordinary jobs use eight pytest workers; the two proof jobs
-      # retain capacity on the six trusted runners.
-      max-parallel: 4
+      # Nyx exposes only three shared job slots through its nyx-ci runner label.
+      # That host-wide budget covers setup, ordinary tests and proofs across
+      # workflows. This per-run limit is a ceiling, not reserved capacity.
+      max-parallel: 3
       matrix:
         python-version: ["3.12", "3.13"]
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -582,7 +585,7 @@ jobs:
 
   landscape-proof:
     name: Landscape long-run proofs
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     uses: ./.github/workflows/landscape-long-run.yml
 
   coverage:
@@ -591,7 +594,7 @@ jobs:
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
     needs: [test, landscape-proof]
-    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: (always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-coverage
     steps:
@@ -696,7 +699,13 @@ jobs:
       # Same open-file limit as the Test job (see the note there).
       options: --ulimit nofile=65536:524288
     needs: [test]
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/')))
+    if: >-
+      (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/')))) &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' ||
+         startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))) ||
+       (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')))
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-integration
     steps:
@@ -807,7 +816,7 @@ jobs:
     name: Testcontainer (PostgreSQL contention proofs)
     # Run on the host so testcontainers-python can use the runner's Docker
     # daemon directly; container jobs do not expose that daemon.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Run PostgreSQL proofs even if static analysis fails. CI Success requires both.
     # PR #212 selected 651 ids on a hosted runner and reached 53% when the
@@ -887,7 +896,7 @@ jobs:
     # container job those ids skip with a reason; here the ELSPETH_CI_*_REQUIRED
     # variables turn the skips into failures, so the ids are proven on every
     # push rather than silently absent (elspeth-bc97e06221 B1, B3).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     timeout-minutes: 15
     env:
@@ -940,7 +949,7 @@ jobs:
   # ===========================================================================
   state-engine-validation:
     name: State-engine catalog and selector validation
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     timeout-minutes: 15
@@ -998,7 +1007,7 @@ jobs:
   # ===========================================================================
   azure-container-apps-bicep:
     name: Azure Container Apps Bicep bundle
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     timeout-minutes: 15
@@ -1062,7 +1071,7 @@ jobs:
 
   supply-chain-audit:
     name: Dependency and License Audit
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm@sha256:227b6570d6ee07061ae6ca2eb04dedfb6d2b34045835f343065b9869e4d427ea
@@ -1222,7 +1231,7 @@ jobs:
   # ===========================================================================
   gateway:
     name: Gateway (locked tests and image)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     env:
@@ -1393,7 +1402,7 @@ jobs:
   # browser journey blocks merge instead of being waved through.
   e2e-frontend:
     name: Frontend E2E (Playwright)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-e2e-frontend
@@ -1502,7 +1511,7 @@ jobs:
   # blocks merge.
   frontend-unit:
     name: Frontend unit (vitest + typecheck)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-frontend-unit
@@ -1552,7 +1561,7 @@ jobs:
       - e2e-frontend
       - frontend-unit
       - gateway
-    if: always()
+    if: (always()) && (github.event_name != 'workflow_dispatch' || (github.ref_protected && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))))
     steps:
       - name: Reject fork pull requests
         env:

@@ -205,18 +205,21 @@ def _assert_manual_admission(workflows: dict[str, dict[str, Any]]) -> None:
             assert _admitted(jobs, name, _context("workflow_dispatch")) == expected, f"{filename}:{name}: trusted manual path changed"
             for context in (
                 _context("workflow_dispatch", ref="refs/heads/contributor"),
-                _context("workflow_dispatch", ref="refs/heads/release/0.8.4"),
                 _context("workflow_dispatch", ref="refs/tags/v0.8.4"),
                 _context("workflow_dispatch", protected=False),
             ):
                 assert not _admitted(jobs, name, context), f"{filename}:{name}: untrusted manual ref reached runner"
+            release = _context("workflow_dispatch", ref="refs/heads/release/0.8.4")
+            assert _admitted(jobs, name, release) == (filename == "ci.yaml"), f"{filename}:{name}: release manual policy changed"
+            release["github"]["ref_protected"] = False
+            assert not _admitted(jobs, name, release), f"{filename}:{name}: untrusted manual ref reached runner"
 
 
 def test_all_declared_event_paths_resolve_to_their_isolated_runner_pool() -> None:
     _assert_routing(_workflows())
 
 
-def test_all_manual_paths_reject_nondefault_or_unprotected_refs_before_runner_allocation() -> None:
+def test_all_manual_paths_reject_unapproved_or_unprotected_refs_before_runner_allocation() -> None:
     _assert_manual_admission(_workflows())
 
 
@@ -329,7 +332,9 @@ def test_runner_policy_detects_privileged_pr_routes_and_unresolved_reusable_path
         _assert_routing(workflows)
 
 
-@pytest.mark.parametrize("filename", ["build-push.yaml", "pages.yaml", "mutation-testing.yaml", "state-engine-live-provider.yml"])
+@pytest.mark.parametrize(
+    "filename", ["ci.yaml", "build-push.yaml", "pages.yaml", "mutation-testing.yaml", "state-engine-live-provider.yml"]
+)
 def test_manual_admission_detects_removed_guard_in_every_workflow(filename: str) -> None:
     workflows = copy.deepcopy(_workflows())
     _assert_manual_admission(workflows)

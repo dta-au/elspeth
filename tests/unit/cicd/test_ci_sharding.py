@@ -35,6 +35,7 @@ from scripts.ci_test_shards import (
     shard_index,
     validate_long_run_shards,
 )
+from tests.unit.cicd.test_workflow_runner_isolation import _context, _expression
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -1912,15 +1913,15 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
     jobs = _activation_workflow_jobs()
     matrix = jobs["test"]["strategy"]["matrix"]
     assert matrix["shard"] == list(range(8))
-    assert jobs["test"]["strategy"]["max-parallel"] == 4
+    assert jobs["test"]["strategy"]["max-parallel"] == 3
     assert jobs["test"]["env"]["PYTEST_WORKERS"] == "2"
     assert "matrix.shard" in jobs["test"]["env"]["CI_CHECKOUT_PATH"]
     aggregate = jobs["coverage"]
     assert aggregate["needs"] == ["test", "landscape-proof"]
-    assert (
-        aggregate["if"]
-        == "always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)"
-    )
+    assert aggregate["if"].startswith("(always() && ")
+    assert _expression(aggregate["if"], _context("push"))
+    assert not _expression(aggregate["if"], _context("pull_request", fork=True))
+    assert not _expression(aggregate["if"], _context("workflow_dispatch", protected=False))
     commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
     assert "needs.test.result" in commands
     assert "needs.landscape-proof.result" in commands
@@ -1945,7 +1946,10 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
     caller = jobs["landscape-proof"]
     assert set(caller) == {"name", "if", "uses"}
     assert caller["uses"] == "./.github/workflows/landscape-long-run.yml"
-    assert caller["if"] == "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+    assert _expression(caller["if"], _context("push"))
+    assert _expression(caller["if"], _context("pull_request"))
+    assert not _expression(caller["if"], _context("pull_request", fork=True))
+    assert not _expression(caller["if"], _context("workflow_dispatch", protected=False))
     for name in ("Run tests with coverage", "Run tests without coverage"):
         run = _activation_step(jobs["test"], name)["run"]
         tokens = shlex.split(run.replace("\\\n", " "), comments=True)
@@ -2004,7 +2008,8 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
         assert "if" not in validation and "continue-on-error" not in validation
     success = jobs["ci-success"]
     assert "landscape-proof" in success["needs"] and "coverage" in success["needs"]
-    assert success["if"] == "always()"
+    assert success["if"].startswith("(always()) && ")
+    assert _expression(success["if"], _context("push"))
     assert 'if [[ "${{ needs.landscape-proof.result }}" != "success" ]]; then' in _activation_step(success, "Check all jobs passed")["run"]
     report = _activation_step(aggregate, "Upload combined coverage report")
     assert report["if"] == "always()"
