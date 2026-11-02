@@ -2024,7 +2024,7 @@ def test_postgres_runs_check_drift_refuses_current_epoch_without_rewriting_schem
         checks_before = Counter((check["name"], check["sqltext"]) for check in inspect(conn).get_check_constraints("runs"))
         identity_before = conn.execute(select(session_schema_identity_table)).all()
         rows_before = run_rows(conn)
-        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 80
+        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 83
     assert probe_session_schema(postgres_engine) is SchemaState.STALE
     with pytest.raises(SessionSchemaError) as raised:
         init_session_schema(postgres_engine)
@@ -2047,7 +2047,7 @@ def test_postgres_runs_check_reflection_is_current_idempotent_and_identity_bound
     with postgres_engine.connect() as conn:
         identity_before = conn.execute(select(session_schema_identity_table)).all()
         rows_before = run_rows(conn)
-        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 80
+        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 83
     init_session_schema(postgres_engine)
     with postgres_engine.connect() as conn:
         assert conn.execute(select(session_schema_identity_table)).all() == identity_before

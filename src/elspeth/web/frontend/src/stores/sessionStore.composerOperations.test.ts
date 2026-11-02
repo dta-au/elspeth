@@ -161,6 +161,29 @@ describe("terminal publication before optional reads", () => {
     } finally { for (const finish of release) finish(); await sending; }
   });
 
+  it("keeps an unsent draft and suppresses Retry when the attached winner has paid overflow", async () => {
+    const winnerId = "66666666-6666-4666-8666-666666666666";
+    const refusal = { status: 409, error_type: "composer_operation_active", operation_id: winnerId, kind: "compose_message" };
+    const body = { error_type: "paid_result_overflow", detail: "The paid result could not be retained.", evidence_status: "incomplete", retryable: false };
+    vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(refusal);
+    vi.mocked(api.composerActiveOperation).mockImplementation((error) => error === refusal ? { operation_id: winnerId, kind: "compose_message" } : null);
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 507, detail: body.detail, error_type: "paid_result_overflow" });
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...snapshot(winnerId), status: "failed", result: null, error: { http_status: 507, failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, body } });
+    vi.mocked(api.fetchComposerOperationFailures).mockResolvedValue({ session_id: sid, items: [{ session_id: sid, operation_id: winnerId, kind: "compose_message", user_message_id: null, settled_at: "2026-10-14T08:00:00Z", failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 } }], next_cursor: null });
+    await useSessionStore.getState().sendMessage("my unsent draft");
+    const state = useSessionStore.getState();
+    const loser = state.messages.find((row) => row.content === "my unsent draft")!;
+    expect(loser.operation_id).not.toBe(winnerId);
+    expect(loser.local_status).toBe("failed");
+    expect(loser.local_failure_code).toBe("paid_result_overflow");
+    expect(loser.local_error).toContain("unsent content remains a draft");
+    expect(loser.local_error).toContain("may have incurred a charge");
+    expect(state.composerFailureOutcomes[0].operation_id).toBe(winnerId);
+    expect(state.composerFailureOutcomes[0].saved_revisions).toEqual({ attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 });
+    await useSessionStore.getState().retryMessage(loser.id);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  });
+
   it.each([false, true])("keeps fresh same-ID tool projections; genuine intervening update=%s", async (intervening) => {
     const tool = { id: userId, type: "function", function: { name: "set_metadata", arguments: "{}" } };
     const old = { ...assistant, content: "older assistant", tool_calls: [tool] };
@@ -330,6 +353,23 @@ describe("durable composer store integration", () => {
     await useSessionStore.getState().sendMessage("hello"); const row = useSessionStore.getState().messages.find((item) => item.role === "user")!; expect(row.local_failure_code).toBe("stale_compose_state");
     const first = vi.mocked(api.submitComposerOperation).mock.calls[0][0]; await useSessionStore.getState().retryMessage(row.id); const second = vi.mocked(api.submitComposerOperation).mock.calls[1][0];
     expect(second.operationId).not.toBe(first.operationId); expect(second.body.state_id).toBe(stateId);
+  });
+  it("publishes paid overflow without offering or dispatching another paid attempt", async () => {
+    const body = { error_type: "paid_result_overflow", detail: "A paid result could not be retained.", evidence_status: "incomplete", retryable: false, cost: { status: "unknown", amount: null } };
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 507, error_type: "paid_result_overflow", detail: body.detail });
+    vi.mocked(api.fetchComposerOperation).mockImplementationOnce(async (_session, operationId) => ({ ...snapshot(operationId), status: "failed", result: null, error: { http_status: 507, failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, body } }));
+    vi.mocked(api.fetchComposerOperationFailures).mockImplementationOnce(async (_session, options) => ({ session_id: sid, items: [{ session_id: sid, operation_id: options!.operationId!, kind: "compose_message", user_message_id: null, settled_at: "2026-10-14T08:00:00Z", failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 } }], next_cursor: null }));
+    await useSessionStore.getState().sendMessage("hello");
+    const state = useSessionStore.getState();
+    const row = state.messages.find((item) => item.role === "user")!;
+    expect(row.local_status).toBe("failed");
+    expect(row.local_failure_code).toBe("paid_result_overflow");
+    expect(row.local_error).toContain("may have incurred a charge");
+    expect(state.composerFailureOutcomes[0].error_type).toBe("paid_result_overflow");
+    expect(state.composerFailureOutcomes[0].saved_revisions).toEqual({ attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 });
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+    await useSessionStore.getState().retryMessage(row.id);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
   });
   it("a delayed terminal reload cannot overwrite a newer state or proposal decisions", async () => {
     let release!: (messages: ChatMessage[]) => void;

@@ -15,6 +15,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
     ContinuationAdmittedCostPolicy,
     ContinuationSegmentPolicy,
 )
@@ -117,6 +118,27 @@ def continuation_policy_v3_from_settings(settings: WebSettings) -> ContinuationA
         actions=costed.actions,
         provider_cost=costed.provider_cost,
         max_retained_payload_bytes=limit,
+    )
+
+
+def continuation_policy_v4_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicyV4 | None:
+    """Prepare an explicit paid-overflow policy; leave admission to its owner.
+
+    Absence of a configured whole-operation allowance still means no new V4
+    policy. This builder neither changes the default V2 path nor activates V4.
+    """
+    if type(settings) is not WebSettings:
+        raise TypeError("continuation policy requires the owned WebSettings")
+    limit = settings.composer_continuation_max_retained_payload_bytes
+    if limit is None:
+        return None
+    costed = continuation_policy_from_settings(settings)
+    return ContinuationAdmissionPolicyV4(
+        segment=costed.segment,
+        actions=costed.actions,
+        provider_cost=costed.provider_cost,
+        max_retained_payload_bytes=limit,
+        paid_provider_overflow_disposition="terminal_paid_overflow",
     )
 
 

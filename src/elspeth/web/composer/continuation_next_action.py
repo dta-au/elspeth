@@ -31,6 +31,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_progress import decode_prescribed_continuation_action
@@ -429,7 +430,8 @@ def _require_quiescent_handoff_cut(root: ContinuationFrameStack) -> None:
 
 
 def handoff_cut_allowance(
-    root: ContinuationFrameStack, policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3
+    root: ContinuationFrameStack,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
 ) -> ContinuationActionPolicy | None:
     """Size the handoff-safe cuts no recovery owner produces; None for every other cut.
 
@@ -537,7 +539,7 @@ def iteration_stage_action_policy(
 def next_continuation_action_policy(
     *,
     selected: SelectedContinuationState,
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
 ) -> ContinuationActionPolicy:
     if type(selected) is not SelectedContinuationState or type(policy) not in (
         ContinuationAdmissionPolicy,

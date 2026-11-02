@@ -70,7 +70,7 @@ accept this trade-off.
 ## First-deploy operator action
 
 Since 0.8.1, shareable-review state is part of the broader web session
-database contract. The unreleased 0.8.10 candidate expects `SESSION_SCHEMA_EPOCH=82`
+database contract. The unreleased 0.8.10 candidate expects `SESSION_SCHEMA_EPOCH=83`
 and `SQLITE_SCHEMA_EPOCH=50`; confirm both against the deployed service's
 live schema constants before a fresh installation.
 
@@ -78,13 +78,14 @@ Epoch 78 retains authoritative committed graph-review facts and adds durable quo
 custody and shared rate-limit policy binding; Landscape epoch 50 binds run calls
 to provider attempts. Preserve epoch-75, both distinct epoch-76, epoch-77, epoch-78 and epoch-79 session
 store contracts and epoch-49 Landscape stores with their compatible prior application.
-Preserve epoch-80 and epoch-81 Sessions stores unchanged too, and provision
-separate epoch-82 Sessions and epoch-50 Landscape targets for the candidate.
+Preserve epoch-80 through epoch-82 Sessions stores unchanged too, and provision
+separate epoch-83 Sessions and epoch-50 Landscape targets for the candidate.
 Epoch 82 makes the admitted continuation policy version, hash and retained-payload
-allowance immutable in the parent operation. Existing epoch-81 stores are refused
-without automatic upgrade; V1/V2 policies can be created/resumed only within a
-compatible epoch-82 store, not by reopening an epoch-81 database. This repair
-does not activate V3 admission or change the application's policy default.
+allowance immutable in the parent operation. Epoch 83 adds the V4 paid-provider
+policy contract and provider-terminal hold table. Existing epoch-81/82 stores
+are refused without automatic upgrade; V1/V2 policies can be created/resumed
+only within a compatible epoch-83 store. This change does not activate V3/V4
+admission or change the application's policy default.
 Drain and isolate old/new workers; they must
 not share these stores. Compatibility keys do not automatically evict old
 replicas.

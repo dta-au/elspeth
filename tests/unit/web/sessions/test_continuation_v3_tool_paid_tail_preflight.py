@@ -113,7 +113,7 @@ async def test_original_v3_tool_cut_refuses_before_issue_and_cold_rejects_unprov
         )
         with pytest.raises(AuditIntegrityError):
             read_v3_tool_no_execution_refusal_on_connection(
-                conn, session_id=store[4], operation_id=operation, effect_key=receipt.effect_key
+                conn, session_id=store[4], operation_id=operation, effect_key=receipt.effect_key, env_ref_names=inventory.names
             )
     with pytest.raises(ComposerOperationFenceLost):
         refuse_v3_tool_before_dispatch(store[2], running, selected=selected, inventory=inventory)
@@ -133,5 +133,5 @@ async def test_original_v3_tool_cut_refuses_before_issue_and_cold_rejects_unprov
         )
         with pytest.raises(AuditIntegrityError):
             read_v3_tool_no_execution_refusal_on_connection(
-                conn, session_id=store[4], operation_id=operation, effect_key=receipt.effect_key
+                conn, session_id=store[4], operation_id=operation, effect_key=receipt.effect_key, env_ref_names=inventory.names
             )

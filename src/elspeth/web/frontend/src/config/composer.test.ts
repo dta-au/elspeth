@@ -22,6 +22,10 @@ describe("durable composer observation policy", () => {
     expect(composer.isComposePermanentRefusal("context_unsupported")).toBe(true);
     expect(composer.isComposeRefreshOnlyFailureCode("context_unsupported")).toBe(false);
   });
+  it("never offers an automatic paid retry after incomplete provider evidence", () => {
+    expect(composer.isComposePermanentRefusal("paid_result_overflow")).toBe(true);
+    expect(composer.isComposeRefreshOnlyFailureCode("paid_result_overflow")).toBe(false);
+  });
   it("distinguishes observation detachment from explicit Stop", () => {
     expect(composer.COMPOSE_TIMEOUT_ABORT_REASON).toBe("compose_timeout");
     expect(composer.COMPOSE_USER_CANCEL_ABORT_REASON).toBe("compose_user_cancel");

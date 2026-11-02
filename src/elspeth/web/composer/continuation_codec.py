@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import Field, JsonValue, ValidationError
 
-from elspeth.contracts.bounded_serialization import utf8_size
+from elspeth.contracts.bounded_serialization import BoundedCanonicalSize, bounded_canonical_json_size, utf8_size
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMProviderCostSource
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -345,12 +345,12 @@ def require_continuation_request_admission(request_json: str) -> None:
     )
 
 
-def encode_continuation_response(
+def _continuation_response_json_value(
     completion: _AdmittedLLMCompletion,
     *,
     advisor_result_metadata: RetainedAdvisorResultMetadata | None = None,
     audit_call: ComposerLLMCall | None = None,
-) -> PrivateChunk:
+) -> dict[str, JsonValue]:
     if type(completion) is not _AdmittedLLMCompletion:
         raise TypeError("response retention requires an admitted completion")
     audit_json = None
@@ -399,13 +399,37 @@ def encode_continuation_response(
             provider_served=metadata.provider_served,
         ),
     )
+    return retained.model_dump(
+        mode="json",
+        exclude={"native_thinking_json"} if retained.native_thinking_json is None else None,
+    )
+
+
+def measure_continuation_response_size(
+    completion: _AdmittedLLMCompletion,
+    *,
+    advisor_result_metadata: RetainedAdvisorResultMetadata | None = None,
+    audit_call: ComposerLLMCall | None = None,
+) -> BoundedCanonicalSize:
+    """Measure the complete success response, including escaped physical audit.
+
+    Only a validated complete result may turn this observation into overflow.
+    Invalid projections and credentials retain their ordinary refusal paths.
+    """
+    value = _continuation_response_json_value(completion, advisor_result_metadata=advisor_result_metadata, audit_call=audit_call)
+    return bounded_canonical_json_size(value, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+
+
+def encode_continuation_response(
+    completion: _AdmittedLLMCompletion,
+    *,
+    advisor_result_metadata: RetainedAdvisorResultMetadata | None = None,
+    audit_call: ComposerLLMCall | None = None,
+) -> PrivateChunk:
     return encode_private_chunk(
         codec="composer.response.v1",
         canonical=canonical_json(
-            retained.model_dump(
-                mode="json",
-                exclude={"native_thinking_json"} if retained.native_thinking_json is None else None,
-            )
+            _continuation_response_json_value(completion, advisor_result_metadata=advisor_result_metadata, audit_call=audit_call)
         ),
     )
 

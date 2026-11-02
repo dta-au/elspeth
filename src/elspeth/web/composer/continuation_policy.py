@@ -23,8 +23,14 @@ PositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)
 CONTINUATION_POLICY_SCHEMA_VERSION: Final = "composer.continuation.policy.v1"
 CONTINUATION_POLICY_SCHEMA_VERSION_V2: Final = "composer.continuation.policy.v2"
 CONTINUATION_POLICY_SCHEMA_VERSION_V3: Final = "composer.continuation.policy.v3"
+CONTINUATION_POLICY_SCHEMA_VERSION_V4: Final = "composer.continuation.policy.v4"
 _KNOWN_POLICY_SCHEMA_VERSIONS: Final = frozenset(
-    {CONTINUATION_POLICY_SCHEMA_VERSION, CONTINUATION_POLICY_SCHEMA_VERSION_V2, CONTINUATION_POLICY_SCHEMA_VERSION_V3}
+    {
+        CONTINUATION_POLICY_SCHEMA_VERSION,
+        CONTINUATION_POLICY_SCHEMA_VERSION_V2,
+        CONTINUATION_POLICY_SCHEMA_VERSION_V3,
+        CONTINUATION_POLICY_SCHEMA_VERSION_V4,
+    }
 )
 
 
@@ -187,9 +193,45 @@ class ContinuationAdmissionPolicyV3(BaseModel):
         return stable_hash(self.model_dump(mode="json"))
 
 
+class ContinuationAdmissionPolicyV4(BaseModel):
+    """V3 payload allowance with an explicit paid-provider overflow disposition.
+
+    The disposition only permits a terminal incomplete-evidence receipt after
+    an actual provider call. It does not authorize dropping tool results or
+    weakening the complete-success contract retained by older policies.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    schema_version: Literal["composer.continuation.policy.v4"] = CONTINUATION_POLICY_SCHEMA_VERSION_V4
+    segment: ContinuationSegmentPolicy
+    actions: ContinuationActionBounds
+    provider_cost: ContinuationAdmittedCostPolicy
+    max_retained_payload_bytes: Annotated[int, Field(strict=True, ge=1, le=_CANONICAL_SAFE_INTEGER_MAX)]
+    paid_provider_overflow_disposition: Literal["terminal_paid_overflow"]
+
+    @model_validator(mode="after")
+    def _finite_segment_sizing(self) -> Self:
+        for action in (
+            self.actions.primary,
+            self.actions.advisor,
+            self.actions.title,
+            self.actions.read,
+            self.actions.session_sql,
+            self.actions.blob,
+            self.actions.external,
+        ):
+            if not math.isfinite(action.total + self.segment.reserve + self.segment.watermark):
+                raise ValueError("complete segment sizing allowance must be finite")
+        return self
+
+    @property
+    def policy_hash(self) -> str:
+        return stable_hash(self.model_dump(mode="json"))
+
+
 def decode_continuation_policy(
     encoded: str, expected_hash: str
-) -> ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3:
+) -> ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4:
     value, error = parse_json_strict(encoded)
     if error is not None:
         raise AuditIntegrityError("continuation policy is not strict JSON")
@@ -201,13 +243,20 @@ def decode_continuation_policy(
     if type(version) is not str or version not in _KNOWN_POLICY_SCHEMA_VERSIONS:
         raise AuditIntegrityError("continuation policy has an unknown schema version")
     try:
-        kind: type[ContinuationAdmissionPolicy] | type[ContinuationAdmissionPolicyV2] | type[ContinuationAdmissionPolicyV3]
+        kind: (
+            type[ContinuationAdmissionPolicy]
+            | type[ContinuationAdmissionPolicyV2]
+            | type[ContinuationAdmissionPolicyV3]
+            | type[ContinuationAdmissionPolicyV4]
+        )
         if version == CONTINUATION_POLICY_SCHEMA_VERSION:
             kind = ContinuationAdmissionPolicy
         elif version == CONTINUATION_POLICY_SCHEMA_VERSION_V2:
             kind = ContinuationAdmissionPolicyV2
-        else:
+        elif version == CONTINUATION_POLICY_SCHEMA_VERSION_V3:
             kind = ContinuationAdmissionPolicyV3
+        else:
+            kind = ContinuationAdmissionPolicyV4
         policy = kind.model_validate_json(canonical_json(value))
     except ValueError as exc:
         raise AuditIntegrityError("continuation policy violates its complete owned contract") from exc

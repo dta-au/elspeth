@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
@@ -38,6 +38,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
     ContinuationSegmentPolicy,
     decode_continuation_policy,
 )
@@ -327,7 +328,7 @@ class ContinuationCASConflict(AuditIntegrityError):
 
 
 def _retained_payload_limit(
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
     supplied: int | None,
 ) -> int | None:
     if type(policy) is not ContinuationAdmissionPolicyV3:
@@ -874,9 +875,36 @@ def prepare_segment_settlement_on_connection(
     outcome: MessageWithStateResponse | ComposerOperationError,
     settled_by: Literal["owner_terminal", "settle_lost", "settle_lost_inactive_session"],
     attempt_outcome: Literal["settled", "interrupted"],
+    prospective_append: PreparedContinuationAppend | None = None,
 ) -> PreparedSegmentSettlement:
     """Freeze publication DATA under the caller's real lock, before any write."""
     stored = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+    driving = _settlement_driving(parent, segment, history)
+    if prospective_append is not None:
+        prospective_append.require_original()
+        if (
+            prospective_append.session_id != session_id
+            or prospective_append.operation_id != operation_id
+            or prospective_append.expected_checkpoint_id != stored.checkpoint_id
+            or prospective_append.expected_cursor != stored.cursor
+            or prospective_append.predecessor_json != stored.payload_json
+            or prospective_append.handoff
+            or not prospective_append.events
+        ):
+            raise AuditIntegrityError("prospective settlement changed its original predecessor")
+        next_root = decode_continuation_snapshot(prospective_append.snapshot_json)
+        previous_root = decode_continuation_snapshot(stored.payload_json)
+        if (
+            next_root.cursor != stored.cursor + len(prospective_append.events)
+            or next_root.logical != previous_root.logical
+            or next_root.mutation_ceiling != previous_root.mutation_ceiling
+            or next_root.provider_cost_policy != previous_root.provider_cost_policy
+            or next_root.policy_hash != previous_root.policy_hash
+            or next_root.admission_policy_json != previous_root.admission_policy_json
+        ):
+            raise AuditIntegrityError("prospective settlement changed its immutable source contract")
+        stored = StoredContinuationSnapshot(prospective_append.snapshot_json, next_root.cursor, prospective_append.checkpoint_id)
+        driving = replace(driving, checkpoint_id=stored.checkpoint_id, cursor=stored.cursor, status_revision=driving.status_revision + 1)
     published = database_now(conn)
     stack, _unresolved, attribution = _settlement_transition(
         stored, segment=segment, outcome=outcome, published_at=published, settled_by=settled_by
@@ -908,8 +936,73 @@ def prepare_segment_settlement_on_connection(
         stored.payload_json,
         original,
     )
-    return PreparedSegmentSettlement(
-        outcome, published, append, _settlement_driving(parent, segment, history), settled_by, attempt_outcome, outcome.model_dump_json()
+    return PreparedSegmentSettlement(outcome, published, append, driving, settled_by, attempt_outcome, outcome.model_dump_json())
+
+
+def admit_prepared_no_dispatch_tail_on_connection(
+    conn: Connection,
+    *,
+    receipt: ProspectiveContinuationChunk,
+    transition: PreparedContinuationAppend,
+    settlement: PreparedSegmentSettlement,
+) -> None:
+    """Admit every actual writer prefix before an unpaid tool-refusal write.
+
+    Each temporary terminal reserve belongs to one prefix. It must not be
+    unioned with a later real event that uses the same journal key.
+    """
+    transition.require_original()
+    settlement.append.require_original()
+    sid, operation = transition.session_id, transition.operation_id
+    source = load_snapshot(conn, session_id=sid, operation_id=operation)
+    terminal = settlement.append
+    if (
+        transition.expected_checkpoint_id != source.checkpoint_id
+        or transition.expected_cursor != source.cursor
+        or transition.predecessor_json != source.payload_json
+        or terminal.session_id != sid
+        or terminal.operation_id != operation
+        or terminal.expected_checkpoint_id != transition.checkpoint_id
+        or terminal.expected_cursor != transition.expected_cursor + len(transition.events)
+        or terminal.predecessor_json != transition.snapshot_json
+    ):
+        raise AuditIntegrityError("prepared no-dispatch tail changed its original chain")
+    root = decode_continuation_snapshot(source.payload_json)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if type(policy) is not ContinuationAdmissionPolicyV3:
+        raise AuditIntegrityError("prepared no-dispatch tail requires its original V3 policy")
+
+    def chunks_for(append: PreparedContinuationAppend) -> tuple[ProspectiveContinuationChunk, ...]:
+        return (
+            *(
+                ProspectiveContinuationChunk(f"event:{append.expected_cursor + index}", item.payload_json.encode("utf-8"), "event.v2")
+                for index, item in enumerate(append.events, start=1)
+            ),
+            ProspectiveContinuationChunk(f"snapshot:{append.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
+        )
+
+    after_receipt = (receipt,)
+    after_transition = (*after_receipt, *chunks_for(transition))
+    for prefix, snapshot, cursor in (
+        (after_receipt, source.payload_json, source.cursor),
+        (after_transition, transition.snapshot_json, terminal.expected_cursor),
+    ):
+        admit_retained_payload_chunks(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            prospective=(
+                *prefix,
+                *_v3_unpaid_terminal_reserve(conn, session_id=sid, operation_id=operation, post_root_json=snapshot, post_cursor=cursor),
+            ),
+            retained_payload_limit_bytes=policy.max_retained_payload_bytes,
+        )
+    admit_retained_payload_chunks(
+        conn,
+        session_id=sid,
+        operation_id=operation,
+        prospective=(*after_transition, *chunks_for(terminal)),
+        retained_payload_limit_bytes=policy.max_retained_payload_bytes,
     )
 
 
@@ -1055,7 +1148,7 @@ def append_complete_snapshot(
 @dataclass(frozen=True, slots=True)
 class _SegmentStartSelection:
     snapshot: StoredContinuationSnapshot
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4
     action: ContinuationActionPolicy
     action_json: str
 
@@ -1067,7 +1160,7 @@ def _initial_segment_action(
     segment: Row[Any],
     snapshot: StoredContinuationSnapshot,
     stack: ContinuationFrameStack,
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
 ) -> ContinuationActionPolicy:
     del conn
     if (
@@ -1104,7 +1197,7 @@ def _selected_segment_action(
     segment: Row[Any],
     snapshot: StoredContinuationSnapshot,
     stack: ContinuationFrameStack,
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
 ) -> ContinuationActionPolicy:
     if segment.sequence == 1 and segment.generation == 1:
         return _initial_segment_action(conn, parent=parent, segment=segment, snapshot=snapshot, stack=stack, policy=policy)
@@ -1245,7 +1338,9 @@ class ComposerSegmentStartObservation:
     context: SessionOperationContext | None = None
     committed: bool = False
     reconciled: bool = False
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | None = None
+    policy: (
+        ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4 | None
+    ) = None
     hard_expires_at: float | None = None
 
 

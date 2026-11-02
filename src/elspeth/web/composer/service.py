@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.turn_effects import BlobDeliveryAttempt, TurnEvidence
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
     from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer, ClassifierReplyDeadline
+    from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal
     from elspeth.web.sessions.protocol import (
         SessionServiceProtocol,
     )
@@ -2208,7 +2209,7 @@ class ComposerServiceImpl:
         work: RequiredWorkBinding,
         provider_owner: ProviderInvocationOwner,
         phase_read: _CurrentPhaseRead | None = None,
-    ) -> None:
+    ) -> ToolNoExecutionRefusal | None:
         """Enter the retained phase owner without re-entering legacy PRIMARY."""
         from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 
@@ -2221,9 +2222,9 @@ class ComposerServiceImpl:
         ):
             raise AuditIntegrityError("continuation service dispatch changed its actual live owners")
         if phase_read is None:
-            await owner.advance(selected)
+            return await owner.advance(selected)
         else:
-            await owner.advance(selected, phase_read=phase_read)
+            return await owner.advance(selected, phase_read=phase_read)
 
     def _new_primary_custody(self, provider_owner: ProviderInvocationOwner | None) -> ProviderCallCustody | None:
         if provider_owner is None:

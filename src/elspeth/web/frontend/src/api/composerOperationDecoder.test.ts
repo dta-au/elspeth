@@ -157,6 +157,33 @@ describe("retained failure page admission", () => {
     expect(() => decodeComposerOperationFailurePage(page, sid, sid)).toThrow();
   });
 });
+
+describe("terminal paid provider overflow", () => {
+  const body = { error_type: "paid_result_overflow", detail: "The complete paid result could not be retained.", evidence_status: "incomplete", retryable: false, cost: { status: "unknown", amount: null } };
+  const terminal = { ...envelope, status: "failed", result: null, error: { http_status: 507, body, error_type: "paid_result_overflow", failure_code: "http_error", diagnostic_id: null } };
+  const outcome = { session_id: sid, operation_id: id, kind: "compose_message", user_message_id: id, settled_at: "2026-10-14T08:00:00Z", failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: id, latest_version: 2 } };
+
+  it("retains terminal facts and saved revisions through GET, SSE terminal and history", () => {
+    for (const cost of [{ status: "unknown", amount: null }, { status: "known", amount: "0.000123" }]) {
+      const response = { ...terminal, error: { ...terminal.error, body: { ...body, cost } } };
+      expect(decodeComposerOperationSnapshot(response, sid, id).error?.body.cost).toEqual(cost);
+    }
+    const frame = { ...heartbeat, event: "terminal", payload: { status: "failed", phase: "settled", status_revision: 9 } };
+    expect(decodeComposerOperationFrame(sse(frame, "9"), sid, id)).toEqual({ ...frame, id: "9" });
+    expect(decodeComposerOperationFailurePage({ session_id: sid, items: [outcome], next_cursor: null }, sid, id).items[0]).toEqual(outcome);
+  });
+
+  it("rejects a terminal that disguises complete or retryable evidence", () => {
+    expect(decodeComposerOperationSnapshot(terminal, sid, id).error?.error_type).toBe("paid_result_overflow");
+    for (const changed of [
+      { body: { ...body, retryable: true } },
+      { body: { ...body, retryable: 0 } },
+      { body: { ...body, evidence_status: "complete" } },
+      { body: { ...body, error_type: "other" } },
+      { failure_code: "worker_lost" },
+    ]) expect(() => decodeComposerOperationSnapshot({ ...terminal, error: { ...terminal.error, ...changed } }, sid, id)).toThrow("Invalid paid overflow terminal");
+  });
+});
 describe("composer operation external admission", () => {
   it("admits each UTF-8 byte split and split CRLF with coalesced frames", () => {
     const value = { ...heartbeat, event: "terminal", payload: { status: "completed" }, label: "€🐈" };

@@ -51,6 +51,8 @@ const LLM_UNAVAILABLE_MESSAGE =
   "The AI service is temporarily unavailable. Please try again in a moment.";
 const LLM_AUTH_ERROR_MESSAGE =
   "The AI service configuration is invalid. Please contact your administrator.";
+const PAID_RESULT_OVERFLOW_MESSAGE =
+  "A model call was made, but its complete result or audit record could not be retained. ELSPETH stopped without using that result. The call may have incurred a charge. Review the saved session before starting another request.";
 const GRAPH_UNAVAILABLE_MESSAGE =
   "The saved graph is unavailable. You can ask Composer to recover a saved draft.";
 
@@ -516,9 +518,16 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   let unavailableHead: UnavailableCompositionHead | null | undefined;
   let proposals: CompositionProposal[] | null = null;
   let refreshed = false;
+  // A refused submission observes the winner. Its failed terminal carries the
+  // actual ApiError inside the attachment; the losing draft keeps its own copy.
+  const attachedTerminalError = failure instanceof ComposerActiveAttachment && failure.terminal.status === "failed"
+    ? failure.terminal.error : null;
   const error = failure as ApiError | null;
-  const errorText = error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
-  const terminalFailure = failure instanceof ComposerActiveAttachment ? failure.terminal.status === "failed" ? failure.terminal.error : null : error;
+  const errorText = failure instanceof ComposerActiveAttachment
+    ? attachedTerminalError?.error_type === "paid_result_overflow"
+      ? `${failure.message} ${PAID_RESULT_OVERFLOW_MESSAGE}` : failure.message
+    : error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "paid_result_overflow" ? PAID_RESULT_OVERFLOW_MESSAGE : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
+  const terminalFailure = failure instanceof ComposerActiveAttachment ? attachedTerminalError : error;
   const terminalIdentity = terminalFailure?.composer_operation;
   const observedFailure: ComposerOperationFailureNotice | null = terminalFailure === null || terminalIdentity === undefined ? null : {
     session_id: sessionId, operation_id: terminalIdentity.operation_id, kind: terminalIdentity.kind, user_message_id: null,
@@ -550,7 +559,11 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
     }
     messages = messages.map((row, index) => {
       if (!(row.id === localMessageId || (row.role === "user" && row.operation_id === descriptor.operationId))) return row;
-      if (error && error.error_type !== "audit_integrity_error" && (failure instanceof ComposerActiveAttachment || !hasGenuineReplyForUser(messages, index))) return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: error.error_type === "stale_compose_state" ? "stale_compose_state" : error.failure_code ?? error.error_type };
+      if (error && error.error_type !== "audit_integrity_error" && (failure instanceof ComposerActiveAttachment || !hasGenuineReplyForUser(messages, index))) {
+        const failureType = attachedTerminalError?.error_type ?? error.error_type;
+        const localFailureCode = failureType === "stale_compose_state" || failureType === "paid_result_overflow" ? failureType : error.failure_code ?? error.error_type;
+        return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: localFailureCode };
+      }
       return { ...row, local_status: undefined, local_error: undefined, local_failure_code: undefined };
     });
     const savedPartial = error?.partial_state_save_failed !== true ? error?.partial_state : null;

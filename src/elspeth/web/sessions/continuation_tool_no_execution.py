@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 from sqlalchemy import Connection, insert, select
@@ -22,12 +22,17 @@ from elspeth.web.composer.continuation_codec import (
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationEvent,
+    PreparedContinuationAppend,
+    StoredContinuationSnapshot,
     _require_current_continuation_running,
+    admit_prepared_no_dispatch_tail_on_connection,
     append_complete_snapshot,
     load_snapshot,
+    prepare_segment_settlement_on_connection,
     private_chunk_key,
     put_chunk,
     read_chunk,
@@ -36,11 +41,15 @@ from elspeth.web.sessions.continuation_primary import (
     read_committed_primary_response_on_connection,
     read_original_committed_primary_response_data_on_connection,
 )
+from elspeth.web.sessions.continuation_retained_capacity import ProspectiveContinuationChunk
+from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
+from elspeth.web.sessions.models import composer_operation_segments_table as segments
+from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 
 
 class ToolNoExecutionRefusal(ContinuationValue):
@@ -170,6 +179,64 @@ def refuse_v3_tool_no_execution_on_connection(
     )
     chunk = encode_private_chunk(codec="composer.tool-no-execution-refusal.v1", canonical=canonical_json(receipt.model_dump(mode="json")))
     result_chunk_key = private_chunk_key(chunk)
+    refused_root = root.model_copy(
+        update={
+            "cursor": source.cursor + 1,
+            "effect_frontier": (
+                *root.effect_frontier,
+                EffectFrontierEntry(effect_id=effect_key, disposition="refused", receipt_id=receipt.receipt_key),
+            ),
+        }
+    )
+    refused_json = encode_continuation_snapshot(refused_root)
+    refusal_events = (ContinuationEvent("effect_refused", _event(receipt, result_chunk_key)),)
+    checkpoint_id, published_at = str(uuid4()), database_now(conn)
+    original = (
+        sid,
+        operation,
+        source.checkpoint_id,
+        source.cursor,
+        refused_json,
+        refusal_events,
+        checkpoint_id,
+        published_at,
+        False,
+        source.payload_json,
+    )
+    prepared_append = PreparedContinuationAppend(*original, original)
+    segment = conn.execute(
+        select(segments).where(
+            segments.c.session_id == sid, segments.c.operation_id == operation, segments.c.sequence == running.claim.segment_sequence
+        )
+    ).one()
+    history = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation,
+            attempts.c.sequence == running.claim.segment_sequence,
+            attempts.c.generation == running.claim.ownership_generation,
+        )
+    ).one()
+    prepared_settlement = prepare_segment_settlement_on_connection(
+        conn,
+        session_id=sid,
+        operation_id=operation,
+        parent=parent,
+        segment=segment,
+        history=history,
+        outcome=selected_error,
+        settled_by="owner_terminal",
+        attempt_outcome="settled",
+        prospective_append=prepared_append,
+    )
+    if len(prepared_settlement.append.events) != 1 or prepared_settlement.append.events[0].tag != "settled":
+        raise AuditIntegrityError("V3 tool refusal cannot settle another unresolved effect")
+    admit_prepared_no_dispatch_tail_on_connection(
+        conn,
+        receipt=ProspectiveContinuationChunk(result_chunk_key, chunk.canonical.encode("utf-8"), chunk.reference.codec),
+        transition=prepared_append,
+        settlement=prepared_settlement,
+    )
     put_chunk(
         conn,
         session_id=sid,
@@ -192,32 +259,27 @@ def refuse_v3_tool_no_execution_on_connection(
             creator_generation=receipt.creator_generation,
         )
     )
-    refused_root = root.model_copy(
-        update={
-            "effect_frontier": (
-                *root.effect_frontier,
-                EffectFrontierEntry(effect_id=effect_key, disposition="refused", receipt_id=receipt.receipt_key),
-            )
-        }
-    )
     refused = append_complete_snapshot(
         conn,
         session_id=sid,
         operation_id=operation,
         expected_checkpoint_id=source.checkpoint_id,
         expected_cursor=source.cursor,
-        snapshot_json=encode_continuation_snapshot(refused_root),
-        event_batch=(ContinuationEvent("effect_refused", _event(receipt, result_chunk_key)),),
+        snapshot_json=refused_json,
+        event_batch=refusal_events,
         handoff=False,
+        prepared_append=prepared_append,
     )
-    terminal = settle_composer_operation_on_connection(conn, running, outcome=selected_error, authoritative_failure=True)
+    terminal = settle_composer_operation_on_connection(
+        conn, running, outcome=selected_error, authoritative_failure=True, prepared_settlement=prepared_settlement
+    )
     if terminal.status != "failed" or terminal.journal_cursor != refused.cursor + 1:
         raise AuditIntegrityError("V3 tool refusal did not atomically settle its failed terminal")
     return receipt
 
 
 def read_v3_tool_no_execution_refusal_on_connection(
-    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str
+    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, env_ref_names: frozenset[str]
 ) -> ToolNoExecutionRefusal | None:
     """Cold terminal proof for one provider-authored call that never issued."""
     sid = str(session_id)
@@ -320,6 +382,16 @@ def read_v3_tool_no_execution_refusal_on_connection(
     if len(source_root.frames) != 2 or type(source_root.frames[-1]) is not ToolBatchFrame:
         raise AuditIntegrityError("V3 tool refusal lost its original tool-ready frame")
     frame = source_root.frames[-1]
+    source_chunks = load_snapshot_private_data_on_connection(
+        conn,
+        session_id=sid,
+        operation_id=operation_id,
+        selected=StoredContinuationSnapshot(encode_continuation_snapshot(source_root), source_root.cursor, receipt.source_checkpoint_id),
+    )
+    matching = tuple(chunk for chunk in source_chunks if chunk.reference == frame.accumulator)
+    if len(matching) != 1:
+        raise AuditIntegrityError("V3 tool refusal lost its original accumulator")
+    data = decode_coupled_batch_chunk(matching[0], env_ref_names=env_ref_names)
     response = read_original_committed_primary_response_data_on_connection(
         conn,
         session_id=session_id,
@@ -329,6 +401,13 @@ def read_v3_tool_no_execution_refusal_on_connection(
         response=frame.response,
     )
     calls = decode_continuation_response(response).tool_batch.calls
+    if (
+        data.calls != calls
+        or data.batch.phase != "call_ready"
+        or data.batch.current_call is not None
+        or data.batch.next_tool_index != frame.next_tool_index
+    ):
+        raise AuditIntegrityError("V3 tool refusal changed its original unissued accumulator")
     if (
         source.kind != "transition"
         or refusal.kind != "transition"

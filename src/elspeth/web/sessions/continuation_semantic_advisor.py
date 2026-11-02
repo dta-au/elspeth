@@ -7,6 +7,7 @@ typed authority facades and supported successor cuts remain separate joins.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
@@ -194,6 +195,14 @@ class _NoSdk(ContinuationValue):
     guard_disposition: str | None
 
 
+class SemanticAdvisorProviderOutcome(StrEnum):
+    """Retained semantic provider dispositions, distinct from row outcomes."""
+
+    SUCCESS = "success"
+    PAID_INVALID = "paid_invalid"
+    CREDENTIAL_WITHHELD = "credential_withheld"
+
+
 class _Outcome(ContinuationValue):
     schema_version: Literal["composer.semantic-provider-outcome.v1"] = "composer.semantic-provider-outcome.v1"
     effect_key: str
@@ -203,7 +212,7 @@ class _Outcome(ContinuationValue):
     creator_generation: int
     source_checkpoint_id: str
     source_cursor: int
-    outcome: Literal["success", "paid_invalid", "credential_withheld"]
+    outcome: SemanticAdvisorProviderOutcome
     audit_call_json: str
     response: PrivateChunkRef | None
     recorder: PrivateChunkRef
@@ -227,7 +236,7 @@ class SemanticAdvisorProviderResult:
     response: PrivateChunk | None
     recorder: PrivateChunk
     decision: ContinuationAdvisorDecision | None
-    outcome: Literal["success", "paid_invalid", "credential_withheld"]
+    outcome: SemanticAdvisorProviderOutcome
     original_error: BaseException | None = field(default=None, repr=False, compare=False)
 
 
@@ -1452,7 +1461,7 @@ def retain_semantic_advisor_outcome_on_connection(
         raise AuditIntegrityError("Semantic paid retention requires its original nominal issuer")
     issuer.require_original_paid_outcome(prepared, selected, outcome)
     _physical_source(conn, running, effect, call, physical_input)
-    kind: Literal["success", "paid_invalid", "credential_withheld"]
+    kind: SemanticAdvisorProviderOutcome
     response: PrivateChunk | None = None
     decision: ContinuationAdvisorDecision | None = None
     if call.status is ComposerLLMCallStatus.SUCCESS:
@@ -1480,13 +1489,13 @@ def retain_semantic_advisor_outcome_on_connection(
             outcome.result.response != response or outcome.result.audit_call != call or outcome.result.decision != decision
         ):
             raise AuditIntegrityError("Semantic returned sum changed its original physical result")
-        kind = "success"
+        kind = SemanticAdvisorProviderOutcome.SUCCESS
     elif call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE and call.error_message == "credential_material_rejected":
         if any(
             value is not None for value in (observed.message, observed.provider_metadata, observed.decision, observed.tool_calls_present)
         ):
             raise AuditIntegrityError("Semantic withheld outcome exposed unadmitted provider fields")
-        kind = "credential_withheld"
+        kind = SemanticAdvisorProviderOutcome.CREDENTIAL_WITHHELD
     elif call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE:
         if observed.decision is not None:
             raise AuditIntegrityError("Semantic paid invalid result cannot carry an admitted decision")
@@ -1494,7 +1503,7 @@ def retain_semantic_advisor_outcome_on_connection(
             response = encode_continuation_text_response(
                 content=observed.message.content, provider_metadata=observed.provider_metadata, audit_call=call
             )
-        kind = "paid_invalid"
+        kind = SemanticAdvisorProviderOutcome.PAID_INVALID
     else:
         raise AuditIntegrityError("Entered semantic timeout/cancellation/unknown result cannot be closed or retried")
     sid, operation = str(running.claim.session_id), running.claim.operation_id
@@ -1526,7 +1535,7 @@ def retain_semantic_advisor_outcome_on_connection(
     )
     manifest_json = _canonical(manifest)
     result_key = f"semantic-provider-outcome:{sha256(manifest_json.encode('utf-8')).hexdigest()}"
-    disposition: Literal["committed", "refused"] = "committed" if kind == "success" else "refused"
+    disposition: Literal["committed", "refused"] = "committed" if kind is SemanticAdvisorProviderOutcome.SUCCESS else "refused"
     with conn.begin_nested():
         for chunk in (
             record,
@@ -1639,7 +1648,7 @@ def _paid_result_data(
         != (call.call_id, effect.creator_sequence, effect.creator_generation, call.model_requested)
         or effect.response_finished_at is None
         or restore_utc(effect.response_finished_at) != call.finished_at
-        or effect.disposition != ("committed" if manifest.outcome == "success" else "refused")
+        or effect.disposition != ("committed" if manifest.outcome is SemanticAdvisorProviderOutcome.SUCCESS else "refused")
     ):
         raise AuditIntegrityError("Semantic cold result changed its original complete physical/effect identity")
     _physical_source_data(conn, sid, operation, effect, call, physical_input)
@@ -1667,7 +1676,7 @@ def _paid_result_data(
         raise AuditIntegrityError("Semantic cold result changed its complete selected parent/response source")
     response = None if manifest.response is None else _ref(conn, sid, operation, manifest.response)
     decision: ContinuationAdvisorDecision | None = None
-    if manifest.outcome == "success":
+    if manifest.outcome is SemanticAdvisorProviderOutcome.SUCCESS:
         if response is None or response.reference.codec != "composer.response.v1" or call.status is not ComposerLLMCallStatus.SUCCESS:
             raise AuditIntegrityError("Semantic decision requires its genuine original successful physical response")
         decoded = decode_continuation_response(response)
@@ -1685,7 +1694,9 @@ def _paid_result_data(
             raise AuditIntegrityError("Semantic cold decision changed its one original response/call ID")
     elif manifest.decision_json is not None or call.status is not ComposerLLMCallStatus.MALFORMED_RESPONSE:
         raise AuditIntegrityError("Semantic refused paid output cannot carry an installed decision")
-    elif manifest.outcome == "credential_withheld" and (response is not None or call.error_message != "credential_material_rejected"):
+    elif manifest.outcome is SemanticAdvisorProviderOutcome.CREDENTIAL_WITHHELD and (
+        response is not None or call.error_message != "credential_material_rejected"
+    ):
         raise AuditIntegrityError("Semantic credential-withheld result exposed provider fields")
     elif response is not None and decode_retained_physical_audit_call(response) != call:
         raise AuditIntegrityError("Semantic invalid response changed its actual paid audit")
@@ -1765,7 +1776,7 @@ def _paid_result_data(
         _effect_snapshot(
             encode_continuation_snapshot(_paid_evidence_root(source_root, expected_parent, paid_advisor, extended)),
             effect_key=effect_key,
-            disposition="committed" if manifest.outcome == "success" else "refused",
+            disposition="committed" if manifest.outcome is SemanticAdvisorProviderOutcome.SUCCESS else "refused",
             receipt_id=manifest.receipt_key,
         )
     )
@@ -1805,7 +1816,7 @@ def read_current_paid_semantic_decision_on_connection(
     if (
         _advisor(root).phase != "response_retained"
         or root != paid_root.model_copy(update={"cursor": selected.cursor})
-        or result.outcome != "success"
+        or result.outcome is not SemanticAdvisorProviderOutcome.SUCCESS
         or result.decision is None
         or result.response is None
     ):
@@ -1839,7 +1850,12 @@ def install_semantic_advisor_decision_on_connection(
 ) -> StoredContinuationSnapshot:
     result, data, _paid_root = _paid_result(conn, running, selected, effect_key)
     root = _current(conn, running, selected)
-    if _advisor(root).phase != "response_retained" or result.outcome != "success" or result.decision is None or result.response is None:
+    if (
+        _advisor(root).phase != "response_retained"
+        or result.outcome is not SemanticAdvisorProviderOutcome.SUCCESS
+        or result.decision is None
+        or result.response is None
+    ):
         raise AuditIntegrityError("Semantic installation requires its one uninstalled original successful decision")
     if result.decision.prescribed_action is not None and result.decision.prescribed_action.kind != "primary_turn":
         raise AuditIntegrityError("Semantic read/review actions require their separate actual execution-owner joins")
@@ -1920,7 +1936,12 @@ def _decision_data(
 
     result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
     original_selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
-    if _advisor(root).phase != "decision_ready" or result.outcome != "success" or result.decision is None or result.response is None:
+    if (
+        _advisor(root).phase != "decision_ready"
+        or result.outcome is not SemanticAdvisorProviderOutcome.SUCCESS
+        or result.decision is None
+        or result.response is None
+    ):
         raise AuditIntegrityError("Semantic cold action lacks an installed successful original decision")
     source = ContinuationActionSource(
         effect_key=effect_key,

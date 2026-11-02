@@ -48,7 +48,7 @@ function failureOutcome(value: unknown, sessionId: string): ComposerOperationFai
   const code = failureCode(record.failure_code);
   const diagnostic = record.diagnostic_id === null ? null : canonicalUuid(record.diagnostic_id);
   if ((code === "operation_failed") !== (diagnostic !== null)) throw new ComposerOperationDecodeError("Invalid diagnostic binding");
-  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "executor_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed", "composer_mutation_authority_revoked", "composer_admission_refused"];
+  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "executor_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed", "composer_mutation_authority_revoked", "composer_admission_refused", "paid_result_overflow"];
   const category = record.error_type === null ? null : categories.find((item) => item === record.error_type);
   if (category === undefined) throw new ComposerOperationDecodeError("Unknown public failure category");
   const requestId = record.request_id === null ? null : text(record.request_id);
@@ -113,7 +113,13 @@ export function decodeError(value: unknown, sessionId: string): ComposerOperatio
   const code = failureCode(record.failure_code);
   const diagnostic_id = record.diagnostic_id === null ? null : canonicalUuid(record.diagnostic_id);
   if ((code === "operation_failed") !== (diagnostic_id !== null)) throw new ComposerOperationDecodeError("Invalid diagnostic binding");
-  return { http_status: status, body: record.body as Record<string, unknown>, error_type: record.error_type === null ? null : text(record.error_type), failure_code: code, diagnostic_id };
+  const errorType = record.error_type === null ? null : text(record.error_type);
+  const body = record.body as Record<string, unknown>;
+  if (errorType === "paid_result_overflow" &&
+      (code !== "http_error" || body.error_type !== errorType || body.evidence_status !== "incomplete" || body.retryable !== false)) {
+    throw new ComposerOperationDecodeError("Invalid paid overflow terminal");
+  }
+  return { http_status: status, body, error_type: errorType, failure_code: code, diagnostic_id };
 }
 function decodeTerminalMessage(value: unknown, sessionId: string, role: "assistant" | "system"): ChatMessage {
   const message = exactRecord(value, ["id", "operation_id", "session_id", "role", "content", "raw_content", "segments", "tool_calls", "created_at", "composition_state_id", "tool_call_id", "parent_assistant_id", "sequence_no", "rejection"]);

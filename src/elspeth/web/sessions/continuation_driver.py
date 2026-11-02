@@ -96,6 +96,7 @@ from elspeth.web.sessions.continuation_next_iteration import advance_continuatio
 from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt
 from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
 from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
+from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, read_v3_tool_no_execution_refusal_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction, session_data_read_transaction
 from elspeth.web.sessions.schemas import SendMessageRequest
 
@@ -125,6 +126,7 @@ type _ActionResult = (
     | PrimaryNoSdkRefusalReceipt
     | SemanticAdvisorNoSdkTerminal
     | V3UnboundedTailRefusal
+    | ToolNoExecutionRefusal
     | ObservedClassifierReplyDeadline
     | None
 )
@@ -578,12 +580,62 @@ class _SegmentDriver:
                 raise AuditIntegrityError("reply deadline disposition lost its original expiry cause")
             self._handled_reply_deadlines.append(handled)
 
+    async def consume_tool_refusal(self, expected: ToolNoExecutionRefusal) -> ContinuationSegmentSettled:
+        from elspeth.web.sessions.composer_async_worker import _StartedSettlement
+
+        observed = self.phases.tool_refusal
+        if (
+            observed is None
+            or observed.receipt != expected
+            or observed.inventory.running is not self.running
+            or observed.inventory.selection.checkpoint_id != expected.source_checkpoint_id
+            or observed.inventory.selection.cursor != expected.source_cursor
+        ):
+            raise AuditIntegrityError("V3 tool refusal lost its original committed observation and inventory")
+
+        def verify_tool_refusal() -> ToolNoExecutionRefusal:
+            with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                actual = read_v3_tool_no_execution_refusal_on_connection(
+                    conn,
+                    session_id=self.running.claim.session_id,
+                    operation_id=self.running.claim.operation_id,
+                    effect_key=expected.effect_key,
+                    env_ref_names=observed.inventory.names,
+                )
+            if actual is None or actual != expected:
+                raise AuditIntegrityError("V3 tool refusal lost its exact original cold source")
+            if (
+                actual.session_id != str(self.running.claim.session_id)
+                or actual.operation_id != self.running.claim.operation_id
+                or actual.creator_sequence != self.running.claim.segment_sequence
+                or actual.creator_generation != self.running.claim.ownership_generation
+                or actual.claim_attempt != self.running.claim.attempt
+                or actual.operation_epoch != self.running.session_operation_context.fence.operation_epoch
+            ):
+                raise AuditIntegrityError("V3 tool refusal changed its actual original claim")
+            return actual
+
+        self.sql_deadline.begin_settlement()
+        await _registered(
+            work=self.work,
+            source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+            operation=verify_tool_refusal,
+            expected=ToolNoExecutionRefusal,
+        )
+        terminal = await self.record()
+        if terminal.status != "failed" or terminal.journal_cursor != expected.source_cursor + 2:
+            raise AuditIntegrityError("V3 tool refusal lost its actual committed failed terminal")
+        await self.worker._verify_terminal_before_release(self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal))
+        return ContinuationSegmentSettled(terminal)
+
     async def dispose(self, original: BaseException | None = None) -> ContinuationSegmentOutcome:
         if original is not None and not any(original is item for item in self._consumed_native):
             self._consumed_native.append(original)
         await self.close_progress(retain_failure=True)
         self.sql_deadline.begin_settlement()
         record = await self.record()
+        if record.status == "failed" and self.phases.tool_refusal is not None:
+            return await self.consume_tool_refusal(self.phases.tool_refusal.receipt)
         if record.cancel_requested_at is not None:
             return await self.settle(record, original)
         names = await read_disposition_env_names(
@@ -806,7 +858,7 @@ class _SegmentDriver:
         ):
             await enter_continuation_end(self.phases, selected, phase_read=phase_read)
             return None
-        await self.service.advance_continuation_phase(
+        return await self.service.advance_continuation_phase(
             owner=self.phases,
             authority=self.authority,
             selected=selected,
@@ -814,7 +866,6 @@ class _SegmentDriver:
             provider_owner=self.provider,
             phase_read=phase_read,
         )
-        return None
 
     async def pending_control(self, selected: SelectedContinuationState) -> StoredContinuationControlIntent | None:
         top = selected.stack.frames[-1]
@@ -1165,6 +1216,8 @@ class _SegmentDriver:
                     return await self.dispose(original)
                 return await self.settle(await self.record(), original)
             if result is not None:
+                if type(result) is ToolNoExecutionRefusal:
+                    return await self.consume_tool_refusal(result)
                 if isinstance(result, V3UnboundedTailRefusal):
                     refusal = result
 

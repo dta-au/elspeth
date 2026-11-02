@@ -10,6 +10,7 @@ from typing import Literal
 
 from pydantic import Field, ValidationError
 
+from elspeth.contracts.bounded_serialization import BoundedCanonicalSize, bounded_canonical_json_size
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -24,6 +25,7 @@ from elspeth.web.composer.continuation_codec import (
     encode_private_chunk,
     verify_private_chunk,
 )
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_provider_outcomes import decode_physical_audit_call, require_successful_response_audit
 from elspeth.web.composer.provider_audit_source import (
     ProviderAuditSource,
@@ -67,6 +69,17 @@ class CapturedTitleProviderResult:
     audit_call: ComposerLLMCall
     audit_drafts: tuple[AuditMessageDraft, ...]
     source: ProviderAuditSource
+
+
+def measure_title_provider_result_size(snapshot: TitleProviderResultSnapshot) -> BoundedCanonicalSize:
+    """Measure the complete outer TITLE value, including nested JSON escaping.
+
+    This is a size observation over a validated nominal snapshot, not an
+    alternative capture, audit, credential or settlement path.
+    """
+    if type(snapshot) is not TitleProviderResultSnapshot:
+        raise TypeError("TITLE size measurement requires its complete nominal snapshot")
+    return bounded_canonical_json_size(snapshot.model_dump(mode="json"), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
 
 
 def _require_response_audit(completion: _AdmittedLLMCompletion, call: ComposerLLMCall) -> None:

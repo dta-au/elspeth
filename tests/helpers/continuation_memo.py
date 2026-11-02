@@ -40,6 +40,7 @@ from sqlalchemy.sql import crud as sql_crud
 from sqlalchemy.sql import dml as sql_dml
 from sqlalchemy.sql import functions as sql_functions
 from sqlalchemy.sql import operators as sql_operators
+from sqlalchemy.sql import selectable as sql_selectable
 from sqlalchemy.sql.compiler import SQLCompiler
 from sqlalchemy.sql.dml import Insert, Update
 from sqlalchemy.sql.elements import (
@@ -57,7 +58,7 @@ from sqlalchemy.sql.elements import (
     quoted_name,
 )
 from sqlalchemy.sql.schema import Column, Table
-from sqlalchemy.sql.selectable import Select
+from sqlalchemy.sql.selectable import Select, _OffsetLimitParam
 from sqlalchemy.util import _collections as sql_collections
 from sqlalchemy.util import immutabledict
 from sqlalchemy.util import langhelpers as sql_langhelpers
@@ -249,6 +250,9 @@ _STRUCTURE_CONNECTION_EXECUTE = Connection.execute
 _STRUCTURE_DRIVER_EXECUTE = Connection.exec_driver_sql
 _STRUCTURE_ENGINE_FACTORY = session_engine.create_session_engine
 _STRUCTURE_WRITE_OPTION = session_engine._SESSION_WRITE_INTENT_OPTION
+_STRUCTURE_READ_OPTION = session_engine._SESSION_DATA_READ_CAPABILITY_OPTION
+_STRUCTURE_READ_CAPABILITY_CLASS = session_engine._SessionDataReadCapability
+_STRUCTURE_READ_CAPABILITY = _STRUCTURE_READ_CAPABILITY_CLASS.FILE_WAL_QUEUE_POOL
 _STRUCTURE_ENGINE_CONFIGURE = next(
     code for code in _STRUCTURE_ENGINE_FACTORY.__code__.co_consts if type(code) is CodeType and code.co_name == "_configure_sqlite_session"
 )
@@ -470,9 +474,10 @@ _STRUCTURE_DRIVER_LITERALS = tuple(
 _STRUCTURE_STORE_FUNCTIONS = tuple(
     (name, function, function.__code__, function.__globals__, count)
     for name, function, count in (
-        ("put_chunk", stored_continuation.put_chunk, 2),
+        ("put_chunk", stored_continuation.put_chunk, 1),
         ("append_complete_snapshot", stored_continuation.append_complete_snapshot, 3),
         ("load_snapshot", stored_continuation.load_snapshot, 3),
+        ("_insert_chunk_after_admission", stored_continuation._insert_chunk_after_admission, 2),
     )
 )
 _STRUCTURE_STORE_INSTRUCTIONS = tuple(
@@ -518,7 +523,7 @@ _STRUCTURE_STORE_CALLS = tuple(
     )
 )
 _STRUCTURE_STORE_ROLES = (
-    (0, 1, Insert, stored_continuation.chunks, "chunk_insert"),
+    (3, 1, Insert, stored_continuation.chunks, "chunk_insert"),
     (1, 0, Insert, stored_continuation.events, "event_insert"),
     (1, 1, Insert, stored_continuation.checkpoints, "checkpoint_insert"),
     (1, 2, Update, stored_continuation.jobs, "head_cas"),
@@ -1320,6 +1325,7 @@ _STRUCTURE_SHAPE_GUARD_CODES: Final = frozenset(
         "dml_final_constant",
         "sequence_origin",
         "dml_bind_name",
+        "execution_options",
     )
 )
 
@@ -1792,9 +1798,21 @@ def _structure_sql_shape(trace, owner: _StructureInvocation, context) -> Structu
         raise ValueError("unknown current execution mode")
     options = context.execution_options
     if type(options) not in (dict, immutabledict) or any(
-        type(key) is not str or key != _STRUCTURE_WRITE_OPTION or type(options[key]) is not bool for key in options
+        type(key) is not str
+        or key not in (_STRUCTURE_WRITE_OPTION, _STRUCTURE_READ_OPTION)
+        or (key == _STRUCTURE_WRITE_OPTION and type(options[key]) is not bool)
+        for key in options
     ):
-        raise ValueError("unsupported execution options")
+        raise _StructureShapeRefusal("execution_options")
+    engine = context.root_connection.engine
+    original = next((row for row in trace._structure_read_options if row[0] is engine), None)
+    if (
+        original is None
+        or (_STRUCTURE_READ_OPTION in options) is not original[1]
+        or (original[1] and options[_STRUCTURE_READ_OPTION] is not original[2])
+        or (original[2] is not None and original[2] is not _STRUCTURE_READ_CAPABILITY)
+    ):
+        raise _StructureShapeRefusal("execution_options")
     if owner.role == "driver":
         if owner.driver_role is None or id(statement) != owner.statement or context.compiled is not None:
             _structure_refuse(trace, "fixed_driver_invocation_changed")
@@ -1831,8 +1849,11 @@ def _structure_sql_shape(trace, owner: _StructureInvocation, context) -> Structu
                 return
             pairs = tuple(zip(extracted, compiled.cache_key.bindparams, strict=True))
         if any(
-            type(current) is not BindParameter
-            or type(cached) is not BindParameter
+            not (
+                type(current) is BindParameter
+                or (type(current) is _OffsetLimitParam and (current is invoked._limit_clause or current is invoked._offset_clause))
+            )
+            or type(cached) is not type(current)
             or current.expanding is not cached.expanding
             or current.literal_execute
             or cached.literal_execute
@@ -1871,7 +1892,9 @@ def _structure_sql_shape(trace, owner: _StructureInvocation, context) -> Structu
                 return ("column", role, column)
             if node_type is Table:
                 return ("table", table_role(node))
-            if node_type is BindParameter:
+            if node_type is BindParameter or (
+                node_type is _OffsetLimitParam and (node is invoked._limit_clause or node is invoked._offset_clause)
+            ):
                 identity = id(node)
                 if identity not in names or node.literal_execute:
                     raise ValueError("unbound current parameter")
@@ -3482,6 +3505,7 @@ class RetentionMemoTrace:
         self._structure_observer_incomplete = False
         self._structure_observation_verified = False
         self._structure_engines: tuple[Engine, ...] = ()
+        self._structure_read_options: tuple[tuple[Engine, bool, object], ...] = ()
         self._structure_listeners: list[tuple[Engine, str, Callable[..., None]]] = []
         self._structure_threads: dict[int, _StructureThread] = {self._owner_thread: _StructureThread(self._owner_thread)}
         self._structure_row_codes: dict[_StructureRowCodeIdentity, _StructureRowCodeFacts] = {}
@@ -3788,9 +3812,16 @@ class RetentionMemoTrace:
         assert len({id(engine) for engine in engines}) == len(engines), "structure engine owners must be distinct"
         assert type(entrypoint) is str and entrypoint in ("calibration", "first_compose")
         assert len(engines) == 1 if entrypoint == "first_compose" else len(engines) <= 2
-        self._structure_required = True
         self._structure_entrypoint = entrypoint
         self._structure_engines = engines
+        self._structure_read_options = tuple(
+            (engine, _STRUCTURE_READ_OPTION in options, options.get(_STRUCTURE_READ_OPTION))
+            for engine in engines
+            for options in (engine.get_execution_options(),)
+        )
+        # The profiler is already installed. Publish the complete engine
+        # capture before enabling its every-event structure source audit.
+        self._structure_required = True
         try:
             current = self._structure_sources_current()
         except Exception:
@@ -3887,6 +3918,15 @@ class RetentionMemoTrace:
         ):
             return _structure_source_refused(diagnostic, "structure.clock_engine")
         for engine in self._structure_engines:
+            original = next((row for row in self._structure_read_options if row[0] is engine), None)
+            options = engine.get_execution_options()
+            if (
+                original is None
+                or (_STRUCTURE_READ_OPTION in options) is not original[1]
+                or options.get(_STRUCTURE_READ_OPTION) is not original[2]
+                or (original[2] is not None and original[2] is not _STRUCTURE_READ_CAPABILITY)
+            ):
+                return _structure_source_refused(diagnostic, "structure.engine_read_option")
             dialect = engine.dialect
             if type(dialect) not in (SQLiteDialect_pysqlite, PGDialect_psycopg):
                 return _structure_source_refused(diagnostic, "structure.dialect")
@@ -3920,6 +3960,7 @@ class RetentionMemoTrace:
             and SQLiteCompiler.construct_params is _STRUCTURE_CONSTRUCT_PARAMS
             and PGCompiler_psycopg.construct_params is _STRUCTURE_CONSTRUCT_PARAMS
             and Connection._exec_single_context is _STRUCTURE_SINGLE_CONTEXT
+            and sql_selectable._OffsetLimitParam is _OffsetLimitParam
         ):
             return _structure_source_refused(diagnostic, "structure.execution")
         for dialect in (SQLiteDialect_pysqlite, PGDialect_psycopg):
@@ -3958,6 +3999,9 @@ class RetentionMemoTrace:
             and composition_initialization.locked_session_transaction is _STRUCTURE_WINDOW_FACTORY
             and session_engine.create_session_engine is _STRUCTURE_ENGINE_FACTORY
             and session_engine._SESSION_WRITE_INTENT_OPTION is _STRUCTURE_WRITE_OPTION
+            and session_engine._SESSION_DATA_READ_CAPABILITY_OPTION is _STRUCTURE_READ_OPTION
+            and session_engine._SessionDataReadCapability is _STRUCTURE_READ_CAPABILITY_CLASS
+            and _STRUCTURE_READ_CAPABILITY_CLASS.FILE_WAL_QUEUE_POOL is _STRUCTURE_READ_CAPABILITY
         ):
             return _structure_source_refused(diagnostic, "structure.runtime_binding")
         for context in (SQLiteExecutionContext, PGExecutionContext_psycopg):
@@ -5218,6 +5262,7 @@ class RetentionMemoTrace:
             self._structure_error_count + sum(thread.error_count for thread in self._structure_threads.values()),
             self._structure_observer_incomplete,
             tuple(self._structure_source_diagnostic),
+            tuple((id(engine), present, id(value)) for engine, present, value in self._structure_read_options),
             tuple(
                 (
                     thread.identity,

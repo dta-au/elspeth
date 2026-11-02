@@ -37,7 +37,7 @@ from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchP
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
 from elspeth.web.composer.continuation_message_family_recipes import ControlResultMessageRecipe
-from elspeth.web.composer.continuation_phase_transitions import BatchTransition, retain_batch_transition
+from elspeth.web.composer.continuation_phase_transitions import BatchTransition, refuse_v3_tool_before_dispatch, retain_batch_transition
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3
 from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
@@ -68,9 +68,10 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.coordination.lifecycle import ContinuationStage, SessionOperationLease
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions.composer_operations import ComposerOperationCancel, ComposerOperationCancelledDuringTurn, ComposerOperationRunning
-from elspeth.web.sessions.continuation import StoredContinuationSnapshot, V3UnboundedTailRefusal, refuse_v3_retained_tail_before_paid
+from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
 from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
+from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal
 from elspeth.web.sessions.locking import locked_session_transaction
 
 if TYPE_CHECKING:
@@ -110,6 +111,12 @@ def _require_runtime_source_refresh(before: ContinuationRuntimeSource, fresh: Co
             raise AuditIntegrityError("live phase refresh extended an original absolute deadline")
 
 
+@dataclass(frozen=True, slots=True)
+class CommittedToolNoExecutionRefusal:
+    receipt: ToolNoExecutionRefusal
+    inventory: CurrentContinuationEnvInventory
+
+
 @dataclass(slots=True)
 class ContinuationLivePhases:
     service: ComposerServiceImpl
@@ -123,9 +130,10 @@ class ContinuationLivePhases:
     p4: ContinuationLiveP4 | None = None
     latest_snapshot: StoredContinuationSnapshot | None = None
     cancellation_requested: asyncio.Event = field(default_factory=asyncio.Event)
-    business_stage: ContinuationStage[None] | None = None
+    business_stage: ContinuationStage[None] | ContinuationStage[ToolNoExecutionRefusal | None] | None = None
     failure_custody: ContinuationToolFailureCustody | None = None
     terminal_completion: TerminalServiceCompletion | None = None
+    tool_refusal: CommittedToolNoExecutionRefusal | None = None
     # The warm post-batch source: this batch's dispatch fold, its committed
     # P4 publication and the batch entry state, for the post-batch owner.
     finished_batch: tuple[_DispatchOutcome, _PersistOutcome | ColdPostBatchPersistData, CompositionState] | None = None
@@ -591,31 +599,36 @@ class ContinuationLivePhases:
         await self.current(following)
         return True
 
-    async def _execute_one(self, selected: SelectedContinuationState) -> None:
+    async def _execute_one(self, selected: SelectedContinuationState) -> ToolNoExecutionRefusal | None:
         previous = self.business_stage
         if previous is not None and (previous.task is None or not previous.task.done() or not previous.observed):
             raise AuditIntegrityError("tool dispatch cannot replace its retained physical stage")
         self.business_stage = stage = self.lease.create_continuation_stage(
             self._execute_one_owned(selected), name="continuation-issued-tool"
         )
-        await self.lease.join_continuation_stage(stage)
+        return await self.lease.join_continuation_stage(stage)
 
-    async def _execute_one_owned(self, selected: SelectedContinuationState) -> None:
+    async def _execute_one_owned(self, selected: SelectedContinuationState) -> ToolNoExecutionRefusal | None:
         runtime, inventory = await self.current(selected)
         data = runtime.graph.batch
         if data is None:
             raise AuditIntegrityError("live dispatch lost its actual batch/provider owners")
         result = await self._primary_for_phase(runtime, inventory, selected)
         if type(runtime.source.policy) is ContinuationAdmissionPolicyV3:
-            await _registered(
+
+            def commit_refusal() -> ToolNoExecutionRefusal:
+                receipt = refuse_v3_tool_before_dispatch(self.authority, inventory.running, selected=selected, inventory=inventory)
+                # Record the actual committed return before the async SQL ticket
+                # can deliver deferred cancellation instead of its result.
+                self.tool_refusal = CommittedToolNoExecutionRefusal(receipt, inventory)
+                return receipt
+
+            return await _registered(
                 work=self.work,
                 source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-                operation=partial(
-                    refuse_v3_retained_tail_before_paid, self.authority, inventory.running, selected=selected, inventory=inventory
-                ),
-                expected=V3UnboundedTailRefusal,
+                operation=commit_refusal,
+                expected=ToolNoExecutionRefusal,
             )
-            return
         batch, accumulator, live = data.batch, data.accumulator, runtime.live
         if batch.phase != "call_ready" or batch.current_call is not None or batch.next_tool_index >= len(data.calls):
             raise AuditIntegrityError("live dispatch lost its actual unissued next call")
@@ -651,7 +664,7 @@ class ContinuationLivePhases:
                 if self.runtime is None:
                     raise AuditIntegrityError("attachment preparation lost its actual runtime")
                 await self._advance_attachment(self.runtime.source.selected, context=context)
-                return
+                return None
             root = captured.stack.model_copy(
                 update={
                     "frames": (*captured.stack.frames[:-1], top.model_copy(update={"phase": "effect_reconciling"})),
@@ -676,7 +689,7 @@ class ContinuationLivePhases:
             )
         if preparation == "stop":
             batch.current_call, batch.phase = None, "dispatch_ready"
-            return
+            return None
         batch.next_tool_index += 1
         batch.current_call = None
         batch.phase = "dispatch_ready" if batch.stop_issued_batch or batch.next_tool_index == len(data.calls) else "call_ready"
@@ -702,7 +715,7 @@ class ContinuationLivePhases:
                 if combined is error:
                     raise
                 raise combined from combined.__cause__
-            return
+            return None
         if self.runtime is None:
             raise AuditIntegrityError("completed tool lost its retained runtime")
         runtime = self.runtime
@@ -741,6 +754,7 @@ class ContinuationLivePhases:
             inventory,
             "tool_completed" if preparation == "prepared" else "tool_preparation_completed",
         )
+        return None
 
     async def _resume_attachment(self, selected: SelectedContinuationState, *, unissued: bool) -> None:
         previous = self.business_stage
@@ -1031,21 +1045,23 @@ class ContinuationLivePhases:
         if data.batch.phase == "dispatch_ready":
             await self._persist_batch(selected)
 
-    async def advance(self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None) -> None:
+    async def advance(
+        self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None
+    ) -> ToolNoExecutionRefusal | None:
         if phase_read is not None:
             self._require_phase_read(selected, phase_read)
         if self.terminal_completion is not None:
             await self._persist_batch(selected)
-            return
+            return None
         top = selected.stack.frames[-1]
         if type(top) is ComposeFrame and top.phase == "response_retained":
             await self._initialize_batch(selected, phase_read=phase_read)
-            return
+            return None
         if phase_read is not None:
             raise AuditIntegrityError("live phase handoff belongs only to its retained PRIMARY response")
         if type(top) is ToolBatchFrame and top.phase == "tool_ready" and top.accumulator.codec == "composer.tool-batch.v1":
             await self._resume_attachment(selected, unissued=True)
-            return
+            return None
         if (
             type(top) is ToolBatchFrame
             and top.accumulator.codec == "composer.tool-batch.v1"
@@ -1059,13 +1075,12 @@ class ContinuationLivePhases:
             )
         ):
             await self._resume_attachment(selected, unissued=False)
-            return
+            return None
         if type(top) is ToolBatchFrame and top.phase == "tool_ready":
             runtime, _inventory = await self.current(selected)
             if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "call_ready":
-                await self._execute_one(selected)
-                return
+                return await self._execute_one(selected)
             if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "dispatch_ready":
                 await self._persist_batch(selected)
-                return
+                return None
         raise AuditIntegrityError("selected phase has no matching live tool action")

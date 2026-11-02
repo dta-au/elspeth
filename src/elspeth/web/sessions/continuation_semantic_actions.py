@@ -69,6 +69,7 @@ from elspeth.web.sessions.continuation_owner_results import (
 )
 from elspeth.web.sessions.continuation_semantic_advisor import (
     SemanticAdvisorPaidDecisionData,
+    SemanticAdvisorProviderOutcome,
     _creator_data,
     _current,
     _effect_data,
@@ -299,7 +300,7 @@ def _original_paid_for_selected(
 ) -> SemanticAdvisorPaidDecisionData:
     sid, operation = str(session_id), operation_id
     result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
-    if result.outcome != "success" or result.decision is None or result.response is None:
+    if result.outcome is not SemanticAdvisorProviderOutcome.SUCCESS or result.decision is None or result.response is None:
         raise AuditIntegrityError("installed semantic action lost its original paid successful response")
     effect = _effect_data(conn, sid, operation, root, effect_key)
     creator = _creator_data(conn, sid, operation, effect)

@@ -2,25 +2,40 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
+from elspeth.contracts.bounded_serialization import BoundedCanonicalSize, bounded_canonical_json_size
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
 from elspeth.web.composer.continuation_codec import owned_json
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 
 _PHYSICAL_AUDIT = TypeAdapter(ComposerLLMCall)
 
 
-def encode_physical_audit_call(call: ComposerLLMCall) -> str:
+def _physical_audit_json_value(call: ComposerLLMCall) -> JsonValue:
     if type(call) is not ComposerLLMCall:
         raise TypeError("physical audit retention requires its complete actual nominal record")
     projected = _PHYSICAL_AUDIT.dump_python(call, mode="json", warnings="error", fallback=owned_json)
     if projected["cost_response_accountable"] is None:
         del projected["cost_response_accountable"]
-    return canonical_json(owned_json(projected))
+    return owned_json(projected)
+
+
+def measure_physical_audit_call_size(call: ComposerLLMCall) -> BoundedCanonicalSize:
+    """Measure the exact normal audit projection; excess is only a size observation.
+
+    A caller must establish semantic and credential validity before treating an
+    excess as a paid-overflow outcome. This helper grants no settlement authority.
+    """
+    return bounded_canonical_json_size(_physical_audit_json_value(call), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+
+
+def encode_physical_audit_call(call: ComposerLLMCall) -> str:
+    return canonical_json(_physical_audit_json_value(call))
 
 
 def decode_physical_audit_call(canonical: str) -> ComposerLLMCall:

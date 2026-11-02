@@ -8155,6 +8155,110 @@ async def test_structure_dml_original_put_chunk_is_complete_and_source_bound(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["original", "predicate-limit-param", "limit-subclass"])
+async def test_structure_limit_bind_is_exact_and_bound_only_to_current_limit_offset(monkeypatch, request, changed):
+    from sqlalchemy import select
+    from sqlalchemy.sql.selectable import _OffsetLimitParam
+
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions.locking import locked_session_transaction
+
+    class ForeignLimit(_OffsetLimitParam):
+        inherit_cache = True
+
+    _require_structure_api()
+    engine = request.getfixturevalue("engine")
+    repository, context, operation_id, _selected, revision = _closed_dml_seed(engine)
+    returned = []
+
+    def work():
+        with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+            assert store.require_continuation_mutation(conn, context) is True
+            for _ in range(2):
+                predicate = _OffsetLimitParam(None, revision, unique=True) if changed == "predicate-limit-param" else revision
+                statement = select(store.jobs.c.status_revision).where(store.jobs.c.status_revision == predicate).limit(1).offset(0)
+                assert type(statement._limit_clause) is type(statement._offset_clause) is _OffsetLimitParam
+                if changed == "limit-subclass":
+                    statement = statement.limit(ForeignLimit(None, 1, unique=True))
+                    assert type(statement._limit_clause) is ForeignLimit
+                actual = conn.execute(statement).scalar_one()
+                assert actual == revision
+                returned.append(actual)
+        return 1
+
+    try:
+        result, snapshot = await _closed_dml_trial(monkeypatch, request, engine, context, operation_id, work, refused=changed != "original")
+        assert result == 1 and returned == [revision, revision]
+        assert any(row.outcome == "returned" for row in _structure_events(snapshot, "sql_return"))
+        if changed == "original":
+            assert snapshot.complete and snapshot.observation_verified and _structure_selects(snapshot)
+        else:
+            assert "current_bind_source_changed" in snapshot.errors
+    finally:
+        repository.release(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["original", "connection-marker", "unknown-option", "engine-marker"])
+async def test_structure_factory_read_option_keeps_original_sql_and_refuses_changed_ownership(monkeypatch, request, changed):
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions import engine as engine_module
+    from elspeth.web.sessions.locking import locked_session_transaction
+
+    _require_structure_api()
+    engine = request.getfixturevalue("engine")
+    repository, context, operation_id, _selected, _revision = _closed_dml_seed(engine)
+    option = engine_module._SESSION_DATA_READ_CAPABILITY_OPTION
+    assert option in engine.get_execution_options() and engine.get_execution_options()[option] is None
+    reached = []
+
+    def work():
+        try:
+            if changed == "engine-marker":
+                engine.update_execution_options(**{option: "changed"})
+            with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+                assert store.require_continuation_mutation(conn, context) is True
+                if changed == "connection-marker":
+                    conn.execution_options(**{option: "changed"})
+                elif changed == "unknown-option":
+                    conn.execution_options(unowned_structure_option=True)
+                reached.append(changed)
+                store.put_chunk(
+                    conn,
+                    session_id=str(context.fence.session_id),
+                    operation_id=operation_id,
+                    key="factory-option-control",
+                    payload=b"original SQL",
+                    codec="control.v1",
+                )
+                assert (
+                    store.read_chunk(
+                        conn, session_id=str(context.fence.session_id), operation_id=operation_id, key="factory-option-control"
+                    )
+                    == b"original SQL"
+                )
+            return 1
+        finally:
+            if changed == "engine-marker":
+                engine.update_execution_options(**{option: None})
+
+    try:
+        result, snapshot = await _closed_dml_trial(monkeypatch, request, engine, context, operation_id, work, refused=changed != "original")
+        assert result == 1 and reached == [changed]
+        assert engine.get_execution_options()[option] is None
+        assert any(row.outcome == "returned" for row in _structure_events(snapshot, "sql_return"))
+        if changed == "original":
+            rows = _closed_dml_rows(snapshot)
+            assert len(rows) == 1 and rows[0].outcome == "returned" and rows[0].sql.bind_arities == (7,)
+        elif changed == "engine-marker":
+            assert "original_source_changed" in snapshot.errors
+        else:
+            assert "publication_guard_execution_options" in snapshot.errors
+    finally:
+        repository.release(context)
+
+
+@pytest.mark.asyncio
 async def test_structure_dml_original_append_preserves_full_publication_and_revision(monkeypatch, request):
     from sqlalchemy import select
     from sqlalchemy.sql.dml import Insert, Update
@@ -8270,7 +8374,7 @@ async def test_structure_dml_changed_current_assignment_predicate_revision_or_cl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["producer", "insert-visitor", "update-visitor", "aggregate-visitor"])
+@pytest.mark.parametrize("changed", ["producer", "insert-producer", "insert-visitor", "update-visitor", "aggregate-visitor"])
 async def test_structure_dml_changed_then_restored_original_sources_refuse(monkeypatch, request, changed):
     from elspeth.web.sessions import continuation as store
     from elspeth.web.sessions.locking import locked_session_transaction
@@ -8279,6 +8383,7 @@ async def test_structure_dml_changed_then_restored_original_sources_refuse(monke
     engine = request.getfixturevalue("engine")
     repository, context, operation_id, selected, _revision = _closed_dml_seed(engine)
     original = store.put_chunk
+    original_insert = store._insert_chunk_after_admission
     method = {"update-visitor": "visit_update", "aggregate-visitor": "visit_function"}.get(changed, "visit_insert")
     owner = next(cls for cls in engine.dialect.statement_compiler.__mro__ if method in vars(cls))
     visitor = vars(owner)[method]
@@ -8289,6 +8394,10 @@ async def test_structure_dml_changed_then_restored_original_sources_refuse(monke
         reached.append("producer")
         return original(*args, **kwargs)
 
+    def insert_source(*args, **kwargs):
+        reached.append("insert-producer")
+        return original_insert(*args, **kwargs)
+
     def compile_original(self, *args, **kwargs):
         reached.append(changed)
         return visitor(self, *args, **kwargs)
@@ -8297,10 +8406,12 @@ async def test_structure_dml_changed_then_restored_original_sources_refuse(monke
         with monkeypatch.context() as patch:
             if changed == "producer":
                 patch.setattr(store, "put_chunk", source)
+            elif changed == "insert-producer":
+                patch.setattr(store, "_insert_chunk_after_admission", insert_source)
             else:
                 patch.setattr(owner, method, compile_original)
             with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
-                if changed == "producer":
+                if changed in ("producer", "insert-producer"):
                     # The genuine saved original body still runs while its
                     # defining module dispatch is replaced; no wrapper credit.
                     assert store.require_continuation_mutation(conn, context) is True
@@ -8318,9 +8429,11 @@ async def test_structure_dml_changed_then_restored_original_sources_refuse(monke
                     )
                 else:
                     assert _closed_dml_append(conn, context, operation_id, selected).cursor == selected.cursor + 1
-        assert store.put_chunk is original and vars(owner)[method] is visitor
+        assert store.put_chunk is original and store._insert_chunk_after_admission is original_insert and vars(owner)[method] is visitor
         if changed == "producer":
             assert reached == []
+        elif changed == "insert-producer":
+            assert reached == ["insert-producer"]
         else:
             assert changed in reached
         return 1
@@ -8384,7 +8497,18 @@ async def test_structure_dml_actual_current_owner_and_carrier_are_required(monke
         return native()
 
     try:
-        result, snapshot = await _closed_dml_trial(monkeypatch, request, engine, context, operation_id, work, refused=True)
+        result, snapshot = await _closed_dml_trial(
+            monkeypatch,
+            request,
+            engine,
+            context,
+            operation_id,
+            work,
+            refused=True,
+            refusal_match="target work lacked its actual stage carrier"
+            if changed == "missing-carrier"
+            else "structure observation incomplete",
+        )
         assert result == 1 and _structure_events(snapshot, "sql_attempt")
     finally:
         repository.release(context)

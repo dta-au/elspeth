@@ -79,7 +79,10 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # Epoch 82 makes the original Continuation parent policy/version/allowance
 # tuple immutable. Epoch-81 stores retain the weaker trigger and are refused
 # unchanged; there is no automatic upgrade or store reset.
-SESSION_SCHEMA_EPOCH = 82
+# Epoch 83 admits the distinct V4 paid-provider overflow policy and retains
+# provider-terminal holds. Epoch-82 stores lack those original admission facts;
+# preserve them unchanged rather than retrofitting a hold or changing a parent.
+SESSION_SCHEMA_EPOCH = 83
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3702,7 +3705,7 @@ composer_async_operations_table = Table(
         "continuation_policy_version IS NOT NULL AND "
         "((continuation_policy_version IN ('composer.continuation.policy.v1', 'composer.continuation.policy.v2') "
         "AND continuation_policy_sha256 IS NULL AND continuation_retained_payload_limit_bytes IS NULL) OR "
-        "(continuation_policy_version = 'composer.continuation.policy.v3' "
+        "(continuation_policy_version IN ('composer.continuation.policy.v3', 'composer.continuation.policy.v4') "
         "AND continuation_policy_sha256 IS NOT NULL "
         "AND continuation_retained_payload_limit_bytes IS NOT NULL "
         "AND continuation_retained_payload_limit_bytes > 0))",
@@ -4003,6 +4006,73 @@ composer_continuation_effects_table = Table(
     ),
     *_lower_sha256_constraints("input_sha256", name="ck_composer_effects_input_sha256"),
     *_lower_sha256_constraints("graph_sha256", name="ck_composer_effects_graph_sha256", nullable=True),
+)
+
+composer_provider_terminal_holds_table = Table(
+    "composer_provider_terminal_holds",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("effect_key", String(128), primary_key=True),
+    Column("policy_sha256", String(64), nullable=False),
+    Column("allowance_bytes", BigInteger, nullable=False),
+    Column("source_checkpoint_id", String(36), nullable=False),
+    Column("source_cursor", BigInteger, nullable=False),
+    Column("source_snapshot_sha256", String(64), nullable=False),
+    Column("source_input_sha256", String(64), nullable=False),
+    Column("creator_sequence", Integer, nullable=False),
+    Column("creator_generation", Integer, nullable=False),
+    Column("claim_attempt", Integer, nullable=False),
+    Column("session_operation_id", String(128), nullable=False),
+    Column("session_operation_epoch", Integer, nullable=False),
+    Column("lease_sha256", String(64), nullable=False),
+    Column("reserved_bytes", BigInteger, nullable=False),
+    Column("fallback_contract_sha256", String(64), nullable=False),
+    Column("provider_attempt_id", String, ForeignKey("quota_provider_attempts.attempt_id", ondelete="RESTRICT")),
+    Column("state", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True)),
+    _continuation_parent_fk("fk_composer_provider_holds_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "effect_key"],
+        [
+            "composer_continuation_effects.session_id",
+            "composer_continuation_effects.operation_id",
+            "composer_continuation_effects.effect_key",
+        ],
+        name="fk_composer_provider_holds_effect",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "creator_sequence", "creator_generation"],
+        [
+            "composer_segment_attempts.session_id",
+            "composer_segment_attempts.operation_id",
+            "composer_segment_attempts.sequence",
+            "composer_segment_attempts.generation",
+        ],
+        name="fk_composer_provider_holds_creator",
+        ondelete="CASCADE",
+    ),
+    UniqueConstraint("provider_attempt_id", name="uq_composer_provider_holds_attempt"),
+    CheckConstraint(
+        "allowance_bytes > 0 AND reserved_bytes > 0 AND reserved_bytes <= allowance_bytes "
+        "AND source_cursor >= 0 AND creator_sequence > 0 AND creator_generation > 0 "
+        "AND claim_attempt > 0 AND session_operation_epoch > 0",
+        name="ck_composer_provider_holds_bounds",
+    ),
+    CheckConstraint("state IN ('active', 'consumed')", name="ck_composer_provider_holds_state"),
+    CheckConstraint(
+        "(state = 'active' AND consumed_at IS NULL) OR "
+        "(state = 'consumed' AND consumed_at IS NOT NULL AND provider_attempt_id IS NOT NULL AND consumed_at >= created_at)",
+        name="ck_composer_provider_holds_consumption",
+    ),
+    CheckConstraint("length(source_checkpoint_id) = 36", name="ck_composer_provider_holds_checkpoint"),
+    *_lower_sha256_constraints("policy_sha256", name="ck_composer_provider_holds_policy"),
+    *_lower_sha256_constraints("source_snapshot_sha256", name="ck_composer_provider_holds_snapshot"),
+    *_lower_sha256_constraints("source_input_sha256", name="ck_composer_provider_holds_input"),
+    *_lower_sha256_constraints("lease_sha256", name="ck_composer_provider_holds_lease"),
+    *_lower_sha256_constraints("fallback_contract_sha256", name="ck_composer_provider_holds_fallback"),
 )
 
 composer_continuation_provider_ordinals_table = Table(

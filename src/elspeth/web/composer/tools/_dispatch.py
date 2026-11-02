@@ -24,6 +24,7 @@ from typing import Any, Final, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
+from pydantic import JsonValue
 from sqlalchemy import Engine
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
@@ -71,13 +72,14 @@ from elspeth.web.composer.tools._registry import (
     resolve_tool_effects,
     should_augment_with_plugin_schemas,
 )
-from elspeth.web.composer.tools.declarations import EffectDomain, ToolEffects
+from elspeth.web.composer.tools.declarations import GRAPH_EFFECTS, EffectDomain, ToolEffects
 from elspeth.web.composer.tools.discovery import _SESSION_AWARE_TOOL_NAMES
 from elspeth.web.composer.tools.generation import build_validation_guidance
 from elspeth.web.composer.tools.sessions import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_VALUES,
 )
+from elspeth.web.composer.tools.transforms import _handle_set_metadata
 from elspeth.web.credential_guard import require_no_credential_material_for_tool
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
@@ -793,6 +795,73 @@ def _enforce_composition_interpretation_gate(
     )
 
 
+def _finalize_dispatched_tool_result(
+    *,
+    tool_name: str,
+    state: CompositionState,
+    catalog: PolicyCatalogView,
+    context: ToolContext,
+    result: ToolResult,
+    effects: ToolEffects,
+    prior_validation: ValidationSummary,
+) -> ToolResult:
+    """Share interpretation and result finalization with pure preparation."""
+    result = _enforce_composition_interpretation_gate(
+        result,
+        tool_name=tool_name,
+        effects=effects,
+        prior_state=state,
+    )
+    return finalize_tool_result(
+        result,
+        tool_name=tool_name,
+        catalog=catalog,
+        context=context,
+        prior_validation=prior_validation,
+    )
+
+
+def prepare_set_metadata_result_value(
+    arguments: object,
+    state: CompositionState,
+    catalog: PolicyCatalogView,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    prior_validation: ValidationSummary | None = None,
+) -> ToolResult:
+    """Compute a detached metadata result through the ordinary dispatch rules.
+
+    This exact-tool capability never receives a session engine, recorder or
+    runtime. It produces a value only: it is neither a retained tool receipt
+    nor permission to apply the result. The Continuation owner must still
+    admit and commit its complete tail before adopting the candidate.
+    """
+    if _MUTATION_TOOLS["set_metadata"] is not _handle_set_metadata:
+        raise AssertionError("set_metadata pure preparation lost its closed declaration")
+    require_no_credential_material_for_tool("set_metadata", arguments, surface="composer_tool_arguments", credential_state=state)
+    if catalog.snapshot is not plugin_snapshot:
+        raise ValueError("plugin_snapshot_catalog_mismatch")
+    current_validation = prior_validation or catalog.validate_composition_state(state).validation
+    require_schema_valid_arguments("set_metadata", arguments)
+    if type(arguments) is not dict:
+        raise TypeError("set_metadata preparation requires an exact validated JSON object")
+    checked_arguments = cast(dict[str, JsonValue], arguments)
+    effects = resolve_tool_effects("set_metadata", checked_arguments)
+    if effects != GRAPH_EFFECTS:
+        raise AssertionError("set_metadata pure preparation lost its closed declaration")
+    context = ToolContext(catalog=catalog, plugin_snapshot=plugin_snapshot, current_validation=current_validation)
+    result = _handle_set_metadata(checked_arguments, state, context)
+    return _finalize_dispatched_tool_result(
+        tool_name="set_metadata",
+        state=state,
+        catalog=catalog,
+        context=context,
+        result=result,
+        effects=effects,
+        prior_validation=current_validation,
+    )
+
+
 def execute_tool(
     tool_name: str,
     arguments: dict[str, Any],
@@ -983,18 +1052,13 @@ def execute_tool(
 
     effects = resolve_tool_effects(tool_name, arguments)
     result = handler(arguments, state, context)
-    result = _enforce_composition_interpretation_gate(
-        result,
+    return _finalize_dispatched_tool_result(
         tool_name=tool_name,
-        effects=effects,
-        prior_state=state,
-    )
-
-    return finalize_tool_result(
-        result,
-        tool_name=tool_name,
+        state=state,
         catalog=catalog,
         context=context,
+        result=result,
+        effects=effects,
         prior_validation=current_validation,
     )
 
