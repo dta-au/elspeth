@@ -8,6 +8,7 @@ from hashlib import sha256
 
 import pytest
 from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
@@ -349,3 +350,35 @@ def test_hold_consumes_once_only_after_complete_settlement(hold_store):
             prospective=(ProspectiveContinuationChunk("after", b"01234567", "event.v2"),),
             retained_payload_limit_bytes=source.allowance_bytes,
         )
+
+
+def test_paid_overflow_effect_cannot_lack_its_distinct_receipt(hold_store):
+    engine, source = hold_store
+    with engine.begin() as conn:
+        _reserve(conn, source)
+        _bind_original_attempt(conn, source)
+        where = (
+            effects.c.session_id == source.session_id,
+            effects.c.operation_id == source.operation_id,
+            effects.c.effect_key == source.effect_key,
+        )
+        with pytest.raises(IntegrityError, match="ck_composer_effects_receipt"), conn.begin_nested():
+            conn.execute(update(effects).where(*where).values(disposition="paid_overflow"))
+        assert conn.execute(select(effects.c.disposition).where(*where)).scalar_one() == "dispatched"
+        conn.execute(
+            insert(chunks).values(
+                session_id=source.session_id,
+                operation_id=source.operation_id,
+                chunk_key="paid-overflow-receipt",
+                codec="composer.paid-overflow.v1",
+                payload=b"{}",
+                sha256=sha256(b"{}").hexdigest(),
+                byte_length=2,
+            )
+        )
+        conn.execute(
+            update(effects)
+            .where(*where)
+            .values(disposition="paid_overflow", receipt_key="paid-overflow:receipt", result_chunk_key="paid-overflow-receipt")
+        )
+        assert conn.execute(select(effects.c.disposition).where(*where)).scalar_one() == "paid_overflow"

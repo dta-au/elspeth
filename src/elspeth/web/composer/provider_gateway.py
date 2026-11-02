@@ -43,6 +43,7 @@ from elspeth.web.composer.capability_skill import load_pipeline_capability_core,
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash
 from elspeth.web.composer.llm_response_parsing import (
     admit_llm_provider_metadata,
+    admit_v4_provider_result,
     attach_llm_calls,
     build_llm_call_record,
     supports_anthropic_prompt_cache_markers,
@@ -60,6 +61,7 @@ from elspeth.web.composer.provider_quota import (
     quota_provider_calls,
     required_provider_audit_scope,
 )
+from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.request_limits import DEFAULT_MAX_PREPARED_REQUEST_BYTES
 from elspeth.web.composer.state import CompositionState
@@ -158,6 +160,7 @@ def _capture_composer_llm_completion_fields(
     pricing_model: str | None = None,
     credential_surface: str = "composer_provider_response",
     require_tool_calls_field: bool = True,
+    provider_custody: ProviderCallCustody | None = None,
 ) -> tuple[_AdmittedAssistantMessage, tuple[Any, ...], _AdmittedLLMProviderMetadata]:
     """Read the response/message surface once, before validating its tool batch."""
 
@@ -165,6 +168,18 @@ def _capture_composer_llm_completion_fields(
     choices = getattr(response, "choices", missing)
     choice = choices[0] if isinstance(choices, list | tuple) and choices else None
     message = getattr(choice, "message", missing) if choice is not None else missing
+    sdk_return = provider_custody.claim_v4_sdk_returned(response) if provider_custody is not None else None
+    if sdk_return is not None:
+        admitted = admit_v4_provider_result(
+            response,
+            choice=choice,
+            message=None if message is missing else message,
+            sdk_return=sdk_return,
+            pricing_model=pricing_model,
+            surface=credential_surface,
+            require_tool_calls_field=require_tool_calls_field,
+        )
+        return admitted.message, admitted.tool_calls, admitted.metadata
     provider_metadata = admit_llm_provider_metadata(
         response,
         choice=choice,
@@ -225,10 +240,13 @@ def _admit_composer_llm_completion(
     *,
     wrap_tool_batch_error: bool = True,
     pricing_model: str | None = None,
+    provider_custody: ProviderCallCustody | None = None,
 ) -> _AdmittedLLMCompletion:
     """Read one LiteLLM completion once and discard the provider objects."""
 
-    message, tool_calls, provider_metadata = _capture_composer_llm_completion_fields(response, pricing_model=pricing_model)
+    message, tool_calls, provider_metadata = _capture_composer_llm_completion_fields(
+        response, pricing_model=pricing_model, provider_custody=provider_custody
+    )
     return _admit_captured_composer_llm_completion(
         message,
         tool_calls,
@@ -257,6 +275,9 @@ def _admit_captured_composer_llm_completion(
             f"LLM tool batch failed admission: {exc}",
             provider_metadata=provider_metadata,
         ) from exc
+    completeness = provider_metadata.v4_completeness
+    if completeness is not None:
+        completeness.require_result(provider_metadata, content=message.content, tool_calls=admitted_batch.calls)
     return _AdmittedLLMCompletion(
         message=message,
         tool_batch=admitted_batch,
@@ -286,6 +307,16 @@ def _require_no_credential_material_in_completion_fields(
     surface: str,
 ) -> None:
     """Guard the normalized provider fields that can be audited or replayed."""
+    if provider_metadata.v4_completeness is not None:
+        from elspeth.web.composer.provider_result_admission import require_v4_provider_metadata_credentials
+
+        require_v4_provider_metadata_credentials(
+            provider_metadata,
+            content=content,
+            tool_calls=tool_calls,
+            surface=surface,
+        )
+        return
     require_no_credential_material_in_llm_metadata(
         content=content,
         tool_calls=tool_calls,
@@ -689,7 +720,7 @@ async def _litellm_acompletion(
         try:
             await clock.run("quota", timed_quota)
         except BaseException as quota_failure:
-            if provider_custody.attempt is not None:
+            if provider_custody.attempt is not None and not provider_custody.has_v4_unentered_hold():
                 try:
                     cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
                 except BaseException as disposition_failure:
@@ -707,6 +738,8 @@ async def _litellm_acompletion(
         if on_provider_dispatch is not None:
             on_provider_dispatch()
     except BaseException as callback_failure:
+        if provider_custody.has_v4_unentered_hold():
+            raise
         try:
             cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
         except BaseException as disposition_failure:
@@ -720,7 +753,9 @@ async def _litellm_acompletion(
         raise
     if clock is None:
         provider_custody.mark_sdk_entered()
-        return await litellm.acompletion(**kwargs)
+        response = await litellm.acompletion(**kwargs)
+        provider_custody.note_v4_sdk_returned(response)
+        return response
 
     async def timed_physical() -> Any:
         verify_dispatch()
@@ -731,12 +766,14 @@ async def _litellm_acompletion(
             # The segment owner queues this without yielding or raising. It
             # must not delay or cancel an already-accountable physical call.
             on_sdk_entry()
-        return await litellm.acompletion(**kwargs)
+        response = await litellm.acompletion(**kwargs)
+        provider_custody.note_v4_sdk_returned(response)
+        return response
 
     try:
         return await clock.run("physical", timed_physical)
     except BaseException as physical_failure:
-        if provider_custody.has_undispatched_attempt():
+        if provider_custody.has_undispatched_attempt() and not provider_custody.has_v4_unentered_hold():
             try:
                 cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
             except BaseException as disposition_failure:
@@ -1017,6 +1054,7 @@ class ProviderGateway:
         completion = _admit_composer_llm_completion(
             response,
             pricing_model=self._settings.composer_pricing_model or self._model,
+            provider_custody=provider_custody,
         )
         batch_credential_state = credential_state_for_tool_batch(
             credential_state, tuple(call.function.name for call in completion.tool_batch.calls)
@@ -1314,6 +1352,14 @@ class ProviderGateway:
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
             error_message = type(exc).__name__
+            attach_llm_calls(exc, recorder)
+            raise
+        except V4ProviderResultIncomplete as exc:
+            failure_to_capture = exc
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            response_metadata = exc.metadata
+            error_class = type(exc).__name__
+            error_message = "paid_result_incomplete"
             attach_llm_calls(exc, recorder)
             raise
         except _MalformedLLMResponseError as exc:
@@ -1661,8 +1707,16 @@ class ProviderGateway:
                 prepared_input=prepared_input,
                 on_sdk_entry=on_sdk_entry,
             )
+            if provider_custody.continuation_primary_v4 is not None:
+                await provider_custody.finalize_continuation_primary_v4(outcome)
+            elif provider_custody.continuation_classifier_v4 is not None:
+                await provider_custody.finalize_continuation_classifier_v4(outcome)
         if outcome.audit_call is None:
             raise AuditIntegrityError("Primary provider outcome lacks its original physical audit")
+        if provider_custody.continuation_primary_v4 is not None and provider_custody.continuation_primary_v4_result is None:
+            raise AuditIntegrityError("V4 PRIMARY provider success lacks its committed complete or terminal result")
+        if provider_custody.continuation_classifier_v4 is not None and provider_custody.continuation_classifier_v4_result is None:
+            raise AuditIntegrityError("V4 classifier provider success lacks its committed complete or terminal result")
         return outcome
 
     @quota_provider_calls

@@ -64,8 +64,10 @@ from tests.unit.web.sessions.test_continuation_v3_paid_tail_preflight import _st
 operation_store = test_composer_operation_authority.operation_store
 
 
-async def historical_tool_cut(operation_store, tmp_path, monkeypatch, *, initialized=False):
+async def historical_tool_cut(operation_store, tmp_path, monkeypatch, *, initialized=False, tool_name="set_metadata"):
     """Construct historical DATA; never dispatch or relax live V3 preflight."""
+    if tool_name not in ("set_metadata", "get_pipeline_state"):
+        raise ValueError("Historical tool fixture requires an explicit supported tool shape")
     store, policy = _store_with_policy(operation_store, monkeypatch, version="v3")
     initial = None
     if initialized:
@@ -98,6 +100,13 @@ async def historical_tool_cut(operation_store, tmp_path, monkeypatch, *, initial
         initial_state=None if initial is None else initial.live.state,
         current_state_id=None if initial is None else initial.live.current_state_id,
     )
+    # Choose the original provider response before any audit, response bytes,
+    # accounting or source root is retained. Never rewrite paid custody later.
+    if tool_name == "get_pipeline_state":
+        original_call = completion.tool_batch.calls[0]
+        call = replace(original_call, function=replace(original_call.function, name=tool_name, arguments="{}"))
+        completion = replace(completion, tool_batch=replace(completion.tool_batch, calls=(call,)))
+        batch = replace(batch, decoded_args_by_call_id={call.id: {}})
     batch = replace(batch, phase="call_ready", next_tool_index=0, tool_outcomes=[], private_authorings_by_call={})
     batch_chunk = encode_coupled_batch_chunk(batch=batch, accumulator=accumulator, calls=completion.tool_batch.calls)
     wire = [{"role": "user", "content": "Historical tool source"}]

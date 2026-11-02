@@ -1212,6 +1212,17 @@ class RequiredWorkCoordinator:
                     raise AuditIntegrityError("Checkpoint projection replaced actual finish-once carrier")
                 self._verify_sql_outcome(ticket, actual_outcome)
 
+    def validate_undispatched_cancellation_sql_outcome[T](
+        self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]
+    ) -> None:
+        """Verify the original zero-use cancellation SQL and its exact carrier."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL)
+            with ticket._lock:
+                if ticket._finish_once_handoff is not actual_outcome:
+                    raise AuditIntegrityError("Undispatched cancellation replaced actual finish-once carrier")
+                self._verify_sql_outcome(ticket, actual_outcome)
+
     def validate_terminal_failure_sql_outcome[T](
         self,
         *,

@@ -7,9 +7,11 @@ did not happen. Only an actual committed, settled response can be reused.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from hashlib import sha256
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -37,15 +39,18 @@ from elspeth.web.composer.continuation_codec import (
 )
 from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_application_data import append_primary_call_to_evidence
-from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalPermit, PrimaryNoSdkRefusalReason
 from elspeth.web.composer.continuation_provider_outcomes import require_successful_response_audit
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
+    ProviderAttempt,
     _undispatched_cancellation_event_id,
     _usage_entry_id,
+    begin_provider_attempt_on_connection,
     token_usage_entry_from_llm_call_envelope,
 )
 from elspeth.web.credential_guard import require_no_credential_material
@@ -54,16 +59,31 @@ from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
     ContinuationEvent,
     ContinuationProviderBinding,
+    PreparedContinuationAppend,
     PreparedContinuationProvider,
     StoredContinuationSnapshot,
     _effect_snapshot,
     _owed_continuation_p4_active,
     _require_current_continuation_running,
     append_complete_snapshot,
+    prepare_snapshot_append,
     private_chunk_key,
     put_chunk,
     read_chunk,
     require_snapshot_cas,
+)
+from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity, PaidOverflowReceipt
+from elspeth.web.sessions.continuation_paid_overflow_quota import preflight_v4_requested_model
+from elspeth.web.sessions.continuation_primary_paid_overflow_no_sdk import PrimaryNoSdkTailPlan, prepare_primary_no_sdk_tail_plan
+from elspeth.web.sessions.continuation_primary_paid_overflow_tail import (
+    PrimaryPaidOverflowTailPlan,
+    prepare_primary_paid_overflow_tail_plan,
+)
+from elspeth.web.sessions.continuation_retained_capacity import (
+    ProspectiveContinuationChunk,
+    ProviderTerminalHoldSource,
+    bind_provider_terminal_hold_attempt,
+    reserve_provider_terminal_hold,
 )
 from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
 from elspeth.web.sessions.models import chat_messages_table as messages
@@ -80,6 +100,10 @@ from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.time_normalization import restore_utc
 
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_primary_observation import PrimaryCompleteObservation, PrimaryPaidObservation
+    from elspeth.web.sessions.service import SessionServiceImpl
+
 
 @dataclass(frozen=True, slots=True)
 class PrimaryProviderResult:
@@ -89,6 +113,48 @@ class PrimaryProviderResult:
     recorder: PrivateChunk
     buffer: RecorderSnapshot
     outcome: _CallModelOutcome
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryPaidOverflowTerminal:
+    receipt: PaidOverflowReceipt
+    snapshot: StoredContinuationSnapshot
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class V4PrimaryProviderAdmission:
+    attempt: ProviderAttempt
+    selected: StoredContinuationSnapshot
+    hold: ProviderTerminalHoldSource
+    tail: PrimaryPaidOverflowTailPlan
+    no_sdk_tail: PrimaryNoSdkTailPlan
+
+
+def finalize_v4_primary_provider_on_connection(
+    conn: Connection,
+    *,
+    service: SessionServiceImpl,
+    prepared: PreparedContinuationProvider,
+    admission: V4PrimaryProviderAdmission,
+    outcome: _CallModelOutcome,
+    recorder: RecorderSnapshot,
+    observation: PrimaryPaidObservation,
+    env_ref_names: frozenset[str],
+) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal:
+    from elspeth.web.sessions.continuation_primary_paid_overflow_finalization import finalize_v4_primary_provider_on_connection as finalize
+
+    return finalize(
+        conn,
+        service=service,
+        prepared=prepared,
+        admission=admission,
+        outcome=outcome,
+        recorder=recorder,
+        observation=observation,
+        env_ref_names=env_ref_names,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,7 +258,7 @@ def _require_primary_effect_action_on_connection(
     # A lost terminal may mark a dispatched physical effect unknown. The
     # action history retains the last witnessed dispatch; it is never a
     # completion claim or permission to issue the physical call again.
-    witnessed_disposition = "dispatched" if effect.disposition == "unknown" else effect.disposition
+    witnessed_disposition = "dispatched" if effect.disposition in ("unknown", "paid_overflow") else effect.disposition
     if len(matching) != 1 or (matching[0].owner_receipt_id, matching[0].disposition) != (
         effect.effect_key,
         witnessed_disposition,
@@ -596,17 +662,35 @@ def selected_primary_effect_data_on_connection(
         or effect.creator_generation < 1
     ):
         raise AuditIntegrityError("primary effect lost its actual issuing attempt")
+    v4 = type(decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)) is ContinuationAdmissionPolicyV4
     if effect.disposition in ("prepared", "dispatched", "unknown"):
+        v4_physical = v4 and effect.disposition in ("dispatched", "unknown")
         if (
             frame.phase != "awaiting_response"
             or frame.pending_response is not None
             or effect.result_chunk_key is not None
             or effect.receipt_key is not None
-            or effect.provider_attempt_id is not None
-            or effect.physical_sequence is not None
-            or effect.physical_generation is not None
-            or effect.requested_model is not None
             or effect.response_finished_at is not None
+            or (
+                v4_physical
+                and (
+                    type(effect.provider_attempt_id) is not str
+                    or not effect.provider_attempt_id
+                    or effect.physical_sequence != effect.creator_sequence
+                    or effect.physical_generation != effect.creator_generation
+                    or type(effect.requested_model) is not str
+                    or not effect.requested_model
+                )
+            )
+            or (
+                not v4_physical
+                and (
+                    effect.provider_attempt_id is not None
+                    or effect.physical_sequence is not None
+                    or effect.physical_generation is not None
+                    or effect.requested_model is not None
+                )
+            )
         ):
             raise AuditIntegrityError("unresolved primary carries contradictory result or physical settlement evidence")
     elif effect.disposition == "committed":
@@ -632,13 +716,46 @@ def selected_primary_effect_data_on_connection(
             or not effect.receipt_key
             or type(effect.result_chunk_key) is not str
             or not effect.result_chunk_key.startswith("value:composer.primary-no-sdk-refusal.v1:")
-            or effect.provider_attempt_id is not None
-            or effect.physical_sequence is not None
-            or effect.physical_generation is not None
-            or effect.requested_model is not None
-            or effect.response_finished_at is not None
+            or (
+                not v4
+                and (
+                    effect.provider_attempt_id is not None
+                    or effect.physical_sequence is not None
+                    or effect.physical_generation is not None
+                    or effect.requested_model is not None
+                    or effect.response_finished_at is not None
+                )
+            )
+            or (
+                v4
+                and effect.provider_attempt_id is not None
+                and (
+                    type(effect.provider_attempt_id) is not str
+                    or effect.physical_sequence != effect.creator_sequence
+                    or effect.physical_generation != effect.creator_generation
+                    or type(effect.requested_model) is not str
+                    or not effect.requested_model
+                    or effect.response_finished_at is not None
+                )
+            )
         ):
             raise AuditIntegrityError("refused primary lost its terminal no-SDK receipt shape")
+    elif effect.disposition == "paid_overflow":
+        if (
+            not v4
+            or frame.phase != "awaiting_response"
+            or frame.pending_response is not None
+            or type(effect.receipt_key) is not str
+            or not effect.receipt_key.startswith("paid-overflow:")
+            or type(effect.result_chunk_key) is not str
+            or not effect.result_chunk_key.startswith("value:composer.paid-overflow.v1:")
+            or type(effect.provider_attempt_id) is not str
+            or effect.physical_sequence != effect.creator_sequence
+            or effect.physical_generation != effect.creator_generation
+            or type(effect.requested_model) is not str
+            or effect.response_finished_at is None
+        ):
+            raise AuditIntegrityError("PRIMARY paid overflow lost its incomplete original source shape")
     else:
         raise AuditIntegrityError("primary effect has an unknown durable disposition")
     _require_primary_effect_action_on_connection(
@@ -722,6 +839,251 @@ def begin_primary_provider_on_connection(
     return result
 
 
+def _v4_dispatch_action_projection(
+    conn: Connection,
+    *,
+    root: ContinuationFrameStack,
+    effect: Row[Any],
+    dispatched_json: str,
+    disposition: Literal["dispatched", "committed", "refused"] = "dispatched",
+) -> tuple[str, PrivateChunk | None]:
+    """Predict the existing action-receipt writer's exact bytes before H is reserved."""
+    if effect.action_json is None:
+        return dispatched_json, None
+    from elspeth.web.composer.continuation_progress import (
+        ActionExecutionReceipt,
+        continuation_action_key,
+        decode_continuation_frontier,
+        decode_prescribed_continuation_action,
+        encode_continuation_frontier,
+        record_action_receipt,
+    )
+
+    ref = root.semantic_frontier
+    if ref is None:
+        raise AuditIntegrityError("V4 PRIMARY prescribed dispatch lost its original semantic frontier")
+    canonical = read_chunk(
+        conn,
+        session_id=str(root.logical.session_id),
+        operation_id=root.logical.operation_id,
+        key=f"value:{ref.codec}:{ref.digest}",
+    ).decode("utf-8", errors="strict")
+    verify_private_chunk(ref, canonical)
+    frontier = decode_continuation_frontier(canonical)
+    action = decode_prescribed_continuation_action(effect.action_json)
+    receipt = ActionExecutionReceipt(
+        continuation_action_key(action, retained_evidence={item.receipt_id: item for item in frontier.evidence}),
+        effect.effect_key,
+        disposition,
+    )
+    updated = record_action_receipt(frontier, receipt, actual_owner_receipt_id=effect.effect_key)
+    chunk = encode_private_chunk(codec="composer.semantic-frontier.v1", canonical=encode_continuation_frontier(updated))
+    predicted_root = decode_continuation_snapshot(dispatched_json).model_copy(update={"semantic_frontier": chunk.reference})
+    if disposition in ("committed", "refused"):
+        predicted_root = predicted_root.model_copy(update={"active_action_json": None, "active_action_source": None})
+    predicted = encode_continuation_snapshot(predicted_root)
+    return predicted, chunk
+
+
+def admit_v4_primary_provider_on_connection(
+    conn: Connection,
+    service: SessionServiceImpl,
+    prepared: PreparedContinuationProvider,
+    *,
+    model: str,
+    no_sdk_issuer: PrimaryNoSdkIssuer,
+) -> V4PrimaryProviderAdmission:
+    """Mint one physical attempt, reserve H and publish dispatch in one original cut."""
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    if type(service) is not SessionServiceImpl or type(prepared) is not PreparedContinuationProvider:
+        raise TypeError("V4 PRIMARY admission requires actual sessions service and prepared source")
+    if type(no_sdk_issuer) is not PrimaryNoSdkIssuer or no_sdk_issuer.prepared_candidate is not prepared:
+        raise AuditIntegrityError("V4 PRIMARY admission changed its original no-SDK issuer")
+    no_sdk_issuer.clock.require_preparation_time()
+    binding, current = prepared.binding, prepared.snapshot
+    running = binding.running
+    _require_current_continuation_running(conn, running)
+    selected, root, frame, effect = _selected_effect(
+        conn,
+        running,
+        checkpoint_id=current.checkpoint_id,
+        cursor=current.cursor,
+        effect_key=binding.effect_key,
+        input_sha256=binding.input_sha256,
+    )
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if (
+        type(policy) is not ContinuationAdmissionPolicyV4
+        or binding.family != 0
+        or binding.effect_key != f"provider:0:{binding.ordinal}"
+        or effect.disposition != "prepared"
+        or frame.phase != "awaiting_response"
+        or frame.pending_response is not None
+        or effect.provider_attempt_id is not None
+        or (effect.creator_sequence, effect.creator_generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
+    ):
+        raise ContinuationCASConflict("V4 PRIMARY admission lost its one prepared original effect")
+    descriptor, _wire, _tools = stored_primary_input_data_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, effect=effect, frame=frame
+    )
+    requested_model = preflight_v4_requested_model(model)
+    if descriptor.model != requested_model.value:
+        raise AuditIntegrityError("V4 PRIMARY admission model differs from its prepared physical request")
+    attempt = begin_provider_attempt_on_connection(
+        conn,
+        session_operation_context=running.session_operation_context,
+        source="composer",
+        policy=service._chargeable_admission_policy,
+        run_id=None,
+    )
+    dispatched_json = _effect_snapshot(
+        encode_continuation_snapshot(root), effect_key=binding.effect_key, disposition="dispatched", receipt_id=None
+    )
+    dispatched_json, action_chunk = _v4_dispatch_action_projection(conn, root=root, effect=effect, dispatched_json=dispatched_json)
+    transition = ContinuationEvent("may_dispatch", canonical_json({"effect_key": binding.effect_key}))
+    published_at = database_now(conn)
+    append = prepare_snapshot_append(selected, snapshot_json=dispatched_json, events=(transition,), published_at=published_at)
+    admitted = StoredContinuationSnapshot(append.snapshot_json, selected.cursor + 1, append.checkpoint_id)
+    context = running.session_operation_context
+    fence = context.fence
+    identity = PaidOverflowIdentity(
+        session_id=str(running.claim.session_id),
+        operation_id=running.claim.operation_id,
+        effect_key=binding.effect_key,
+        attempt_id=attempt.attempt_id,
+        session_operation_id=fence.operation_id,
+        session_operation_epoch=fence.operation_epoch,
+        ownership_generation=running.claim.ownership_generation,
+        lease_sha256=sha256(fence.lease_token.encode("utf-8")).hexdigest(),
+        policy_sha256=policy.policy_hash,
+        source_checkpoint_id=selected.checkpoint_id,
+        source_cursor=selected.cursor,
+        source_snapshot_sha256=sha256(selected.payload_json.encode("utf-8")).hexdigest(),
+    )
+    tail = prepare_primary_paid_overflow_tail_plan(identity=identity, admitted=admitted, creator_sequence=running.claim.segment_sequence)
+    refused_projection = _effect_snapshot(
+        admitted.payload_json,
+        effect_key=binding.effect_key,
+        disposition="refused",
+        receipt_id="00000000-0000-4000-8000-000000000000",
+    )
+    _refused_json, no_sdk_action_chunk = _v4_dispatch_action_projection(
+        conn,
+        root=decode_continuation_snapshot(admitted.payload_json),
+        effect=effect,
+        dispatched_json=refused_projection,
+        disposition="refused",
+    )
+    no_sdk_tail = prepare_primary_no_sdk_tail_plan(
+        admitted=admitted,
+        attempt_id=attempt.attempt_id,
+        requested_model=requested_model.value,
+        input_sha256=effect.input_sha256,
+        effect_key=binding.effect_key,
+        creator_sequence=running.claim.segment_sequence,
+        creator_generation=running.claim.ownership_generation,
+        claim_attempt=running.claim.attempt,
+        operation_epoch=fence.operation_epoch,
+        action_chunk=no_sdk_action_chunk,
+    )
+    reserved_bytes = max(tail.reserved_bytes, no_sdk_tail.reserved_bytes)
+    fallback_contract_sha256 = sha256(
+        canonical_json(
+            {
+                "version": "composer.primary-v4-combined-tail.v1",
+                "paid": tail.fallback_contract_sha256,
+                "no_sdk": no_sdk_tail.contract_sha256,
+                "reserved_bytes": reserved_bytes,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    hold = ProviderTerminalHoldSource(
+        session_id=identity.session_id,
+        operation_id=identity.operation_id,
+        effect_key=identity.effect_key,
+        policy_sha256=identity.policy_sha256,
+        allowance_bytes=policy.max_retained_payload_bytes,
+        source_checkpoint_id=identity.source_checkpoint_id,
+        source_cursor=identity.source_cursor,
+        source_snapshot_sha256=identity.source_snapshot_sha256,
+        source_input_sha256=effect.input_sha256,
+        creator_sequence=running.claim.segment_sequence,
+        creator_generation=running.claim.ownership_generation,
+        claim_attempt=running.claim.attempt,
+        session_operation_id=fence.operation_id,
+        session_operation_epoch=fence.operation_epoch,
+        lease_sha256=identity.lease_sha256,
+        reserved_bytes=reserved_bytes,
+        fallback_contract_sha256=fallback_contract_sha256,
+    )
+    prospective = (
+        *(
+            (
+                ProspectiveContinuationChunk(
+                    private_chunk_key(action_chunk), action_chunk.canonical.encode("utf-8"), action_chunk.reference.codec
+                ),
+            )
+            if action_chunk is not None
+            else ()
+        ),
+        ProspectiveContinuationChunk(f"event:{admitted.cursor}", transition.payload_json.encode("utf-8"), "event.v2"),
+        ProspectiveContinuationChunk(f"snapshot:{admitted.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
+    )
+    reserve_provider_terminal_hold(conn, source=hold, prospective=prospective, created_at=published_at)
+    changed = conn.execute(
+        update(effects)
+        .where(
+            effects.c.session_id == identity.session_id,
+            effects.c.operation_id == identity.operation_id,
+            effects.c.effect_key == identity.effect_key,
+            effects.c.disposition == "prepared",
+            effects.c.provider_attempt_id.is_(None),
+        )
+        .values(
+            disposition="dispatched",
+            provider_attempt_id=attempt.attempt_id,
+            physical_sequence=running.claim.segment_sequence,
+            physical_generation=running.claim.ownership_generation,
+            requested_model=requested_model.value,
+        )
+    )
+    if changed.rowcount != 1:
+        raise AuditIntegrityError("V4 PRIMARY dispatch lost its original prepared effect CAS")
+    bind_provider_terminal_hold_attempt(conn, source=hold, provider_attempt_id=attempt.attempt_id)
+    if action_chunk is not None:
+        from elspeth.web.sessions.continuation import retain_action_execution_receipt_on_connection
+
+        actual_json = retain_action_execution_receipt_on_connection(
+            conn,
+            session_id=identity.session_id,
+            operation_id=identity.operation_id,
+            effect_key=identity.effect_key,
+            disposition="dispatched",
+            snapshot_json=_effect_snapshot(
+                encode_continuation_snapshot(root), effect_key=binding.effect_key, disposition="dispatched", receipt_id=None
+            ),
+        )
+        if actual_json != dispatched_json:
+            raise AuditIntegrityError("V4 PRIMARY prescribed dispatch changed its reserved action bytes")
+    stored = append_complete_snapshot(
+        conn,
+        session_id=identity.session_id,
+        operation_id=identity.operation_id,
+        expected_checkpoint_id=selected.checkpoint_id,
+        expected_cursor=selected.cursor,
+        snapshot_json=append.snapshot_json,
+        event_batch=append.events,
+        handoff=False,
+        prepared_append=append,
+    )
+    if stored != admitted:
+        raise AuditIntegrityError("V4 PRIMARY dispatch changed its reserved complete snapshot")
+    no_sdk_issuer.clock.require_preparation_time()
+    no_sdk_issuer.note_dispatched_candidate(admitted)
+    return V4PrimaryProviderAdmission(attempt, admitted, hold, tail, no_sdk_tail)
+
+
 class _PrimaryNoSdkRefusalData(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
@@ -761,6 +1123,25 @@ class PrimaryNoSdkRefusalReceipt:
     receipt_key: str
     result_chunk_key: str
     deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
+
+
+def refuse_v4_primary_unentered_on_connection(
+    conn: Connection,
+    *,
+    prepared: PreparedContinuationProvider,
+    admission: V4PrimaryProviderAdmission,
+    permit: PrimaryNoSdkRefusalPermit,
+    append_audit_event: Callable[[str, str, datetime], None],
+) -> PrimaryNoSdkRefusalReceipt:
+    from elspeth.web.sessions.continuation_primary_paid_overflow_refusal import refuse_v4_primary_unentered_on_connection as refuse
+
+    return refuse(
+        conn,
+        prepared=prepared,
+        admission=admission,
+        permit=permit,
+        append_audit_event=append_audit_event,
+    )
 
 
 def _primary_no_sdk_event(data: _PrimaryNoSdkRefusalData, result_chunk_key: str) -> str:
@@ -928,6 +1309,13 @@ def read_primary_no_sdk_refusal_on_connection(
     )
     if effect.disposition != "refused":
         return None
+    if (
+        type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is ContinuationAdmissionPolicyV4
+        and effect.provider_attempt_id is not None
+    ):
+        from elspeth.web.sessions.continuation_primary_paid_overflow_refusal_terminal import read_v4_primary_no_sdk_refusal_on_connection
+
+        return read_v4_primary_no_sdk_refusal_on_connection(conn, session_id=session_id, operation_id=operation_id, effect_key=effect_key)
     chunk_row = conn.execute(
         select(chunks.c.codec).where(
             chunks.c.session_id == sid,
@@ -1262,6 +1650,8 @@ def publish_primary_provider_on_connection(
     outcome: _CallModelOutcome,
     recorder: RecorderSnapshot,
     env_ref_names: frozenset[str] = frozenset(),
+    complete_observation: PrimaryCompleteObservation | None = None,
+    prepared_append: PreparedContinuationAppend | None = None,
 ) -> PrimaryProviderResult:
     if type(binding) is not ContinuationProviderBinding or type(outcome) is not _CallModelOutcome or type(recorder) is not RecorderSnapshot:
         raise AuditIntegrityError("primary publication lost its nominal actual owners")
@@ -1274,6 +1664,18 @@ def publish_primary_provider_on_connection(
         effect_key=binding.effect_key,
         input_sha256=binding.input_sha256,
     )
+    v4 = type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is ContinuationAdmissionPolicyV4
+    if v4:
+        from elspeth.web.composer.continuation_primary_observation import PrimaryCompleteObservation
+
+        if (
+            type(complete_observation) is not PrimaryCompleteObservation
+            or complete_observation.outcome is not outcome
+            or type(prepared_append) is not PreparedContinuationAppend
+        ):
+            raise AuditIntegrityError("V4 PRIMARY complete publication lost its exact observed result batch")
+    elif complete_observation is not None or prepared_append is not None:
+        raise AuditIntegrityError("legacy PRIMARY publication cannot consume V4 complete batch credit")
     if (
         binding.family != 0
         or binding.effect_key != f"provider:0:{binding.ordinal}"
@@ -1284,10 +1686,24 @@ def publish_primary_provider_on_connection(
         or effect.result_chunk_key is not None
         or effect.receipt_key is not None
         or outcome.audit_call is None
-        or effect.provider_attempt_id is not None
-        or effect.physical_sequence is not None
-        or effect.physical_generation is not None
-        or effect.requested_model is not None
+        or (
+            v4
+            and (
+                effect.provider_attempt_id != outcome.audit_call.call_id
+                or effect.physical_sequence != effect.creator_sequence
+                or effect.physical_generation != effect.creator_generation
+                or effect.requested_model != outcome.audit_call.model_requested
+            )
+        )
+        or (
+            not v4
+            and (
+                effect.provider_attempt_id is not None
+                or effect.physical_sequence is not None
+                or effect.physical_generation is not None
+                or effect.requested_model is not None
+            )
+        )
         or effect.response_finished_at is not None
     ):
         raise ContinuationCASConflict("primary publication cannot replace a result or its original dispatched owner")
@@ -1325,6 +1741,12 @@ def publish_primary_provider_on_connection(
     extended_evidence = append_primary_call_to_evidence(evidence, call=call, recorder=recorder, env_ref_names=env_ref_names)
     audit = extended_evidence.recorder_chunk
     updated_evidence = encode_turn_evidence(extended_evidence, env_ref_names=env_ref_names)
+    if complete_observation is not None and (
+        complete_observation.response != response
+        or complete_observation.recorder != audit
+        or complete_observation.evidence != updated_evidence
+    ):
+        raise AuditIntegrityError("V4 PRIMARY publication changed its original observed complete bytes")
     for chunk in (response, audit, updated_evidence):
         put_chunk(
             conn,
@@ -1390,6 +1812,7 @@ def publish_primary_provider_on_connection(
             ),
         ),
         handoff=False,
+        prepared_append=prepared_append,
     )
     return PrimaryProviderResult(committed, binding.effect_key, response, audit, recorder, outcome)
 

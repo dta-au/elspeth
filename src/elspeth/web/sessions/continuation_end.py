@@ -36,6 +36,7 @@ from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
 
 if TYPE_CHECKING:
+    from elspeth.web.composer._compose_loop_carriers import _TerminateOutcome
     from elspeth.web.composer.continuation_codec import PrivateChunk
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
     from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, RestoredContinuationRuntime, _CurrentPhaseRead
@@ -183,6 +184,20 @@ async def execute_continuation_end_review(
     if superseded_reply.strip():
         superseded_reply_index = len(live.llm_messages)
         live.llm_messages.append({"role": "assistant", "content": superseded_reply})
+    checkpoint_phase_owner = None
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
+    from elspeth.web.composer.service import _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE
+
+    if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
+        from elspeth.web.composer.continuation_checkpoint_phase import prepare_checkpoint_phase_owner
+
+        checkpoint_phase_owner = await prepare_checkpoint_phase_owner(
+            phases,
+            runtime,
+            current,
+            superseded_reply_index=superseded_reply_index,
+            elide_advisor_exchange=_ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE,
+        )
     context = bindings.session_operation_context
     if context is None:
         raise AuditIntegrityError("END review lost its actual COMPOSE operation context")
@@ -219,14 +234,45 @@ async def execute_continuation_end_review(
             failed_turn=live.failed_turn,
             completion_gates=bindings.completion_gates,
             provider_owner=bindings.provider_owner,
+            checkpoint_phase_owner=checkpoint_phase_owner,
         )
+    return await continue_end_after_terminal_review(
+        phases,
+        current=current,
+        runtime=runtime,
+        terminate=terminate,
+        superseded_reply=superseded_reply,
+        superseded_reply_index=superseded_reply_index,
+        elide_advisor_exchange=_ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE,
+    )
+
+
+async def continue_end_after_terminal_review(
+    phases: ContinuationLivePhases,
+    *,
+    current: SelectedContinuationState,
+    runtime: RestoredContinuationRuntime,
+    terminate: _TerminateOutcome,
+    superseded_reply: str,
+    superseded_reply_index: int | None,
+    elide_advisor_exchange: bool,
+) -> EndReviewExecution | EndReviewContinued:
+    """Finish the original END caller without reappending its reply or invoking SDK."""
+    service = phases.service
+    live, bindings = runtime.live, runtime.bindings
+    context = bindings.session_operation_context
+    if context is None:
+        raise AuditIntegrityError("END continuation lost its original operation context")
+    if superseded_reply_index is not None and (
+        not 0 <= superseded_reply_index < len(live.llm_messages)
+        or live.llm_messages[superseded_reply_index] != {"role": "assistant", "content": superseded_reply}
+    ):
+        raise AuditIntegrityError("END continuation changed its original superseded reply position")
     if terminate.advisor_review_state is not None:
         live.advisor_review_state = terminate.advisor_review_state
     if terminate.action != "return":
         # A repair or flagged review asked the model to keep working. The
         # next authoring transition is the provider's next PRIMARY call.
-        from elspeth.web.composer.service import _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE
-
         live.repair_turns_used += terminate.repair_turns_delta
         live.advisor_checkpoint_passes_used += terminate.advisor_passes_delta
         if superseded_reply_index is not None:
@@ -239,7 +285,7 @@ async def execute_continuation_end_review(
             )
         if terminate.advisor_injection_index is not None:
             live.advisor_repair_context_introduced = True
-            if _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE:
+            if elide_advisor_exchange:
                 live.pending_advisor_elision_indices.append(terminate.advisor_injection_index)
                 if superseded_reply_index is not None:
                     live.pending_advisor_elision_indices.append(superseded_reply_index)

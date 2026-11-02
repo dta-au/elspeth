@@ -412,6 +412,7 @@ def test_actual_v2_parent_sql_row_decodes_every_continuation_field(tmp_path):
                     kind="compose_message",
                     status="queued",
                     request_hash=composer_operation_admission_request_hash(session_id=session.id, kind="compose_message", request=request),
+                    continuation_policy_version="composer.continuation.policy.v2",
                     actor_user_id="alice",
                     request_id="transport",
                     request_json=request.model_dump_json(),

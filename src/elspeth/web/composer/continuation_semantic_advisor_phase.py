@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import cast
 from uuid import UUID
 
 from sqlalchemy import Connection
@@ -25,23 +26,29 @@ from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
+from elspeth.web.composer.continuation_policy import (
+    ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
+    decode_continuation_policy,
+)
 from elspeth.web.composer.continuation_progress import decode_prescribed_continuation_action
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.continuation_semantic_advisor import SemanticAdvisorRetainedInputs, prepare_semantic_advisor_request
 from elspeth.web.composer.continuation_semantic_advisor_outcome import (
     SemanticAdvisorInvocationRaised,
     SemanticAdvisorInvocationReturned,
+    SemanticAdvisorInvocationV4Finalized,
     observe_semantic_advisor_invocation,
 )
 from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
 from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer, SemanticAdvisorNoSdkRefusalReason
+from elspeth.web.composer.continuation_semantic_observation import SemanticProviderResponseObservation
 from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
 from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
-from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
+from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.composer_operations import ComposerOperationRecord, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
@@ -67,13 +74,22 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
     retain_semantic_advisor_outcome_on_connection,
     select_semantic_advisor_current_graph_on_connection,
 )
+from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
+from elspeth.web.sessions.continuation_semantic_v4_no_sdk_close import close_v4_semantic_no_sdk_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.service import SessionServiceImpl
 
 
 @dataclass(frozen=True, slots=True)
 class SemanticAdvisorNoSdkTerminal:
     terminal: ComposerOperationRecord
     original_error: BaseException = field(repr=False, compare=False)
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticAdvisorPaidTerminal:
+    verified: VerifiedSemanticPaidOverflowTerminal
     deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
 
 
@@ -247,7 +263,7 @@ async def run_prescribed_semantic_read(phases: ContinuationLivePhases, selected:
 
 async def run_continuation_semantic_advisor(
     phases: ContinuationLivePhases, selected: SelectedContinuationState
-) -> SemanticAdvisorNoSdkTerminal | V3UnboundedTailRefusal | None:
+) -> SemanticAdvisorNoSdkTerminal | SemanticAdvisorPaidTerminal | V3UnboundedTailRefusal | None:
     """Execute one real action; retain paid output before a new SQL action.
 
     Stop/expiry may finish an original physical outcome, but cannot install a
@@ -364,6 +380,114 @@ async def run_continuation_semantic_advisor(
         expected=PreparedContinuationProvider,
     )
     issuer.bind_prepared(prepared)
+    if type(policy) is ContinuationAdmissionPolicyV4:
+        if type(phases.service._sessions_service) is not SessionServiceImpl:
+            raise AuditIntegrityError("V4 semantic Advisor requires the original session SQL owner")
+        session_service = phases.service._sessions_service
+
+        async def finalize_paid(
+            observation: SemanticProviderResponseObservation, ticket: RequiredWorkTicket
+        ) -> RequiredSQLFinishOnce[SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal]:
+            deadline_owner = phases.work.coordinator.sql_deadline_owner
+            if deadline_owner is not None:
+                deadline_owner.begin_settlement()
+            outcome = await run_required_sql_finish_once(
+                ticket,
+                lambda: session_service.complete_v4_semantic_result_sync(
+                    prepared=prepared,
+                    admission=issuer.require_original_v4_admission(prepared),
+                    observation=observation,
+                    recorder=runtime.live.recorder,
+                    no_sdk_issuer=issuer,
+                ),
+            )
+            phases.work.coordinator.validate_continuation_sql_outcome(
+                ticket=ticket, expected_source=RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, actual_outcome=outcome
+            )
+            return outcome
+
+        observed_v4: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationV4Finalized | SemanticAdvisorInvocationRaised | None = (
+            None
+        )
+        try:
+            remaining = clock.deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("Semantic action exhausted its original allowance before physical dispatch")
+            observed_v4 = await observe_semantic_advisor_invocation(
+                request,
+                provider_owner=phases.provider_owner,
+                recorder=runtime.live.recorder,
+                timeout=remaining,
+                no_sdk_issuer=issuer,
+                v4_prepared=prepared,
+                v4_env_ref_names=runtime.env_ref_names,
+                v4_finalizer=finalize_paid,
+            )
+            if type(observed_v4) is SemanticAdvisorInvocationV4Finalized:
+                paid_finalization = observed_v4.finalization
+                if type(paid_finalization.result) is VerifiedSemanticPaidOverflowTerminal:
+                    return SemanticAdvisorPaidTerminal(paid_finalization.result, paid_finalization.deferred_cancellations)
+                if type(paid_finalization.result) is not SemanticAdvisorProviderResult:
+                    raise AuditIntegrityError("V4 semantic Advisor lost its exact paid result variant")
+                phases.latest_snapshot = paid_finalization.result.snapshot
+                retained_parent = decode_continuation_snapshot(paid_finalization.result.snapshot.payload_json).frames[0]
+                if type(retained_parent) is not ComposeFrame:
+                    raise AuditIntegrityError("V4 semantic paid finish lost its Compose counter owner")
+                runtime.live.advisor_calls_used = retained_parent.advisor_calls
+                if paid_finalization.deferred_cancellations:
+                    raise combine_failure_objects(
+                        paid_finalization.deferred_cancellations[0], *paid_finalization.deferred_cancellations[1:]
+                    )
+                return None
+            if type(observed_v4) is not SemanticAdvisorInvocationRaised:
+                raise AuditIntegrityError("V4 semantic Advisor lost its original physical observation")
+            if observed_v4.observation.sdk_entered:
+                # A returned failure or unknown physical outcome has no approved
+                # terminal policy. Keep its original attempt and H unresolved.
+                raise observed_v4.error
+            original = observed_v4.observation.original_failure
+            reason = None if original is None else _refusal_reason(original)
+            admission = issuer.original_v4_admission_or_none(prepared)
+            if reason is None or original is None or admission is None:
+                raise observed_v4.error
+            no_sdk_reason = reason
+            no_sdk_original = original
+            sql, projection = phases.work.reserve_pair(
+                RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+            )
+            deadline_owner = phases.work.coordinator.sql_deadline_owner
+            if deadline_owner is not None:
+                deadline_owner.begin_settlement()
+            closed, deferred = await _finish_physical(
+                phases,
+                sql,
+                projection,
+                lambda: _transaction(
+                    phases,
+                    lambda conn: _PhysicalFinish(
+                        terminal=close_v4_semantic_no_sdk_on_connection(
+                            conn,
+                            service=session_service,
+                            prepared=prepared,
+                            admission=admission,
+                            issuer=issuer,
+                            reason=no_sdk_reason,
+                            original_failure=no_sdk_original,
+                        )
+                    ),
+                ),
+            )
+            if closed.terminal is None:
+                raise AuditIntegrityError("V4 semantic no-SDK finish lost its failed terminal")
+            cancellations = list(_native_cancellations(observed_v4.error))
+            cancellations.extend(item for item in deferred if all(item is not prior for prior in cancellations))
+            return SemanticAdvisorNoSdkTerminal(closed.terminal, observed_v4.error, tuple(cancellations))
+        except BaseException as failure:
+            if type(observed_v4) is SemanticAdvisorInvocationRaised:
+                combined = combine_failure_objects(observed_v4.error, failure)
+                if combined is not failure:
+                    raise combined from combined.__cause__
+            raise
     dispatched = await _registered(
         work=phases.work,
         source=RequiredWorkSource.CONTINUATION_STATE_SQL,
@@ -372,7 +496,7 @@ async def run_continuation_semantic_advisor(
     )
     issuer.bind_dispatched(dispatched)
     sql, projection = phases.work.reserve_pair(RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION)
-    observed: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised | None = None
+    observed: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised | SemanticAdvisorInvocationV4Finalized | None = None
     try:
         remaining = clock.deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
@@ -384,6 +508,9 @@ async def run_continuation_semantic_advisor(
             timeout=remaining,
             no_sdk_issuer=issuer,
         )
+        if type(observed) is SemanticAdvisorInvocationV4Finalized:
+            raise AuditIntegrityError("Legacy semantic Advisor received a V4 finalization")
+        legacy_observed = cast(SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised, observed)
         if not observed.observation.sdk_entered:
             if type(observed) is not SemanticAdvisorInvocationRaised:
                 raise AuditIntegrityError("Semantic unentered observation cannot invent a returned paid result")
@@ -422,7 +549,7 @@ async def run_continuation_semantic_advisor(
                         conn,
                         prepared,
                         selected=dispatched,
-                        outcome=observed,
+                        outcome=legacy_observed,
                         recorder=runtime.live.recorder,
                         issuer=issuer,
                     )

@@ -596,9 +596,13 @@ def _encode_turn_evidence_source(
     if type(snapshot) is not TurnEvidenceSnapshot:
         raise TypeError("evidence requires its owned closed snapshot")
     from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
+    from elspeth.web.composer.continuation_capture_overflow import (
+        ContinuationCaptureOverflowWitness,
+        ContinuationMandatoryCaptureOverflow,
+        require_capture_retention_capacity,
+    )
     from elspeth.web.composer.continuation_retention import (
         bind_retained_json_encoding,
-        require_retention_capacity,
         retained_model_json_view,
     )
 
@@ -610,11 +614,12 @@ def _encode_turn_evidence_source(
     if mandatory_retention:
         # A complete shelf has its own first-party limit. Evidence may then
         # exceed independently through complete states, journals and recorder.
-        require_retention_capacity(
+        require_capture_retention_capacity(
             bounded_canonical_json_size(retained_model_json_view(snapshot.transcript), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES),
             reason="retained_history_bytes",
+            codec="composer.transcript.v1",
         )
-        expected_bytes = require_retention_capacity(measured, reason="retained_chunk_bytes")
+        expected_bytes = require_capture_retention_capacity(measured, reason="retained_chunk_bytes", codec="composer.evidence.v2")
     else:
         if measured.admitted_bytes is None:
             raise AuditIntegrityError("evidence source exceeds its original complete document bound")
@@ -625,7 +630,15 @@ def _encode_turn_evidence_source(
         if mandatory_retention:
             from elspeth.web.composer.protocol import ComposerContextUnsupported
 
-            raise ComposerContextUnsupported("retained_chunk_bytes")
+            raise ComposerContextUnsupported("retained_chunk_bytes") from ContinuationMandatoryCaptureOverflow(
+                ContinuationCaptureOverflowWitness(
+                    unit="evidence_pair",
+                    codec="composer.evidence.v2",
+                    observed_bytes=expected_bytes + recorder_chunk.reference.byte_length,
+                    limit_bytes=CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES,
+                    size_is_exact=True,
+                )
+            )
         raise AuditIntegrityError("evidence and original recorder exceed their complete pair bound")
     encoded = canonical_json(snapshot.model_dump(mode="json"))
     bind_retained_json_encoding(encoded, expected_bytes=expected_bytes)

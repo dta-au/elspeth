@@ -82,7 +82,9 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # Epoch 83 admits the distinct V4 paid-provider overflow policy and retains
 # provider-terminal holds. Epoch-82 stores lack those original admission facts;
 # preserve them unchanged rather than retrofitting a hold or changing a parent.
-SESSION_SCHEMA_EPOCH = 83
+# Epoch 84 adds the distinct paid_overflow effect and private receipt codec.
+# Published epoch-83 stores have the older effect CHECK and are refused intact.
+SESSION_SCHEMA_EPOCH = 84
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3998,10 +4000,13 @@ composer_continuation_effects_table = Table(
     ForeignKeyConstraint(
         ["provider_attempt_id"], ["quota_provider_attempts.attempt_id"], name="fk_composer_effects_attempt", ondelete="RESTRICT"
     ),
-    CheckConstraint("disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown')", name="ck_composer_effects_disposition"),
+    CheckConstraint(
+        "disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown', 'paid_overflow')",
+        name="ck_composer_effects_disposition",
+    ),
     CheckConstraint(_CONTINUATION_EFFECT_OWNER_CHECK, name="ck_composer_effects_owner"),
     CheckConstraint(
-        "disposition NOT IN ('committed', 'refused') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
+        "disposition NOT IN ('committed', 'refused', 'paid_overflow') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
         name="ck_composer_effects_receipt",
     ),
     *_lower_sha256_constraints("input_sha256", name="ck_composer_effects_input_sha256"),

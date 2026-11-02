@@ -502,7 +502,7 @@ def iteration_stage_action_policy(
     *,
     selected: StoredContinuationSnapshot,
     stage: IterationStageData | None,
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
 ) -> ContinuationActionPolicy:
     """Size an original source stage; this DATA grants no paid execution."""
     from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
@@ -514,6 +514,7 @@ def iteration_stage_action_policy(
         ContinuationAdmissionPolicy,
         ContinuationAdmissionPolicyV2,
         ContinuationAdmissionPolicyV3,
+        ContinuationAdmissionPolicyV4,
     ):
         raise TypeError("iteration allowance requires its nominal selected source and original policy")
     root = decode_continuation_snapshot(selected.payload_json)
@@ -545,6 +546,7 @@ def next_continuation_action_policy(
         ContinuationAdmissionPolicy,
         ContinuationAdmissionPolicyV2,
         ContinuationAdmissionPolicyV3,
+        ContinuationAdmissionPolicyV4,
     ):
         raise TypeError("next allowance requires its actual selected DATA and retained policy")
     selected.__post_init__()

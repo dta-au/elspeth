@@ -20,7 +20,11 @@ from elspeth.web.composer.continuation_codec import (
     encode_private_chunk,
 )
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
+from elspeth.web.composer.continuation_policy import (
+    ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
+    decode_continuation_policy,
+)
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRunning
@@ -140,7 +144,7 @@ def refuse_v3_tool_no_execution_on_connection(
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
     if (
-        type(policy) is not ContinuationAdmissionPolicyV3
+        (type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4)
         or parent.status != "running"
         or parent.continuation_policy_version != policy.schema_version
         or parent.continuation_policy_sha256 != policy.policy_hash
@@ -289,7 +293,7 @@ def read_v3_tool_no_execution_refusal_on_connection(
     terminal = load_snapshot(conn, session_id=sid, operation_id=operation_id)
     root = decode_continuation_snapshot(terminal.payload_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    if type(policy) is not ContinuationAdmissionPolicyV3:
+    if type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4:
         return None
     if (
         parent.continuation_policy_version != policy.schema_version

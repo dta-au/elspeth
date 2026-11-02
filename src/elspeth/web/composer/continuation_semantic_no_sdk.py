@@ -14,6 +14,8 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import is_lower_sha256_hex
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.coordination.quota_authority import ProviderAttempt
@@ -27,9 +29,11 @@ if TYPE_CHECKING:
         SemanticAdvisorInvocationObservation,
         SemanticAdvisorInvocationRaised,
         SemanticAdvisorInvocationReturned,
+        SemanticAdvisorInvocationV4Finalized,
         _SemanticAdvisorInvocationCapture,
     )
     from elspeth.web.composer.provider_quota import ProviderCallCustody
+    from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission
 
 
 class SemanticAdvisorNoSdkRefusalReason(Enum):
@@ -100,6 +104,7 @@ class SemanticAdvisorNoSdkIssuer:
         self._body_observation: SemanticAdvisorInvocationObservation | None = None
         self._result: SemanticAdvisorResult | None = None
         self._outcome: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised | None = None
+        self._v4_finalized: SemanticAdvisorInvocationV4Finalized | None = None
 
     @property
     def prepared_candidate(self) -> PreparedContinuationProvider | None:
@@ -208,6 +213,50 @@ class SemanticAdvisorNoSdkIssuer:
                 raise AuditIntegrityError("Semantic outcome lost its actual returned/raised sum")
             self._outcome = outcome
 
+    def seal_v4_finalization(self, capture: _SemanticAdvisorInvocationCapture, finalized: SemanticAdvisorInvocationV4Finalized) -> None:
+        from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationV4Finalized
+        from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
+        from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
+
+        with self._lock:
+            original = self._body_observation
+            if (
+                type(finalized) is not SemanticAdvisorInvocationV4Finalized
+                or capture is not self._capture
+                or original is None
+                or finalized.observation != original
+                or self._v4_finalized is not None
+                or self._state != "sdk_entered"
+                or self._prepared is None
+                or self._dispatched is None
+                or self._attempt_id is None
+                or self._captured_call is None
+                or original.audit_call is not self._captured_call
+                or original.original_failure is not None
+            ):
+                raise AuditIntegrityError("V4 semantic finalization changed its one original paid capture")
+            result = finalized.finalization.result
+            if type(result) is SemanticAdvisorProviderResult:
+                if (
+                    self._result is None
+                    or result.audit_call != self._captured_call
+                    or result.decision != original.decision
+                    or result.response != self._result.response
+                    or result.effect_key != self._prepared.binding.effect_key
+                ):
+                    raise AuditIntegrityError("V4 semantic complete finalization changed its original result")
+            elif type(result) is VerifiedSemanticPaidOverflowTerminal:
+                if (
+                    self._result is not None
+                    or result.provider_attempt_id != self._attempt_id
+                    or result.source.effect_key != self._prepared.binding.effect_key
+                    or result.terminal.cursor < self._dispatched.cursor + 2
+                ):
+                    raise AuditIntegrityError("V4 semantic terminal finalization changed its original effect")
+            else:
+                raise AuditIntegrityError("V4 semantic finalization lost its complete/terminal sum")
+            self._v4_finalized = finalized
+
     def note_prepared_candidate(self, prepared: PreparedContinuationProvider) -> None:
         with self._lock:
             if self._state != "open" or self._prepared_candidate is not None or type(prepared) is not PreparedContinuationProvider:
@@ -254,10 +303,22 @@ class SemanticAdvisorNoSdkIssuer:
 
         with self._lock:
             self.require_original_clock()
+            prepared = self._prepared
+            v4_prepared = (
+                prepared is not None
+                and self._dispatched is None
+                and type(
+                    decode_continuation_policy(
+                        decode_continuation_snapshot(prepared.snapshot.payload_json).admission_policy_json,
+                        decode_continuation_snapshot(prepared.snapshot.payload_json).policy_hash,
+                    )
+                )
+                is ContinuationAdmissionPolicyV4
+            )
             if (
                 self._state != "open"
-                or self._prepared is None
-                or self._dispatched is None
+                or prepared is None
+                or (self._dispatched is None and not v4_prepared)
                 or self._custody is not None
                 or type(custody) is not ProviderCallCustody
                 or custody.family is not ProviderInvocationFamily.ADVISOR
@@ -337,6 +398,86 @@ class SemanticAdvisorNoSdkIssuer:
                 or self._captured_call.call_id != self._attempt_id
             ):
                 raise AuditIntegrityError("Semantic paid retention requires its original effect, minted custody and complete outcome")
+
+    def require_original_v4_response_observation(
+        self,
+        prepared: PreparedContinuationProvider,
+        selected: StoredContinuationSnapshot,
+    ) -> SemanticAdvisorInvocationObservation:
+        """Return the original captured paid DATA before V4 SQL settlement.
+
+        V4 must classify the complete response before the legacy returned/raised
+        wrapper can be sealed. The caller must still rederive the immutable SQL
+        source and quota attempt in its original locked transaction.
+        """
+        with self._lock:
+            original = self._body_observation
+            if (
+                self._state != "sdk_entered"
+                or prepared is not self._prepared
+                or selected is not self._dispatched
+                or self._custody is None
+                or self._custody.continuation_semantic_v4 is not prepared
+                or self._custody.attempt is None
+                or self._custody.attempt.attempt_id != self._attempt_id
+                or original is None
+                or not original.sdk_entered
+                or not original.recorder_completed
+                or original.original_failure is not None
+                or original.audit_call is not self._captured_call
+                or self._captured_call is None
+                or original.attempt is None
+                or original.attempt.attempt_id != self._attempt_id
+                or self._captured_call.call_id != self._attempt_id
+            ):
+                raise AuditIntegrityError("V4 semantic response lost its one original successful paid capture")
+            return original
+
+    def require_original_v4_admission(self, prepared: PreparedContinuationProvider) -> V4SemanticProviderAdmission:
+        from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission
+
+        with self._lock:
+            custody = self._custody
+            admission = None if custody is None else custody.continuation_semantic_v4_admission
+            if (
+                self._prepared is not prepared
+                or custody is None
+                or custody.continuation_semantic_v4 is not prepared
+                or type(admission) is not V4SemanticProviderAdmission
+                or self._dispatched is not admission.selected
+                or self._attempt_id != admission.attempt.attempt_id
+                or custody.attempt is not admission.attempt
+            ):
+                raise AuditIntegrityError("V4 semantic issuer lost original prepared dispatch, H or physical attempt")
+            return admission
+
+    def original_v4_admission_or_none(self, prepared: PreparedContinuationProvider) -> V4SemanticProviderAdmission | None:
+        with self._lock:
+            custody = self._custody
+            if self._prepared is not prepared or custody is None or custody.continuation_semantic_v4 is not prepared:
+                raise AuditIntegrityError("V4 semantic no-SDK source changed its original prepared custody")
+            if custody.continuation_semantic_v4_admission is None:
+                if self._attempt_id is not None or self._dispatched is not None or custody.attempt is not None:
+                    raise AuditIntegrityError("V4 semantic no-SDK source lost a partially admitted physical attempt")
+                return None
+        return self.require_original_v4_admission(prepared)
+
+    def original_v4_dispatched_candidate(self, prepared: PreparedContinuationProvider) -> StoredContinuationSnapshot | None:
+        """Expose only the exact in-transaction candidate for cold admission reproof."""
+        with self._lock:
+            custody = self._custody
+            if self._prepared is not prepared or custody is None or custody.continuation_semantic_v4 is not prepared:
+                raise AuditIntegrityError("V4 semantic cold admission changed its original prepared custody")
+            return self._dispatched_candidate
+
+    def note_v4_sql_cancelled_attempt(self, admission: V4SemanticProviderAdmission) -> None:
+        from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission
+
+        if type(admission) is not V4SemanticProviderAdmission or self._prepared is None:
+            raise AuditIntegrityError("V4 semantic SQL cancellation requires its nominal original admission")
+        if self.require_original_v4_admission(self._prepared) is not admission or self._custody is None:
+            raise AuditIntegrityError("V4 semantic SQL cancellation changed its original physical attempt")
+        self.note_undispatched_cancel(self._custody, admission.attempt, model=admission.no_sdk_tail.requested_model)
 
     def reserve_refusal(
         self, *, reason: SemanticAdvisorNoSdkRefusalReason, original_failure: BaseException

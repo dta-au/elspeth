@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
@@ -57,6 +57,7 @@ from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow,
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.continuation_terminal_p4_data import TerminalP4Document, TerminalP4Input
     from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
     from elspeth.web.sessions.continuation_p4_application_store import (
@@ -72,12 +73,15 @@ from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
     ContinuationEvent,
     ContinuationOwnerCommit,
+    HistoricalEffectLocator,
+    PreparedContinuationAppend,
     StoredContinuationSnapshot,
     ValidatedHistoricalEffectReference,
     _OwedP4Scope,
     _require_current_continuation_running,
     append_complete_snapshot,
     load_snapshot,
+    prepare_snapshot_append,
     private_chunk_key,
     put_chunk,
     read_chunk,
@@ -103,7 +107,9 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.models import (
     composition_states_table as states,
 )
+from elspeth.web.sessions.protocol import ChatMessageRecord, CompositionStateRecord, serialize_composition_validation_errors
 from elspeth.web.sessions.state_decoder import state_record_from_row
+from elspeth.web.sessions.state_envelope import envelope_state_column
 from elspeth.web.sessions.time_normalization import restore_utc
 
 _RECEIPT = TypeAdapter(PersistedComposerTurnReceipt)
@@ -116,6 +122,58 @@ class ReadmittedP4Result:
     receipt: PersistedComposerTurnReceipt
     outcome: RetainedAuditOutcome
     historical_effect: ValidatedHistoricalEffectReference | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedP4ResultData:
+    """Prospective publication DATA, never an immutable SQL readback proof."""
+
+    receipt: PersistedComposerTurnReceipt
+    outcome: RetainedAuditOutcome
+    historical_effect: HistoricalEffectLocator
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedP4PreparationTail:
+    """Exact prospective P4 input prefix; no current committing capability."""
+
+    effect_key: str
+    input_sha256: str
+    append: PreparedContinuationAppend
+    chunks: tuple[PrivateChunk, ...]
+    original_values: tuple[object, ...] = field(repr=False)
+
+    def require_original(self) -> None:
+        if (
+            type(self) is not PreparedP4PreparationTail
+            or type(self.append) is not PreparedContinuationAppend
+            or type(self.chunks) is not tuple
+            or any(type(chunk) is not PrivateChunk for chunk in self.chunks)
+        ):
+            raise TypeError("P4 preparation requires its nominal complete tail DATA")
+        self.append.require_original()
+        if self.original_values != (self.effect_key, self.input_sha256, self.append, self.chunks):
+            raise AuditIntegrityError("prepared P4 prefix changed its original complete DATA")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedP4ResultTail:
+    result: PreparedP4ResultData
+    chunk: PrivateChunk
+    append: PreparedContinuationAppend
+    original_values: tuple[object, ...] = field(repr=False)
+
+    def require_original(self) -> None:
+        if (
+            type(self) is not PreparedP4ResultTail
+            or type(self.result) is not PreparedP4ResultData
+            or type(self.chunk) is not PrivateChunk
+            or type(self.append) is not PreparedContinuationAppend
+        ):
+            raise TypeError("P4 result requires its nominal complete tail DATA")
+        self.append.require_original()
+        if self.original_values != (self.result, self.chunk, self.append):
+            raise AuditIntegrityError("prepared P4 result changed its original complete DATA")
 
 
 @dataclass(slots=True)
@@ -477,7 +535,13 @@ def require_selected_p4_input(
 
 
 def _chat_row_hash(row: Any) -> str:
-    record = chat_message_record_from_row(row)
+    return planned_p4_chat_hash(chat_message_record_from_row(row))
+
+
+def planned_p4_chat_hash(record: ChatMessageRecord) -> str:
+    """Hash an exact planned or decoded row; equality grants no SQL authority."""
+    if type(record) is not ChatMessageRecord or record.operation_id is not None:
+        raise AuditIntegrityError("P4 message hash requires its exact non-ingress row DATA")
     payload = {
         "id": str(record.id),
         "session_id": str(record.session_id),
@@ -496,29 +560,90 @@ def _chat_row_hash(row: Any) -> str:
     return sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def planned_p4_state_hash(record: CompositionStateRecord, *, creator_operation_id: str) -> str:
+    """Encode the exact current writer columns for a planned tool checkpoint."""
+    if type(record) is not CompositionStateRecord or record.review_projection is not None:
+        raise AuditIntegrityError("P4 state hash requires its exact raw planned row DATA")
+    return _state_columns_hash(
+        state_id=str(record.id),
+        session_id=str(record.session_id),
+        version=record.version,
+        sources=envelope_state_column(record.sources),
+        nodes=envelope_state_column(record.nodes),
+        edges=envelope_state_column(record.edges),
+        outputs=envelope_state_column(record.outputs),
+        metadata=envelope_state_column(record.metadata_),
+        is_valid=record.is_valid,
+        validation_errors=serialize_composition_validation_errors(record.validation_errors),
+        composer_meta=envelope_state_column(record.composer_meta),
+        creator_operation_id=creator_operation_id,
+        created_at=record.created_at,
+        derived_from_state_id=None if record.derived_from_state_id is None else str(record.derived_from_state_id),
+        provenance="tool_call",
+    )
+
+
 def _state_row_hash(row: Any) -> str:
     # Include DB-only provenance and creator as well as every public record
     # field. Hashing never applies redaction or turns equal graphs into an
     # interchangeable historical revision.
     state_record_from_row(row)
+    return _state_columns_hash(
+        state_id=row.id,
+        session_id=row.session_id,
+        version=row.version,
+        sources=row.sources,
+        nodes=row.nodes,
+        edges=row.edges,
+        outputs=row.outputs,
+        metadata=row.metadata_,
+        is_valid=row.is_valid,
+        validation_errors=row.validation_errors,
+        composer_meta=row.composer_meta,
+        creator_operation_id=row.creator_operation_id,
+        created_at=row.created_at,
+        derived_from_state_id=row.derived_from_state_id,
+        provenance=row.provenance,
+    )
+
+
+def _state_columns_hash(
+    *,
+    state_id: str,
+    session_id: str,
+    version: int,
+    sources: object,
+    nodes: object,
+    edges: object,
+    outputs: object,
+    metadata: object,
+    is_valid: bool,
+    validation_errors: object,
+    composer_meta: object,
+    creator_operation_id: str | None,
+    created_at: datetime,
+    derived_from_state_id: str | None,
+    provenance: str,
+) -> str:
+    """Hash exact stored columns; callers retain their original envelope bytes."""
     return sha256(
         canonical_json(
             {
-                "id": row.id,
-                "session_id": row.session_id,
-                "version": row.version,
-                "sources": row.sources,
-                "nodes": row.nodes,
-                "edges": row.edges,
-                "outputs": row.outputs,
-                "metadata_": row.metadata_,
-                "is_valid": row.is_valid,
-                "validation_errors": row.validation_errors,
-                "composer_meta": row.composer_meta,
-                "creator_operation_id": row.creator_operation_id,
-                "created_at": restore_utc(row.created_at).isoformat(),
-                "derived_from_state_id": row.derived_from_state_id,
-                "provenance": row.provenance,
+                "id": state_id,
+                "session_id": session_id,
+                "version": version,
+                "sources": sources,
+                "nodes": nodes,
+                "edges": edges,
+                "outputs": outputs,
+                "metadata_": metadata,
+                "is_valid": is_valid,
+                "validation_errors": validation_errors,
+                "composer_meta": composer_meta,
+                "creator_operation_id": creator_operation_id,
+                "created_at": restore_utc(created_at).isoformat(),
+                "derived_from_state_id": derived_from_state_id,
+                "provenance": provenance,
             }
         ).encode("utf-8")
     ).hexdigest()
@@ -605,6 +730,143 @@ def decode_p4_receipt(
     return receipt, data
 
 
+def prepare_p4_receipt_data(
+    *,
+    effect_key: str,
+    input_sha256: str,
+    prepared: PreparedP4Value,
+    outcome: RetainedAuditOutcome,
+    chat_message_ids: tuple[UUID, ...],
+    chat_message_hashes: tuple[str, ...],
+    state_row_hashes: tuple[str, ...],
+    rejection_ids: tuple[str, ...] = (),
+    rejection_hashes: tuple[str, ...] = (),
+    env_ref_names: frozenset[str] = frozenset(),
+) -> PersistedComposerTurnReceipt:
+    """Prepare complete receipt bytes from closed DATA, never a commit witness."""
+    if type(outcome) is not RetainedAuditOutcome:
+        raise TypeError("P4 receipt preparation requires its nominal retained outcome DATA")
+    members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
+    audit_json = canonical_json(outcome.model_dump(mode="json", warnings="error"))
+    checked = decode_audit_outcome_data(audit_json, prepared=prepared, env_ref_names=env_ref_names)
+    checkpoint = checked.checkpoint
+    receipt = PersistedComposerTurnReceipt(
+        state_row_hashes=state_row_hashes,
+        schema_version="composer.persisted-turn.v2",
+        effect_key=effect_key,
+        input_sha256=input_sha256,
+        assistant_id=None if checked.assistant_id is None else UUID(checked.assistant_id),
+        current_state_id=None if checked.current_state_id is None else UUID(checked.current_state_id),
+        checkpoint_disposition=checked.checkpoint_disposition,
+        creator_operation_id=prepared.creator_operation_id,
+        inserted_state_ids=() if checkpoint is None else checkpoint.inserted_state_ids,
+        authored_state_hash=None
+        if checkpoint is None
+        else authored_state_hash(state_from_record(historical_checkpoint_record(checkpoint, env_ref_names=env_ref_names))),
+        chat_message_ids=chat_message_ids,
+        chat_message_hashes=chat_message_hashes,
+        rejection_ids=rejection_ids,
+        rejection_hashes=rejection_hashes,
+        prepared_p4_json=encode_prepared_p4(prepared, env_ref_names=env_ref_names),
+        audit_outcome_json=audit_json,
+        unwind_audit_failed=checked.unwind_audit_failed,
+        invocation_ids=() if checked.unwind_audit_failed else tuple(item.tool_call_id for item in members.invocations),
+        invocation_hashes=()
+        if checked.unwind_audit_failed
+        else tuple(
+            sha256(canonical_json(redacted_tool_invocation_content_and_envelope(item)[1]).encode("utf-8")).hexdigest()
+            for item in members.invocations
+        ),
+        withheld_hashes=()
+        if checked.unwind_audit_failed
+        else tuple(sha256(item.content.encode("utf-8")).hexdigest() for item in members.withheld_replies),
+    )
+    decode_p4_receipt(_dump_owned(_RECEIPT, receipt), env_ref_names=env_ref_names)
+    return receipt
+
+
+def prepare_p4_result_tail(
+    *,
+    selected: SelectedContinuationState,
+    receipt: PersistedComposerTurnReceipt,
+    published_at: datetime,
+    env_ref_names: frozenset[str],
+) -> PreparedP4ResultTail:
+    """Preview exact successful result bytes without claiming publication."""
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+
+    if type(selected) is not SelectedContinuationState or type(receipt) is not PersistedComposerTurnReceipt:
+        raise TypeError("P4 result preparation requires its complete prospective selection")
+    selected.__post_init__()
+    root = selected.stack
+    frame = root.frames[-1]
+    if (
+        type(frame) is not ToolBatchFrame
+        or frame.phase != "effect_reconciling"
+        or root.active_action_json is not None
+        or root.active_action_source is not None
+        or root.pending_owner_results
+        or receipt.effect_key != f"batch:{frame.response.digest}:p4"
+        or receipt.checkpoint_disposition != "committed"
+        or receipt.assistant_id is None
+        or receipt.authored_state_hash is None
+    ):
+        raise AuditIntegrityError("prepared P4 result requires its ordinary successful publication")
+    encoded = _dump_owned(_RECEIPT, receipt)
+    checked_receipt, outcome = decode_p4_receipt(encoded, env_ref_names=env_ref_names)
+    pending = tuple(chunk for chunk in selected.chunks if chunk.reference == frame.accumulator)
+    if len(pending) != 1:
+        raise AuditIntegrityError("prepared P4 result lost its exact pending batch")
+    data = decode_p4_pending_batch_chunk(pending[0], env_ref_names=env_ref_names)
+    frontier = tuple(item for item in root.effect_frontier if item.effect_id == receipt.effect_key)
+    if (
+        data.batch.p4_input_json != receipt.prepared_p4_json
+        or len(frontier) != 1
+        or frontier[0].disposition != "prepared"
+        or frontier[0].receipt_id is not None
+    ):
+        raise AuditIntegrityError("prepared P4 result changed its original complete input/effect")
+    chunk = encode_private_chunk(codec="composer.owner-result.v1", canonical=encoded, env_ref_names=env_ref_names)
+    locator = HistoricalEffectLocator(
+        receipt.effect_key,
+        receipt.input_sha256,
+        receipt.creator_operation_id,
+        str(receipt.assistant_id),
+        receipt.inserted_state_ids,
+        receipt.authored_state_hash,
+    )
+    result = PreparedP4ResultData(checked_receipt, outcome, locator)
+    following = root.model_copy(
+        update={
+            "pending_owner_results": (
+                RetainedOwnerResultRef(effect_key=receipt.effect_key, kind="persisted_turn", result=chunk.reference),
+            ),
+            "effect_frontier": (
+                *tuple(item for item in root.effect_frontier if item.effect_id != receipt.effect_key),
+                EffectFrontierEntry(effect_id=receipt.effect_key, disposition="committed", receipt_id=str(receipt.assistant_id)),
+            ),
+        }
+    )
+    events = (
+        ContinuationEvent(
+            "effect_committed",
+            canonical_json(
+                {
+                    "effect_key": receipt.effect_key,
+                    "kind": "persisted_turn",
+                    "receipt_id": str(receipt.assistant_id),
+                    "phase": "owner_result_retained",
+                }
+            ),
+        ),
+    )
+    predecessor = StoredContinuationSnapshot(encode_continuation_snapshot(root), root.cursor, selected.checkpoint_id)
+    append = prepare_snapshot_append(
+        predecessor, snapshot_json=encode_continuation_snapshot(following), events=events, published_at=published_at
+    )
+    return PreparedP4ResultTail(result, chunk, append, (result, chunk, append))
+
+
 def retain_p4_result_on_connection(
     conn: Connection,
     commit: ContinuationOwnerCommit,
@@ -614,6 +876,7 @@ def retain_p4_result_on_connection(
     base_sequence: int | None,
     created_at: datetime | None,
     env_ref_names: frozenset[str] = frozenset(),
+    prepared_tail: PreparedP4ResultTail | None = None,
 ) -> PersistedComposerTurnReceipt:
     stored = require_owner_commit(conn, commit, commit.running.session_operation_context)
     selected = _selected_prepared(conn, stored, running=commit.running, effect_key=commit.effect_key, env_ref_names=env_ref_names)
@@ -673,40 +936,29 @@ def retain_p4_result_on_connection(
     ]
     if any(row.creator_operation_id != prepared.creator_operation_id for row in state_rows):
         raise AuditIntegrityError("P4 receipt substituted a foreign state creator")
-    receipt = PersistedComposerTurnReceipt(
-        state_row_hashes=tuple(_state_row_hash(row) for row in state_rows),
-        schema_version="composer.persisted-turn.v2",
+    receipt = prepare_p4_receipt_data(
         effect_key=commit.effect_key,
         input_sha256=commit.input_sha256,
-        assistant_id=None if outcome.assistant_id is None else UUID(outcome.assistant_id),
-        current_state_id=None if outcome.current_state_id is None else UUID(outcome.current_state_id),
-        checkpoint_disposition=outcome.checkpoint_disposition,
-        creator_operation_id=prepared.creator_operation_id,
-        inserted_state_ids=() if checkpoint is None else checkpoint.inserted_state_ids,
-        authored_state_hash=None if checkpoint is None else authored_state_hash(state_from_record(checkpoint.state)),
+        prepared=prepared,
+        outcome=decode_audit_outcome_data(audit_json, prepared=prepared, env_ref_names=env_ref_names),
         chat_message_ids=tuple(UUID(row.id) for row in rows),
         chat_message_hashes=tuple(_chat_row_hash(row) for row in rows),
+        state_row_hashes=tuple(_state_row_hash(row) for row in state_rows),
         rejection_ids=tuple(row.id for row in refusal_rows),
         rejection_hashes=tuple(_rejection_row_hash(row) for row in refusal_rows),
-        prepared_p4_json=encode_prepared_p4(prepared, env_ref_names=env_ref_names),
-        audit_outcome_json=audit_json,
-        unwind_audit_failed=outcome.unwind_audit_failed,
-        invocation_ids=() if outcome.unwind_audit_failed else tuple(item.tool_call_id for item in members.invocations),
-        invocation_hashes=()
-        if outcome.unwind_audit_failed
-        else tuple(
-            sha256(canonical_json(redacted_tool_invocation_content_and_envelope(item)[1]).encode("utf-8")).hexdigest()
-            for item in members.invocations
-        ),
-        withheld_hashes=()
-        if outcome.unwind_audit_failed
-        else tuple(sha256(item.content.encode("utf-8")).hexdigest() for item in members.withheld_replies),
+        env_ref_names=env_ref_names,
     )
     encoded = _dump_owned(_RECEIPT, receipt)
     decode_p4_receipt(encoded, env_ref_names=env_ref_names)
     terminal = read_terminal_p4_source_on_connection(
         conn, session_id=commit.running.claim.session_id, operation_id=operation_id, env_ref_names=env_ref_names
     )
+    if prepared_tail is not None:
+        if type(prepared_tail) is not PreparedP4ResultTail:
+            raise TypeError("P4 result consumer requires its nominal prepared tail")
+        prepared_tail.require_original()
+        if terminal is not None or prepared_tail.result.receipt != receipt or prepared_tail.chunk.canonical != encoded:
+            raise AuditIntegrityError("P4 publication differs from its complete prepared result")
     terminal_result = None
     if terminal is not None:
         terminal_result = _terminal_result_document(terminal, receipt, env_ref_names=env_ref_names)
@@ -789,6 +1041,7 @@ def retain_p4_result_on_connection(
             ),
         ),
         handoff=False,
+        prepared_append=None if prepared_tail is None else prepared_tail.append,
     )
     return receipt
 
@@ -1018,6 +1271,112 @@ def selected_p4_drain_scope(
             raise AuditIntegrityError("P4 drain scope changed during its actual transaction")
 
 
+def prepare_p4_preparation_tail(
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    pending_batch: PrivateChunk,
+    captured: CapturedContinuationRuntime,
+    published_at: datetime,
+    env_ref_names: frozenset[str],
+) -> PreparedP4PreparationTail:
+    """Preview a P4 prefix; actual selection and authority are checked at write."""
+    from dataclasses import replace
+
+    from elspeth.web.composer.continuation import ComposeFrame
+    from elspeth.web.composer.continuation_batch_data import decode_coupled_batch_chunk, encode_coupled_batch_data
+    from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+
+    if type(selected) is not SelectedContinuationState or type(captured) is not CapturedContinuationRuntime:
+        raise TypeError("P4 preparation requires its exact prospective runtime DATA")
+    selected.__post_init__()
+    root = selected.stack
+    frame = root.frames[-1]
+    if (
+        root.logical.session_id != str(running.claim.session_id)
+        or root.logical.operation_id != running.claim.operation_id
+        or root.active_action_json is not None
+        or root.active_action_source is not None
+        or root.pending_owner_results
+        or len(root.frames) != 2
+        or type(root.frames[0]) is not ComposeFrame
+        or type(frame) is not ToolBatchFrame
+        or frame.phase != "tool_ready"
+    ):
+        raise AuditIntegrityError("prepared P4 prefix requires its original ordinary completed tool cut")
+    sources = {chunk.reference: chunk for chunk in selected.chunks}
+    if frame.accumulator not in sources or frame.response not in sources:
+        raise AuditIntegrityError("prepared P4 prefix lost its complete batch/PRIMARY sources")
+    old = decode_coupled_batch_chunk(sources[frame.accumulator], env_ref_names=env_ref_names)
+    pending = decode_p4_pending_batch_chunk(pending_batch, env_ref_names=env_ref_names)
+    if old.batch.phase != "dispatch_ready" or pending.batch.p4_input_json is None:
+        raise AuditIntegrityError("prepared P4 prefix cannot skip remaining tool work")
+    unchanged = replace(pending.batch, phase="dispatch_ready", p4_input_json=None)
+    if (
+        encode_coupled_batch_data(batch=unchanged, accumulator=pending.accumulator, calls=pending.calls, env_ref_names=env_ref_names)
+        != sources[frame.accumulator].canonical
+        or decode_continuation_response(sources[frame.response]).tool_batch.calls != pending.calls
+        or frame.next_tool_index != pending.batch.next_tool_index
+    ):
+        raise AuditIntegrityError("prepared P4 prefix changed its original completed call cohort")
+    prepared = decode_prepared_p4(pending.batch.p4_input_json, env_ref_names=env_ref_names)
+    if (
+        prepared.session_id != str(running.claim.session_id)
+        or prepared.creator_operation_id != running.session_operation_context.fence.operation_id
+        or prepared.creator_operation_epoch != running.session_operation_context.fence.operation_epoch
+        or prepared_p4_members(prepared, env_ref_names=env_ref_names).mutation_ceiling != root.mutation_ceiling.materialize()
+    ):
+        raise AuditIntegrityError("prepared P4 prefix changed its original creator/ceiling")
+    if (
+        captured.selected != selected
+        or len(captured.stack.frames) != 2
+        or type(captured.stack.frames[0]) is not ComposeFrame
+        or captured.stack.frames[-1] != frame
+        or captured.stack.model_copy(update={"frames": root.frames}) != root
+    ):
+        raise AuditIntegrityError("prepared P4 capture changed its prospective predecessor")
+    before, after = root.frames[0], captured.stack.frames[0]
+    if (
+        after.model_copy(
+            update={
+                "messages": before.messages,
+                "tools": before.tools,
+                "state": before.state,
+                "evidence": before.evidence,
+                "transcript": before.transcript,
+                "audit_buffer": before.audit_buffer,
+                "caches": before.caches,
+                "iteration": before.iteration,
+            }
+        )
+        != before
+    ):
+        raise AuditIntegrityError("prepared P4 capture changed original counters/state/disposition")
+    key = f"batch:{frame.response.digest}:p4"
+    if any(item.effect_id == key for item in root.effect_frontier):
+        raise AuditIntegrityError("prepared P4 prefix repeats an original effect")
+    input_hash = stable_hash(_read_json_value(p4_semantic_input(prepared, env_ref_names=env_ref_names)))
+    following = captured.stack.model_copy(
+        update={
+            "frames": (
+                *captured.stack.frames[:-1],
+                frame.model_copy(update={"phase": "effect_reconciling", "accumulator": pending_batch.reference}),
+            ),
+            "effect_frontier": (*root.effect_frontier, EffectFrontierEntry(effect_id=key, disposition="prepared", receipt_id=None)),
+        }
+    )
+    predecessor = StoredContinuationSnapshot(encode_continuation_snapshot(root), root.cursor, selected.checkpoint_id)
+    append = prepare_snapshot_append(
+        predecessor,
+        snapshot_json=encode_continuation_snapshot(following),
+        events=(ContinuationEvent("tool_prepared", canonical_json({"effect_key": key, "input_sha256": input_hash})),),
+        published_at=published_at,
+    )
+    chunks = (*captured.chunks, pending_batch)
+    return PreparedP4PreparationTail(key, input_hash, append, chunks, (key, input_hash, append, chunks))
+
+
 def prepare_p4_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
@@ -1027,6 +1386,7 @@ def prepare_p4_on_connection(
     pending_batch: PrivateChunk,
     env_ref_names: frozenset[str] = frozenset(),
     captured: CapturedContinuationRuntime | None = None,
+    prepared_tail: PreparedP4PreparationTail | None = None,
 ) -> ContinuationOwnerCommit:
     """Prepare only the exact selected completed batch's first P4 effect.
 
@@ -1104,6 +1464,19 @@ def prepare_p4_on_connection(
         raise AuditIntegrityError("P4 preparation requires its actual current creator")
     key = f"batch:{frame.response.digest}:p4"
     input_hash = stable_hash(_read_json_value(p4_semantic_input(prepared, env_ref_names=env_ref_names)))
+    if prepared_tail is not None:
+        if type(prepared_tail) is not PreparedP4PreparationTail:
+            raise TypeError("P4 preparation consumer requires its nominal prepared tail")
+        prepared_tail.require_original()
+        if (
+            captured is None
+            or prepared_tail.effect_key != key
+            or prepared_tail.input_sha256 != input_hash
+            or prepared_tail.chunks != (*captured.chunks, pending_batch)
+            or stack.active_action_json is not None
+            or stack.active_action_source is not None
+        ):
+            raise AuditIntegrityError("P4 writer changed its original prepared publication prefix")
     if (
         conn.execute(
             select(effects.c.effect_key).where(
@@ -1217,6 +1590,7 @@ def prepare_p4_on_connection(
         snapshot_json=snapshot,
         event_batch=(ContinuationEvent("tool_prepared", canonical_json({"effect_key": key, "input_sha256": input_hash})),),
         handoff=False,
+        prepared_append=None if prepared_tail is None else prepared_tail.append,
     )
     if captured is not None:
         from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection

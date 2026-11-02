@@ -18,7 +18,8 @@ from elspeth.web.composer.continuation_codec import (
     decode_continuation_snapshot,
     encode_continuation_snapshot,
 )
-from tests.helpers.continuation_policy import minimal_continuation_policy
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from tests.helpers.continuation_policy import continuation_test_settings, minimal_continuation_policy
 
 
 def initial_stack():
@@ -74,6 +75,26 @@ def test_unknown_dispatch_is_not_a_handoff_boundary():
     )
     assert not unknown.is_handoff_safe
     assert not stack.model_copy(update={"pending_settlement_ids": ("attempt:1",)}).is_handoff_safe
+
+
+def test_paid_overflow_frontier_is_v4_only_and_never_handoff_safe():
+    original = initial_stack()
+    overflow = EffectFrontierEntry(effect_id="provider:3:0", disposition="paid_overflow", receipt_id="paid-overflow:receipt")
+    with pytest.raises(AuditIntegrityError):
+        decode_continuation_snapshot(encode_continuation_snapshot(original.model_copy(update={"effect_frontier": (overflow,)})))
+
+    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=4096))
+    assert policy is not None
+    v4 = original.model_copy(
+        update={
+            "policy_hash": policy.policy_hash,
+            "admission_policy_json": policy.model_dump_json(),
+            "effect_frontier": (overflow,),
+        }
+    )
+    restored = decode_continuation_snapshot(encode_continuation_snapshot(v4))
+    assert restored.effect_frontier == (overflow,)
+    assert not restored.is_handoff_safe
 
 
 @pytest.mark.parametrize("field,value", [("schema_version", "future"), ("cursor", True), ("extra", "ignored")])

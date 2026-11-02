@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import typing
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -44,9 +45,11 @@ from elspeth.web.composer.continuation_policy import (
 )
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import (
+    COMPOSER_OPERATION_FAILURE_CODES,
     ComposerOperationCancelledDuringTurn,
     ComposerOperationClaim,
     ComposerOperationError,
+    ComposerOperationFailureCode,
     ComposerOperationFenceLost,
     ComposerOperationRunning,
     composer_operation_admission_request_hash,
@@ -54,6 +57,7 @@ from elspeth.web.sessions.composer_operations import (
 from elspeth.web.sessions.continuation_events import CONTINUATION_EVENT_TAGS, ContinuationEventTag
 from elspeth.web.sessions.continuation_retained_capacity import (
     ProspectiveContinuationChunk,
+    ProviderTerminalHoldSource,
     admit_retained_payload_chunks,
     load_continuation_read_contract,
     read_bounded_retained_chunk,
@@ -99,7 +103,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
     from elspeth.web.composer.continuation_handoff import ContinuationYieldReason
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
-    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority, _ComposerTerminalValues
 
 _OWED_P4_SCOPE_KEY = "elspeth.continuation.owed-p4"
 _OWED_P4_SEAL = object()
@@ -252,11 +256,11 @@ def initialize_continuation(
     policy = decode_continuation_policy(initial.admission_policy_json, initial.policy_hash)
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
     if contract.version != policy.schema_version or (
-        type(policy) is ContinuationAdmissionPolicyV3
+        (type(policy) is ContinuationAdmissionPolicyV3 or type(policy) is ContinuationAdmissionPolicyV4)
         and (contract.policy_hash != policy.policy_hash or contract.allowance != policy.max_retained_payload_bytes)
     ):
         raise AuditIntegrityError("initial root differs from its original persisted admission contract")
-    if type(policy) is ContinuationAdmissionPolicyV3 and (
+    if type(policy) in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4) and (
         initial.logical.session_id != session_id
         or initial.logical.operation_id != operation_id
         or initial.cursor != 0
@@ -269,8 +273,10 @@ def initialize_continuation(
     initial_chunk = ProspectiveContinuationChunk(snapshot_key, snapshot_json.encode("utf-8"), "snapshot.v2")
     if limit is not None:
         reserved = (
-            _v3_unpaid_terminal_reserve(conn, session_id=session_id, operation_id=operation_id, post_root_json=snapshot_json, post_cursor=0)
-            if type(policy) is ContinuationAdmissionPolicyV3
+            continuation_unpaid_terminal_reserve_on_connection(
+                conn, session_id=session_id, operation_id=operation_id, post_root_json=snapshot_json, post_cursor=0
+            )
+            if type(policy) in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
             else ()
         )
         admit_retained_payload_chunks(
@@ -331,9 +337,10 @@ def _retained_payload_limit(
     policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
     supplied: int | None,
 ) -> int | None:
-    if type(policy) is not ContinuationAdmissionPolicyV3:
+    if type(policy) is ContinuationAdmissionPolicyV3 or type(policy) is ContinuationAdmissionPolicyV4:
+        admitted = policy.max_retained_payload_bytes
+    else:
         return supplied
-    admitted = policy.max_retained_payload_bytes
     if supplied is not None and (type(supplied) is not int or supplied != admitted):
         raise AuditIntegrityError("V3 retained payload allowance differs from its immutable admission policy")
     return admitted
@@ -359,23 +366,59 @@ def put_chunk(
         .limit(1)
     ).one_or_none()
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
-    if existing is None and contract.version == "composer.continuation.policy.v3":
+    if existing is None and contract.version in ("composer.continuation.policy.v3", "composer.continuation.policy.v4"):
         raise AuditIntegrityError("V3 chunk write requires its admitted initial checkpoint")
     limit = retained_payload_limit_bytes
     selected: StoredContinuationSnapshot | None = None
     if existing is not None:
         selected = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
         root = decode_continuation_snapshot(selected.payload_json)
-        if root.policy_hash != contract.policy_hash and contract.version == "composer.continuation.policy.v3":
+        if root.policy_hash != contract.policy_hash and contract.version in (
+            "composer.continuation.policy.v3",
+            "composer.continuation.policy.v4",
+        ):
             raise AuditIntegrityError("V3 chunk writer lost its original policy hash")
         limit = _retained_payload_limit(decode_continuation_policy(root.admission_policy_json, root.policy_hash), limit)
     candidate = ProspectiveContinuationChunk(key, payload, codec)
+    from elspeth.web.sessions.continuation_prepared_tail import require_prepared_tail_chunk
+    from elspeth.web.sessions.continuation_primary_paid_overflow_capacity import primary_credit_for_chunk, record_primary_chunk
+    from elspeth.web.sessions.continuation_semantic_paid_overflow_capacity import record_semantic_chunk, semantic_credit_for_chunk
+    from elspeth.web.sessions.continuation_v4_checkpoint_paid_tail import (
+        checkpoint_paid_tail_credit_for_chunk,
+        record_checkpoint_paid_tail_chunk,
+    )
+    from elspeth.web.sessions.continuation_v4_paid_tail import paid_tail_credit_for_chunk, record_paid_tail_chunk
+    from elspeth.web.sessions.continuation_v4_title_complete_tail import complete_tail_credit_for_chunk, record_complete_tail_chunk
+
+    prepared_tail = require_prepared_tail_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    paid_credit = paid_tail_credit_for_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    complete_credit = complete_tail_credit_for_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    primary_credit = primary_credit_for_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    semantic_credit = semantic_credit_for_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    checkpoint_credit = checkpoint_paid_tail_credit_for_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    if sum(credit is not None for credit in (paid_credit, complete_credit, primary_credit, semantic_credit, checkpoint_credit)) > 1:
+        raise AuditIntegrityError("V4 chunk cannot consume two different terminal hold scopes")
+    scoped_credit = next(
+        (credit for credit in (paid_credit, complete_credit, primary_credit, semantic_credit, checkpoint_credit) if credit is not None),
+        None,
+    )
+    if scoped_credit is not None and (contract.version != "composer.continuation.policy.v4" or limit is None):
+        raise AuditIntegrityError("paid tail chunk credit requires its bounded original V4 policy")
     if limit is not None:
         reserved = (
-            _v3_unpaid_terminal_reserve(
+            continuation_unpaid_terminal_reserve_on_connection(
                 conn, session_id=session_id, operation_id=operation_id, post_root_json=selected.payload_json, post_cursor=selected.cursor
             )
-            if contract.version == "composer.continuation.policy.v3" and selected is not None
+            if selected is not None
+            and not prepared_tail
+            and (
+                contract.version == "composer.continuation.policy.v3"
+                or (
+                    contract.version == "composer.continuation.policy.v4"
+                    and scoped_credit is None
+                    and not _has_active_provider_hold(conn, session_id=session_id, operation_id=operation_id)
+                )
+            )
             else ()
         )
         admit_retained_payload_chunks(
@@ -384,14 +427,20 @@ def put_chunk(
             operation_id=operation_id,
             prospective=(candidate, *reserved),
             retained_payload_limit_bytes=limit,
+            consuming_hold=scoped_credit,
         )
     _insert_chunk_after_admission(conn, session_id=session_id, operation_id=operation_id, chunk=candidate)
+    record_paid_tail_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    record_complete_tail_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    record_primary_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    record_semantic_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
+    record_checkpoint_paid_tail_chunk(conn, session_id=session_id, operation_id=operation_id, candidate=candidate)
 
 
 def _insert_chunk_after_admission(conn: Connection, *, session_id: str, operation_id: str, chunk: ProspectiveContinuationChunk) -> None:
     digest = sha256(chunk.payload).hexdigest()
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
-    if contract.version == "composer.continuation.policy.v3":
+    if contract.version in ("composer.continuation.policy.v3", "composer.continuation.policy.v4"):
         if contract.allowance is None:
             raise AuditIntegrityError("V3 chunk write lost its original allowance")
         bounded_old = read_bounded_retained_chunk(
@@ -433,7 +482,7 @@ def _insert_chunk_after_admission(conn: Connection, *, session_id: str, operatio
 
 def read_chunk(conn: Connection, *, session_id: str, operation_id: str, key: str) -> bytes:
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
-    if contract.version == "composer.continuation.policy.v3":
+    if contract.version in ("composer.continuation.policy.v3", "composer.continuation.policy.v4"):
         if contract.allowance is None:
             raise AuditIntegrityError("V3 chunk read lost its original allowance")
         bounded = read_bounded_retained_chunk(conn, session_id=session_id, operation_id=operation_id, key=key, allowance=contract.allowance)
@@ -538,7 +587,7 @@ def load_snapshot(conn: Connection, *, session_id: str, operation_id: str) -> St
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
     policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
     if contract.version != policy.schema_version or (
-        type(policy) is ContinuationAdmissionPolicyV3
+        (type(policy) is ContinuationAdmissionPolicyV3 or type(policy) is ContinuationAdmissionPolicyV4)
         and (contract.policy_hash != policy.policy_hash or contract.allowance != policy.max_retained_payload_bytes)
     ):
         raise AuditIntegrityError("selected root differs from its original persisted admission contract")
@@ -575,6 +624,67 @@ class PreparedContinuationAppend:
             self.predecessor_json,
         ):
             raise AuditIntegrityError("prepared continuation append changed its original complete values")
+
+
+def prepare_snapshot_append(
+    predecessor: StoredContinuationSnapshot,
+    *,
+    snapshot_json: str,
+    events: tuple[ContinuationEvent, ...],
+    published_at: datetime,
+    handoff: bool = False,
+) -> PreparedContinuationAppend:
+    """Prepare exact append DATA; this grants no current-head or write authority.
+
+    A prospective chain can use an earlier prepared result as its predecessor.
+    The consuming transaction must prove the original SQL head and every link,
+    admit all retained prefixes, and pass these bytes to the ordinary writer.
+    """
+    from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
+
+    before = decode_continuation_snapshot(predecessor.payload_json)
+    after = decode_continuation_snapshot(snapshot_json)
+    cursor = predecessor.cursor + len(events)
+    if (
+        not events
+        or before.cursor != predecessor.cursor
+        or cursor > _CANONICAL_SAFE_INTEGER_MAX
+        or after.logical != before.logical
+        or after.mutation_ceiling != before.mutation_ceiling
+        or after.provider_cost_policy != before.provider_cost_policy
+        or after.policy_hash != before.policy_hash
+        or after.admission_policy_json != before.admission_policy_json
+        or after.cursor not in (predecessor.cursor, cursor)
+    ):
+        raise AuditIntegrityError("prepared append changed its original request, policy or cursor")
+    final_json = encode_continuation_snapshot(after.model_copy(update={"cursor": cursor}))
+    checkpoint_id = str(uuid4())
+    original = (
+        before.logical.session_id,
+        before.logical.operation_id,
+        predecessor.checkpoint_id,
+        predecessor.cursor,
+        final_json,
+        events,
+        checkpoint_id,
+        published_at,
+        handoff,
+        predecessor.payload_json,
+    )
+    return PreparedContinuationAppend(
+        session_id=before.logical.session_id,
+        operation_id=before.logical.operation_id,
+        expected_checkpoint_id=predecessor.checkpoint_id,
+        expected_cursor=predecessor.cursor,
+        snapshot_json=final_json,
+        events=events,
+        checkpoint_id=checkpoint_id,
+        published_at=published_at,
+        handoff=handoff,
+        predecessor_json=predecessor.payload_json,
+        original_values=original,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -763,7 +873,32 @@ def _v3_unbounded_tail_error(request_id: str | None) -> ComposerOperationError:
 def _v3_unpaid_terminal_reserve(
     conn: Connection, *, session_id: str, operation_id: str, post_root_json: str, post_cursor: int
 ) -> tuple[ProspectiveContinuationChunk, ...]:
-    """Exact encoded no-effect failed terminal from the proposed V3 root.
+    """Preserve the original V3 reserve bytes and public compatibility."""
+    root = decode_continuation_snapshot(post_root_json)
+    if type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is not ContinuationAdmissionPolicyV3:
+        return ()
+    return continuation_unpaid_terminal_reserve_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, post_root_json=post_root_json, post_cursor=post_cursor
+    )
+
+
+def _has_active_provider_hold(conn: Connection, *, session_id: str, operation_id: str) -> bool:
+    from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
+
+    return (
+        conn.execute(
+            select(holds.c.effect_key).where(
+                holds.c.session_id == session_id, holds.c.operation_id == operation_id, holds.c.state == "active"
+            )
+        ).first()
+        is not None
+    )
+
+
+def continuation_unpaid_terminal_reserve_on_connection(
+    conn: Connection, *, session_id: str, operation_id: str, post_root_json: str, post_cursor: int
+) -> tuple[ProspectiveContinuationChunk, ...]:
+    """Exact encoded unpaid failed-terminal capacity from the proposed root.
 
     The reservation is checked with the proposed write in one locked SQL
     transaction. No reserved row is inserted. A later segment claim must
@@ -771,7 +906,7 @@ def _v3_unpaid_terminal_reserve(
     """
     root = decode_continuation_snapshot(post_root_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    if type(policy) is not ContinuationAdmissionPolicyV3:
+    if type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4:
         return ()
     parent = conn.execute(select(jobs).where(jobs.c.session_id == session_id, jobs.c.operation_id == operation_id)).one()
     if (
@@ -792,6 +927,20 @@ def _v3_unpaid_terminal_reserve(
         )
     ).one_or_none()
     error = _v3_unbounded_tail_error(parent.request_id)
+    if type(policy) is ContinuationAdmissionPolicyV4:
+        # Only capacity DATA: select the largest actual closed failure-code
+        # encoding. This never writes a cancellation or grants settlement.
+        failure_code = typing.cast(
+            ComposerOperationFailureCode,
+            max(COMPOSER_OPERATION_FAILURE_CODES, key=lambda code: len(canonical_json(code).encode("utf-8"))),
+        )
+        error = ComposerOperationError(
+            http_status=409,
+            failure_code=failure_code,
+            error_type="retained_tail_unbounded",
+            body={"reason": "retained_tail_unbounded"},
+            diagnostic_id=str(uuid4()) if failure_code == "operation_failed" else None,
+        )
     terminal_events: tuple[ContinuationEvent, ...]
     if segment is None:
         if root.effect_frontier or root.pending_owner_results or root.pending_settlement_ids:
@@ -832,7 +981,11 @@ def _v3_unpaid_terminal_reserve(
 def require_v3_unpaid_terminal_reserve_on_connection(conn: Connection, *, session_id: str, operation_id: str) -> None:
     """Recheck the current root after a claim changes its terminal attribution."""
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
-    if contract.version != "composer.continuation.policy.v3":
+    if contract.version not in ("composer.continuation.policy.v3", "composer.continuation.policy.v4"):
+        return
+    if contract.version == "composer.continuation.policy.v4" and _has_active_provider_hold(
+        conn, session_id=session_id, operation_id=operation_id
+    ):
         return
     current = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
     if contract.allowance is None:
@@ -841,7 +994,7 @@ def require_v3_unpaid_terminal_reserve_on_connection(conn: Connection, *, sessio
         conn,
         session_id=session_id,
         operation_id=operation_id,
-        prospective=_v3_unpaid_terminal_reserve(
+        prospective=continuation_unpaid_terminal_reserve_on_connection(
             conn,
             session_id=session_id,
             operation_id=operation_id,
@@ -969,8 +1122,8 @@ def admit_prepared_no_dispatch_tail_on_connection(
         raise AuditIntegrityError("prepared no-dispatch tail changed its original chain")
     root = decode_continuation_snapshot(source.payload_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    if type(policy) is not ContinuationAdmissionPolicyV3:
-        raise AuditIntegrityError("prepared no-dispatch tail requires its original V3 policy")
+    if type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4:
+        raise AuditIntegrityError("prepared no-dispatch tail requires its original bounded policy")
 
     def chunks_for(append: PreparedContinuationAppend) -> tuple[ProspectiveContinuationChunk, ...]:
         return (
@@ -993,7 +1146,9 @@ def admit_prepared_no_dispatch_tail_on_connection(
             operation_id=operation,
             prospective=(
                 *prefix,
-                *_v3_unpaid_terminal_reserve(conn, session_id=sid, operation_id=operation, post_root_json=snapshot, post_cursor=cursor),
+                *continuation_unpaid_terminal_reserve_on_connection(
+                    conn, session_id=sid, operation_id=operation, post_root_json=snapshot, post_cursor=cursor
+                ),
             ),
             retained_payload_limit_bytes=policy.max_retained_payload_bytes,
         )
@@ -1018,6 +1173,7 @@ def append_complete_snapshot(
     handoff: bool,
     prepared_append: PreparedContinuationAppend | None = None,
     retained_payload_limit_bytes: int | None = None,
+    consuming_hold: ProviderTerminalHoldSource | None = None,
 ) -> StoredContinuationSnapshot:
     from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX
     from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
@@ -1033,6 +1189,10 @@ def append_complete_snapshot(
     previous_stack = decode_continuation_snapshot(current.payload_json)
     policy = decode_continuation_policy(previous_stack.admission_policy_json, previous_stack.policy_hash)
     limit = _retained_payload_limit(policy, retained_payload_limit_bytes)
+    if consuming_hold is not None and (
+        type(policy) is not ContinuationAdmissionPolicyV4 or type(consuming_hold) is not ProviderTerminalHoldSource or limit is None
+    ):
+        raise AuditIntegrityError("provider terminal hold consumption requires its exact V4 source and allowance")
     frame_stack = decode_continuation_snapshot(snapshot_json)
     if (
         frame_stack.logical != previous_stack.logical
@@ -1077,12 +1237,51 @@ def append_complete_snapshot(
         ),
         ProspectiveContinuationChunk(snapshot_key, snapshot_json.encode("utf-8"), "snapshot.v2"),
     )
+    from elspeth.web.sessions.continuation_prepared_tail import record_prepared_tail_append, require_prepared_tail_append
+    from elspeth.web.sessions.continuation_primary_paid_overflow_capacity import primary_credit_for_append, record_primary_append
+    from elspeth.web.sessions.continuation_semantic_paid_overflow_capacity import record_semantic_append, semantic_credit_for_append
+    from elspeth.web.sessions.continuation_v4_checkpoint_paid_tail import (
+        checkpoint_paid_tail_credit_for_append,
+        record_checkpoint_paid_tail_append,
+    )
+    from elspeth.web.sessions.continuation_v4_paid_tail import paid_tail_credit_for_append, record_paid_tail_append
+    from elspeth.web.sessions.continuation_v4_title_complete_tail import complete_tail_credit_for_append, record_complete_tail_append
+
+    prepared_tail = require_prepared_tail_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    paid_credit = paid_tail_credit_for_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    complete_credit = complete_tail_credit_for_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    primary_credit = primary_credit_for_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    semantic_credit = semantic_credit_for_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    checkpoint_credit = checkpoint_paid_tail_credit_for_append(
+        conn, session_id=session_id, operation_id=operation_id, append=prepared_append
+    )
+    if sum(credit is not None for credit in (paid_credit, complete_credit, primary_credit, semantic_credit, checkpoint_credit)) > 1:
+        raise AuditIntegrityError("V4 append cannot consume two different terminal hold scopes")
+    scoped_credit = next(
+        (credit for credit in (paid_credit, complete_credit, primary_credit, semantic_credit, checkpoint_credit) if credit is not None),
+        None,
+    )
+    if scoped_credit is not None:
+        if type(policy) is not ContinuationAdmissionPolicyV4 or limit is None:
+            raise AuditIntegrityError("paid tail append credit requires its bounded original V4 policy")
+        if consuming_hold is not None and consuming_hold != scoped_credit:
+            raise AuditIntegrityError("paid tail append changed its original hold credit")
+        consuming_hold = scoped_credit
     if limit is not None:
         reserved = (
-            _v3_unpaid_terminal_reserve(
+            continuation_unpaid_terminal_reserve_on_connection(
                 conn, session_id=session_id, operation_id=operation_id, post_root_json=snapshot_json, post_cursor=next_cursor
             )
-            if type(policy) is ContinuationAdmissionPolicyV3 and conn.info.get(_V3_TERMINAL_SCOPE_KEY) is not _V3_TERMINAL_SCOPE_SEAL
+            if (
+                type(policy) is ContinuationAdmissionPolicyV3
+                or (
+                    type(policy) is ContinuationAdmissionPolicyV4
+                    and scoped_credit is None
+                    and not _has_active_provider_hold(conn, session_id=session_id, operation_id=operation_id)
+                )
+            )
+            and conn.info.get(_V3_TERMINAL_SCOPE_KEY) is not _V3_TERMINAL_SCOPE_SEAL
+            and not prepared_tail
             else ()
         )
         admit_retained_payload_chunks(
@@ -1091,6 +1290,7 @@ def append_complete_snapshot(
             operation_id=operation_id,
             prospective=(*prospective, *reserved),
             retained_payload_limit_bytes=limit,
+            consuming_hold=consuming_hold,
         )
     cursor = expected_cursor
     for item in event_batch:
@@ -1142,6 +1342,12 @@ def append_complete_snapshot(
     )
     if changed.rowcount != 1:
         raise ContinuationCASConflict("continuation snapshot compare-and-swap failed")
+    record_prepared_tail_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    record_paid_tail_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    record_complete_tail_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    record_primary_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    record_semantic_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
+    record_checkpoint_paid_tail_append(conn, session_id=session_id, operation_id=operation_id, append=prepared_append)
     return StoredContinuationSnapshot(snapshot_json, cursor, checkpoint_id)
 
 
@@ -1753,6 +1959,38 @@ def settle_segment_on_connection(
         )
         if committed.rowcount != 1:
             raise AuditIntegrityError("END publication lost its single dispatched review effect row")
+    _finalize_terminal_rows_after_append(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        parent=parent,
+        segment=segment,
+        history=history,
+        retained=retained,
+        terminal_values=terminal_values,
+        attempt_outcome=attempt_outcome,
+        now=now,
+    )
+
+
+def _finalize_terminal_rows_after_append(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    parent: Row[Any],
+    segment: Row[Any],
+    history: Row[Any] | None,
+    retained: StoredContinuationSnapshot,
+    terminal_values: _ComposerTerminalValues,
+    attempt_outcome: Literal["settled", "interrupted"],
+    now: datetime,
+) -> None:
+    """Only row machinery after a separately proved terminal append.
+
+    This helper grants no settlement authority: callers must prove the live
+    owner, exact terminal journal and outcome before invoking it.
+    """
     if history is not None:
         revoked = conn.execute(
             update(attempts)

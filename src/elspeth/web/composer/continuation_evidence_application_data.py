@@ -54,7 +54,8 @@ from elspeth.web.composer.continuation_prepared_p4 import decode_prepared_p4, p4
 from elspeth.web.composer.continuation_tool_batch import _read_json_value
 from elspeth.web.composer.turn_effects import PersistedTurnEffects, TurnEvidence, authored_state_hash
 from elspeth.web.credential_guard import require_no_credential_material
-from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result, decode_p4_receipt
+from elspeth.web.sessions.continuation import HistoricalEffectLocator
+from elspeth.web.sessions.continuation_p4 import PreparedP4ResultData, ReadmittedP4Result, decode_p4_receipt
 
 Verification = Literal["verified", "not_applicable", "authored_state_mismatch", "checkpoint_decode_or_compare_failed"]
 
@@ -70,6 +71,21 @@ class PortableP4ApplicationBundle:
     audit_chunk: PrivateChunk
     state_chunk: PrivateChunk
     result: ReadmittedP4Result
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPortableP4ApplicationBundle:
+    """Prospective immutable bytes, never an application or SQL read witness."""
+
+    entry: PortableP4ApplicationEntry
+    evidence_after: AdmittedTurnEvidence
+    batch_after: RestoredBatchData
+    recorder_after: RecorderSnapshot
+    evidence_chunk: PrivateChunk
+    batch_chunk: PrivateChunk
+    audit_chunk: PrivateChunk
+    state_chunk: PrivateChunk
+    result: PreparedP4ResultData
 
 
 def retained_effects(value: PersistedTurnEffects) -> RetainedTurnEffects:
@@ -147,7 +163,7 @@ def _recorder_aliases(before: RecorderSnapshot, after: RecorderSnapshot) -> None
 
 
 def _project(
-    graph: ApplicationGraph, result: ReadmittedP4Result, *, env_ref_names: frozenset[str]
+    graph: ApplicationGraph, result: ReadmittedP4Result | PreparedP4ResultData, *, env_ref_names: frozenset[str]
 ) -> tuple[PersistedTurnEffects, RecorderSnapshot, Verification]:
     batch = graph.selected.batch
     if batch.p4_input_json is None:
@@ -200,6 +216,42 @@ def _checked_result(
         or type(result) is not ReadmittedP4Result
     ):
         raise TypeError("portable application requires the actual immutable receipt DATA")
+    _checked_result_values(result_chunk, result, producer, env_ref_names=env_ref_names)
+
+
+def _checked_prepared_result(
+    result_chunk: PrivateChunk, result: PreparedP4ResultData, producer: P4EffectProducerData, *, env_ref_names: frozenset[str]
+) -> None:
+    if (
+        type(result) is not PreparedP4ResultData
+        or type(result_chunk) is not PrivateChunk
+        or type(result.historical_effect) is not HistoricalEffectLocator
+        or result_chunk.reference.codec != "composer.owner-result.v1"
+    ):
+        raise TypeError("prepared application requires its separate prospective result DATA")
+    _checked_result_values(result_chunk, result, producer, env_ref_names=env_ref_names)
+    receipt, locator = result.receipt, result.historical_effect
+    if (
+        receipt.checkpoint_disposition != "committed"
+        or receipt.assistant_id is None
+        or receipt.authored_state_hash is None
+        or locator.effect_key != receipt.effect_key
+        or locator.input_sha256 != receipt.input_sha256
+        or locator.creator_operation_id != receipt.creator_operation_id
+        or locator.receipt_id != str(receipt.assistant_id)
+        or locator.inserted_state_ids != receipt.inserted_state_ids
+        or locator.authored_state_hash != receipt.authored_state_hash
+    ):
+        raise AuditIntegrityError("prepared application changed its prospective original result locator")
+
+
+def _checked_result_values(
+    result_chunk: PrivateChunk,
+    result: ReadmittedP4Result | PreparedP4ResultData,
+    producer: P4EffectProducerData,
+    *,
+    env_ref_names: frozenset[str],
+) -> None:
     if type(producer) is not P4EffectProducerData:
         raise TypeError("portable application requires complete historical producer DATA")
     producer.__post_init__()
@@ -228,7 +280,7 @@ def _require_input(
     response_chunk: PrivateChunk,
     pending_batch_chunk: PrivateChunk,
     graph: ApplicationGraph,
-    result: ReadmittedP4Result,
+    result: ReadmittedP4Result | PreparedP4ResultData,
     *,
     env_ref_names: frozenset[str],
 ) -> None:
@@ -336,6 +388,68 @@ def build_portable_p4_application(
     env_ref_names: frozenset[str],
 ) -> PortableP4ApplicationBundle:
     _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
+    bundle = _build_portable_p4_application(
+        logical=logical,
+        checkpoint_id=checkpoint_id,
+        cursor=cursor,
+        response_chunk=response_chunk,
+        pending_batch_chunk=pending_batch_chunk,
+        evidence_snapshot=evidence_snapshot,
+        result_chunk=result_chunk,
+        result=result,
+        producer=producer,
+        env_ref_names=env_ref_names,
+    )
+    if type(bundle) is not PortableP4ApplicationBundle:
+        raise AuditIntegrityError("actual P4 projection returned prospective DATA")
+    return bundle
+
+
+def prepare_portable_p4_application(
+    *,
+    logical: LogicalRequestBinding,
+    checkpoint_id: str,
+    cursor: int,
+    response_chunk: PrivateChunk,
+    pending_batch_chunk: PrivateChunk,
+    evidence_snapshot: AdmittedTurnEvidence,
+    result_chunk: PrivateChunk,
+    result: PreparedP4ResultData,
+    producer: P4EffectProducerData,
+    env_ref_names: frozenset[str],
+) -> PreparedPortableP4ApplicationBundle:
+    """Encode future application bytes without manufacturing SQL proof."""
+    _checked_prepared_result(result_chunk, result, producer, env_ref_names=env_ref_names)
+    bundle = _build_portable_p4_application(
+        logical=logical,
+        checkpoint_id=checkpoint_id,
+        cursor=cursor,
+        response_chunk=response_chunk,
+        pending_batch_chunk=pending_batch_chunk,
+        evidence_snapshot=evidence_snapshot,
+        result_chunk=result_chunk,
+        result=result,
+        producer=producer,
+        env_ref_names=env_ref_names,
+    )
+    if type(bundle) is not PreparedPortableP4ApplicationBundle:
+        raise AuditIntegrityError("prepared P4 projection returned an actual readback owner")
+    return bundle
+
+
+def _build_portable_p4_application(
+    *,
+    logical: LogicalRequestBinding,
+    checkpoint_id: str,
+    cursor: int,
+    response_chunk: PrivateChunk,
+    pending_batch_chunk: PrivateChunk,
+    evidence_snapshot: AdmittedTurnEvidence,
+    result_chunk: PrivateChunk,
+    result: ReadmittedP4Result | PreparedP4ResultData,
+    producer: P4EffectProducerData,
+    env_ref_names: frozenset[str],
+) -> PortableP4ApplicationBundle | PreparedPortableP4ApplicationBundle:
     admitted = require_admitted_turn_evidence(evidence_snapshot, env_ref_names=env_ref_names)
     snapshot = admitted.snapshot
     if snapshot.logical != logical:
@@ -415,7 +529,23 @@ def build_portable_p4_application(
         mandatory_retention=True,
         source_chunks=(audit, *admitted.sources.chunks, response_chunk, pending_batch_chunk, prepared_chunk, result_chunk),
     )
-    require_admitted_p4_application(after, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
+    _require_p4_application_source(after, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
+    if type(result) is PreparedP4ResultData:
+        return PreparedPortableP4ApplicationBundle(
+            entry,
+            after,
+            after_data,
+            recorder,
+            encode_turn_evidence(after, env_ref_names=env_ref_names),
+            encode_private_chunk(codec="composer.applied-p4-batch.v2", canonical=graph_json, env_ref_names=env_ref_names),
+            after.recorder_chunk,
+            encode_private_chunk(
+                codec="composer.state.v1", canonical=canonical_json(after_data.batch.state.to_dict()), env_ref_names=env_ref_names
+            ),
+            result,
+        )
+    if not isinstance(result, ReadmittedP4Result):
+        raise TypeError("P4 application projection lost its nominal result kind")
     return PortableP4ApplicationBundle(
         entry,
         after,
@@ -441,7 +571,7 @@ def require_portable_p4_application(
     source_chunks: tuple[PrivateChunk, ...],
     recorder_source: ApplicationRecorderSource,
 ) -> None:
-    if type(entry) is not PortableP4ApplicationEntry:
+    if type(entry) is not PortableP4ApplicationEntry or type(result) is not ReadmittedP4Result:
         raise TypeError("portable application requires its closed journal owner")
     _require_p4_application_source(
         entry,
@@ -462,7 +592,7 @@ def require_admitted_p4_application(
     producer: P4EffectProducerData,
     env_ref_names: frozenset[str],
 ) -> None:
-    if type(evidence) is not AdmittedTurnEvidence:
+    if type(evidence) is not AdmittedTurnEvidence or type(result) is not ReadmittedP4Result:
         raise TypeError("portable evidence requires its actual source-admitted owner")
     _require_p4_application_source(evidence, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
 
@@ -471,15 +601,20 @@ def _require_p4_application_source(
     source: PortableP4ApplicationEntry | AdmittedTurnEvidence,
     *,
     result_chunk: PrivateChunk,
-    result: ReadmittedP4Result,
+    result: ReadmittedP4Result | PreparedP4ResultData,
     producer: P4EffectProducerData,
     env_ref_names: frozenset[str],
     sources: P4ApplicationSources | None = None,
     recorder_source: ApplicationRecorderSource | None = None,
 ) -> None:
+    if type(result) is PreparedP4ResultData:
+        _checked_prepared_result(result_chunk, result, producer, env_ref_names=env_ref_names)
+    elif isinstance(result, ReadmittedP4Result):
+        _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
+    else:
+        raise TypeError("P4 application source lost its nominal result kind")
     if type(source) is PortableP4ApplicationEntry:
         entry = PortableP4ApplicationEntry.model_validate_json(canonical_json(source.model_dump(mode="json")))
-        _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
         if type(sources) is not P4ApplicationSources:
             raise AuditIntegrityError("journal admission lost its original dependency owners")
         if recorder_source is None:
@@ -487,7 +622,6 @@ def _require_p4_application_source(
         graph = admit_journal_values(entry, env_ref_names=env_ref_names, sources=sources, recorder_source=recorder_source)
     elif type(source) is AdmittedTurnEvidence:
         admitted = require_admitted_turn_evidence(source, env_ref_names=env_ref_names)
-        _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
         admitted_entry = admitted.snapshot.application_entry
         admitted_graph = admitted.graph
         if admitted_entry is None or admitted_graph is None:

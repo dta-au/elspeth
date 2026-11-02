@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -10,7 +11,7 @@ from sqlalchemy import Connection, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
-from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef, ToolBatchFrame
+from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, PrivateChunkRef, ToolBatchFrame
 from elspeth.web.composer.continuation_application_graph import (
     ApplicationGraph,
     admit_application_recorder_source,
@@ -28,7 +29,9 @@ from elspeth.web.composer.continuation_env_inventory import ContinuationEnvSelec
 from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, decode_turn_evidence, require_admitted_turn_evidence
 from elspeth.web.composer.continuation_evidence_application_data import (
     PortableP4ApplicationBundle,
+    PreparedPortableP4ApplicationBundle,
     build_portable_p4_application,
+    prepare_portable_p4_application,
     require_admitted_p4_application,
     require_selected_applied_batch_chunk,
     retained_effects,
@@ -44,17 +47,24 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationEvent,
     ContinuationOwnerCommit,
+    PreparedContinuationAppend,
     StoredContinuationSnapshot,
     _require_current_continuation_running,
     append_complete_snapshot,
     load_snapshot,
+    prepare_snapshot_append,
     private_chunk_key,
     put_chunk,
     read_chunk,
     read_private_chunk,
     require_snapshot_cas,
 )
-from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result, decode_p4_receipt, verify_p4_immutable_receipt_on_connection
+from elspeth.web.sessions.continuation_p4 import (
+    PreparedP4ResultData,
+    ReadmittedP4Result,
+    decode_p4_receipt,
+    verify_p4_immutable_receipt_on_connection,
+)
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
@@ -67,6 +77,29 @@ if TYPE_CHECKING:
 class StoredP4Application:
     snapshot: StoredContinuationSnapshot
     bundle: PortableP4ApplicationBundle
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedP4ApplicationTail:
+    """Complete prospective application bytes, never a committed application."""
+
+    bundle: PreparedPortableP4ApplicationBundle
+    append: PreparedContinuationAppend
+    chunks: tuple[PrivateChunk, ...]
+    original_values: tuple[object, ...] = field(repr=False)
+
+    def require_original(self) -> None:
+        if (
+            type(self) is not PreparedP4ApplicationTail
+            or type(self.bundle) is not PreparedPortableP4ApplicationBundle
+            or type(self.append) is not PreparedContinuationAppend
+            or type(self.chunks) is not tuple
+            or any(type(chunk) is not PrivateChunk for chunk in self.chunks)
+        ):
+            raise TypeError("P4 application requires its nominal complete tail DATA")
+        self.append.require_original()
+        if self.original_values != (self.bundle.entry, self.append, self.chunks):
+            raise AuditIntegrityError("prepared P4 application changed its original complete bytes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +127,11 @@ class CommittedContinuationP4:
 
 
 def apply_committing_p4_application_on_connection(
-    conn: Connection, commit: ContinuationOwnerCommit, *, env_ref_names: frozenset[str]
+    conn: Connection,
+    commit: ContinuationOwnerCommit,
+    *,
+    env_ref_names: frozenset[str],
+    prepared_tail: PreparedP4ApplicationTail | None = None,
 ) -> StoredP4Application | StoredTerminalP4Application:
     """Finish the real newly retained receipt inside its existing transaction."""
     from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection
@@ -105,6 +142,8 @@ def apply_committing_p4_application_on_connection(
         conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, env_ref_names=env_ref_names
     )
     if terminal is not None:
+        if prepared_tail is not None:
+            raise AuditIntegrityError("prepared ordinary P4 application became a terminal publication")
         if type(terminal) is not StoredTerminalP4Application:
             raise AuditIntegrityError("terminal P4 application has no actual retained result")
         return terminal
@@ -130,6 +169,7 @@ def apply_committing_p4_application_on_connection(
         inventory=inventory,
         expected_evidence_chunk=chunks[compose.evidence],
         expected_pending_batch_chunk=chunks[batch.accumulator],
+        prepared_tail=prepared_tail,
     )
 
 
@@ -389,6 +429,132 @@ def require_p4_application_journal_data_on_connection(
     return tuple(checked_results)
 
 
+def _application_values(
+    selected: SelectedContinuationState,
+    bundle: PortableP4ApplicationBundle | PreparedPortableP4ApplicationBundle,
+) -> tuple[ContinuationFrameStack, tuple[ContinuationEvent, ...], tuple[PrivateChunk, ...]]:
+    compose_index = _compose_frame_index(selected)
+    compose, batch = selected.stack.frames[compose_index], selected.stack.frames[-1]
+    if type(compose) is not ComposeFrame or type(batch) is not ToolBatchFrame or batch.phase != "effect_reconciling":
+        raise AuditIntegrityError("P4 application values lost their selected source")
+    effect_key = f"batch:{batch.response.digest}:p4"
+    if effect_key in batch.settled_effect_ids:
+        raise AuditIntegrityError("P4 application already belongs to its selected settled batch")
+    current_state_id = bundle.evidence_after.snapshot.effects.latest_committed_state_id
+    following = list(selected.stack.frames)
+    following[compose_index] = compose.model_copy(
+        update={
+            "evidence": bundle.evidence_chunk.reference,
+            "audit_buffer": bundle.audit_chunk.reference,
+            "state": bundle.state_chunk.reference,
+            "current_state_id": current_state_id,
+        }
+    )
+    following[-1] = batch.model_copy(
+        update={
+            "phase": "result_retained",
+            "accumulator": bundle.batch_chunk.reference,
+            "settled_effect_ids": (*batch.settled_effect_ids, effect_key),
+        }
+    )
+    root = selected.stack.model_copy(
+        update={
+            "frames": tuple(following),
+            "pending_owner_results": tuple(item for item in selected.stack.pending_owner_results if item.effect_key != effect_key),
+        }
+    )
+    events = (
+        ContinuationEvent(
+            "checkpoint",
+            canonical_json(
+                {
+                    "phase": "p4_application_committed",
+                    "effect_key": effect_key,
+                    "selected_checkpoint_id": selected.checkpoint_id,
+                    "selected_cursor": selected.stack.cursor,
+                    "evidence_digest": bundle.evidence_chunk.reference.digest,
+                    "batch_digest": bundle.batch_chunk.reference.digest,
+                }
+            ),
+        ),
+    )
+    chunks = (bundle.evidence_chunk, bundle.batch_chunk, bundle.audit_chunk, bundle.state_chunk, *bundle.evidence_after.sources.chunks)
+    return root, events, chunks
+
+
+def prepare_p4_application_tail(
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    evidence: AdmittedTurnEvidence,
+    pending_batch: PrivateChunk,
+    result: PreparedP4ResultData,
+    result_chunk: PrivateChunk,
+    published_at: datetime,
+    env_ref_names: frozenset[str],
+) -> PreparedP4ApplicationTail:
+    """Preview the exact application with prospective DATA, not SQL authority."""
+    if type(selected) is not SelectedContinuationState or type(result) is not PreparedP4ResultData:
+        raise TypeError("P4 application preparation requires its explicit prospective DATA")
+    selected.__post_init__()
+    root = selected.stack
+    compose_index = _compose_frame_index(selected)
+    compose, frame = root.frames[compose_index], root.frames[-1]
+    if (
+        root.logical.session_id != str(running.claim.session_id)
+        or root.logical.operation_id != running.claim.operation_id
+        or root.active_action_json is not None
+        or root.active_action_source is not None
+        or type(compose) is not ComposeFrame
+        or type(frame) is not ToolBatchFrame
+        or frame.phase != "effect_reconciling"
+        or frame.accumulator != pending_batch.reference
+        or len(root.pending_owner_results) != 1
+        or root.pending_owner_results[0].effect_key != result.receipt.effect_key
+        or root.pending_owner_results[0].kind != "persisted_turn"
+        or root.pending_owner_results[0].result != result_chunk.reference
+    ):
+        raise AuditIntegrityError("prepared application changed its original prospective pending cut")
+    chunks = {chunk.reference: chunk for chunk in selected.chunks}
+    if (
+        frame.response not in chunks
+        or chunks.get(frame.accumulator) != pending_batch
+        or chunks.get(result_chunk.reference) != result_chunk
+        or chunks.get(compose.evidence) is None
+        or evidence.snapshot.recorder != compose.audit_buffer
+    ):
+        raise AuditIntegrityError("prepared application lost its complete original private sources")
+    from elspeth.web.composer.continuation_evidence import encode_turn_evidence
+
+    if encode_turn_evidence(evidence, env_ref_names=env_ref_names) != chunks[compose.evidence]:
+        raise AuditIntegrityError("prepared application changed its original evidence bytes")
+    frontier = tuple(item for item in root.effect_frontier if item.effect_id == result.receipt.effect_key)
+    if len(frontier) != 1 or frontier[0].disposition != "committed" or frontier[0].receipt_id != str(result.receipt.assistant_id):
+        raise AuditIntegrityError("prepared application changed its original result frontier")
+    fence = running.session_operation_context.fence
+    producer = P4EffectProducerData(
+        running.claim.segment_sequence, running.claim.ownership_generation, fence.operation_id, fence.operation_epoch
+    )
+    bundle = prepare_portable_p4_application(
+        logical=root.logical,
+        checkpoint_id=selected.checkpoint_id,
+        cursor=root.cursor,
+        response_chunk=chunks[frame.response],
+        pending_batch_chunk=pending_batch,
+        evidence_snapshot=evidence,
+        result_chunk=result_chunk,
+        result=result,
+        producer=producer,
+        env_ref_names=env_ref_names,
+    )
+    following, events, retained = _application_values(selected, bundle)
+    predecessor = StoredContinuationSnapshot(encode_continuation_snapshot(root), root.cursor, selected.checkpoint_id)
+    append = prepare_snapshot_append(
+        predecessor, snapshot_json=encode_continuation_snapshot(following), events=events, published_at=published_at
+    )
+    return PreparedP4ApplicationTail(bundle, append, retained, (bundle.entry, append, retained))
+
+
 def apply_p4_application_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
@@ -397,6 +563,7 @@ def apply_p4_application_on_connection(
     inventory: CurrentContinuationEnvInventory,
     expected_evidence_chunk: PrivateChunk,
     expected_pending_batch_chunk: PrivateChunk,
+    prepared_tail: PreparedP4ApplicationTail | None = None,
 ) -> StoredP4Application:
     """Consume one checked result and append its complete successor atomically."""
     compose_index = _compose_frame_index(selected)
@@ -453,8 +620,13 @@ def apply_p4_application_on_connection(
         expected_cursor=selected.stack.cursor,
     )
     sid, operation_id = str(running.claim.session_id), running.claim.operation_id
-    retained = [bundle.evidence_chunk, bundle.batch_chunk, bundle.audit_chunk, bundle.state_chunk]
-    retained.extend(bundle.evidence_after.sources.chunks)
+    root, events, retained = _application_values(selected, bundle)
+    if prepared_tail is not None:
+        if type(prepared_tail) is not PreparedP4ApplicationTail:
+            raise TypeError("P4 application consumer requires its nominal prepared tail")
+        prepared_tail.require_original()
+        if prepared_tail.bundle.entry != bundle.entry or prepared_tail.chunks != retained:
+            raise AuditIntegrityError("actual P4 application differs from its complete prepared bytes")
     for chunk in retained:
         verify_private_chunk(chunk.reference, chunk.canonical)
         put_chunk(
@@ -465,28 +637,6 @@ def apply_p4_application_on_connection(
             payload=chunk.canonical.encode("utf-8"),
             codec=chunk.reference.codec,
         )
-    following = list(selected.stack.frames)
-    following[compose_index] = compose.model_copy(
-        update={
-            "evidence": bundle.evidence_chunk.reference,
-            "audit_buffer": bundle.audit_chunk.reference,
-            "state": bundle.state_chunk.reference,
-            "current_state_id": current_state_id,
-        }
-    )
-    following[-1] = batch.model_copy(
-        update={
-            "phase": "result_retained",
-            "accumulator": bundle.batch_chunk.reference,
-            "settled_effect_ids": (*batch.settled_effect_ids, effect_key),
-        }
-    )
-    root = selected.stack.model_copy(
-        update={
-            "frames": tuple(following),
-            "pending_owner_results": tuple(item for item in selected.stack.pending_owner_results if item.effect_key != effect_key),
-        }
-    )
     snapshot = append_complete_snapshot(
         conn,
         session_id=sid,
@@ -494,21 +644,8 @@ def apply_p4_application_on_connection(
         expected_checkpoint_id=selected.checkpoint_id,
         expected_cursor=selected.stack.cursor,
         snapshot_json=encode_continuation_snapshot(root),
-        event_batch=(
-            ContinuationEvent(
-                "checkpoint",
-                canonical_json(
-                    {
-                        "phase": "p4_application_committed",
-                        "effect_key": effect_key,
-                        "selected_checkpoint_id": selected.checkpoint_id,
-                        "selected_cursor": selected.stack.cursor,
-                        "evidence_digest": bundle.evidence_chunk.reference.digest,
-                        "batch_digest": bundle.batch_chunk.reference.digest,
-                    }
-                ),
-            ),
-        ),
+        event_batch=events,
         handoff=False,
+        prepared_append=None if prepared_tail is None else prepared_tail.append,
     )
     return StoredP4Application(snapshot, bundle)

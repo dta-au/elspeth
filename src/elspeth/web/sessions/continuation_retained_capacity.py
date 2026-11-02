@@ -506,6 +506,106 @@ def consume_provider_terminal_hold_after_complete_result(
         raise AuditIntegrityError("provider terminal hold consumption lost its active row")
 
 
+def consume_provider_terminal_hold_after_paid_overflow(
+    conn: Connection,
+    *,
+    source: ProviderTerminalHoldSource,
+    provider_attempt_id: str,
+    consumed_at: datetime,
+    names: frozenset[str],
+) -> None:
+    """Release only a fully cold-proved TITLE paid/incomplete terminal.
+
+    This is distinct from complete-result consumption. A generic failed parent
+    or a receipt without its exact journal, quota and physical attempt cannot
+    free the original predispatch reservation.
+    """
+    from uuid import UUID
+
+    from elspeth.web.sessions.continuation_title_paid_overflow_terminal import read_v4_title_paid_overflow_terminal_on_connection
+    from elspeth.web.sessions.continuation_v4_paid_tail import record_paid_tail_hold_consumed
+
+    if not conn.in_transaction():
+        raise AuditIntegrityError("paid overflow hold consumption requires the original SQL transaction")
+    if type(consumed_at) is not datetime or consumed_at.tzinfo is None or consumed_at.utcoffset() is None:
+        raise ValueError("paid overflow hold consumption requires an aware database time")
+    if type(names) is not frozenset or any(type(name) is not str for name in names):
+        raise TypeError("paid overflow hold consumption requires actual current guard names")
+    verified = read_v4_title_paid_overflow_terminal_on_connection(
+        conn, session_id=UUID(source.session_id), operation_id=source.operation_id, names=names
+    )
+    if (
+        verified is None
+        or verified.source != source
+        or verified.provider_attempt_id != provider_attempt_id
+        or verified.hold_state != "active"
+    ):
+        raise AuditIntegrityError("paid overflow hold cannot consume an unverified or foreign terminal")
+    changed = conn.execute(
+        update(holds)
+        .where(
+            holds.c.session_id == source.session_id,
+            holds.c.operation_id == source.operation_id,
+            holds.c.effect_key == source.effect_key,
+            holds.c.state == "active",
+            holds.c.provider_attempt_id == provider_attempt_id,
+        )
+        .values(state="consumed", consumed_at=consumed_at)
+    )
+    if changed.rowcount != 1:
+        raise AuditIntegrityError("paid overflow hold consumption lost its exact active row")
+    record_paid_tail_hold_consumed(conn, session_id=source.session_id, operation_id=source.operation_id, source=source)
+    post = read_v4_title_paid_overflow_terminal_on_connection(
+        conn, session_id=UUID(source.session_id), operation_id=source.operation_id, names=names
+    )
+    if post is None or post.hold_state != "consumed" or post.receipt != verified.receipt or post.terminal != verified.terminal:
+        raise AuditIntegrityError("paid overflow hold post-consumption cold proof changed")
+
+
+def consume_provider_terminal_hold_after_primary_paid_overflow(
+    conn: Connection, *, source: ProviderTerminalHoldSource, provider_attempt_id: str, consumed_at: datetime
+) -> None:
+    """Release only the original cold-proved PRIMARY paid/incomplete terminal."""
+    from uuid import UUID
+
+    from elspeth.web.sessions.continuation_primary_paid_overflow_capacity import record_primary_hold_consumed
+    from elspeth.web.sessions.continuation_primary_paid_overflow_terminal import read_v4_primary_paid_overflow_terminal_on_connection
+
+    if not conn.in_transaction():
+        raise AuditIntegrityError("PRIMARY paid overflow hold consumption requires its original transaction")
+    if type(consumed_at) is not datetime or consumed_at.tzinfo is None or consumed_at.utcoffset() is None:
+        raise ValueError("PRIMARY paid overflow hold consumption requires aware database time")
+    verified = read_v4_primary_paid_overflow_terminal_on_connection(
+        conn, session_id=UUID(source.session_id), operation_id=source.operation_id, effect_key=source.effect_key
+    )
+    if (
+        verified is None
+        or verified.source != source
+        or verified.provider_attempt_id != provider_attempt_id
+        or verified.hold_state != "active"
+    ):
+        raise AuditIntegrityError("PRIMARY paid overflow cannot consume an unverified or foreign terminal")
+    changed = conn.execute(
+        update(holds)
+        .where(
+            holds.c.session_id == source.session_id,
+            holds.c.operation_id == source.operation_id,
+            holds.c.effect_key == source.effect_key,
+            holds.c.state == "active",
+            holds.c.provider_attempt_id == provider_attempt_id,
+        )
+        .values(state="consumed", consumed_at=consumed_at)
+    )
+    if changed.rowcount != 1:
+        raise AuditIntegrityError("PRIMARY paid overflow hold lost its exact active row")
+    record_primary_hold_consumed(conn, session_id=source.session_id, operation_id=source.operation_id, source=source)
+    post = read_v4_primary_paid_overflow_terminal_on_connection(
+        conn, session_id=UUID(source.session_id), operation_id=source.operation_id, effect_key=source.effect_key
+    )
+    if post is None or post.hold_state != "consumed" or post.receipt != verified.receipt or post.terminal != verified.terminal:
+        raise AuditIntegrityError("PRIMARY paid overflow hold post-consumption proof changed")
+
+
 def admit_retained_payload_chunks(
     conn: Connection,
     *,

@@ -179,8 +179,8 @@ def test_effect_owner_check_drift_refuses_epoch_80_and_preserves_private_store(o
             schema_before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
             identities_before = conn.execute(select(schema_identity_table)).all()
             effects_before = conn.execute(select(effects).order_by(effects.c.effect_key)).all()
-            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == SESSION_SCHEMA_EPOCH == 83
-            assert identities_before[0].schema_epoch == 83
+            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == SESSION_SCHEMA_EPOCH == 84
+            assert identities_before[0].schema_epoch == 84
         with pytest.raises(SessionSchemaError) as raised:
             unexpectedly_admitted = create_session_engine(url)
             unexpectedly_admitted.dispose()
@@ -191,6 +191,6 @@ def test_effect_owner_check_drift_refuses_epoch_80_and_preserves_private_store(o
             assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
             assert conn.execute(select(schema_identity_table)).all() == identities_before
             assert conn.execute(select(effects).order_by(effects.c.effect_key)).all() == effects_before
-            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 83
+            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 84
     finally:
         stale.dispose()

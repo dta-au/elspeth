@@ -34,6 +34,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
 from elspeth.web.continuation_retention_memo import (
@@ -494,7 +495,11 @@ class ComposerAsyncOperationAuthority:
         *,
         owner_instance_id: str,
         claim_lease_seconds: int,
-        continuation_policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | None = None,
+        continuation_policy: ContinuationAdmissionPolicy
+        | ContinuationAdmissionPolicyV2
+        | ContinuationAdmissionPolicyV3
+        | ContinuationAdmissionPolicyV4
+        | None = None,
     ) -> None:
         """``continuation_policy`` is required to admit; read-only owners may omit it."""
         if engine.dialect.name not in ("sqlite", "postgresql") or not owner_instance_id.strip() or not 5 <= claim_lease_seconds <= 600:
@@ -503,6 +508,7 @@ class ComposerAsyncOperationAuthority:
             ContinuationAdmissionPolicy,
             ContinuationAdmissionPolicyV2,
             ContinuationAdmissionPolicyV3,
+            ContinuationAdmissionPolicyV4,
         ):
             raise TypeError("continuation policy must be its owned complete admission policy")
         self._engine = engine
@@ -653,11 +659,13 @@ class ComposerAsyncOperationAuthority:
                             request_hash=request_hash,
                             continuation_policy_version=retained_policy.schema_version,
                             continuation_policy_sha256=(
-                                retained_policy.policy_hash if type(retained_policy) is ContinuationAdmissionPolicyV3 else None
+                                retained_policy.policy_hash
+                                if isinstance(retained_policy, (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4))
+                                else None
                             ),
                             continuation_retained_payload_limit_bytes=(
                                 retained_policy.max_retained_payload_bytes
-                                if type(retained_policy) is ContinuationAdmissionPolicyV3
+                                if isinstance(retained_policy, (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4))
                                 else None
                             ),
                             actor_user_id=actor_user_id,

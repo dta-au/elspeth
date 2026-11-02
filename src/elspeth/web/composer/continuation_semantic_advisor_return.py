@@ -60,7 +60,9 @@ if TYPE_CHECKING:
         ClassifierPrimaryIssuer,
         ClassifierPrimaryResult,
         ClassifierReplyDeadline,
+        VerifiedClassifierPaidOverflowTerminal,
     )
+    from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
 
 
 @dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
@@ -413,9 +415,14 @@ async def observe_continuation_iteration_classification(
     selected: SelectedContinuationState,
     dispatch: _DispatchOutcome,
     persist: _PersistOutcome | ColdPostBatchPersistData,
-) -> ObservedClassification | ObservedClassifierReplyDeadline:
+) -> ObservedClassification | ObservedClassifierReplyDeadline | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
     """Observe the actual classifier; preserve its original thrown outcome."""
-    from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer, ClassifierReplyDeadline
+    from elspeth.web.sessions.continuation_classifier_primary import (
+        ClassifierPrimaryIssuer,
+        ClassifierReplyDeadline,
+        VerifiedClassifierPaidOverflowTerminal,
+    )
+    from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
 
     source = _live_source(phases, runtime, selected, dispatch, persist)
     service, live, bindings = phases.service, runtime.live, runtime.bindings
@@ -484,7 +491,17 @@ async def observe_continuation_iteration_classification(
         # No await, source refresh, runtime capture or finalizer follows the
         # reached boundary. The driver owns original deadline disposition.
         return observed_deadline
-    if type(outcome) not in (_ClassifyOutcome, ClassifyPostPrimary, ClassifySourceProofStop):
+    if isinstance(outcome, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
+        if type(outcome) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+            raise AuditIntegrityError("iteration classifier returned a non-nominal terminal")
+        if issuer.terminal is not outcome:
+            raise AuditIntegrityError("iteration classifier lost its original terminal source")
+        return outcome
+    if not isinstance(outcome, (_ClassifyOutcome, ClassifyPostPrimary, ClassifySourceProofStop)) or type(outcome) not in (
+        _ClassifyOutcome,
+        ClassifyPostPrimary,
+        ClassifySourceProofStop,
+    ):
         raise AuditIntegrityError("iteration classifier lost its original nominal outcome")
     return _register_classification(source, outcome, completion_capture, issuer=issuer)
 
@@ -728,6 +745,20 @@ async def observe_continuation_classifier_end(
     context = runtime.bindings.session_operation_context
     if context is None:
         raise AuditIntegrityError("classifier END lost its original current operation context")
+    checkpoint_phase_owner = None
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
+
+    if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
+        from elspeth.web.composer.continuation_checkpoint_phase import prepare_checkpoint_phase_owner
+        from elspeth.web.composer.service import _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE
+
+        checkpoint_phase_owner = await prepare_checkpoint_phase_owner(
+            phases,
+            runtime,
+            selected,
+            superseded_reply_index=None,
+            elide_advisor_exchange=_ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE,
+        )
     with composer_quota_scope(phases.service._require_sessions_service(), context), prompt_guard_user_scope(runtime.bindings.message):
         outcome = await phases.service.resume_continuation_classifier_end(
             pending=pending,
@@ -737,6 +768,7 @@ async def observe_continuation_classifier_end(
             primary_response=primary_response,
             completion_capture=capture,
             deadline=_original_action_deadline(phases, runtime, clock),
+            checkpoint_phase_owner=checkpoint_phase_owner,
         )
     if type(outcome) is not _ClassifyOutcome:
         raise AuditIntegrityError("classifier END lost its actual nominal outcome")
@@ -784,6 +816,7 @@ async def observe_continuation_classifier_reply_refusal(
             primary_response=None,
             completion_capture=capture,
             deadline=deadline,
+            checkpoint_phase_owner=None,
         )
     if (
         type(outcome) is not _ClassifyOutcome

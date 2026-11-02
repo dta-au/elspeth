@@ -1,0 +1,40 @@
+"""Real historical V3 metadata admission and cold custody on PostgreSQL."""
+
+from __future__ import annotations
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import (
+    operation_postgres_target as operation_postgres_target,
+)
+from tests.testcontainer.web.test_composer_operations_postgres import (
+    operation_store as operation_store,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_actual_driver_can_handover_after_metadata_commit_without_new_provider as test_actual_driver_can_handover_after_metadata_commit_without_new_provider,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_historical_v3_metadata_publishes_all_prefixes_and_cold_restore_never_reexecutes as test_historical_v3_metadata_publishes_all_prefixes_and_cold_restore_never_reexecutes,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_metadata_full_tail_capacity_counts_off_head_history_before_any_issue as test_metadata_full_tail_capacity_counts_off_head_history_before_any_issue,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_metadata_locked_admission_preserves_existing_review_rows as test_metadata_locked_admission_preserves_existing_review_rows,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_metadata_preparation_bound_refusal_does_not_leave_a_required_sql_failure as test_metadata_preparation_bound_refusal_does_not_leave_a_required_sql_failure,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_metadata_publication_failure_rolls_back_original_tool_and_all_prefixes as test_metadata_publication_failure_rolls_back_original_tool_and_all_prefixes,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_metadata_records_committed_snapshot_before_cancelled_delivery as test_metadata_records_committed_snapshot_before_cancelled_delivery,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_normal_v2_metadata_uses_existing_tool_dispatch as test_normal_v2_metadata_uses_existing_tool_dispatch,
+)
+from tests.unit.web.sessions.test_continuation_v3_metadata_live import (
+    test_unsupported_original_v3_read_tool_refuses_without_metadata_preparation as test_unsupported_original_v3_read_tool_refuses_without_metadata_preparation,
+)
+
+pytestmark = pytest.mark.testcontainer

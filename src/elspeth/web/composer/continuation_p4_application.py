@@ -38,7 +38,7 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
-from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result
+from elspeth.web.sessions.continuation_p4 import PreparedP4ResultData, ReadmittedP4Result
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.schemas import SendMessageRequest
 
@@ -134,7 +134,7 @@ def _join_graph(selected: SelectedContinuationState, data: RestoredBatchData, *,
 
 
 def _project_recorder(
-    before: RecorderSnapshot, prepared: PreparedP4Value, result: ReadmittedP4Result, *, env_ref_names: frozenset[str]
+    before: RecorderSnapshot, prepared: PreparedP4Value, result: ReadmittedP4Result | PreparedP4ResultData, *, env_ref_names: frozenset[str]
 ) -> RecorderSnapshot:
     before.validate_links_and_cursors()
     members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
@@ -173,7 +173,7 @@ def _project_recorder(
 
 def _project_effects(
     before: PersistedTurnEffects,
-    result: ReadmittedP4Result,
+    result: ReadmittedP4Result | PreparedP4ResultData,
     data: RestoredBatchData,
     *,
     env_ref_names: frozenset[str],

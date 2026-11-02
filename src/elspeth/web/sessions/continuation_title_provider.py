@@ -8,6 +8,7 @@ No title mutation, ready transition or SDK retry is provided by this owner.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
@@ -30,7 +31,11 @@ from elspeth.web.composer.continuation_codec import (
     verify_private_chunk,
 )
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
+from elspeth.web.composer.continuation_policy import (
+    ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
+    decode_continuation_policy,
+)
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash, continuation_provider_input_json
 from elspeth.web.composer.continuation_title_values import (
     CapturedTitleProviderResult,
@@ -48,11 +53,13 @@ from elspeth.web.sessions.composer_operations import ComposerOperationClaim, Com
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
     ContinuationEvent,
+    PreparedContinuationAppend,
     StoredContinuationSnapshot,
     _effect_snapshot,
     _require_current_continuation_running,
     append_complete_snapshot,
     load_snapshot,
+    prepare_snapshot_append,
     private_chunk_key,
     put_chunk,
     read_chunk,
@@ -61,6 +68,18 @@ from elspeth.web.sessions.continuation_bootstrap_source import (
     _pretitle_checkpoint_at_cursor,
     read_pretitle_bootstrap_on_connection,
     require_current_prepared_title_values_on_connection,
+)
+from elspeth.web.sessions.continuation_paid_overflow import CANONICAL_INTEGER_MAX, PaidOverflowIdentity
+from elspeth.web.sessions.continuation_paid_overflow_quota import preflight_v4_requested_model
+from elspeth.web.sessions.continuation_retained_capacity import (
+    ProspectiveContinuationChunk,
+    ProviderTerminalHoldSource,
+    bind_provider_terminal_hold_attempt,
+    reserve_provider_terminal_hold,
+)
+from elspeth.web.sessions.continuation_title_paid_overflow_tail import (
+    TitlePaidOverflowTailPlan,
+    prepare_title_paid_overflow_tail_plan,
 )
 from elspeth.web.sessions.models import (
     chat_messages_table as messages,
@@ -144,6 +163,14 @@ class PreparedTitleProvider:
 class TitleProviderAdmission:
     attempt: ProviderAttempt
     selected: StoredContinuationSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class V4TitleProviderAdmission:
+    attempt: ProviderAttempt
+    selected: StoredContinuationSnapshot
+    hold: ProviderTerminalHoldSource
+    tail: TitlePaidOverflowTailPlan
 
 
 class TitleNoSdkRefusal(ContinuationValue):
@@ -326,6 +353,7 @@ def _append(
     following: str,
     descriptor: PrivateChunkRef,
     stage: Literal["prepared", "admitted", "received", "settled"],
+    prepared_append: PreparedContinuationAppend | None = None,
 ) -> StoredContinuationSnapshot:
     sequence, generation = require_title_creator(running)
     return append_complete_snapshot(
@@ -351,6 +379,7 @@ def _append(
             ),
         ),
         handoff=False,
+        prepared_append=prepared_append,
     )
 
 
@@ -531,6 +560,7 @@ def title_source_chain_data_on_connection(
     generation: int | None,
     selected: StoredContinuationSnapshot,
     names: frozenset[str],
+    terminal_failed_request: bool = False,
 ) -> tuple[TitleInputDescriptor, PrivateChunkRef, str, StoredContinuationSnapshot]:
     """Immutable TITLE source lineage after the caller proves SQL admission."""
     from elspeth.web.sessions.continuation_bootstrap_source import (
@@ -690,11 +720,23 @@ def title_source_chain_data_on_connection(
             snapshot = decode_continuation_bootstrap(bootstrap)
             parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
             principal = conn.execute(select(sessions.c.user_id, sessions.c.archived_at).where(sessions.c.id == sid)).one()
+            if terminal_failed_request:
+                original_request_json = bootstrap_values(snapshot).request.model_dump_json()
+                request_matches = (
+                    parent.status == "failed"
+                    and parent.phase == "settled"
+                    and parent.settled_by == "owner_terminal"
+                    and parent.request_json is None
+                    and effect.disposition == "paid_overflow"
+                    and before_frame.request_json == original_request_json
+                )
+            else:
+                request_matches = before_frame.request_json == parent.request_json
             if (
                 snapshot.logical != before.logical
                 or snapshot.actor_user_id != parent.actor_user_id
                 or principal.user_id != parent.actor_user_id
-                or before_frame.request_json != parent.request_json
+                or not request_matches
                 or not snapshot.auto_title_eligible
             ):
                 raise AuditIntegrityError("TITLE source changed its original logical request/actor/eligibility")
@@ -1278,9 +1320,9 @@ def read_v3_title_no_sdk_refusal_on_connection(
     return data
 
 
-def admit_title_provider_on_connection(
+def _require_title_admission_source(
     conn: Connection, service: SessionServiceImpl, prepared: PreparedTitleProvider, *, model: str
-) -> TitleProviderAdmission:
+) -> tuple[PrivateChunkRef, Row[Any]]:
     if type(prepared) is not PreparedTitleProvider or prepared.composer._require_sessions_service() is not service:
         raise AuditIntegrityError("TITLE physical admission changed its actual prepared owner")
     running, selected = prepared.running, prepared.selected
@@ -1313,6 +1355,18 @@ def admit_title_provider_on_connection(
         or effect.response_finished_at is not None
     ):
         raise AuditIntegrityError("TITLE refuses foreign or already dispatched provider preparation")
+    return ref, effect
+
+
+def admit_title_provider_on_connection(
+    conn: Connection, service: SessionServiceImpl, prepared: PreparedTitleProvider, *, model: str
+) -> TitleProviderAdmission:
+    ref, _effect = _require_title_admission_source(conn, service, prepared, model=model)
+    running, selected = prepared.running, prepared.selected
+    root = decode_continuation_snapshot(selected.payload_json)
+    if type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is ContinuationAdmissionPolicyV4:
+        raise AuditIntegrityError("V4 TITLE requires the guarded terminal-tail admission owner")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
     _timing(conn, running, selected)
     attempt = begin_provider_attempt_on_connection(
         conn,
@@ -1350,6 +1404,139 @@ def admit_title_provider_on_connection(
     return TitleProviderAdmission(attempt, _append(conn, running, selected, encoded, ref, "admitted"))
 
 
+def admit_v4_title_provider_on_connection(
+    conn: Connection, service: SessionServiceImpl, prepared: PreparedTitleProvider, *, model: str
+) -> V4TitleProviderAdmission:
+    """Reserve one complete terminal tail in the original TITLE dispatch cut.
+
+    This remains dormant until the matching complete/overflow settlement and
+    cold reader are installed. A refused reservation rolls back the newly
+    minted physical attempt with this caller's original locked transaction.
+    """
+    ref, effect = _require_title_admission_source(conn, service, prepared, model=model)
+    running, selected = prepared.running, prepared.selected
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    root = decode_continuation_snapshot(selected.payload_json)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if type(policy) is not ContinuationAdmissionPolicyV4:
+        raise AuditIntegrityError("guarded TITLE hold requires the original V4 admission policy")
+    if policy.max_retained_payload_bytes >= CANONICAL_INTEGER_MAX:
+        raise AuditIntegrityError("V4 TITLE aggregate terminal receipt requires a bounded original allowance")
+    requested_model = preflight_v4_requested_model(model)
+    _timing(conn, running, selected)
+    attempt = begin_provider_attempt_on_connection(
+        conn,
+        session_operation_context=running.session_operation_context,
+        source="auto_title",
+        policy=service._chargeable_admission_policy,
+        run_id=None,
+    )
+    frame = _frame(selected)
+    following = root.model_copy(update={"frames": (frame.model_copy(update={"title_attempt_id": attempt.attempt_id}),)})
+    dispatched_json = _effect_snapshot(
+        encode_continuation_snapshot(following),
+        effect_key="provider:3:0",
+        disposition="dispatched",
+        receipt_id=None,
+        add_attempt_id=attempt.attempt_id,
+    )
+    transition = ContinuationEvent(
+        "checkpoint",
+        _event(
+            TitleTransition(
+                stage="admitted",
+                predecessor_checkpoint_id=selected.checkpoint_id,
+                predecessor_cursor=selected.cursor,
+                input=ref,
+                creator_sequence=running.claim.segment_sequence,
+                creator_generation=running.claim.ownership_generation,
+            )
+        ),
+    )
+    published_at = database_now(conn)
+    append = prepare_snapshot_append(selected, snapshot_json=dispatched_json, events=(transition,), published_at=published_at)
+    admitted = StoredContinuationSnapshot(append.snapshot_json, selected.cursor + 1, append.checkpoint_id)
+    context = running.session_operation_context
+    fence = context.fence
+    identity = PaidOverflowIdentity(
+        session_id=sid,
+        operation_id=operation,
+        effect_key=effect.effect_key,
+        attempt_id=attempt.attempt_id,
+        session_operation_id=fence.operation_id,
+        session_operation_epoch=fence.operation_epoch,
+        ownership_generation=running.claim.ownership_generation,
+        lease_sha256=sha256(fence.lease_token.encode("utf-8")).hexdigest(),
+        policy_sha256=policy.policy_hash,
+        source_checkpoint_id=selected.checkpoint_id,
+        source_cursor=selected.cursor,
+        source_snapshot_sha256=sha256(selected.payload_json.encode("utf-8")).hexdigest(),
+    )
+    tail = prepare_title_paid_overflow_tail_plan(identity=identity, admitted=admitted, creator_sequence=running.claim.segment_sequence)
+    hold = ProviderTerminalHoldSource(
+        session_id=sid,
+        operation_id=operation,
+        effect_key=effect.effect_key,
+        policy_sha256=policy.policy_hash,
+        allowance_bytes=policy.max_retained_payload_bytes,
+        source_checkpoint_id=selected.checkpoint_id,
+        source_cursor=selected.cursor,
+        source_snapshot_sha256=identity.source_snapshot_sha256,
+        source_input_sha256=effect.input_sha256,
+        creator_sequence=running.claim.segment_sequence,
+        creator_generation=running.claim.ownership_generation,
+        claim_attempt=running.claim.attempt,
+        session_operation_id=fence.operation_id,
+        session_operation_epoch=fence.operation_epoch,
+        lease_sha256=identity.lease_sha256,
+        reserved_bytes=tail.reserved_bytes,
+        fallback_contract_sha256=tail.fallback_contract_sha256,
+    )
+    reserve_provider_terminal_hold(
+        conn,
+        source=hold,
+        prospective=(
+            ProspectiveContinuationChunk(f"event:{admitted.cursor}", transition.payload_json.encode("utf-8"), "event.v2"),
+            ProspectiveContinuationChunk(f"snapshot:{admitted.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
+        ),
+        created_at=published_at,
+    )
+    changed = conn.execute(
+        update(effects)
+        .where(
+            effects.c.session_id == sid,
+            effects.c.operation_id == operation,
+            effects.c.effect_key == "provider:3:0",
+            effects.c.disposition == "prepared",
+            effects.c.provider_attempt_id.is_(None),
+        )
+        .values(
+            disposition="dispatched",
+            provider_attempt_id=attempt.attempt_id,
+            physical_sequence=running.claim.segment_sequence,
+            physical_generation=running.claim.ownership_generation,
+            requested_model=requested_model.value,
+        )
+    )
+    if changed.rowcount != 1:
+        raise AuditIntegrityError("V4 TITLE dispatch lost its original prepared provider effect")
+    bind_provider_terminal_hold_attempt(conn, source=hold, provider_attempt_id=attempt.attempt_id)
+    stored = append_complete_snapshot(
+        conn,
+        session_id=sid,
+        operation_id=operation,
+        expected_checkpoint_id=selected.checkpoint_id,
+        expected_cursor=selected.cursor,
+        snapshot_json=append.snapshot_json,
+        event_batch=append.events,
+        handoff=False,
+        prepared_append=append,
+    )
+    if stored != admitted:
+        raise AuditIntegrityError("V4 TITLE dispatch changed its reserved complete snapshot")
+    return V4TitleProviderAdmission(attempt, stored, hold, tail)
+
+
 def retain_title_response_on_connection(
     conn: Connection,
     prepared: PreparedTitleProvider,
@@ -1357,6 +1544,7 @@ def retain_title_response_on_connection(
     selected: StoredContinuationSnapshot,
     captured: CapturedTitleProviderResult,
     names: frozenset[str],
+    prepared_append: PreparedContinuationAppend | None = None,
 ) -> TitleAuditSettlementRequest:
     running = prepared.running
     _current(conn, running, selected, owed=True)
@@ -1417,7 +1605,10 @@ def retain_title_response_on_connection(
     encoded = _effect_snapshot(
         encode_continuation_snapshot(following), effect_key=effect.effect_key, disposition="committed", receipt_id=receipt
     )
-    following_selected = _append(conn, running, selected, encoded, ref, "received")
+    if prepared_append is None:
+        following_selected = _append(conn, running, selected, encoded, ref, "received")
+    else:
+        following_selected = _append(conn, running, selected, encoded, ref, "received", prepared_append=prepared_append)
     return TitleAuditSettlementRequest(running, following_selected, captured.chunk, captured.audit_call, captured.audit_drafts)
 
 
@@ -1782,7 +1973,9 @@ def admit_title_audit_source_on_connection(
     return AdmittedTitleAuditSource(conn, conn.get_transaction(), context, request, result.source, descriptor, current.settled)
 
 
-def complete_title_accounting_on_connection(conn: Connection, admitted: AdmittedTitleAuditSource) -> None:
+def complete_title_accounting_on_connection(
+    conn: Connection, admitted: AdmittedTitleAuditSource, *, prepared_append: PreparedContinuationAppend | None = None
+) -> None:
     admitted.require(conn, admitted.context, admitted.request.audit_drafts)
     running, selected = admitted.request.running, admitted.request.selected
     _require_audit_cohort(conn, running, admitted.request.audit_call, admitted.request.audit_drafts, settled=True)
@@ -1795,4 +1988,7 @@ def complete_title_accounting_on_connection(conn: Connection, admitted: Admitted
         receipt_id=f"title:{admitted.request.result.reference.digest}",
         remove_attempt_id=admitted.request.audit_call.call_id,
     )
-    _append(conn, running, selected, encoded, admitted.descriptor, "settled")
+    if prepared_append is None:
+        _append(conn, running, selected, encoded, admitted.descriptor, "settled")
+    else:
+        _append(conn, running, selected, encoded, admitted.descriptor, "settled", prepared_append=prepared_append)

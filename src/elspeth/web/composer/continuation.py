@@ -98,6 +98,10 @@ class PrivateChunkRef(ContinuationValue):
         "composer.title-no-sdk-refusal.v1",
         "composer.tool-no-execution-refusal.v1",
         "composer.title-provider-result.v1",
+        "composer.classifier-primary-source.v1",
+        "composer.checkpoint-end-input.v1",
+        "composer.paid-overflow.v1",
+        "composer.paid-incomplete.v1",
         "composer.semantic-frontier.v1",
         "composer.owner-result.v1",
         "composer.bootstrap.v1",
@@ -109,7 +113,7 @@ class PrivateChunkRef(ContinuationValue):
 
 class EffectFrontierEntry(ContinuationValue):
     effect_id: str
-    disposition: Literal["prepared", "dispatched", "committed", "refused", "unknown"]
+    disposition: Literal["prepared", "dispatched", "committed", "refused", "unknown", "paid_overflow"]
     receipt_id: str | None
 
 
@@ -254,7 +258,7 @@ class ContinuationFrameStack(ContinuationValue):
     def is_handoff_safe(self) -> bool:
         if self.pending_settlement_ids or self.pending_owner_results:
             return False
-        if any(e.disposition in ("dispatched", "unknown") for e in self.effect_frontier):
+        if any(e.disposition in ("dispatched", "unknown", "paid_overflow") for e in self.effect_frontier):
             return False
         top = self.frames[-1]
         return (
@@ -285,6 +289,11 @@ class ContinuationFrameStack(ContinuationValue):
         if len(set(pending_keys)) != len(pending_keys):
             raise ValueError("duplicate pending owner result identity")
         effects = {effect.effect_id: effect for effect in self.effect_frontier}
+        if any(effect.disposition == "paid_overflow" for effect in self.effect_frontier):
+            from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+
+            if type(decode_continuation_policy(self.admission_policy_json, self.policy_hash)) is not ContinuationAdmissionPolicyV4:
+                raise ValueError("paid provider overflow requires its original V4 admission")
         for result in self.pending_owner_results:
             effect = effects.get(result.effect_key)
             if effect is None or effect.disposition != "committed" or effect.receipt_id is None:
@@ -371,6 +380,7 @@ def prepare_composer_continuation_admission(
     from elspeth.web.composer.continuation_policy import (
         ContinuationAdmissionPolicyV2,
         ContinuationAdmissionPolicyV3,
+        ContinuationAdmissionPolicyV4,
         decode_continuation_policy,
     )
 
@@ -405,7 +415,7 @@ def prepare_composer_continuation_admission(
                 accounting_owner="physical_audit_and_token_ledger",
                 admission_policy_hash=policy_hash,
             )
-            if type(admitted_policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3)
+            if type(admitted_policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
             else ContinuationProviderCostPolicy(
                 applicability="not_applicable",
                 lifecycle_version=2,

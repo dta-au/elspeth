@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
@@ -46,6 +47,9 @@ from elspeth.web.sessions.continuation_title_provider import (
 )
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.schemas import SendMessageRequest
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
 
 
 def _running(work: RequiredWorkBinding) -> ComposerOperationRunning:
@@ -102,7 +106,7 @@ async def prepare_current_title_provider(
 
 async def run_prepared_title_provider(
     *, prepared: PreparedTitleProvider, invocation_owner: ProviderInvocationOwner
-) -> TitleAuditSettlementRequest | None:
+) -> TitleAuditSettlementRequest | VerifiedTitlePaidOverflowTerminal | None:
     if type(prepared) is not PreparedTitleProvider or type(invocation_owner) is not ProviderInvocationOwner:
         raise AuditIntegrityError("TITLE execution requires its actual prepared/current invocation owners")
     if invocation_owner.required_work is not prepared.work or invocation_owner.service is not _sessions(prepared.composer):
@@ -163,6 +167,8 @@ async def run_prepared_title_provider(
         max_prepared_request_bytes=settings.composer_max_prepared_request_bytes,
         prepared_input=prepared.provider_input,
     )
+    if custody.continuation_title_v4_terminal is not None:
+        return custody.continuation_title_v4_terminal
     return custody.continuation_title_result
 
 
@@ -202,7 +208,104 @@ async def retain_current_title_success(custody: ProviderCallCustody, completion:
     prepared = custody.continuation_title
     if type(prepared) is not PreparedTitleProvider:
         raise AuditIntegrityError("TITLE retention lost its original action clock")
+    if custody.continuation_title_v4_admission is not None:
+        await prepared.clock.run("retention", lambda: _retain_current_title_v4_once(custody, completion))
+        return
     await prepared.clock.run("retention", lambda: _retain_current_title_success_once(custody, completion))
+
+
+async def _retain_current_title_v4_once(custody: ProviderCallCustody, completion: _AdmittedLLMCompletion) -> None:
+    from elspeth.web.composer.continuation_title_observation import (
+        TitleCompleteObservation,
+        TitleOverflowObservation,
+        observe_title_provider_result,
+    )
+    from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
+    from elspeth.web.sessions.continuation_title_provider import V4TitleProviderAdmission, _descriptor
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    prepared, admission = custody.continuation_title, custody.continuation_title_v4_admission
+    service = custody.service
+    if (
+        type(prepared) is not PreparedTitleProvider
+        or type(admission) is not V4TitleProviderAdmission
+        or custody.call is None
+        or custody.attempt is not admission.attempt
+        or type(service) is not SessionServiceImpl
+        or service is not _sessions(prepared.composer)
+        or not custody._sdk_entered
+    ):
+        raise AuditIntegrityError("V4 TITLE observation lost its original entered physical producer")
+    names = await current_title_names(service=prepared.composer, running=prepared.running, work=prepared.work)
+    if custody.continuation_title_selected != names.selected or admission.selected != names.selected:
+        raise AuditIntegrityError("V4 TITLE response lost its exact physical admission root")
+    root = decode_continuation_snapshot(names.selected.payload_json)
+    creator_sequence, creator_generation = require_title_creator(prepared.running)
+    observation = observe_title_provider_result(
+        logical=root.logical,
+        actor_user_id=prepared.actor_user_id,
+        effect_key="provider:3:0",
+        input_sha256=_descriptor(prepared.input).input_sha256,
+        creator_sequence=creator_sequence,
+        creator_generation=creator_generation,
+        completion=completion,
+        audit_call=custody.call,
+        context=custody.context,
+        audit_drafts=provider_attempt_audit_drafts(custody.call, custody.context),
+        env_ref_names=names.names,
+        require_source_issued_v4=True,
+    )
+
+    def retain() -> TitleAuditSettlementRequest | VerifiedTitlePaidOverflowTerminal:
+        if type(observation) is TitleCompleteObservation:
+            return service.complete_v4_title_result_sync(prepared=prepared, admission=admission, captured=observation.captured, names=names)
+        if type(observation) is TitleOverflowObservation:
+            return service.settle_v4_title_overflow_sync(prepared=prepared, admission=admission, observation=observation, names=names)
+        raise AuditIntegrityError("V4 TITLE observation has no closed paid-result disposition")
+
+    sql, projection = prepared.work.reserve_pair(
+        RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+    )
+    try:
+        outcome = await run_required_sql_finish_once(sql, retain)
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    try:
+        prepared.work.coordinator.validate_continuation_sql_outcome(
+            ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_STATE_SQL, actual_outcome=outcome
+        )
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    errors: list[BaseException] = []
+    if type(outcome) is RequiredSQLRaised:
+        projection.complete_without_submission()
+        errors.append(outcome.error)
+    elif type(outcome) is RequiredSQLReturned:
+        projection.begin_projection()
+        try:
+            if type(outcome.value) is TitleAuditSettlementRequest:
+                if type(observation) is not TitleCompleteObservation:
+                    raise AuditIntegrityError("V4 TITLE overflow returned a complete paid result")
+                custody.note_v4_title_complete(outcome.value)
+            elif type(outcome.value) is VerifiedTitlePaidOverflowTerminal:
+                custody.note_v4_title_terminal(outcome.value)
+            else:
+                raise AuditIntegrityError("V4 TITLE retention returned no cold-proved paid result")
+        except BaseException as error:
+            projection.complete_owned(error)
+            errors.append(error)
+        else:
+            projection.complete_owned()
+    else:
+        projection.complete_without_submission()
+        raise AuditIntegrityError("V4 TITLE retention returned no owned SQL outcome")
+    errors.extend(cancellation for cancellation in outcome.deferred_cancellations if all(cancellation is not error for error in errors))
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("V4 TITLE retention original outcomes", errors)
 
 
 async def _retain_current_title_success_once(custody: ProviderCallCustody, completion: _AdmittedLLMCompletion) -> None:

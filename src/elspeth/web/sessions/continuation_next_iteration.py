@@ -44,6 +44,8 @@ from elspeth.web.composer.continuation_semantic_advisor_return import (
 )
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
 from elspeth.web.sessions.continuation_iteration_return import (
     IterationPendingEndData,
     IterationStageData,
@@ -109,7 +111,13 @@ async def advance_continuation_iteration(
     selected: SelectedContinuationState,
     *,
     iteration_stage: IterationStageData | None = None,
-) -> ComposerOperationRecord | ObservedClassifierReplyDeadline | None:
+) -> (
+    ComposerOperationRecord
+    | ObservedClassifierReplyDeadline
+    | VerifiedClassifierPaidOverflowTerminal
+    | ClassifierNoSdkRefusalReceipt
+    | None
+):
     from elspeth.web.composer.service import _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE, _record_advisor_repair_mutations
 
     applied_batch_cut(selected.stack.frames)
@@ -284,7 +292,9 @@ async def advance_continuation_iteration(
         for elision_index in sorted(live.pending_advisor_elision_indices, reverse=True):
             del live.llm_messages[elision_index]
         live.pending_advisor_elision_indices = []
-    observed: ObservedClassification | ObservedClassifierReplyDeadline
+    observed: (
+        ObservedClassification | ObservedClassifierReplyDeadline | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt
+    )
     if stage == "reply_refusal":
         refusal_pending = await _registered(
             work=phases.work,
@@ -325,6 +335,8 @@ async def advance_continuation_iteration(
         observed = await observe_continuation_iteration_classification(
             phases, runtime, selected=current, dispatch=dispatch, persist=persist
         )
+    if isinstance(observed, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
+        return observed
     if isinstance(observed, ObservedClassifierReplyDeadline):
         return observed
     classify = observed.outcome

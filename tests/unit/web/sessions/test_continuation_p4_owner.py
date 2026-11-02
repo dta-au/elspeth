@@ -32,9 +32,8 @@ from elspeth.web.composer._compose_loop_carriers import (
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner
 from elspeth.web.composer.audit import begin_dispatch, finish_plugin_crash, finish_success
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
-from elspeth.web.composer.continuation import ToolBatchFrame
-from elspeth.web.composer.continuation_batch_data import encode_coupled_batch_chunk
-from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_response, encode_continuation_snapshot
+from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk, encode_p4_pending_batch_chunk
 from elspeth.web.composer.continuation_p4_outcome import (
     capture_p4_outcome,
@@ -43,7 +42,7 @@ from elspeth.web.composer.continuation_p4_outcome import (
     historical_checkpoint_record,
     require_same_p4_outcome,
 )
-from elspeth.web.composer.continuation_prepared_p4 import capture_prepared_p4, encode_prepared_p4, prepared_p4_members
+from elspeth.web.composer.continuation_prepared_p4 import capture_prepared_p4, decode_prepared_p4, encode_prepared_p4, prepared_p4_members
 from elspeth.web.composer.continuation_tool_batch import RetainedBatchFailure
 from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence, diagnostic_evidence_identity
 from elspeth.web.composer.state import CompositionState, ValidationSummary
@@ -56,13 +55,7 @@ from elspeth.web.coordination.contracts import FenceLossReason, SessionOperation
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, RejectionRecord
 from elspeth.web.sessions.composer_operations import ComposerOperationFenceLost
-from elspeth.web.sessions.continuation import (
-    ContinuationCASConflict,
-    ContinuationEvent,
-    append_complete_snapshot,
-    private_chunk_key,
-    put_chunk,
-)
+from elspeth.web.sessions.continuation import ContinuationCASConflict
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import (
     chat_messages_table,
@@ -263,54 +256,21 @@ def completed_cut(
 
 
 def selected_p4(store, *, graph=False, crash_pending=False):
-    engine, repository, authority, _service, sid = store
-    _record, _seed, _action = admit_continuation(store)
-    running = start_continuation(repository, authority)
-    head = authority.load_continuation_snapshot(running)
-    stack = decode_continuation_snapshot(head.payload_json)
-    batch, acc, response, prepared = completed_cut(running, stack, graph=graph, crash_pending=crash_pending)
-    batch_chunk = encode_coupled_batch_chunk(batch=batch, accumulator=acc, calls=response.tool_batch.calls)
-    response_chunk = encode_continuation_response(response)
-    # Direct storage setup is restricted to the selected input boundary. All
-    # SQL preparation, mutation, publication, root CAS and recovery below use
-    # the actual production owners, with no guard patched out.
-    with locked_session_transaction(engine, str(sid)) as conn:
-        for chunk in (batch_chunk, response_chunk):
-            put_chunk(
-                conn,
-                session_id=str(sid),
-                operation_id=running.claim.operation_id,
-                key=private_chunk_key(chunk),
-                payload=chunk.canonical.encode(),
-                codec=chunk.reference.codec,
-            )
-        selected = stack.model_copy(
-            update={
-                "frames": (
-                    *stack.frames,
-                    ToolBatchFrame(
-                        phase="tool_ready",
-                        response=response_chunk.reference,
-                        accumulator=batch_chunk.reference,
-                        next_tool_index=1,
-                        settled_effect_ids=(),
-                    ),
-                )
-            }
-        )
-        head = append_complete_snapshot(
-            conn,
-            session_id=str(sid),
-            operation_id=running.claim.operation_id,
-            expected_checkpoint_id=head.checkpoint_id,
-            expected_cursor=head.cursor,
-            snapshot_json=encode_continuation_snapshot(selected),
-            event_batch=(ContinuationEvent("tool_prepared", canonical_json({"fixture": "selected P4 input"})),),
-            handoff=False,
-        )
-    pending = replace(batch, phase="p4_pending", p4_input_json=encode_prepared_p4(prepared))
-    chunk = encode_p4_pending_batch_chunk(batch=pending, accumulator=acc, calls=response.tool_batch.calls)
-    restored = decode_p4_pending_batch_chunk(chunk)
+    from tests.unit.web.sessions.test_continuation_owed_evidence import committed_evidence_case
+
+    # Construct the complete original Compose/evidence/batch input. The actual
+    # writer below still owns both receipt retention and atomic application.
+    running, selected, _inventory, evidence, commit = asyncio.run(
+        committed_evidence_case(store, graph=graph, crash_pending=crash_pending, joint=True, persist_result=False)
+    )
+    assert sum(type(frame) is ComposeFrame for frame in selected.stack.frames) == 1
+    frame = selected.stack.frames[-1]
+    assert type(frame) is ToolBatchFrame and frame.phase == "effect_reconciling"
+    assert (selected.checkpoint_id, selected.stack.cursor) == (commit.expected_checkpoint_id, commit.expected_cursor)
+    chunk = next(item for item in selected.chunks if item.reference == frame.accumulator)
+    restored = decode_p4_pending_batch_chunk(chunk, env_ref_names=evidence.env_ref_names)
+    assert restored.batch.p4_input_json is not None
+    prepared = decode_prepared_p4(restored.batch.p4_input_json, env_ref_names=evidence.env_ref_names)
     assert restored.batch.entry_state is restored.accumulator.state
     if crash_pending:
         assert restored.batch.tool_outcomes[0].response is None
@@ -320,9 +280,6 @@ def selected_p4(store, *, graph=False, crash_pending=False):
         assert restored.batch.tool_outcomes[0].response.updated_state is restored.batch.state
     assert restored.batch.tool_outcomes[0].call is restored.calls[0]
     assert (restored.batch.state is restored.accumulator.state) is (not graph)
-    commit = authority.prepare_continuation_p4(
-        running, expected_checkpoint_id=head.checkpoint_id, expected_cursor=head.cursor, pending_batch=chunk
-    )
     return running, prepared, commit
 
 
@@ -351,10 +308,34 @@ def persist(service, running, prepared, commit):
 
 
 def recovered(authority, running, commit):
+    """Read the deliberately retained-only library seam, before application."""
     head = authority.load_continuation_snapshot(running)
     return authority.read_continuation_p4_result(
         running, expected_checkpoint_id=head.checkpoint_id, expected_cursor=head.cursor, effect_key=commit.effect_key
     )
+
+
+def applied_result(store, running, commit):
+    """Re-admit current applied evidence and recheck its immutable SQL journal."""
+    from elspeth.web.composer.continuation_evidence_restore import read_turn_evidence_on_connection
+    from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_data_on_connection
+    from tests.unit.web.sessions.test_continuation_p4_application_store import selected_now
+
+    engine, _repository, _authority, _service, sid = store
+    selected, inventory = asyncio.run(selected_now(store, running))
+    assert not selected.stack.pending_owner_results
+    with locked_session_transaction(engine, str(sid)) as conn:
+        evidence = read_turn_evidence_on_connection(conn, running, selected=selected, inventory=inventory)
+        results = require_p4_application_journal_data_on_connection(
+            conn,
+            session_id=sid,
+            operation_id=running.claim.operation_id,
+            selected=selected,
+            evidence=evidence,
+            env_ref_names=inventory.names,
+        )
+    (result,) = [value for value in results if value.receipt.effect_key == commit.effect_key]
+    return result
 
 
 def rows(engine):
@@ -365,6 +346,52 @@ def rows(engine):
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original_compose", ("missing", "duplicate"))
+async def test_application_requires_one_original_compose_after_complete_pending_read(operation_store, original_compose):
+    from elspeth.web.composer.continuation_owed_evidence import read_owed_p4_evidence_on_connection
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.sessions.continuation_p4_application_store import apply_p4_application_on_connection
+    from elspeth.web.sessions.continuation_selection import load_private_chunks
+    from tests.unit.web.sessions.test_continuation_owed_evidence import committed_evidence_case
+    from tests.unit.web.sessions.test_continuation_p4_application_store import apply_case, continuation_rows
+
+    engine, repository, authority, _service, sid = operation_store
+    running, selected, inventory, _evidence, commit = await committed_evidence_case(operation_store, joint=True)
+    try:
+        compose, batch = selected.stack.frames
+        assert type(compose) is ComposeFrame and type(batch) is ToolBatchFrame
+        before = rows(engine), continuation_rows(engine), authority.load_continuation_snapshot(running)
+        with locked_session_transaction(engine, str(sid)) as conn:
+            positive = read_owed_p4_evidence_on_connection(
+                conn, running, selected=selected, inventory=inventory, effect_key=commit.effect_key
+            )
+            assert positive.result.receipt.effect_key == commit.effect_key
+            frames = (batch,) if original_compose == "missing" else (compose, compose, batch)
+            altered = selected.stack.model_copy(update={"frames": frames})
+            substituted = SelectedContinuationState(
+                selected.checkpoint_id,
+                altered,
+                load_private_chunks(conn, session_id=str(sid), operation_id=running.claim.operation_id, stack=altered),
+            )
+            with pytest.raises(AuditIntegrityError, match="requires its one original Compose frame"):
+                apply_p4_application_on_connection(
+                    conn,
+                    running,
+                    selected=substituted,
+                    inventory=inventory,
+                    expected_evidence_chunk=next(chunk for chunk in selected.chunks if chunk.reference == compose.evidence),
+                    expected_pending_batch_chunk=next(chunk for chunk in selected.chunks if chunk.reference == batch.accumulator),
+                )
+        assert (rows(engine), continuation_rows(engine), authority.load_continuation_snapshot(running)) == before
+        applied = await apply_case(operation_store, running, selected, inventory)
+        assert applied.bundle.result == positive.result
+        assert not decode_continuation_snapshot(applied.snapshot.payload_json).pending_owner_results
+        assert rows(engine) == before[0]
+    finally:
+        repository.release(running.session_operation_context)
+
+
 @pytest.mark.parametrize("graph", [False, True])
 def test_actual_p4_commits_rows_complete_receipt_and_root_together(operation_store, graph):
     engine, repository, authority, service, sid = operation_store
@@ -372,12 +399,12 @@ def test_actual_p4_commits_rows_complete_receipt_and_root_together(operation_sto
     try:
         audit = persist(service, running, prepared, commit)
         assert type(audit) is AuditOutcome
-        result = recovered(authority, running, commit)
+        result = applied_result(operation_store, running, commit)
         assert str(result.receipt.assistant_id) == audit.assistant_id
         assert result.outcome.published_assistant_content == "retained prose"
         assert result.receipt.creator_operation_id == running.session_operation_context.fence.operation_id
         assert result.receipt.invocation_ids == ("owned-p4-call",)
-        assert len(result.receipt.withheld_hashes) == 1
+        assert len(result.receipt.withheld_hashes) == len(prepared_p4_members(prepared).withheld_replies)
         with engine.connect() as conn:
             stored = conn.execute(
                 select(chat_messages_table).where(chat_messages_table.c.session_id == str(sid)).order_by(chat_messages_table.c.sequence_no)
@@ -385,7 +412,13 @@ def test_actual_p4_commits_rows_complete_receipt_and_root_together(operation_sto
         assert tuple(str(item) for item in result.receipt.chat_message_ids) == tuple(
             row.id for row in stored if row.writer_principal == "compose_loop"
         )
-        assert [row.role for row in stored if row.writer_principal == "compose_loop"] == ["assistant", "tool", "audit", "audit", "audit"]
+        assert [row.role for row in stored if row.writer_principal == "compose_loop"] == [
+            "assistant",
+            "tool",
+            "audit",
+            "audit",
+            *("audit" for _ in prepared_p4_members(prepared).withheld_replies),
+        ]
         assert stored[-1].content == "unpublished words"
         assert audit.checkpoint_disposition == ("committed" if graph else "empty")
         if graph:
@@ -398,7 +431,13 @@ def test_actual_p4_commits_rows_complete_receipt_and_root_together(operation_sto
             assert audit.checkpoint is None and result.historical_effect is None
             assert len(result.receipt.rejection_ids) == 1
         before = rows(engine)
-        assert recovered(authority, running, commit) == result
+        assert applied_result(operation_store, running, commit) == result
+        root = decode_continuation_snapshot(authority.load_continuation_snapshot(running).payload_json)
+        assert not root.pending_owner_results
+        assert root.frames[-1].phase == "result_retained"
+        assert commit.effect_key in root.frames[-1].settled_effect_ids
+        with pytest.raises(AuditIntegrityError, match="no exact selected pending result"):
+            recovered(authority, running, commit)
         assert rows(engine) == before
         with pytest.raises(ContinuationCASConflict):
             persist(service, running, prepared, commit)
@@ -408,13 +447,13 @@ def test_actual_p4_commits_rows_complete_receipt_and_root_together(operation_sto
 
 
 def test_actual_revoked_publication_preserves_refusal_not_candidate_graph(operation_store):
-    engine, repository, authority, service, sid = operation_store
+    engine, repository, _authority, service, sid = operation_store
     running, prepared, commit = selected_p4(operation_store, graph=True)
     try:
         with engine.begin() as conn:
             conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(trust_mode="explicit_approve"))
         audit = persist(service, running, prepared, commit)
-        result = recovered(authority, running, commit)
+        result = applied_result(operation_store, running, commit)
         assert audit.authority_revocation == ComposerMutationRevocation(prepared_p4_members(prepared).mutation_ceiling, "explicit_approve")
         assert audit.published_assistant_content == ""
         assert audit.published_tool_rows == prepared_p4_members(prepared).revoked_rows
@@ -481,7 +520,7 @@ def test_result_publication_failure_rolls_back_business_rows_and_private_head(op
 
 
 def test_unavailable_p4_retains_rollback_facts_without_checkpoint_witness(operation_store, monkeypatch):
-    engine, repository, authority, service, _sid = operation_store
+    engine, repository, _authority, service, _sid = operation_store
     running, prepared, commit = selected_p4(operation_store, crash_pending=True)
     before = rows(engine)
     failure = OperationalError("INSERT controlled unavailable", {}, RuntimeError("storage unavailable"))
@@ -497,7 +536,7 @@ def test_unavailable_p4_retains_rollback_facts_without_checkpoint_witness(operat
         assert audit.checkpoint is None and audit.assistant_id is None
         assert audit.continuation_retention_failure is None
         assert rows(engine) == before
-        result = recovered(authority, running, commit)
+        result = applied_result(operation_store, running, commit)
         assert result.receipt.unwind_audit_failed
         assert result.receipt.chat_message_ids == result.receipt.inserted_state_ids == ()
         assert result.historical_effect is None
@@ -507,18 +546,18 @@ def test_unavailable_p4_retains_rollback_facts_without_checkpoint_witness(operat
 
 @pytest.mark.parametrize("member", ["content", "raw_content", "is_valid", "composer_meta", "provenance", "rejection_message"])
 def test_recovery_binds_complete_real_rows_not_only_authored_graph(operation_store, member):
-    engine, repository, authority, service, _sid = operation_store
+    engine, repository, _authority, service, _sid = operation_store
     graph = member not in ("rejection_message",)
     running, prepared, commit = selected_p4(operation_store, graph=graph)
     try:
         audit = persist(service, running, prepared, commit)
-        good = recovered(authority, running, commit)
+        good = applied_result(operation_store, running, commit)
         if member == "content":
             before = rows(engine)
             with pytest.raises(IntegrityError, match=r"chat_messages\.content is append-only"), engine.begin() as conn:
                 conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit.assistant_id).values(content="changed"))
             assert rows(engine) == before
-            assert recovered(authority, running, commit).receipt == good.receipt
+            assert applied_result(operation_store, running, commit).receipt == good.receipt
             return
         with engine.begin() as conn:
             if member == "raw_content":
@@ -539,7 +578,7 @@ def test_recovery_binds_complete_real_rows_not_only_authored_graph(operation_sto
                 )
                 conn.execute(update(composition_states_table).where(composition_states_table.c.id == audit.current_state_id).values(values))
         with pytest.raises(AuditIntegrityError):
-            recovered(authority, running, commit)
+            applied_result(operation_store, running, commit)
     finally:
         repository.release(running.session_operation_context)
 

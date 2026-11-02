@@ -24,7 +24,11 @@ from elspeth.web.composer.continuation_batch_data import (
 )
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
+from elspeth.web.composer.continuation_policy import (
+    ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
+    decode_continuation_policy,
+)
 from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -654,11 +658,10 @@ def retain_batch_transition(
         stored = load_snapshot(conn, session_id=before.logical.session_id, operation_id=before.logical.operation_id)
         if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(before):
             raise AuditIntegrityError("batch transition replaced its actual selected predecessor")
-        if (
-            transition in ("tool_issued", "attachment_prepared", "attachment_reprepared")
-            and type(decode_continuation_policy(before.admission_policy_json, before.policy_hash)) is ContinuationAdmissionPolicyV3
-        ):
-            raise AuditIntegrityError("V3 tool issue requires a complete finite result envelope before dispatch")
+        if transition in ("tool_issued", "attachment_prepared", "attachment_reprepared") and type(
+            decode_continuation_policy(before.admission_policy_json, before.policy_hash)
+        ) in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
+            raise AuditIntegrityError("bounded tool issue requires a complete finite result envelope before dispatch")
         response = (
             read_committed_primary_response_for_settlement_on_connection(conn, running, selected=selected, reference=frame.response)
             if transition == "tool_completed"

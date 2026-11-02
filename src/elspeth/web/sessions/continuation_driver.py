@@ -36,6 +36,7 @@ from elspeth.web.composer.continuation_progress import decode_prescribed_continu
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.continuation_semantic_advisor_phase import (
     SemanticAdvisorNoSdkTerminal,
+    SemanticAdvisorPaidTerminal,
     run_continuation_semantic_advisor,
     run_prescribed_semantic_read,
 )
@@ -85,6 +86,15 @@ from elspeth.web.sessions.continuation import (
     V3UnboundedTailRefusal,
     read_v3_retained_tail_refusal_on_connection,
 )
+from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+from elspeth.web.sessions.continuation_classifier_primary_no_sdk import (
+    ClassifierNoSdkRefusalReceipt,
+    read_classifier_no_sdk_refusal_on_connection,
+)
+from elspeth.web.sessions.continuation_classifier_primary_terminal import (
+    VerifiedClassifierPaidOverflowCold,
+    read_v4_classifier_paid_overflow_terminal_on_connection,
+)
 from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, publish_semantic_continuation_result
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
 from elspeth.web.sessions.continuation_iteration_return import (
@@ -93,8 +103,20 @@ from elspeth.web.sessions.continuation_iteration_return import (
     retain_iteration_reply_deadline_ready,
 )
 from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
-from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt
+from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, PrimaryPaidOverflowTerminal, PrimaryProviderResult
+from elspeth.web.sessions.continuation_primary_paid_overflow_terminal import (
+    VerifiedPrimaryPaidOverflowTerminal,
+    read_v4_primary_paid_overflow_terminal_on_connection,
+)
 from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
+from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import (
+    VerifiedSemanticPaidOverflowTerminal,
+    read_v4_semantic_paid_overflow_terminal_on_connection,
+)
+from elspeth.web.sessions.continuation_title_paid_overflow_terminal import (
+    VerifiedTitlePaidOverflowTerminal,
+    read_v4_title_paid_overflow_terminal_on_connection,
+)
 from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
 from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, read_v3_tool_no_execution_refusal_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction, session_data_read_transaction
@@ -120,10 +142,21 @@ class ContinuationSegmentSettled:
     terminal: ComposerOperationRecord
 
 
+@dataclass(frozen=True, slots=True)
+class _TitlePaidTerminalResult:
+    verified: VerifiedTitlePaidOverflowTerminal
+    names: frozenset[str]
+
+
 type ContinuationSegmentOutcome = ContinuationSegmentYielded | ContinuationSegmentHandedOver | ContinuationSegmentSettled
 type _ActionResult = (
     ComposerOperationRecord
+    | _TitlePaidTerminalResult
+    | SemanticAdvisorPaidTerminal
+    | VerifiedClassifierPaidOverflowTerminal
+    | ClassifierNoSdkRefusalReceipt
     | PrimaryNoSdkRefusalReceipt
+    | PrimaryPaidOverflowTerminal
     | SemanticAdvisorNoSdkTerminal
     | V3UnboundedTailRefusal
     | ToolNoExecutionRefusal
@@ -753,7 +786,9 @@ class _SegmentDriver:
                     )
                     if isinstance(prepared, V3UnboundedTailRefusal):
                         return prepared
-                    await run_prepared_title_provider(prepared=prepared, invocation_owner=self.provider)
+                    title_result = await run_prepared_title_provider(prepared=prepared, invocation_owner=self.provider)
+                    if type(title_result) is VerifiedTitlePaidOverflowTerminal:
+                        return _TitlePaidTerminalResult(title_result, prepared.names)
                 else:
                     current = await settle_current_title_result(service=self.service, running=self.running, required_work=self.work)
                     await apply_current_title_success(service=self.service, selected=current.selected, required_work=self.work)
@@ -814,11 +849,18 @@ class _SegmentDriver:
                 timeout=policy.actions.primary.total,
                 on_sdk_entry=self.progress_owner.notify_sdk_entry if self.progress_owner is not None else None,
             )
-            if isinstance(primary_result, (PrimaryNoSdkRefusalReceipt, V3UnboundedTailRefusal)):
+            if isinstance(primary_result, (PrimaryNoSdkRefusalReceipt, PrimaryPaidOverflowTerminal, V3UnboundedTailRefusal)):
                 return primary_result
             if delivery is not None:
                 runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
             self.phases.accept_primary(primary_result)
+            if type(primary_result) is PrimaryProviderResult:
+                if len(primary_result.deferred_cancellations) == 1:
+                    raise primary_result.deferred_cancellations[0]
+                if primary_result.deferred_cancellations:
+                    raise BaseExceptionGroup(
+                        "PRIMARY complete result and original cancellations", list(primary_result.deferred_cancellations)
+                    )
             return None
         if type(top) is AdvisorFrame:
             if (
@@ -1216,6 +1258,196 @@ class _SegmentDriver:
                     return await self.dispose(original)
                 return await self.settle(await self.record(), original)
             if result is not None:
+                if type(result) is VerifiedClassifierPaidOverflowTerminal:
+                    classifier_paid_result = result
+
+                    def verify_classifier_paid_overflow(
+                        expected_terminal: VerifiedClassifierPaidOverflowTerminal = classifier_paid_result,
+                    ) -> VerifiedClassifierPaidOverflowCold:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_v4_classifier_paid_overflow_terminal_on_connection(
+                                conn,
+                                session_id=self.running.claim.session_id,
+                                operation_id=self.running.claim.operation_id,
+                                effect_key=expected_terminal.receipt.identity.effect_key,
+                            )
+                        if (
+                            actual is None
+                            or actual.receipt != expected_terminal.receipt
+                            or actual.terminal != expected_terminal.snapshot
+                            or actual.provider_attempt_id != expected_terminal.receipt.identity.attempt_id
+                            or actual.hold_state != "consumed"
+                        ):
+                            raise AuditIntegrityError("Classifier paid overflow lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_classifier_paid_overflow,
+                        expected=VerifiedClassifierPaidOverflowCold,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.snapshot.checkpoint_id,
+                        result.snapshot.cursor,
+                    ):
+                        raise AuditIntegrityError("Classifier paid overflow lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is ClassifierNoSdkRefusalReceipt:
+                    classifier_refusal_result = result
+
+                    def verify_classifier_no_sdk(
+                        expected_refusal: ClassifierNoSdkRefusalReceipt = classifier_refusal_result,
+                    ) -> ClassifierNoSdkRefusalReceipt:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_classifier_no_sdk_refusal_on_connection(
+                                conn,
+                                session_id=self.running.claim.session_id,
+                                operation_id=self.running.claim.operation_id,
+                                effect_key=expected_refusal.effect_key,
+                            )
+                        if actual is None or actual != expected_refusal:
+                            raise AuditIntegrityError("Classifier no-SDK refusal lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_classifier_no_sdk,
+                        expected=ClassifierNoSdkRefusalReceipt,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or terminal != result.terminal:
+                        raise AuditIntegrityError("Classifier no-SDK refusal lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is SemanticAdvisorPaidTerminal:
+                    semantic_paid_result = result
+
+                    def verify_semantic_paid_overflow(
+                        expected_terminal: SemanticAdvisorPaidTerminal = semantic_paid_result,
+                    ) -> VerifiedSemanticPaidOverflowTerminal:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_v4_semantic_paid_overflow_terminal_on_connection(
+                                conn,
+                                session_id=self.running.claim.session_id,
+                                operation_id=self.running.claim.operation_id,
+                                effect_key=expected_terminal.verified.receipt.identity.effect_key,
+                            )
+                        if actual is None or actual != expected_terminal.verified or actual.hold_state != "consumed":
+                            raise AuditIntegrityError("Semantic paid overflow lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_semantic_paid_overflow,
+                        expected=VerifiedSemanticPaidOverflowTerminal,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.verified.terminal.checkpoint_id,
+                        result.verified.terminal.cursor,
+                    ):
+                        raise AuditIntegrityError("Semantic paid overflow lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is _TitlePaidTerminalResult:
+                    title_paid_result = result
+
+                    def verify_title_paid_overflow(
+                        expected_terminal: _TitlePaidTerminalResult = title_paid_result,
+                    ) -> VerifiedTitlePaidOverflowTerminal:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_v4_title_paid_overflow_terminal_on_connection(
+                                conn,
+                                session_id=self.running.claim.session_id,
+                                operation_id=self.running.claim.operation_id,
+                                names=expected_terminal.names,
+                            )
+                        if actual is None or actual != expected_terminal.verified or actual.hold_state != "consumed":
+                            raise AuditIntegrityError("TITLE paid overflow lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_title_paid_overflow,
+                        expected=VerifiedTitlePaidOverflowTerminal,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.verified.terminal.checkpoint_id,
+                        result.verified.terminal.cursor,
+                    ):
+                        raise AuditIntegrityError("TITLE paid overflow lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal)
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is PrimaryPaidOverflowTerminal:
+                    primary_paid_result = result
+
+                    def verify_paid_overflow(
+                        expected_terminal: PrimaryPaidOverflowTerminal = primary_paid_result,
+                    ) -> VerifiedPrimaryPaidOverflowTerminal:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_v4_primary_paid_overflow_terminal_on_connection(
+                                conn,
+                                session_id=self.running.claim.session_id,
+                                operation_id=self.running.claim.operation_id,
+                                effect_key=expected_terminal.receipt.identity.effect_key,
+                            )
+                        if (
+                            actual is None
+                            or actual.receipt != expected_terminal.receipt
+                            or actual.terminal != expected_terminal.snapshot
+                            or actual.hold_state != "consumed"
+                        ):
+                            raise AuditIntegrityError("PRIMARY paid overflow lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_paid_overflow,
+                        expected=VerifiedPrimaryPaidOverflowTerminal,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.snapshot.checkpoint_id,
+                        result.snapshot.cursor,
+                    ):
+                        raise AuditIntegrityError("PRIMARY paid overflow lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
                 if type(result) is ToolNoExecutionRefusal:
                     return await self.consume_tool_refusal(result)
                 if isinstance(result, V3UnboundedTailRefusal):

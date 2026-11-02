@@ -22,6 +22,7 @@ from elspeth.web.composer.continuation import (
 from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
@@ -227,7 +228,7 @@ def read_continuation_cost_snapshot_on_connection(conn: Connection, stack: Conti
     if type(stack) is not ContinuationFrameStack:
         raise AuditIntegrityError("Continuation cost source requires its actual selected root")
     policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
-    if not isinstance(policy, (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3)):
+    if not isinstance(policy, (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)):
         if type(stack.provider_cost_policy) is not ContinuationProviderCostPolicyV2:
             return None
         raise AuditIntegrityError("legacy Continuation policy gained a current cost owner")

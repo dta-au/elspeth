@@ -44,6 +44,7 @@ from elspeth.web.composer.continuation_dispatch_audit import (
     encode_dispatch_audit,
     re_admit_dispatch_audit,
 )
+from elspeth.web.composer.continuation_limits import ContinuationDocumentTooLarge
 from elspeth.web.composer.continuation_result_credentials import require_retained_argument_credentials, require_retained_result_credentials
 from elspeth.web.composer.continuation_tool_batch import (
     RetainedAdvisorRefusalSource,
@@ -1148,7 +1149,7 @@ def _encode_values(
             payload["schema_version"] = "composer.prepared-evidence-batch-graph.v2"
     encoded = canonical_json(payload)
     if not prospective and len(encoded.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES:
-        _fail("coupled batch data exceeds its complete byte bound")
+        raise ContinuationDocumentTooLarge("coupled batch data exceeds its complete byte bound")
     return encoded
 
 

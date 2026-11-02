@@ -1,4 +1,8 @@
-"""Real P4 writer, current names producer and checked application-input reads."""
+"""Retained-only P4 DATA, current names producer and checked pending reads.
+
+Business rows and immutable receipts are real; these tests deliberately stop
+before application and do not claim atomic product publication.
+"""
 
 import asyncio
 from dataclasses import replace
@@ -29,14 +33,15 @@ from elspeth.web.sessions.models import composer_operation_segments_table as seg
 from elspeth.web.sessions.models import session_operation_fences_table as fences
 from tests.helpers.continuation_inventory import inventory_advisor, inventory_work
 from tests.unit.web.coordination import test_composer_operation_authority
-from tests.unit.web.sessions.test_continuation_p4_owner import persist, recovered, rows, selected_p4
+from tests.unit.web.sessions.test_continuation_owed_evidence import persist_retained_library_cut
+from tests.unit.web.sessions.test_continuation_p4_owner import recovered, rows, selected_p4
 
 operation_store = test_composer_operation_authority.operation_store
 
 
 async def committed_case(store, *, graph=False, crash_pending=False, unavailable=False, revoked=False, monkeypatch=None):
     engine, _repository, authority, service, sid = store
-    running, prepared, commit = selected_p4(store, graph=graph, crash_pending=crash_pending)
+    running, prepared, commit = await asyncio.to_thread(selected_p4, store, graph=graph, crash_pending=crash_pending)
     if revoked:
         with engine.begin() as conn:
             conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(trust_mode="explicit_approve"))
@@ -49,9 +54,9 @@ async def committed_case(store, *, graph=False, crash_pending=False, unavailable
 
         with monkeypatch.context() as patch:
             patch.setattr(service, "_insert_chat_message", refuse_insert)
-            audit = await asyncio.to_thread(persist, service, running, prepared, commit)
+            audit = await asyncio.to_thread(persist_retained_library_cut, service, running, prepared, commit, expected_unavailable=True)
     else:
-        audit = await asyncio.to_thread(persist, service, running, prepared, commit)
+        audit = await asyncio.to_thread(persist_retained_library_cut, service, running, prepared, commit)
     stored = authority.load_continuation_snapshot(running)
     work = inventory_work(running)
     selected = await load_selected_continuation(authority=authority, running=running, selected=stored, required_work=work)

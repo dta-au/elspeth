@@ -1680,6 +1680,73 @@ class _PreparedPendingInterpretation:
             raise TypeError("prepared pending interpretation validator must be exact")
 
 
+@dataclass(frozen=True, slots=True)
+class PendingInterpretationValidationObservation:
+    """The original validation and the complete candidate it actually examined."""
+
+    candidate: SessionPendingInterpretationValidationCandidate
+    result: SessionPendingInterpretationValidationResult
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInterpretationPolicyPlan:
+    """Replayable policy DATA, never authority to write either audit store."""
+
+    command: SessionPendingInterpretationCommand
+    snapshot: SessionPendingInterpretationSnapshot
+    policy: PendingInterpretationPolicy
+    appended_state_id: UUID
+    decision: SessionPendingInterpretationDecision
+    validation: PendingInterpretationValidationObservation | None
+
+
+def plan_pending_interpretation(
+    command: SessionPendingInterpretationCommand,
+    snapshot: SessionPendingInterpretationSnapshot,
+    validator: _SessionPendingInterpretationValidator,
+    *,
+    policy: PendingInterpretationPolicy,
+) -> PendingInterpretationPolicyPlan:
+    """Observe validation once, then retain its exact pure policy consequence."""
+    if type(validator) is not _SessionPendingInterpretationValidator:
+        raise TypeError("pending plan requires the original validation-only capability")
+    validator.assert_source_state(snapshot)
+    observation: PendingInterpretationValidationObservation | None = None
+
+    def observe(candidate: SessionPendingInterpretationValidationCandidate) -> SessionPendingInterpretationValidationResult:
+        nonlocal observation
+        if observation is not None:
+            raise AuditIntegrityError("pending interpretation requested validation twice")
+        result = validator(candidate)
+        observation = PendingInterpretationValidationObservation(candidate, result)
+        return result
+
+    appended_state_id = uuid.uuid4()
+    decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, observe, policy=policy, appended_state_id=appended_state_id)
+    return PendingInterpretationPolicyPlan(command, snapshot, policy, appended_state_id, decision, observation)
+
+
+def reprove_pending_interpretation_plan(plan: PendingInterpretationPolicyPlan) -> None:
+    """Recompute using retained validation only; no external read or write."""
+    if type(plan) is not PendingInterpretationPolicyPlan:
+        raise TypeError("pending interpretation policy plan must be exact")
+    consumed = False
+
+    def replay(candidate: SessionPendingInterpretationValidationCandidate) -> SessionPendingInterpretationValidationResult:
+        nonlocal consumed
+        observation = plan.validation
+        if consumed or type(observation) is not PendingInterpretationValidationObservation or candidate != observation.candidate:
+            raise AuditIntegrityError("pending interpretation lost its original validation candidate")
+        consumed = True
+        return observation.result
+
+    decision = _SessionPendingInterpretationPlanner.plan(
+        plan.command, plan.snapshot, replay, policy=plan.policy, appended_state_id=plan.appended_state_id
+    )
+    if decision != plan.decision or consumed != (plan.validation is not None):
+        raise AuditIntegrityError("pending interpretation changed its original policy consequence")
+
+
 @final
 class _SessionPendingInterpretationPlanner:
     """Canonical reconciliation planner; it can request validation but cannot perform DML."""
@@ -1700,9 +1767,12 @@ class _SessionPendingInterpretationPlanner:
         validator: SessionPendingInterpretationValidator,
         *,
         policy: PendingInterpretationPolicy = PendingInterpretationPolicy.RECONCILE,
+        appended_state_id: UUID | None = None,
     ) -> SessionPendingInterpretationDecision:
         if type(policy) is not PendingInterpretationPolicy:
             raise TypeError("pending interpretation policy must be exact")
+        if appended_state_id is not None and type(appended_state_id) is not UUID:
+            raise TypeError("pending interpretation appended state identity must be exact")
         if type(validator) is _SessionPendingInterpretationValidator:
             validator.assert_source_state(snapshot)
         event_id = command.event_id
@@ -2106,7 +2176,7 @@ class _SessionPendingInterpretationPlanner:
             ),
             ensure_opt_out_marker=True,
             appended_state=SessionCompositionStateCreation(
-                id=uuid.uuid4(),
+                id=uuid.uuid4() if appended_state_id is None else appended_state_id,
                 data=patched_state,
                 provenance="interpretation_resolve",
                 created_at=now,

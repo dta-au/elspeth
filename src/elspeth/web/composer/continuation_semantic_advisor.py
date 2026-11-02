@@ -11,10 +11,10 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 from urllib.parse import urlsplit
 
 from pydantic import TypeAdapter
@@ -65,6 +65,11 @@ from elspeth.web.composer.continuation_progress import ContinuationFrontier
 from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
 from elspeth.web.composer.continuation_semantic_advisor_outcome import _SemanticAdvisorInvocationCapture
 from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+from elspeth.web.composer.continuation_semantic_observation import (
+    SemanticCompleteResponseObservation,
+    SemanticProviderResponseObservation,
+    observe_semantic_provider_response,
+)
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls, build_llm_call_record
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput, prepare_provider_input
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
@@ -78,11 +83,19 @@ from elspeth.web.composer.provider_gateway import (
 )
 from elspeth.web.composer.provider_quota import (
     ProviderInvocationOwner,
+    SemanticV4Finalization,
     provider_call_scope,
     required_provider_audit_scope,
 )
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.credential_guard import CredentialMaterialRefused
+from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
+from elspeth.web.required_work import RequiredWorkTicket
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation import PreparedContinuationProvider
+    from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
+    from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
 
 _SEMANTIC_INSTRUCTIONS = (
     "Assess the complete originating request, current graph, retained obligations, evidence and actual action outcomes. "
@@ -443,7 +456,14 @@ async def run_semantic_advisor(
     on_provider_dispatch: Callable[[], None] | None = None,
     no_sdk_issuer: SemanticAdvisorNoSdkIssuer | None = None,
     _outcome: _SemanticAdvisorInvocationCapture | None = None,
-) -> SemanticAdvisorResult:
+    v4_prepared: PreparedContinuationProvider | None = None,
+    v4_env_ref_names: frozenset[str] | None = None,
+    v4_finalizer: Callable[
+        [SemanticProviderResponseObservation, RequiredWorkTicket],
+        Awaitable[RequiredSQLFinishOnce[SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal]],
+    ]
+    | None = None,
+) -> SemanticAdvisorResult | SemanticV4Finalization:
     """One actual Advisor call; no retry, source retention or action execution."""
     if (
         type(request) is not PreparedSemanticAdvisorRequest
@@ -478,6 +498,19 @@ async def run_semantic_advisor(
         if _outcome is None:
             raise AuditIntegrityError("Semantic original issuer lost its private physical capture")
         no_sdk_issuer.bind_capture(custody, _outcome)
+    if any(value is not None for value in (v4_prepared, v4_env_ref_names, v4_finalizer)):
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+
+        if (
+            type(v4_prepared) is not PreparedContinuationProvider
+            or type(v4_env_ref_names) is not frozenset
+            or v4_finalizer is None
+            or no_sdk_issuer is None
+            or no_sdk_issuer.prepared_candidate is not v4_prepared
+            or _outcome is None
+        ):
+            raise AuditIntegrityError("V4 semantic physical call requires original prepared, env and SQL owners")
+        custody.bind_continuation_semantic_v4(v4_prepared, v4_finalizer)
     options = deep_thaw(request.options)
     limit = custody.cost_completion_limit()
     expected_limit = owner._settings.composer_advisor_max_completion_tokens
@@ -531,7 +564,14 @@ async def run_semantic_advisor(
                 pricing_model=owner._settings.composer_advisor_pricing_model or prepared.model,
                 credential_surface="composer_advisor_response",
                 require_tool_calls_field=True,
+                provider_custody=custody,
             )
+            if v4_prepared is not None:
+                completeness = metadata.v4_completeness
+                if completeness is None:
+                    raise AuditIntegrityError("V4 semantic result lacks its original complete SDK return witness")
+                custody.require_v4_result_completeness(completeness)
+                completeness.require_result(metadata, content=message.content, tool_calls=tool_calls)
             # Admission has already guarded these exact prose/metadata
             # fields. Preserve allowed paid output before semantic parsing;
             # raw, unadmitted SDK tool objects never enter the observation.
@@ -634,6 +674,33 @@ async def run_semantic_advisor(
                     no_sdk_issuer.note_original_observation(custody, _outcome)
     if decision is None or call is None or metadata is None or original_content is None or decision.decision_id != call.call_id:
         raise AuditIntegrityError("Semantic Advisor result lost its original decision/audit pair")
+    if custody.continuation_semantic_v4 is not None:
+        if _outcome is None or custody.attempt is None or v4_env_ref_names is None:
+            raise AuditIntegrityError("V4 semantic result lost its original physical observation")
+        observed = observe_semantic_provider_response(
+            _outcome.snapshot(),
+            source=request.source,
+            request_sha256=request.request_sha256,
+            attempt=custody.attempt,
+            context=custody.context,
+            env_ref_names=v4_env_ref_names,
+            require_v4_completeness=True,
+        )
+        finalized = await custody.finalize_continuation_semantic_v4(observed)
+        if type(observed) is SemanticCompleteResponseObservation:
+            from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
+
+            if type(finalized.result) is SemanticAdvisorProviderResult:
+                if (
+                    finalized.result.audit_call != call
+                    or finalized.result.response != observed.response
+                    or finalized.result.decision != decision
+                ):
+                    raise AuditIntegrityError("V4 semantic complete SQL changed its original response or decision")
+                result = SemanticAdvisorResult(request.source, request.request_sha256, decision, call, observed.response)
+                if no_sdk_issuer is not None:
+                    no_sdk_issuer.note_original_result(result)
+        return finalized
     response_chunk = encode_continuation_text_response(content=original_content, provider_metadata=metadata, audit_call=call)
     result = SemanticAdvisorResult(request.source, request.request_sha256, decision, call, response_chunk)
     if no_sdk_issuer is not None:

@@ -135,6 +135,7 @@ type ComposerOperationPublicFailureType = Literal[
     "fingerprint_key_missing",
     "secret_decryption_failed",
     "composer_admission_refused",
+    "paid_result_overflow",
 ]
 COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
     (
@@ -151,6 +152,7 @@ COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
         "fingerprint_key_missing",
         "secret_decryption_failed",
         "composer_admission_refused",
+        "paid_result_overflow",
     )
 )
 

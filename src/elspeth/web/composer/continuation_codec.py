@@ -31,6 +31,11 @@ from elspeth.web.composer.continuation import (
     InitializeFrame,
     PrivateChunkRef,
 )
+from elspeth.web.composer.continuation_capture_overflow import (
+    ContinuationCaptureOverflowWitness,
+    ContinuationMandatoryCaptureOverflow,
+    require_capture_retention_capacity,
+)
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.continuation_retention_memo import (
     CanonicalTextEncodingKey,
@@ -93,9 +98,13 @@ def encode_mandatory_private_chunk(*, codec: str, value: object, env_ref_names: 
     retained-data verification. Fresh callers must establish their original
     graph/source/credential authority before invoking this resource obligation.
     """
-    from elspeth.web.composer.continuation_retention import bind_retained_json_encoding, preflight_retained_json
+    from elspeth.web.composer.continuation_retention import bind_retained_json_encoding
 
-    expected = preflight_retained_json(value, reason="retained_chunk_bytes")
+    expected = require_capture_retention_capacity(
+        bounded_canonical_json_size(value, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES),
+        reason="retained_chunk_bytes",
+        codec=codec,
+    )
     canonical = bind_retained_json_encoding(canonical_json(value), expected_bytes=expected)
     return encode_private_chunk(codec=codec, canonical=canonical, env_ref_names=env_ref_names)
 
@@ -112,6 +121,18 @@ def encode_private_chunk(
 
     proof_key = CanonicalTextEncodingKey(canonical, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
     memo = current_retention_stage_memo()
+    if utf8_size(canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+        # Measure this original text, not a reconstruction by the paid owner.
+        # Size alone does not establish canonical/credential admission.
+        raise AuditIntegrityError("private chunk exceeds the complete JSON admission bound") from ContinuationMandatoryCaptureOverflow(
+            ContinuationCaptureOverflowWitness(
+                unit="private_chunk",
+                codec=codec,
+                observed_bytes=utf8_size(canonical),
+                limit_bytes=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+                size_is_exact=True,
+            )
+        )
     proof = (
         memo.canonical_text_proof(proof_key, _private_chunk_canonical_text_bytes, sha256)
         if memo is not None and type(canonical) is str

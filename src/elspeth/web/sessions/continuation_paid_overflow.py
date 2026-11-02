@@ -9,6 +9,7 @@ No complete result, provider text, or successful-response audit is represented.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -21,13 +22,62 @@ from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.credential_guard import require_no_credential_material
 
-_CANONICAL_INTEGER_MAX = 2**53 - 1
+CANONICAL_INTEGER_MAX = 2**53 - 1
+LEDGER_TOKENS_MAX = 2**31 - 1
+MODEL_MAX_LENGTH = 256
+COST_AMOUNT_MAX_LENGTH = 128
+FINISHED_AT_MAX_LENGTH = 64
+type PaidOverflowReason = Literal["private_document_bytes", "evidence_pair_bytes", "retained_payload_bytes", "aggregate_retained_bytes"]
+type PaidOverflowRepresentation = Literal["response", "physical_audit", "recorder", "evidence_pair", "retained_tail", "retained_history"]
+type PaidOverflowCostStatus = Literal["known", "unknown"]
+type PaidOverflowUsageStatus = Literal["observed", "unavailable"]
 _UUID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 _SHA256 = r"^[0-9a-f]{64}$"
 type _Identity = Annotated[str, Field(pattern=_UUID, min_length=36, max_length=36)]
 type _Digest = Annotated[str, Field(pattern=_SHA256, min_length=64, max_length=64)]
-type _Ordinal = Annotated[int, Field(ge=0, le=_CANONICAL_INTEGER_MAX)]
-type _LedgerTokens = Annotated[int, Field(ge=0, le=2**31 - 1)]
+type _Ordinal = Annotated[int, Field(ge=0, le=CANONICAL_INTEGER_MAX)]
+type _LedgerTokens = Annotated[int, Field(ge=0, le=LEDGER_TOKENS_MAX)]
+
+
+def encode_paid_overflow_cost_amount(value: float | Decimal) -> str:
+    """Canonical bounded decimal text without expanding a scientific value.
+
+    Float observations use their shortest round-tripping decimal spelling,
+    matching the actual audit amount rather than asserting extra precision.
+    The exponent range covers finite binary64 observations, including their
+    subnormals. Decimal callers must stay inside this same bounded domain.
+    """
+    if type(value) is float:
+        amount = Decimal(str(value))
+    elif type(value) is Decimal:
+        amount = value
+    else:
+        raise TypeError("paid overflow cost requires a float or Decimal observation")
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("paid overflow cost must be finite and nonnegative")
+    if not amount:
+        return "0"
+    adjusted = amount.adjusted()
+    if not -324 <= adjusted <= 308 or amount > Decimal("1.7976931348623157e308"):
+        raise ValueError("paid overflow cost exponent exceeds the observation domain")
+    parts = amount.as_tuple()
+    digits = "".join(str(digit) for digit in parts.digits).rstrip("0")
+    if len(digits) > COST_AMOUNT_MAX_LENGTH:
+        raise ValueError("paid overflow cost exceeds its text budget")
+    if -6 <= adjusted < 21:
+        point = adjusted + 1
+        if point <= 0:
+            encoded = "0." + "0" * -point + digits
+        elif point >= len(digits):
+            encoded = digits + "0" * (point - len(digits))
+        else:
+            encoded = digits[:point] + "." + digits[point:]
+    else:
+        coefficient = digits[0] + ("." + digits[1:] if len(digits) > 1 else "")
+        encoded = coefficient + "e" + str(adjusted)
+    if len(encoded) > COST_AMOUNT_MAX_LENGTH:
+        raise ValueError("paid overflow cost exceeds its text budget")
+    return encoded
 
 
 class PaidOverflowIdentity(BaseModel):
@@ -55,8 +105,8 @@ class PaidOverflowCost(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
 
-    status: Literal["known", "unknown"]
-    amount: Annotated[str, Field(max_length=128, pattern=r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")] | None
+    status: PaidOverflowCostStatus
+    amount: Annotated[str, Field(max_length=COST_AMOUNT_MAX_LENGTH, pattern=r"^(0|[1-9][0-9]*)(\.[0-9]+)?(e-?[0-9]+)?$")] | None
     source: ComposerLLMProviderCostSource
 
     @model_validator(mode="after")
@@ -64,6 +114,11 @@ class PaidOverflowCost(BaseModel):
         if self.status == "known":
             if self.amount is None or self.source == "not_available":
                 raise ValueError("known overflow cost requires an amount and provenance")
+            # Published v1 admitted all bounded fixed-decimal spellings.
+            # Preserve those bytes on read; scientific notation is new and
+            # must already use the canonical spelling from its first writer.
+            if "e" in self.amount and encode_paid_overflow_cost_amount(Decimal(self.amount)) != self.amount:
+                raise ValueError("known overflow cost requires canonical amount text")
         elif self.amount is not None or self.source != "not_available":
             raise ValueError("unknown overflow cost cannot assert an amount or provenance")
         return self
@@ -81,14 +136,14 @@ class PaidOverflowUsage(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
 
-    status: Literal["observed", "unavailable"]
-    model: Annotated[str, Field(min_length=1, max_length=256)] | None
+    status: PaidOverflowUsageStatus
+    model: Annotated[str, Field(min_length=1, max_length=MODEL_MAX_LENGTH)] | None
     prompt_tokens: _LedgerTokens | None
     completion_tokens: _LedgerTokens | None
     cached_prompt_tokens: _LedgerTokens | None
     reasoning_tokens: _LedgerTokens | None
     # The quota owner's database-clock-bound completion time, not provider time.
-    finished_at: Annotated[str, Field(min_length=1, max_length=64)] | None
+    finished_at: Annotated[str, Field(min_length=1, max_length=FINISHED_AT_MAX_LENGTH)] | None
 
     @field_validator("model")
     @classmethod
@@ -128,15 +183,15 @@ class PaidOverflowReceipt(BaseModel):
 
     schema_version: Literal["composer.paid-overflow.v1"]
     identity: PaidOverflowIdentity
-    producer: Literal["primary", "title", "semantic_advisor", "manual_advisor"]
+    producer: Literal["primary", "title", "semantic_advisor", "manual_advisor", "checkpoint_advisor"]
     outcome: Literal["terminal_paid_overflow"]
     evidence_status: Literal["incomplete"]
     retryable: Literal[False]
-    reason: Literal["private_document_bytes", "evidence_pair_bytes", "retained_payload_bytes"]
-    representation: Literal["response", "physical_audit", "recorder", "evidence_pair", "retained_tail"]
+    reason: PaidOverflowReason
+    representation: PaidOverflowRepresentation
     measurement: Literal["exact", "at_least"]
     observed_bytes: _Ordinal
-    limit_bytes: Annotated[int, Field(ge=1, le=_CANONICAL_INTEGER_MAX)]
+    limit_bytes: Annotated[int, Field(ge=1, le=CANONICAL_INTEGER_MAX)]
     cost: PaidOverflowCost
     usage: PaidOverflowUsage | None = None
 
@@ -151,6 +206,14 @@ class PaidOverflowReceipt(BaseModel):
     def _observed_overflow(self) -> Self:
         if self.observed_bytes <= self.limit_bytes:
             raise ValueError("overflow observation must exceed its original limit")
+        # Only SQL's admission of the complete success batch can establish
+        # this history-wide lower bound. The codec validates its closed shape,
+        # not the inventory, original allowance or hold-credit proof.
+        if self.reason == "aggregate_retained_bytes":
+            if self.representation != "retained_history" or self.measurement != "at_least" or self.observed_bytes != self.limit_bytes + 1:
+                raise ValueError("aggregate overflow requires its saturated retained-history lower bound")
+        elif self.representation == "retained_history":
+            raise ValueError("retained-history observation requires its aggregate overflow reason")
         return self
 
 
@@ -181,6 +244,13 @@ def encode_paid_overflow_receipt(
     except ValidationError as error:
         raise AuditIntegrityError("paid overflow receipt violates its owned contract") from error
     _bind(checked, expected)
+    if checked.cost.amount is not None:
+        try:
+            canonical_amount = encode_paid_overflow_cost_amount(Decimal(checked.cost.amount))
+        except ValueError as error:
+            raise AuditIntegrityError("paid overflow writer requires canonical amount text") from error
+        if canonical_amount != checked.cost.amount:
+            raise AuditIntegrityError("paid overflow writer requires canonical amount text")
     encoded = canonical_json(checked.model_dump(mode="json"))
     if utf8_size(encoded, limit=max_bytes) > max_bytes:
         raise AuditIntegrityError("paid overflow receipt exceeds its byte budget")
@@ -206,6 +276,9 @@ def decode_paid_overflow_receipt(
         receipt = PaidOverflowReceipt.model_validate(value)
     except ValidationError as cause:
         raise AuditIntegrityError("paid overflow receipt violates its owned contract") from cause
-    if encode_paid_overflow_receipt(receipt, expected=expected, max_bytes=max_bytes) != encoded:
+    _bind(receipt, expected)
+    # Read canonical JSON while preserving the published v1 fixed-decimal
+    # amount spelling. The new writer's numeric spelling is a stricter gate.
+    if canonical_json(receipt.model_dump(mode="json")) != encoded:
         raise AuditIntegrityError("paid overflow receipt is not canonical")
     return receipt

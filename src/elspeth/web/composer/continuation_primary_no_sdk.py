@@ -22,6 +22,7 @@ from elspeth.web.sessions.continuation import PreparedContinuationProvider, Stor
 
 if TYPE_CHECKING:
     from elspeth.web.composer.provider_quota import ProviderCallCustody
+    from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission
 
 
 class PrimaryNoSdkRefusalReason(Enum):
@@ -185,14 +186,37 @@ class PrimaryNoSdkIssuer:
                 raise AuditIntegrityError("PRIMARY no-SDK issuer changed its actual committed dispatch")
             self._dispatched = dispatched
 
-    def bind_custody(self, custody: ProviderCallCustody) -> None:
-        from elspeth.web.composer.provider_quota import ProviderCallCustody
-
+    def bind_cold_recovered_dispatched(self, dispatched: StoredContinuationSnapshot) -> None:
+        """Replace only an equal in-worker candidate after a trusted cold SQL proof."""
         with self._lock:
             if (
                 self._state != "open"
                 or self._prepared is None
-                or self._dispatched is None
+                or self._dispatched is not None
+                or type(dispatched) is not StoredContinuationSnapshot
+                or self._dispatched_candidate is None
+                or self._dispatched_candidate != dispatched
+            ):
+                raise AuditIntegrityError("PRIMARY cold admission did not match its original SQL dispatch candidate")
+            self._dispatched_candidate = dispatched
+            self.bind_dispatched(dispatched)
+
+    def bind_custody(self, custody: ProviderCallCustody) -> None:
+        from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+        from elspeth.web.composer.provider_quota import ProviderCallCustody
+
+        with self._lock:
+            v4_prepared = False
+            if self._prepared is not None:
+                root = decode_continuation_snapshot(self._prepared.snapshot.payload_json)
+                v4_prepared = (
+                    type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is ContinuationAdmissionPolicyV4
+                )
+            if (
+                self._state != "open"
+                or self._prepared is None
+                or (self._dispatched is None and not v4_prepared)
                 or self._custody is not None
                 or type(custody) is not ProviderCallCustody
                 or custody.context is not self.running.session_operation_context
@@ -200,6 +224,61 @@ class PrimaryNoSdkIssuer:
             ):
                 raise AuditIntegrityError("PRIMARY no-SDK issuer cannot bind a foreign physical custody")
             self._custody = custody
+
+    def reserve_v4_refusal(
+        self, *, admission: V4PrimaryProviderAdmission, reason: PrimaryNoSdkRefusalReason, original_failure: BaseException
+    ) -> PrimaryNoSdkRefusalPermit:
+        """Reserve a proven unentered admitted attempt before one atomic SQL cancellation."""
+        from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+        from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission
+
+        with self._lock:
+            if self._prepared is None:
+                raise AuditIntegrityError("V4 PRIMARY no-SDK refusal has no original prepared source")
+            root = decode_continuation_snapshot(self._prepared.snapshot.payload_json)
+            if (
+                type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is not ContinuationAdmissionPolicyV4
+                or type(admission) is not V4PrimaryProviderAdmission
+                or self._state != "open"
+                or self._dispatched is None
+                or self._dispatched != admission.selected
+                or self._custody is None
+                or self._attempt_id is None
+                or self._attempt_id != admission.attempt.attempt_id
+                or self._attempt_model is None
+                or self._cancelled_attempt
+                or self._permit is not None
+                or type(reason) is not PrimaryNoSdkRefusalReason
+                or (
+                    reason in (PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED, PrimaryNoSdkRefusalReason.PRE_SDK_DEADLINE)
+                    and type(original_failure) is not TimeoutError
+                )
+                or (reason is PrimaryNoSdkRefusalReason.CHARGEABLE_REFUSED and type(original_failure) is not ChargeableAdmissionRefused)
+                or (reason is PrimaryNoSdkRefusalReason.COST_REFUSED and type(original_failure) is not CommonProviderCostRefused)
+                or (reason is PrimaryNoSdkRefusalReason.STORAGE_FAILURE and not isinstance(original_failure, SQLAlchemyError))
+                or (reason is PrimaryNoSdkRefusalReason.INTEGRITY_REFUSED and not isinstance(original_failure, AuditIntegrityError))
+                or (reason is PrimaryNoSdkRefusalReason.CANCELLED_BEFORE_SDK and type(original_failure) is not asyncio.CancelledError)
+                or (
+                    reason is PrimaryNoSdkRefusalReason.RETAINED_TAIL_UNBOUNDED
+                    and type(original_failure) is not ContinuationRetainedTailUnbounded
+                )
+            ):
+                raise AuditIntegrityError("V4 PRIMARY no-SDK refusal lacks proved unentered admitted custody")
+            self._custody.require_v4_primary_unentered(admission)
+            permit = PrimaryNoSdkRefusalPermit(
+                self,
+                self._prepared,
+                self._dispatched,
+                reason,
+                original_failure,
+                str(uuid4()),
+                self._attempt_id,
+                self._attempt_model,
+            )
+            self._permit = permit
+            self._state = "refusing"
+            return permit
 
     def note_admitted_attempt(self, custody: ProviderCallCustody, attempt: ProviderAttempt, *, model: str) -> None:
         with self._lock:

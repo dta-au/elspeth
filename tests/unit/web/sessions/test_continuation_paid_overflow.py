@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
-from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_limits import (
+    CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES,
+    CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+)
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.sessions.continuation_paid_overflow import (
+    CANONICAL_INTEGER_MAX,
     PaidOverflowCost,
     PaidOverflowIdentity,
     PaidOverflowReceipt,
     PaidOverflowUsage,
     decode_paid_overflow_receipt,
+    encode_paid_overflow_cost_amount,
     encode_paid_overflow_receipt,
 )
 
@@ -63,6 +69,112 @@ def test_round_trip_preserves_cost_and_observation(receipt, measurement, known):
     assert restored.cost.amount == ("0.000123" if known else None)
     assert restored.retryable is False
     assert len(encoded.encode("utf-8")) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+
+
+@pytest.mark.parametrize("allowance", [1, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, CANONICAL_INTEGER_MAX - 1])
+def test_aggregate_overflow_round_trip_is_original_allowance_plus_one(receipt, allowance):
+    original = receipt.model_copy(
+        update={
+            "reason": "aggregate_retained_bytes",
+            "representation": "retained_history",
+            "measurement": "at_least",
+            "observed_bytes": allowance + 1,
+            "limit_bytes": allowance,
+        }
+    )
+    encoded = encode_paid_overflow_receipt(original, expected=receipt.identity)
+    restored = decode_paid_overflow_receipt(encoded, expected=receipt.identity)
+    assert restored == original
+    assert restored.cost == receipt.cost
+    assert restored.identity == receipt.identity
+    assert len(encoded.encode("utf-8")) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("reason", "private_document_bytes"),
+        ("reason", "retained_payload_bytes"),
+        ("representation", "response"),
+        ("representation", "retained_tail"),
+        ("measurement", "exact"),
+        ("observed_bytes", 100),
+        ("observed_bytes", 102),
+        ("observed_bytes", True),
+        ("limit_bytes", 0),
+    ],
+)
+def test_aggregate_overflow_rejects_mixed_or_fabricated_measurements(receipt, field, changed):
+    value = receipt.model_dump(mode="json")
+    value.update(
+        reason="aggregate_retained_bytes",
+        representation="retained_history",
+        measurement="at_least",
+        observed_bytes=101,
+        limit_bytes=100,
+    )
+    value[field] = changed
+    with pytest.raises(AuditIntegrityError, match="owned contract"):
+        decode_paid_overflow_receipt(canonical_json(value), expected=receipt.identity)
+
+
+def test_aggregate_saturation_cannot_exceed_canonical_integer_domain(receipt):
+    value = receipt.model_dump(mode="json")
+    value.update(
+        reason="aggregate_retained_bytes",
+        representation="retained_history",
+        measurement="at_least",
+        observed_bytes=CANONICAL_INTEGER_MAX + 1,
+        limit_bytes=CANONICAL_INTEGER_MAX,
+    )
+    # Strict JSON permits this integer, while the owned canonical domain does
+    # not. Bypass the trusted canonical writer to exercise actual admission.
+    with pytest.raises(AuditIntegrityError, match="owned contract"):
+        decode_paid_overflow_receipt(json.dumps(value), expected=receipt.identity)
+    unchecked = receipt.model_copy(
+        update={
+            "reason": "aggregate_retained_bytes",
+            "representation": "retained_history",
+            "measurement": "at_least",
+            "observed_bytes": CANONICAL_INTEGER_MAX + 1,
+            "limit_bytes": CANONICAL_INTEGER_MAX,
+        }
+    )
+    with pytest.raises(AuditIntegrityError, match="owned contract"):
+        encode_paid_overflow_receipt(unchecked, expected=receipt.identity)
+
+
+def test_aggregate_schema_extends_vocabulary_without_relaxing_document_caps():
+    definitions = PaidOverflowReceipt.model_json_schema()["$defs"]
+    assert "aggregate_retained_bytes" in definitions["PaidOverflowReason"]["enum"]
+    assert "retained_history" in definitions["PaidOverflowRepresentation"]["enum"]
+    assert CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES == 1_048_576
+    assert CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES == 1_048_576
+
+
+def test_checkpoint_advisor_is_a_distinct_closed_producer(receipt):
+    assert PaidOverflowReceipt.model_json_schema()["properties"]["producer"]["enum"] == [
+        "primary",
+        "title",
+        "semantic_advisor",
+        "manual_advisor",
+        "checkpoint_advisor",
+    ]
+    for producer in ("checkpoint_advisor", "manual_advisor"):
+        original = receipt.model_copy(update={"producer": producer})
+        encoded = encode_paid_overflow_receipt(original, expected=receipt.identity)
+        restored = decode_paid_overflow_receipt(encoded, expected=receipt.identity)
+        assert restored == original
+        assert restored.producer == producer
+        assert restored.identity == receipt.identity
+
+
+@pytest.mark.parametrize("producer", ["early_advisor", "end_advisor", "checkpoint", "checkpoint_advisor_early", "CHECKPOINT_ADVISOR"])
+def test_checkpoint_producer_does_not_admit_phase_or_spelling_aliases(receipt, producer):
+    value = receipt.model_dump(mode="json")
+    value["producer"] = producer
+    with pytest.raises(AuditIntegrityError, match="owned contract"):
+        decode_paid_overflow_receipt(canonical_json(value), expected=receipt.identity)
 
 
 @pytest.mark.parametrize(
@@ -130,6 +242,72 @@ def test_rejects_malformed_status_and_observation(receipt, field, changed):
 def test_unknown_cost_is_not_zero_and_known_cost_is_exact(receipt, cost):
     value = receipt.model_dump(mode="json")
     value["cost"] = cost
+    with pytest.raises(AuditIntegrityError, match="owned contract"):
+        decode_paid_overflow_receipt(canonical_json(value), expected=receipt.identity)
+
+
+@pytest.mark.parametrize(
+    ("amount", "expected"),
+    [
+        (0.0, "0"),
+        (0.000123, "0.000123"),
+        (1e-7, "1e-7"),
+        (1e308, "1e308"),
+        (float("1.7976931348623157e308"), "1.7976931348623157e308"),
+        (float("5e-324"), "5e-324"),
+        (Decimal("1.2300e30"), "1.23e30"),
+    ],
+)
+def test_known_cost_uses_bounded_canonical_decimal_or_scientific_text(receipt, amount, expected):
+    encoded_amount = encode_paid_overflow_cost_amount(amount)
+    assert encoded_amount == expected
+    assert encode_paid_overflow_cost_amount(Decimal(encoded_amount)) == expected
+    cost = PaidOverflowCost(status="known", amount=encoded_amount, source="response_usage.cost")
+    original = receipt.model_copy(update={"cost": cost})
+    encoded = encode_paid_overflow_receipt(original, expected=receipt.identity)
+    restored = decode_paid_overflow_receipt(encoded, expected=receipt.identity)
+    assert restored.cost == cost
+    assert restored.cost.status == "known"
+    assert len(encoded_amount) <= 128
+    assert len(encoded.encode("utf-8")) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+
+
+@pytest.mark.parametrize(
+    "amount",
+    [float("nan"), float("inf"), -float("inf"), -0.1, Decimal("1e999999"), Decimal("1e-999999")],
+)
+def test_cost_encoder_refuses_nonfinite_negative_and_huge_exponents(amount):
+    with pytest.raises(ValueError):
+        encode_paid_overflow_cost_amount(amount)
+
+
+@pytest.mark.parametrize(
+    "amount",
+    ["NaN", "Infinity", "-1", "1e999999", "1e-999999", "1e309", "1.8e308", "1e+308", "1e0308", "0e0"],
+)
+def test_cost_decoder_rejects_nonfinite_out_of_domain_or_noncanonical_amount(receipt, amount):
+    value = receipt.model_dump(mode="json")
+    value["cost"] = {"status": "known", "amount": amount, "source": "response_usage.cost"}
+    with pytest.raises(AuditIntegrityError, match="owned contract"):
+        decode_paid_overflow_receipt(canonical_json(value), expected=receipt.identity)
+
+
+@pytest.mark.parametrize("amount", ["1.00", "0.000", "1234567890123456789012", "9" * 128, "0." + "0" * 125 + "1"])
+def test_published_v1_fixed_decimal_amounts_remain_readable_verbatim(receipt, amount):
+    value = receipt.model_dump(mode="json")
+    value["cost"] = {"status": "known", "amount": amount, "source": "response_usage.cost"}
+    encoded = canonical_json(value)
+    restored = decode_paid_overflow_receipt(encoded, expected=receipt.identity)
+    assert restored.cost.amount == amount
+    assert canonical_json(restored.model_dump(mode="json")) == encoded
+    with pytest.raises(AuditIntegrityError, match="canonical amount text"):
+        encode_paid_overflow_receipt(restored, expected=receipt.identity)
+
+
+@pytest.mark.parametrize("amount", ["01", "+1", "1.", ".1", " 1", "1 ", "1" * 129, "1E2"])
+def test_v1_fixed_decimal_compatibility_does_not_accept_old_invalid_forms(receipt, amount):
+    value = receipt.model_dump(mode="json")
+    value["cost"] = {"status": "known", "amount": amount, "source": "response_usage.cost"}
     with pytest.raises(AuditIntegrityError, match="owned contract"):
         decode_paid_overflow_receipt(canonical_json(value), expected=receipt.identity)
 

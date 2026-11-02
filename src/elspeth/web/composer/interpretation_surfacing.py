@@ -7,13 +7,23 @@ provenance at construction; state and operation fences remain per call.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
+from weakref import WeakKeyDictionary
 
-from elspeth.contracts.composer_interpretation import InterpretationKind, InterpretationSource, InterpretationSurfaceOrigin
+from pydantic import TypeAdapter
+
+from elspeth.contracts.composer_interpretation import (
+    InterpretationEventRecord,
+    InterpretationKind,
+    InterpretationSource,
+    InterpretationSurfaceOrigin,
+)
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.invariants import InvariantError
@@ -40,6 +50,50 @@ from elspeth.web.interpretation_state import (
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.protocol import PreparedInterpretationEventDraft, SessionServiceProtocol
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class PendingInterpretationReviewObservation:
+    """Original pending SQL cohort and findings from the same read."""
+
+    session_id: str | None
+    state_sha256: str
+    events: tuple[InterpretationEventRecord, ...]
+    missing_sites: tuple[tuple[str, str, InterpretationKind], ...]
+
+    @property
+    def source_sha256(self) -> str:
+        return stable_hash(
+            {
+                "session_id": self.session_id,
+                "state_sha256": self.state_sha256,
+                "events": TypeAdapter(tuple[InterpretationEventRecord, ...]).dump_python(self.events, mode="json"),
+            }
+        )
+
+
+_review_observations: WeakKeyDictionary[
+    PendingInterpretationReviewObservation, tuple[InterpretationSurfacing, str, tuple[tuple[str, str, InterpretationKind], ...]]
+] = WeakKeyDictionary()
+
+
+def require_original_pending_review_observation(
+    observation: PendingInterpretationReviewObservation,
+    *,
+    owner: InterpretationSurfacing,
+    state: CompositionState,
+    session_id: str | None,
+) -> None:
+    source = _review_observations.get(observation) if type(observation) is PendingInterpretationReviewObservation else None
+    if (
+        source is None
+        or source[0] is not owner
+        or source[1] != observation.source_sha256
+        or source[2] != observation.missing_sites
+        or observation.session_id != session_id
+        or observation.state_sha256 != stable_hash(state.to_dict())
+    ):
+        raise AuditIntegrityError("pending review observation lost its original SQL cohort")
 
 
 def _has_pending_prompt_template_requirement(options: Mapping[str, Any], *, user_term: str) -> bool:
@@ -727,9 +781,21 @@ class InterpretationSurfacing:
     ) -> tuple[tuple[str, str, InterpretationKind], ...]:
         """Return pending interpretation handoffs that cannot be resolved."""
 
+        return (await self.observe_pending_interpretation_review_sites(state, session_id=session_id)).missing_sites
+
+    async def observe_pending_interpretation_review_sites(
+        self,
+        state: CompositionState,
+        *,
+        session_id: str | None,
+    ) -> PendingInterpretationReviewObservation:
+        """Keep the exact read that produced the orphan precheck; grant no write."""
+
         sites = interpretation_sites(state)
         if session_id is None:
-            return ()
+            observation = PendingInterpretationReviewObservation(None, stable_hash(state.to_dict()), (), ())
+            _review_observations[observation] = (self, observation.source_sha256, observation.missing_sites)
+            return observation
         sessions_service = self._sessions_service_required()
         events = await sessions_service.list_interpretation_events(UUID(session_id), status="pending")
         pending_sites = {
@@ -753,7 +819,11 @@ class InterpretationSurfacing:
             )
             if wiring_count != 1:
                 missing_or_unresolvable[event_site_key] = None
-        return tuple(missing_or_unresolvable)
+        observation = PendingInterpretationReviewObservation(
+            session_id, stable_hash(state.to_dict()), tuple(events), tuple(missing_or_unresolvable)
+        )
+        _review_observations[observation] = (self, observation.source_sha256, observation.missing_sites)
+        return observation
 
     async def _auto_surface_prompt_template_reviews(
         self,

@@ -2315,7 +2315,9 @@ owners.
 """
 
 
-def _parameter_rebound(owner: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
+def _parameter_rebound(
+    owner: ast.FunctionDef | ast.AsyncFunctionDef, name: str, *, unrelated_field_writes: frozenset[str] = frozenset()
+) -> bool:
     for child in _walk_same_scope(owner):
         if isinstance(child, ast.Name) and child.id == name and isinstance(child.ctx, (ast.Store, ast.Del)):
             return True
@@ -2337,10 +2339,12 @@ def _parameter_rebound(owner: ast.FunctionDef | ast.AsyncFunctionDef, name: str)
                 root = root.value
             if isinstance(root, ast.Name) and root.id == name:
                 return True
-    return _subject_rebound(owner, name)
+    return _subject_rebound(owner, name, unrelated_field_writes=unrelated_field_writes)
 
 
-def _subject_rebound(owner: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
+def _subject_rebound(
+    owner: ast.FunctionDef | ast.AsyncFunctionDef, name: str, *, unrelated_field_writes: frozenset[str] = frozenset()
+) -> bool:
     parameters = {
         argument.arg
         for argument in (
@@ -2370,6 +2374,13 @@ def _subject_rebound(owner: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -
 
     for child in _walk_same_scope(owner):
         if isinstance(child, ast.Attribute) and isinstance(child.ctx, (ast.Store, ast.Del)):
+            if (
+                isinstance(child.ctx, ast.Store)
+                and isinstance(child.value, ast.Name)
+                and child.value.id == name
+                and child.attr in unrelated_field_writes
+            ):
+                continue
             root: ast.expr = child
             while isinstance(root, ast.Attribute):
                 root = root.value
@@ -2519,26 +2530,78 @@ def _non_landscape_scalar_attribute_read(node: ast.Attribute, resolver: _Resolve
     if not (arithmetic or formatted):
         return False
 
-    def receiver_owner(expression: ast.expr) -> str | None:
+    policy_owners = frozenset(
+        "elspeth.web.composer.continuation_policy." + name
+        for name in (
+            "ContinuationAdmissionPolicy",
+            "ContinuationAdmissionPolicyV2",
+            "ContinuationAdmissionPolicyV3",
+            "ContinuationAdmissionPolicyV4",
+        )
+    )
+
+    def annotation_owners(annotation: ast.expr, source: _Resolver, use: ast.AST) -> frozenset[str] | None:
+        if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+            left = annotation_owners(annotation.left, source, use)
+            right = annotation_owners(annotation.right, source, use)
+            if left is None or right is None or not (left | right) <= policy_owners:
+                return None
+            return left | right
+        qualified = source.qualified_name(annotation, use=use)
+        return frozenset({qualified}) if qualified is not None else None
+
+    def receiver_owners(expression: ast.expr) -> frozenset[str] | None:
         if isinstance(expression, ast.Name):
             parameter = resolver.parameter(expression.id, node)
-            owner = _owner_function(parameter) if parameter is not None else None
-            if owner is None or _parameter_rebound(owner, expression.id):
+            if parameter is None:
+                return None
+            function_owner = _owner_function(parameter)
+            if function_owner is None:
                 return None
             located = _method_receiver(node)
             if located is not None and expression.id == located[1]:
                 module = resolver.unit.path.removeprefix("src/").removesuffix(".py").replace("/", ".")
-                return module + "." + _symbol(located[0])
-            return resolver.qualified_name(parameter.annotation, use=node) if parameter.annotation is not None else None
+                path: ast.expr = node
+                while isinstance(path, ast.Attribute) and not isinstance(path.value, ast.Name):
+                    path = path.value
+                if not isinstance(path, ast.Attribute) or not isinstance(path.value, ast.Name) or path.value.id != expression.id:
+                    return None
+                # A method may update its other plain declared fields while
+                # reading self.policy.segment.reserve. Aliased/dynamic writes,
+                # deletion, and any write to the actual receiver path refuse.
+                unrelated = frozenset(
+                    member.target.id
+                    for member in located[0].body
+                    if isinstance(member, ast.AnnAssign)
+                    and member.value is None
+                    and isinstance(member.target, ast.Name)
+                    and member.target.id != path.attr
+                )
+                if _parameter_rebound(function_owner, expression.id, unrelated_field_writes=unrelated):
+                    return None
+                return frozenset({module + "." + _symbol(located[0])})
+            if _parameter_rebound(function_owner, expression.id):
+                return None
+            return annotation_owners(parameter.annotation, resolver, node) if parameter.annotation is not None else None
         if isinstance(expression, ast.Attribute):
-            owner = proof.class_for(receiver_owner(expression.value))
-            field = proof.member(*owner, expression.attr) if owner is not None else None
-            if field is not None and isinstance(field[0], ast.AnnAssign) and field[0].value is None:
-                return field[2].qualified_name(field[0].annotation, use=field[0])
+            receivers = receiver_owners(expression.value)
+            if not receivers:
+                return None
+            results: set[str] = set()
+            for qualified in receivers:
+                owner = proof.class_for(qualified)
+                field = proof.member(*owner, expression.attr) if owner is not None else None
+                if field is None or not isinstance(field[0], ast.AnnAssign) or field[0].value is not None:
+                    return None
+                members = annotation_owners(field[0].annotation, field[2], field[0])
+                if members is None:
+                    return None
+                results.update(members)
+            return frozenset(results)
         return None
 
-    qualified = receiver_owner(node.value)
-    if (qualified, node.attr) != ("elspeth.web.composer.continuation_policy.ContinuationSegmentPolicy", "reserve"):
+    qualified = "elspeth.web.composer.continuation_policy.ContinuationSegmentPolicy"
+    if receiver_owners(node.value) != frozenset({qualified}):
         return False
     owner = proof.class_for(qualified)
     field = proof.member(*owner, node.attr) if owner is not None else None
@@ -32845,6 +32908,121 @@ def test_reserve_scalar_collision_requires_a_source_owned_scalar_read(annotation
     assert all(_non_landscape_scalar_attribute_read(node, _resolver_for_unit(unit), proof) is admitted for node in reads)
     violations = _mutation_callable_escapes((policy, unit))
     assert bool(violations) is not admitted, violations
+
+
+@pytest.mark.parametrize("receiver_kind", ("parameter", "owner_field"))
+@pytest.mark.parametrize(
+    ("annotation", "statement", "admitted"),
+    (
+        ("P1 | P2", "return VALUE + 1.0", True),
+        ("P1 | P2 | P3 | P4", 'return f"{VALUE:g} s"', True),
+        ("P4 | (P3 | P2) | P1", "return 1.0 + VALUE", True),
+        ("P1 | Unknown", "return VALUE + 1.0", False),
+        ("P1 | None", "return VALUE + 1.0", False),
+        ("P1 | Foreign", "return VALUE + 1.0", False),
+        ("P1 | P2", "return VALUE()", False),
+        ("P1 | P2", "return VALUE", False),
+        ("P1 | P2", "callback = VALUE\nreturn callback()", False),
+        ("P1 | P2", "ROOT = foreign\nreturn VALUE + 1.0", False),
+        ("P1 | P2", "POLICY.segment = foreign\nreturn VALUE + 1.0", False),
+    ),
+)
+def test_reserve_scalar_policy_unions_require_every_owned_arm(receiver_kind, annotation, statement, admitted):
+    policy = _read_source("src/elspeth/web/composer/continuation_policy.py")
+    prefix = (
+        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy as P1, "
+        "ContinuationAdmissionPolicyV2 as P2, ContinuationAdmissionPolicyV3 as P3, "
+        "ContinuationAdmissionPolicyV4 as P4, ContinuationSegmentPolicy\n"
+        "class Foreign:\n    segment: ContinuationSegmentPolicy\n"
+    )
+    selected = "selected" if receiver_kind == "parameter" else "self.policy"
+    body = (
+        statement.replace("VALUE", selected + ".segment.reserve")
+        .replace("POLICY", selected)
+        .replace("ROOT", "selected" if receiver_kind == "parameter" else "self")
+    )
+    if receiver_kind == "parameter":
+        source = prefix + f"def probe(selected: {annotation}):\n" + textwrap.indent(body, "    ") + "\n"
+    else:
+        source = prefix + f"class Owner:\n    policy: {annotation}\n    def probe(self):\n" + textwrap.indent(body, "        ") + "\n"
+    unit = _parse_source("src/elspeth/web/reserve_union_control.py", source)
+    proof = _AuthorityProof((policy, unit))
+    reads = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Attribute) and node.attr == "reserve"]
+    assert reads
+    assert all(_non_landscape_scalar_attribute_read(node, _resolver_for_unit(unit), proof) is admitted for node in reads)
+
+
+@pytest.mark.parametrize(
+    "policy_name",
+    ("ContinuationAdmissionPolicy", "ContinuationAdmissionPolicyV2", "ContinuationAdmissionPolicyV3", "ContinuationAdmissionPolicyV4"),
+)
+@pytest.mark.parametrize("replacement", ("segment: Unknown", "segment = foreign", "def segment(self):\n        return foreign"))
+def test_reserve_scalar_policy_union_refuses_one_changed_live_arm(policy_name, replacement):
+    policy = _read_source("src/elspeth/web/composer/continuation_policy.py")
+    unit = _parse_source(
+        "src/elspeth/web/reserve_union_control.py",
+        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, "
+        "ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4\n"
+        "def probe(selected: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4):\n"
+        "    return selected.segment.reserve + 1.0\n",
+    )
+    [read] = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Attribute) and node.attr == "reserve"]
+    assert _non_landscape_scalar_attribute_read(read, _resolver_for_unit(unit), _AuthorityProof((policy, unit)))
+    changed_tree = copy.deepcopy(policy.tree)
+    owner = next(node for node in changed_tree.body if isinstance(node, ast.ClassDef) and node.name == policy_name)
+    [field] = [
+        node for node in owner.body if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "segment"
+    ]
+    owner.body[owner.body.index(field)] = ast.parse(replacement).body[0]
+    changed = _parse_source(policy.path, ast.unparse(changed_tree))
+    assert not _non_landscape_scalar_attribute_read(read, _resolver_for_unit(unit), _AuthorityProof((changed, unit)))
+    assert _non_landscape_scalar_attribute_read(read, _resolver_for_unit(unit), _AuthorityProof((policy, unit)))
+
+
+@pytest.mark.parametrize(
+    ("statement", "admitted"),
+    (
+        ("self.elapsed = 1.0", True),
+        ("self.policy = foreign", False),
+        ("self.policy.segment = foreign", False),
+        ("self = foreign", False),
+        ("del self.elapsed", False),
+        ("alias = self\nalias.elapsed = 1.0", False),
+        ("setattr(self, 'elapsed', 1.0)", False),
+        ("self.policy['segment'] = foreign", False),
+    ),
+)
+def test_reserve_scalar_policy_union_allows_only_disjoint_declared_self_writes(statement, admitted):
+    policy = _read_source("src/elspeth/web/composer/continuation_policy.py")
+    source = (
+        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV4\n"
+        "class Owner:\n"
+        "    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV4\n"
+        "    elapsed: float\n"
+        "    def probe(self):\n" + textwrap.indent(statement, "        ") + "\n        return self.policy.segment.reserve + 1.0\n"
+    )
+    unit = _parse_source("src/elspeth/web/reserve_union_control.py", source)
+    [read] = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Attribute) and node.attr == "reserve"]
+    assert _non_landscape_scalar_attribute_read(read, _resolver_for_unit(unit), _AuthorityProof((policy, unit))) is admitted
+
+
+def test_reserve_scalar_policy_unions_cover_actual_policy_settings_and_sql_deadline():
+    policy = _read_source("src/elspeth/web/composer/continuation_policy.py")
+    settings = _read_source("src/elspeth/web/composer/continuation_policy_settings.py")
+    deadline = _read_source("src/elspeth/web/sessions/continuation_sql_deadline.py")
+    units = (policy, settings, deadline)
+    proof = _AuthorityProof(units)
+    for unit, symbol, expected in (
+        (settings, "_require_first_segment_fits_its_chain", 2),
+        (deadline, "ContinuationSQLDeadlineOwner.begin_action", 1),
+    ):
+        owner = _reserve_node_at(unit, symbol)
+        assert owner is not None
+        reads = [node for node in ast.walk(owner) if isinstance(node, ast.Attribute) and node.attr == "reserve"]
+        assert len(reads) == expected
+        assert all(_non_landscape_scalar_attribute_read(node, _resolver_for_unit(unit), proof) for node in reads)
+    violations = _mutation_callable_escapes(units)
+    assert not [row for row in violations if "unknown mutation receiver .reserve" in row], violations
 
 
 @pytest.mark.parametrize(

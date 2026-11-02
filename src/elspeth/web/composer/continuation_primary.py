@@ -11,7 +11,7 @@ import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
@@ -22,21 +22,25 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.async_workers import run_required_sql_finish_once
+from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation import ComposeFrame
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, owned_json
+from elspeth.web.composer.continuation_evidence import decode_turn_evidence
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
 from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_primary_no_sdk import (
     PrimaryNoSdkIssuer,
     PrimaryNoSdkRefusalReason,
 )
+from elspeth.web.composer.continuation_primary_observation import observe_v4_primary_provider_result
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers, _CurrentProducerInputs
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -49,7 +53,8 @@ from elspeth.web.composer.provider_cost import (
     continuation_common_cost_policy,
 )
 from elspeth.web.composer.provider_gateway import PreparedContinuationPrimaryRequest
-from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -63,8 +68,15 @@ from elspeth.web.sessions.continuation import (
     refuse_v3_retained_tail_before_paid,
 )
 from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
-from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, PrimaryProviderResult, primary_action_wire_message
+from elspeth.web.sessions.continuation_primary import (
+    PrimaryNoSdkRefusalReceipt,
+    PrimaryPaidOverflowTerminal,
+    PrimaryProviderResult,
+    V4PrimaryProviderAdmission,
+    primary_action_wire_message,
+)
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.service import SessionServiceImpl
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +131,7 @@ def _project[T](
                 PreparedContinuationProvider,
                 StoredContinuationSnapshot,
                 PrimaryProviderResult,
+                PrimaryPaidOverflowTerminal,
                 V3UnboundedTailRefusal,
             ):
                 raise AuditIntegrityError("primary SQL returned an unfamiliar owned result")
@@ -237,6 +250,91 @@ async def _finish_primary_no_sdk(
     raise AuditIntegrityError("PRIMARY no-SDK refusal lost its exact terminal receipt")
 
 
+async def _finish_v4_primary_no_sdk(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    required_work: RequiredWorkBinding,
+    issuer: PrimaryNoSdkIssuer,
+    custody: ProviderCallCustody,
+    admission: V4PrimaryProviderAdmission,
+    reason: PrimaryNoSdkRefusalReason,
+    original_failure: BaseException,
+    original_cancellations: tuple[asyncio.CancelledError, ...] = (),
+) -> PrimaryNoSdkRefusalReceipt:
+    """Dispose the actual admitted, unentered H and physical attempt together."""
+    deadline_owner = required_work.coordinator.sql_deadline_owner
+    if deadline_owner is not None:
+        deadline_owner.begin_settlement()
+    permit = issuer.reserve_v4_refusal(admission=admission, reason=reason, original_failure=original_failure)
+    sessions = service._require_sessions_service()
+    if type(sessions) is not SessionServiceImpl:
+        raise AuditIntegrityError("V4 PRIMARY zero-use refusal lost its original session service")
+    cancellations: list[asyncio.CancelledError] = []
+    if type(original_failure) is asyncio.CancelledError:
+        cancellations.append(original_failure)
+    cancellations.extend(item for item in original_cancellations if all(item is not prior for prior in cancellations))
+    last_failure: BaseException | None = None
+    receipt: PrimaryNoSdkRefusalReceipt | None = None
+    for attempt in range(2):
+        ticket = required_work.coordinator.reserve(
+            RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,
+            transition_ordinal=required_work.transition_ordinal,
+            semantic_ordinal=required_work.semantic_ordinal,
+            recurrence_ordinal=attempt,
+        )
+        outcome = await sessions.cancel_v4_continuation_primary_unentered(
+            prepared=permit.prepared,
+            admission=admission,
+            permit=permit,
+            required_work=ticket,
+        )
+        required_work.coordinator.validate_undispatched_cancellation_sql_outcome(ticket=ticket, actual_outcome=outcome)
+        if type(outcome) is RequiredSQLReturned:
+            if type(outcome.value) is not PrimaryNoSdkRefusalReceipt:
+                raise AuditIntegrityError("V4 PRIMARY zero-use SQL returned a foreign terminal")
+            receipt = outcome.value
+            cancellations.extend(item for item in outcome.deferred_cancellations if all(item is not prior for prior in cancellations))
+            break
+        if type(outcome) is not RequiredSQLRaised:
+            raise AuditIntegrityError("V4 PRIMARY zero-use SQL lost its finish-once outcome")
+        last_failure = outcome.error
+        cancellations.extend(item for item in outcome.deferred_cancellations if all(item is not prior for prior in cancellations))
+        read_sql, read_projection = required_work.reserve_pair(
+            RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION
+        )
+        observed = await run_required_sql_finish_once(read_sql, authority.read_continuation_primary_no_sdk_refusal, permit)
+        readback, read_failure, read_deferred = _project_no_sdk_sql(
+            required_work, read_sql, read_projection, observed, expected=PrimaryNoSdkRefusalReceipt, allow_none=True
+        )
+        cancellations.extend(item for item in read_deferred if all(item is not prior for prior in cancellations))
+        if read_failure is not None:
+            raise BaseExceptionGroup("V4 PRIMARY zero-use refusal and readback failed", [last_failure, read_failure])
+        if readback is not None:
+            receipt = readback
+            break
+    if receipt is None:
+        if last_failure is not None:
+            raise last_failure
+        raise AuditIntegrityError("V4 PRIMARY zero-use refusal lost its exact terminal")
+    # A returned SQL result is still verified cold before in-memory custody is closed.
+    read_sql, read_projection = required_work.reserve_pair(
+        RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION
+    )
+    cold = await run_required_sql_finish_once(read_sql, authority.read_continuation_primary_no_sdk_refusal, permit)
+    proved, failure, deferred = _project_no_sdk_sql(
+        required_work, read_sql, read_projection, cold, expected=PrimaryNoSdkRefusalReceipt, allow_none=True
+    )
+    cancellations.extend(item for item in deferred if all(item is not prior for prior in cancellations))
+    if failure is not None:
+        raise failure
+    if proved is None or proved != receipt:
+        raise AuditIntegrityError("V4 PRIMARY zero-use refusal changed its exact cold terminal")
+    issuer.mark_refusal_committed(permit)
+    custody.note_v4_primary_no_sdk(proved, admission)
+    return replace(proved, deferred_cancellations=tuple(cancellations))
+
+
 def _pre_sdk_failure(
     error: BaseException, *, preparing: bool
 ) -> tuple[PrimaryNoSdkRefusalReason, BaseException, tuple[asyncio.CancelledError, ...]] | None:
@@ -301,7 +399,7 @@ async def _read_primary_candidate(
 def _current_cost_budget(
     conn: Connection,
     selected: SelectedContinuationState,
-    policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+    policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
     existing: CommonProviderCostBudget | None,
 ) -> CommonProviderCostBudget:
     source = read_continuation_cost_snapshot_on_connection(conn, selected.stack)
@@ -402,10 +500,8 @@ def _freeze_input(
         )
 
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
-    if type(policy) is ContinuationAdmissionPolicyV2:
-        cost_policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 = policy
-    elif type(policy) is ContinuationAdmissionPolicyV3:
-        cost_policy = policy
+    if type(policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
+        cost_policy = cast("ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4", policy)
     else:
         if selected.stack.active_action_json is not None:
             raise AuditIntegrityError("legacy PRIMARY cannot consume a current prescribed action")
@@ -427,6 +523,130 @@ def _freeze_input(
         return prepared_from_current(current_inputs, current_budget, action_json=action_json, reprove_after=False)
 
 
+async def _run_v4_primary_after_prepared(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    prepared: PreparedContinuationProvider,
+    invocation: PreparedPrimaryInvocation,
+    recorder: BufferingRecorder,
+    drained: RecorderDrainCursors,
+    required_work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+    issuer: PrimaryNoSdkIssuer,
+    clock: ContinuationActionClock,
+    deadline: float,
+    env_ref_names: frozenset[str],
+    on_sdk_entry: Callable[[], None] | None,
+) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal | PrimaryNoSdkRefusalReceipt:
+    """Keep one pre-SDK H and one in-scope paid observation on the same custody."""
+    custody: ProviderCallCustody | None = None
+    sessions = service._require_sessions_service()
+    if type(sessions) is not SessionServiceImpl:
+        raise AuditIntegrityError("V4 PRIMARY result lost its original session service")
+    try:
+        custody = provider_owner.mint(ProviderInvocationFamily.PRIMARY)
+        custody.bind_continuation_primary_clock(clock)
+        custody.bind_primary_no_sdk_issuer(issuer)
+        frame = selected.stack.frames[-1]
+        if type(frame) is not ComposeFrame:
+            raise AuditIntegrityError("V4 PRIMARY dispatch lost its original compose frame")
+        by_ref = {chunk.reference: chunk for chunk in selected.chunks}
+        previous = decode_turn_evidence(by_ref[frame.evidence], env_ref_names=env_ref_names, source_chunks=selected.chunks)
+        state = _state_from_tool_json(by_ref[frame.state].canonical, env_ref_names=env_ref_names)
+        now = time.monotonic()
+        remaining = deadline - now
+        deadline_owner = required_work.coordinator.sql_deadline_owner
+        if deadline_owner is not None:
+            remaining = min(remaining, deadline_owner.remaining_dispatch(monotonic_now=now))
+        if remaining <= 0:
+            raise TimeoutError("V4 PRIMARY action allowance expired before provider admission")
+        provider_input = invocation.request.provider_input
+        service._provider_gateway.verify_input(provider_input)
+        if canonical_json(invocation.messages) != canonical_json(provider_input.evidence.messages) or canonical_json(
+            invocation.tools
+        ) != canonical_json(provider_input.tools if provider_input.tools is not None else ()):
+            raise AuditIntegrityError("V4 PRIMARY invocation changed its original admitted wire")
+
+        async def finalizer(
+            outcome: _CallModelOutcome, sql: RequiredWorkTicket
+        ) -> RequiredSQLFinishOnce[PrimaryProviderResult | PrimaryPaidOverflowTerminal]:
+            admission = custody.continuation_primary_v4_admission
+            if type(admission) is not V4PrimaryProviderAdmission:
+                raise AuditIntegrityError("V4 PRIMARY result lost its exact admitted H")
+            witness = outcome.completion.provider_metadata.v4_completeness
+            if type(witness) is not V4ProviderResultCompleteness:
+                raise AuditIntegrityError("V4 PRIMARY result lacks its original complete SDK return")
+            custody.require_v4_result_completeness(witness)
+            snapshot = recorder.snapshot_for_continuation(drained=drained)
+            observation = observe_v4_primary_provider_result(
+                outcome=outcome,
+                recorder=snapshot,
+                previous_evidence=previous,
+                context=issuer.running.session_operation_context,
+                env_ref_names=env_ref_names,
+            )
+            return await sessions.finalize_v4_continuation_primary(
+                prepared=prepared,
+                admission=admission,
+                outcome=outcome,
+                recorder=snapshot,
+                observation=observation,
+                env_ref_names=env_ref_names,
+                required_work=sql,
+            )
+
+        custody.bind_continuation_primary_v4(prepared, finalizer)
+        actual = await service._provider_gateway._call_llm_outcome_with_audit(
+            provider_input.evidence.messages,
+            provider_input.tools if provider_input.tools is not None else [],
+            timeout=remaining,
+            recorder=recorder,
+            provider_custody=custody,
+            credential_state=state,
+            continuation_input_sha256=invocation.request.input_sha256,
+            prepared_input=provider_input,
+            on_sdk_entry=on_sdk_entry,
+        )
+    except BaseException as error:
+        failure = _pre_sdk_failure(error, preparing=False)
+        if custody is not None and custody.continuation_primary_v4_admission is not None and custody.has_v4_unentered_hold():
+            if failure is not None:
+                return await _finish_v4_primary_no_sdk(
+                    service=service,
+                    authority=authority,
+                    required_work=required_work,
+                    issuer=issuer,
+                    custody=custody,
+                    admission=custody.continuation_primary_v4_admission,
+                    reason=failure[0],
+                    original_failure=failure[1],
+                    original_cancellations=failure[2],
+                )
+        elif issuer.can_refuse() and failure is not None:
+            return await _finish_primary_no_sdk(
+                authority=authority,
+                required_work=required_work,
+                issuer=issuer,
+                reason=failure[0],
+                original_failure=failure[1],
+                original_cancellations=failure[2],
+            )
+        raise
+    result = custody.continuation_primary_v4_result
+    if type(result) is PrimaryProviderResult:
+        if result.outcome is not actual:
+            raise AuditIntegrityError("V4 PRIMARY complete result changed its original paid outcome")
+    elif type(result) is PrimaryPaidOverflowTerminal:
+        admission = custody.continuation_primary_v4_admission
+        if type(admission) is not V4PrimaryProviderAdmission or result.receipt.identity.attempt_id != admission.attempt.attempt_id:
+            raise AuditIntegrityError("V4 PRIMARY paid terminal changed its original attempt")
+    else:
+        raise AuditIntegrityError("V4 PRIMARY provider returned without its exact SQL result")
+    return replace(result, deferred_cancellations=custody.continuation_primary_v4_deferred_cancellations)
+
+
 async def run_continuation_primary(
     *,
     service: ComposerServiceImpl,
@@ -441,7 +661,7 @@ async def run_continuation_primary(
     provider_owner: ProviderInvocationOwner,
     timeout: float,
     on_sdk_entry: Callable[[], None] | None = None,
-) -> PrimaryProviderResult | PrimaryNoSdkRefusalReceipt | V3UnboundedTailRefusal:
+) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal | PrimaryNoSdkRefusalReceipt | V3UnboundedTailRefusal:
     _require_owners(authority, required_work)
     running = required_work.running
     if (
@@ -462,7 +682,10 @@ async def run_continuation_primary(
     started = time.monotonic()
     clock = ContinuationActionClock(policy.actions.primary)
     budget = provider_owner.cost_budget
-    if type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3) and budget is not None:
+    if (
+        type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
+        and budget is not None
+    ):
         raise AuditIntegrityError("legacy Continuation policy cannot activate a current cost allowance")
     if timeout > policy.actions.primary.total:
         raise AuditIntegrityError("primary invocation cannot renew its retained action allowance")
@@ -517,7 +740,7 @@ async def run_continuation_primary(
     invocation = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_READ_SQL, captured)
     if type(invocation) is not PreparedPrimaryInvocation:
         raise AuditIntegrityError("primary input preparation lost its actual request")
-    if type(policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3):
+    if type(policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
         if type(invocation.cost_budget) is not CommonProviderCostBudget:
             raise AuditIntegrityError("PRIMARY input lost its original cost owner")
         if budget is None:
@@ -626,6 +849,33 @@ async def run_continuation_primary(
             issuer=issuer,
             reason=PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED,
             original_failure=error,
+        )
+    if type(policy) is ContinuationAdmissionPolicyV4:
+        try:
+            clock.finish_preparation()
+        except TimeoutError as error:
+            return await _finish_primary_no_sdk(
+                authority=authority,
+                required_work=required_work,
+                issuer=issuer,
+                reason=PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED,
+                original_failure=error,
+            )
+        return await _run_v4_primary_after_prepared(
+            service=service,
+            authority=authority,
+            selected=selected,
+            prepared=prepared,
+            invocation=invocation,
+            recorder=recorder,
+            drained=drained,
+            required_work=required_work,
+            provider_owner=provider_owner,
+            issuer=issuer,
+            clock=clock,
+            deadline=deadline,
+            env_ref_names=producers.inventory.names,
+            on_sdk_entry=on_sdk_entry,
         )
     sql, projection = required_work.reserve_pair(
         RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION

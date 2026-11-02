@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.composition_completion import _TerminalNoToolAdvisorGateOutcome
+    from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
     from elspeth.web.composer.continuation_classifier_handoff import ClassifyPostPrimary, ClassifySourceProofStop
     from elspeth.web.composer.continuation_classifier_owned_source import ClassifyReplyRefusalReady
     from elspeth.web.composer.continuation_codec import PrivateChunk
@@ -39,7 +41,12 @@ if TYPE_CHECKING:
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.composer.turn_effects import BlobDeliveryAttempt, TurnEvidence
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
-    from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer, ClassifierReplyDeadline
+    from elspeth.web.sessions.continuation_classifier_primary import (
+        ClassifierPrimaryIssuer,
+        ClassifierReplyDeadline,
+        VerifiedClassifierPaidOverflowTerminal,
+    )
+    from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
     from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal
     from elspeth.web.sessions.protocol import (
         SessionServiceProtocol,
@@ -496,6 +503,8 @@ class _ClassifierCompletionContext:
     completion_gates: CompletionGateFacts | None
     provider_owner: ProviderInvocationOwner | None
     completion_capture: _ClassifyEndInvocationCapture | None
+    checkpoint_phase_owner: CheckpointPhaseOwner | None = None
+    checkpoint_pending: ClassifyPostPrimary | None = None
 
 
 class ComposerServiceImpl:
@@ -1100,7 +1109,14 @@ class ComposerServiceImpl:
         provider_owner: ProviderInvocationOwner | None = None,
         classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
         completion_capture: _ClassifyEndInvocationCapture | None = None,
-    ) -> _ClassifyOutcome | ClassifyPostPrimary | ClassifySourceProofStop | ClassifierReplyDeadline:
+    ) -> (
+        _ClassifyOutcome
+        | ClassifyPostPrimary
+        | ClassifySourceProofStop
+        | ClassifierReplyDeadline
+        | VerifiedClassifierPaidOverflowTerminal
+        | ClassifierNoSdkRefusalReceipt
+    ):
         """Phase P5 of the compose loop — anti-anchor + turn accounting.
 
         Three concerns share this phase because their decision flow is
@@ -1440,6 +1456,13 @@ class ComposerServiceImpl:
                             issued = await classifier_primary_issuer.invoke(
                                 branch="staged_review", prepared_input=reply_input, recorder=recorder, deadline=deadline
                             )
+                            from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+                            from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+
+                            if isinstance(issued, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
+                                if type(issued) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+                                    raise AuditIntegrityError("classifier PRIMARY returned a non-nominal terminal")
+                                return issued
                             completion = issued.completion
                     except provider_failures:
                         if classifier_primary_issuer is not None:
@@ -1534,7 +1557,7 @@ class ComposerServiceImpl:
                 selected_final_messages, selected_final_tools, final_delivery, final_input = self._prepare_primary_delivery(
                     messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence, state=state, failed_turn=failed_turn
                 )
-                completion = await self._call_llm_before_deadline(
+                last_chance_result = await self._call_llm_before_deadline(
                     selected_final_messages,
                     selected_final_tools,
                     state,
@@ -1550,6 +1573,14 @@ class ComposerServiceImpl:
                     prepared_input=final_input,
                     classifier_primary_issuer=classifier_primary_issuer,
                 )
+                from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+                from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+
+                if isinstance(last_chance_result, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
+                    if type(last_chance_result) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+                        raise AuditIntegrityError("classifier PRIMARY returned a non-nominal terminal")
+                    return last_chance_result
+                completion = last_chance_result
                 recovery_result = self._terminal_recovery_result(
                     completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
                 )
@@ -1688,6 +1719,7 @@ class ComposerServiceImpl:
             failed_turn=failed_turn,
             completion_gates=completion_gates,
             provider_owner=provider_owner,
+            checkpoint_phase_owner=context.checkpoint_phase_owner,
         )
         classified = _ClassifyOutcome(
             action="return",
@@ -1711,6 +1743,7 @@ class ComposerServiceImpl:
         primary_response: PrivateChunk | None,
         completion_capture: _ClassifyEndInvocationCapture,
         deadline: float,
+        checkpoint_phase_owner: CheckpointPhaseOwner | None = None,
     ) -> _ClassifyOutcome:
         """Run the original tail after its independently proved pending cut.
 
@@ -1787,6 +1820,8 @@ class ComposerServiceImpl:
             completion_gates=bindings.completion_gates,
             provider_owner=bindings.provider_owner,
             completion_capture=completion_capture,
+            checkpoint_phase_owner=checkpoint_phase_owner,
+            checkpoint_pending=pending if type(pending) is ClassifyPostPrimary else None,
         )
         if type(pending) is ClassifyReplyRefusalReady:
             if primary_response is not None or not _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes):
@@ -1846,7 +1881,6 @@ class ComposerServiceImpl:
         session_scope = context.session_scope
         session_id = context.session_id
         user_id = context.user_id
-        mutation_success_seen = context.mutation_success_seen
         repair_turns_used = context.repair_turns_used
         composition_turns_used = context.composition_turns_used
         discovery_turns_used = context.discovery_turns_used
@@ -1862,9 +1896,14 @@ class ComposerServiceImpl:
         persisted_assistant_content = persist.persisted_assistant_content
         persisted_tool_call_turn = persist.persisted_tool_call_turn
         failed_turn = persist.failed_turn
-        turn_has_mutation = context.dispatch.turn_has_mutation
-        turn_has_discovery = context.dispatch.turn_has_discovery
         advisor_gate = None
+        checkpoint_caller = None
+        if context.checkpoint_phase_owner is not None:
+            from elspeth.web.composer.continuation_checkpoint_end_locals import IterationEndCallerLocals
+
+            if context.checkpoint_pending is None or context.checkpoint_pending.branch != "staged_review":
+                raise AuditIntegrityError("staged END checkpoint lost its original iteration continuation")
+            checkpoint_caller = IterationEndCallerLocals(context.checkpoint_pending)
         if reply is not None:
             try:
                 advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
@@ -1894,6 +1933,8 @@ class ComposerServiceImpl:
                     deadline=deadline,
                     completion_gates=completion_gates,
                     provider_owner=provider_owner,
+                    checkpoint_phase_owner=context.checkpoint_phase_owner,
+                    checkpoint_caller=checkpoint_caller,
                 )
             except _AdvisorCheckpointComposeDeadlineExpired:
                 await self._completion._persist_withheld_reply(
@@ -1911,6 +1952,34 @@ class ComposerServiceImpl:
                     llm_calls=recorder.llm_calls,
                     failed_turn=failed_turn,
                 ) from None
+        return await self._continue_staged_classifier_after_advisor_gate(
+            context=context, reply=reply, runtime_result=runtime_result, advisor_gate=advisor_gate
+        )
+
+    async def _continue_staged_classifier_after_advisor_gate(
+        self,
+        *,
+        context: _ClassifierCompletionContext,
+        reply: _AdmittedAssistantMessage | None,
+        runtime_result: ValidationResult | None,
+        advisor_gate: _TerminalNoToolAdvisorGateOutcome | None,
+    ) -> _ClassifyOutcome:
+        """Resume this original caller after END without another PRIMARY or gate."""
+        session_operation_context = context.session_operation_context
+        state = context.dispatch.state
+        session_id, persist = context.session_id, context.persist
+        progress, recorder = context.progress, context.recorder
+        initial_version, user_id = context.initial_version, context.user_id
+        runtime_preflight_cache = context.runtime_preflight_cache
+        session_scope, message = context.session_scope, context.message
+        mutation_success_seen = context.mutation_success_seen
+        repair_turns_used = context.repair_turns_used
+        plugin_snapshot, deadline = context.plugin_snapshot, context.deadline
+        completion_gates = context.completion_gates
+        turn_has_mutation, turn_has_discovery = context.dispatch.turn_has_mutation, context.dispatch.turn_has_discovery
+        persisted_assistant_message_id = persist.persisted_assistant_message_id
+        persisted_assistant_content = persist.persisted_assistant_content
+        persisted_tool_call_turn = persist.persisted_tool_call_turn
         if advisor_gate is not None and advisor_gate.action == "return":
             if advisor_gate.result is None:
                 raise InvariantError("Staged reply review omitted its terminal result")
@@ -2039,7 +2108,6 @@ class ComposerServiceImpl:
         session_scope = context.session_scope
         session_id = context.session_id
         user_id = context.user_id
-        mutation_success_seen = context.mutation_success_seen
         repair_turns_used = context.repair_turns_used
         composition_turns_used = context.composition_turns_used
         discovery_turns_used = context.discovery_turns_used
@@ -2057,6 +2125,13 @@ class ComposerServiceImpl:
         failed_turn = persist.failed_turn
         last_runtime_preflight = context.dispatch.last_runtime_preflight
         new_composition_turns_used = composition_turns_used + 1
+        checkpoint_caller = None
+        if context.checkpoint_phase_owner is not None:
+            from elspeth.web.composer.continuation_checkpoint_end_locals import IterationEndCallerLocals
+
+            if context.checkpoint_pending is None or context.checkpoint_pending.branch != "composition_last_chance":
+                raise AuditIntegrityError("last-chance END checkpoint lost its original iteration continuation")
+            checkpoint_caller = IterationEndCallerLocals(context.checkpoint_pending)
         try:
             if retained is None:
                 runtime_result = await self._preflight.turn_runtime_preflight(
@@ -2102,6 +2177,8 @@ class ComposerServiceImpl:
                 deadline=deadline,
                 completion_gates=completion_gates,
                 provider_owner=provider_owner,
+                checkpoint_phase_owner=context.checkpoint_phase_owner,
+                checkpoint_caller=checkpoint_caller,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             # The model had already replied; the timeout envelope
@@ -2121,6 +2198,33 @@ class ComposerServiceImpl:
                 llm_calls=recorder.llm_calls,
                 failed_turn=failed_turn,
             ) from None
+        return await self._continue_last_chance_classifier_after_advisor_gate(
+            context=context, assistant_message=assistant_message, advisor_gate=advisor_gate
+        )
+
+    async def _continue_last_chance_classifier_after_advisor_gate(
+        self,
+        *,
+        context: _ClassifierCompletionContext,
+        assistant_message: _AdmittedAssistantMessage,
+        advisor_gate: _TerminalNoToolAdvisorGateOutcome,
+    ) -> _ClassifyOutcome:
+        """Resume the retained last-chance caller at its actual post-END cut."""
+        session_operation_context = context.session_operation_context
+        state = context.dispatch.state
+        session_id, persist = context.session_id, context.persist
+        progress, recorder = context.progress, context.recorder
+        initial_version, user_id = context.initial_version, context.user_id
+        last_runtime_preflight = context.dispatch.last_runtime_preflight
+        runtime_preflight_cache = context.runtime_preflight_cache
+        session_scope, message = context.session_scope, context.message
+        mutation_success_seen = context.mutation_success_seen
+        repair_turns_used = context.repair_turns_used
+        plugin_snapshot, deadline = context.plugin_snapshot, context.deadline
+        completion_gates = context.completion_gates
+        persisted_assistant_message_id = persist.persisted_assistant_message_id
+        persisted_assistant_content = persist.persisted_assistant_content
+        persisted_tool_call_turn = persist.persisted_tool_call_turn
         if advisor_gate.action == "return":
             advisor_result = advisor_gate.result
             classified = _ClassifyOutcome(
@@ -2248,7 +2352,7 @@ class ComposerServiceImpl:
         provider_owner: ProviderInvocationOwner | None = None,
         prepared_input: PreparedProviderInput | None = None,
         classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
-    ) -> _AdmittedLLMCompletion:
+    ) -> _AdmittedLLMCompletion | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
         """Preserve the completion-returning deadline boundary."""
         outcome = await self._call_llm_outcome_before_deadline(
             messages,
@@ -2264,6 +2368,13 @@ class ComposerServiceImpl:
             prepared_input=prepared_input,
             classifier_primary_issuer=classifier_primary_issuer,
         )
+        from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+        from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+
+        if isinstance(outcome, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
+            if type(outcome) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+                raise AuditIntegrityError("classifier PRIMARY returned a non-nominal terminal")
+            return outcome
         return outcome.completion
 
     async def _call_llm_outcome_before_deadline(
@@ -2281,7 +2392,7 @@ class ComposerServiceImpl:
         provider_owner: ProviderInvocationOwner | None = None,
         prepared_input: PreparedProviderInput | None = None,
         classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
-    ) -> _CallModelOutcome:
+    ) -> _CallModelOutcome | VerifiedClassifierPaidOverflowTerminal | ClassifierNoSdkRefusalReceipt:
         """Call the LLM with a per-call timeout derived from the deadline.
 
         The Gateway retains admitted provider accounting and joins its owned
@@ -2344,6 +2455,13 @@ class ComposerServiceImpl:
                         deadline=deadline,
                         credential_state=state,
                     )
+                    from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidOverflowTerminal
+                    from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+
+                    if isinstance(issued, (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt)):
+                        if type(issued) not in (VerifiedClassifierPaidOverflowTerminal, ClassifierNoSdkRefusalReceipt):
+                            raise AuditIntegrityError("classifier PRIMARY returned a non-nominal terminal")
+                        return issued
                     return issued.outcome
                 if attempt and prepared_input is not None:
                     prepared_input = self._provider_gateway.reprepare_input(prepared_input)

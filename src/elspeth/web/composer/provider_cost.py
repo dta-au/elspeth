@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3
+from elspeth.web.composer.continuation_policy import (
+    ContinuationAdmissionPolicyV2,
+    ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
+)
 
 if TYPE_CHECKING:
     from elspeth.web.composer.protocol import ComposerSettings
@@ -220,9 +224,11 @@ class CommonProviderCostBudget:
         self._snapshot = replace(s, charges=charges, refusal_code=code)
 
 
-def continuation_common_cost_policy(policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3) -> CommonProviderCostPolicy:
+def continuation_common_cost_policy(
+    policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+) -> CommonProviderCostPolicy:
     """Materialize the existing ledger policy from one hashed admission."""
-    if type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3):
+    if type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
         raise AuditIntegrityError("Continuation cost limits require their exact admitted costed policy")
     admitted = policy.provider_cost
     return CommonProviderCostPolicy(

@@ -99,7 +99,7 @@ def required_private_chunks(stack: ContinuationFrameStack) -> tuple[PrivateChunk
 
 
 def nested_private_chunks(chunk: PrivateChunk) -> tuple[PrivateChunkRef, ...]:
-    """Only the closed END/Advisor and application-record schemas add edges.
+    """Only closed END, Advisor, checkpoint-input and application schemas add edges.
 
     Their admitted edge codecs exclude END and Advisor, so self/cross cycles
     cannot be expressed by valid source values. Never discover refs by walking
@@ -138,6 +138,10 @@ def nested_private_chunks(chunk: PrivateChunk) -> tuple[PrivateChunkRef, ...]:
         if candidate.semantic_source is not None:
             refs.append(candidate.semantic_source.response)
         return tuple(refs)
+    if chunk.reference.codec == "composer.checkpoint-end-input.v1":
+        from elspeth.web.composer.continuation_checkpoint_end_input import checkpoint_end_input_references
+
+        return checkpoint_end_input_references(chunk)
     if chunk.reference.codec == "composer.advisor.v1":
         source = decode_continuation_advisor_invocation(chunk)
         refs = [source.state, source.evidence, source.transcript, source.iteration]

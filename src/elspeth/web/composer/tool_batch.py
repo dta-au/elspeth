@@ -1023,6 +1023,39 @@ class ContinuationBatchState:
     manual_advisor_allowance: ManualAdvisorAllowance | None = field(default=None, repr=False)
 
 
+def completed_tool_state(
+    result: ToolResult,
+    *,
+    state: CompositionState,
+    last_validation: ValidationSummary | None,
+    last_runtime_preflight: ValidationResult | None,
+    unapplied: bool,
+) -> tuple[CompositionState, ValidationSummary | None, ValidationResult | None]:
+    """Fold one completed result without dispatching or publishing anything."""
+    if unapplied:
+        return state, last_validation, last_runtime_preflight
+    return result.updated_state, result.validation, result.runtime_preflight or last_runtime_preflight
+
+
+def record_completed_tool_anchor(
+    result: ToolResult,
+    *,
+    tracker: AntiAnchorTracker,
+    tool_name: str,
+    arguments_hash: str,
+    version_before: int,
+    mutation_success_observed: bool,
+    unapplied: bool,
+) -> bool:
+    """Share the actual successful-dispatch anchor fold with detached DATA."""
+    if unapplied or not result.success:
+        tracker.record_failure(tool_name, arguments_hash)
+    elif _tool_result_mutated_composition_state(version_before=version_before, result=result):
+        tracker.record_success()
+        mutation_success_observed = True
+    return mutation_success_observed
+
+
 async def _await_started_tool_stage[T](
     awaitable: Awaitable[T],
     *,
@@ -3844,10 +3877,13 @@ async def _execute_continuation_call_live(
                     ) from preflight_exc.original_exc
                 if findings is not None:
                     result = replace(result, runtime_preflight=findings)
-            if prevalidated_unapplied_result is None:
-                state = result.updated_state
-                last_validation = result.validation
-                last_runtime_preflight = result.runtime_preflight or last_runtime_preflight
+            state, last_validation, last_runtime_preflight = completed_tool_state(
+                result,
+                state=state,
+                last_validation=last_validation,
+                last_runtime_preflight=last_runtime_preflight,
+                unapplied=prevalidated_unapplied_result is not None,
+            )
             # Mark the (plugin_type, plugin_name) pair as
             # schema-loaded for this session when a get_plugin_schema
             # call returned a discovery success. The per-turn system
@@ -3891,14 +3927,15 @@ async def _execute_continuation_call_live(
             # Mutation means a CompositionState version advance here.
             # Blob-store side effects such as create_blob/update_blob are
             # useful work, but they do not make an empty pipeline exist.
-            if prevalidated_unapplied_result is not None:
-                anti_anchor.record_failure(tool_name, audit.arguments_hash)
-            elif result.success:
-                if _tool_result_mutated_composition_state(version_before=version_before_tool, result=result):
-                    mutation_success_observed = True
-                    anti_anchor.record_success()
-            else:
-                anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            mutation_success_observed = record_completed_tool_anchor(
+                result,
+                tracker=anti_anchor,
+                tool_name=tool_name,
+                arguments_hash=audit.arguments_hash,
+                version_before=version_before_tool,
+                mutation_success_observed=mutation_success_observed,
+                unapplied=prevalidated_unapplied_result is not None,
+            )
             result_json = (
                 serialize_admitted_discovery_result(admitted_result) if admitted_result is not None else _serialize_tool_result(result)
             )

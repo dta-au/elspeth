@@ -76,11 +76,13 @@ from elspeth.web.credential_guard import require_no_credential_material_in_llm_m
 
 if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
+    from elspeth.web.composer.provider_result_admission import V4ProviderResultAdmission, V4ProviderSdkReturn
 
 __all__ = [
     "PROVIDER_STRING_TRUNCATION_MARKER",
     "AnthropicCacheMarkerPlan",
     "admit_llm_provider_metadata",
+    "admit_v4_provider_result",
     "apply_anthropic_cache_markers",
     "attach_llm_calls",
     "build_llm_call_record",
@@ -121,6 +123,30 @@ class _ReasoningMetadata(TypedDict):
     reasoning_content: str | None
     reasoning_details: Any | None
     thinking_blocks: Any | None
+
+
+def admit_v4_provider_result(
+    response: Any,
+    *,
+    choice: Any | None,
+    message: Any | None,
+    sdk_return: V4ProviderSdkReturn,
+    pricing_model: str | None = None,
+    surface: str = "composer_provider_response",
+    require_tool_calls_field: bool = True,
+) -> V4ProviderResultAdmission:
+    """Opt-in original V4 admission; legacy diagnostic callers stay unchanged."""
+    from elspeth.web.composer.provider_result_admission import admit_v4_provider_result as admit
+
+    return admit(
+        response,
+        choice=choice,
+        message=message,
+        sdk_return=sdk_return,
+        pricing_model=pricing_model,
+        surface=surface,
+        require_tool_calls_field=require_tool_calls_field,
+    )
 
 
 def token_usage_from_response(response: Any | None) -> TokenUsage:
@@ -694,6 +720,11 @@ def build_llm_call_record(
     private_request: PrivateProviderContext | None = None,
 ) -> ComposerLLMCall:
     from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+
+    if response_metadata is not None and response_metadata.v4_completeness is not None:
+        from elspeth.web.composer.provider_result_admission import diagnostic_provider_metadata
+
+        response_metadata = diagnostic_provider_metadata(response_metadata)
 
     if response_metadata is None:
         usage = token_usage_from_response(response)

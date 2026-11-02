@@ -60,7 +60,7 @@ from elspeth.web.sessions.auto_title_outcome import _AutoTitleCapture
 from elspeth.web.validation import _redact_sensitive_content, _warn_pii_shaped_content, reject_credential_shaped_content
 
 if TYPE_CHECKING:
-    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _AdmittedLLMProviderMetadata
     from elspeth.web.sessions.protocol import SessionServiceProtocol
 
 
@@ -554,6 +554,7 @@ async def _maybe_auto_title_session_required(
     error_message: str | None = None
     admitted: _AdmittedAutoTitleCompletion | None = None
     full_completion: _AdmittedLLMCompletion | None = None
+    v4_response_metadata: _AdmittedLLMProviderMetadata | None = None
     durable_audit: _ContinuationTitleAuditKwargs = {}
     try:
         async with provider_call_scope(provider_custody):
@@ -586,8 +587,39 @@ async def _maybe_auto_title_session_required(
                     # Only the physical await establishes provider transport
                     # weather. HTTP-shaped parser faults remain first party.
                     raise _AutoTitleProviderTransportError from exc
-                admitted = _admit_auto_title_completion(response)
-                if provider_custody.continuation_title is not None:
+                if provider_custody.continuation_title_v4_admission is not None:
+                    from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+
+                    try:
+                        full_completion = provider_gateway._admit_composer_llm_completion(
+                            response, pricing_model=model, provider_custody=provider_custody
+                        )
+                    except V4ProviderResultIncomplete as incomplete:
+                        # Keep bounded charge facts from the original return;
+                        # the H-backed attempt remains pending until its distinct
+                        # returned-incomplete terminal owner is integrated.
+                        v4_response_metadata = incomplete.metadata
+                        raise
+                    v4_response_metadata = full_completion.provider_metadata
+                    witness = v4_response_metadata.v4_completeness
+                    if witness is None:
+                        raise AuditIntegrityError("V4 TITLE result lacks its source-issued complete return")
+                    provider_custody.require_v4_result_completeness(witness)
+                    witness.require_result(
+                        v4_response_metadata,
+                        content=full_completion.message.content,
+                        tool_calls=full_completion.tool_batch.calls,
+                    )
+                    admitted = _AdmittedAutoTitleCompletion(
+                        content=full_completion.message.content,
+                        finish_reason=full_completion.provider_metadata.finish_reason,
+                    )
+                    provider_gateway._require_no_credential_material_in_completion(full_completion, surface="composer_auto_title_response")
+                    if full_completion.tool_batch.calls:
+                        raise _MalformedAutoTitleResponseError("TITLE returned an unsupported tool batch")
+                else:
+                    admitted = _admit_auto_title_completion(response)
+                if provider_custody.continuation_title is not None and provider_custody.continuation_title_v4_admission is None:
                     from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
 
                     try:
@@ -635,7 +667,8 @@ async def _maybe_auto_title_session_required(
                             started_ns=started_ns,
                             temperature=temperature,
                             seed=seed,
-                            response=response,
+                            response=response if provider_custody.continuation_title_v4_admission is None else None,
+                            response_metadata=v4_response_metadata,
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,

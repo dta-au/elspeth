@@ -21,6 +21,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
 )
 from elspeth.web.sessions.composer_drain import (
     COMPOSER_DRAIN_DISPOSITION_SECONDS,
@@ -43,7 +44,7 @@ class ContinuationReadResultDeadline:
 
 class ContinuationSQLDeadlineOwner:
     running: ComposerOperationRunning
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4
     drain_signal: ComposerDrainSignal
     drain_seconds: float
     hard_expires_at: float
@@ -60,14 +61,20 @@ class ContinuationSQLDeadlineOwner:
         self,
         running: ComposerOperationRunning,
         *,
-        policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+        policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
         drain_signal: ComposerDrainSignal,
         drain_seconds: float,
         hard_expires_at: float,
     ) -> None:
         if (
             type(running) is not ComposerOperationRunning
-            or type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3)
+            or type(policy)
+            not in (
+                ContinuationAdmissionPolicy,
+                ContinuationAdmissionPolicyV2,
+                ContinuationAdmissionPolicyV3,
+                ContinuationAdmissionPolicyV4,
+            )
             or type(drain_signal) is not ComposerDrainSignal
             or type(drain_seconds) not in (float, int)
             or not math.isfinite(drain_seconds)

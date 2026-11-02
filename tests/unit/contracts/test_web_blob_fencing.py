@@ -3239,7 +3239,7 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     # Epoch 78 binds quota custody and output storage reservations, retaining blob_read.
     # Epoch 79 retains Composer continuation segments, chunks, journal and snapshots;
     # epoch 80 makes Continuation the one Composer lifecycle.
-    assert SESSION_SCHEMA_EPOCH == 83
+    assert SESSION_SCHEMA_EPOCH == 84
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

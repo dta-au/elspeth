@@ -230,6 +230,7 @@ from elspeth.web.sessions.locking import (
     try_blob_custody_session_lock,
 )
 from elspeth.web.sessions.models import (
+    approvals_table,
     audit_access_log_table,
     blobs_table,
     chat_messages_table,
@@ -425,21 +426,69 @@ from elspeth.web.validation import _validate_accepted_value_content
 
 if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+    from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+    from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
+    from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkRefusalPermit
+    from elspeth.web.composer.continuation_checkpoint_observation import (
+        CheckpointIncompleteResponseObservation,
+        CheckpointReturnedResponseObservation,
+    )
+    from elspeth.web.composer.continuation_classifier_no_sdk import ClassifierNoSdkIssuer, ClassifierNoSdkRefusalPermit
     from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from elspeth.web.composer.continuation_p4_outcome import RetainedAuditOutcome
     from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
+    from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalPermit
+    from elspeth.web.composer.continuation_primary_observation import PrimaryPaidObservation
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+    from elspeth.web.composer.continuation_semantic_observation import SemanticProviderResponseObservation
+    from elspeth.web.composer.continuation_title_observation import TitleOverflowObservation
+    from elspeth.web.composer.continuation_title_values import CapturedTitleProviderResult
     from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.protocol import ComposerResult, PipelineCommitIntent
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-    from elspeth.web.sessions.continuation import ContinuationOwnerCommit, PreparedSegmentSettlement, StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation import (
+        ContinuationOwnerCommit,
+        PreparedContinuationAppend,
+        PreparedContinuationProvider,
+        PreparedSegmentSettlement,
+        StoredContinuationSnapshot,
+    )
+    from elspeth.web.sessions.continuation_checkpoint_paid import (
+        CheckpointPreparedSource,
+        PreparedCheckpointProvider,
+        PreparedCheckpointSource,
+        V4CheckpointProviderAdmission,
+    )
+    from elspeth.web.sessions.continuation_checkpoint_paid_terminal import VerifiedCheckpointPaidOverflowTerminal
+    from elspeth.web.sessions.continuation_classifier_primary import (
+        ClassifierPrimaryResult,
+        PreparedClassifierPrimaryProvider,
+        V4ClassifierProviderAdmission,
+        VerifiedClassifierPaidOverflowTerminal,
+        _PublishPermit,
+    )
+    from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
     from elspeth.web.sessions.continuation_graph_recovery_projection import GraphRecoveryProjectionInput
     from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
     from elspeth.web.sessions.continuation_p4 import P4WriterObservation
     from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
+    from elspeth.web.sessions.continuation_primary import (
+        PrimaryNoSdkRefusalReceipt,
+        PrimaryPaidOverflowTerminal,
+        PrimaryProviderResult,
+        V4PrimaryProviderAdmission,
+    )
     from elspeth.web.sessions.continuation_publication_projection import PipelinePublicationReplayData, PublicationProjectionInput
+    from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, V4SemanticProviderAdmission
+    from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
+    from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
+    from elspeth.web.sessions.continuation_title_provider import CurrentTitleNames, V4TitleProviderAdmission
     from elspeth.web.sessions.continuation_tool_failure import CommittedContinuationFailure, ContinuationFailureObservation
 
 
@@ -694,6 +743,25 @@ class _TitleSettlementWriteKwargs(TypedDict, total=False):
 @dataclass(frozen=True, slots=True)
 class _ProviderAdmissionRefused:
     refusal: ChargeableAdmissionRefused
+
+
+class MetadataPublicationUnavailable(ValueError):
+    """This original cut has no admitted pure metadata publication envelope."""
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedComposeTurnPublication:
+    """Exact prospective metadata publication; DATA, never permission to write."""
+
+    prepared: PreparedP4Value
+    original: SelectedContinuationState
+    messages: tuple[ChatMessageRecord, ...]
+    state: CompositionStateRecord
+    state_input: CompositionStateData
+    retained_outcome: RetainedAuditOutcome
+    created_at: datetime
+    base_sequence: int
+    creator_operation_id: str
 
 
 def _validate_principal_snapshot(value: tuple[str | None, PluginAvailabilitySnapshot | None]) -> None:
@@ -1839,6 +1907,372 @@ class SessionServiceImpl:
                 affected_node_id=retired.affected_node_id,
                 reason=retired.reason,
             )
+
+    def prepare_compose_turn_publication_on_connection(
+        self,
+        conn: Connection,
+        *,
+        running: ComposerOperationRunning,
+        original_selected: SelectedContinuationState,
+        prepared: PreparedP4Value,
+        env_ref_names: frozenset[str],
+    ) -> PreparedComposeTurnPublication:
+        """Plan one pure metadata publication under its original locked cut."""
+        from elspeth.web.composer.continuation_policy import (
+            ContinuationAdmissionPolicyV3,
+            ContinuationAdmissionPolicyV4,
+            decode_continuation_policy,
+        )
+        from elspeth.web.composer.continuation_selection import SelectedContinuationState
+        from elspeth.web.sessions.continuation import _require_current_continuation_running, require_snapshot_cas
+
+        if type(running) is not ComposerOperationRunning or type(original_selected) is not SelectedContinuationState:
+            raise TypeError("metadata publication preparation requires its actual original running and selection")
+        original_selected.__post_init__()
+        sid = str(running.claim.session_id)
+        self._assert_session_write_lock_held(conn, sid, caller="prepare_compose_turn_publication_on_connection")
+        _require_current_continuation_running(conn, running)
+        actual = require_snapshot_cas(
+            conn,
+            session_id=sid,
+            operation_id=running.claim.operation_id,
+            expected_checkpoint_id=original_selected.checkpoint_id,
+            expected_cursor=original_selected.stack.cursor,
+        )
+        from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
+
+        if actual.payload_json != encode_continuation_snapshot(original_selected.stack):
+            raise AuditIntegrityError("metadata publication changed its original selected root")
+        if original_selected.stack.active_action_json is not None or original_selected.stack.active_action_source is not None:
+            raise MetadataPublicationUnavailable("prepared metadata publication cannot consume an active semantic action")
+        policy = decode_continuation_policy(original_selected.stack.admission_policy_json, original_selected.stack.policy_hash)
+        if type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4:
+            raise AuditIntegrityError("prepared metadata publication requires its original bounded policy")
+        return self._prepare_metadata_publication_rows(
+            conn,
+            running=running,
+            original_selected=original_selected,
+            prepared=prepared,
+            env_ref_names=env_ref_names,
+            created_at=self._now(),
+            message_ids=tuple(uuid.uuid4() for _ in range(4)),
+            state_id=uuid.uuid4(),
+        )
+
+    def _prepare_metadata_publication_rows(
+        self,
+        conn: Connection,
+        *,
+        running: ComposerOperationRunning,
+        original_selected: SelectedContinuationState,
+        prepared: PreparedP4Value,
+        env_ref_names: frozenset[str],
+        created_at: datetime,
+        message_ids: tuple[UUID, ...],
+        state_id: UUID,
+    ) -> PreparedComposeTurnPublication:
+        from elspeth.contracts.composer_audit import ComposerToolStatus
+        from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+        from elspeth.web.composer.continuation_p4_outcome import (
+            HistoricalCheckpointData,
+            RetainedAuditOutcome,
+            decode_audit_outcome_data,
+            historical_checkpoint_columns_json,
+        )
+        from elspeth.web.composer.continuation_prepared_p4 import prepared_p4_members
+
+        context = running.session_operation_context
+        sid = str(running.claim.session_id)
+        self._assert_session_write_lock_held(conn, sid, caller="_prepare_metadata_publication_rows")
+        self._require_session_write_authority_on_connection(conn, context, session_id=sid)
+        members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
+        if (
+            prepared.session_id != sid
+            or prepared.creator_operation_id != context.fence.operation_id
+            or prepared.creator_operation_epoch != context.fence.operation_epoch
+            or len(message_ids) != 4
+            or len(set(message_ids)) != 4
+        ):
+            raise AuditIntegrityError("prepared metadata publication changed its original creator or planned identities")
+        if (
+            len(members.redacted_calls) != 1
+            or members.redacted_calls[0]["function"]["name"] != "set_metadata"
+            or len(members.redacted_rows) != 1
+            or len(members.invocations) != 1
+            or members.invocations[0].status is not ComposerToolStatus.SUCCESS
+            or len(members.private_tool_evidence) != 1
+            or members.private_tool_failures
+            or members.rejection_records
+            or members.withheld_replies
+            or members.authority_revocation is not None
+            or members.mutation_ceiling is None
+            or prepared.crash_pending
+        ):
+            raise MetadataPublicationUnavailable("prepared publication is outside the single successful metadata capability")
+        members.mutation_ceiling.validate_context(context)
+        if check_auto_mutation_on_connection(conn, context=context, ceiling=members.mutation_ceiling) is not None:
+            raise MetadataPublicationUnavailable("prepared metadata publication lacks current automatic mutation authority")
+        pending = conn.execute(
+            select(interpretation_events_table.c.id)
+            .where(
+                interpretation_events_table.c.session_id == sid,
+                interpretation_events_table.c.choice == InterpretationChoice.PENDING.value,
+            )
+            .limit(1)
+        ).first()
+        approval = conn.execute(
+            select(approvals_table.c.approval_id).where(approvals_table.c.session_id == sid, approvals_table.c.decision.is_(None)).limit(1)
+        ).first()
+        if pending is not None or approval is not None:
+            raise MetadataPublicationUnavailable("prepared metadata publication cannot retire pending reviews or approvals")
+        current = conn.execute(
+            select(composition_states_table.c.id, composition_states_table.c.version)
+            .where(composition_states_table.c.session_id == sid)
+            .order_by(composition_states_table.c.version.desc())
+            .limit(1)
+        ).one_or_none()
+        current_id = None if current is None else current.id
+        if current_id != prepared.expected_current_state_id:
+            raise StaleComposeStateError("prepared metadata publication changed its original current state")
+        if prepared.parent_composition_state_id is not None:
+            _assert_state_in_session(
+                conn, state_id=prepared.parent_composition_state_id, expected_session_id=sid, caller="metadata publication"
+            )
+        row = members.redacted_rows[0]
+        payload = row.composition_state_payload
+        if payload is None or row.visible_event is None:
+            raise AuditIntegrityError("prepared metadata publication lost its complete state and visible result")
+        lineage = payload.derived_from_state_id or current_id
+        if lineage != current_id:
+            raise AuditIntegrityError("prepared metadata publication requires its original current predecessor")
+        version = 1 if current is None else current.version + 1
+        published = prepare_content_publication(payload.data, session_id=running.claim.session_id, state_id=state_id, state_version=version)
+        state = CompositionStateRecord(
+            id=state_id,
+            session_id=running.claim.session_id,
+            version=version,
+            sources=published.sources,
+            nodes=published.nodes,
+            edges=published.edges,
+            outputs=published.outputs,
+            metadata_=published.metadata_,
+            is_valid=published.is_valid,
+            validation_errors=published.validation_errors,
+            composer_meta=published.composer_meta,
+            created_at=created_at,
+            derived_from_state_id=None if lineage is None else UUID(lineage),
+        )
+        base = self._reserve_sequence_range(conn, sid, count=4)
+        audit_content, audit_envelope = redacted_tool_invocation_content_and_envelope(members.invocations[0])
+        assistant_id = message_ids[0]
+        messages = (
+            ChatMessageRecord(
+                id=assistant_id,
+                session_id=running.claim.session_id,
+                role="assistant",
+                content=prepared.assistant_content,
+                raw_content=prepared.raw_content,
+                tool_calls=members.redacted_calls,
+                sequence_no=base,
+                writer_principal="compose_loop",
+                created_at=created_at,
+                composition_state_id=None if prepared.parent_composition_state_id is None else UUID(prepared.parent_composition_state_id),
+            ),
+            ChatMessageRecord(
+                id=message_ids[1],
+                session_id=running.claim.session_id,
+                role="tool",
+                content=row.content,
+                tool_calls=(row.visible_event.with_parent(str(assistant_id)).to_envelope(),),
+                sequence_no=base + 1,
+                writer_principal="compose_loop",
+                created_at=created_at,
+                composition_state_id=state_id,
+                tool_call_id=row.tool_call_id,
+                parent_assistant_id=assistant_id,
+            ),
+            ChatMessageRecord(
+                id=message_ids[2],
+                session_id=running.claim.session_id,
+                role="audit",
+                content="Private credential-filtered tool evidence",
+                tool_calls=(members.private_tool_evidence[0].to_envelope(),),
+                sequence_no=base + 2,
+                writer_principal="compose_loop",
+                created_at=created_at,
+                composition_state_id=state_id,
+            ),
+            ChatMessageRecord(
+                id=message_ids[3],
+                session_id=running.claim.session_id,
+                role="audit",
+                content=audit_content,
+                tool_calls=(audit_envelope,),
+                sequence_no=base + 3,
+                writer_principal="compose_loop",
+                created_at=created_at,
+                composition_state_id=state_id,
+            ),
+        )
+        outcome = RetainedAuditOutcome(
+            assistant_id=str(assistant_id),
+            unwind_audit_failed=False,
+            current_state_id=str(state_id),
+            checkpoint_disposition="committed",
+            checkpoint=HistoricalCheckpointData(
+                id=state.id,
+                session_id=state.session_id,
+                version=state.version,
+                original_columns_json=historical_checkpoint_columns_json(state),
+                is_valid=state.is_valid,
+                created_at=state.created_at,
+                derived_from_state_id=state.derived_from_state_id,
+                review_projection=None,
+                creator_operation_id=context.fence.operation_id,
+                inserted_state_ids=(state_id,),
+            ),
+            authority_revocation_json=None,
+            published_tool_rows_json=prepared.redacted_rows_json,
+            published_assistant_content=prepared.assistant_content,
+        )
+        decode_audit_outcome_data(canonical_json(outcome.model_dump(mode="json")), prepared=prepared, env_ref_names=env_ref_names)
+        return PreparedComposeTurnPublication(
+            prepared, original_selected, messages, state, payload.data, outcome, created_at, base, context.fence.operation_id
+        )
+
+    def consume_compose_turn_publication_on_connection(
+        self,
+        conn: Connection,
+        *,
+        running: ComposerOperationRunning,
+        publication: PreparedComposeTurnPublication,
+        commit: ContinuationOwnerCommit,
+        publication_append: PreparedContinuationAppend,
+        env_ref_names: frozenset[str],
+    ) -> AuditOutcome:
+        """Consume the planned rows only after the caller admits the full tail."""
+        from elspeth.web.composer.continuation_p4_outcome import encode_audit_outcome_data
+        from elspeth.web.composer.continuation_prepared_p4 import prepared_p4_members
+        from elspeth.web.sessions.continuation_p4 import require_selected_p4_input, selected_p4_drain_scope
+        from elspeth.web.sessions.continuation_prepared_tail import require_prepared_tail_append
+
+        if type(publication) is not PreparedComposeTurnPublication or commit.running is not running:
+            raise AuditIntegrityError("prepared metadata publication changed its actual SQL owner")
+        prepared = publication.prepared
+        members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
+        context = running.session_operation_context
+        sid = str(running.claim.session_id)
+        self._assert_session_write_lock_held(conn, sid, caller="consume_compose_turn_publication_on_connection")
+        if not require_prepared_tail_append(conn, session_id=sid, operation_id=running.claim.operation_id, append=publication_append):
+            raise AuditIntegrityError("metadata publication requires its admitted complete original tail")
+        with (
+            selected_p4_drain_scope(conn, commit, prepared, env_ref_names=env_ref_names),
+            self._session_composer_mutation_transaction(
+                conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE
+            ),
+        ):
+            require_selected_p4_input(
+                conn,
+                commit,
+                prepared=prepared,
+                context=context,
+                assistant_content=prepared.assistant_content,
+                raw_content=prepared.raw_content,
+                redacted_assistant_tool_calls=members.redacted_calls,
+                redacted_tool_rows=members.redacted_rows,
+                revoked_tool_rows=members.revoked_rows,
+                mutation_ceiling=members.mutation_ceiling,
+                authority_revocation=members.authority_revocation,
+                private_tool_evidence=members.private_tool_evidence,
+                private_tool_failures=members.private_tool_failures,
+                rejection_records=members.rejection_records,
+                parent_composition_state_id=prepared.parent_composition_state_id,
+                expected_current_state_id=prepared.expected_current_state_id,
+                plugin_crash_pending=prepared.crash_pending,
+                env_ref_names=env_ref_names,
+            )
+            expected = self._prepare_metadata_publication_rows(
+                conn,
+                running=running,
+                original_selected=publication.original,
+                prepared=prepared,
+                env_ref_names=env_ref_names,
+                created_at=publication.created_at,
+                message_ids=tuple(message.id for message in publication.messages),
+                state_id=publication.state.id,
+            )
+            if expected != publication:
+                raise AuditIntegrityError("prepared metadata publication changed its complete original row plan")
+            for index, message in enumerate(publication.messages):
+                if index == 1:
+                    self._insert_composition_checkpoint(
+                        conn,
+                        session_id=sid,
+                        state=publication.state_input,
+                        provenance="tool_call",
+                        created_at=publication.created_at,
+                        session_operation_context=context,
+                        state_id=publication.state.id,
+                        derived_from_state_id=None
+                        if publication.state.derived_from_state_id is None
+                        else str(publication.state.derived_from_state_id),
+                    )
+                if message.sequence_no is None:
+                    raise AuditIntegrityError("prepared metadata publication lost its exact sequence")
+                self._insert_chat_message(
+                    conn,
+                    session_id=sid,
+                    role=message.role,
+                    content=message.content,
+                    raw_content=message.raw_content,
+                    tool_calls=deep_thaw(message.tool_calls),
+                    sequence_no=message.sequence_no,
+                    writer_principal=message.writer_principal,
+                    composition_state_id=None if message.composition_state_id is None else str(message.composition_state_id),
+                    tool_call_id=message.tool_call_id,
+                    parent_assistant_id=None if message.parent_assistant_id is None else str(message.parent_assistant_id),
+                    created_at=message.created_at,
+                    session_operation_context=context,
+                    message_id=str(message.id),
+                )
+            actual_state = conn.execute(
+                select(composition_states_table).where(composition_states_table.c.id == str(publication.state.id))
+            ).one()
+            if (
+                self._row_to_state_record(actual_state) != publication.state
+                or actual_state.creator_operation_id != publication.creator_operation_id
+            ):
+                raise AuditIntegrityError("metadata publication inserted a different planned checkpoint")
+            actual_messages = conn.execute(
+                select(chat_messages_table)
+                .where(
+                    chat_messages_table.c.session_id == sid,
+                    chat_messages_table.c.sequence_no >= publication.base_sequence,
+                    chat_messages_table.c.sequence_no < publication.base_sequence + len(publication.messages),
+                )
+                .order_by(chat_messages_table.c.sequence_no)
+            ).all()
+            if tuple(chat_message_record_from_row(row) for row in actual_messages) != publication.messages:
+                raise AuditIntegrityError("metadata publication inserted a different planned transcript")
+        outcome = AuditOutcome(
+            assistant_id=str(publication.messages[0].id),
+            unwind_audit_failed=False,
+            current_state_id=str(publication.state.id),
+            checkpoint_disposition="committed",
+            checkpoint=CommittedCheckpointWitness(
+                state=self._row_to_state_record(actual_state),
+                creator_operation_id=actual_state.creator_operation_id,
+                inserted_state_ids=(publication.state.id,),
+            ),
+            authority_revocation=None,
+            published_tool_rows=members.redacted_rows,
+            published_assistant_content=prepared.assistant_content,
+        )
+        if encode_audit_outcome_data(outcome, prepared=prepared, env_ref_names=env_ref_names) != canonical_json(
+            publication.retained_outcome.model_dump(mode="json")
+        ):
+            raise AuditIntegrityError("metadata publication changed its prepared complete outcome")
+        return outcome
 
     def persist_compose_turn(
         self,
@@ -7973,8 +8407,14 @@ class SessionServiceImpl:
         prepared: PreparedTitleProvider,
         requested_model: str,
         required_work: RequiredWorkTicket,
-    ) -> TitleProviderAdmission:
-        from elspeth.web.sessions.continuation_title_provider import PreparedTitleProvider, admit_title_provider_on_connection
+    ) -> TitleProviderAdmission | V4TitleProviderAdmission:
+        from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+        from elspeth.web.sessions.continuation_title_provider import (
+            PreparedTitleProvider,
+            admit_title_provider_on_connection,
+            admit_v4_title_provider_on_connection,
+        )
 
         if type(prepared) is not PreparedTitleProvider:
             _refuse_required_sql(required_work, AuditIntegrityError("TITLE admission requires its actual prepared producer"))
@@ -7983,7 +8423,7 @@ class SessionServiceImpl:
             required_work, sources=(RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL,), session_id=context.fence.session_id, context=context
         )
 
-        def _sync() -> TitleProviderAdmission | _ProviderAdmissionRefused:
+        def _sync() -> TitleProviderAdmission | V4TitleProviderAdmission | _ProviderAdmissionRefused:
             try:
                 with (
                     self._session_process_locked_begin(context.fence.session_id) as conn,
@@ -7996,6 +8436,10 @@ class SessionServiceImpl:
                         expected_kind=SessionOperationKind.COMPOSE,
                         now=database_now(conn),
                     )
+                    root = decode_continuation_snapshot(prepared.selected.payload_json)
+                    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+                    if type(policy) is ContinuationAdmissionPolicyV4:
+                        return admit_v4_title_provider_on_connection(conn, self, prepared, model=requested_model)
                     return admit_title_provider_on_connection(conn, self, prepared, model=requested_model)
             except ChargeableAdmissionRefused as refusal:
                 try:
@@ -8008,6 +8452,260 @@ class SessionServiceImpl:
         if isinstance(outcome, _ProviderAdmissionRefused):
             raise outcome.refusal
         return outcome
+
+    async def begin_v4_continuation_primary_attempt(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        requested_model: str,
+        no_sdk_issuer: PrimaryNoSdkIssuer,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[V4PrimaryProviderAdmission | _ProviderAdmissionRefused]:
+        from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.continuation_primary import admit_v4_primary_provider_on_connection
+
+        if type(prepared) is not PreparedContinuationProvider or type(no_sdk_issuer) is not PrimaryNoSdkIssuer:
+            _refuse_required_sql(
+                required_work, AuditIntegrityError("V4 PRIMARY admission requires its original prepared and no-SDK owners")
+            )
+        context = prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_ADMISSION_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> V4PrimaryProviderAdmission | _ProviderAdmissionRefused:
+            try:
+                with (
+                    self._session_process_locked_begin(context.fence.session_id) as conn,
+                    self._session_write_lock(conn, context.fence.session_id),
+                ):
+                    self._require_session_operation_context_on_connection(
+                        conn,
+                        context,
+                        session_id=context.fence.session_id,
+                        expected_kind=SessionOperationKind.COMPOSE,
+                        now=database_now(conn),
+                    )
+                    return admit_v4_primary_provider_on_connection(conn, self, prepared, model=requested_model, no_sdk_issuer=no_sdk_issuer)
+            except ChargeableAdmissionRefused as refusal:
+                try:
+                    self._record_provider_attempt_quota_refusal_sync(context, "composer", refusal)
+                except BaseException as recorder_error:
+                    raise BaseExceptionGroup("V4 PRIMARY quota refusal recording failed", [refusal, recorder_error]) from None
+                return _ProviderAdmissionRefused(refusal)
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def begin_v4_continuation_semantic_attempt(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        requested_model: str,
+        no_sdk_issuer: SemanticAdvisorNoSdkIssuer,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[V4SemanticProviderAdmission | _ProviderAdmissionRefused]:
+        from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.continuation_semantic_advisor import admit_v4_semantic_provider_on_connection
+
+        if type(prepared) is not PreparedContinuationProvider or type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer:
+            _refuse_required_sql(
+                required_work, AuditIntegrityError("V4 semantic admission requires its original prepared and no-SDK owners")
+            )
+        context = prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_ADMISSION_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> V4SemanticProviderAdmission | _ProviderAdmissionRefused:
+            try:
+                with (
+                    self._session_process_locked_begin(context.fence.session_id) as conn,
+                    self._session_write_lock(conn, context.fence.session_id),
+                ):
+                    self._require_session_operation_context_on_connection(
+                        conn,
+                        context,
+                        session_id=context.fence.session_id,
+                        expected_kind=SessionOperationKind.COMPOSE,
+                        now=database_now(conn),
+                    )
+                    return admit_v4_semantic_provider_on_connection(
+                        conn, self, prepared, model=requested_model, no_sdk_issuer=no_sdk_issuer
+                    )
+            except ChargeableAdmissionRefused as refusal:
+                try:
+                    self._record_provider_attempt_quota_refusal_sync(context, "composer", refusal)
+                except BaseException as recorder_error:
+                    raise BaseExceptionGroup("V4 semantic quota refusal recording failed", [refusal, recorder_error]) from None
+                return _ProviderAdmissionRefused(refusal)
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def begin_v4_continuation_classifier_attempt(
+        self,
+        *,
+        prepared: PreparedClassifierPrimaryProvider,
+        requested_model: str,
+        no_sdk_issuer: ClassifierNoSdkIssuer,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[V4ClassifierProviderAdmission | _ProviderAdmissionRefused]:
+        from elspeth.web.composer.continuation_classifier_no_sdk import ClassifierNoSdkIssuer
+        from elspeth.web.sessions.continuation_classifier_primary import PreparedClassifierPrimaryProvider
+        from elspeth.web.sessions.continuation_classifier_primary_admission import admit_v4_classifier_provider_on_connection
+
+        if type(prepared) is not PreparedClassifierPrimaryProvider or type(no_sdk_issuer) is not ClassifierNoSdkIssuer:
+            _refuse_required_sql(
+                required_work, AuditIntegrityError("V4 classifier admission requires its original prepared and no-SDK owners")
+            )
+        context = prepared.prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_ADMISSION_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> V4ClassifierProviderAdmission | _ProviderAdmissionRefused:
+            try:
+                with (
+                    self._session_process_locked_begin(context.fence.session_id) as conn,
+                    self._session_write_lock(conn, context.fence.session_id),
+                ):
+                    self._require_session_operation_context_on_connection(
+                        conn,
+                        context,
+                        session_id=context.fence.session_id,
+                        expected_kind=SessionOperationKind.COMPOSE,
+                        now=database_now(conn),
+                    )
+                    return admit_v4_classifier_provider_on_connection(
+                        conn, self, prepared, model=requested_model, no_sdk_issuer=no_sdk_issuer
+                    )
+            except ChargeableAdmissionRefused as refusal:
+                try:
+                    self._record_provider_attempt_quota_refusal_sync(context, "composer", refusal)
+                except BaseException as recorder_error:
+                    raise BaseExceptionGroup("V4 classifier quota refusal recording failed", [refusal, recorder_error]) from None
+                return _ProviderAdmissionRefused(refusal)
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def read_v4_continuation_primary_admission(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[V4PrimaryProviderAdmission | None]:
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.continuation_primary_paid_overflow_admission import read_v4_primary_admission_on_connection
+
+        if type(prepared) is not PreparedContinuationProvider:
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 PRIMARY admission read requires its original prepared source"))
+        context = prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.CONTINUATION_READ_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> V4PrimaryProviderAdmission | None:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+            ):
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    context,
+                    session_id=context.fence.session_id,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=database_now(conn),
+                )
+                return read_v4_primary_admission_on_connection(conn, prepared=prepared)
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def read_v4_continuation_classifier_admission(
+        self,
+        *,
+        prepared: PreparedClassifierPrimaryProvider,
+        no_sdk_issuer: ClassifierNoSdkIssuer,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[V4ClassifierProviderAdmission | None]:
+        from elspeth.web.composer.continuation_classifier_no_sdk import ClassifierNoSdkIssuer
+        from elspeth.web.sessions.continuation_classifier_primary import PreparedClassifierPrimaryProvider
+        from elspeth.web.sessions.continuation_classifier_primary_admission import read_v4_classifier_admission_on_connection
+
+        if type(prepared) is not PreparedClassifierPrimaryProvider or type(no_sdk_issuer) is not ClassifierNoSdkIssuer:
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 classifier admission read requires its original prepared source"))
+        context = prepared.prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.CONTINUATION_READ_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> V4ClassifierProviderAdmission | None:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+            ):
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    context,
+                    session_id=context.fence.session_id,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=database_now(conn),
+                )
+                return read_v4_classifier_admission_on_connection(conn, prepared, no_sdk_issuer=no_sdk_issuer)
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def read_v4_continuation_semantic_admission(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        no_sdk_issuer: SemanticAdvisorNoSdkIssuer,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[V4SemanticProviderAdmission | None]:
+        from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.continuation_semantic_v4_admission_read import read_v4_semantic_admission_on_connection
+
+        if type(prepared) is not PreparedContinuationProvider or type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer:
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 semantic admission read requires its original prepared source"))
+        context = prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.CONTINUATION_READ_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> V4SemanticProviderAdmission | None:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+            ):
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    context,
+                    session_id=context.fence.session_id,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=database_now(conn),
+                )
+                return read_v4_semantic_admission_on_connection(conn, prepared=prepared, issuer=no_sdk_issuer)
+
+        return await run_required_sql_finish_once(required_work, _sync)
 
     def begin_run_provider_attempt_sync(self, *, session_operation_context: SessionOperationContext, run_id: UUID) -> ProviderAttempt:
         """Return the committed EXECUTE attempt identity to the pipeline worker."""
@@ -8114,6 +8812,258 @@ class SessionServiceImpl:
             raise ComposerRequiredAuditPersistenceError(
                 "composer_llm_call_persist_failed: required provider checkpoint failed", helper="llm_calls"
             ) from exc
+
+    async def finalize_v4_continuation_primary(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        admission: V4PrimaryProviderAdmission,
+        outcome: _CallModelOutcome,
+        recorder: RecorderSnapshot,
+        observation: PrimaryPaidObservation,
+        env_ref_names: frozenset[str],
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[PrimaryProviderResult | PrimaryPaidOverflowTerminal]:
+        from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+        from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
+        from elspeth.web.composer.continuation_primary_observation import PrimaryCompleteObservation, PrimaryOverflowObservation
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission, finalize_v4_primary_provider_on_connection
+
+        if (
+            type(prepared) is not PreparedContinuationProvider
+            or type(admission) is not V4PrimaryProviderAdmission
+            or type(outcome) is not _CallModelOutcome
+            or type(recorder) is not RecorderSnapshot
+            or type(observation) not in (PrimaryCompleteObservation, PrimaryOverflowObservation)
+            or type(env_ref_names) is not frozenset
+            or any(type(name) is not str for name in env_ref_names)
+        ):
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 PRIMARY finalizer requires its exact original paid source"))
+        context = prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> PrimaryProviderResult | PrimaryPaidOverflowTerminal:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=context.fence.session_id,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+                return finalize_v4_primary_provider_on_connection(
+                    conn,
+                    service=self,
+                    prepared=prepared,
+                    admission=admission,
+                    outcome=outcome,
+                    recorder=recorder,
+                    observation=observation,
+                    env_ref_names=env_ref_names,
+                )
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def finalize_v4_continuation_classifier(
+        self,
+        *,
+        prepared: PreparedClassifierPrimaryProvider,
+        admission: V4ClassifierProviderAdmission,
+        outcome: _CallModelOutcome,
+        recorder: RecorderSnapshot,
+        permit: _PublishPermit,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[ClassifierPrimaryResult | VerifiedClassifierPaidOverflowTerminal]:
+        from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+        from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
+        from elspeth.web.sessions.continuation_classifier_primary import (
+            PreparedClassifierPrimaryProvider,
+            V4ClassifierProviderAdmission,
+            _PublishPermit,
+        )
+        from elspeth.web.sessions.continuation_classifier_primary_finalization import finalize_v4_classifier_provider_on_connection
+
+        if (
+            type(prepared) is not PreparedClassifierPrimaryProvider
+            or type(admission) is not V4ClassifierProviderAdmission
+            or type(outcome) is not _CallModelOutcome
+            or type(recorder) is not RecorderSnapshot
+            or type(permit) is not _PublishPermit
+        ):
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 classifier finalizer requires its exact original paid source"))
+        context = prepared.prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> ClassifierPrimaryResult | VerifiedClassifierPaidOverflowTerminal:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=context.fence.session_id,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+                return finalize_v4_classifier_provider_on_connection(
+                    conn,
+                    service=self,
+                    prepared=prepared,
+                    admission=admission,
+                    outcome=outcome,
+                    recorder=recorder,
+                    permit=permit,
+                )
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def cancel_v4_continuation_primary_unentered(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        admission: V4PrimaryProviderAdmission,
+        permit: PrimaryNoSdkRefusalPermit,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[PrimaryNoSdkRefusalReceipt]:
+        from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkRefusalPermit
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission, refuse_v4_primary_unentered_on_connection
+
+        if (
+            type(prepared) is not PreparedContinuationProvider
+            or type(admission) is not V4PrimaryProviderAdmission
+            or type(permit) is not PrimaryNoSdkRefusalPermit
+            or permit.prepared is not prepared
+            or permit.dispatched != admission.selected
+            or permit.undispatched_attempt_id != admission.attempt.attempt_id
+        ):
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 PRIMARY zero-use refusal requires its original admitted source"))
+        context = prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+        sid = context.fence.session_id
+
+        def _sync() -> PrimaryNoSdkRefusalReceipt:
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+
+                def _append_audit_event(event_id: str, content: str, created_at: datetime) -> None:
+                    self._assert_session_write_lock_held(conn, sid, caller="cancel_v4_continuation_primary_unentered")
+                    sequence_no = self._reserve_sequence_range(conn, sid, count=1)
+                    self._insert_chat_message(
+                        conn,
+                        session_id=sid,
+                        role="audit",
+                        content=content,
+                        raw_content=None,
+                        tool_calls=None,
+                        sequence_no=sequence_no,
+                        writer_principal="compose_loop",
+                        composition_state_id=None,
+                        tool_call_id=None,
+                        parent_assistant_id=None,
+                        created_at=created_at,
+                        session_operation_context=context,
+                        message_id=event_id,
+                        audit_only=True,
+                    )
+                    with self._session_mutations(conn, session_id=sid, session_operation_context=context) as mutations:
+                        mutations.mark_session_updated(updated_at=created_at)
+
+                return refuse_v4_primary_unentered_on_connection(
+                    conn, prepared=prepared, admission=admission, permit=permit, append_audit_event=_append_audit_event
+                )
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
+    async def cancel_v4_continuation_classifier_unentered(
+        self,
+        *,
+        permit: ClassifierNoSdkRefusalPermit,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[ClassifierNoSdkRefusalReceipt]:
+        from elspeth.web.composer.continuation_classifier_no_sdk import ClassifierNoSdkRefusalPermit
+        from elspeth.web.sessions.continuation_classifier_primary_no_sdk import refuse_classifier_no_sdk_on_connection
+
+        if type(permit) is not ClassifierNoSdkRefusalPermit:
+            _refuse_required_sql(required_work, AuditIntegrityError("V4 classifier zero-use refusal requires its original permit"))
+        permit.issuer.require_refusal_permit(permit)
+        context = permit.issuer.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+        sid = context.fence.session_id
+
+        def _sync() -> ClassifierNoSdkRefusalReceipt:
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+
+                def _append_audit_event(event_id: str, content: str, created_at: datetime) -> None:
+                    self._assert_session_write_lock_held(conn, sid, caller="cancel_v4_continuation_classifier_unentered")
+                    sequence_no = self._reserve_sequence_range(conn, sid, count=1)
+                    self._insert_chat_message(
+                        conn,
+                        session_id=sid,
+                        role="audit",
+                        content=content,
+                        raw_content=None,
+                        tool_calls=None,
+                        sequence_no=sequence_no,
+                        writer_principal="compose_loop",
+                        composition_state_id=None,
+                        tool_call_id=None,
+                        parent_assistant_id=None,
+                        created_at=created_at,
+                        session_operation_context=context,
+                        message_id=event_id,
+                        audit_only=True,
+                    )
+                    with self._session_mutations(conn, session_id=sid, session_operation_context=context) as mutations:
+                        mutations.mark_session_updated(updated_at=created_at)
+
+                return refuse_classifier_no_sdk_on_connection(conn, permit, append_audit_event=_append_audit_event)
+
+        return await run_required_sql_finish_once(required_work, _sync)
 
     async def cancel_undispatched_provider_attempt(
         self,
@@ -10492,6 +11442,465 @@ class SessionServiceImpl:
         with self._session_mutations(conn, session_id=sid, session_operation_context=session_operation_context) as session_mutations:
             session_mutations.mark_session_updated(updated_at=now)
         return tuple(active_drafts)
+
+    def settle_v4_title_overflow_sync(
+        self,
+        *,
+        prepared: PreparedTitleProvider,
+        admission: V4TitleProviderAdmission,
+        observation: TitleOverflowObservation,
+        names: CurrentTitleNames,
+    ) -> VerifiedTitlePaidOverflowTerminal:
+        """Settle one observed over-limit paid TITLE result under its original lock."""
+        from elspeth.web.composer.continuation_title_observation import TitleOverflowObservation
+        from elspeth.web.sessions.continuation_title_paid_overflow_settlement import settle_v4_title_paid_overflow_on_connection
+        from elspeth.web.sessions.continuation_title_paid_overflow_terminal import read_v4_title_paid_overflow_terminal_on_connection
+        from elspeth.web.sessions.continuation_title_provider import CurrentTitleNames, V4TitleProviderAdmission
+
+        if (
+            type(prepared) is not PreparedTitleProvider
+            or type(admission) is not V4TitleProviderAdmission
+            or type(observation) is not TitleOverflowObservation
+            or type(names) is not CurrentTitleNames
+            or prepared.composer._require_sessions_service() is not self
+            or names.running is not prepared.running
+            or names.selected != admission.selected
+            or admission.attempt.attempt_id != observation.attempt_id
+        ):
+            raise AuditIntegrityError("V4 TITLE overflow settlement changed its original producer or service")
+        running = prepared.running
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn,
+                session_id=sid,
+                session_operation_context=running.session_operation_context,
+                expected_kind=SessionOperationKind.COMPOSE,
+                audit_only=True,
+            ),
+        ):
+            names.require(conn)
+            receipt = settle_v4_title_paid_overflow_on_connection(conn, prepared=prepared, admission=admission, observation=observation)
+            terminal = read_v4_title_paid_overflow_terminal_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=operation, names=names.names
+            )
+            if terminal is None or terminal.receipt != receipt or terminal.hold_state != "consumed":
+                raise AuditIntegrityError("V4 TITLE paid overflow lost its cold terminal after settlement")
+            return terminal
+
+    def complete_v4_title_result_sync(
+        self,
+        *,
+        prepared: PreparedTitleProvider,
+        admission: V4TitleProviderAdmission,
+        captured: CapturedTitleProviderResult,
+        names: CurrentTitleNames,
+    ) -> TitleAuditSettlementRequest | VerifiedTitlePaidOverflowTerminal:
+        """Retain one complete V4 TITLE response, audit, ledger and hold atomically.
+
+        The live caller must enter through a required SQL worker and project
+        the committed locator before delivering deferred cancellation. This
+        synchronous owner remains dormant until that worker is connected.
+        """
+        from elspeth.web.composer.continuation_title_values import CapturedTitleProviderResult
+        from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+        from elspeth.web.sessions.continuation_retained_capacity import (
+            ContinuationRetainedCapacityExceeded,
+            consume_provider_terminal_hold_after_complete_result,
+        )
+        from elspeth.web.sessions.continuation_title_paid_overflow_settlement import (
+            TitleAggregateCapacityObservation,
+            settle_v4_title_paid_overflow_on_connection,
+        )
+        from elspeth.web.sessions.continuation_title_paid_overflow_terminal import (
+            read_v4_title_paid_overflow_terminal_on_connection,
+        )
+        from elspeth.web.sessions.continuation_title_provider import (
+            CurrentTitleNames,
+            V4TitleProviderAdmission,
+            admit_title_audit_source_on_connection,
+            complete_title_accounting_on_connection,
+            read_title_result_on_connection,
+            retain_title_response_on_connection,
+        )
+        from elspeth.web.sessions.continuation_v4_title_complete_tail import (
+            admit_v4_title_complete_tail_on_connection,
+            build_v4_title_complete_batch,
+            preflight_v4_title_complete_batch_on_connection,
+            record_complete_tail_hold_consumed,
+            require_v4_title_complete_batch_matches_capture,
+        )
+
+        if (
+            type(prepared) is not PreparedTitleProvider
+            or type(admission) is not V4TitleProviderAdmission
+            or type(captured) is not CapturedTitleProviderResult
+            or type(names) is not CurrentTitleNames
+            or prepared.composer._require_sessions_service() is not self
+            or names.running is not prepared.running
+            or names.selected != admission.selected
+            or admission.attempt.attempt_id != captured.audit_call.call_id
+        ):
+            raise AuditIntegrityError("V4 TITLE complete settlement changed its original producer or service")
+        running = prepared.running
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn,
+                session_id=sid,
+                session_operation_context=context,
+                expected_kind=SessionOperationKind.COMPOSE,
+                audit_only=True,
+            ),
+        ):
+            names.require(conn)
+            batch = build_v4_title_complete_batch(
+                prepared=prepared, admission=admission, captured=captured, published_at=database_now(conn)
+            )
+            require_v4_title_complete_batch_matches_capture(prepared=prepared, admission=admission, captured=captured, batch=batch)
+            try:
+                preflight_v4_title_complete_batch_on_connection(conn, batch=batch)
+            except ContinuationRetainedCapacityExceeded:
+                aggregate_capacity_exceeded = True
+            else:
+                aggregate_capacity_exceeded = False
+            if aggregate_capacity_exceeded:
+                receipt = settle_v4_title_paid_overflow_on_connection(
+                    conn,
+                    prepared=prepared,
+                    admission=admission,
+                    observation=TitleAggregateCapacityObservation(
+                        captured=captured,
+                        batch=batch,
+                        source=captured.source,
+                        attempt_id=admission.attempt.attempt_id,
+                    ),
+                )
+                terminal = read_v4_title_paid_overflow_terminal_on_connection(
+                    conn, session_id=running.claim.session_id, operation_id=operation, names=names.names
+                )
+                if terminal is None or terminal.receipt != receipt or terminal.hold_state != "consumed":
+                    raise AuditIntegrityError("V4 TITLE aggregate overflow lost its cold terminal after settlement")
+                return terminal
+            with admit_v4_title_complete_tail_on_connection(conn, batch=batch):
+                retained = retain_title_response_on_connection(
+                    conn,
+                    prepared,
+                    selected=admission.selected,
+                    captured=captured,
+                    names=names.names,
+                    prepared_append=batch.received,
+                )
+                if retained.selected != StoredContinuationSnapshot(
+                    batch.received.snapshot_json, batch.received.expected_cursor + 1, batch.received.checkpoint_id
+                ):
+                    raise AuditIntegrityError("V4 TITLE complete result changed its exact received root")
+                received_names = CurrentTitleNames(running, retained.selected, names.names)
+                admitted = admit_title_audit_source_on_connection(
+                    conn, context, replace(retained, inventory=received_names), names=names.names
+                )
+                try:
+                    self._write_audit_cohort_on_connection(
+                        conn,
+                        session_id=running.claim.session_id,
+                        drafts=captured.audit_drafts,
+                        writer_principal="compose_loop",
+                        composition_state_id=None,
+                        session_operation_context=context,
+                        audit_only=True,
+                        admitted_title_source=admitted,
+                    )
+                    complete_title_accounting_on_connection(conn, admitted, prepared_append=batch.settled)
+                finally:
+                    admitted.active = False
+                settled_names = CurrentTitleNames(running, batch.final, names.names)
+                current = read_title_result_on_connection(conn, running, selected=batch.final, inventory=settled_names)
+                if not current.settled or current.settlement.result != captured.chunk:
+                    raise AuditIntegrityError("V4 TITLE complete result lost its original cold audit or ledger")
+                consume_provider_terminal_hold_after_complete_result(
+                    conn,
+                    source=admission.hold,
+                    provider_attempt_id=admission.attempt.attempt_id,
+                    consumed_at=database_now(conn),
+                )
+                record_complete_tail_hold_consumed(conn, session_id=sid, operation_id=operation, source=admission.hold)
+                return current.settlement
+
+    def complete_v4_semantic_result_sync(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        admission: V4SemanticProviderAdmission,
+        observation: SemanticProviderResponseObservation,
+        recorder: BufferingRecorder,
+        no_sdk_issuer: SemanticAdvisorNoSdkIssuer,
+    ) -> SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal:
+        """Commit original semantic paid output or incomplete terminal atomically."""
+        from elspeth.web.composer.audit import BufferingRecorder
+        from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+        from elspeth.web.composer.continuation_semantic_observation import (
+            SemanticCompleteResponseObservation,
+            SemanticIncompleteResponseObservation,
+            observe_semantic_provider_response,
+            observe_semantic_retained_tail_overflow,
+        )
+        from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
+        from elspeth.web.sessions.continuation import (
+            PreparedContinuationProvider,
+            _require_current_continuation_running,
+            require_snapshot_cas,
+        )
+        from elspeth.web.sessions.continuation_semantic_advisor import (
+            V4SemanticProviderAdmission,
+            _descriptor_data,
+        )
+        from elspeth.web.sessions.continuation_semantic_paid_overflow_settlement import (
+            settle_v4_semantic_paid_overflow_on_connection,
+        )
+        from elspeth.web.sessions.continuation_semantic_v4_complete import (
+            V4SemanticCompletePrepared,
+            persist_v4_semantic_complete_on_connection,
+            preflight_v4_semantic_complete_capacity,
+            prepare_v4_semantic_complete_on_connection,
+        )
+        from elspeth.web.sessions.models import composer_async_operations_table as semantic_jobs
+        from elspeth.web.sessions.models import composer_continuation_effects_table as semantic_effects
+        from elspeth.web.sessions.models import quota_provider_attempts_table as semantic_physical
+
+        if (
+            type(prepared) is not PreparedContinuationProvider
+            or type(admission) is not V4SemanticProviderAdmission
+            or type(observation) not in (SemanticCompleteResponseObservation, SemanticIncompleteResponseObservation)
+            or type(recorder) is not BufferingRecorder
+            or type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer
+            or no_sdk_issuer.running is not prepared.binding.running
+            or admission.hold.effect_key != prepared.binding.effect_key
+            or admission.hold.source_input_sha256 != prepared.binding.input_sha256
+        ):
+            raise AuditIntegrityError("V4 semantic result changed its original prepared owner or provider result")
+        running = prepared.binding.running
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        context = running.session_operation_context
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn,
+                session_id=sid,
+                session_operation_context=context,
+                expected_kind=SessionOperationKind.COMPOSE,
+                audit_only=True,
+            ),
+        ):
+            _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+            selected = require_snapshot_cas(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                expected_checkpoint_id=admission.selected.checkpoint_id,
+                expected_cursor=admission.selected.cursor,
+            )
+            if selected != admission.selected:
+                raise AuditIntegrityError("V4 semantic result changed its original dispatched complete root")
+            effect = conn.execute(
+                select(semantic_effects).where(
+                    semantic_effects.c.session_id == sid,
+                    semantic_effects.c.operation_id == operation,
+                    semantic_effects.c.effect_key == prepared.binding.effect_key,
+                )
+            ).one()
+            _stored, source, _physical_input = _descriptor_data(conn, sid, operation, effect)
+            original = no_sdk_issuer.require_original_v4_response_observation(prepared, admission.selected)
+            if original.source != source.invocation or original.request_sha256 != prepared.binding.input_sha256:
+                raise AuditIntegrityError("V4 semantic SQL result changed its original prepared invocation")
+            reobserved = observe_semantic_provider_response(
+                original,
+                source=original.source,
+                request_sha256=prepared.binding.input_sha256,
+                attempt=admission.attempt,
+                context=context,
+                env_ref_names=source.source.env_ref_names,
+                require_v4_completeness=True,
+            )
+            if reobserved != observation:
+                raise AuditIntegrityError("V4 semantic SQL result differs from the genuine original provider observation")
+            physical = conn.execute(select(semantic_physical).where(semantic_physical.c.attempt_id == admission.attempt.attempt_id)).one()
+            parent = conn.execute(
+                select(semantic_jobs).where(semantic_jobs.c.session_id == sid, semantic_jobs.c.operation_id == operation)
+            ).one()
+            incomplete: SemanticIncompleteResponseObservation | None
+            complete: V4SemanticCompletePrepared | None = None
+            if isinstance(observation, SemanticIncompleteResponseObservation):
+                incomplete = observation
+            else:
+                candidate = prepare_v4_semantic_complete_on_connection(
+                    conn, prepared=prepared, admission=admission, observation=observation, recorder=recorder
+                )
+                if type(candidate) is SemanticIncompleteResponseObservation:
+                    incomplete = candidate
+                elif type(candidate) is V4SemanticCompletePrepared:
+                    complete = candidate
+                    if preflight_v4_semantic_complete_capacity(conn, prepared=complete):
+                        incomplete = None
+                    else:
+                        incomplete = observe_semantic_retained_tail_overflow(
+                            observation,
+                            context=context,
+                            representation="retained_history",
+                            limit_bytes=admission.hold.allowance_bytes,
+                        )
+                else:
+                    raise AuditIntegrityError("V4 semantic result builder returned a foreign complete/overflow sum")
+            if incomplete is not None:
+                return settle_v4_semantic_paid_overflow_on_connection(
+                    conn,
+                    admission=admission,
+                    observation=incomplete,
+                    running=running,
+                    effect=effect,
+                    physical_row=physical,
+                    parent=parent,
+                )
+            if complete is None or type(observation) is not SemanticCompleteResponseObservation:
+                raise AuditIntegrityError("V4 semantic complete result lost its exact original paid response")
+            self._write_audit_cohort_on_connection(
+                conn,
+                session_id=running.claim.session_id,
+                drafts=provider_attempt_audit_drafts(observation.audit_call, context),
+                writer_principal="compose_loop",
+                composition_state_id=None,
+                session_operation_context=context,
+                audit_only=True,
+            )
+            return persist_v4_semantic_complete_on_connection(conn, prepared=prepared, admission=admission, batch=complete)
+
+    def prepare_v4_checkpoint_source_sync(self, *, prepared: PreparedCheckpointSource) -> CheckpointPreparedSource:
+        """Retain the original EARLY/END pre-call capture before paid admission.
+
+        The caller runs this under one registered continuation-state SQL ticket.
+        Detached runtime restore occurs after this committed cut and before the
+        separate physical admission. This method cannot mint a quota attempt.
+        """
+        from elspeth.web.sessions.continuation_checkpoint_paid import (
+            PreparedCheckpointSource,
+            prepare_v4_checkpoint_source_on_connection,
+        )
+
+        if type(prepared) is not PreparedCheckpointSource:
+            raise AuditIntegrityError("checkpoint source preparation requires its original nominal producer")
+        context = prepared.running.session_operation_context
+        with (
+            self._session_process_locked_begin(context.fence.session_id) as conn,
+            self._session_write_lock(conn, context.fence.session_id),
+        ):
+            self._require_session_operation_context_on_connection(
+                conn,
+                context,
+                session_id=context.fence.session_id,
+                expected_kind=SessionOperationKind.COMPOSE,
+                now=database_now(conn),
+            )
+            return prepare_v4_checkpoint_source_on_connection(conn, self, prepared)
+
+    def begin_v4_checkpoint_provider_attempt_sync(
+        self, *, prepared: PreparedCheckpointProvider, requested_model: str
+    ) -> V4CheckpointProviderAdmission:
+        """Admit one original checkpoint attempt and reserve its terminal H."""
+        from elspeth.web.sessions.continuation_checkpoint_paid import (
+            PreparedCheckpointProvider,
+            admit_v4_checkpoint_provider_on_connection,
+        )
+
+        if type(prepared) is not PreparedCheckpointProvider:
+            raise AuditIntegrityError("checkpoint provider admission requires its original nominal producer")
+        context = prepared.running.session_operation_context
+        try:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+            ):
+                self._require_session_operation_context_on_connection(
+                    conn,
+                    context,
+                    session_id=context.fence.session_id,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    now=database_now(conn),
+                )
+                return admit_v4_checkpoint_provider_on_connection(conn, self, prepared, model=requested_model)
+        except ChargeableAdmissionRefused as refusal:
+            try:
+                self._record_provider_attempt_quota_refusal_sync(context, "composer", refusal)
+            except BaseException as recorder_error:
+                raise BaseExceptionGroup("V4 checkpoint quota refusal recording failed", [refusal, recorder_error]) from None
+            raise
+
+    def complete_v4_checkpoint_result_sync(
+        self,
+        *,
+        prepared: PreparedCheckpointProvider,
+        admission: V4CheckpointProviderAdmission,
+        observed: CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation,
+    ) -> VerifiedCheckpointPaidOverflowTerminal:
+        """Settle an original returned-overflow checkpoint; full success is dormant.
+
+        A fitting raw response cannot be accepted until its actual full phase
+        pass/evidence/injection batch and later reserve are proved together.
+        The caller uses one registered provider-settlement SQL worker ticket.
+        """
+        from elspeth.web.composer.continuation_checkpoint_observation import (
+            CheckpointIncompleteResponseObservation,
+            CheckpointReturnedResponseObservation,
+        )
+        from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
+        from elspeth.web.sessions.continuation_checkpoint_paid_settlement import settle_v4_checkpoint_returned_overflow_on_connection
+
+        if type(prepared) is not PreparedCheckpointProvider or type(admission) is not V4CheckpointProviderAdmission:
+            raise AuditIntegrityError("V4 checkpoint completion changed its original prepared paid source")
+        if type(observed) is CheckpointReturnedResponseObservation:
+            raise AuditIntegrityError("V4 checkpoint complete phase batch has no proved downstream retention bound")
+        if type(observed) is not CheckpointIncompleteResponseObservation:
+            raise AuditIntegrityError("V4 checkpoint completion requires its original returned response observation")
+        context = prepared.running.session_operation_context
+        sid = str(prepared.running.claim.session_id)
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn,
+                session_id=sid,
+                session_operation_context=context,
+                expected_kind=SessionOperationKind.COMPOSE,
+                audit_only=True,
+            ),
+        ):
+            return settle_v4_checkpoint_returned_overflow_on_connection(conn, prepared=prepared, admission=admission, observation=observed)
+
+    def refuse_v4_checkpoint_no_sdk_sync(self, *, permit: CheckpointNoSdkRefusalPermit) -> ComposerOperationRecord:
+        """Close one original checkpoint admission proven unentered by custody."""
+        from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkRefusalPermit
+        from elspeth.web.sessions.continuation_checkpoint_no_sdk_close import refuse_v4_checkpoint_no_sdk_on_connection
+
+        if type(permit) is not CheckpointNoSdkRefusalPermit:
+            raise AuditIntegrityError("V4 checkpoint no-SDK closure requires its original nominal permit")
+        context = permit.prepared.running.session_operation_context
+        sid = str(permit.prepared.running.claim.session_id)
+        with (
+            self._session_process_locked_begin(sid) as conn,
+            self._session_write_lock(conn, sid),
+            self._session_composer_mutation_transaction(
+                conn,
+                session_id=sid,
+                session_operation_context=context,
+                expected_kind=SessionOperationKind.COMPOSE,
+                audit_only=True,
+            ),
+        ):
+            return refuse_v4_checkpoint_no_sdk_on_connection(conn, service=self, permit=permit)
 
     async def add_messages_atomic(
         self,

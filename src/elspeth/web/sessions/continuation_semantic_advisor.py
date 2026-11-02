@@ -61,7 +61,7 @@ from elspeth.web.composer.continuation_end_values import EndContinuationCandidat
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
 from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence, state_from_evidence_json
 from elspeth.web.composer.continuation_evidence_application_data import append_primary_call_to_evidence
-from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.continuation_progress import continuation_action_key, decode_prescribed_continuation_action, retain_advisor_action
 from elspeth.web.composer.continuation_provider_outcomes import (
     decode_physical_audit_call,
@@ -87,9 +87,12 @@ from elspeth.web.composer.provider_audit_source import ProviderAuditSource, prov
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.turn_effects import authored_state_hash
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
+    ProviderAttempt,
     _undispatched_cancellation_event_id,
     _usage_entry_id,
+    begin_provider_attempt_on_connection,
     token_usage_entry_from_llm_call_envelope,
 )
 from elspeth.web.sessions.composer_operations import ComposerOperationRecord, ComposerOperationRunning
@@ -105,14 +108,31 @@ from elspeth.web.sessions.continuation import (
     append_complete_snapshot,
     bound_action_json,
     load_snapshot,
+    prepare_snapshot_append,
     private_chunk_key,
     put_chunk,
     read_chunk,
     require_snapshot_cas,
 )
+from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
+from elspeth.web.sessions.continuation_paid_overflow_quota import preflight_v4_requested_model
 from elspeth.web.sessions.continuation_primary import read_original_committed_primary_response_data_on_connection
+from elspeth.web.sessions.continuation_retained_capacity import (
+    ProspectiveContinuationChunk,
+    ProviderTerminalHoldSource,
+    bind_provider_terminal_hold_attempt,
+    reserve_provider_terminal_hold,
+)
 from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource, read_runtime_source_on_connection
 from elspeth.web.sessions.continuation_selection import load_private_chunks
+from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import (
+    SemanticNoSdkTailPlan,
+    prepare_semantic_no_sdk_tail_plan,
+)
+from elspeth.web.sessions.continuation_semantic_paid_overflow_tail import (
+    SemanticPaidOverflowTailPlan,
+    prepare_semantic_paid_overflow_tail_plan,
+)
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
@@ -120,6 +140,7 @@ from elspeth.web.sessions.models import composer_continuation_effects_table as e
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 from elspeth.web.sessions.models import composer_continuation_provider_ordinals_table as ordinals
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as provider_holds
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import sessions_table
@@ -131,6 +152,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_iteration_return import IterationReturnCommitted
     from elspeth.web.sessions.continuation_semantic_actions import SemanticActionAdmission
     from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
+    from elspeth.web.sessions.service import SessionServiceImpl
 
 
 class _ChunkBody(ContinuationValue):
@@ -238,6 +260,15 @@ class SemanticAdvisorProviderResult:
     decision: ContinuationAdvisorDecision | None
     outcome: SemanticAdvisorProviderOutcome
     original_error: BaseException | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class V4SemanticProviderAdmission:
+    attempt: ProviderAttempt
+    selected: StoredContinuationSnapshot
+    hold: ProviderTerminalHoldSource
+    tail: SemanticPaidOverflowTailPlan
+    no_sdk_tail: SemanticNoSdkTailPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -878,6 +909,159 @@ def begin_semantic_advisor_on_connection(
         return result
 
 
+def admit_v4_semantic_provider_on_connection(
+    conn: Connection,
+    service: SessionServiceImpl,
+    prepared: PreparedContinuationProvider,
+    *,
+    model: str,
+    no_sdk_issuer: SemanticAdvisorNoSdkIssuer,
+) -> V4SemanticProviderAdmission:
+    """Mint the original physical attempt, H and dispatch in one V4 SQL cut."""
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    if type(service) is not SessionServiceImpl or type(prepared) is not PreparedContinuationProvider:
+        raise TypeError("V4 semantic admission requires original sessions service and prepared source")
+    if type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer or no_sdk_issuer.prepared_candidate is not prepared:
+        raise AuditIntegrityError("V4 semantic admission changed its original no-SDK issuer")
+    no_sdk_issuer.require_original_clock()
+    no_sdk_issuer.clock.require_preparation_time()
+    binding, selected = prepared.binding, prepared.snapshot
+    running = binding.running
+    root = _current(conn, running, selected)
+    effect = _effect(conn, running, root, binding.effect_key)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if (
+        type(policy) is not ContinuationAdmissionPolicyV4
+        or binding.family != 1
+        or binding.effect_key != f"provider:1:{binding.ordinal}"
+        or binding.input_sha256 != effect.input_sha256
+        or effect.disposition != "prepared"
+        or effect.provider_attempt_id is not None
+        or effect.result_chunk_key is not None
+        or effect.receipt_key is not None
+        or (effect.creator_sequence, effect.creator_generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
+    ):
+        raise ContinuationCASConflict("V4 semantic admission lost its one prepared original effect")
+    _inflight_source_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root)
+    _stored_descriptor, _invocation, physical_input = _descriptor(conn, running, effect)
+    requested_model = preflight_v4_requested_model(model)
+    if physical_input.options["model"] != requested_model.value:
+        raise AuditIntegrityError("V4 semantic model differs from its prepared original physical request")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    with conn.begin_nested():
+        attempt = begin_provider_attempt_on_connection(
+            conn,
+            session_operation_context=running.session_operation_context,
+            source="composer",
+            policy=service._chargeable_admission_policy,
+            run_id=None,
+        )
+        dispatched_json = _effect_snapshot(selected.payload_json, effect_key=binding.effect_key, disposition="dispatched", receipt_id=None)
+        transition = ContinuationEvent("may_dispatch", canonical_json({"effect_key": binding.effect_key}))
+        published_at = database_now(conn)
+        append = prepare_snapshot_append(selected, snapshot_json=dispatched_json, events=(transition,), published_at=published_at)
+        admitted = StoredContinuationSnapshot(append.snapshot_json, selected.cursor + 1, append.checkpoint_id)
+        fence = running.session_operation_context.fence
+        identity = PaidOverflowIdentity(
+            session_id=sid,
+            operation_id=operation,
+            effect_key=binding.effect_key,
+            attempt_id=attempt.attempt_id,
+            session_operation_id=fence.operation_id,
+            session_operation_epoch=fence.operation_epoch,
+            ownership_generation=running.claim.ownership_generation,
+            lease_sha256=sha256(fence.lease_token.encode("utf-8")).hexdigest(),
+            policy_sha256=policy.policy_hash,
+            source_checkpoint_id=selected.checkpoint_id,
+            source_cursor=selected.cursor,
+            source_snapshot_sha256=sha256(selected.payload_json.encode("utf-8")).hexdigest(),
+        )
+        tail = prepare_semantic_paid_overflow_tail_plan(
+            identity=identity, admitted=admitted, creator_sequence=running.claim.segment_sequence
+        )
+        no_sdk_tail = prepare_semantic_no_sdk_tail_plan(
+            admitted=admitted,
+            attempt_id=attempt.attempt_id,
+            requested_model=requested_model.value,
+            input_sha256=effect.input_sha256,
+            effect_key=effect.effect_key,
+            creator_sequence=running.claim.segment_sequence,
+            creator_generation=running.claim.ownership_generation,
+        )
+        reserved_bytes = max(tail.reserved_bytes, no_sdk_tail.reserved_bytes)
+        contract_sha256 = sha256(
+            canonical_json(
+                {
+                    "version": "composer.semantic-v4-combined-tail.v1",
+                    "paid": tail.fallback_contract_sha256,
+                    "no_sdk": no_sdk_tail.contract_sha256,
+                    "reserved_bytes": reserved_bytes,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        hold = ProviderTerminalHoldSource(
+            session_id=sid,
+            operation_id=operation,
+            effect_key=binding.effect_key,
+            policy_sha256=policy.policy_hash,
+            allowance_bytes=policy.max_retained_payload_bytes,
+            source_checkpoint_id=selected.checkpoint_id,
+            source_cursor=selected.cursor,
+            source_snapshot_sha256=identity.source_snapshot_sha256,
+            source_input_sha256=effect.input_sha256,
+            creator_sequence=running.claim.segment_sequence,
+            creator_generation=running.claim.ownership_generation,
+            claim_attempt=running.claim.attempt,
+            session_operation_id=fence.operation_id,
+            session_operation_epoch=fence.operation_epoch,
+            lease_sha256=identity.lease_sha256,
+            reserved_bytes=reserved_bytes,
+            fallback_contract_sha256=contract_sha256,
+        )
+        prospective = (
+            ProspectiveContinuationChunk(f"event:{admitted.cursor}", transition.payload_json.encode("utf-8"), "event.v2"),
+            ProspectiveContinuationChunk(f"snapshot:{admitted.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
+        )
+        reserve_provider_terminal_hold(conn, source=hold, prospective=prospective, created_at=published_at)
+        changed = conn.execute(
+            update(effects)
+            .where(
+                effects.c.session_id == sid,
+                effects.c.operation_id == operation,
+                effects.c.effect_key == binding.effect_key,
+                effects.c.disposition == "prepared",
+                effects.c.provider_attempt_id.is_(None),
+            )
+            .values(
+                disposition="dispatched",
+                provider_attempt_id=attempt.attempt_id,
+                physical_sequence=running.claim.segment_sequence,
+                physical_generation=running.claim.ownership_generation,
+                requested_model=requested_model.value,
+            )
+        )
+        if changed.rowcount != 1:
+            raise AuditIntegrityError("V4 semantic dispatch lost its original prepared effect CAS")
+        bind_provider_terminal_hold_attempt(conn, source=hold, provider_attempt_id=attempt.attempt_id)
+        stored = append_complete_snapshot(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            expected_checkpoint_id=selected.checkpoint_id,
+            expected_cursor=selected.cursor,
+            snapshot_json=append.snapshot_json,
+            event_batch=append.events,
+            handoff=False,
+            prepared_append=append,
+        )
+        if stored != admitted:
+            raise AuditIntegrityError("V4 semantic dispatch changed its reserved complete snapshot")
+        no_sdk_issuer.clock.require_preparation_time()
+        no_sdk_issuer.note_dispatched_candidate(stored)
+        return V4SemanticProviderAdmission(attempt, stored, hold, tail, no_sdk_tail)
+
+
 def _original_input(
     conn: Connection, running: ComposerOperationRunning, root: ContinuationFrameStack, effect: Row[Any]
 ) -> tuple[SemanticAdvisorInvocationData, _PhysicalInput]:
@@ -950,6 +1134,13 @@ def _physical_source_data(
         raise AuditIntegrityError("Semantic physical audit changed its exact original physical request")
     creator = _creator_data(conn, sid, operation, effect)
     actual = conn.execute(select(physical).where(physical.c.attempt_id == call.call_id)).one_or_none()
+    v4_hold = conn.execute(
+        select(provider_holds.c.provider_attempt_id).where(
+            provider_holds.c.session_id == sid,
+            provider_holds.c.operation_id == operation,
+            provider_holds.c.effect_key == effect.effect_key,
+        )
+    ).scalar_one_or_none()
     principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one()
     if (
         actual is None
@@ -972,7 +1163,10 @@ def _physical_source_data(
             principal,
         )
         or actual.settled_at is None
-        or restore_utc(actual.started_at) != call.started_at
+        or (
+            (restore_utc(actual.started_at) != call.started_at and v4_hold is None)
+            or (v4_hold is not None and (v4_hold != call.call_id or effect.provider_attempt_id != call.call_id))
+        )
     ):
         raise AuditIntegrityError("Semantic result changed its original creator or actual settled attempt")
     entry = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(call))

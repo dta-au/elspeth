@@ -38,13 +38,14 @@ operation_store = test_composer_operation_authority.operation_store
 
 
 @asynccontextmanager
-async def _historical_driver(operation_store, tmp_path, monkeypatch, *, historical_values=None):
+async def _historical_driver(operation_store, tmp_path, monkeypatch, *, historical_values=None, tool_name="get_pipeline_state"):
     if historical_values is None:
         _install_original_deadline(operation_store, monkeypatch)
-        values = await historical_tool_cut(operation_store, tmp_path, monkeypatch, initialized=True)
+        values = await historical_tool_cut(operation_store, tmp_path, monkeypatch, initialized=True, tool_name=tool_name)
     else:
         values = historical_values
     store, policy, running, selected, _inventory, _batch, _accumulator, completion, arguments = values
+    assert tuple(call.function.name for call in completion.tool_batch.calls) == (tool_name,)
     work = arguments["required_work"]
     adoption = ContinuationLeaseAdoption(
         store[1], running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS, required_work=work.coordinator
@@ -219,7 +220,7 @@ async def test_driver_rejects_returned_receipt_substitution_after_real_commit(op
     # Fixture failures must retain their own traceback, outside the expected
     # driver-rejection boundary.
     _install_original_deadline(operation_store, monkeypatch)
-    historical_values = await historical_tool_cut(operation_store, tmp_path, monkeypatch, initialized=True)
+    historical_values = await historical_tool_cut(operation_store, tmp_path, monkeypatch, initialized=True, tool_name="get_pipeline_state")
     observed, releases = [], []
     actual = ComposerServiceImpl.advance_continuation_phase
     verify = ComposerAsyncWorker._verify_terminal_before_release

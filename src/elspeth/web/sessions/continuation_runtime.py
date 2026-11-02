@@ -26,6 +26,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     ContinuationAdmissionPolicyV2,
     ContinuationAdmissionPolicyV3,
+    ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_prompt_producers import _CurrentProducerInputs, _read_current_inputs
@@ -47,7 +48,7 @@ class ContinuationRuntimeSource:
     original: ContinuationBootstrapValues
     iteration: ContinuationIterationSnapshot
     evidence: TurnEvidenceSnapshot
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4
     cost_snapshot: CommonProviderCostSnapshot | None
     timing: ContinuationTimingObservation
     admitted_evidence: AdmittedTurnEvidence = field(compare=False)

@@ -38,7 +38,7 @@ from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
 from elspeth.web.composer.continuation_message_family_recipes import ControlResultMessageRecipe
 from elspeth.web.composer.continuation_phase_transitions import BatchTransition, refuse_v3_tool_before_dispatch, retain_batch_transition
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
     RestoredContinuationRuntime,
@@ -614,7 +614,11 @@ class ContinuationLivePhases:
         if data is None:
             raise AuditIntegrityError("live dispatch lost its actual batch/provider owners")
         result = await self._primary_for_phase(runtime, inventory, selected)
-        if type(runtime.source.policy) is ContinuationAdmissionPolicyV3:
+        if type(runtime.source.policy) in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
+            from elspeth.web.composer.continuation_metadata_admission import try_admit_metadata_tool
+
+            if await try_admit_metadata_tool(self, runtime=runtime, selected=selected, inventory=inventory):
+                return None
 
             def commit_refusal() -> ToolNoExecutionRefusal:
                 receipt = refuse_v3_tool_before_dispatch(self.authority, inventory.running, selected=selected, inventory=inventory)

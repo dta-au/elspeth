@@ -49,6 +49,7 @@ from elspeth.web.composer.continuation_prompt_producers import CurrentContinuati
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.tool_batch import ToolBatchContext, ToolBatchCustody, ToolBatchProvenance
 from elspeth.web.continuation_retention_memo import RetentionStageMemo, retention_stage_memo_scope
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -75,6 +76,7 @@ class RestoredContinuationRuntime:
     drained: RecorderDrainCursors
     attachments: ContinuationAttachmentHistory
     env_ref_names: frozenset[str]
+    detached_disclosure: SchemaDisclosureTracker | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,8 +189,13 @@ def _restore_live(
     monotonic_before_read: float,
     progress: ComposerProgressSink | None,
     finish_read: ContinuationFinishRead | None = None,
+    detached_disclosure: SchemaDisclosureTracker | None = None,
 ) -> RestoredContinuationRuntime:
-    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3
+    from elspeth.web.composer.continuation_policy import (
+        ContinuationAdmissionPolicyV2,
+        ContinuationAdmissionPolicyV3,
+        ContinuationAdmissionPolicyV4,
+    )
     from elspeth.web.composer.provider_cost import CommonProviderCostBudget, continuation_common_cost_policy
     from elspeth.web.composer.service import _chat_ingress_inputs_for_compose
 
@@ -197,9 +204,7 @@ def _restore_live(
         if provider_owner.cost_budget is not None:
             raise AuditIntegrityError("legacy runtime gained a current cost owner")
     else:
-        if type(source.policy) is ContinuationAdmissionPolicyV2:
-            cost_policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 = source.policy
-        elif type(source.policy) is ContinuationAdmissionPolicyV3:
+        if isinstance(source.policy, (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)):
             cost_policy = source.policy
         else:
             raise AuditIntegrityError("runtime cost source lacks admitted v2 policy")
@@ -340,13 +345,16 @@ def _restore_live(
     else:
         finish_read.require_selection(selected, inventory)
         finish_read.read_runtime(authority)
-    service._schema_disclosure.restore_session_for_continuation(
+    disclosure = service._schema_disclosure if detached_disclosure is None else detached_disclosure
+    disclosure.restore_session_for_continuation(
         source.iteration.disclosure,
         session_id=selected.stack.logical.session_id,
         catalog_hash=snapshot.snapshot_hash,
         policy_hash=snapshot.policy_hash,
     )
-    return RestoredContinuationRuntime(live, bindings, graph, materialization, source, graph.drained, attachments, names)
+    return RestoredContinuationRuntime(
+        live, bindings, graph, materialization, source, graph.drained, attachments, names, detached_disclosure
+    )
 
 
 async def restore_continuation_runtime(
@@ -359,6 +367,89 @@ async def restore_continuation_runtime(
     provider_owner: ProviderInvocationOwner,
     progress: ComposerProgressSink | None = None,
     finish_read: ContinuationFinishRead | None = None,
+) -> RestoredContinuationRuntime:
+    return await _restore_runtime(
+        service=service,
+        authority=authority,
+        selected=selected,
+        inventory=inventory,
+        required_work=required_work,
+        provider_owner=provider_owner,
+        progress=progress,
+        finish_read=finish_read,
+        detached_disclosure=None,
+    )
+
+
+async def restore_metadata_preparation_runtime(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    required_work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+) -> RestoredContinuationRuntime:
+    """Restore actual original DATA without replacing shared disclosure state."""
+    return await _restore_runtime(
+        service=service,
+        authority=authority,
+        selected=selected,
+        inventory=inventory,
+        required_work=required_work,
+        provider_owner=provider_owner,
+        progress=None,
+        finish_read=None,
+        detached_disclosure=SchemaDisclosureTracker(),
+    )
+
+
+async def restore_checkpoint_projection_runtime(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    required_work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+) -> RestoredContinuationRuntime:
+    """Restore an isolated V4 graph for a prospective paid checkpoint batch.
+
+    The caller must first retain its actual pre-call warm source. This reader
+    accepts only the current SQL selection and restores the existing coupled
+    evidence/recorder graph; it never copies a live graph or mints a provider
+    owner. The detached disclosure tracker prevents preparation from replacing
+    the active service's disclosure history.
+    """
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+
+    policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+    if type(policy) is not ContinuationAdmissionPolicyV4:
+        raise AuditIntegrityError("checkpoint projection requires its original V4 SQL source")
+    return await _restore_runtime(
+        service=service,
+        authority=authority,
+        selected=selected,
+        inventory=inventory,
+        required_work=required_work,
+        provider_owner=provider_owner,
+        progress=None,
+        finish_read=None,
+        detached_disclosure=SchemaDisclosureTracker(),
+    )
+
+
+async def _restore_runtime(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    required_work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+    progress: ComposerProgressSink | None,
+    finish_read: ContinuationFinishRead | None,
+    detached_disclosure: SchemaDisclosureTracker | None,
 ) -> RestoredContinuationRuntime:
     from elspeth.web.composer.service import ComposerServiceImpl
 
@@ -415,6 +506,7 @@ async def restore_continuation_runtime(
             monotonic_before_read=monotonic_before_read,
             progress=progress,
             finish_read=finish_read,
+            detached_disclosure=detached_disclosure,
         ),
     )
     if type(result) is not RestoredContinuationRuntime:
@@ -502,7 +594,7 @@ async def build_runtime_tool_batch_context(
         ),
         redaction_telemetry=service._redaction_telemetry,
         preflight=service._preflight,
-        schema_disclosure=service._schema_disclosure,
+        schema_disclosure=service._schema_disclosure if runtime.detached_disclosure is None else runtime.detached_disclosure,
         advisor_checkpoint=service._advisor_checkpoint,
         advisor_max_calls_per_compose=service._settings.composer_advisor_max_calls_per_compose,
         advisor_timeout_seconds=service._settings.composer_advisor_timeout_seconds,
@@ -724,7 +816,9 @@ def _capture_owners(
             advisor_review=live.advisor_review_state,
             failed_turn=live.failed_turn,
             anti_anchor=live.anti_anchor.snapshot_for_continuation(),
-            disclosure=runtime.materialization.service._schema_disclosure.snapshot_for_continuation(
+            disclosure=(
+                runtime.materialization.service._schema_disclosure if runtime.detached_disclosure is None else runtime.detached_disclosure
+            ).snapshot_for_continuation(
                 session_id=root.logical.session_id,
                 catalog_hash=bindings.plugin_snapshot.snapshot_hash,
                 policy_hash=bindings.plugin_snapshot.policy_hash,
@@ -827,6 +921,57 @@ def _capture_owners(
     chunks = _selected_chunks(changed_root, selected.chunks, added)
     SelectedContinuationState(selected.checkpoint_id, changed_root, chunks)
     return CapturedContinuationRuntime(selected, changed_root, chunks)
+
+
+@dataclass(frozen=True, slots=True)
+class _MetadataRuntimeCapture:
+    captured: CapturedContinuationRuntime | None
+
+    def __post_init__(self) -> None:
+        if self.captured is not None and type(self.captured) is not CapturedContinuationRuntime:
+            raise AuditIntegrityError("metadata capture changed its nominal captured DATA owner")
+
+
+async def capture_metadata_preparation_runtime(
+    runtime: RestoredContinuationRuntime, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+) -> CapturedContinuationRuntime | None:
+    """Capture prospective metadata DATA with a clean, size-only refusal result."""
+    from elspeth.web.composer.continuation_limits import ContinuationDocumentTooLarge
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4
+    from elspeth.web.composer.protocol import ComposerContextUnsupported
+
+    if (
+        type(runtime) is not RestoredContinuationRuntime
+        or type(runtime.detached_disclosure) is not SchemaDisclosureTracker
+        or runtime.detached_disclosure is runtime.materialization.service._schema_disclosure
+        or (
+            type(runtime.source.policy) is not ContinuationAdmissionPolicyV3
+            and type(runtime.source.policy) is not ContinuationAdmissionPolicyV4
+        )
+    ):
+        raise AuditIntegrityError("metadata capture requires its original detached bounded runtime")
+    work = runtime.bindings.required_work
+    if type(work) is not RequiredWorkBinding:
+        raise AuditIntegrityError("metadata capture lost its actual required work")
+    authority = runtime.materialization.authority
+    running = _work_owners(authority, inventory, work)
+
+    def capture() -> _MetadataRuntimeCapture:
+        with retention_stage_memo_scope() as memo:
+            source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
+            try:
+                captured = _capture_owners(runtime, source=source, inventory=inventory)
+            except (ComposerContextUnsupported, ContinuationDocumentTooLarge) as refused:
+                try:
+                    authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
+                except BaseException as failure:
+                    raise BaseExceptionGroup("Metadata retention refusal and final current-source admission", [refused, failure]) from None
+                return _MetadataRuntimeCapture(None)
+            authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
+            return _MetadataRuntimeCapture(captured)
+
+    result = await _registered_read(work, _MetadataRuntimeCapture, capture)
+    return result.captured
 
 
 async def capture_continuation_runtime_owners(

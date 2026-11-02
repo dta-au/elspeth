@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
     from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
     from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot
+    from elspeth.web.composer.continuation_metadata_preparation import PreparedMetadataToolCall
     from elspeth.web.composer.continuation_retention import OrderedObjectJSON
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.tool_batch import ContinuationBatchState, ContinuationCallState
@@ -851,6 +852,79 @@ class CurrentContinuationMessageProducers:
         registered = self._register(message, recipe)
         self._remember_tool_result_provenance(registered)
         return registered
+
+    def register_prepared_metadata_result_message(
+        self,
+        *,
+        prepared: PreparedMetadataToolCall,
+        result: ToolResult,
+        serialized: str,
+    ) -> None:
+        """Capture detached result recipe DATA, without granting issue authority.
+
+        Only the original single metadata call can use this preparation seam.
+        Its caller must retain the whole prepared tail before adopting the
+        detached graph. Every later source reader still proves the actual SQL
+        issue and completion through the ordinary tool-result recipe.
+        """
+        from elspeth.web.composer.continuation_batch_data import decode_coupled_batch_chunk
+        from elspeth.web.composer.continuation_metadata_preparation import PreparedMetadataToolCall
+        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
+
+        if (
+            type(prepared) is not PreparedMetadataToolCall
+            or prepared.runtime.materialization is not self
+            or prepared.context.message_producers is not self
+            or prepared.runtime.source.selected is not self.selected
+        ):
+            raise AuditIntegrityError("metadata recipe crossed its original detached owners")
+        completion, call = prepared.call_model.completion, prepared.call.tool_call
+        tool_index = prepared.call.index
+        self._require_compose_family()
+        selected = self.selected
+        if type(selected) is not SelectedContinuationState:
+            raise AuditIntegrityError("metadata preparation lost its actual selected source")
+        top = selected.stack.frames[-1]
+        policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+        if (
+            type(policy) is not ContinuationAdmissionPolicyV3
+            or type(top) is not ToolBatchFrame
+            or top.phase != "tool_ready"
+            or top.accumulator.codec != "composer.coupled-batch-data.v1"
+            or tool_index != 0
+            or top.next_tool_index != 0
+            or len(completion.tool_batch.calls) != 1
+            or completion.tool_batch.calls[0] is not call
+            or call.function.name != "set_metadata"
+            or type(result) is not ToolResult
+            or result.plugin_schemas is not None
+        ):
+            raise AuditIntegrityError("metadata preparation requires its original single unissued call")
+        found = tuple(chunk for chunk in selected.chunks if chunk.reference == top.accumulator)
+        if len(found) != 1:
+            raise AuditIntegrityError("metadata preparation lost its original accumulator")
+        original = decode_coupled_batch_chunk(found[0], env_ref_names=self.inventory.names)
+        if (
+            original.calls != completion.tool_batch.calls
+            or original.batch.phase != "call_ready"
+            or original.batch.current_call is not None
+            or original.batch.next_tool_index != 0
+            or original.batch.tool_outcomes
+        ):
+            raise AuditIntegrityError("metadata preparation changed its original unissued batch")
+        message = tool_result_message(call_id=call.id, result=result, serialized=serialized)
+        recipe = capture_tool_result_recipe(
+            response=top.response,
+            completion=completion,
+            tool_index=tool_index,
+            call=call,
+            result=result,
+            serialized=serialized,
+            message=message,
+        )
+        registered = self._register(message, recipe)
+        self._remember_tool_result_provenance(registered)
+        prepared.runtime.live.llm_messages.append(registered)
 
     def _remember_tool_result_provenance(self, message: dict[str, Any]) -> None:
         """Keep alias/immutable-part facts from this actual producer output."""

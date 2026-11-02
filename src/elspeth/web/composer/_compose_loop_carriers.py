@@ -53,6 +53,7 @@ from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
 from elspeth.web.composer.provider_errors import ProviderRequestFailure
+from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
@@ -145,7 +146,7 @@ class _AdmittedToolBatch:
     call_ids: frozenset[str]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _AdmittedLLMProviderMetadata:
     """Minimal provider projection retained for audit and provenance."""
 
@@ -159,6 +160,7 @@ class _AdmittedLLMProviderMetadata:
     reasoning_details: Any | None
     thinking_blocks: Any | None
     provider_served: str | None
+    v4_completeness: V4ProviderResultCompleteness | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         freeze_fields(self, "reasoning_details", "thinking_blocks")

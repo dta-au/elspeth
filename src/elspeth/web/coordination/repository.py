@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final, get_args
 from uuid import UUID, uuid4
+from weakref import WeakKeyDictionary
 
 from sqlalchemy import ColumnElement, Connection, Engine, Row, and_, delete, func, insert, select, update
 from sqlalchemy.engine import RowMapping
@@ -152,6 +153,7 @@ from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     CompositionStateRecord,
     IllegalRunTransitionError,
+    InterpretationResolveError,
     OperationReceiptFence,
     PendingInterpretationCreationResult,
     PendingInterpretationPolicy,
@@ -204,6 +206,7 @@ if TYPE_CHECKING:
         ComposerSegmentYieldReceipt,
     )
     from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
+    from elspeth.web.sessions.pending_interpretation import PendingInterpretationPolicyPlan, _SessionPendingInterpretationValidator
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
@@ -975,6 +978,41 @@ class _RepositoryCompositionStateMutations:
         return record
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class PendingInterpretationWritePlan:
+    """Original read/validation DATA; construction alone grants no apply authority.
+
+    Approval supersession is exposed before any write. This plan does not
+    authorize a V4 policy decision or make Sessions/Landscape atomic.
+    """
+
+    policy_plan: PendingInterpretationPolicyPlan
+    pending_events: tuple[InterpretationEventRecord, ...]
+    open_approval_ids: tuple[str, ...]
+    database_now: datetime
+    appended_record: CompositionStateRecord | None
+    retired_dead_site_ids: tuple[str, ...]
+
+    @property
+    def requires_approval_supersession(self) -> bool:
+        return self.appended_record is not None and bool(self.open_approval_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuedPendingWritePlan:
+    context: SessionOperationContext
+    validator: _SessionPendingInterpretationValidator
+    policy_plan: PendingInterpretationPolicyPlan
+    pending_events: tuple[InterpretationEventRecord, ...]
+    open_approval_ids: tuple[str, ...]
+    database_now: datetime
+    appended_record: CompositionStateRecord | None
+    retired_dead_site_ids: tuple[str, ...]
+
+
+_pending_write_plans: WeakKeyDictionary[PendingInterpretationWritePlan, _IssuedPendingWritePlan] = WeakKeyDictionary()
+
+
 @final
 class _RepositoryInterpretationMutations:
     """Interpretation-event capability bound to one private operation transaction."""
@@ -1081,11 +1119,20 @@ class _RepositoryInterpretationMutations:
         policy: PendingInterpretationPolicy,
     ) -> PendingInterpretationCreationResult:
         """Apply the canonical pending-review decision inside the exact live fence."""
+        return self.apply_pending_plan(self.plan_pending(command, validator, policy=policy))
+
+    def _read_pending_snapshot(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+        *,
+        policy: PendingInterpretationPolicy,
+    ) -> SessionPendingInterpretationSnapshot:
+        """Read the original planner inputs under the unchanged writer checks."""
         self._require_pending_creation_authority()
         if type(command) is not SessionPendingInterpretationCommand:
             raise TypeError("pending interpretation command must be exact")
         from elspeth.web.sessions.pending_interpretation import (
-            _SessionPendingInterpretationPlanner,
             _SessionPendingInterpretationValidator,
         )
 
@@ -1195,7 +1242,135 @@ class _RepositoryInterpretationMutations:
             )
             if any(term.strip() == command.user_term.strip() for term in candidate_terms):
                 raise AuditIntegrityError("pipeline candidate review site already has immutable evidence")
-        decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator, policy=policy)
+        return snapshot
+
+    def _pending_plan_tail_source(self) -> tuple[tuple[InterpretationEventRecord, ...], tuple[str, ...]]:
+        self._require_pending_creation_authority()
+        state = self.__state
+        connection = _resolve_mutation_connection(state._connection_token)
+        pending_rows = connection.execute(
+            select(interpretation_events_table)
+            .where(
+                interpretation_events_table.c.session_id == state._session_id,
+                interpretation_events_table.c.choice == InterpretationChoice.PENDING.value,
+            )
+            .order_by(interpretation_events_table.c.id)
+        ).all()
+        approvals = (
+            connection.execute(
+                select(approvals_table.c.approval_id)
+                .where(approvals_table.c.session_id == state._session_id, approvals_table.c.decision.is_(None))
+                .order_by(approvals_table.c.approval_id)
+            )
+            .scalars()
+            .all()
+        )
+        return tuple(self._event_record(row) for row in pending_rows), tuple(approvals)
+
+    def plan_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+        *,
+        policy: PendingInterpretationPolicy = PendingInterpretationPolicy.RECONCILE,
+    ) -> PendingInterpretationWritePlan:
+        """Read and plan without Sessions DML or approval-audit callbacks."""
+        from elspeth.web.sessions.pending_interpretation import (
+            _reviewed_content_identity,
+            _SessionPendingInterpretationValidator,
+            plan_pending_interpretation,
+        )
+
+        snapshot = self._read_pending_snapshot(command, validator, policy=policy)
+        if type(validator) is not _SessionPendingInterpretationValidator:
+            raise TypeError("pending interpretation validator must be exact")
+        policy_plan = plan_pending_interpretation(command, snapshot, validator, policy=policy)
+        pending, approvals = self._pending_plan_tail_source()
+        appended = policy_plan.decision.appended_state
+        record = None
+        if appended is not None:
+            version = snapshot.live_state.version + 1
+            data = prepare_content_publication(
+                appended.data, session_id=snapshot.live_state.session_id, state_id=appended.id, state_version=version
+            )
+            require_stored_state_metadata(data, state_id=appended.id)
+            record = CompositionStateRecord(
+                id=appended.id,
+                session_id=snapshot.live_state.session_id,
+                version=version,
+                sources=data.sources,
+                nodes=data.nodes,
+                edges=data.edges,
+                outputs=data.outputs,
+                metadata_=data.metadata_,
+                is_valid=data.is_valid,
+                validation_errors=data.validation_errors,
+                created_at=appended.created_at,
+                derived_from_state_id=appended.derived_from_state_id,
+                composer_meta=data.composer_meta,
+            )
+        retired: list[str] = []
+        if record is not None:
+            for event in pending:
+                if (
+                    event.id in policy_plan.decision.superseded_event_ids
+                    or event.interpretation_source is not InterpretationSource.USER_APPROVED
+                ):
+                    continue
+                if event.kind is None or event.affected_node_id is None or event.user_term is None:
+                    raise AuditIntegrityError("pending review lost its dead-site identity")
+                try:
+                    _reviewed_content_identity(
+                        record,
+                        kind=event.kind,
+                        affected_node_id=event.affected_node_id,
+                        user_term=event.user_term,
+                        context="supersede_dead_site_pending_interpretation_events",
+                    )
+                except InterpretationResolveError:
+                    retired.append(str(event.id))
+        planned = PendingInterpretationWritePlan(policy_plan, pending, approvals, self.__state._database_now, record, tuple(retired))
+        context = self.__state._operation_context
+        if context is None:
+            raise AuditIntegrityError("pending interpretation plan lost its checked operation context")
+        _pending_write_plans[planned] = _IssuedPendingWritePlan(
+            context,
+            validator,
+            policy_plan,
+            pending,
+            approvals,
+            planned.database_now,
+            record,
+            planned.retired_dead_site_ids,
+        )
+        return planned
+
+    def apply_pending_plan(self, planned: PendingInterpretationWritePlan) -> PendingInterpretationCreationResult:
+        """Reprove original read custody before entering the existing DML tail."""
+        from elspeth.web.sessions.pending_interpretation import reprove_pending_interpretation_plan
+
+        self._require_pending_creation_authority()
+        source = _pending_write_plans.get(planned) if type(planned) is PendingInterpretationWritePlan else None
+        if (
+            source is None
+            or source.context != self.__state._operation_context
+            or source.policy_plan is not planned.policy_plan
+            or source.pending_events != planned.pending_events
+            or source.open_approval_ids != planned.open_approval_ids
+            or source.database_now != planned.database_now
+            or source.appended_record != planned.appended_record
+            or source.retired_dead_site_ids != planned.retired_dead_site_ids
+        ):
+            raise AuditIntegrityError("pending interpretation apply requires its original fenced plan")
+        policy_plan = planned.policy_plan
+        command, snapshot, decision = policy_plan.command, policy_plan.snapshot, policy_plan.decision
+        current = self._read_pending_snapshot(command, source.validator, policy=policy_plan.policy)
+        if current != snapshot or self._pending_plan_tail_source() != (planned.pending_events, planned.open_approval_ids):
+            raise AuditIntegrityError("pending interpretation source changed before apply")
+        reprove_pending_interpretation_plan(policy_plan)
+        state = self.__state
+        connection = _resolve_mutation_connection(state._connection_token)
+        state_id = str(command.composition_state_id)
         if type(decision) is not SessionPendingInterpretationDecision:
             raise TypeError("pending interpretation planner must return an exact decision")
         matching_term_ids = {
@@ -1406,16 +1581,20 @@ class _RepositoryInterpretationMutations:
                 derived_from_state_id=appended_state.derived_from_state_id,
                 composer_meta=data.composer_meta,
             )
-            supersede_dead_site_pending_interpretation_events(
+            if appended_record != planned.appended_record:
+                raise AuditIntegrityError("pending interpretation changed its planned state publication")
+            retired = supersede_dead_site_pending_interpretation_events(
                 connection,
                 session_id=state._session_id,
                 build_state_record=lambda: appended_record,
-                now=state._database_now,
+                now=planned.database_now,
             )
+            if tuple(sorted(item.event_id for item in retired)) != planned.retired_dead_site_ids:
+                raise AuditIntegrityError("pending interpretation changed its planned dead-site supersession")
             supersede_open_approvals(
                 connection,
                 session_id=state._session_id,
-                now=state._database_now,
+                now=planned.database_now,
                 record=state._approval_supersession_recorder,
             )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(command.event_id))).one()

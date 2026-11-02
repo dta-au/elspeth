@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID
 
 import structlog
@@ -21,6 +21,7 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.prompt_guard import GuardedProviderMessage
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
@@ -109,7 +110,7 @@ from elspeth.web.composer.tools.generation import (
     ProofUnavailable,
     compute_proof_diagnostics,
 )
-from elspeth.web.composer.turn_effects import TurnEvidence
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview, TurnEvidence
 from elspeth.web.composer.withheld_replies import WithheldReplyOrigin, withheld_reply_envelope
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
@@ -139,6 +140,10 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.protocol import SessionServiceProtocol
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_checkpoint_end_locals import EndCallerLocals
+    from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
 
 slog = structlog.get_logger()
 
@@ -1300,6 +1305,7 @@ class CompositionCompletion:
         failed_turn: FailedTurnMetadata | None,
         completion_gates: CompletionGateFacts | None,
         provider_owner: ProviderInvocationOwner | None,
+        checkpoint_phase_owner: CheckpointPhaseOwner | None = None,
     ) -> _TerminateOutcome:
         """Close authoring on the bound observation, retaining END and card duties."""
         runtime = _source_proof_unavailable_validation(state, proof, last_runtime_preflight)
@@ -1327,6 +1333,17 @@ class CompositionCompletion:
                         }
                     ),
                 }
+            )
+        checkpoint_caller = None
+        if checkpoint_phase_owner is not None:
+            from elspeth.web.composer.continuation_checkpoint_end_locals import EndProofDiagnostic, SourceProofEndCallerLocals
+
+            checkpoint_caller = SourceProofEndCallerLocals(
+                proof_kind="unavailable" if type(proof) is ProofUnavailable else "malformed_claim",
+                diagnostics=cast(tuple[EndProofDiagnostic, ...], proof.diagnostics) if type(proof) is ProofUnavailable else None,
+                source_name=proof.source_name if isinstance(proof, MalformedSourceProofClaim) else None,
+                reason=proof.reason if isinstance(proof, MalformedSourceProofClaim) else None,
+                composed_stop_validation=runtime,
             )
         try:
             gate = await self._evaluate_terminal_no_tool_advisor_gate(
@@ -1358,6 +1375,8 @@ class CompositionCompletion:
                 deadline=deadline,
                 completion_gates=completion_gates,
                 provider_owner=provider_owner,
+                checkpoint_phase_owner=checkpoint_phase_owner,
+                checkpoint_caller=checkpoint_caller,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             await self._persist_withheld_reply(
@@ -1375,6 +1394,34 @@ class CompositionCompletion:
                 llm_calls=recorder.llm_calls,
                 failed_turn=failed_turn,
             ) from None
+        return self._continue_source_proof_after_advisor_gate(
+            gate=gate,
+            runtime=runtime,
+            state=state,
+            assistant_message=assistant_message,
+            recorder=recorder,
+            repair_turns_used=repair_turns_used,
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+            completion_gates=completion_gates,
+        )
+
+    def _continue_source_proof_after_advisor_gate(
+        self,
+        *,
+        gate: _TerminalNoToolAdvisorGateOutcome,
+        runtime: ValidationResult,
+        state: CompositionState,
+        assistant_message: _AdmittedAssistantMessage,
+        recorder: BufferingRecorder,
+        repair_turns_used: int,
+        persisted_assistant_message_id: str | None,
+        persisted_assistant_content: str | None,
+        persisted_tool_call_turn: bool,
+        completion_gates: CompletionGateFacts | None,
+    ) -> _TerminateOutcome:
+        """Finish the original source-stop caller without rerunning its proof or END."""
         if gate.action == "continue":
             raise AuditIntegrityError("Source readiness stop reopened primary authoring")
         if gate.action == "return":
@@ -1661,6 +1708,7 @@ class CompositionCompletion:
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        checkpoint_phase_owner: CheckpointPhaseOwner | None = None,
     ) -> _TerminateOutcome:
         """Phase P2 of the compose loop — handle the no-tool-calls branch.
 
@@ -1713,6 +1761,7 @@ class CompositionCompletion:
                 failed_turn=failed_turn,
                 completion_gates=completion_gates,
                 provider_owner=provider_owner,
+                checkpoint_phase_owner=checkpoint_phase_owner,
             )
         if not confirmed_stop and repair_turns_used < _MAX_REPAIR_TURNS:
             missing_interpretation_sites = await self._interpretation_surfacing._missing_pending_interpretation_review_sites(
@@ -1850,6 +1899,21 @@ class CompositionCompletion:
                     }
                 )
 
+        checkpoint_caller = None
+        if checkpoint_phase_owner is not None:
+            from elspeth.web.composer.continuation_checkpoint_end_locals import EndProofDiagnostic, OrdinaryEndCallerLocals
+
+            proof_action = None if proof_repair is None else proof_repair.action
+            if proof_action == "repair_injected":
+                raise AuditIntegrityError("END source cannot retain a caller that already continued repair")
+            checkpoint_caller = OrdinaryEndCallerLocals(
+                proof_runtime_preflight=proof_runtime_preflight,
+                proof_repair_action=proof_action,
+                proof_repair_diagnostics=None
+                if proof_repair is None
+                else cast(tuple[EndProofDiagnostic, ...], proof_repair.blocking_diagnostics),
+                confirmed_stop=confirmed_stop,
+            )
         try:
             advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
                 state=state,
@@ -1891,6 +1955,8 @@ class CompositionCompletion:
                 deadline=deadline,
                 completion_gates=completion_gates,
                 provider_owner=provider_owner,
+                checkpoint_phase_owner=checkpoint_phase_owner,
+                checkpoint_caller=checkpoint_caller,
             )
         except _AdvisorCheckpointComposeDeadlineExpired:
             # The model had already replied; the timeout envelope carries no
@@ -1910,6 +1976,64 @@ class CompositionCompletion:
                 llm_calls=recorder.llm_calls,
                 failed_turn=failed_turn,
             ) from None
+        return await self._continue_no_tools_after_advisor_gate(
+            advisor_gate=advisor_gate,
+            proof_runtime_preflight=proof_runtime_preflight,
+            proof_repair=proof_repair,
+            no_tool_response=no_tool_response,
+            state=state,
+            assistant_message=assistant_message,
+            session_operation_context=session_operation_context,
+            session_id=session_id,
+            current_state_id=current_state_id,
+            progress=progress,
+            recorder=recorder,
+            initial_version=initial_version,
+            user_id=user_id,
+            last_runtime_preflight=last_runtime_preflight,
+            runtime_preflight_cache=runtime_preflight_cache,
+            session_scope=session_scope,
+            message=message,
+            mutation_success_seen=mutation_success_seen,
+            repair_turns_used=repair_turns_used,
+            plugin_snapshot=plugin_snapshot,
+            deadline=deadline,
+            completion_gates=completion_gates,
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+        )
+
+    async def _continue_no_tools_after_advisor_gate(
+        self,
+        *,
+        advisor_gate: _TerminalNoToolAdvisorGateOutcome,
+        proof_runtime_preflight: ValidationResult | None,
+        proof_repair: _ProofRepairOutcome | None,
+        no_tool_response: NoToolResponse,
+        state: CompositionState,
+        assistant_message: _AdmittedAssistantMessage,
+        session_operation_context: SessionOperationContext | None,
+        session_id: str | None,
+        current_state_id: str | None,
+        progress: ComposerProgressSink | None,
+        recorder: BufferingRecorder,
+        initial_version: int,
+        user_id: str | None,
+        last_runtime_preflight: ValidationResult | None,
+        runtime_preflight_cache: _RuntimePreflightCache,
+        session_scope: str,
+        message: str,
+        mutation_success_seen: bool,
+        repair_turns_used: int,
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+        deadline: float | None,
+        completion_gates: CompletionGateFacts | None,
+        persisted_assistant_message_id: str | None,
+        persisted_assistant_content: str | None,
+        persisted_tool_call_turn: bool,
+    ) -> _TerminateOutcome:
+        """Continue the already-reviewed original no-tool caller at its saved cut."""
         if advisor_gate.action == "return":
             result = advisor_gate.result
             if proof_runtime_preflight is not None:
@@ -2372,6 +2496,8 @@ class CompositionCompletion:
         # 2026-09-22). ``None`` = none known: the END gate reviews as before.
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        checkpoint_phase_owner: CheckpointPhaseOwner | None = None,
+        checkpoint_caller: EndCallerLocals | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
         """Run the shared terminal no-tool END advisor gate for P2 and P5.
 
@@ -2397,6 +2523,8 @@ class CompositionCompletion:
         """
         if allow_repair_continue and llm_messages is None:
             raise TypeError("Authoring repair requires its original mutable message buffer")
+        if (checkpoint_phase_owner is None) != (checkpoint_caller is None):
+            raise AuditIntegrityError("END gate requires both original phase owner and caller continuation")
         max_passes = self._max_advisor_checkpoint_passes
         if type(turn_evidence) is not TurnEvidence:
             raise TypeError("Terminal review requires the current request's owned evidence")
@@ -2409,15 +2537,20 @@ class CompositionCompletion:
             and completion_gates.advisor_signoff.cause is AdvisorBlockCause.GRAPH_REJECTED
         )
 
-        orphaned_precheck = await self._interpretation_surfacing._missing_pending_interpretation_review_sites(
-            state,
-            session_id=session_id,
-        )
+        orphan_observation = None
+        if checkpoint_phase_owner is None:
+            orphaned_precheck = await self._interpretation_surfacing._missing_pending_interpretation_review_sites(
+                state,
+                session_id=session_id,
+            )
+        else:
+            orphan_observation = await self._interpretation_surfacing.observe_pending_interpretation_review_sites(
+                state, session_id=session_id
+            )
+            orphaned_precheck = orphan_observation.missing_sites
         # Backend-auto-surfaceable sites are pseudo-orphans: the
         # surface+unfiltered-gate pair runs on EVERY terminal no-tool return, so
         # they must not suppress the advisor. Genuine model-authored orphans do.
-        genuine_orphans = tuple(s for s in orphaned_precheck if s[2] not in _FINALIZATION_AUTO_SURFACEABLE_KINDS)
-
         # R2-F14 (elspeth-5403f346c0): a checkpoint that could not render a
         # verdict (unavailable/malformed) used to terminal-block on the FIRST
         # ``ok=False``, discarding whatever checkpoint budget remained — the
@@ -2430,6 +2563,7 @@ class CompositionCompletion:
         # ``_run_advisor_checkpoint`` call in this method).
         passes_delta = 0
         review_state = advisor_review_state or _AdvisorReviewState()
+        initial_review_state = review_state
         # ``state`` is fixed for the whole gate call, so the evidence hash is
         # loop-invariant; computed once for both the stalled-repair check and
         # every ``_advance_advisor_review_state`` capture below.
@@ -2458,6 +2592,45 @@ class CompositionCompletion:
                 break
             pass_index = advisor_checkpoint_passes_used + passes_delta + 1
             policy_refusal: CommonProviderCostRefused | None = None
+            checkpoint_end_input = None
+            if checkpoint_phase_owner is not None:
+                from elspeth.web.composer.continuation_checkpoint_end_locals import (
+                    CheckpointEndGateLocals,
+                    capture_checkpoint_end_gate_locals,
+                )
+
+                if orphan_observation is None or checkpoint_caller is None:
+                    raise AuditIntegrityError("END pre-call capture omitted its original caller or orphan read")
+                checkpoint_end_input = capture_checkpoint_end_gate_locals(
+                    CheckpointEndGateLocals(
+                        assistant_message=assistant_message,
+                        runtime_preflight=runtime_preflight,
+                        review_state=review_state,
+                        initial_review_state=initial_review_state,
+                        publication_review=publication_review,
+                        completion_gates=completion_gates,
+                        advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                        passes_delta=passes_delta,
+                        pass_index=pass_index,
+                        max_passes=max_passes,
+                        allow_repair_continue=allow_repair_continue,
+                        orphan_observation=orphan_observation,
+                        caller=checkpoint_caller,
+                        current_state_id=current_state_id,
+                        initial_version=initial_version,
+                        repair_turns_used=repair_turns_used,
+                        persisted_assistant_message_id=persisted_assistant_message_id,
+                        persisted_assistant_content=persisted_assistant_content,
+                        persisted_tool_call_turn=persisted_tool_call_turn,
+                    ),
+                    phase_owner=checkpoint_phase_owner,
+                    state=state,
+                    evidence=turn_evidence,
+                    surfacing=self._interpretation_surfacing,
+                    session_id=session_id,
+                    request=user_message,
+                    dialogue=llm_messages,
+                )
             try:
                 verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
                     phase="end",
@@ -2472,6 +2645,8 @@ class CompositionCompletion:
                     session_operation_context=session_operation_context,
                     provider_owner=provider_owner,
                     publication_review=publication_review,
+                    checkpoint_phase_owner=checkpoint_phase_owner,
+                    checkpoint_end_input=checkpoint_end_input,
                 )
             except CommonProviderCostRefused as refusal:
                 policy_refusal = refusal
@@ -2500,6 +2675,84 @@ class CompositionCompletion:
             if verdict.ok or not verdict.retryable or (advisor_checkpoint_passes_used + passes_delta) >= max_passes:
                 break
 
+        return await self._continue_terminal_no_tool_advisor_gate(
+            verdict=verdict,
+            publication_review=publication_review,
+            passes_delta=passes_delta,
+            review_state=review_state,
+            stalled_repair=stalled_repair,
+            graph_already_blocked=graph_already_blocked,
+            orphaned_precheck=orphaned_precheck,
+            state=state,
+            turn_evidence=turn_evidence,
+            session_id=session_id,
+            current_state_id=current_state_id,
+            assistant_message=assistant_message,
+            llm_messages=cast(list[GuardedProviderMessage] | None, llm_messages),
+            recorder=recorder,
+            progress=progress,
+            session_operation_context=session_operation_context,
+            advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+            max_passes=max_passes,
+            repair_turns_used=repair_turns_used,
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+            allow_repair_continue=allow_repair_continue,
+            runtime_preflight=runtime_preflight,
+            user_message=user_message,
+            user_id=user_id,
+            runtime_preflight_cache=runtime_preflight_cache,
+            initial_version=initial_version,
+            session_scope=session_scope,
+            plugin_snapshot=plugin_snapshot,
+            deadline=deadline,
+            completion_gates=completion_gates,
+        )
+
+    async def _continue_terminal_no_tool_advisor_gate(
+        self,
+        *,
+        verdict: AdvisorCheckpointVerdict,
+        publication_review: AdvisorPublicationReview,
+        passes_delta: int,
+        review_state: _AdvisorReviewState,
+        stalled_repair: bool,
+        graph_already_blocked: bool,
+        orphaned_precheck: tuple[tuple[str, str, InterpretationKind], ...],
+        state: CompositionState,
+        turn_evidence: TurnEvidence,
+        session_id: str | None,
+        current_state_id: str | None,
+        assistant_message: _AdmittedAssistantMessage,
+        llm_messages: list[GuardedProviderMessage] | None,
+        recorder: BufferingRecorder,
+        progress: ComposerProgressSink | None,
+        session_operation_context: SessionOperationContext | None,
+        advisor_checkpoint_passes_used: int,
+        max_passes: int,
+        repair_turns_used: int,
+        persisted_assistant_message_id: str | None,
+        persisted_assistant_content: str | None,
+        persisted_tool_call_turn: bool,
+        allow_repair_continue: bool,
+        runtime_preflight: ValidationResult | None,
+        user_message: str,
+        user_id: str | None,
+        runtime_preflight_cache: _RuntimePreflightCache,
+        initial_version: int,
+        session_scope: str,
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+        deadline: float | None,
+        completion_gates: CompletionGateFacts | None,
+    ) -> _TerminalNoToolAdvisorGateOutcome:
+        """Apply the original completed gate decision without repeating a paid pass.
+
+        This is the existing effectful consequence owner, not a pure V4 plan.
+        A retained caller must first admit its complete consequence batch.
+        """
+        candidate = assistant_message.content or ""
+        genuine_orphans = tuple(s for s in orphaned_precheck if s[2] not in _FINALIZATION_AUTO_SURFACEABLE_KINDS)
         is_last_pass = (advisor_checkpoint_passes_used + passes_delta) >= max_passes
         review_identity = AdvisorGraphReviewIdentity(
             binding=publication_review.binding,
