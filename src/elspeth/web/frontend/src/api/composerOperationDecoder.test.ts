@@ -1,5 +1,6 @@
 import producerFixtures from "@/test/composerRecoveryProducerFixtures.json";
 import executorFixtures from "../../../../../../tests/fixtures/web/composer/composer_executor_failure_producer.json";
+import admissionFixtures from "../../../../../../tests/fixtures/web/composer/composer_admission_refusal_producer.json";
 import { describe, expect, it } from "vitest";
 import { ComposerOperationDecodeError, ComposerSseDecoder, decodeComposerActiveOperation, decodeComposerOperationFrame, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 const sid = "11111111-1111-4111-8111-111111111111";
@@ -10,6 +11,29 @@ const sse = (data: unknown, eventId: string | null = null) => ({ id: eventId, da
 /** A settled operation envelope; cases set status, result and error. */
 const envelope = { operation_id: id, kind: "compose_message", poll_after_ms: 1000, cancel_requested: false, phase: "settled", status_revision: 9, created_at: "2026-10-06T00:00:00Z", observed_at: "2026-10-06T00:00:00Z", segment: null };
 const encode = new TextEncoder();
+
+describe.each(Object.entries(admissionFixtures))("actual no-SDK worker refusal %s", (_case, producer) => {
+  const sessionId = producer.history.session_id, operationId = producer.terminal.operation_id;
+  it("preserves the produced terminal and its closed history category", () => {
+    const terminal = decodeComposerOperationSnapshot(producer.terminal, sessionId, operationId);
+    const page = decodeComposerOperationFailurePage(producer.history, sessionId, operationId);
+    expect(terminal).toEqual(producer.terminal);
+    expect(page).toEqual(producer.history);
+    expect(terminal.error?.error_type).toBe("composer_admission_refused");
+    expect(page.items[0].error_type).toBe("composer_admission_refused");
+    expect(page.items[0].failure_code).toBe("http_error");
+    expect(page.items[0].request_id).toBe(terminal.error?.body.request_id);
+    expect(page.items[0].saved_revisions).toEqual({ attribution: "fenced", count: 0, latest_state_id: null, latest_version: null });
+  });
+  it("rejects unknown categories and private fields after reaching the real history positive", () => {
+    expect(decodeComposerOperationFailurePage(producer.history, sessionId)).toEqual(producer.history);
+    for (const changes of [{ error_type: "unreviewed_admission_refusal" }, { private_policy_id: "PRIVATE" }]) {
+      const changed = { ...producer.history, items: [{ ...producer.history.items[0], ...changes }] };
+      expect(() => decodeComposerOperationFailurePage(changed, sessionId)).toThrow(ComposerOperationDecodeError);
+      expect(decodeComposerOperationFailurePage(producer.history, sessionId)).toEqual(producer.history);
+    }
+  });
+});
 
 describe.each([
   ["generation", executorFixtures.generation],
@@ -72,7 +96,7 @@ describe.each([
       "request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost",
       "operation_failed", "audit_integrity_error", "database_unavailable", "storage_unavailable",
       "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed",
-      "composer_mutation_authority_revoked", null,
+      "composer_mutation_authority_revoked", "composer_admission_refused", null,
     ]) {
       const control = { ...producer.history, items: [{ ...producer.history.items[0], error_type: category }] };
       expect(decodeComposerOperationFailurePage(control, sessionId, operationId)).toEqual(control);

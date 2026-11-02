@@ -39,6 +39,10 @@ from elspeth.web.composer.continuation_semantic_advisor_phase import (
     run_continuation_semantic_advisor,
     run_prescribed_semantic_read,
 )
+from elspeth.web.composer.continuation_semantic_advisor_return import (
+    ObservedClassifierReplyDeadline,
+    require_original_classifier_reply_deadline,
+)
 from elspeth.web.composer.continuation_semantic_advisor_review import review_prescribed_continuation_end
 from elspeth.web.composer.continuation_title_application import apply_current_title_success
 from elspeth.web.composer.continuation_title_provider import (
@@ -52,6 +56,7 @@ from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import ContinuationStage, SessionOperationLease
 from elspeth.web.required_work import (
+    ComposerFailureReceipt,
     RequiredWorkBinding,
     RequiredWorkCoordinator,
     RequiredWorkRole,
@@ -82,7 +87,11 @@ from elspeth.web.sessions.continuation import (
 )
 from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, publish_semantic_continuation_result
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
-from elspeth.web.sessions.continuation_iteration_return import IterationStageData, read_iteration_stage_on_connection
+from elspeth.web.sessions.continuation_iteration_return import (
+    IterationStageData,
+    read_iteration_stage_on_connection,
+    retain_iteration_reply_deadline_ready,
+)
 from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
 from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt
 from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
@@ -111,7 +120,14 @@ class ContinuationSegmentSettled:
 
 
 type ContinuationSegmentOutcome = ContinuationSegmentYielded | ContinuationSegmentHandedOver | ContinuationSegmentSettled
-type _ActionResult = ComposerOperationRecord | PrimaryNoSdkRefusalReceipt | SemanticAdvisorNoSdkTerminal | V3UnboundedTailRefusal | None
+type _ActionResult = (
+    ComposerOperationRecord
+    | PrimaryNoSdkRefusalReceipt
+    | SemanticAdvisorNoSdkTerminal
+    | V3UnboundedTailRefusal
+    | ObservedClassifierReplyDeadline
+    | None
+)
 
 
 @dataclass(slots=True)
@@ -124,10 +140,12 @@ class _ActionExpiry:
     timer: asyncio.TimerHandle | None = None
     completed_at: float | None = None
     expired: bool = False
+    interrupted: bool = False
     cause: TimeoutError = field(default_factory=lambda: TimeoutError("Continuation action exceeded its original allowance"))
     callback_errors: list[BaseException] = field(default_factory=list)
 
     def _interrupt(self, *, deadline: bool = True) -> None:
+        self.interrupted = True
         reason = COMPOSER_DEADLINE if deadline else COMPOSER_LEASE_LOST
         try:
             self.phases.cancel_business(reason)
@@ -188,6 +206,24 @@ class _ActionExpiry:
         return failures
 
 
+@dataclass(frozen=True, slots=True)
+class _HandledReplyDeadline:
+    """A committed ready source handles only this original deadline signal."""
+
+    signal: RequiredWorkTicket
+    cause: TimeoutError
+    observed: ObservedClassifierReplyDeadline
+    ready: StoredContinuationSnapshot
+
+    def handles(self, receipt: ComposerFailureReceipt) -> bool:
+        return (
+            receipt.key == self.signal.key
+            and receipt.original_root is self.cause
+            and len(receipt.original_category_witnesses) == 1
+            and receipt.original_category_witnesses[0] is self.cause
+        )
+
+
 class _SegmentDriver:
     def __init__(
         self, worker: ComposerAsyncWorker, services: ComposerAppServices, running: ComposerOperationRunning, lease: SessionOperationLease
@@ -213,6 +249,7 @@ class _SegmentDriver:
         self._progress_cleanup_failures: list[BaseException] = []
         self._iteration_stage: IterationStageData | None = None
         self._action_clock: ContinuationActionClock | None = None
+        self._handled_reply_deadlines: list[_HandledReplyDeadline] = []
 
     async def start_progress(self, record: ComposerOperationRecord) -> None:
         if self.progress_owner is not None:
@@ -458,7 +495,11 @@ class _SegmentDriver:
                 self.running, self.lease, current, _StartedSettlement(terminal_receipt=current)
             )
             return ContinuationSegmentSettled(current)
-        receipts = self.work.coordinator.settlement_failure_receipts()
+        receipts = tuple(
+            receipt
+            for receipt in self.work.coordinator.settlement_failure_receipts()
+            if not any(handled.handles(receipt) for handled in self._handled_reply_deadlines)
+        )
         reduction = reduce_composer_failures(receipts)
         failure = reduction.project(request_id=current.request_id, timeout_seconds=timeout_seconds)
         return await self.settle(current, original, expired_failure=failure)
@@ -481,6 +522,61 @@ class _SegmentDriver:
                     raise
                 raise combined from combined.__cause__
             raise
+
+    async def retain_reply_deadline(
+        self,
+        observed: ObservedClassifierReplyDeadline,
+        *,
+        expiry: _ActionExpiry,
+        stage: ContinuationStage[_ActionResult],
+        clock: ContinuationActionClock,
+    ) -> None:
+        """Retain only the original returned no-SDK boundary after its stage joins."""
+        if (
+            type(observed) is not ObservedClassifierReplyDeadline
+            or expiry.interrupted
+            or expiry.callback_errors
+            or expiry.completed_at is None
+            or stage.original is not None
+            or not stage.returned
+            or stage.task is not expiry.task
+            or stage.task is None
+            or not stage.task.done()
+            or stage.task.result() is not observed
+            or self.phases.cancellation_requested.is_set()
+            or self._action_clock is not clock
+            or not expiry.producer.complete
+            or not expiry.signal.complete
+            or any(handled.signal is expiry.signal for handled in self._handled_reply_deadlines)
+        ):
+            raise AuditIntegrityError("reply deadline disposition lost its original joined action")
+        original = require_original_classifier_reply_deadline(observed, phases=self.phases, running=self.running, action_clock=clock)
+        sampled = original.token.observation.observed_monotonic
+        if sampled is None or sampled > expiry.completed_at:
+            raise AuditIntegrityError("reply deadline observation followed its original producer completion")
+        self.sql_deadline.require_action_clock(clock)
+        self.lease.raise_if_lost()
+        self.sql_deadline.begin_settlement()
+        ready = await _registered(
+            work=self.work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=partial(
+                retain_iteration_reply_deadline_ready,
+                self.authority,
+                self.running,
+                selected=original.selected,
+                inventory=original.inventory,
+                observed=observed,
+                action_clock=clock,
+                phases=self.phases,
+            ),
+            expected=StoredContinuationSnapshot,
+        )
+        if expiry.expired:
+            handled = _HandledReplyDeadline(expiry.signal, expiry.cause, observed, ready)
+            if not any(handled.handles(receipt) for receipt in expiry.signal.receipts()):
+                raise AuditIntegrityError("reply deadline disposition lost its original expiry cause")
+            self._handled_reply_deadlines.append(handled)
 
     async def dispose(self, original: BaseException | None = None) -> ContinuationSegmentOutcome:
         if original is not None and not any(original is item for item in self._consumed_native):
@@ -748,7 +844,7 @@ class _SegmentDriver:
             return None
         if not isinstance(stage, IterationStageData) or stage.current != stored:
             raise AuditIntegrityError("iteration stage read changed its exact current source DATA")
-        if stage.stage in ("early_dispatched", "classify_dispatched", "end_dispatched"):
+        if stage.stage in ("early_dispatched", "classify_dispatched", "end_dispatched", "reply_refusal_dispatched"):
             raise AuditIntegrityError("iteration stage cannot replay unresolved paid work")
         return stage
 
@@ -1039,12 +1135,27 @@ class _SegmentDriver:
                     raise BaseExceptionGroup(
                         "Continuation stage observation failed", ([original] if original is not None else []) + list(failures)
                     )
+            if (
+                type(result) is ObservedClassifierReplyDeadline
+                and original is None
+                and not expiry.interrupted
+                and not self.phases.cancellation_requested.is_set()
+                and not self._worker_is_draining()
+            ):
+                await self.retain_reply_deadline(result, expiry=expiry, stage=stage_owner, clock=action_clock)
+                # The old action is closed. The loop re-reads current ownership
+                # and independently admits the retained SQL refusal tail.
+                continue
             if expiry.expired:
                 from elspeth.web.sessions.composer_async_worker import _terminal_completion_unknown
 
                 if original is not None and _terminal_completion_unknown(original):
                     raise original
                 return await self.settle_expired(original, timeout_seconds=action.total)
+            if type(result) is ObservedClassifierReplyDeadline:
+                # A watcher Stop/drain observation wins over an otherwise
+                # returned no-SDK boundary; do not reopen its business stage.
+                return await self.dispose(original)
             if original is not None:
                 from elspeth.web.sessions.composer_async_worker import _terminal_completion_unknown
 

@@ -1,20 +1,25 @@
-"""Finite local AST transfer receipts; common receiver/effect proof remains required."""
+"""Finite Continuation/proposal AST transfers, conditional on Common custody.
+
+The retired freeform turn, compose/compose_recovery and moved finalizer have
+no receipts here. Current driver constructor proofs and manual proposal child
+ownership replace those transfers; recovery text belongs to current recipes.
+"""
 
 import ast
 import copy
 import hashlib
 import json
-from types import SimpleNamespace
 
 from tests.helpers import web_reserve_proposal_child_transfers as _supplier_sources
-from tests.helpers.web_reserve_composer_receiver import composer_dispatch_calls
+from tests.helpers.web_reserve_provider_mint_contract import provider_driver_constructor_contract
 
-TURN = "src/elspeth/web/sessions/composer_turn.py"
-SERVICE = "src/elspeth/web/composer/service.py"
+DRIVER = "src/elspeth/web/sessions/continuation_driver.py"
+PHASES = "src/elspeth/web/composer/continuation_live_phases.py"
 PROPOSALS = "src/elspeth/web/sessions/routes/composer/proposals.py"
 SETTLEMENT = "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py"
-FINALIZATION = "src/elspeth/web/sessions/composer_finalization.py"
 RECOVERY_MESSAGES = "src/elspeth/web/composer/continuation_message_builders.py"
+RECOVERY_PRODUCERS = "src/elspeth/web/composer/continuation_prompt_producers.py"
+RECOVERY_RECIPES = "src/elspeth/web/composer/continuation_prompt_recipes.py"
 RECOVERY_INSTRUCTION_ORIGINS = frozenset(
     {
         "elspeth.web.composer.continuation_message_builders.recovery_instruction_message",
@@ -39,11 +44,19 @@ _RECOVERY_INSTRUCTION_SOURCE = """def recovery_instruction_message() -> dict[str
     }
 """
 
+# Existing reviewed proposal-body pins are retained unchanged. No new driver,
+# service, recovery or whole-file hash is invented to waive a changed program.
+_REVIEWED_METHOD_SHAPES = {
+    PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
+    SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
+}
+
 
 def _node(unit, path):
     body = unit.tree.body
+    current = None
     for part in path.split("."):
-        matches = [n for n in body if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == part]
+        matches = [node for node in body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == part]
         if len(matches) != 1:
             return None
         current = matches[0]
@@ -52,103 +65,48 @@ def _node(unit, path):
 
 
 def _shape(node):
-    if node is None:
-        return None
-    return ast.dump(node, include_attributes=False)
-
-
-def _statement(source):
-    return ast.parse(source).body[0]
+    return None if node is None else ast.dump(node, include_attributes=False)
 
 
 def _exact(node, source):
-    return _shape(node) == _shape(_statement(source))
+    return _shape(node) == _shape(ast.parse(source).body[0])
 
 
-def _calls(method, predicate):
-    def executable(node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            # The selected function is invoked later; its decorator, defaults,
-            # type parameters and annotations are definition-time expressions,
-            # not its executable body. A nested definition's body is not an
-            # occurrence in its enclosing function.
-            if node is method:
-                for statement in node.body:
-                    yield from executable(statement)
-            return
-        if isinstance(node, ast.TypeAlias):
-            # PEP 695's alias value is resolved lazily, so it cannot stand in
-            # for an actual call in the selected executed statement list.
-            return
-        yield node
-        children = ([node.value] if node.value is not None else []) if isinstance(node, ast.AnnAssign) else ast.iter_child_nodes(node)
-        for child in children:
-            yield from executable(child)
-
-    return [n for n in executable(method) if isinstance(n, ast.Call) and predicate(n)]
+def _canonical_ast(value):
+    if isinstance(value, ast.AST):
+        if isinstance(value, ast.Call):
+            value = copy.copy(value)
+            value.keywords = [
+                keyword
+                for keyword in value.keywords
+                if not (keyword.arg is None and isinstance(keyword.value, ast.Dict) and not keyword.value.keys)
+            ]
+        return [
+            type(value).__name__,
+            [[name, _canonical_ast(field)] for name, field in ast.iter_fields(value) if field is not None and field != []],
+        ]
+    if isinstance(value, (list, tuple)):
+        return [_canonical_ast(item) for item in value]
+    if value is Ellipsis:
+        return {"literal_type": "ellipsis"}
+    return value
 
 
-def _nested_body_calls(method, predicate):
-    found = []
-    for nested in ast.walk(method):
-        if nested is method:
-            continue
-        if isinstance(nested, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            found.extend(_calls(nested, predicate))
-            headers = [*nested.decorator_list, *nested.args.defaults, *(value for value in nested.args.kw_defaults if value is not None)]
-        elif isinstance(nested, ast.ClassDef):
-            headers = [*nested.decorator_list, *nested.bases, *(value.value for value in nested.keywords), *nested.body]
-        elif isinstance(nested, ast.Lambda):
-            headers = [nested.body, *nested.args.defaults, *(value for value in nested.args.kw_defaults if value is not None)]
-        else:
-            continue
-        found.extend(call for header in headers for call in ast.walk(header) if isinstance(call, ast.Call) and predicate(call))
-    return found
-
-
-def _executed_path(method, selected):
-    """Return actual statement-list ancestry, refusing an unreviewed wrapper."""
-    parents = {}
-    for parent in ast.walk(method):
-        for field, children in ast.iter_fields(parent):
-            if isinstance(children, ast.AST):
-                parents[id(children)] = (parent, field, None)
-            elif isinstance(children, list):
-                for index, child in enumerate(children):
-                    if isinstance(child, ast.AST):
-                        parents[id(child)] = (parent, field, index)
-    path = []
-    current = selected
-    while current is not method:
-        record = parents.get(id(current))
-        if record is None:
-            return ()
-        parent, field, index = record
-        if field == "body" and index is not None and any(isinstance(earlier, (ast.Return, ast.Raise)) for earlier in parent.body[:index]):
-            return ()
-        path.append((type(parent).__name__, field, index, type(current).__name__))
-        current = parent
-    return tuple(reversed(path))
-
-
-def _direct_prefix_has_terminal(method, before):
-    """A same-list terminal before the call prevents the claimed guard path."""
-    return any(isinstance(statement, (ast.Return, ast.Raise)) for statement in method.body[:before])
-
-
-def _formal(method, name, *, keyword_only):
-    args = method.args.kwonlyargs if keyword_only else method.args.args
-    return sum(argument.arg == name for argument in args) == 1 and len(_lexical_bindings(method, name)) == 1
-
-
-def _keyword(call, name):
-    values = [k.value for k in call.keywords if k.arg == name]
-    return values[0] if len(values) == 1 else None
+def _method_shape(method):
+    header = copy.copy(method)
+    header.body = list(method.body)
+    if (
+        header.body
+        and isinstance(header.body[0], ast.Expr)
+        and isinstance(header.body[0].value, ast.Constant)
+        and type(header.body[0].value.value) is str
+    ):
+        header.body[0] = ast.Expr(value=ast.Constant(value="<inert docstring>"))
+    payload = json.dumps(_canonical_ast(header), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _lexical_bindings(method, name):
-    # A closure/class can carry a surprising name shadow or an evaluated
-    # definition-time binder. Refuse all additional stores, not only top-level.
     bound = []
     for node in ast.walk(method):
         if (
@@ -170,719 +128,263 @@ def _lexical_bindings(method, name):
     return bound
 
 
-def _source3_local_transfers(units):
-    """Return exact call IDs only with the actual guarded producers intact.
+def _calls(method, name):
+    """Only executable calls, excluding nested/deferred bodies and annotations."""
 
-    These local receipts do not establish import/receiver identity, method
-    lookup, app.state stability, or arbitrary intervening callback effects.
-    """
+    def walk(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            if node is method:
+                for statement in node.body:
+                    yield from walk(statement)
+            return
+        if isinstance(node, ast.TypeAlias):
+            return
+        yield node
+        children = ([node.value] if node.value is not None else []) if isinstance(node, ast.AnnAssign) else ast.iter_child_nodes(node)
+        for child in children:
+            yield from walk(child)
+
+    return [node for node in walk(method) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name]
+
+
+def _index(units, required):
     selected = {}
     for unit in units:
-        if unit.path in {TURN, SERVICE, PROPOSALS, SETTLEMENT}:
+        if unit.path in required:
             if unit.path in selected:
-                return ["composer transfer source duplicated " + unit.path], None
+                return None
             selected[unit.path] = unit
-    if set(selected) != {TURN, SERVICE, PROPOSALS, SETTLEMENT}:
-        return ["composer transfer source missing"], None
-    turn = _node(selected[TURN], "_run_composer_turn")
-    compose_class = _node(selected[SERVICE], "ComposerServiceImpl")
-    compose = _node(selected[SERVICE], "ComposerServiceImpl.compose")
+    return selected if set(selected) == set(required) else None
+
+
+def _import(unit, name, module):
+    return _supplier_sources.import_origin(unit.tree, name, module, name)
+
+
+def compose_proposal_local_transfers(units):
+    """Actual driver constructors and the still-live manual proposal transfer.
+
+    The existing receiver receipt proves _job/segment entry, app services and
+    phase binding. The shared closed driver-constructor receipt proves nominal
+    work/provider ownership here; it does not authorize arbitrary call sites.
+    """
+    selected = _index(units, {DRIVER, PHASES, PROPOSALS, SETTLEMENT})
+    if selected is None:
+        return ["composer transfer current source missing or duplicated"], None
+    failures, driver = provider_driver_constructor_contract(units)
+    if failures:
+        return failures, None
+    init = _node(selected[DRIVER], "_SegmentDriver.__init__")
+    phases = _node(selected[PHASES], "ContinuationLivePhases")
     accept = _node(selected[PROPOSALS], "accept_composition_proposal")
     settle = _node(selected[SETTLEMENT], "settle_pipeline_proposal_under_compose_lock")
-    if any(x is None for x in (turn, compose_class, compose, accept, settle)):
-        return ["composer transfer exact producer or callee missing"], None
-    if any(n.decorator_list or n.type_params for n in (turn, compose, settle)) or accept.type_params:
-        return ["composer transfer decorator or type parameter unproved"], None
-    route_decorator = ast.parse(
-        "router.post('/{session_id}/proposals/{proposal_id}/accept', response_model=CompositionProposalResponse)", mode="eval"
+    if any(node is None for node in (init, phases, accept, settle)):
+        return ["composer transfer current declaration missing"], None
+    for path, method in ((PROPOSALS, accept), (SETTLEMENT, settle)):
+        if _method_shape(method) != _REVIEWED_METHOD_SHAPES[path]:
+            return ["composer complete executed method grammar changed " + path], None
+    if not _supplier_sources.owned_origin(selected[PHASES].tree, "ContinuationLivePhases", phases):
+        return ["composer current phase supplier binding changed"], None
+    if phases.bases or phases.keywords or phases.type_params or len(phases.decorator_list) != 1:
+        return ["composer current phase constructor changed"], None
+    if _shape(phases.decorator_list[0]) != _shape(ast.parse("dataclass(slots=True)", mode="eval").body):
+        return ["composer current phase constructor changed"], None
+    fields = ast.parse(
+        "service: ComposerServiceImpl\nauthority: ComposerAsyncOperationAuthority\n"
+        "work: RequiredWorkBinding\nprovider_owner: ProviderInvocationOwner\nlease: SessionOperationLease"
     ).body
-    if len(accept.decorator_list) != 1 or _shape(accept.decorator_list[0]) != _shape(route_decorator):
-        return ["proposal route decorator or dispatch binding changed"], None
-    if any(isinstance(n, (ast.Yield, ast.YieldFrom)) for method in (turn, compose, accept, settle) for n in ast.walk(method)):
-        return ["composer transfer generator execution unproved"], None
-    if compose_class.bases or compose_class.keywords or compose_class.decorator_list or compose_class.type_params:
-        return ["composer service normal class lookup unproved"], None
+    if len(phases.body) < len(fields) or any(_shape(left) != _shape(right) for left, right in zip(phases.body, fields, strict=False)):
+        return ["composer current phase positional ownership schema changed"], None
     if any(
-        isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and n.name in {"__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__get__"}
-        for n in compose_class.body
+        _lexical_bindings(phases, name)
+        for name in ("__init__", "__post_init__", "__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__")
     ):
-        return ["composer service custom lookup unproved"], None
-    if any(_lexical_bindings(statement, "compose") for statement in compose_class.body if statement is not compose):
-        return ["composer service compose lookup rebound"], None
-    if len(turn.body) < 37 or not all(isinstance(turn.body[i], ast.Assign) for i in (17, 18)):
-        return ["composer turn binding position changed"], None
-    if not _exact(
-        turn.body[8],
-        "if type(required_work) is not RequiredWorkCoordinator:\n"
-        "    raise AuditIntegrityError('Composer turn requires an owned required-work coordinator')",
-    ):
-        return ["composer turn nominal coordinator guard changed"], None
-    if not _exact(turn.body[9], "lease.bind_required_work(required_work)"):
-        return ["composer turn owned lease binding changed"], None
-    if not _exact(turn.body[17], "provider_binding = RequiredWorkBinding(required_work, 0, 0, RequiredWorkRole.TURN, running)"):
-        return ["composer turn exact provider binding producer changed"], None
-    if not _exact(turn.body[18], "provider_owner = ProviderInvocationOwner(service=service, required_work=provider_binding)"):
-        return ["composer turn exact provider owner producer changed"], None
-    if len(_lexical_bindings(turn, "provider_binding")) != 1 or len(_lexical_bindings(turn, "provider_owner")) != 1:
-        return ["composer turn provider owner or binding rebound"], None
-    if (
-        not isinstance(turn.body[36], ast.Try)
-        or len(turn.body[36].body) < 16
-        or not _exact(
-            turn.body[36].body[15],
-            "provider_owner.bind_cost_budget(capture_common_provider_cost("
-            "session_id=str(session.id), request_id=str(turn_user_message_id), lifecycle_version=1, "
-            "initially_empty=state is not None and state_is_structurally_empty(state), settings=settings))",
-        )
-    ):
-        return ["composer turn original request cost capture changed"], None
-    if (
-        len(turn.body[36].body) < 18
-        or not _exact(
-            turn.body[36].body[16],
-            "initial_preferences = await service.get_composer_preferences(turn.session_id)",
-        )
-        or not _exact(
-            turn.body[36].body[17],
-            "mutation_ceiling = ComposerMutationCeiling(str(turn.session_id), str(turn_user_message_id), initial_preferences.trust_mode)",
-        )
-        or len(_lexical_bindings(turn, "initial_preferences")) != 1
-        or len(_lexical_bindings(turn, "mutation_ceiling")) != 1
-    ):
-        return ["composer turn original request mutation capture changed"], None
-    if len(_lexical_bindings(turn, "required_work")) != 2 or not _exact(
-        turn.body[10],
-        "if turn.budget_seconds != budget_anchor.remaining_at_running_seconds:\n"
-        '    raise ValueError("composer turn budget_seconds is not its budget anchor\'s remaining_at_running_seconds")',
-    ):
-        return ["composer turn retained coordinator or budget prefix changed"], None
-    composer_assignments = [
-        n
-        for n in ast.walk(turn)
-        if isinstance(n, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "composer" for target in n.targets)
-    ]
-    if (
-        len(composer_assignments) != 1
-        or not _exact(composer_assignments[0], "composer = services.composer_service")
-        or len(_lexical_bindings(turn, "composer")) != 1
-    ):
-        return ["composer app-services receiver transfer changed"], None
-
-    def compose_predicate(n):
-        return (
-            isinstance(n.func, ast.Attribute)
-            and isinstance(n.func.value, ast.Name)
-            and n.func.value.id == "composer"
-            and n.func.attr in {"compose", "compose_recovery"}
-        )
-
-    if _nested_body_calls(turn, compose_predicate):
-        return ["composer call in unreviewed nested executable body"], None
-    compose_calls = _calls(turn, compose_predicate)
-    if len(compose_calls) != 2 or {call.func.attr for call in compose_calls} != {"compose", "compose_recovery"}:
-        return ["composer turn compose call universe changed"], None
-    if not isinstance(turn.body[36], ast.Try) or len(turn.body[36].body) < 25:
-        return ["composer call executed path or preceding terminal changed"], None
-    dispatch = composer_dispatch_calls(turn.body[36].body[24])
-    if dispatch is None or set(dispatch) != set(compose_calls) or _direct_prefix_has_terminal(turn, 36):
-        return ["composer turn exact paired call arguments or closed branches changed"], None
-    compose_call, recovery_call = dispatch
-    if _shape(_keyword(compose_call, "retained_operation_context")) != _shape(ast.Name(id="retained_operation_context", ctx=ast.Load())):
-        return ["composer retained operation context argument changed"], None
-    for call, arm, index in ((compose_call, "orelse", 1), (recovery_call, "body", 0)):
-        if _executed_path(turn, call) != (
-            ("AsyncFunctionDef", "body", 36, "Try"),
-            ("Try", "body", 24, "Try"),
-            ("Try", "body", 2, "If"),
-            ("If", arm, index, "Assign"),
-            ("Assign", "value", None, "Await"),
-            ("Await", "value", None, "Call"),
+        return ["composer current phase custom constructor or lookup unproved"], None
+    for name in ("service", "authority", "work", "provider_owner", "lease"):
+        if any(
+            _lexical_bindings(statement, name)
+            for statement in phases.body[len(fields) :]
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
         ):
-            return ["composer call executed path or preceding terminal changed"], None
-    if len(compose.body) < 6 or not _exact(
-        compose.body[1],
-        "if retained_operation_context is not None:\n"
-        "    if type(retained_operation_context) is not RetainedOperationContext:\n"
-        "        raise TypeError('Retained operation context must be an owned value')\n"
-        "    retained_operation_context.validate_for(session_id=session_id, actor_user_id=user_id)",
-    ):
-        return ["composer retained operation context admission changed"], None
+            return ["composer current phase constructor field rebound"], None
+    origins = []
+    imports = (
+        (DRIVER, "ProviderInvocationOwner", "elspeth.web.composer.provider_quota"),
+        (DRIVER, "RequiredWorkBinding", "elspeth.web.required_work"),
+        (DRIVER, "ContinuationLivePhases", "elspeth.web.composer.continuation_live_phases"),
+        (PHASES, "dataclass", "dataclasses"),
+        (PROPOSALS, "settle_pipeline_proposal_under_compose_lock", "elspeth.web.sessions.routes.composer.pipeline_settlement"),
+        (PROPOSALS, "RequiredWorkCoordinator", "elspeth.web.required_work"),
+        (PROPOSALS, "RequiredWorkAuthority", "elspeth.web.required_work"),
+        (PROPOSALS, "RequiredWorkBinding", "elspeth.web.required_work"),
+        (PROPOSALS, "RequiredAuthorityKind", "elspeth.web.required_work"),
+        (PROPOSALS, "RequiredWorkRole", "elspeth.web.required_work"),
+        (SETTLEMENT, "RequiredWorkCoordinator", "elspeth.web.required_work"),
+        (SETTLEMENT, "RequiredWorkBinding", "elspeth.web.required_work"),
+    )
+    for path, name, module in imports:
+        origin = _import(selected[path], name, module)
+        if origin is None:
+            return ["composer transfer canonical supplier changed " + name], None
+        origins.append((path, id(origin[1])))
+    if not _supplier_sources.owned_origin(selected[SETTLEMENT].tree, "settle_pipeline_proposal_under_compose_lock", settle):
+        return ["proposal settlement supplier declaration rebound"], None
+    proposal_calls = _calls(accept, "settle_pipeline_proposal_under_compose_lock")
+    owner_calls = _calls(init, "ProviderInvocationOwner")
+    phase_calls = _calls(init, "ContinuationLivePhases")
+    if len(proposal_calls) != 1 or len(owner_calls) != 1 or len(phase_calls) != 1:
+        return ["composer current transfer call universe changed"], None
+    if _lexical_bindings(accept, "settle_pipeline_proposal_under_compose_lock"):
+        return ["proposal settlement canonical caller shadowed"], None
     if not _exact(
-        compose.body[2],
-        "if (required_work is None) != (provider_owner is None):\n"
-        "    raise AuditIntegrityError('Required Composer provider ownership must be supplied with its turn binding')",
-    ):
-        return ["composer pair admission guard changed"], None
-    if not (
-        isinstance(compose.body[0], ast.Expr)
-        and isinstance(compose.body[0].value, ast.Constant)
-        and type(compose.body[0].value.value) is str
-    ):
-        return ["composer pre-admission executable prefix changed"], None
-    if not all(
-        _formal(compose, name, keyword_only=False)
-        for name in ("required_work", "provider_owner", "session_operation_context", "retained_operation_context")
-    ):
-        return ["composer callee formal owner transfer changed"], None
-    if not _exact(
-        compose.body[3],
-        "if provider_owner is not None:\n"
-        "    if type(provider_owner) is not ProviderInvocationOwner or provider_owner.service is not self._require_sessions_service():\n"
-        "        raise AuditIntegrityError('Composer provider owner belongs to another exact service')\n"
-        "    if provider_owner.required_work is not required_work:\n"
-        "        raise AuditIntegrityError('Composer provider owner replaced its actual turn binding')\n"
-        "    provider_owner.required_work.validate_context(session_operation_context)",
-    ):
-        return ["composer owner, service, binding or context admission changed"], None
-    loop_blocks = [
-        node
-        for node in ast.walk(compose)
-        if isinstance(node, ast.Try)
-        and any(
-            isinstance(statement, ast.Return)
-            and isinstance(statement.value, ast.Await)
-            and isinstance(statement.value.value, ast.Call)
-            and _shape(statement.value.value.func) == _shape(ast.parse("self._compose_loop", mode="eval").body)
-            for statement in node.body
-        )
-    ]
-    if (
-        len(loop_blocks) != 1
-        or len(loop_blocks[0].body) != 2
-        or not _exact(
-            loop_blocks[0].body[0],
-            "if provider_owner is not None and session_id is not None and user_message_id is not None:\n"
-            "    cost_budget = provider_owner.cost_budget\n"
-            "    if cost_budget is None:\n"
-            "        cost_budget = capture_common_provider_cost(\n"
-            "            session_id=session_id, request_id=user_message_id, lifecycle_version=1,\n"
-            "            initially_empty=_state_is_structurally_empty(state), settings=self._settings)\n"
-            "        provider_owner.bind_cost_budget(cost_budget)\n"
-            "    cost_budget.validate_binding(session_id=session_id, request_id=user_message_id, lifecycle_version=1)\n"
-            "    cost_budget.require_supported_configuration()",
-        )
-    ):
-        return ["composer common entry retained cost policy admission changed"], None
-
-    def proposal_predicate(n):
-        return isinstance(n.func, ast.Name) and n.func.id == "settle_pipeline_proposal_under_compose_lock"
-
-    if _nested_body_calls(accept, proposal_predicate):
-        return ["proposal settlement call in unreviewed nested executable body"], None
-    proposal_calls = _calls(accept, proposal_predicate)
-    if len(proposal_calls) != 1:
-        return ["proposal settlement call universe changed"], None
-    proposal_call = proposal_calls[0]
-    if _executed_path(accept, proposal_call) != (
-        ("AsyncFunctionDef", "body", 2, "AsyncWith"),
-        ("AsyncWith", "body", 5, "If"),
-        ("If", "body", 3, "Try"),
-        ("Try", "body", 0, "Assign"),
-        ("Assign", "value", None, "Await"),
-        ("Await", "value", None, "Call"),
-    ) or _direct_prefix_has_terminal(accept, 2):
-        return ["proposal call executed path or preceding terminal changed"], None
-    if (
-        len(accept.body) < 3
-        or not isinstance(accept.body[2], ast.AsyncWith)
-        or len(accept.body[2].body) < 6
-        or not isinstance(accept.body[2].body[5], ast.If)
-        or _shape(accept.body[2].body[5].test) != _shape(ast.parse("pipeline_authority is not None", mode="eval").body)
-    ):
-        return ["proposal route owned branch changed"], None
-    branch = accept.body[2].body[5]
-    if (
-        len(branch.body) < 4
-        or not _exact(
-            branch.body[0],
-            "required_work = RequiredWorkCoordinator(RequiredWorkAuthority("
-            "RequiredAuthorityKind.MANUAL_PROPOSAL, lease.context, proposal_id=str(proposal.id), "
-            "invocation_id=str(uuid4()), tool_call_id=proposal.tool_call_id))",
-        )
-        or not _exact(branch.body[1], "lease.bind_required_work(required_work)")
-        or not isinstance(branch.body[3], ast.Try)
-        or proposal_call not in tuple(ast.walk(branch.body[3]))
-        or len(_lexical_bindings(accept, "required_work")) != 1
-    ):
-        return ["proposal required-work producer or call dominance changed"], None
-    if (
-        _shape(_keyword(proposal_call, "required_work")) != _shape(ast.Name(id="required_work", ctx=ast.Load()))
-        or _shape(_keyword(proposal_call, "required_binding"))
-        != _shape(ast.parse("RequiredWorkBinding(required_work, 0, 0, RequiredWorkRole.TURN)", mode="eval").body)
-        or _shape(_keyword(proposal_call, "session_operation_context"))
-        != _shape(ast.Attribute(value=ast.Name(id="lease", ctx=ast.Load()), attr="context", ctx=ast.Load()))
-    ):
-        return ["proposal exact paired settlement arguments changed"], None
-    if (
-        len(settle.body) < 6
-        or not all(_formal(settle, name, keyword_only=True) for name in ("required_work", "required_binding", "session_operation_context"))
-        or _direct_prefix_has_terminal(settle, 5)
-        or not _exact(settle.body[2], "child: RequiredWorkCoordinator | None = None")
-        or not _exact(settle.body[3], "producer = None")
-        or not _exact(settle.body[4], "child_binding = None")
-        or not _exact(
-            settle.body[0],
-            "if required_binding is not None and type(required_binding) is not RequiredWorkBinding:\n"
-            "    raise AuditIntegrityError('Pipeline settlement requires an owned parent binding')",
-        )
-    ):
-        return ["proposal nominal binding admission changed"], None
-    if not _exact(
-        settle.body[1],
-        "if required_work is not None:\n"
-        "    if type(required_work) is not RequiredWorkCoordinator:\n"
-        "        raise AuditIntegrityError('Pipeline settlement requires an owned required-work coordinator')\n"
-        "    if required_work.authority.context != session_operation_context:\n"
-        "        raise AuditIntegrityError('Pipeline required-work scope disagrees with context')",
-    ):
-        return ["proposal coordinator and context admission changed"], None
-    if not _exact(
-        settle.body[5],
-        "if required_work is not None:\n"
-        "    parent_binding = RequiredWorkBinding(required_work, 0, 0, RequiredWorkRole.TURN, running) if required_binding is None else required_binding\n"
-        "    if parent_binding.coordinator is not required_work:\n"
-        "        raise AuditIntegrityError('Pipeline parent binding has a foreign coordinator')\n"
-        "    parent_binding.validate_context(session_operation_context)\n"
-        "    child, producer = required_work.begin_proposal_child(str(authority.row.id), authority.row.tool_call_id, transition_ordinal=parent_binding.transition_ordinal, semantic_ordinal=parent_binding.semantic_ordinal)\n"
-        "    child_binding = RequiredWorkBinding(child, parent_binding.transition_ordinal, parent_binding.semantic_ordinal, parent_binding.role, parent_binding.running)",
-    ):
-        return ["proposal parent binding and child issuance changed"], None
+        accept.body[2].body[5].body[0],
+        "required_work = RequiredWorkCoordinator(RequiredWorkAuthority(RequiredAuthorityKind.MANUAL_PROPOSAL, "
+        "lease.context, proposal_id=str(proposal.id), invocation_id=str(uuid4()), tool_call_id=proposal.tool_call_id))",
+    ) or not _exact(accept.body[2].body[5].body[1], "lease.bind_required_work(required_work)"):
+        return ["proposal exact actual authority and lease binding changed"], None
+    constructors = {
+        "provider_owner": (DRIVER, id(owner_calls[0])),
+        "live_phases": (DRIVER, id(phase_calls[0])),
+    }
     return [], {
-        "validated_transfer_nodes": frozenset({(TURN, id(compose_call)), (TURN, id(recovery_call)), (PROPOSALS, id(proposal_call))}),
+        "validated_transfer_nodes": frozenset({*constructors.values(), (PROPOSALS, id(proposal_calls[0]))}),
+        "constructor_calls": constructors,
+        "proposal_call": (PROPOSALS, id(proposal_calls[0])),
+        "driver_constructor": driver,
+        "source_origins": tuple(origins),
+        "supplier_definitions": ((DRIVER, id(init)), (PHASES, id(phases)), (SETTLEMENT, id(settle))),
         "common_unknown": (
-            "composer.app.state receiver and normal method binding",
-            "import and callable identity of proposal settlement",
-            "FastAPI route decorator registration and normal callable transfer",
-            "outside writes, descriptors and intervening effects on retained owners",
-            "exact class, binding, coordinator, authority and context suppliers",
+            "actual worker/driver entry and app-services receiver receipt",
+            "runtime class, dataclass, import and callable identity",
+            "current actor, SQL admission, lease and proposal authority",
+            "outside writes, descriptor effects and intervening callbacks",
+            "phase runtime binding and provider invocation admission",
         ),
     }
 
 
-# The four original complete bodies and the extracted finalizer, their headers,
-# and exact selected Call grammars form one finite producer contract. The
-# hashes bind structural ASTs, not import identity or physical custody; those
-# remain explicit common-boundary obligations in the returned receipt.
-_REVIEWED_METHOD_SHAPES = {
-    TURN: "e24e67ac2fa723269ff782ddf40a194f25282279b90eb92efd5960e49a61d974",
-    SERVICE: "888d117a75a50c8c4bfda3ec1a91d624e3ba82232bdd87e957dd452dc688baac",
-    PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
-    SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
-    # Root derives this from the actual selected body after the finite join is
-    # reviewed. None refuses; it is never a waiver for an unreceived body.
-    # Reviewed 2026-11-01: the verified-checkpoint refusal before the
-    # strict-lane save (the head verification read, fix-autocommit).
-    FINALIZATION: "743ca996546636bf24704d96b43c9181831aa652935ba448da58bfdc970e9eee",
-}
-_REVIEWED_RECOVERY_METHOD_SHAPE = "cb8dea7814eb14cbe8601c402db19eb544781954c26679a6780e378b3d6d35c0"
-_REVIEWED_ANNOTATIONS = {TURN: frozenset({"assistant_write", "parent_assistant_id"})}
-_METHOD_PATHS = {
-    TURN: "_run_composer_turn",
-    SERVICE: "ComposerServiceImpl.compose",
-    PROPOSALS: "accept_composition_proposal",
-    SETTLEMENT: "settle_pipeline_proposal_under_compose_lock",
-    FINALIZATION: "settle_composer_result",
-}
-
-# Reviewed 2026-11-01: adds the state_from_record import used by the head
-# verification read (fix-autocommit).
-_FINALIZATION_NAMESPACE_SHAPE = "a0b4c30c6dacaf268964af90f7c197e27ba9c2971efd71d574d2cd0f0ba2e2fa"
-_FINALIZATION_FIELDS = (
-    "service",
-    "session",
-    "recovery_context",
-    "lease",
-    "compose_base_state_id",
-    "running",
-    "observation",
-    "progress_sink",
-    "state",
-    "chat_ingress",
-    "chat_ingress_inputs",
-    "prior_completion_gates_facts",
-    "state_record",
-    "budget_anchor",
-    "services",
-    "turn",
-    "labels",
-    "provider_binding",
-    "settings",
-    "plugin_snapshot",
-    "profile_registry",
-    "required_work",
-)
-
-
-def _canonical_ast(value):
-    """Serialize all nonempty AST fields identically on Python 3.12/3.13."""
-    if isinstance(value, ast.AST):
-        if isinstance(value, ast.Call):
-            # A literal empty keyword spread adds no binding or producer.
-            # Every nonempty or computed spread remains part of the shape.
-            call = copy.copy(value)
-            call.keywords = [
-                keyword
-                for keyword in value.keywords
-                if not (keyword.arg is None and isinstance(keyword.value, ast.Dict) and not keyword.value.keys)
-            ]
-            if (
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr == "compose"
-                and isinstance(call.func.value, ast.Name)
-                and call.func.value.id == "composer"
-            ):
-                call.keywords = [
-                    ast.keyword(arg="progress", value=ast.Constant(value="<unproved advisory effect>"))
-                    if keyword.arg == "progress"
-                    else keyword
-                    for keyword in call.keywords
-                ]
-            value = call
-        return [
-            type(value).__name__,
-            [[name, _canonical_ast(field)] for name, field in ast.iter_fields(value) if field is not None and field != []],
-        ]
-    if isinstance(value, list):
-        return [_canonical_ast(item) for item in value]
-    if isinstance(value, tuple):
-        return [_canonical_ast(item) for item in value]
-    if value is Ellipsis:
-        return {"literal_type": "ellipsis"}
-    return value
-
-
-def _method_shape(method):
-    # Prose may change without changing the executable program. Every other
-    # field, including the entire signature and every nested branch, is bound.
-    header = copy.copy(method)
-    header.body = list(method.body)
-    if (
-        header.body
-        and isinstance(header.body[0], ast.Expr)
-        and isinstance(header.body[0].value, ast.Constant)
-        and type(header.body[0].value.value) is str
-    ):
-        header.body[0] = ast.Expr(value=ast.Constant(value="<inert docstring>"))
-    payload = json.dumps(_canonical_ast(header), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _inert_annotation(method, statement, path):
-    if isinstance(statement, ast.AnnAssign):
-        if (
-            statement.value is not None and not (isinstance(statement.value, ast.Constant) and statement.value.value is None)
-        ) or not isinstance(statement.target, ast.Name):
-            return False
-        target = statement.target
-        if target.id in _REVIEWED_ANNOTATIONS.get(path, ()):
-            return False
-    elif isinstance(statement, ast.TypeAlias):
-        if not isinstance(statement.name, ast.Name):
-            return False
-        target = statement.name
-    else:
-        return False
-    name = target.id
-    # A local annotation under future annotations executes neither its type
-    # expression nor a value assignment. It is inert only when its new local
-    # name is not read, rebound, captured, or otherwise observed in the body.
-    references = [node for node in ast.walk(method) if isinstance(node, ast.Name) and node.id == name]
-    if references != [target]:
-        return False
-    return not any(isinstance(node, ast.arg) and node.arg == name for node in ast.walk(method))
-
-
-def _strip_inert_annotations(method, path):
-    def visit(node):
-        changed = False
-        updates = {}
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, list):
-                items = []
-                for item in value:
-                    if isinstance(item, ast.AST) and _inert_annotation(method, item, path):
-                        changed = True
-                        continue
-                    if isinstance(item, ast.AST):
-                        next_item = visit(item)
-                        changed |= next_item is not item
-                        item = next_item
-                    items.append(item)
-                if changed:
-                    updates[field] = items
-            elif isinstance(value, ast.AST):
-                next_value = visit(value)
-                if next_value is not value:
-                    changed = True
-                    updates[field] = next_value
-        if not changed:
-            return node
-        clone = copy.copy(node)
-        for field, value in updates.items():
-            setattr(clone, field, value)
-        return clone
-
-    return visit(method)
-
-
-def _finalization_namespace_shape(tree):
-    """Keep evaluated namespace/headers; deferred bodies have separate guards."""
-
-    class Headers(ast.NodeTransformer):
-        def visit_FunctionDef(self, node):
-            node.body = [ast.Pass()]
-            return node
-
-        def visit_AsyncFunctionDef(self, node):
-            node.body = [ast.Pass()]
-            return node
-
-        def visit_Lambda(self, node):
-            node.body = ast.Constant(value=None)
-            return node
-
-    return _method_shape(Headers().visit(_supplier_sources.copy_ast_fields(tree)))
-
-
-def _moved_finalization_contract(selected):
-    """Bind only the original turn wrapper to its complete moved supplier.
-
-    The node identities below describe the real source join, not a new SQL,
-    callback, arbitrary constructor or capability admission exception.
-    """
-    turn_unit = selected[TURN]
-    unit = selected[FINALIZATION]
-    turn = _node(turn_unit, "_run_composer_turn")
-    cls = _node(unit, "ComposerFinalizationInputs")
-    method = _node(unit, "settle_composer_result")
-    if not isinstance(turn, ast.AsyncFunctionDef) or not isinstance(cls, ast.ClassDef) or not isinstance(method, ast.AsyncFunctionDef):
-        return ["composer moved finalizer actual source declarations missing"], None
-    module = "elspeth.web.sessions.composer_finalization"
-    for name in ("ComposerFinalizationInputs", "settle_composer_result"):
-        if _supplier_sources.import_origin(turn_unit.tree, name, module, name) is None or _lexical_bindings(turn, name):
-            return ["composer moved finalizer canonical caller import changed " + name], None
-    if (
-        not _supplier_sources.owned_origin(unit.tree, "ComposerFinalizationInputs", cls)
-        or not _supplier_sources.owned_origin(unit.tree, "settle_composer_result", method)
-        or _supplier_sources.import_origin(unit.tree, "dataclass", "dataclasses", "dataclass") is None
-    ):
-        return ["composer moved finalizer owned supplier or dataclass binding changed"], None
-    fields = cls.body
-    if fields and isinstance(fields[0], ast.Expr) and isinstance(fields[0].value, ast.Constant) and type(fields[0].value.value) is str:
-        fields = fields[1:]
-    post_init = ast.parse('def __post_init__(self) -> None:\n    freeze_fields(self, "chat_ingress", "chat_ingress_inputs")').body[0]
-    if not fields or _shape(fields[-1]) != _shape(post_init):
-        return ["composer moved finalizer exact value freeze changed"], None
-    fields = fields[:-1]
-    for name in ("freeze_fields", "deep_thaw"):
-        if _supplier_sources.import_origin(unit.tree, name, "elspeth.contracts.freeze", name) is None:
-            return ["composer moved finalizer canonical value supplier changed " + name], None
-    if _supplier_sources.import_origin(unit.tree, "cast", "typing", "cast") is None:
-        return ["composer moved finalizer canonical value cast changed"], None
-    if (
-        cls.bases
-        or cls.keywords
-        or cls.type_params
-        or len(cls.decorator_list) != 1
-        or _shape(cls.decorator_list[0]) != _shape(ast.parse("dataclass(frozen=True, slots=True)", mode="eval").body)
-        or len(fields) != len(_FINALIZATION_FIELDS)
-        or any(
-            not isinstance(field, ast.AnnAssign)
-            or not isinstance(field.target, ast.Name)
-            or field.target.id != name
-            or field.value is not None
-            or field.simple != 1
-            for field, name in zip(fields, _FINALIZATION_FIELDS, strict=True)
-        )
-    ):
-        return ["composer moved finalizer constructor is not the actual plain frozen fields"], None
-    wrappers = [n for n in ast.walk(turn) if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
-    arguments = ", ".join(name + "=" + name for name in _FINALIZATION_FIELDS)
-    wrapper_source = (
-        "async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse) -> ComposerOperationRecord:\n"
-        "    return await settle_composer_result(ComposerFinalizationInputs(" + arguments + "), result)"
-    )
-    if len(wrappers) != 1 or not _exact(wrappers[0], wrapper_source) or len(_lexical_bindings(turn, "settle_post_provider")) != 1:
-        return ["composer moved finalizer exact original wrapper or arguments changed"], None
-    calls = {}
-    for name in ("ComposerFinalizationInputs", "settle_composer_result", "settle_post_provider"):
-        references = [n for n in ast.walk(turn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == name]
-        sites = [n for n in ast.walk(turn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name]
-        if len(references) != 1 or len(sites) != 1 or references[0] is not sites[0].func:
-            return ["composer moved finalizer original once-only call universe changed " + name], None
-        calls[name] = sites[0]
-    owners = [
-        n for n in ast.walk(turn) if isinstance(n, ast.Assign) and any(nested is calls["settle_post_provider"] for nested in ast.walk(n))
-    ]
-    if len(owners) != 1 or not _exact(
-        owners[0],
-        "continuation = lease.create_task(_capture_freeform_child(settle_post_provider(result)), name=labels.settlement_task_name)",
-    ):
-        return ["composer moved finalizer original lease task ownership changed"], None
-    if (
-        len(method.body) < 2 + len(_FINALIZATION_FIELDS)
-        or not _exact(
-            method.body[0],
-            "from elspeth.web.sessions.composer_turn import _SETTLEMENT_TIMEOUT_DETAIL, _graph_recovery_response, _required_audit",
-        )
-        or len(_lexical_bindings(method, "inputs")) != 1
-    ):
-        return ["composer moved finalizer original supplier imports or input binding changed"], None
-    for name, statement in zip(_FINALIZATION_FIELDS, method.body[2 : 2 + len(_FINALIZATION_FIELDS)], strict=True):
-        if not _exact(statement, name + " = inputs." + name) or len(_lexical_bindings(method, name)) != 1:
-            return ["composer moved finalizer original field forwarding changed " + name], None
-    updates = ast.parse(
-        '_post_compose_updates: ComposerPostComposeUpdates = {"repair_turns_used": result.repair_turns_used, '
-        '"ingress": cast("CompositionIngressRecord", deep_thaw(chat_ingress)), '
-        '"chat_ingress_inputs": cast("list[ChatIngressInput]", deep_thaw(chat_ingress_inputs))}'
-    ).body[0]
-    if sum(_shape(node) == _shape(updates) for node in method.body) != 1:
-        return ["composer moved finalizer exact metadata value thaw changed"], None
-    preflight = [
-        node
-        for node in ast.walk(method)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_handle_runtime_preflight_failure"
-    ]
-    required_values = {
-        "ingress": 'cast("CompositionIngressRecord", deep_thaw(chat_ingress))',
-        "chat_ingress_inputs": 'cast("list[ChatIngressInput]", deep_thaw(chat_ingress_inputs))',
-    }
-    if len(preflight) != 1 or any(
-        len(
-            [
-                item
-                for item in preflight[0].keywords
-                if item.arg == name and _shape(item.value) == _shape(ast.parse(value, mode="eval").body)
-            ]
-        )
-        != 1
-        for name, value in required_values.items()
-    ):
-        return ["composer moved finalizer exact preflight value thaw changed"], None
-    failures = []
-    if _finalization_namespace_shape(unit.tree) != _FINALIZATION_NAMESPACE_SHAPE:
-        failures.append("composer moved finalizer complete supplier namespace changed")
-    if failures:
-        return failures, None
-    return [], {name: (TURN, id(call)) for name, call in calls.items()}
-
-
-def compose_proposal_local_transfers(units):
-    """Bind original execution and the complete moved body before receipts."""
-    selected = {}
-    for unit in units:
-        if unit.path not in _METHOD_PATHS:
-            continue
-        if unit.path in selected:
-            return ["composer transfer source duplicated " + unit.path], None
-        selected[unit.path] = unit
-    if set(selected) != set(_METHOD_PATHS):
-        return ["composer transfer source missing"], None
-    recovery = _node(selected[SERVICE], "ComposerServiceImpl.compose_recovery")
-    if recovery is None or _method_shape(recovery) != _REVIEWED_RECOVERY_METHOD_SHAPE:
-        return ["composer recovery complete executed method grammar changed"], None
-    if _supplier_sources.import_origin(
-        selected[SERVICE].tree,
-        "recovery_instruction_message",
-        "elspeth.web.composer.continuation_message_builders",
-        "recovery_instruction_message",
-    ) is None or _lexical_bindings(recovery, "recovery_instruction_message"):
-        return ["composer recovery instruction supplier origin changed"], None
-    finalization_failures, finalization = _moved_finalization_contract(selected)
-    if finalization_failures:
-        return finalization_failures, None
-    normalized = {}
-    for path, unit in selected.items():
-        if not any(
-            isinstance(node, ast.ImportFrom) and node.module == "__future__" and any(alias.name == "annotations" for alias in node.names)
-            for node in unit.tree.body
-        ):
-            return ["composer inert annotation execution mode changed " + path], None
-        method = _node(unit, _METHOD_PATHS[path])
-        if method is None:
-            return ["composer transfer method missing " + path], None
-        normal_method = _strip_inert_annotations(method, path)
-        try:
-            shape = _method_shape(normal_method)
-        except (TypeError, ValueError, OverflowError):
-            return ["composer unsupported executable AST literal " + path], None
-        if shape != _REVIEWED_METHOD_SHAPES[path]:
-            return ["composer complete executed method grammar changed " + path], None
-        if path == TURN and len(_lexical_bindings(method, "lease")) != 1:
-            return ["composer retained lease lexical binding changed"], None
-        tree = copy.copy(unit.tree)
-        tree.body = list(tree.body)
-        if "." in _METHOD_PATHS[path]:
-            class_name = _METHOD_PATHS[path].split(".")[0]
-            original_class = _node(unit, class_name)
-            class_clone = copy.copy(original_class)
-            class_clone.body = [normal_method if node is method else node for node in original_class.body]
-            tree.body = [class_clone if node is original_class else node for node in tree.body]
-        else:
-            tree.body = [normal_method if node is method else node for node in tree.body]
-        normalized[path] = SimpleNamespace(path=path, tree=tree)
-    failures, receipt = _source3_local_transfers(tuple(normalized.values()))
-    if failures:
-        return failures, None
-    receipt["moved_finalization"] = finalization
-    return [], receipt
-
-
 def recovery_instruction_supplier_contracts(units):
-    """Bind the extracted instruction in supplied ASTs; never read a source file.
-
-    The ordinary transfer receipt validates the consumer import and call. This
-    additional dependency receipt requires the defining source and keeps loader,
-    enum and callable-code behavior conditional on the common proof.
-    """
-    index = {}
-    for unit in units:
-        if unit.path in index:
-            return ["recovery instruction supplier: duplicate source unit"], None
-        index[unit.path] = unit
-    if SERVICE not in index or RECOVERY_MESSAGES not in index:
-        return ["recovery instruction supplier: missing current source"], None
-    source = index[RECOVERY_MESSAGES]
-    if not any(
-        isinstance(node, ast.ImportFrom) and node.module == "__future__" and any(alias.name == "annotations" for alias in node.names)
-        for node in source.tree.body
+    """Actual literal supplier and two current recipe calls, never V1 recovery."""
+    selected = _index(units, {RECOVERY_MESSAGES, RECOVERY_PRODUCERS, RECOVERY_RECIPES})
+    if selected is None:
+        return ["recovery instruction supplier: current source missing or duplicated"], None
+    source, consumer = selected[RECOVERY_MESSAGES], selected[RECOVERY_PRODUCERS]
+    recipes = selected[RECOVERY_RECIPES]
+    recipe = _node(recipes, "RecoveryInstructionRecipe")
+    if (
+        recipe is None
+        or not _exact(
+            recipe,
+            "class RecoveryInstructionRecipe(ContinuationValue):\n    kind: Literal['recovery_instruction'] = 'recovery_instruction'",
+        )
+        or not _supplier_sources.owned_origin(recipes.tree, "RecoveryInstructionRecipe", recipe)
     ):
-        return ["recovery instruction supplier: postponed annotations required"], None
+        return ["recovery instruction supplier: closed recipe schema changed"], None
     method = _node(source, "recovery_instruction_message")
-    if method is None or not _exact(method, _RECOVERY_INSTRUCTION_SOURCE):
+    producer = _node(consumer, "CurrentContinuationMessageProducers.recovery_instruction")
+    rebuild = _node(consumer, "CurrentContinuationMessageProducers._rebuild_shelf")
+    restore = _node(consumer, "CurrentContinuationMessageProducers.restore_shelf")
+    register = _node(consumer, "CurrentContinuationMessageProducers._register")
+    if any(node is None for node in (method, producer, rebuild, restore, register)):
+        return ["recovery instruction supplier: current producer declaration missing"], None
+    if not _exact(method, _RECOVERY_INSTRUCTION_SOURCE) or not _supplier_sources.owned_origin(
+        source.tree, "recovery_instruction_message", method
+    ):
         return ["recovery instruction supplier: complete producer changed"], None
-    if not _supplier_sources.owned_origin(source.tree, "recovery_instruction_message", method):
-        return ["recovery instruction supplier: producer binding changed"], None
+    for unit in (source, consumer):
+        if _import(unit, "annotations", "__future__") is None:
+            return ["recovery instruction supplier: postponed annotations required"], None
     origins = []
-    for binding in ("PROMPT_GUARD_TRUST_KEY", "PromptGuardTrust"):
-        origin = _supplier_sources.import_origin(source.tree, binding, "elspeth.contracts.prompt_guard", binding)
+    for unit, name, module in (
+        (source, "PROMPT_GUARD_TRUST_KEY", "elspeth.contracts.prompt_guard"),
+        (source, "PromptGuardTrust", "elspeth.contracts.prompt_guard"),
+        (consumer, "recovery_instruction_message", "elspeth.web.composer.continuation_message_builders"),
+        (consumer, "RecoveryInstructionRecipe", "elspeth.web.composer.continuation_prompt_recipes"),
+        (recipes, "ContinuationValue", "elspeth.web.composer.continuation"),
+        (recipes, "Literal", "typing"),
+    ):
+        origin = _import(unit, name, module)
         if origin is None:
-            return ["recovery instruction supplier: canonical dependency changed " + binding], None
-        origins.append((source.path, id(origin[1])))
-    consumer = index[SERVICE]
-    origin = _supplier_sources.import_origin(
-        consumer.tree,
-        "recovery_instruction_message",
-        "elspeth.web.composer.continuation_message_builders",
-        "recovery_instruction_message",
-    )
-    recovery = _node(consumer, "ComposerServiceImpl.compose_recovery")
-    if origin is None or recovery is None or _lexical_bindings(recovery, "recovery_instruction_message"):
-        return ["recovery instruction supplier: consumer origin changed"], None
-    calls = _calls(recovery, lambda node: isinstance(node.func, ast.Name) and node.func.id == "recovery_instruction_message")
-    if len(calls) != 1 or calls[0].args or calls[0].keywords:
-        return ["recovery instruction supplier: exact consumer call changed"], None
+            return ["recovery instruction supplier: canonical dependency changed " + name], None
+        origins.append((unit.path, id(origin[1])))
+    if not _exact(
+        producer,
+        "def recovery_instruction(self) -> dict[str, Any]:\n"
+        "    return self._register(recovery_instruction_message(), RecoveryInstructionRecipe())",
+    ):
+        return ["recovery instruction supplier: actual recipe issuance changed"], None
+    if not _exact(
+        restore,
+        "def restore_shelf(self, snapshot: MessageShelfSnapshot) -> list[dict[str, Any]]:\n"
+        "    inputs = self._require_current()\n"
+        "    restored = self._rebuild_shelf(snapshot, inputs=inputs)\n"
+        "    self._require_current()\n"
+        "    return restored",
+    ):
+        return ["recovery instruction supplier: current reconstruction brackets changed"], None
+    if not _exact(
+        register,
+        "def _register(self, message: dict[str, Any], recipe: ContinuationMessageRecipe) -> dict[str, Any]:\n"
+        "    if type(self.inputs) is _ReadyProducerInputs and type(recipe) is not InitialMessageRecipe:\n"
+        "        raise AuditIntegrityError('ready message producer admits only its actual initial-message family')\n"
+        "    if any(existing is message for existing, _, _ in self._produced) or any(\n"
+        "        item.message is message for item in self._feedback_produced):\n"
+        "        raise AuditIntegrityError('message producer registered the same actual object twice')\n"
+        "    self._produced.append((message, recipe, _wire(message)))\n"
+        "    return message",
+    ):
+        return ["recovery instruction supplier: exact object/recipe registration changed"], None
+    if (
+        len(rebuild.body) < 4
+        or not _exact(
+            rebuild.body[2],
+            "if type(inputs) is not _CurrentProducerInputs or inputs != self.inputs:\n"
+            "    raise AuditIntegrityError('shelf assembly changed its actual producer inputs')",
+        )
+        or not _exact(
+            rebuild.body[3],
+            "if type(snapshot) is not MessageShelfSnapshot or encode_message_shelf(snapshot).canonical != inputs.evidence_messages_json:\n"
+            "    raise AuditIntegrityError('message reconstruction changed the complete selected transcript shelf')",
+        )
+    ):
+        return ["recovery instruction supplier: exact selected shelf admission changed"], None
+    branches = [
+        node
+        for node in ast.walk(rebuild)
+        if isinstance(node, ast.If)
+        and _shape(node.test) == _shape(ast.parse("type(recipe) is RecoveryInstructionRecipe", mode="eval").body)
+    ]
+    if len(branches) != 1 or len(branches[0].body) != 1 or not _exact(branches[0].body[0], "current = recovery_instruction_message()"):
+        return ["recovery instruction supplier: exact recovery reconstruction branch changed"], None
+    calls = (*_calls(producer, "recovery_instruction_message"), *_calls(rebuild, "recovery_instruction_message"))
+    all_calls = [
+        node
+        for node in ast.walk(consumer.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "recovery_instruction_message"
+    ]
+    if len(calls) != 2 or set(calls) != set(all_calls) or any(call.args or call.keywords for call in calls):
+        return ["recovery instruction supplier: exact current call universe changed"], None
+    if any(_lexical_bindings(node, "recovery_instruction_message") for node in (producer, rebuild)):
+        return ["recovery instruction supplier: consumer origin shadowed"], None
     if _supplier_sources._executed_protected_loads(
         source.tree, {"recovery_instruction_message", "PROMPT_GUARD_TRUST_KEY", "PromptGuardTrust"}
     ):
         return ["recovery instruction supplier: evaluated producer escape"], None
     return [], {
         "supplier_definitions": ((source.path, id(method)),),
-        "supplier_calls": ((consumer.path, id(calls[0])),),
-        "source_origins": (*origins, (consumer.path, id(origin[1]))),
+        "supplier_calls": tuple((consumer.path, id(call)) for call in calls),
+        "source_origins": tuple(origins),
         "protected_origins": RECOVERY_INSTRUCTION_ORIGINS,
         "function_origins": RECOVERY_INSTRUCTION_FUNCTION_ORIGINS,
         "class_origins": RECOVERY_INSTRUCTION_CLASS_ORIGINS,
-        "common_unknown": ("runtime prompt-guard enum and callable-code identity", "outside or deferred supplier mutation"),
+        "current_recipe_definitions": (
+            *((consumer.path, id(node)) for node in (producer, rebuild, restore, register)),
+            (recipes.path, id(recipe)),
+        ),
+        "common_unknown": (
+            "runtime prompt-guard enum and callable-code identity",
+            "current producer receiver, schema suppliers and selected SQL admission",
+            "complete reconstruction control flow and retained wire equality",
+            "outside or deferred supplier mutation",
+        ),
     }

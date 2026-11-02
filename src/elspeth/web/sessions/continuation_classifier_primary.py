@@ -26,6 +26,8 @@ from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, 
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, ContinuationValue, ToolBatchFrame
 from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot, decode_recorder_snapshot
+from elspeth.web.composer.continuation_classifier_handoff import decode_classifier_runtime_preflight
+from elspeth.web.composer.continuation_classifier_owned_source import ClassifierOwnedSourceObservation
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
@@ -850,6 +852,14 @@ def read_original_classifier_primary_on_connection(
     )
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class ClassifierReplyDeadline:
+    """Original uninvoked reply observation; only its issuing owner can verify it."""
+
+    observation: ClassifierOwnedSourceObservation
+    runtime_preflight_json: str | None
+
+
 class ClassifierPrimaryIssuer:
     """One live classifier attempt, admitted afresh at each SQL/SDK boundary."""
 
@@ -906,6 +916,90 @@ class ClassifierPrimaryIssuer:
         self._sdk_entered = False
         self._failure: BaseException | None = None
         self._result: ClassifierPrimaryResult | None = None
+        self._reply_deadline: float | None = None
+        self._reply_deadline_observation: ClassifierReplyDeadline | None = None
+        self._reply_clock = clock
+        self._reply_sql_owner = owner
+
+    def bind_reply_deadline(self, deadline: float) -> None:
+        """Bind the observer's original deadline before entering the classifier."""
+        owner = self.work.coordinator.sql_deadline_owner
+        now = time.monotonic()
+        if (
+            type(deadline) is not float
+            or not math.isfinite(deadline)
+            or type(owner) is not ContinuationSQLDeadlineOwner
+            or owner is not self._reply_sql_owner
+            or self.clock is not self._reply_clock
+            or owner.running is not self.running
+            or self._reply_deadline is not None
+            or self._started
+            or deadline > min(self.runtime.bindings.deadline, self.clock.started_monotonic + self.clock.policy.total)
+            or deadline > now + owner.remaining_dispatch(monotonic_now=now)
+        ):
+            raise AuditIntegrityError("classifier reply substituted its original active deadline")
+        owner.require_action_clock(self.clock)
+        self._reply_deadline = deadline
+
+    def seal_reply_deadline(
+        self, observation: ClassifierOwnedSourceObservation, *, runtime_preflight_json: str | None
+    ) -> ClassifierReplyDeadline:
+        """Close this never-invoked issuer at the actual elapsed reply boundary."""
+        self._reply_sql_owner.require_action_clock(self._reply_clock)
+        fence = self.running.session_operation_context.fence
+        if (
+            type(observation) is not ClassifierOwnedSourceObservation
+            or observation.kind != "reply_deadline_exhausted"
+            or self._reply_deadline is None
+            or self.clock is not self._reply_clock
+            or self.work.coordinator.sql_deadline_owner is not self._reply_sql_owner
+            or observation.deadline != self._reply_deadline
+            or observation.observed_monotonic is None
+            or observation.observed_monotonic > time.monotonic()
+            or observation.observed_monotonic < self._reply_deadline
+            or observation.clock_started_monotonic != self.clock.started_monotonic
+            or observation.clock_policy_json != canonical_json(self.clock.policy.model_dump(mode="json"))
+            or observation.source_checkpoint_id != self.selected.checkpoint_id
+            or observation.source_cursor != self.selected.stack.cursor
+            or observation.state_sha256 != stable_hash(self.runtime.live.state.to_dict())
+            or observation.physical_operation_id != fence.operation_id
+            or observation.physical_operation_epoch != fence.operation_epoch
+            or self._started
+            or self._sdk_entered
+            or self._failure is not None
+            or self._result is not None
+            or self._reply_deadline_observation is not None
+        ):
+            raise AuditIntegrityError("reply deadline requires its original never-invoked issuer observation")
+        decode_classifier_runtime_preflight(runtime_preflight_json)
+        sealed = ClassifierReplyDeadline(observation, runtime_preflight_json)
+        self._reply_deadline_observation = sealed
+        return sealed
+
+    def require_reply_deadline(self, sealed: ClassifierReplyDeadline) -> ClassifierOwnedSourceObservation:
+        """Verify exact live custody; decoded or copied observations grant nothing."""
+        owner = self.work.coordinator.sql_deadline_owner
+        if (
+            type(sealed) is not ClassifierReplyDeadline
+            or sealed is not self._reply_deadline_observation
+            or self._started
+            or self._sdk_entered
+            or self._failure is not None
+            or self._result is not None
+            or type(owner) is not ContinuationSQLDeadlineOwner
+            or owner is not self._reply_sql_owner
+            or self.clock is not self._reply_clock
+            or owner.running is not self.running
+            or self.work.running is not self.running
+            or self.provider_owner.required_work is not self.work
+            or sealed.observation.deadline != self._reply_deadline
+            or sealed.observation.clock_started_monotonic != self.clock.started_monotonic
+            or sealed.observation.clock_policy_json != canonical_json(self.clock.policy.model_dump(mode="json"))
+        ):
+            raise AuditIntegrityError("reply deadline disposition lost its exact original issuer")
+        owner.require_action_clock(self.clock)
+        decode_classifier_runtime_preflight(sealed.runtime_preflight_json)
+        return sealed.observation
 
     @property
     def result(self) -> ClassifierPrimaryResult | None:
@@ -950,6 +1044,8 @@ class ClassifierPrimaryIssuer:
         deadline: float,
         credential_state: CompositionState | None = None,
     ) -> ClassifierPrimaryResult:
+        if self._reply_deadline_observation is not None:
+            raise AuditIntegrityError("classifier reply deadline permanently closed its original dispatch")
         if self._started:
             if self._failure is not None:
                 raise self._failure

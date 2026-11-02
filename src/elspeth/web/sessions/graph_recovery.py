@@ -83,6 +83,28 @@ class GraphRecoverySettlement:
     malformed_head: bool = False
 
 
+def graph_recovery_notice(recovery: GraphRecoverySettlement) -> str:
+    """The exact trusted notice for one frozen recovery disposition."""
+    if recovery.failure_reason is not None:
+        notice = "Graph recovery did not complete: the requested draft could not be preserved or restored. The current graph is unchanged."
+    elif recovery.intent.action == "park":
+        notice = f"Draft parked as {recovery.park_id}. The graph remains visible."
+    elif recovery.empty_fallback:
+        notice = (
+            "No eligible saved draft was available; an empty authoring workspace was opened. "
+            "Uploads and history remain. The abandoned working candidate was not captured."
+        )
+    else:
+        notice = (
+            f"Restored saved draft {recovery.target_state_id} as a new editable version. "
+            "Execution readiness and approvals require current checks. "
+            "The abandoned working candidate was not captured. Uploads and history remain."
+        )
+    if recovery.malformed_head:
+        notice += " The previous stored graph or its completion metadata could not be decoded; its historical row was preserved."
+    return notice
+
+
 def empty_recovery_state() -> CompositionState:
     return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
 

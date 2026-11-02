@@ -468,9 +468,9 @@ def _provider_contracts():
     return {
         "ProviderCallCustody.__init__": (
             ("self",),
-            ("service", "context", "required_work", "cost_budget"),
+            ("service", "context", "required_work", "cost_budget", "family"),
             (),
-            (None, None, None, c(None)),
+            (None, None, None, c(None), c(None)),
             False,
             (),
             [
@@ -487,11 +487,21 @@ def _provider_contracts():
                     ),
                     [raising(n("AuditIntegrityError"))],
                 ),
+                iff(
+                    both(
+                        cmp(n("family"), ast.IsNot, c(None)),
+                        cmp(call("type", n("family")), ast.IsNot, n("ProviderInvocationFamily")),
+                    ),
+                    [raising(n("AuditIntegrityError"))],
+                ),
+                assign(s("_family"), n("family")),
                 assign(s("_cost_budget"), n("cost_budget")),
                 assign(s("_cost_response_accountable"), c(False)),
                 assign(s("_service"), n("service")),
                 assign(s("_context"), n("context")),
                 assign(s("_required_work"), n("required_work")),
+                annotate(s("_primary_no_sdk_issuer"), union(n("PrimaryNoSdkIssuer"), c(None)), c(None)),
+                annotate(s("_semantic_no_sdk_issuer"), union(n("SemanticAdvisorNoSdkIssuer"), c(None)), c(None)),
                 annotate(s("attempt"), ast.BinOp(left=n("ProviderAttempt"), op=ast.BitOr(), right=c(None)), c(None)),
                 annotate(s("call"), ast.BinOp(left=n("ComposerLLMCall"), op=ast.BitOr(), right=c(None)), c(None)),
                 assign(s("_sdk_entered"), c(False)),
@@ -500,6 +510,7 @@ def _provider_contracts():
                 assign(s("_undispatched_recurrence"), c(0)),
                 assign(s("_settlements"), c(0)),
                 annotate(s("continuation_title"), union(n("PreparedTitleProvider"), c(None)), c(None)),
+                annotate(s("continuation_primary_clock"), union(n("ContinuationActionClock"), c(None)), c(None)),
                 annotate(s("continuation_title_selected"), union(n("StoredContinuationSnapshot"), c(None)), c(None)),
                 annotate(s("continuation_title_result"), union(n("TitleAuditSettlementRequest"), c(None)), c(None)),
             ],
@@ -529,6 +540,7 @@ def _provider_contracts():
             (),
             [
                 iff(either(cmp(s("attempt"), ast.Is, c(None)), s("_sdk_entered")), [raising(n("AuditIntegrityError"))]),
+                assign(n("admitted"), s("attempt")),
                 assign(n("binding"), s("required_work")),
                 assign(n("ticket"), reserve("UNDISPATCHED_ATTEMPT_CANCELLATION_SQL", "_undispatched_recurrence")),
                 aug(s("_undispatched_recurrence")),
@@ -546,6 +558,14 @@ def _provider_contracts():
                             ),
                         )
                     ),
+                ),
+                iff(
+                    cmp(s("_primary_no_sdk_issuer"), ast.IsNot, c(None)),
+                    [expr(call(a(s("_primary_no_sdk_issuer"), "note_undispatched_cancel"), n("self"), n("admitted"), model=n("model")))],
+                ),
+                iff(
+                    cmp(s("_semantic_no_sdk_issuer"), ast.IsNot, c(None)),
+                    [expr(call(a(s("_semantic_no_sdk_issuer"), "note_undispatched_cancel"), n("self"), n("admitted"), model=n("model")))],
                 ),
                 assign(s("attempt"), c(None)),
                 assign(s("call"), c(None)),
@@ -659,7 +679,21 @@ def _provider_contracts():
                 ),
                 iff(
                     cmp(s("_cost_budget"), ast.IsNot, c(None)),
-                    [expr(call(a(s("_cost_budget"), "consume_settled"), s("call"), response_accountable=s("_cost_response_accountable")))],
+                    [
+                        iff(
+                            both(
+                                cmp(a(call(a(s("_cost_budget"), "snapshot")), "applicability"), ast.Eq, c("continuation_v2")),
+                                either(
+                                    cmp(a(s("call"), "cost_response_accountable"), ast.Is, c(None)),
+                                    cmp(a(s("call"), "cost_response_accountable"), ast.IsNot, s("_cost_response_accountable")),
+                                ),
+                            ),
+                            [raising(n("AuditIntegrityError"))],
+                        ),
+                        expr(
+                            call(a(s("_cost_budget"), "consume_settled"), s("call"), response_accountable=s("_cost_response_accountable"))
+                        ),
+                    ],
                 ),
                 assign(s("attempt"), c(None)),
                 assign(s("call"), c(None)),
@@ -1973,13 +2007,17 @@ def family_local_contracts(units):
                     "_context",
                     "_cost_budget",
                     "_cost_response_accountable",
+                    "_family",
+                    "_primary_no_sdk_issuer",
                     "_required_work",
                     "_sdk_entered",
+                    "_semantic_no_sdk_issuer",
                     "_service",
                     "_settlements",
                     "_undispatched_recurrence",
                     "attempt",
                     "call",
+                    "continuation_primary_clock",
                     "continuation_title",
                     "continuation_title_result",
                     "continuation_title_selected",

@@ -22,10 +22,12 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as attempt
 from tests.unit.web.coordination import test_composer_operation_authority
 from tests.unit.web.sessions import test_continuation_v3_central_capacity as central
 from tests.unit.web.sessions.test_continuation_primary_result import primary_input
+from tests.unit.web.sessions.test_continuation_schema import continuation_unadmitted_parent
 from tests.unit.web.sessions.test_continuation_v3_paid_tail_preflight import _store_with_policy
 
 pytest_plugins = ("tests.unit.web.sessions.test_continuation_schema",)
 operation_store = test_composer_operation_authority.operation_store
+continuation_parent = continuation_unadmitted_parent
 
 
 def _minimal_failed_tail() -> ContinuationEvent:

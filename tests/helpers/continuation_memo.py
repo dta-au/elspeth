@@ -7,6 +7,7 @@ Closed uncached validators are separately charged per native invocation and
 stage. Scalar input characters are not detector traversal bytes.
 """
 
+import ast
 import builtins
 import dis
 import hashlib
@@ -19,6 +20,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from inspect import CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR, CO_VARARGS
+from pathlib import Path
 from threading import Lock, get_ident
 from types import BuiltinFunctionType, CellType, CodeType, FrameType, FunctionType, MethodType, TracebackType
 from typing import Final, Literal
@@ -106,6 +108,7 @@ _LOW_CODE_OBJECTS = (
     (continuation_codec._decode_continuation_snapshot_uncached.__code__, "snapshot_work"),
     (continuation_codec._private_chunk_canonical_text_bytes.__code__, "chunk_work"),
     (credential_material.find_credential_material.__code__, "detector_work"),
+    (continuation_codec._verify_private_chunk_canonical.__code__, "chunk_work"),
 )
 _LOW_CODES = {id(code): label for code, label in _LOW_CODE_OBJECTS}
 _PARSE = json_parser.parse_json_strict.__code__
@@ -119,6 +122,12 @@ _CHUNK_WORK_CODE = _CHUNK_PRODUCER.__code__
 _CHUNK_QUERY_CODE = _CHUNK_QUERY.__code__
 _CHUNK_VALUE_CODE = _CHUNK_VALUE.__code__
 _CHUNK_REFERENCE_CODE = _CHUNK_REFERENCE.__code__
+_CHUNK_ONLY_PRODUCER = continuation_codec._verify_private_chunk_canonical
+_CHUNK_ONLY_WORK_CODE = _CHUNK_ONLY_PRODUCER.__code__
+_CHUNK_ONLY_QUERY = RetentionStageMemo.private_chunk
+_CHUNK_ONLY_QUERY_CODE = _CHUNK_ONLY_QUERY.__code__
+_CHUNK_ONLY_VALUE = retention_memo._chunk_value
+_CHUNK_ONLY_VALUE_CODE = _CHUNK_ONLY_VALUE.__code__
 _SNAPSHOT_PRODUCER = continuation_codec._decode_continuation_snapshot_uncached
 _SNAPSHOT_QUERY = RetentionStageMemo.snapshot
 _SNAPSHOT_VALUE = retention_memo._snapshot_value
@@ -135,6 +144,7 @@ _CANONICAL = hashing.canonical_json.__code__
 _QUERY_CODES = (
     RetentionStageMemo.snapshot.__code__,
     RetentionStageMemo.private_chunk.__code__,
+    RetentionStageMemo.canonical_text_proof.__code__,
     RetentionStageMemo.credential.__code__,
     RetentionStageMemo.state_credentials.__code__,
 )
@@ -1093,10 +1103,17 @@ def _structure_parameter_arities(parameters, executemany: bool) -> tuple[int, ..
     return (len(parameters),)
 
 
-def _structure_sql_sources_current() -> bool:
+def _structure_source_refused(diagnostic: list[str] | None, site: str) -> bool:
+    # One fixed first-rejection site; never retain SQL, parameters or owners.
+    if diagnostic is not None and not diagnostic:
+        diagnostic.append(site)
+    return False
+
+
+def _structure_sql_sources_current(diagnostic: list[str] | None = None) -> bool:
     # Identity guards never invoke a mutable identifier's equality/protocol.
-    if not _structure_store_cache_sources_current():
-        return False
+    if not _structure_store_cache_sources_current(diagnostic):
+        return _structure_source_refused(diagnostic, "sql.cache")
     for table, name, schema, named, fullname in _STRUCTURE_TABLE_FACTS:
         if (
             type(table) is not Table
@@ -1105,7 +1122,7 @@ def _structure_sql_sources_current() -> bool:
             or table.named_with_column is not named
             or table.fullname is not fullname
         ):
-            return False
+            return _structure_source_refused(diagnostic, "sql.table")
     for column, table, name, key, datatype, literal in _STRUCTURE_COLUMN_FACTS:
         if (
             type(column) is not Column
@@ -1115,29 +1132,29 @@ def _structure_sql_sources_current() -> bool:
             or column.type is not datatype
             or column.is_literal is not literal
         ):
-            return False
+            return _structure_source_refused(diagnostic, "sql.column")
     for identifier, quote in _STRUCTURE_IDENTIFIER_FACTS:
         if identifier.quote is not quote:
-            return False
+            return _structure_source_refused(diagnostic, "sql.identifier")
     for compiler, mro in _STRUCTURE_COMPILER_MROS:
         if compiler.__mro__ is not mro:
-            return False
+            return _structure_source_refused(diagnostic, "sql.compiler_mro")
     for sites, (_name, _function, _code, _globals, count) in zip(_STRUCTURE_STORE_CALLS, _STRUCTURE_STORE_FUNCTIONS, strict=True):
         if len(sites) != count:
-            return False
+            return _structure_source_refused(diagnostic, "sql.store_calls")
     for name, function, code, namespace, _count in _STRUCTURE_STORE_FUNCTIONS:
         if stored_continuation.__dict__.get(name) is not function or function.__code__ is not code or function.__globals__ is not namespace:
-            return False
+            return _structure_source_refused(diagnostic, "sql.store_function")
     for name, function, code, class_name, constructor in _STRUCTURE_STORE_CONSTRUCTORS:
         if (
             stored_continuation.__dict__.get(name) is not function
             or function.__code__ is not code
             or function.__globals__.get(class_name) is not constructor
         ):
-            return False
+            return _structure_source_refused(diagnostic, "sql.store_constructor")
     for module, name, expected in _STRUCTURE_STORE_MODULE_CLASSES:
         if module.__dict__.get(name) is not expected:
-            return False
+            return _structure_source_refused(diagnostic, "sql.module_class")
     if (
         sql_operators.add is not _STRUCTURE_STORE_ADD
         or sql_operators.comma_op is not _STRUCTURE_STORE_COMMA
@@ -1155,16 +1172,16 @@ def _structure_sql_sources_current() -> bool:
         or _STRUCTURE_STORE_COMPILE_PLUGINS.get(("default", "insert")) is not sql_dml.InsertDMLState
         or _STRUCTURE_STORE_COMPILE_PLUGINS.get(("default", "update")) is not sql_dml.UpdateDMLState
     ):
-        return False
+        return _structure_source_refused(diagnostic, "sql.registry")
     for name, function, code in _STRUCTURE_STORE_CRUD_FUNCTIONS:
         if sql_crud.__dict__.get(name) is not function or type(function) is not FunctionType or function.__code__ is not code:
-            return False
+            return _structure_source_refused(diagnostic, "sql.crud")
     for cls, mro in _STRUCTURE_STORE_MROS:
         if cls.__mro__ is not mro:
-            return False
+            return _structure_source_refused(diagnostic, "sql.store_mro")
     for table, columns, returning in _STRUCTURE_STORE_TABLE_FACTS:
         if table.columns is not columns or table.implicit_returning is not returning:
-            return False
+            return _structure_source_refused(diagnostic, "sql.store_table")
     for column, default, onupdate, server_default, server_onupdate, primary, nullable, autoincrement in _STRUCTURE_STORE_COLUMN_FACTS:
         if (
             column.default is not default
@@ -1175,13 +1192,13 @@ def _structure_sql_sources_current() -> bool:
             or column.nullable is not nullable
             or column.autoincrement is not autoincrement
         ):
-            return False
+            return _structure_source_refused(diagnostic, "sql.store_column")
     guards = _STRUCTURE_STORE_SLOT_GUARDS
     if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[2]:
-        return False
+        return _structure_source_refused(diagnostic, "sql.slot_guards")
     origins = _STRUCTURE_STORE_SLOT_KIND_ORIGINS
     if _STRUCTURE_GUARD_KIND_ORIGINS is not origins:
-        return False
+        return _structure_source_refused(diagnostic, "sql.slot_origins")
     original_type, original_function_type = origins[0], origins[1]
     for owner, name, present, descriptor, function, code in guards:
         if (
@@ -1194,10 +1211,10 @@ def _structure_sql_sources_current() -> bool:
                 or (code is not None and function.__code__ is not code)
             )
         ):
-            return False
+            return _structure_source_refused(diagnostic, "sql.slot")
     guards = _STRUCTURE_STORE_VISITOR_GUARDS
     if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[3]:
-        return False
+        return _structure_source_refused(diagnostic, "sql.store_visitor_guards")
     for owner, name, present, function, code in guards:
         if (
             (name in owner.__dict__) is not present
@@ -1212,10 +1229,10 @@ def _structure_sql_sources_current() -> bool:
                 )
             )
         ):
-            return False
+            return _structure_source_refused(diagnostic, "sql.store_visitor")
     guards = _STRUCTURE_VISITOR_GUARDS
     if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[4]:
-        return False
+        return _structure_source_refused(diagnostic, "sql.visitor_guards")
     for owner, name, present, function, code in guards:
         if not (
             (name in owner.__dict__) is present
@@ -1230,7 +1247,7 @@ def _structure_sql_sources_current() -> bool:
                 )
             )
         ):
-            return False
+            return _structure_source_refused(diagnostic, "sql.visitor")
     return True
 
 
@@ -1319,7 +1336,7 @@ class _StructureShapeRefusal(Exception):
         super().__init__()
 
 
-def _structure_store_cache_sources_current() -> bool:
+def _structure_store_cache_sources_current(diagnostic: list[str] | None = None) -> bool:
     """Static held source facts only; never inspect a current SQL/cache object."""
     if (
         sql_base.DialectKWArgs is not _STRUCTURE_CACHE_OWNER
@@ -1334,13 +1351,13 @@ def _structure_store_cache_sources_current() -> bool:
         or _STRUCTURE_CACHE_GETTER.__globals__ is not sql_base.__dict__
         or sql_base.__dict__.get("util") is not sql_util
     ):
-        return False
+        return _structure_source_refused(diagnostic, "cache.source")
     for cls, mro in _STRUCTURE_CACHE_MROS:
         if cls.__mro__ is not mro:
-            return False
+            return _structure_source_refused(diagnostic, "cache.mro")
     guards = _STRUCTURE_CACHE_SLOT_GUARDS
     if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[5]:
-        return False
+        return _structure_source_refused(diagnostic, "cache.slot_guards")
     for owner, name, present, descriptor, function, code in guards:
         if (
             (name in owner.__dict__) is not present
@@ -1351,16 +1368,16 @@ def _structure_store_cache_sources_current() -> bool:
                 or (code is not None and function.__code__ is not code)
             )
         ):
-            return False
+            return _structure_source_refused(diagnostic, "cache.slot")
     descriptor_state = object.__getattribute__(_STRUCTURE_CACHE_DESCRIPTOR, "__dict__")
     if type(descriptor_state) is not dict or dict.__len__(descriptor_state) != len(_STRUCTURE_CACHE_DESCRIPTOR_FACTS):
-        return False
+        return _structure_source_refused(diagnostic, "cache.descriptor_extent")
     for key in dict.keys(descriptor_state):
         if type(key) is not str:
-            return False
+            return _structure_source_refused(diagnostic, "cache.descriptor_key")
     for name, expected in _STRUCTURE_CACHE_DESCRIPTOR_FACTS:
         if name not in descriptor_state or descriptor_state[name] is not expected:
-            return False
+            return _structure_source_refused(diagnostic, "cache.descriptor_value")
     return True
 
 
@@ -2089,7 +2106,7 @@ _SCANNER_SIZE_SITES = {_FIND: _scanner_size_sites(_FIND, ("value", "key")), _REF
 _SCANNER_SIZE_WINDOWS = {code: _scanner_size_windows(code, sites) for code, sites in _SCANNER_SIZE_SITES.items()}
 _EXTENT_SITES = {_UTF8_CODE: _encoded_len_sites(_UTF8_CODE, 1)}
 _PREPARATION_SITES = {_POLICY_NAMES: _encoded_len_sites(_POLICY_NAMES, 1), _TOKEN: _encoded_len_sites(_TOKEN, 1)}
-_BYTE_CODES = (*_SCANNER_SIZE_SITES, *_EXTENT_SITES, *_PREPARATION_SITES, _CHUNK_REQUEST)
+_BYTE_CODES = (*_SCANNER_SIZE_SITES, *_EXTENT_SITES, *_PREPARATION_SITES, _CHUNK_REQUEST, _CHUNK_QUERY_CODE)
 _UTF8_RETURN_BRANCHES = {
     item.offset: {13: "length_excess", 15: "ascii", 21: "encoded_excess", 22: "encoded"}[item.positions.lineno - _UTF8_CODE.co_firstlineno]
     for item in dis.get_instructions(_UTF8_CODE)
@@ -2742,27 +2759,82 @@ def _direct_call_site(
 
 
 def _direct_target_call_sites(
-    code: CodeType, symbol: str, *, load_op: str = "LOAD_GLOBAL", arguments: int, expected: int
+    code: CodeType,
+    symbol: str,
+    *,
+    load_op: str = "LOAD_GLOBAL",
+    arguments: int,
+    expected: int,
+    operands: tuple[str, ...],
+    exhaustive: bool = False,
 ) -> tuple[tuple[range, int], ...]:
-    """Bind actual callee positions, excluding argument/tuple loads of that name."""
+    """Join the closed source operand grammar to its complete native CALL span."""
+    tree = ast.parse(Path(code.co_filename).read_text())
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if type(node) in (ast.FunctionDef, ast.AsyncFunctionDef) and node.name == code.co_name and node.lineno == code.co_firstlineno
+    ]
+    assert len(functions) == 1, "original direct target source definition changed"
+    compiled = compile(ast.Module(body=[functions[0]], type_ignores=[]), code.co_filename, "exec")
+    definitions = [value for value in compiled.co_consts if type(value) is CodeType and value.co_name == code.co_name]
+    assert len(definitions) == 1, "original direct target compiled definition changed"
+    original = definitions[0]
+    assert (code.co_code, code.co_names, code.co_varnames, code.co_consts) == (
+        original.co_code,
+        original.co_names,
+        original.co_varnames,
+        original.co_consts,
+    ), "original direct target body differs from its source grammar"
+    calls = [
+        node
+        for node in ast.walk(functions[0])
+        if type(node) is ast.Call
+        and type(node.func) is ast.Name
+        and node.func.id == symbol
+        and len(node.args) == arguments
+        and not node.keywords
+        and arguments == 1
+        and ast.unparse(node.args[0]) in operands
+    ]
+    assert len(calls) == expected, "original direct target operand grammar changed"
+    if exhaustive:
+        all_calls = [
+            node for node in ast.walk(functions[0]) if type(node) is ast.Call and type(node.func) is ast.Name and node.func.id == symbol
+        ]
+        assert len(all_calls) == len(calls) and all(node in calls for node in all_calls), "original direct target partition is incomplete"
     instructions = tuple(dis.get_instructions(code))
     sites = []
-    for load in instructions:
-        named = load.opname == load_op and load.argval == symbol
-        combined = load_op == "LOAD_FAST" and load.opname == "LOAD_FAST_LOAD_FAST" and type(load.argval) is tuple and symbol in load.argval
-        if not (named or combined):
-            continue
-        for index, call in enumerate(instructions):
-            if call.opname != "CALL" or (call.positions.lineno, call.positions.col_offset) != (
-                load.positions.lineno,
-                load.positions.col_offset,
-            ):
-                continue
-            assert call.arg == arguments and call.positions.lineno is not None, "original direct target signature changed"
-            site = (range(call.offset, instructions[index + 1].offset), call.positions.lineno)
-            assert site not in sites, "original direct target has duplicate load ownership"
-            sites.append(site)
-    assert len(sites) == expected, "original direct target callsites changed"
+    for source in calls:
+        targets = [
+            (index, call)
+            for index, call in enumerate(instructions)
+            if call.opname == "CALL"
+            and (
+                call.positions.lineno,
+                call.positions.col_offset,
+                call.positions.end_lineno,
+                call.positions.end_col_offset,
+            )
+            == (source.lineno, source.col_offset, source.end_lineno, source.end_col_offset)
+        ]
+        assert len(targets) == 1, "original direct target native source span changed"
+        index, call = targets[0]
+        loads = [
+            load
+            for load in instructions[:index]
+            if (load.positions.lineno, load.positions.col_offset) == (source.func.lineno, source.func.col_offset)
+            and (
+                (load.opname == load_op and load.argval == symbol)
+                or (
+                    load_op == "LOAD_FAST" and load.opname == "LOAD_FAST_LOAD_FAST" and type(load.argval) is tuple and symbol in load.argval
+                )
+            )
+        ]
+        assert len(loads) == 1 and call.arg == arguments, "original direct target load or signature changed"
+        site = (range(call.offset, instructions[index + 1].offset), source.lineno)
+        assert site not in sites, "original direct target has duplicate load ownership"
+        sites.append(site)
     return tuple(sites)
 
 
@@ -2835,6 +2907,8 @@ _TITLE_FIND_SITE = _direct_call_site(_TITLE_REJECT, "find_credential_material", 
 _SNAPSHOT_SOURCE_SITE = _direct_call_site(_LOAD_SNAPSHOT, "decode_continuation_snapshot", arguments=1, load_op="LOAD_FAST")
 _CHUNK_SOURCE_SITE = _direct_call_site(_LOAD_CHUNKS, "verify_private_chunk", arguments=2)
 _CHUNK_PARSE_SITE = _direct_call_site(_CHUNK_WORK_CODE, "parse_json_strict", arguments=1)
+_CHUNK_ONLY_PARSE_SITE = _direct_call_site(_CHUNK_ONLY_WORK_CODE, "parse_json_strict", arguments=1)
+_CHUNK_PREPARATION_SIZE_SITE = _direct_call_site(_CHUNK_WORK_CODE, "utf8_size", arguments=2, keywords=("limit",))
 _SNAPSHOT_PARSE_SITE = _direct_call_site(
     continuation_codec._decode_continuation_snapshot_uncached.__code__, "parse_json_strict", arguments=1
 )
@@ -2852,10 +2926,59 @@ _SNAPSHOT_DECODE_BYTES_SITE = _direct_call_site(_LOAD_SNAPSHOT, "decode", argume
 _CHUNK_DECODE_BYTES_SITE = _direct_call_site(_LOAD_CHUNKS, "decode", arguments=2, load_op="LOAD_ATTR", keywords=("errors",))
 # Two real encoded-buffer branches (canonical-only and cold fallback), plus
 # the retained-proof length check. Both direct SHA branches stay observable.
-_CHUNK_LENGTH_SITES = _direct_target_call_sites(_CHUNK_REQUEST, "len", arguments=1, expected=3)
-_CHUNK_DIGEST_SITES = _direct_target_call_sites(_CHUNK_REQUEST, "sha256", arguments=1, expected=2)
+_CHUNK_LENGTH_SITES = _direct_target_call_sites(_CHUNK_REQUEST, "len", arguments=1, expected=3, operands=("encoded", "proof.encoded"))
+_CHUNK_METADATA_SITES = _direct_target_call_sites(
+    _CHUNK_REQUEST,
+    "len",
+    arguments=1,
+    expected=4,
+    operands=(
+        "reference.codec.encode('utf-8')",
+        "reference.digest.encode('utf-8')",
+        "str(reference.byte_length)",
+        "str(CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)",
+    ),
+)
+_CHUNK_ALL_LENGTH_SITES = _direct_target_call_sites(
+    _CHUNK_REQUEST,
+    "len",
+    arguments=1,
+    expected=7,
+    operands=(
+        "encoded",
+        "proof.encoded",
+        "reference.codec.encode('utf-8')",
+        "reference.digest.encode('utf-8')",
+        "str(reference.byte_length)",
+        "str(CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)",
+    ),
+    exhaustive=True,
+)
+assert set(_CHUNK_ALL_LENGTH_SITES) == {*_CHUNK_LENGTH_SITES, *_CHUNK_METADATA_SITES}, "chunk length roles lost a native callsite"
+_CHUNK_DIGEST_SITES = _direct_target_call_sites(_CHUNK_REQUEST, "sha256", arguments=1, expected=2, operands=("encoded",), exhaustive=True)
 _SNAPSHOT_WORK_SITE = _direct_call_site(_SNAPSHOT_VALUE_CODE, "producer", arguments=1, load_op="LOAD_FAST")
-(_CHUNK_WORK_SITE,) = _direct_target_call_sites(_CHUNK_VALUE_CODE, "producer", arguments=1, load_op="LOAD_FAST", expected=1)
+(_CHUNK_WORK_SITE,) = _direct_target_call_sites(
+    _CHUNK_VALUE_CODE, "producer", arguments=1, load_op="LOAD_FAST", expected=1, operands=("key",), exhaustive=True
+)
+_CHUNK_ONLY_WORK_SITE = _direct_call_site(_CHUNK_ONLY_VALUE_CODE, "producer", arguments=1, load_op="LOAD_FAST")
+(_CHUNK_PROOF_DIGEST_SITE,) = _direct_target_call_sites(
+    _CHUNK_QUERY_CODE, "digest_producer", arguments=1, load_op="LOAD_FAST", expected=1, operands=("encoded",), exhaustive=True
+)
+_CHUNK_PROOF_METADATA_SITES = _direct_target_call_sites(
+    _CHUNK_QUERY_CODE,
+    "len",
+    arguments=1,
+    expected=8,
+    operands=(
+        "encoded",
+        "digest",
+        "reference.codec.encode('utf-8')",
+        "reference.digest.encode('utf-8')",
+        "str(reference.byte_length)",
+        "str(key.max_utf8_bytes)",
+    ),
+    exhaustive=True,
+)
 
 
 def _artifact_query_site(code: CodeType, attribute: str, family: ArtifactFamily, *, arguments: int = 2) -> tuple[range, int]:
@@ -2882,6 +3005,34 @@ def _snapshot_query_site() -> tuple[range, int]:
 
 _SNAPSHOT_QUERY_SITE = _snapshot_query_site()
 _CHUNK_QUERY_SITE = _artifact_query_site(_CHUNK_REQUEST, "canonical_text_proof", "chunk", arguments=3)
+_CHUNK_ONLY_QUERY_SITE = _artifact_query_site(_CHUNK_REQUEST, "private_chunk", "chunk")
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkTracePath:
+    query: FunctionType
+    value: FunctionType
+    producer: FunctionType
+    query_site: tuple[range, int]
+    work_site: tuple[range, int]
+    key_type: type
+    parse_site: tuple[range, int]
+
+
+_CHUNK_TRACE_PATHS = (
+    _ChunkTracePath(
+        _CHUNK_QUERY, _CHUNK_VALUE, _CHUNK_PRODUCER, _CHUNK_QUERY_SITE, _CHUNK_WORK_SITE, CanonicalTextEncodingKey, _CHUNK_PARSE_SITE
+    ),
+    _ChunkTracePath(
+        _CHUNK_ONLY_QUERY,
+        _CHUNK_ONLY_VALUE,
+        _CHUNK_ONLY_PRODUCER,
+        _CHUNK_ONLY_QUERY_SITE,
+        _CHUNK_ONLY_WORK_SITE,
+        PrivateChunkVerificationKey,
+        _CHUNK_ONLY_PARSE_SITE,
+    ),
+)
 
 
 def _snapshot_source_utf8_extent(encoded: str) -> int:
@@ -2982,6 +3133,11 @@ class MemoInspection:
     snapshot_artifact_bound: bool = False
     chunk_artifact_attempts: int = 0
     chunk_artifact_bound: bool = False
+    chunk_proof_id: int | None = None
+    chunk_proof_buffer: tuple[int, int, str] | None = None
+    chunk_proof: CanonicalTextProof | None = None
+    chunk_proof_encoded: bytes | None = None
+    chunk_binding_returned: bool = False
 
     @property
     def group(self):
@@ -3039,6 +3195,20 @@ class _PendingChunkParse:
 
 
 @dataclass(frozen=True, slots=True)
+class _PendingMemoMetadata:
+    """Native operand DATA captured without entering the source's mutex."""
+
+    owner: MemoInspection | None
+    memo: RetentionStageMemo | None
+    key: object
+    producer: object
+    thread: int
+    expected_memo_id: int | None
+    size: int | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class UncachedValidationAttempt:
     """One real direct detector call; no input value or retained frame."""
 
@@ -3078,6 +3248,7 @@ class _ScannerSizeInspection:
     call_offset: int | None = None
     profile_offset: int | None = None
     private_resource: bool = False
+    canonical_preparation: bool = False
     chunks: int = 0
     encoded_bytes: int = 0
     branch: Literal["length_excess", "ascii", "encoded_excess", "encoded"] | None = None
@@ -3306,6 +3477,7 @@ class RetentionMemoTrace:
         self._structure_closing = False
         self._structure_entrypoint = "calibration"
         self._structure_errors: list[str] = []
+        self._structure_source_diagnostic: list[str] = []
         self._structure_error_count = 0
         self._structure_observer_incomplete = False
         self._structure_observation_verified = False
@@ -3337,6 +3509,8 @@ class RetentionMemoTrace:
         self._byte_diagnostic_sites: set[tuple[object, ...]] = set()
         self._byte_diagnostic_lock = Lock()
         self._byte_pending_parses: dict[int, list[_PendingChunkParse]] = {}
+        self._byte_pending_memo_metadata: dict[int, list[_PendingMemoMetadata]] = {}
+        self._byte_pending_memo_failures: dict[int, Exception] = {}
         self._byte_detector_frames: dict[int, MemoInspection | UncachedValidationInvocation] = {}
         self._byte_size_pending: dict[int, _ScannerSizeInspection] = {}
         self._byte_size_frames: dict[int, _ScannerSizeInspection] = {}
@@ -3411,6 +3585,7 @@ class RetentionMemoTrace:
         for function in (
             RetentionStageMemo.snapshot,
             RetentionStageMemo.private_chunk,
+            RetentionStageMemo.canonical_text_proof,
             RetentionStageMemo.credential,
             RetentionStageMemo.state_credentials,
         ):
@@ -3453,6 +3628,11 @@ class RetentionMemoTrace:
                         # Existing keys only. Never invoke work to fill evidence.
                         with memo._lock:
                             entries = [*memo._snapshots, *memo._chunks, *memo._credentials, *memo._states]
+                            entries.extend(
+                                (producer, key)
+                                for producer, digest_producer, key in memo._canonical_proofs
+                                if key.reference is not None and digest_producer is _SHA256
+                            )
                         with self._lock:
                             self.populated[memo] = len(entries)
                             for producer, key in entries:
@@ -3691,29 +3871,30 @@ class RetentionMemoTrace:
         )
 
     def _structure_sources_current(self) -> bool:
-        if not _structure_sql_sources_current():
-            return False
+        diagnostic = self._structure_source_diagnostic
+        if not _structure_sql_sources_current(diagnostic):
+            return _structure_source_refused(diagnostic, "structure.sql")
         monitor = self._structure_lifetime_monitor
         if monitor is not None and not monitor.installing and not monitor.current():
-            return False
+            return _structure_source_refused(diagnostic, "structure.monitor")
         for function, code in _STRUCTURE_FUNCTION_CODES:
             if not (type(function) is FunctionType and function.__code__ is code):
-                return False
+                return _structure_source_refused(diagnostic, "structure.function_before")
         if (
             continuation_clock.__dict__.get("ContinuationActionClock") is not _STRUCTURE_CLOCK_CLASS
             or _STRUCTURE_CLOCK_CLASS.__dict__.get("run") is not _STRUCTURE_CLOCK
             or Engine.__dict__.get("begin") is not _STRUCTURE_SQLA_ENGINE_BEGIN
         ):
-            return False
+            return _structure_source_refused(diagnostic, "structure.clock_engine")
         for engine in self._structure_engines:
             dialect = engine.dialect
             if type(dialect) not in (SQLiteDialect_pysqlite, PGDialect_psycopg):
-                return False
+                return _structure_source_refused(diagnostic, "structure.dialect")
             if dialect.statement_compiler is not (SQLiteCompiler if type(dialect) is SQLiteDialect_pysqlite else PGCompiler_psycopg):
-                return False
+                return _structure_source_refused(diagnostic, "structure.compiler")
             method = engine.begin
             if type(method) is not MethodType or method.__self__ is not engine:
-                return False
+                return _structure_source_refused(diagnostic, "structure.engine_method")
             if engine.dialect.name == "sqlite":
                 factory = method.__func__
                 wrapped = factory.__dict__.get("__wrapped__")
@@ -3726,12 +3907,12 @@ class RetentionMemoTrace:
                     or len(factory.__closure__) != 1
                     or factory.__closure__[0].cell_contents is not wrapped
                 ):
-                    return False
+                    return _structure_source_refused(diagnostic, "structure.sqlite_factory")
             elif method.__func__ is not _STRUCTURE_SQLA_ENGINE_BEGIN:
-                return False
+                return _structure_source_refused(diagnostic, "structure.postgres_factory")
         for function, code in _STRUCTURE_FUNCTION_CODES:
             if not (type(function) is FunctionType and function.__code__ is code):
-                return False
+                return _structure_source_refused(diagnostic, "structure.function_after")
         if not (
             continuation_clock.ContinuationActionClock.run is _STRUCTURE_CLOCK
             and continuation_clock.ContinuationActionClock is _STRUCTURE_CLOCK_CLASS
@@ -3740,23 +3921,23 @@ class RetentionMemoTrace:
             and PGCompiler_psycopg.construct_params is _STRUCTURE_CONSTRUCT_PARAMS
             and Connection._exec_single_context is _STRUCTURE_SINGLE_CONTEXT
         ):
-            return False
+            return _structure_source_refused(diagnostic, "structure.execution")
         for dialect in (SQLiteDialect_pysqlite, PGDialect_psycopg):
             if not (
                 dialect.do_execute is _STRUCTURE_CURSOR_EXECUTE
                 and dialect.do_execute_no_params is _STRUCTURE_CURSOR_NO_PARAMS
                 and dialect.do_executemany is _STRUCTURE_CURSOR_MANY
             ):
-                return False
+                return _structure_source_refused(diagnostic, "structure.cursor")
         if not (
             composition_initialization.initialize_continuation_composition is _STRUCTURE_ROOT
             and continuation_first_runtime.restore_first_continuation_runtime is _STRUCTURE_HANDOFF_ROOT
             and session_locking.locked_session_transaction is _STRUCTURE_WINDOW_FACTORY
         ):
-            return False
+            return _structure_source_refused(diagnostic, "structure.roots")
         for name, function in _STRUCTURE_LOCK_BINDINGS:
             if session_locking.__dict__.get(name) is not function:
-                return False
+                return _structure_source_refused(diagnostic, "structure.lock_binding")
         if not (
             _GeneratorContextManager.__enter__.__code__ is _STRUCTURE_CONTEXT_ENTER_CODE
             and _STRUCTURE_WINDOW_FACTORY.__wrapped__ is _STRUCTURE_WINDOW
@@ -3778,13 +3959,13 @@ class RetentionMemoTrace:
             and session_engine.create_session_engine is _STRUCTURE_ENGINE_FACTORY
             and session_engine._SESSION_WRITE_INTENT_OPTION is _STRUCTURE_WRITE_OPTION
         ):
-            return False
+            return _structure_source_refused(diagnostic, "structure.runtime_binding")
         for context in (SQLiteExecutionContext, PGExecutionContext_psycopg):
             if not (
                 context._init_compiled.__func__ is _STRUCTURE_EXECUTION_INIT
                 and context._init_statement.__func__ is _STRUCTURE_STATEMENT_INIT
             ):
-                return False
+                return _structure_source_refused(diagnostic, "structure.context")
         return True
 
     def _structure_profile(self, frame: FrameType, event: str, arg: object, expected_id: int | None) -> None:
@@ -5036,6 +5217,7 @@ class RetentionMemoTrace:
             self.structure_snapshot(),
             self._structure_error_count + sum(thread.error_count for thread in self._structure_threads.values()),
             self._structure_observer_incomplete,
+            tuple(self._structure_source_diagnostic),
             tuple(
                 (
                     thread.identity,
@@ -5054,8 +5236,10 @@ class RetentionMemoTrace:
             return
         assert requested, "structure observation assertion is required"
         snapshot = self.structure_snapshot()
-        assert snapshot.closed and snapshot.complete and not self._observation_incomplete, "structure observation incomplete" + (
-            "\n" + ",".join(snapshot.errors) if snapshot.errors else ""
+        assert snapshot.closed and snapshot.complete and not self._observation_incomplete, (
+            "structure observation incomplete"
+            + ("\n" + ",".join(snapshot.errors) if snapshot.errors else "")
+            + ("\nfirst source rejection: " + ",".join(self._structure_source_diagnostic) if self._structure_source_diagnostic else "")
         )
         self._structure_observation_verified = True
 
@@ -5481,19 +5665,36 @@ class RetentionMemoTrace:
         )
 
     @staticmethod
-    def _chunk_artifact_source_is_original() -> bool:
+    def _chunk_artifact_source_is_original(path: _ChunkTracePath = _CHUNK_TRACE_PATHS[0]) -> bool:
         return (
             continuation_codec.verify_private_chunk is _CHUNK_PUBLIC
             and _CHUNK_PUBLIC.__code__ is _CHUNK_REQUEST
-            and RetentionStageMemo.canonical_text_proof is _CHUNK_QUERY
-            and _CHUNK_QUERY.__code__ is _CHUNK_QUERY_CODE
-            and RetentionStageMemo.canonical_text_proof is _CHUNK_VALUE
-            and _CHUNK_VALUE.__code__ is _CHUNK_VALUE_CODE
-            and continuation_codec._private_chunk_canonical_text_bytes is _CHUNK_PRODUCER
-            and _CHUNK_PRODUCER.__code__ is _CHUNK_WORK_CODE
+            and (
+                (
+                    path is _CHUNK_TRACE_PATHS[0]
+                    and RetentionStageMemo.canonical_text_proof is path.query
+                    and path.query.__code__ is _CHUNK_QUERY_CODE
+                    and path.value is path.query
+                    and continuation_codec._private_chunk_canonical_text_bytes is path.producer
+                    and path.producer.__code__ is _CHUNK_WORK_CODE
+                )
+                or (
+                    path is _CHUNK_TRACE_PATHS[1]
+                    and RetentionStageMemo.private_chunk is path.query
+                    and path.query.__code__ is _CHUNK_ONLY_QUERY_CODE
+                    and retention_memo._chunk_value is path.value
+                    and path.value.__code__ is _CHUNK_ONLY_VALUE_CODE
+                    and continuation_codec._verify_private_chunk_canonical is path.producer
+                    and path.producer.__code__ is _CHUNK_ONLY_WORK_CODE
+                )
+            )
             and continuation_codec._private_chunk_memo_reference is _CHUNK_REFERENCE
             and _CHUNK_REFERENCE.__code__ is _CHUNK_REFERENCE_CODE
             and continuation_codec.CanonicalTextEncodingKey is CanonicalTextEncodingKey
+            and retention_memo.CanonicalTextEncodingKey is CanonicalTextEncodingKey
+            and retention_memo.CanonicalTextProof is CanonicalTextProof
+            and continuation_codec.PrivateChunkVerificationKey is PrivateChunkVerificationKey
+            and continuation_codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES == _PRIVATE_UTF8_LIMIT
             and continuation_codec.PrivateChunkRef is PrivateChunkRef
             and continuation_codec.parse_json_strict is _STRICT_PARSE
             and json_parser.parse_json_strict is _STRICT_PARSE
@@ -5504,6 +5705,10 @@ class RetentionMemoTrace:
             and hashing.rfc8785.dumps is _RFC_DUMPS
             and (type(_RFC_DUMPS) is not FunctionType or _RFC_DUMPS.__code__ is _SNAPSHOT_RFC_CODE)
             and continuation_codec.sha256 is _SHA256
+            and continuation_codec.__dict__.get("len", builtins.len) is builtins.len
+            and continuation_codec.__dict__.get("str", builtins.str) is builtins.str
+            and retention_memo.__dict__.get("len", builtins.len) is builtins.len
+            and retention_memo.__dict__.get("str", builtins.str) is builtins.str
         )
 
     @staticmethod
@@ -5571,8 +5776,21 @@ class RetentionMemoTrace:
             noun = "decoder"
         else:
             assert family == "chunk"
-            high_code, query_code, work_code, value_code = _CHUNK_REQUEST, _CHUNK_QUERY_CODE, _CHUNK_WORK_CODE, _CHUNK_VALUE_CODE
-            query_site, work_site, producer = _CHUNK_QUERY_SITE, _CHUNK_WORK_SITE, _CHUNK_PRODUCER
+            path = next(
+                (
+                    candidate
+                    for candidate in _CHUNK_TRACE_PATHS
+                    if any(frame.f_code is code for code in (candidate.query.__code__, candidate.producer.__code__))
+                ),
+                _CHUNK_TRACE_PATHS[0],
+            )
+            key = frame.f_locals.get("key")
+            if type(key) is CanonicalTextEncodingKey and key.reference is None and self._ancestor(frame.f_back, "chunk") is None:
+                # The shared encoder also serves callers that did not request
+                # a private-chunk verification. It cannot borrow that family.
+                return
+            high_code, query_code, work_code, value_code = _CHUNK_REQUEST, path.query.__code__, path.producer.__code__, path.value.__code__
+            query_site, work_site, producer = path.query_site, path.work_site, path.producer
             noun = "verifier"
         code = frame.f_code
         if code is high_code and event == "return":
@@ -5603,7 +5821,7 @@ class RetentionMemoTrace:
                 requests[id(frame)] = _ArtifactRequest(ordinal, id(memo), get_ident(), expected_id)
                 return
             source_original = (
-                self._snapshot_artifact_source_is_original() if family == "snapshot" else self._chunk_artifact_source_is_original()
+                self._snapshot_artifact_source_is_original() if family == "snapshot" else self._chunk_artifact_source_is_original(path)
             )
             if code is query_code:
                 parent = frame.f_back
@@ -5626,6 +5844,8 @@ class RetentionMemoTrace:
                     or record.memo is not memo
                     or frame.f_locals.get("producer") is not producer
                     or record.producer is not producer
+                    or (family == "chunk" and type(key) is not path.key_type)
+                    or (family == "chunk" and path is _CHUNK_TRACE_PATHS[0] and frame.f_locals.get("digest_producer") is not _SHA256)
                     or state.memo_id != id(memo)
                     or state.thread_id != get_ident()
                     or state.expected_memo_id != expected_id
@@ -5648,7 +5868,7 @@ class RetentionMemoTrace:
             ):
                 errors.append(f"{family} artifact {noun} lost its original body/callsite/globals")
                 return
-            ancestor = parent if family == "chunk" else parent.f_back
+            ancestor = parent if family == "chunk" and path is _CHUNK_TRACE_PATHS[0] else parent.f_back
             for _ in range(64):
                 if ancestor is None or ancestor.f_code is query_code:
                     break
@@ -5679,7 +5899,13 @@ class RetentionMemoTrace:
                 or parent.f_locals.get("producer") is not producer
                 or ancestor.f_locals.get("key") is not key
                 or ancestor.f_locals.get("self") is not memo
-                or (frame.f_locals.get("encoded") is not text if family == "snapshot" else frame.f_locals.get("key") is not key)
+                or (
+                    frame.f_locals.get("encoded") is not text
+                    if family == "snapshot"
+                    else frame.f_locals.get("key") is not key
+                    if path is _CHUNK_TRACE_PATHS[0]
+                    else frame.f_locals.get("canonical") is not text
+                )
                 or not self._artifact_input_matches(key, high, family)
                 or state.memo_id != id(memo)
                 or state.thread_id != get_ident()
@@ -5701,6 +5927,8 @@ class RetentionMemoTrace:
             and all(type(memo) is RetentionStageMemo and not memo.active for memo in self.memos)
             and (self._byte_monitor is None or self._byte_monitor.closed)
             and not requests
+            and not self._byte_pending_memo_metadata
+            and not self._byte_pending_memo_failures
         )
 
     def snapshot_artifact_closed(self) -> bool:
@@ -5727,7 +5955,7 @@ class RetentionMemoTrace:
                 ChunkArtifactStageTotals,
                 _chunk_source_utf8_extent,
             )
-            producer_name = "_verify_private_chunk_canonical"
+            producer_name = "_private_chunk_canonical_text_bytes"
             basis = _CHUNK_ARTIFACT_BASIS
         rows, sizing_failed = [], False
         for stage, memo in enumerate(self.memos, 1):
@@ -5737,7 +5965,11 @@ class RetentionMemoTrace:
                 if (
                     not self._artifact_record(record, family)[0]
                     or self._artifact_text(record.key, family) is None
-                    or record.producer is not producer
+                    or (
+                        record.producer is not producer
+                        if family == "snapshot"
+                        else all(record.producer is not path.producer for path in _CHUNK_TRACE_PATHS)
+                    )
                 ):
                     errors.append(f"{family} artifact source key was not completely observed")
                     continue
@@ -5745,6 +5977,7 @@ class RetentionMemoTrace:
                     groups.append(record.group)
             for group in groups:
                 calls = [record for record in records if self._artifact_record(record, family)[0] and record.group == group]
+                actual_producer_name = calls[0].producer.__name__ if family == "chunk" else producer_name
                 attempts = sum(self._artifact_record(record, family)[1] for record in calls)
                 extent = None
                 try:
@@ -5761,7 +5994,7 @@ class RetentionMemoTrace:
                     row_type(
                         stage,
                         len(rows) + 1,
-                        producer_name,
+                        actual_producer_name,
                         basis,
                         len(calls),
                         attempts,
@@ -5981,17 +6214,27 @@ class RetentionMemoTrace:
         caller = frame.f_back
         text = frame.f_locals.get("text")
         key = record.key
+        path = next(
+            (candidate for candidate in _CHUNK_TRACE_PATHS if caller is not None and caller.f_code is candidate.producer.__code__), None
+        )
+        if path is None:
+            return False
+        actual_producer = (
+            continuation_codec._private_chunk_canonical_text_bytes
+            if path is _CHUNK_TRACE_PATHS[0]
+            else continuation_codec._verify_private_chunk_canonical
+        )
         if (
             caller is None
-            or not self._at_site(caller, _LOW_CODE_OBJECTS[1][0], _CHUNK_PARSE_SITE)
+            or not self._at_site(caller, path.producer.__code__, path.parse_site)
             or caller.f_globals is not continuation_codec.__dict__
             or frame.f_globals is not json_parser.__dict__
             or continuation_codec.parse_json_strict is not _STRICT_PARSE
-            or continuation_codec._verify_private_chunk_canonical is not _CHUNK_PRODUCER
+            or actual_producer is not path.producer
             or record.family != "chunk"
-            or type(key) is not PrivateChunkVerificationKey
+            or type(key) is not path.key_type
             or not _safe_key(key)
-            or record.producer is not _CHUNK_PRODUCER
+            or record.producer is not path.producer
             or type(text) is not str
             or text is not key.canonical
         ):
@@ -6024,18 +6267,24 @@ class RetentionMemoTrace:
     def _bind_pending_chunk(self, frame: FrameType, owner: MemoInspection, operand: bytes, expected_id: int | None) -> None:
         for pending in self._byte_pending_parses.pop(id(frame), ()):
             key = owner.key
+            path = next((candidate for candidate in _CHUNK_TRACE_PATHS if type(key) is candidate.key_type), None)
+            actual_producer = (
+                continuation_codec._private_chunk_canonical_text_bytes
+                if path is _CHUNK_TRACE_PATHS[0]
+                else continuation_codec._verify_private_chunk_canonical
+            )
             if (
                 self.records[pending.record_ordinal - 1] is not owner
                 or pending.memo_id != id(owner.memo)
                 or pending.thread_id != get_ident()
                 or pending.expected_memo_id != expected_id
-                or type(key) is not PrivateChunkVerificationKey
+                or path is None
                 or not _safe_key(key)
-                or owner.producer is not _CHUNK_PRODUCER
+                or owner.producer is not path.producer
                 or id(key.canonical) != pending.text_id
                 or frame.f_globals is not continuation_codec.__dict__
                 or continuation_codec.parse_json_strict is not _STRICT_PARSE
-                or continuation_codec._verify_private_chunk_canonical is not _CHUNK_PRODUCER
+                or actual_producer is not path.producer
                 or frame.f_locals.get("canonical") is not key.canonical
                 or frame.f_locals.get("reference") is not key.reference
             ):
@@ -6130,7 +6379,7 @@ class RetentionMemoTrace:
             return None
         if self._at_site(caller, _LOW_CODE_OBJECTS[0][0], _SNAPSHOT_PARSE_SITE):
             source_code, source_site, variable = _LOAD_SNAPSHOT, _SNAPSHOT_SOURCE_SITE, "encoded"
-        elif self._at_site(caller, _LOW_CODE_OBJECTS[1][0], _CHUNK_PARSE_SITE):
+        elif any(self._at_site(caller, path.producer.__code__, path.parse_site) for path in _CHUNK_TRACE_PATHS):
             source_code, source_site, variable = _LOAD_CHUNKS, _CHUNK_SOURCE_SITE, "canonical"
         else:
             # Nested policy/action text has no native UTF-8 buffer at these
@@ -6219,7 +6468,7 @@ class RetentionMemoTrace:
                 record
                 for record in reversed(self.records)
                 if record.memo is actual
-                and type(record.key) is PrivateChunkVerificationKey
+                and type(record.key) in (PrivateChunkVerificationKey, CanonicalTextEncodingKey)
                 and record.key.reference is reference
                 and record.key.canonical is canonical
             ),
@@ -6237,9 +6486,10 @@ class RetentionMemoTrace:
             or type(payload) is not bytes
             or self._byte_sources.get(id(parent)) != (id(payload), len(payload))
             or owner.byte_calls["chunk_length"] != 1
-            or owner.byte_calls["chunk_digest"] != 1
+            or not owner.chunk_binding_returned
+            or owner.byte_calls["chunk_digest"] not in (0, 1)
             or owner.byte_counts["chunk_length"] != reference.byte_length
-            or owner.byte_counts["chunk_digest"] != reference.byte_length
+            or owner.byte_counts["chunk_digest"] != owner.byte_calls["chunk_digest"] * reference.byte_length
             or (previous is not None and (previous.inspection is None or previous.inspection.branch is None))
         ):
             self._byte_error("private resource size lacks its original verified DATA request", frame, expected_id, owner)
@@ -6298,6 +6548,50 @@ class RetentionMemoTrace:
         self._byte_size_frames[id(frame)] = inspection
         return True
 
+    def _canonical_size_call(self, frame: FrameType, expected_id: int | None) -> bool:
+        parent = frame.f_back
+        if parent is None or not self._at_site(parent, _CHUNK_WORK_CODE, _CHUNK_PREPARATION_SIZE_SITE):
+            return False
+        owner = self._ancestor(parent, "chunk")
+        key = parent.f_locals.get("key")
+        if owner is None and type(key) is CanonicalTextEncodingKey and key.reference is None:
+            return False
+        if (
+            owner is None
+            or owner.key is not key
+            or type(key) is not CanonicalTextEncodingKey
+            or not _safe_key(key)
+            or owner.producer is not _CHUNK_PRODUCER
+            or continuation_codec._private_chunk_canonical_text_bytes is not _CHUNK_PRODUCER
+            or continuation_codec.utf8_size is not _UTF8_SIZE
+            or parent.f_globals is not continuation_codec.__dict__
+            or frame.f_globals is not bounded_serialization.__dict__
+            or frame.f_locals.get("text") is not key.canonical
+            or parent.f_locals.get("canonical") is not key.canonical
+            or frame.f_locals.get("errors") != "strict"
+            or frame.f_locals.get("limit") != key.max_utf8_bytes
+            or self._byte_carrier(expected_id, frame) is not owner.memo
+        ):
+            self._byte_error("canonical text size lost its actual key/producer/carrier", frame, expected_id, owner)
+            return True
+        inspection = _ScannerSizeInspection(
+            owner,
+            id(parent),
+            id(key.canonical),
+            str.__len__(key.canonical),
+            key.max_utf8_bytes,
+            get_ident(),
+            expected_id,
+            call_code=_CHUNK_WORK_CODE,
+            call_offset=parent.f_lasti,
+            profile_offset=parent.f_lasti,
+            canonical_preparation=True,
+        )
+        self._byte_size_frames[id(frame)] = inspection
+        self._byte_size_inspections.append(inspection)
+        owner.byte_calls["scanner_size"] += 1
+        return True
+
     def _scanner_size_profile(self, frame: FrameType, event: str, arg: object, expected_id: int | None) -> None:
         if frame.f_code in _SCANNER_SIZE_SITES:
             if event == "return" and self._byte_size_pending.pop(id(frame), None) is not None:
@@ -6310,6 +6604,8 @@ class RetentionMemoTrace:
             inspection = self._byte_size_pending.pop(id(parent), None)
             if inspection is None:
                 if self._private_size_call(frame, expected_id):
+                    return
+                if self._canonical_size_call(frame, expected_id):
                     return
                 if any(current_retention_stage_memo() is memo for memo in self.memos) or expected_id is not None:
                     self._byte_error("bounded scanner lacks its exact charged invocation", frame, expected_id)
@@ -6488,22 +6784,98 @@ class RetentionMemoTrace:
                 record.byte_calls["strict_parse"] += 1
                 record.byte_counts["strict_parse"] += size
 
+    def _capture_memo_metadata(self, frame: FrameType, callable_, operand) -> None:
+        # Some calibrated sites run while this exact memo holds its plain
+        # mutex. No locking liveness getter, observer mutex or diagnostic
+        # callback may run here. The query return joins this DATA afterward.
+        owner = self._ancestor(frame.f_back, "chunk")
+        key = frame.f_locals.get("key")
+        if type(key) is CanonicalTextEncodingKey and key.reference is None and owner is None:
+            return
+        memo = _CATALOG_STAGE_CONTEXT.get()
+        expected = self._byte_threads.get(get_ident())
+        error = None
+        size = None
+        if (
+            type(memo) is not RetentionStageMemo
+            or owner is None
+            or memo is not owner.memo
+            or not any(memo is observed for observed in self.memos)
+            or frame.f_locals.get("self") is not memo
+            or frame.f_locals.get("key") is not owner.key
+            or frame.f_locals.get("producer") is not owner.producer
+            or frame.f_locals.get("digest_producer") is not _SHA256
+            or callable_ is not builtins.len
+            or get_ident() not in self._byte_threads
+            or (expected is not None and expected != id(memo))
+        ):
+            error = "canonical metadata lost its actual key/callsite/owner"
+        elif type(operand) is bytes:
+            size = len(operand)
+        elif type(operand) is str and operand.isascii():
+            size = str.__len__(operand)
+        else:
+            error = "canonical metadata operand is not its exact immutable extent"
+        captured = memo if type(memo) is RetentionStageMemo else None
+        pending = _PendingMemoMetadata(owner, captured, key, frame.f_locals.get("producer"), get_ident(), expected, size, error)
+        self._byte_pending_memo_metadata.setdefault(id(frame), []).append(pending)
+
+    def _join_memo_metadata(self, frame: FrameType, expected_id: int | None) -> None:
+        # A Python return/exception profile event follows the context-manager
+        # exit. Source liveness and shared counters can safely be checked now.
+        failure = self._byte_pending_memo_failures.pop(id(frame), None)
+        if failure is not None:
+            self._byte_error("canonical metadata capture failed: " + type(failure).__name__, frame, expected_id)
+        for pending in self._byte_pending_memo_metadata.pop(id(frame), ()):
+            owner = pending.owner
+            error = pending.error
+            if error is None and (
+                owner is None
+                or pending.memo is not owner.memo
+                or pending.memo is not current_retention_stage_memo()
+                or pending.memo is not self._byte_carrier(expected_id, frame)
+                or pending.key is not frame.f_locals.get("key")
+                or pending.key is not owner.key
+                or pending.producer is not frame.f_locals.get("producer")
+                or pending.producer is not owner.producer
+                or pending.thread != get_ident()
+                or pending.expected_memo_id != expected_id
+                or type(pending.size) is not int
+                or pending.size < 0
+            ):
+                error = "canonical metadata lost its query-return custody"
+            if error is not None:
+                self._byte_error(error, frame, expected_id, owner)
+                continue
+            owner.byte_calls["key_preparation"] += 1
+            owner.byte_counts["key_preparation"] += pending.size
+
     def _byte_call(self, code: CodeType, offset: int, callable_, operand) -> None:
         """Read only the calibrated original CALL operand, never reconstruct it."""
         frame = None
+        deferred_metadata = False
         try:
             frame = sys._getframe(1)
+            deferred_metadata = frame.f_code is _CHUNK_QUERY_CODE and any(
+                self._at_site(frame, _CHUNK_QUERY_CODE, site) for site in _CHUNK_PROOF_METADATA_SITES
+            )
             if frame.f_code is not code or frame.f_lasti != offset:
+                if deferred_metadata:
+                    raise ValueError("native byte CALL lost its original frame or offset")
                 self._byte_error("native byte CALL lost its original frame or offset", frame, self._byte_threads.get(get_ident()))
                 return
             if code in _SCANNER_SIZE_SITES:
                 if offset in _SCANNER_SIZE_SITES[code]:
                     self._scanner_size_call(frame, offset, callable_, operand)
                 return
+            if deferred_metadata:
+                self._capture_memo_metadata(frame, callable_, operand)
+                return
             if code is _CHUNK_REQUEST:
                 if callable_ is builtins.len:
-                    channel = "chunk_length"
-                    sites = _CHUNK_LENGTH_SITES
+                    metadata = any(self._at_site(frame, _CHUNK_REQUEST, site) for site in _CHUNK_METADATA_SITES)
+                    channel = "key_preparation" if metadata else "chunk_length"
+                    sites = _CHUNK_METADATA_SITES if metadata else _CHUNK_LENGTH_SITES
                 elif callable_ is _SHA256:
                     channel = "chunk_digest"
                     sites = _CHUNK_DIGEST_SITES
@@ -6514,10 +6886,36 @@ class RetentionMemoTrace:
                     return
                 proof = frame.f_locals.get("proof")
                 encoded = proof.encoded if type(proof) is CanonicalTextProof else frame.f_locals.get("encoded")
-                if operand is not encoded:
+                if channel != "key_preparation" and operand is not encoded:
                     self._byte_error("chunk binding operand differs from its native buffer", frame, self._byte_threads.get(get_ident()))
                     return
                 owner = self._frames.get(id(frame))
+            elif code is _CHUNK_QUERY_CODE:
+                key = frame.f_locals.get("key")
+                owner = self._ancestor(frame.f_back, "chunk")
+                if type(key) is CanonicalTextEncodingKey and key.reference is None and owner is None:
+                    return
+                if callable_ is _SHA256:
+                    channel, sites = "chunk_digest", (_CHUNK_PROOF_DIGEST_SITE,)
+                    if operand is not frame.f_locals.get("encoded"):
+                        self._byte_error(
+                            "canonical proof digest lost its actual native buffer", frame, self._byte_threads.get(get_ident()), owner
+                        )
+                        return
+                else:
+                    return
+                if (
+                    owner is None
+                    or owner.key is not key
+                    or frame.f_locals.get("self") is not owner.memo
+                    or frame.f_locals.get("producer") is not owner.producer
+                    or frame.f_locals.get("digest_producer") is not _SHA256
+                    or not any(self._at_site(frame, _CHUNK_QUERY_CODE, site) for site in sites)
+                ):
+                    self._byte_error(
+                        "canonical proof work lost its actual key/callsite/owner", frame, self._byte_threads.get(get_ident()), owner
+                    )
+                    return
             else:
                 sites = _EXTENT_SITES.get(code)
                 channel = "scanner_extent"
@@ -6569,10 +6967,14 @@ class RetentionMemoTrace:
                 if owner is None or owner.memo is not actual:
                     self._byte_error("native encoded extent lacks its actual charged owner", frame, expected, owner)
                     return
-                if type(operand) is not bytes:
+                if channel == "key_preparation" and type(operand) is str and operand.isascii():
+                    size = str.__len__(operand)
+                elif type(operand) is bytes:
+                    size = len(operand)
+                else:
                     self._byte_error("native encoded extent is not exact bytes", frame, expected, owner)
                     return
-                if code is _CHUNK_REQUEST:
+                if code is _CHUNK_REQUEST and channel != "key_preparation":
                     self._bind_pending_chunk(frame, owner, operand, expected)
                 elif code is _UTF8_CODE:
                     inspection.chunks += 1
@@ -6580,18 +6982,106 @@ class RetentionMemoTrace:
                     if inspection.private_resource:
                         return
                 owner.byte_calls[channel] += 1
-                owner.byte_counts[channel] += len(operand)
+                owner.byte_counts[channel] += size
         except Exception as error:
+            if deferred_metadata and frame is not None:
+                # Reporting also consults source liveness. Keep it outside the
+                # protected callback, and invalidate any incomplete capture.
+                self._observation_incomplete = True
+                self._byte_pending_memo_failures[id(frame)] = error
+                return
             self._byte_error(
                 "native byte callback: " + type(error).__name__, frame or sys._getframe(1), self._byte_threads.get(get_ident())
             )
+
+    def _observe_chunk_proof_return(self, frame: FrameType, arg: object, expected_id: int | None) -> None:
+        record = self._ancestor(frame.f_back, "chunk")
+        if record is None:
+            return
+        key = frame.f_locals.get("key")
+        if (
+            frame.f_globals is not retention_memo.__dict__
+            or frame.f_locals.get("self") is not record.memo
+            or current_retention_stage_memo() is not record.memo
+            or key is not record.key
+            or type(key) is not CanonicalTextEncodingKey
+            or not _safe_key(key)
+            or frame.f_locals.get("producer") is not record.producer
+            or record.producer is not _CHUNK_PRODUCER
+            or frame.f_locals.get("digest_producer") is not _SHA256
+            or continuation_codec.sha256 is not _SHA256
+        ):
+            self.errors.append("chunk retained proof lost its actual key/producer/carrier")
+            return
+        # This is local DATA provenance. Submission/stage equality is checked
+        # by the artifact/native carrier validators; foreign observed stages
+        # must retain their real work without receiving qualification.
+        if type(arg) is CanonicalTextProof:
+            if type(arg.encoded) is not bytes or type(arg.digest) is not str:
+                self.errors.append("chunk retained proof changed its immutable returned fields")
+                return
+            if frame.f_locals.get("hit") is arg:
+                original = next(
+                    (
+                        previous
+                        for previous in self.records
+                        if previous is not record
+                        and previous.memo is record.memo
+                        and previous.producer is record.producer
+                        and previous.key == key
+                        and previous.chunk_proof is arg
+                        and previous.chunk_proof_encoded is arg.encoded
+                        and previous.chunk_proof_buffer == (id(arg.encoded), len(arg.encoded), arg.digest)
+                    ),
+                    None,
+                )
+                if original is None:
+                    self.errors.append("chunk retained digest lacks its original observed proof")
+                    return
+            elif arg.encoded is not frame.f_locals.get("encoded") or arg.digest != frame.f_locals.get("digest"):
+                self.errors.append("chunk cold proof differs from its actual encoded buffer/digest")
+                return
+            record.chunk_proof_id = id(arg)
+            record.chunk_proof_buffer = (id(arg.encoded), len(arg.encoded), arg.digest)
+            record.chunk_proof = arg
+            record.chunk_proof_encoded = arg.encoded
+
+    def _observe_chunk_binding_return(self, frame: FrameType, record: MemoInspection) -> None:
+        if frame.f_lasti not in _CHUNK_SUCCESS_RETURNS or not _safe_key(record.key):
+            return
+        key = record.key
+        if frame.f_locals.get("reference") is not key.reference or frame.f_locals.get("canonical") is not key.canonical:
+            return
+        if type(key) is CanonicalTextEncodingKey:
+            proof = frame.f_locals.get("proof")
+            if (
+                type(proof) is CanonicalTextProof
+                and proof is record.chunk_proof
+                and proof.encoded is record.chunk_proof_encoded
+                and id(proof) == record.chunk_proof_id
+                and record.chunk_proof_buffer == (id(proof.encoded), len(proof.encoded), proof.digest)
+                and frame.f_locals.get("length") == key.reference.byte_length
+                and frame.f_locals.get("digest") == key.reference.digest
+            ):
+                record.chunk_binding_returned = True
+        elif type(key) is PrivateChunkVerificationKey:
+            # This original return follows its real direct len/SHA comparisons;
+            # it carries no retained digest and must observe both native calls.
+            record.chunk_binding_returned = record.attempts["length"] == record.attempts["sha256"] == 1
 
     def _event(self, frame: FrameType, event: str, arg: object, expected_id: int | None) -> None:
         code = frame.f_code
         high = code is _SNAPSHOT_REQUEST or code is _CHUNK_REQUEST or code is _CREDENTIAL_REQUEST or code is _STATE_REQUEST
         if event == "return":
+            if code is _CHUNK_QUERY_CODE:
+                with self._lock:
+                    self._join_memo_metadata(frame, expected_id)
+                    self._observe_chunk_proof_return(frame, arg, expected_id)
             if high or code is _METADATA_VALIDATOR or code is _CONTEXT_VALIDATOR or code is _TITLE_VALIDATOR:
                 with self._lock:
+                    record = self._frames.get(id(frame))
+                    if code is _CHUNK_REQUEST and record is not None:
+                        self._observe_chunk_binding_return(frame, record)
                     self._frames.pop(id(frame), None)
                     invocation = self._validator_frames.pop(id(frame), None)
                     context = self._context_byte_frames.pop(id(frame), None)
@@ -6606,13 +7096,24 @@ class RetentionMemoTrace:
             binding = None
             if arg is _SHA256:
                 binding = "sha256"
-            elif code is _CHUNK_REQUEST and arg is builtins.len:
-                binding = "length"
             elif (
                 code is _CHUNK_REQUEST
+                and arg is builtins.len
+                and any(self._at_site(frame, _CHUNK_REQUEST, site) for site in _CHUNK_LENGTH_SITES)
+            ):
+                binding = "length"
+            elif (
+                any(code is owner for owner in (_CHUNK_REQUEST, _CHUNK_WORK_CODE, _CHUNK_QUERY_CODE))
                 and type(arg) is BuiltinFunctionType
                 and arg.__name__ == "encode"
-                and arg.__self__ is frame.f_locals.get("canonical")
+                and (
+                    arg.__self__ is frame.f_locals.get("canonical")
+                    or (
+                        code is _CHUNK_QUERY_CODE
+                        and type(frame.f_locals.get("key")) is CanonicalTextEncodingKey
+                        and arg.__self__ is frame.f_locals["key"].canonical
+                    )
+                )
             ):
                 binding = "utf8"
             if binding is not None:
@@ -6695,6 +7196,10 @@ class RetentionMemoTrace:
                     self._frames[id(frame)] = record
                 return
             record = self._ancestor(frame.f_back)
+            if code is _CHUNK_WORK_CODE:
+                key = frame.f_locals.get("key")
+                if type(key) is CanonicalTextEncodingKey and key.reference is None and (record is None or record.family != "chunk"):
+                    return
             if id(code) in self._query_codes:
                 key = frame.f_locals.get("key")
                 producer = frame.f_locals.get("producer")
@@ -6981,12 +7486,14 @@ class RetentionMemoTrace:
             owners.add(id(item.owner))
             key = item.owner.key
             assert (
-                type(key) is PrivateChunkVerificationKey
+                type(key) in (PrivateChunkVerificationKey, CanonicalTextEncodingKey)
+                and _safe_key(key)
+                and key.reference is not None
                 and id(key.reference) == item.reference
                 and id(key.canonical) == item.text
                 and key.reference.byte_length == item.byte_length
-                and item.owner.byte_calls["chunk_length"] == item.owner.byte_calls["chunk_digest"] == 1
-                and item.owner.byte_counts["chunk_length"] == item.owner.byte_counts["chunk_digest"] == item.byte_length
+                and item.owner.byte_calls["chunk_length"] == 1
+                and item.owner.byte_counts["chunk_length"] == item.byte_length
                 and inspection.owner is item.owner
                 and inspection.text == item.text
                 and inspection.characters == item.characters
@@ -7009,6 +7516,27 @@ class RetentionMemoTrace:
                     )
                 )
             ), "private resource size changed or exchanged its bounded DATA work"
+            if type(key) is PrivateChunkVerificationKey:
+                assert item.owner.byte_calls["chunk_digest"] == 1 and item.owner.byte_counts["chunk_digest"] == item.byte_length, (
+                    "canonical-only private resource lost its fresh digest work"
+                )
+            else:
+                proof = item.owner.chunk_proof
+                assert (
+                    item.owner.chunk_binding_returned
+                    and type(proof) is CanonicalTextProof
+                    and type(proof.encoded) is bytes
+                    and type(proof.digest) is str
+                    and id(proof) == item.owner.chunk_proof_id
+                    and proof.encoded is item.owner.chunk_proof_encoded
+                    and item.owner.chunk_proof_buffer == (id(proof.encoded), item.byte_length, key.reference.digest)
+                    and len(proof.encoded) == item.byte_length
+                    and proof.digest == key.reference.digest
+                    and item.owner.byte_calls["chunk_digest"] == item.owner.attempts["sha256"]
+                    and item.owner.attempts["sha256"]
+                    == int(next(record for record in self.records if record.chunk_proof is proof) is item.owner)
+                    and item.owner.byte_counts["chunk_digest"] == item.byte_length * item.owner.attempts["sha256"]
+                ), "private resource canonical proof lost its original binding lineage"
 
     def _assert_native_byte_budget(self, budgets: tuple[NativeByteBudget, ...]) -> None:
         assert not self.byte_errors, "native byte provenance invalid: " + str(self.byte_errors)
@@ -7024,6 +7552,8 @@ class RetentionMemoTrace:
             and not self._byte_private_payloads
             and not self._context_byte_frames
             and not self._byte_pending_parses
+            and not self._byte_pending_memo_metadata
+            and not self._byte_pending_memo_failures
             and all(record.exited for record in self.context_canonical_inspections)
         ), "native byte work remains active"
         self._assert_private_size_work()
@@ -7031,9 +7561,15 @@ class RetentionMemoTrace:
             item.call_code is not None
             and type(item.call_offset) is int
             and type(item.profile_offset) is int
-            and item.call_code in _SCANNER_SIZE_WINDOWS
-            and item.call_offset in _SCANNER_SIZE_WINDOWS[item.call_code]
-            and item.profile_offset in _SCANNER_SIZE_WINDOWS[item.call_code][item.call_offset][0]
+            and (
+                item.call_code is _CHUNK_WORK_CODE
+                and item.call_offset in _CHUNK_PREPARATION_SIZE_SITE[0]
+                and item.profile_offset in _CHUNK_PREPARATION_SIZE_SITE[0]
+                if item.canonical_preparation
+                else item.call_code in _SCANNER_SIZE_WINDOWS
+                and item.call_offset in _SCANNER_SIZE_WINDOWS[item.call_code]
+                and item.profile_offset in _SCANNER_SIZE_WINDOWS[item.call_code][item.call_offset][0]
+            )
             for item in self._byte_size_inspections
         ), "bounded scanner lost its original native CALL origin"
         for _stage, _family, _key, _producer, _invocation, records in self._byte_rows():
@@ -7421,7 +7957,15 @@ class RetentionMemoTrace:
                     )
                     if require_valid_chunk_bindings:
                         assert all(
-                            record.attempts["utf8"] == record.attempts["length"] == record.attempts["sha256"] == 1 for record in calls
+                            record.chunk_binding_returned
+                            and record.attempts["length"] == 1
+                            and (
+                                record.attempts["sha256"] == record.attempts["chunk_work"]
+                                and record.attempts["utf8"] == 2 * record.attempts["chunk_work"]
+                                if type(record.key) is CanonicalTextEncodingKey
+                                else record.attempts["utf8"] == record.attempts["sha256"] == 1
+                            )
+                            for record in calls
                         ), "valid chunk call omitted or repeated its real binding work"
                 else:
                     assert attempts["detector_work"] == 1, "credential input recomputed within one actual stage"

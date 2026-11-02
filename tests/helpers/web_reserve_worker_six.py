@@ -1,4 +1,8 @@
-"""Finite conditional worker-six source transfers on supplied ASTs, never admission."""
+"""Current Continuation worker reserves on supplied ASTs, never admission.
+
+The historical module name is retained for callers. Deleted V1 worker methods
+are replaced by actual adoption and driver reserves, not six empty exemptions.
+"""
 
 import ast
 import copy
@@ -12,14 +16,7 @@ from tests.helpers import web_worker_whole_scope_origin as source_origins
 
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
 LIFECYCLE = "src/elspeth/web/coordination/lifecycle.py"
-METHODS = (
-    "_run_started",
-    "_run_started_under_lease",
-    "_reconcile_failed_adoption",
-    "_reserve_failed_terminal_projection",
-    "_settle_failure",
-    "_recover_failed_adoption",
-)
+DRIVER = "src/elspeth/web/sessions/continuation_driver.py"
 
 
 def chain(node):
@@ -96,15 +93,6 @@ def code_for(tree, owners):
     return (code, None)
 
 
-GRAMMARS = {
-    "_run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
-    "_run_started_under_lease": "9102ab313b7bc66ae98b3516d9bce69be08a017686be541ad9435d06fa54e298",
-    "_reconcile_failed_adoption": "275bf719b88e638c990f9da7217588ed581cdfdee326dba3813d547dd4f41ce4",
-    "_reserve_failed_terminal_projection": "2eac0f1a376009eea11cac52de3d2d70f6fad279400b87162b3a162dcdcbbe66",
-    "_settle_failure": "ebdb7c1fe90737788a107dda02489381741194830a0f995aaae600d3faa491fb",
-    "_recover_failed_adoption": "cc360dcce49988785bb88b1b30241f9d099e19654599b0f784b1856f33fb469e",
-}
-IMPORT_GRAMMAR = "3b442f921115a868c5b933f82f0681432b524512986f3ff1478cf65b97c2bc64"
 CONTINUATION_OWNER_GRAMMARS = {
     "ComposerAsyncWorker._job": "aa8d9593bc27624ba0f57d95b39cd1c9c03eb1971e1ba8dcbfd2a07a38899150",
     "ContinuationLeaseAdoption": "6c853b51d24a4cc2d73d8adc70fa44567b25eb671141e558a2cf08b0f5c7c87f",
@@ -348,198 +336,176 @@ def continuation_start_owner_contract(units):
     }
 
 
+_DRIVER_ACTION_CLOCK = """
+action_clock = ContinuationActionClock(action)
+self._action_clock = action_clock
+self.sql_deadline.begin_action(action, started_at=action_clock.started_monotonic)
+self.phases.bind_action_clock(action_clock)
+self._action_ordinal += 1
+producer: RequiredWorkTicket | None = None
+signal: RequiredWorkTicket | None = None
+expiry: _ActionExpiry | None = None
+stage_owner: ContinuationStage[_ActionResult] | None = None
+stage_coroutine: Coroutine[object, object, _ActionResult] | None = None
+"""
+
+_DRIVER_STAGE_RESERVES = """
+producer = self.work.coordinator.reserve(
+    RequiredWorkSource.REQUIRED_CONTINUATION_PRODUCER,
+    transition_ordinal=selected.stack.cursor, recurrence_ordinal=self._action_ordinal,
+)
+signal = self.work.coordinator.reserve(
+    RequiredWorkSource.DEADLINE_SIGNAL,
+    transition_ordinal=selected.stack.cursor, recurrence_ordinal=self._action_ordinal,
+)
+now = time.monotonic()
+active_expiry = _ActionExpiry(self.phases, producer, signal, now + self.sql_deadline.remaining_dispatch(monotonic_now=now))
+expiry = active_expiry
+"""
+
+
+def _unique_sequence(owner, template):
+    expected = [ast.dump(node) for node in ast.parse(template).body]
+    matches = []
+    for node in ast.walk(owner):
+        for _, value in ast.iter_fields(node):
+            if not isinstance(value, list):
+                continue
+            for offset in range(len(value) - len(expected) + 1):
+                actual = value[offset : offset + len(expected)]
+                if all(isinstance(item, ast.AST) for item in actual) and [ast.dump(item) for item in actual] == expected:
+                    matches.append((value, offset, actual))
+    return matches[0] if len(matches) == 1 else None
+
+
 def worker_six_local_contracts(units):
-    """Failures gate every receipt; local facts require separate origin premises."""
+    """Compose actual owner proofs and return only original AST reserve nodes.
+
+    Current complete source guards remain mandatory at the central boundary.
+    These facts do not admit arbitrary methods of the driver or coordinator.
+    """
+    # Imported here to keep the source-origin helper's module initialization
+    # independent of the provider proof, which consumes its origin primitives.
+    from tests.helpers.web_reserve_provider_mint_contract import provider_driver_constructor_contract
+
+    units = tuple(units)
     receipt = {
         "reserve_calls": frozenset(),
+        "driver_reserve_calls": frozenset(),
+        "adoption_reserve_calls": frozenset(),
         "per_call": [],
         "caller_calls": [],
         "selected_definitions": [],
         "invocation_scopes": [],
         "import_nodes": [],
         "prerequisite_joins": [],
+        "effect_dependencies": [
+            {
+                "identity": name,
+                "qualification": "UNKNOWN",
+                "requirement": requirement,
+            }
+            for name, requirement in (
+                ("CURRENT_COMPLETE_SOURCE", "central complete current source guards must hold on these exact ASTs"),
+                ("CURRENT_WORKER_CALLER", "same-input app/job/segment caller and whole-scope origins must compose"),
+                ("COORDINATOR_MEMBERS", "owned coordinator reserve, source enums and ticket semantics remain separately proved"),
+                ("LEASE_AND_OUTSIDE_EFFECTS", "actual lease fields, descriptors and external writes preserve current ownership"),
+            )
+        ],
     }
-    receipt["effect_dependencies"] = [
-        {"identity": name, "qualification": "UNKNOWN", "requirement": requirement}
-        for name, requirement in (
-            ("WHOLE_SCOPE_SOURCE2", "compose the separately reviewed current worker whole-scope origin receipt on these exact ASTs"),
-            ("WORKER_CALLER_V1", "compose separately reviewed worker caller app/job/started-under-lease receipts on these exact ASTs"),
-            (
-                "LEASE_REQUIRED_WORK",
-                "actual nominal SessionOperationLease.required_work property yields same coordinator; no outside writes",
-            ),
-            (
-                "COORDINATOR_MEMBERS",
-                "normal pinned RequiredWorkCoordinator reserve/validation/authority/tickets semantics and enum origins",
-            ),
-            (
-                "RECOVERED_CONSTRUCTORS",
-                "actual imported RequiredWorkCoordinator/RequiredWorkAuthority constructors return exact owned authority under acquired recovery context",
-            ),
-            (
-                "TASK_CALLBACK_AND_OUTSIDE_EFFECTS",
-                "normal pinned callbacks/awaits/member lookups retain source-bound receiver/formal/result origins",
-            ),
-            (
-                "SQL_AND_PHYSICAL_JOIN",
-                "actual SQL/Future joins, fences, task lifecycle, release and terminal return ownership remain independently qualified",
-            ),
-        )
-    ]
-    units = list(units)
-    index = {str(n.path): n for n in units}
-    if len(index) != len(units) or WORKER not in index or (not isinstance(index[WORKER].tree, ast.Module)):
-        return (["worker six: missing/duplicate/unsupported SourceUnit"], receipt)
-    tree = index[WORKER].tree
-    failures = []
-    selected = {}
-    if not any(
-        isinstance(n, ast.ImportFrom) and n.level == 0 and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
-        for n in tree.body
-    ):
-        failures.append("worker six: annotation execution mode changed")
-    imports = [n for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == "elspeth.web.required_work"]
-    actual = (
-        None
-        if len(imports) != 1
-        else hashlib.sha256(json.dumps(canonical(imports[0]), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    )
-    if actual != IMPORT_GRAMMAR:
-        failures.append("worker six: canonical required work import changed")
-    else:
-        receipt["import_nodes"] = [(WORKER, id(imports[0]))]
-    for module, digest in SUPPLIER_IMPORT_GRAMMARS.items():
-        matches = [n for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == module]
-        current = (
-            None
-            if len(matches) != 1
-            else hashlib.sha256(json.dumps(canonical(matches[0]), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        )
-        if current != digest:
-            failures.append("worker six: canonical nominal supplier import changed " + module)
-        else:
-            receipt["import_nodes"].append((WORKER, id(matches[0])))
-    for name in METHODS:
-        function, owners = find(tree, "ComposerAsyncWorker." + name)
-        expected = ast.FunctionDef if name == "_reserve_failed_terminal_projection" else ast.AsyncFunctionDef
-        if not isinstance(function, expected) or grammar(function) != GRAMMARS[name]:
-            failures.append("worker six: complete finite method grammar changed " + name)
-            continue
-        code, reason = code_for(tree, owners)
+    index = {str(unit.path): unit for unit in units}
+    if len(index) != len(units) or any(path not in index for path in (WORKER, LIFECYCLE, DRIVER)):
+        return ["worker continuation reserves: missing/duplicate source unit"], receipt
+    start_failures, start = continuation_start_owner_contract(units)
+    if start_failures:
+        return start_failures, receipt
+    flow_failures, flow = worker_caller.continuation_caller_contracts(units)
+    if flow_failures:
+        return flow_failures, receipt
+    constructor_failures, constructor = provider_driver_constructor_contract(units)
+    if constructor_failures:
+        return constructor_failures, receipt
+    driver = index[DRIVER]
+    cls, _ = find(driver.tree, "_SegmentDriver")
+    run, run_owners = find(driver.tree, "_SegmentDriver.run")
+    settle, settle_owners = find(driver.tree, "_SegmentDriver.settle")
+    if not isinstance(run, ast.AsyncFunctionDef) or not isinstance(settle, ast.AsyncFunctionDef):
+        return ["worker continuation reserves: missing actual driver methods"], receipt
+    for method, owners in ((run, run_owners), (settle, settle_owners)):
+        code, reason = code_for(driver.tree, owners)
         mask = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
-        bits = None if code is None else code.co_flags & mask
-        if bits != (0 if expected is ast.FunctionDef else inspect.CO_COROUTINE):
-            failures.append("worker six: actual compiler callable kind changed " + name)
-            continue
-        selected[name] = function
-        receipt["selected_definitions"].append((WORKER, id(function)))
+        if (
+            code is None
+            or code.co_flags & mask != inspect.CO_COROUTINE
+            or "RequiredWorkSource" in code.co_varnames + code.co_cellvars + code.co_freevars
+        ):
+            return ["worker continuation reserves: actual source scope changed " + method.name], receipt
+        receipt["selected_definitions"].append((DRIVER, id(method)))
         receipt["invocation_scopes"].append(
             {
-                "definition": (WORKER, id(function)),
-                "kind_bits": bits,
+                "definition": (DRIVER, id(method)),
+                "kind_bits": code.co_flags & mask,
                 "locals": code.co_varnames,
                 "cells": code.co_cellvars,
                 "free": code.co_freevars,
                 "compiler_reason": reason,
-                "qualification": "SOURCE_SCOPE_KIND_ORIGIN_UNKNOWN",
             }
         )
-    if failures:
-        return (failures, receipt)
-    rows = []
-    for name, total in (
-        ("_run_started", 1),
-        ("_run_started_under_lease", 1),
-        ("_reconcile_failed_adoption", 3),
-        ("_reserve_failed_terminal_projection", 1),
-    ):
-        f = selected[name]
-        calls = [
-            n
-            for n in ast.walk(f)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and (n.func.attr == "reserve")
-            and (chain(n.func.value) in (("coordinator",), ("original_work",), ("recovered_work",)))
-        ]
-        if len(calls) != total:
-            return (["worker six: selected reserve inventory changed " + name], receipt)
-        for call in calls:
-            symbol = call.func.value.id
-            stores = [n for n in ast.walk(f) if isinstance(n, ast.Assign) and len(n.targets) == 1 and (chain(n.targets[0]) == (symbol,))]
-            formals = [n for n in (*f.args.args, *f.args.kwonlyargs) if n.arg == symbol]
-            guards = [
-                n
-                for n in ast.walk(f)
-                if isinstance(n, ast.If) and any(isinstance(x, ast.Name) and x.id == symbol for x in ast.walk(n.test))
-            ]
-            returns = [n for n in ast.walk(f) if isinstance(n, ast.Return)]
-            validation = [n for n in ast.walk(f) if isinstance(n, ast.Call) and chain(n.func) == (symbol, "validate_terminal_failure_work")]
-            if symbol == "coordinator" and name in ("_run_started", "_run_started_under_lease"):
-                if len(stores) != 1 or chain(stores[0].value) != ("lease", "required_work") or formals or (not guards):
-                    return (["worker six: lease producer/guard changed"], receipt)
-            elif symbol == "recovered_work":
-                if (
-                    len(stores) != 1
-                    or not isinstance(stores[0].value, ast.Call)
-                    or chain(stores[0].value.func) != ("RequiredWorkCoordinator",)
-                    or formals
-                ):
-                    return (["worker six: recovered constructor changed"], receipt)
-            elif symbol == "original_work":
-                if len(formals) != 1 or stores or len(validation) != 1:
-                    return (["worker six: original formal/authority validation changed"], receipt)
-            elif symbol == "coordinator" and (len(formals) != 1 or stores or (not guards) or (len(validation) != 1)):
-                return (["worker six: projection formal/nominal guard changed"], receipt)
-            rows.append(
-                {
-                    "call": (WORKER, id(call)),
-                    "method": (WORKER, id(f)),
-                    "receiver_value": (WORKER, id(call.func.value)),
-                    "producer_stores": [(WORKER, id(n)) for n in stores],
-                    "formals": [(WORKER, id(n)) for n in formals],
-                    "guards": [(WORKER, id(n)) for n in guards],
-                    "authority_validation_calls": [(WORKER, id(n)) for n in validation],
-                    "returns": [(WORKER, id(n)) for n in returns],
-                    "source_local_only": True,
-                }
-            )
-    receipt["reserve_calls"] = frozenset(row["call"] for row in rows)
-    receipt["per_call"] = rows
-    continuation_failures, continuation = continuation_start_owner_contract(units)
-    if continuation_failures:
-        return continuation_failures, receipt
-    receipt["continuation_start_owner"] = continuation
-    receipt["continuation_reserve_calls"] = continuation["continuation_reserve_calls"]
-    expected = [
-        ("_run_started", "_run_started_under_lease", 1),
-        ("_recover_failed_adoption", "_reconcile_failed_adoption", 1),
-        ("_settle_failure", "_reserve_failed_terminal_projection", 2),
-        ("_reconcile_failed_adoption", "_reserve_failed_terminal_projection", 1),
+    origin = source_origins.import_origin(driver.tree, "RequiredWorkSource", "elspeth.web.required_work", "RequiredWorkSource")
+    if origin is None:
+        return ["worker continuation reserves: source enum origin changed"], receipt
+    receipt["import_nodes"].append((DRIVER, id(origin[0])))
+    clock = _unique_sequence(run, _DRIVER_ACTION_CLOCK)
+    stage = _unique_sequence(run, _DRIVER_STAGE_RESERVES)
+    if clock is None or stage is None:
+        return ["worker continuation reserves: original action/clock/stage reserve sequence changed"], receipt
+    block, offset, statements = clock
+    if offset + len(statements) >= len(block):
+        return ["worker continuation reserves: stage no longer follows original clock"], receipt
+    stage_try = block[offset + len(statements)]
+    if not isinstance(stage_try, ast.Try) or stage[0] is not stage_try.body or stage[1] != 0:
+        return ["worker continuation reserves: stage reserve moved outside original clock custody"], receipt
+    failure_template = ast.parse("projection = self.work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_PROJECTION)").body[0]
+    failure_assignments = [node for node in ast.walk(settle) if ast.dump(node) == ast.dump(failure_template)]
+    if len(failure_assignments) != 1:
+        return ["worker continuation reserves: owned terminal projection changed"], receipt
+    rows = [(run, stage[2][0].value), (run, stage[2][1].value), (settle, failure_assignments[0].value)]
+    actual = [
+        node
+        for node in ast.walk(cls)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "reserve"
     ]
-    for owner, callee, total in expected:
-        calls = [n for n in ast.walk(selected[owner]) if isinstance(n, ast.Call) and chain(n.func) == ("self", callee)]
-        if len(calls) != total:
-            return (["worker six: exact finite caller transfer changed"], receipt)
-        receipt["caller_calls"].extend((WORKER, id(n)) for n in calls)
-    receipt["prerequisite_joins"] = [
-        {
-            "package": "sol-web-worker-whole-scope-origin-2",
-            "join_definition": (WORKER, id(selected["_run_started_under_lease"])),
-            "qualification": "SEPARATE_REVIEWED_RECEIPT_REQUIRED",
-        },
-        {
-            "package": "sol-web-worker-caller-transfer-1",
-            "join_call": receipt["caller_calls"][0],
-            "qualification": "SEPARATE_REVIEWED_RECEIPT_REQUIRED",
-        },
-    ]
-    return ([], receipt)
-
-
-SUPPLIER_IMPORT_GRAMMARS = {
-    "elspeth.web.coordination.lifecycle": "386c21fb55b3289545251677448dd29fbe2a9b23220398ac49f774d445bc85eb",
-    "elspeth.contracts.session_operation": "499e013091e47e73666eff45d82788d171510b6e5e4d596143c9f8d8790443bf",
-    "elspeth.web.required_sql_outcomes": "6ab23511eebf3383ddcdcfbcc511b8dae4b1c358df3e02781732ffb460b741c7",
-    "elspeth.web.sessions.composer_operations": "747dacdbbb06c576e01bb44de86d6df77b5eb26b914cf0ea296f68fed5b81758",
-}
+    if {id(node) for node in actual} != {id(node) for _, node in rows} or len(actual) != 3:
+        return ["worker continuation reserves: unreviewed driver reserve or receiver"], receipt
+    for method, call in rows:
+        receipt["per_call"].append(
+            {
+                "call": (DRIVER, id(call)),
+                "method": (DRIVER, id(method)),
+                "receiver_value": (DRIVER, id(call.func.value)),
+                "source_argument": (DRIVER, id(call.args[0])),
+                "producer_stores": tuple(constructor["binding_constructor_stores"]),
+                "source_local_only": True,
+            }
+        )
+    driver_calls = frozenset((DRIVER, id(call)) for _, call in rows)
+    adoption_calls = start["continuation_reserve_calls"]
+    if not adoption_calls or driver_calls & adoption_calls:
+        return ["worker continuation reserves: missing/overlapping actual adoption reserve"], receipt
+    receipt.update(
+        reserve_calls=driver_calls | adoption_calls,
+        driver_reserve_calls=driver_calls,
+        adoption_reserve_calls=adoption_calls,
+        continuation_reserve_calls=adoption_calls,
+        continuation_start_owner=start,
+        continuation_transport=flow,
+        driver_constructor=constructor,
+        caller_calls=list(flow["transport_calls"]),
+        supplier_arguments=start["supplier_arguments"] | flow["supplier_arguments"],
+        action_clock_statements=tuple((DRIVER, id(node)) for node in statements),
+        prerequisite_joins=[
+            {"package": "current-worker-caller", "join_calls": flow["job_segment_calls"]},
+            {"package": "current-provider-driver-constructor", "join_stores": constructor["binding_constructor_stores"]},
+        ],
+    )
+    return [], receipt

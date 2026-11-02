@@ -435,6 +435,7 @@ if TYPE_CHECKING:
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
     from elspeth.web.sessions.continuation import ContinuationOwnerCommit, PreparedSegmentSettlement, StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation_graph_recovery_projection import GraphRecoveryProjectionInput
     from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
     from elspeth.web.sessions.continuation_p4 import P4WriterObservation
     from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
@@ -7196,6 +7197,226 @@ class SessionServiceImpl:
 
         return cast(GraphRecoveryAdmission, await self._run_sync(_sync))
 
+    def prepare_graph_recovery_on_connection(
+        self,
+        conn: Connection,
+        session_id: UUID,
+        *,
+        context: GraphRecoveryContext,
+        intent: GraphRecoveryIntent,
+        session_operation_context: SessionOperationContext,
+        candidate_state: CompositionState | None = None,
+    ) -> GraphRecoverySettlement:
+        """Select the original recovery target on the caller's exact transaction."""
+        sid = str(session_id)
+        operation_id = session_operation_context.fence.operation_id
+        self._require_session_operation_context_on_connection(
+            conn,
+            session_operation_context,
+            session_id=sid,
+            expected_kind=SessionOperationKind.COMPOSE,
+            now=database_now(conn),
+        )
+        heads = conn.execute(
+            select(composition_states_table.c.id, composition_states_table.c.version, composition_states_table.c.creator_operation_id)
+            .where(composition_states_table.c.session_id == sid)
+            .order_by(composition_states_table.c.version.desc())
+        ).all()
+        for row in heads:
+            if row.version > context.turn_start_version and row.creator_operation_id != operation_id:
+                raise StaleComposeStateError("Recovery cannot overwrite a checkpoint from another operation")
+        head = heads[0] if heads else None
+        expected_id = recovery_identity(head.id) if head is not None else None
+        version = head.version if head is not None else 0
+
+        def _refusal() -> GraphRecoverySettlement:
+            return GraphRecoverySettlement(
+                session_id=session_id,
+                operation_id=operation_id,
+                intent=intent,
+                expected_state_id=expected_id,
+                expected_version=version,
+                target_state_id=None,
+                state_id=None,
+                data=None,
+                park_id=None,
+                empty_fallback=False,
+                failure_reason="target_unavailable",
+                receipt_id=uuid.uuid4(),
+                malformed_head=context.malformed_head,
+            )
+
+        target_id: UUID | None = None
+        state = None
+        park_changes_head = context.malformed_head
+        if intent.action == "park":
+            target_id = expected_id
+            if candidate_state is not None:
+                try:
+                    candidate_data = checkpoint_data(candidate_state)
+                except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                    return _refusal()
+                state = candidate_state
+                try:
+                    current_data = (
+                        checkpoint_data(read_editable_checkpoint(conn, session_id, expected_id))
+                        if expected_id is not None
+                        else checkpoint_data(empty_recovery_state())
+                    )
+                except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                    park_changes_head = True
+                else:
+                    park_changes_head = park_changes_head or candidate_data != current_data
+        elif intent.action == "reset_to_turn_start":
+            target_id = UUID(context.turn_start_state_id) if context.turn_start_state_id is not None else None
+        elif intent.action == "restore_parked_graph":
+            target = conn.execute(
+                select(composition_graph_parks_table.c.state_id).where(
+                    composition_graph_parks_table.c.id == intent.park_id,
+                    composition_graph_parks_table.c.session_id == sid,
+                )
+            ).scalar_one_or_none()
+            if target is None:
+                return _refusal()
+            target_id = UUID(target)
+        elif intent.action == "reset_to_safe_checkpoint":
+            for row in heads:
+                try:
+                    state = read_editable_checkpoint(conn, session_id, UUID(row.id))
+                except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                    continue
+                target_id = UUID(row.id)
+                break
+        else:
+            raise ValueError("Unknown graph recovery action")
+        if state is None and target_id is not None:
+            try:
+                state = read_editable_checkpoint(conn, session_id, target_id)
+            except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                return _refusal()
+        empty_fallback = state is None
+        if state is None:
+            state = empty_recovery_state()
+        from elspeth.web.execution.completion_gates import completion_gates_meta_from_facts, parse_completion_gates
+
+        data = checkpoint_data(state)
+        prior = None
+        reviewed_state = state
+        if target_id is not None:
+            # Graph eligibility remains independent of validation
+            # decoding; the gate metadata below is not.
+            try:
+                reviewed_state = read_editable_checkpoint(conn, session_id, target_id)
+            except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
+                # Only park can select a new valid candidate over an
+                # unreadable current target. A new authoritative fact,
+                # if present, still has to match below or fail closed.
+                reviewed_state = state
+            target_meta = conn.execute(
+                select(composition_states_table.c.composer_meta).where(
+                    composition_states_table.c.id == str(target_id), composition_states_table.c.session_id == sid
+                )
+            ).scalar_one()
+            # Every stored gate envelope comes from a current writer, so
+            # damage is Tier-1 corruption. ``unwrap_state_column``
+            # raises AuditIntegrityError itself; ``parse_completion_gates``
+            # raises ValueError for a malformed envelope.
+            try:
+                prior = parse_completion_gates(self._unwrap_envelope(target_meta))
+            except ValueError as exc:
+                raise AuditIntegrityError("graph recovery target has malformed completion-gate metadata") from exc
+        # Fact corruption or custody loss is an integrity refusal, never
+        # silently treated as an absent review or a safe checkpoint.
+        review = self._graph_review_for_base_on_connection(
+            conn, session_id=session_id, state_id=target_id, read_state=lambda: reviewed_state
+        )
+        if review is not None:
+            review.validate_for_state(reviewed_state, prior=prior)
+            self._assert_graph_review_receipt(conn, review)
+            prior = review.gates
+        if prior is not None and prior.advisor_signoff is not None:
+            data = replace(data, composer_meta={"completion_gates": completion_gates_meta_from_facts(prior)})
+        return GraphRecoverySettlement(
+            session_id=session_id,
+            operation_id=operation_id,
+            intent=intent,
+            expected_state_id=expected_id,
+            expected_version=version,
+            target_state_id=target_id,
+            state_id=(expected_id if intent.action == "park" and expected_id is not None and not park_changes_head else uuid.uuid4()),
+            data=data,
+            park_id=uuid.uuid4() if intent.action == "park" else None,
+            empty_fallback=empty_fallback,
+            receipt_id=uuid.uuid4(),
+            malformed_head=context.malformed_head,
+        )
+
+    def require_continuation_graph_recovery_selection_on_connection(
+        self, conn: Connection, running: ComposerOperationRunning, projection: GraphRecoveryProjectionInput
+    ) -> None:
+        """Re-derive the original recovery selection before its terminal DML."""
+        from elspeth.web.sessions.continuation import load_snapshot
+        from elspeth.web.sessions.continuation_graph_recovery_projection import GraphRecoveryProjectionInput
+        from elspeth.web.sessions.continuation_semantic_advisor import require_semantic_owned_iteration_publication_on_connection
+
+        if type(projection) is not GraphRecoveryProjectionInput:
+            raise AuditIntegrityError("Continuation recovery requires its original source DATA")
+        selected = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+        if selected is None:
+            raise AuditIntegrityError("Continuation recovery lost its actual current checkpoint")
+        proof = require_semantic_owned_iteration_publication_on_connection(conn, running, selected=selected)
+        if (
+            proof is None
+            or proof.outcome_kind != "owned_recovery"
+            or proof.source_kind != "graph_recovery"
+            or proof.recovery_context is None
+        ):
+            raise AuditIntegrityError("Continuation recovery has no original recovery and paid Stop source")
+        original = replace(proof.returned.result, llm_calls=(*proof.returned.result.llm_calls, proof.admission.paid.audit_call))
+        if projection.original_result != original or projection.original_context != proof.recovery_context:
+            raise AuditIntegrityError("Continuation recovery substituted its original result or bootstrap context")
+        intent = proof.returned.result.graph_recovery_intent
+        actual = projection.recovery
+        if intent is None or actual.intent != intent:
+            raise AuditIntegrityError("Continuation recovery changed the provider's original control")
+        replay = self.prepare_graph_recovery_on_connection(
+            conn,
+            running.claim.session_id,
+            context=proof.recovery_context,
+            intent=intent,
+            session_operation_context=running.session_operation_context,
+            candidate_state=proof.returned.result.state,
+        )
+        if type(actual.receipt_id) is not UUID:
+            raise AuditIntegrityError("Continuation recovery requires its actual receipt identity")
+        if replay.park_id is None:
+            if actual.park_id is not None:
+                raise AuditIntegrityError("Continuation recovery invented a parked graph")
+        elif type(actual.park_id) is not UUID:
+            raise AuditIntegrityError("Continuation recovery lost its actual park identity")
+        elif (
+            conn.execute(
+                select(composition_graph_parks_table.c.id).where(composition_graph_parks_table.c.id == str(actual.park_id))
+            ).first()
+            is not None
+        ):
+            raise AuditIntegrityError("Continuation recovery reused an existing park identity")
+        if replay.state_id is None or replay.state_id == replay.expected_state_id:
+            if actual.state_id != replay.state_id:
+                raise AuditIntegrityError("Continuation recovery changed its deterministic state target")
+        elif type(actual.state_id) is not UUID:
+            raise AuditIntegrityError("Continuation recovery lost its new state identity")
+        elif (
+            conn.execute(select(composition_states_table.c.id).where(composition_states_table.c.id == str(actual.state_id))).first()
+            is not None
+        ):
+            raise AuditIntegrityError("Continuation recovery reused an existing state identity")
+        if conn.execute(select(chat_messages_table.c.id).where(chat_messages_table.c.id == str(actual.receipt_id))).first() is not None:
+            raise AuditIntegrityError("Continuation recovery reused an existing receipt identity")
+        comparable = replace(replay, receipt_id=actual.receipt_id, park_id=actual.park_id, state_id=actual.state_id)
+        if actual != comparable:
+            raise AuditIntegrityError("Continuation recovery changed its independently selected original target")
+
     async def prepare_graph_recovery(
         self,
         session_id: UUID,
@@ -7206,154 +7427,16 @@ class SessionServiceImpl:
         candidate_state: CompositionState | None = None,
     ) -> GraphRecoverySettlement:
         """Freeze a qualified target without reading the abandoned candidate."""
-        sid = str(session_id)
-        operation_id = session_operation_context.fence.operation_id
 
         def _sync() -> GraphRecoverySettlement:
             with self._engine.begin() as conn:
-                self._require_session_operation_context_on_connection(
+                return self.prepare_graph_recovery_on_connection(
                     conn,
-                    session_operation_context,
-                    session_id=sid,
-                    expected_kind=SessionOperationKind.COMPOSE,
-                    now=database_now(conn),
-                )
-                heads = conn.execute(
-                    select(
-                        composition_states_table.c.id, composition_states_table.c.version, composition_states_table.c.creator_operation_id
-                    )
-                    .where(composition_states_table.c.session_id == sid)
-                    .order_by(composition_states_table.c.version.desc())
-                ).all()
-                for row in heads:
-                    if row.version > context.turn_start_version and row.creator_operation_id != operation_id:
-                        raise StaleComposeStateError("Recovery cannot overwrite a checkpoint from another operation")
-                head = heads[0] if heads else None
-                expected_id = recovery_identity(head.id) if head is not None else None
-                version = head.version if head is not None else 0
-
-                def _refusal() -> GraphRecoverySettlement:
-                    return GraphRecoverySettlement(
-                        session_id=session_id,
-                        operation_id=operation_id,
-                        intent=intent,
-                        expected_state_id=expected_id,
-                        expected_version=version,
-                        target_state_id=None,
-                        state_id=None,
-                        data=None,
-                        park_id=None,
-                        empty_fallback=False,
-                        failure_reason="target_unavailable",
-                        receipt_id=uuid.uuid4(),
-                        malformed_head=context.malformed_head,
-                    )
-
-                target_id: UUID | None = None
-                state = None
-                park_changes_head = context.malformed_head
-                if intent.action == "park":
-                    target_id = expected_id
-                    if candidate_state is not None:
-                        try:
-                            candidate_data = checkpoint_data(candidate_state)
-                        except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
-                            return _refusal()
-                        state = candidate_state
-                        try:
-                            current_data = (
-                                checkpoint_data(read_editable_checkpoint(conn, session_id, expected_id))
-                                if expected_id is not None
-                                else checkpoint_data(empty_recovery_state())
-                            )
-                        except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
-                            park_changes_head = True
-                        else:
-                            park_changes_head = park_changes_head or candidate_data != current_data
-                elif intent.action == "reset_to_turn_start":
-                    target_id = UUID(context.turn_start_state_id) if context.turn_start_state_id is not None else None
-                elif intent.action == "restore_parked_graph":
-                    target = conn.execute(
-                        select(composition_graph_parks_table.c.state_id).where(
-                            composition_graph_parks_table.c.id == intent.park_id,
-                            composition_graph_parks_table.c.session_id == sid,
-                        )
-                    ).scalar_one_or_none()
-                    if target is None:
-                        return _refusal()
-                    target_id = UUID(target)
-                elif intent.action == "reset_to_safe_checkpoint":
-                    for row in heads:
-                        try:
-                            state = read_editable_checkpoint(conn, session_id, UUID(row.id))
-                        except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
-                            continue
-                        target_id = UUID(row.id)
-                        break
-                else:
-                    raise ValueError("Unknown graph recovery action")
-                if state is None and target_id is not None:
-                    try:
-                        state = read_editable_checkpoint(conn, session_id, target_id)
-                    except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
-                        return _refusal()
-                empty_fallback = state is None
-                if state is None:
-                    state = empty_recovery_state()
-                from elspeth.web.execution.completion_gates import completion_gates_meta_from_facts, parse_completion_gates
-
-                data = checkpoint_data(state)
-                prior = None
-                reviewed_state = state
-                if target_id is not None:
-                    # Graph eligibility remains independent of validation
-                    # decoding; the gate metadata below is not.
-                    try:
-                        reviewed_state = read_editable_checkpoint(conn, session_id, target_id)
-                    except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
-                        # Only park can select a new valid candidate over an
-                        # unreadable current target. A new authoritative fact,
-                        # if present, still has to match below or fail closed.
-                        reviewed_state = state
-                    target_meta = conn.execute(
-                        select(composition_states_table.c.composer_meta).where(
-                            composition_states_table.c.id == str(target_id), composition_states_table.c.session_id == sid
-                        )
-                    ).scalar_one()
-                    # Every stored gate envelope comes from a current writer, so
-                    # damage is Tier-1 corruption. ``unwrap_state_column``
-                    # raises AuditIntegrityError itself; ``parse_completion_gates``
-                    # raises ValueError for a malformed envelope.
-                    try:
-                        prior = parse_completion_gates(self._unwrap_envelope(target_meta))
-                    except ValueError as exc:
-                        raise AuditIntegrityError("graph recovery target has malformed completion-gate metadata") from exc
-                # Fact corruption or custody loss is an integrity refusal, never
-                # silently treated as an absent review or a safe checkpoint.
-                review = self._graph_review_for_base_on_connection(
-                    conn, session_id=session_id, state_id=target_id, read_state=lambda: reviewed_state
-                )
-                if review is not None:
-                    review.validate_for_state(reviewed_state, prior=prior)
-                    self._assert_graph_review_receipt(conn, review)
-                    prior = review.gates
-                if prior is not None and prior.advisor_signoff is not None:
-                    data = replace(data, composer_meta={"completion_gates": completion_gates_meta_from_facts(prior)})
-                return GraphRecoverySettlement(
-                    session_id=session_id,
-                    operation_id=operation_id,
+                    session_id,
+                    context=context,
                     intent=intent,
-                    expected_state_id=expected_id,
-                    expected_version=version,
-                    target_state_id=target_id,
-                    state_id=(
-                        expected_id if intent.action == "park" and expected_id is not None and not park_changes_head else uuid.uuid4()
-                    ),
-                    data=data,
-                    park_id=uuid.uuid4() if intent.action == "park" else None,
-                    empty_fallback=empty_fallback,
-                    receipt_id=uuid.uuid4(),
-                    malformed_head=context.malformed_head,
+                    session_operation_context=session_operation_context,
+                    candidate_state=candidate_state,
                 )
 
         return cast(GraphRecoverySettlement, await self._run_sync(_sync))
@@ -9714,25 +9797,9 @@ class SessionServiceImpl:
         receipt_id = recovery.receipt_id
         if receipt_id is None:
             raise AuditIntegrityError("Graph recovery receipt identity is missing")
-        if recovery.failure_reason is not None:
-            notice = (
-                "Graph recovery did not complete: the requested draft could not be preserved or restored. The current graph is unchanged."
-            )
-        elif recovery.intent.action == "park":
-            notice = f"Draft parked as {recovery.park_id}. The graph remains visible."
-        elif recovery.empty_fallback:
-            notice = (
-                "No eligible saved draft was available; an empty authoring workspace was opened. "
-                "Uploads and history remain. The abandoned working candidate was not captured."
-            )
-        else:
-            notice = (
-                f"Restored saved draft {recovery.target_state_id} as a new editable version. "
-                "Execution readiness and approvals require current checks. "
-                "The abandoned working candidate was not captured. Uploads and history remain."
-            )
-        if recovery.malformed_head:
-            notice += " The previous stored graph or its completion metadata could not be decoded; its historical row was preserved."
+        from elspeth.web.sessions.graph_recovery import graph_recovery_notice
+
+        notice = graph_recovery_notice(recovery)
         self._insert_chat_message(
             conn,
             session_id=sid,
@@ -9793,7 +9860,7 @@ class SessionServiceImpl:
         recovery: GraphRecoverySettlement | None = None,
         provider_audit_calls: tuple[ComposerLLMCall, ...] = (),
         publication_result: ComposerResult | None = None,
-        publication_projection: PublicationProjectionInput | None = None,
+        publication_projection: PublicationProjectionInput | GraphRecoveryProjectionInput | None = None,
     ) -> ComposerOperationRecord:
         """Publish final assistant/audit/snapshot/result in one exact COMPOSE transaction."""
         if (assistant is None) == (assistant_record is None):
@@ -9821,12 +9888,15 @@ class SessionServiceImpl:
             nonlocal attempted_response, frozen_created_at
             nonlocal attempted_message, attempted_audit_rows, attempted_proposals, attempted_state
             nonlocal frozen_audit_ids, frozen_provider_cohort
+            from elspeth.web.coordination.composer_operation_authority import graph_recovery_prior_read_scope
+
             with (
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
                 self._session_composer_mutation_transaction(
                     conn, session_id=sid, session_operation_context=context, expected_kind=SessionOperationKind.COMPOSE
                 ),
+                graph_recovery_prior_read_scope(conn),
             ):
                 now = database_now(conn)
                 if frozen_created_at is None:
@@ -9854,6 +9924,30 @@ class SessionServiceImpl:
                 terminal_review = self._validate_terminal_graph_review(
                     conn, running=running, drafts=complete_audit_cohort, audit_state_id=audit_composition_state_id
                 )
+                if publication_projection is not None:
+                    from elspeth.web.sessions.continuation_graph_recovery_projection import GraphRecoveryProjectionInput
+
+                    if type(publication_projection) is GraphRecoveryProjectionInput:
+                        if recovery != publication_projection.recovery:
+                            raise AuditIntegrityError("Continuation recovery projection changed its actual settlement")
+                        self.require_continuation_graph_recovery_selection_on_connection(conn, running, publication_projection)
+                recovery_prior_state = None
+                if (
+                    recovery is not None
+                    and recovery.failure_reason is None
+                    and recovery.intent.action == "park"
+                    and recovery.state_id is not None
+                    and recovery.state_id == recovery.expected_state_id
+                    and publication_projection is not None
+                ):
+                    from elspeth.web.coordination.composer_operation_authority import read_graph_recovery_prior_state_on_connection
+
+                    recovery_prior_state = read_graph_recovery_prior_state_on_connection(
+                        conn,
+                        running,
+                        service=self,
+                        recovery=recovery,
+                    )
                 recovery_state_id = (
                     self._settle_graph_recovery_on_connection(
                         conn,
@@ -9994,10 +10088,11 @@ class SessionServiceImpl:
                 projection_actor = None
                 if publication_projection is not None:
                     from elspeth.web.composer.protocol import ComposerResult
+                    from elspeth.web.sessions.continuation_graph_recovery_projection import GraphRecoveryProjectionInput
                     from elspeth.web.sessions.continuation_publication_projection import PublicationProjectionInput
 
                     if (
-                        type(publication_projection) is not PublicationProjectionInput
+                        type(publication_projection) not in (PublicationProjectionInput, GraphRecoveryProjectionInput)
                         or type(publication_result) is not ComposerResult
                         or current_job.actor_user_id is None
                     ):
@@ -10012,6 +10107,7 @@ class SessionServiceImpl:
                     publication_assistant=message if publication_projection is not None else None,
                     publication_service=self if publication_projection is not None else None,
                     publication_actor=projection_actor,
+                    recovery_prior_state=recovery_prior_state,
                 )
             # Telemetry is after commit and cannot change the stored terminal.
             for draft in active_drafts:

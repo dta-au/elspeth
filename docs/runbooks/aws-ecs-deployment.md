@@ -1640,7 +1640,7 @@ approvals, not invented evidence:
   "rollback_doctor_task_definition": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 80, "landscape_epoch": 50, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 82, "landscape_epoch": 50, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
@@ -1670,13 +1670,18 @@ v2 records/receipts do not satisfy the current v3 contract.
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 80, Landscape epoch 50 and `run_web_plugin_policy` presence,
+session epoch 82, Landscape epoch 50 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
 any later deployment action. Existing-store transitions are unsupported and
 must stop without mutation; do not uninstall or recreate a predecessor store
 to convert it into a fresh-store claim.
+Epoch 82 makes the admitted continuation policy version, hash and retained-payload
+allowance immutable in the parent operation. Existing epoch-81 stores remain
+unchanged and refused, without automatic upgrade. V1/V2 policy creation/resume
+is supported within a compatible epoch-82 store, not an old epoch-81 database.
+This repair does not activate V3 admission or change the application policy default.
 Unknown or unapproved compatibility is NO-GO; expiry or identity drift is also NO-GO.
 
 Before either schema initializer runs, create and prove the required EFS

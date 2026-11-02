@@ -71,7 +71,7 @@ package version do not establish combined-release qualification or publication.
   lifecycle and lifecycle negotiation are removed: the client sends no
   `Composer-Operation-Version` header, and operation records, stream frames
   and the status endpoint carry no lifecycle or protocol version. The
-  Sessions schema moves to epoch 80 and needs fresh Sessions stores, and open
+  Sessions schema moves to epoch 82 and needs fresh Sessions stores, and open
   browser tabs must be reloaded after deploying (see Upgrade notes).
 - **Full replacements support provider-authored named and plural attachment
   roots.** `set_pipeline` accepts `blob_id` or ordered `blob_ids` on its default
@@ -235,14 +235,18 @@ package version do not establish combined-release qualification or publication.
 
 ### Upgrade notes
 
-**Session epoch advances from 78 to 80 (hard cut).** Epoch 79 existed only on
-pre-release 0.8.10 builds. Epoch 80 adds Continuation's tables for the single
-Composer lifecycle and terminal-run database checks, removes `PLANNER` from the
-provider-family set, and drops `sessions_cleanup_claims` and
-`composition_states.source`. An existing epoch-78 Sessions store is refused,
-not migrated, and so is a pre-release epoch-79 store. Deploy 0.8.10 against a
-fresh Sessions store on ECS, ACA and the dev box, and leave the epoch-78
-database in place. Landscape epoch 50 remains unchanged. The AWS ECS and Azure Container Apps fresh-store procedures
+**Session epoch advances from 78 to 82 (hard cut).** Epoch 79 existed only on
+pre-release 0.8.10 builds. Epoch 80 added Continuation's tables for the single
+Composer lifecycle and terminal-run database checks, removed `PLANNER` from the
+provider-family set, and dropped `sessions_cleanup_claims` and
+`composition_states.source`. Epoch 82 makes the admitted continuation policy
+version, hash and retained-payload allowance immutable in the parent operation.
+Existing epoch-78 through epoch-81 Sessions stores are preserved unchanged and
+refused, without automatic upgrade or migration. Deploy 0.8.10 against a fresh
+Sessions store on ECS, ACA and the dev box. V1/V2 policy creation and resume
+remain supported within a compatible epoch-82 store; old epoch-81 databases
+cannot resume under this code. This integrity repair does not activate V3
+admission or change its application default. Landscape epoch 50 remains unchanged. The AWS ECS and Azure Container Apps fresh-store procedures
 are in
 [docs/release/0.8.10-upgrade-notes-draft.md](docs/release/0.8.10-upgrade-notes-draft.md).
 

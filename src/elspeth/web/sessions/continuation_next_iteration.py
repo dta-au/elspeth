@@ -24,16 +24,20 @@ from typing import TYPE_CHECKING, Literal
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer._compose_loop_carriers import _ClassifyOutcome
 from elspeth.web.composer.continuation_classifier_handoff import ClassifyPostPrimary, ClassifySourceProofStop
+from elspeth.web.composer.continuation_classifier_owned_source import ClassifyReplyRefusalReady
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_iteration_transitions import IterationTransition, applied_batch_cut, retain_iteration_transition
 from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.continuation_semantic_advisor_return import (
+    ObservedClassification,
+    ObservedClassifierReplyDeadline,
     capture_original_classification_pending,
     complete_continuation_iteration_return,
     observe_continuation_classifier_end,
     observe_continuation_classifier_end_input,
+    observe_continuation_classifier_reply_refusal,
     observe_continuation_iteration_classification,
     observe_continuation_iteration_early,
     refresh_original_classification_source,
@@ -44,7 +48,9 @@ from elspeth.web.sessions.continuation_iteration_return import (
     IterationPendingEndData,
     IterationStageData,
     begin_iteration_paid_stage,
+    begin_iteration_reply_refusal,
     read_iteration_pending_end,
+    read_iteration_reply_refusal,
     retain_iteration_early_completed,
     retain_iteration_pending_end,
     retain_iteration_prepared,
@@ -103,7 +109,7 @@ async def advance_continuation_iteration(
     selected: SelectedContinuationState,
     *,
     iteration_stage: IterationStageData | None = None,
-) -> ComposerOperationRecord | None:
+) -> ComposerOperationRecord | ObservedClassifierReplyDeadline | None:
     from elspeth.web.composer.service import _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE, _record_advisor_repair_mutations
 
     applied_batch_cut(selected.stack.frames)
@@ -189,10 +195,16 @@ async def advance_continuation_iteration(
             )
         )
         return None
-    if iteration_stage.stage not in ("early_ready", "classify_ready", "end_ready"):
+    if iteration_stage.stage not in ("early_ready", "classify_ready", "end_ready", "reply_refusal_ready"):
         raise AuditIntegrityError("post-batch paid stage cannot replay a dispatched or completed owner")
-    stage: Literal["early", "classify", "end"] = (
-        "early" if iteration_stage.stage == "early_ready" else "end" if iteration_stage.stage == "end_ready" else "classify"
+    stage: Literal["early", "classify", "end", "reply_refusal"] = (
+        "early"
+        if iteration_stage.stage == "early_ready"
+        else "end"
+        if iteration_stage.stage == "end_ready"
+        else "reply_refusal"
+        if iteration_stage.stage == "reply_refusal_ready"
+        else "classify"
     )
     end_input = None
     if stage == "end":
@@ -217,17 +229,28 @@ async def advance_continuation_iteration(
             persist=persist,
             primary_response=ready_input.primary_response,
         )
-    stored = await retain(
-        partial(
-            begin_iteration_paid_stage,
-            phases.authority,
-            running,
-            selected=selected,
-            inventory=runtime.materialization.inventory,
-            stage=stage,
-            end_input=end_input,
+    if stage == "reply_refusal":
+        stored = await retain(
+            partial(
+                begin_iteration_reply_refusal,
+                phases.authority,
+                running,
+                selected=selected,
+                inventory=runtime.materialization.inventory,
+            )
         )
-    )
+    else:
+        stored = await retain(
+            partial(
+                begin_iteration_paid_stage,
+                phases.authority,
+                running,
+                selected=selected,
+                inventory=runtime.materialization.inventory,
+                stage=stage,
+                end_input=end_input,
+            )
+        )
     current = await load_selected_continuation(authority=phases.authority, running=running, selected=stored, required_work=phases.work)
     phase_read = await phases._current_phase_read(current)
     if phase_read.finish_read is None:
@@ -261,7 +284,25 @@ async def advance_continuation_iteration(
         for elision_index in sorted(live.pending_advisor_elision_indices, reverse=True):
             del live.llm_messages[elision_index]
         live.pending_advisor_elision_indices = []
-    if stage == "end":
+    observed: ObservedClassification | ObservedClassifierReplyDeadline
+    if stage == "reply_refusal":
+        refusal_pending = await _registered(
+            work=phases.work,
+            source=RequiredWorkSource.CONTINUATION_READ_SQL,
+            operation=partial(
+                read_iteration_reply_refusal, phases.authority, running, selected=current, inventory=runtime.materialization.inventory
+            ),
+            expected=ClassifyReplyRefusalReady,
+        )
+        observed = await observe_continuation_classifier_reply_refusal(
+            phases,
+            runtime,
+            selected=current,
+            pending=refusal_pending,
+            dispatch=dispatch,
+            persist=persist,
+        )
+    elif stage == "end":
         pending_source = await _registered(
             work=phases.work,
             source=RequiredWorkSource.CONTINUATION_READ_SQL,
@@ -278,11 +319,14 @@ async def advance_continuation_iteration(
             dispatch=dispatch,
             persist=persist,
             primary_response=pending_source.primary_response,
+            owned_source_json=pending_source.owned_source_json,
         )
     else:
         observed = await observe_continuation_iteration_classification(
             phases, runtime, selected=current, dispatch=dispatch, persist=persist
         )
+    if isinstance(observed, ObservedClassifierReplyDeadline):
+        return observed
     classify = observed.outcome
     if isinstance(classify, (ClassifyPostPrimary, ClassifySourceProofStop)):
         captured, current = await capture_original_classification_pending(observed, phases, runtime)

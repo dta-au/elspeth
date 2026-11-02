@@ -310,6 +310,165 @@ def install_sdk(monkeypatch: pytest.MonkeyPatch, sdk: Callable[..., Any]) -> Non
     monkeypatch.setattr(litellm, "acompletion", sdk)
 
 
+def observe_original_driver_failures(monkeypatch: pytest.MonkeyPatch, operation_id: str, *, session_id: UUID) -> list[dict[str, Any]]:
+    """Observe original worker failures without changing dispatch or logging payloads.
+
+    Retained private failure facts omit traceback locations. Tests print this
+    bounded metadata only after an unexpected public failure, while the exact
+    original exception still flows through the real driver and settlement.
+    """
+    from hashlib import sha256
+    from time import monotonic, perf_counter
+    from traceback import extract_tb
+
+    from elspeth.web.sessions.continuation_driver import _SegmentDriver
+
+    observations: list[dict[str, Any]] = []
+    original_advance, original_settle = _SegmentDriver.advance, _SegmentDriver.settle
+
+    project_root = Path(__file__).resolve().parents[2]
+
+    def exception_data(error: BaseException, depth: int = 0) -> dict[str, Any]:
+        first = error.args[0] if error.args and type(error.args[0]) is str else None
+        line = first.splitlines()[0] if first else ""
+        # An exception may contain provider words or tool arguments. Preserve
+        # a matching digest/length and print only a small fixed vocabulary.
+        safe_line = line if line in {"", "cancelled", "deadline expired", "operation cancelled"} else "[redacted]"
+        frames = []
+        for frame in extract_tb(error.__traceback__)[-16:]:
+            filename = Path(frame.filename)
+            safe_path = filename.relative_to(project_root).as_posix() if filename.is_relative_to(project_root) else filename.name
+            frames.append((safe_path, frame.name, frame.lineno))
+        data: dict[str, Any] = {
+            "type": type(error).__name__,
+            "first_line": safe_line,
+            "line_length": len(line),
+            "line_sha256": sha256(line.encode("utf-8", errors="replace")).hexdigest(),
+            "frames": tuple(frames),
+        }
+        if isinstance(error, BaseExceptionGroup):
+            data["members"] = tuple(exception_data(member, depth + 1) for member in error.exceptions[:8]) if depth < 2 else ("depth_limit",)
+        return data
+
+    def action_kind(driver: _SegmentDriver, clock: Any) -> str | None:
+        if clock is None:
+            return None
+        policy = driver.sql_deadline.policy.actions
+        return next(
+            (
+                name
+                for candidate, name in (
+                    (policy.primary, "primary"),
+                    (policy.advisor, "advisor"),
+                    (policy.title, "title"),
+                    (policy.read, "read"),
+                    (policy.session_sql, "session_sql"),
+                    (policy.blob, "blob"),
+                    (policy.external, "external"),
+                )
+                if clock.policy is candidate
+            ),
+            "unmapped",
+        )
+
+    async def advance(driver: _SegmentDriver, stored: Any, selected: Any) -> Any:
+        if driver.running.claim.operation_id != operation_id or driver.running.claim.session_id != session_id:
+            return await original_advance(driver, stored, selected)
+        claim = driver.running.claim
+        started = perf_counter()
+        before_ordinal = driver._action_ordinal
+        bound_clock = driver._action_clock
+        task = asyncio.current_task()
+        source: dict[str, Any] = {"boundary": "advance", "event": "entry", "cursor": stored.cursor}
+        try:
+            frame = selected.stack.frames[-1]
+            source.update(
+                {
+                    "frame": frame.model_dump(include={"frame_kind", "phase", "ingress_phase"}),
+                    "segment": claim.segment_sequence,
+                    "generation": claim.ownership_generation,
+                    "attempt": claim.attempt,
+                    "action_ordinal_before": before_ordinal,
+                    "action_kind": action_kind(driver, bound_clock),
+                    "driver_id": id(driver),
+                    "task_id": None if task is None else id(task),
+                    "perf_counter": started,
+                }
+            )
+        except Exception:
+            source["frame"] = "observation_unavailable"
+        observations.append(source)
+        original_error: BaseException | None = None
+        try:
+            return await original_advance(driver, stored, selected)
+        except BaseException as error:
+            original_error = error
+            raise
+        finally:
+            # Observation must never replace a real worker result or error.
+            try:
+                now = monotonic()
+                runtime = driver.phases.runtime
+                exit_task = asyncio.current_task()
+                exit_row: dict[str, Any] = {
+                    "boundary": "advance",
+                    "event": "exit",
+                    "cursor": stored.cursor,
+                    "frame": source["frame"],
+                    "segment": claim.segment_sequence,
+                    "generation": claim.ownership_generation,
+                    "attempt": claim.attempt,
+                    "action_ordinal_after": driver._action_ordinal,
+                    "action_kind": action_kind(driver, bound_clock),
+                    "clock_identity_changed": driver._action_clock is not bound_clock,
+                    "driver_id": id(driver),
+                    "task_id": None if exit_task is None else id(exit_task),
+                    "action_total": None if bound_clock is None else bound_clock.policy.total,
+                    "action_preparation": None if bound_clock is None else bound_clock.policy.preparation,
+                    "remaining_preparation": None if bound_clock is None else bound_clock.preparation_deadline_monotonic - now,
+                    "remaining_clock_loop": None if bound_clock is None else bound_clock.deadline - asyncio.get_running_loop().time(),
+                    "elapsed_seconds": perf_counter() - started,
+                    "remaining_action": driver.sql_deadline.remaining_action(monotonic_now=now),
+                    "remaining_dispatch": driver.sql_deadline.remaining_dispatch(monotonic_now=now),
+                    "hard_remaining": driver.sql_deadline.hard_expires_at - now,
+                    "loop_remaining": None if runtime is None else runtime.bindings.deadline - asyncio.get_running_loop().time(),
+                    "drain_started": driver.sql_deadline.drain_signal.started_at is not None,
+                    "cancellation_requested": driver.phases.cancellation_requested.is_set(),
+                    "task_cancelling": None if exit_task is None else exit_task.cancelling(),
+                }
+                if original_error is not None:
+                    exit_row["original"] = exception_data(original_error)
+                observations.append(exit_row)
+            except Exception:
+                observations.append({"boundary": "advance", "event": "observation_unavailable", "cursor": stored.cursor})
+
+    async def settle(driver: _SegmentDriver, record: Any, original: BaseException | None = None, *, expired_failure: Any = None) -> Any:
+        if driver.running.claim.operation_id == operation_id and driver.running.claim.session_id == session_id:
+            try:
+                task = asyncio.current_task()
+                observations.append(
+                    {
+                        "boundary": "settle",
+                        "cursor": record.journal_cursor,
+                        "segment": driver.running.claim.segment_sequence,
+                        "generation": driver.running.claim.ownership_generation,
+                        "attempt": driver.running.claim.attempt,
+                        "driver_id": id(driver),
+                        "task_id": None if task is None else id(task),
+                        "task_cancelling": None if task is None else task.cancelling(),
+                        "original": None if original is None else exception_data(original),
+                        "expired_failure_code": None if expired_failure is None else expired_failure.failure_code,
+                    }
+                )
+            except Exception:
+                observations.append({"boundary": "settle", "event": "observation_unavailable"})
+        return await original_settle(driver, record, original, expired_failure=expired_failure)
+
+    monkeypatch.setattr(_SegmentDriver, "advance", advance)
+    monkeypatch.setattr(_SegmentDriver, "settle", settle)
+    return observations
+
+
 async def settle(
     harness: ContinuationApp, *, operation_id: str, client: httpx.AsyncClient | None = None, rounds: int = 240
 ) -> ComposerOperationSnapshot:

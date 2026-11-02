@@ -643,6 +643,15 @@ class ContinuationLivePhases:
             top = captured.stack.frames[-1]
             if type(top) is not ToolBatchFrame:
                 raise AuditIntegrityError("prepared tool capture changed its actual frame family")
+            if call.tool_name in ("read_attachment", "get_blob_content"):
+                # Retain this actual prepared SDK/audit graph before entering
+                # the attachment owner. No semantic Read grant is manufactured.
+                await self._retain(captured, inventory, "attachment_prepared")
+                self._bind_retained_attachment_audit()
+                if self.runtime is None:
+                    raise AuditIntegrityError("attachment preparation lost its actual runtime")
+                await self._advance_attachment(self.runtime.source.selected, context=context)
+                return
             root = captured.stack.model_copy(
                 update={
                     "frames": (*captured.stack.frames[:-1], top.model_copy(update={"phase": "effect_reconciling"})),
@@ -732,6 +741,149 @@ class ContinuationLivePhases:
             inventory,
             "tool_completed" if preparation == "prepared" else "tool_preparation_completed",
         )
+
+    async def _resume_attachment(self, selected: SelectedContinuationState, *, unissued: bool) -> None:
+        previous = self.business_stage
+        if previous is not None and (previous.task is None or not previous.task.done() or not previous.observed):
+            raise AuditIntegrityError("attachment resume cannot replace its retained physical stage")
+        operation = self._reprepare_attachment(selected) if unissued else self._advance_attachment(selected)
+        self.business_stage = stage = self.lease.create_continuation_stage(operation, name="continuation-attachment")
+        await self.lease.join_continuation_stage(stage)
+
+    async def _reprepare_attachment(self, selected: SelectedContinuationState) -> None:
+        """Fresh preparation after the current SQL reader proves no read issued."""
+        from elspeth.web.composer.continuation_batch_data import RestoredPreparedBatchData
+        from elspeth.web.sessions.continuation_attachment_preparation import read_unissued_attachment_preparation_on_connection
+
+        runtime, inventory = await self.current(selected)
+
+        def read_preparation() -> RestoredPreparedBatchData:
+            with locked_session_transaction(self.authority._engine, str(inventory.running.claim.session_id)) as conn:
+                return read_unissued_attachment_preparation_on_connection(conn, inventory.running, selected=selected, inventory=inventory)
+
+        await _registered_read(self.work, RestoredPreparedBatchData, read_preparation)
+        data = runtime.graph.batch
+        if data is None or data.batch.current_call is None:
+            raise AuditIntegrityError("attachment repreparation lost its original prepared graph")
+        call = data.batch.current_call
+        if call.tool_name not in ("read_attachment", "get_blob_content"):
+            raise AuditIntegrityError("attachment repreparation changed its original tool domain")
+        primary = await self._primary_for_phase(runtime, inventory, selected)
+        context = await self._tool_context(runtime)
+        preparation = await _prepare_continuation_call_live(
+            call_model=primary.outcome, ctx=context, llm_messages=runtime.live.llm_messages, batch=data.batch, call=call
+        )
+        if preparation != "prepared" or call.audit is None:
+            raise AuditIntegrityError("attachment repreparation did not produce its exact fresh audit owner")
+        self.runtime = runtime = replace(
+            runtime,
+            graph=runtime.graph.with_selected_dispatch(
+                capture_dispatch_audit(call.audit, env_ref_names=inventory.names), context.tool_contract_dialect
+            ),
+        )
+        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+        await self._retain(captured, inventory, "attachment_reprepared")
+        self._bind_retained_attachment_audit()
+        if self.runtime is None:
+            raise AuditIntegrityError("attachment repreparation lost its current runtime")
+        await self._advance_attachment(self.runtime.source.selected, context=context)
+
+    def _bind_retained_attachment_audit(self) -> None:
+        """Use the exact retained portable DATA without replacing live owners."""
+        runtime = self.runtime
+        if runtime is None:
+            raise AuditIntegrityError("attachment preparation lost its current runtime")
+        selected = runtime.source.selected
+        frame = selected.stack.frames[-1]
+        source = runtime.source.admitted_evidence.graph
+        if (
+            type(frame) is not ToolBatchFrame
+            or frame.phase != "tool_ready"
+            or frame.accumulator.codec != "composer.tool-batch.v1"
+            or selected.stack.pending_owner_results
+            or source is None
+            or source.selected_audit is None
+            or source.selected_dialect is None
+        ):
+            raise AuditIntegrityError("attachment preparation lost its authenticated retained audit DATA")
+        # Capture sampled elapsed time when it encoded this preparation. The
+        # warm graph still owns the earlier sample; only these portable fields
+        # adopt the exact current SQL value. The original live timer stays put.
+        self.runtime = replace(runtime, graph=runtime.graph.with_selected_dispatch(source.selected_audit, source.selected_dialect))
+
+    async def _advance_attachment(self, selected: SelectedContinuationState, *, context: ToolBatchContext | None = None) -> None:
+        """Use the actual retained read owner and apply its original B2 suffix."""
+        from elspeth.web.composer.continuation_attachment_application_driver import apply_current_attachment_runtime
+        from elspeth.web.composer.continuation_attachment_result import apply_attachment_history, run_attachment_result
+
+        runtime, inventory = await self.current(selected)
+        frame = selected.stack.frames[-1]
+        if type(frame) is not ToolBatchFrame or frame.accumulator.codec != "composer.tool-batch.v1":
+            raise AuditIntegrityError("attachment phase lost its actual prepared/result cut")
+        data = runtime.graph.batch
+        if data is None or data.batch.current_call is None:
+            raise AuditIntegrityError("attachment phase lost its actual original prepared call")
+        call = data.batch.current_call
+        if frame.phase == "tool_ready":
+            # Only an actual live preparation can start a new read. Cold DATA
+            # first requires current source admission and fresh preparation.
+            if context is None or call.audit is None:
+                raise AuditIntegrityError("attachment read requires its original live preparation owner")
+            stored = await run_attachment_result(
+                service=self.service,
+                authority=self.authority,
+                selected=selected,
+                inventory=inventory,
+                required_work=self.work,
+                audit=call.audit,
+            )
+            self.latest_snapshot = stored
+            selected = await load_selected_continuation(
+                authority=self.authority, running=inventory.running, selected=stored, required_work=self.work
+            )
+            runtime, inventory = await self.current(selected)
+            frame = selected.stack.frames[-1]
+        if type(frame) is ToolBatchFrame and frame.phase == "effect_reconciling":
+            # This reader accepts only an actually committed retained result;
+            # an interrupted physical read cannot be redispatched here.
+            stored = await apply_attachment_history(
+                authority=self.authority, selected=selected, inventory=inventory, required_work=self.work
+            )
+            self.latest_snapshot = stored
+            selected = await load_selected_continuation(
+                authority=self.authority, running=inventory.running, selected=stored, required_work=self.work
+            )
+            runtime, inventory = await self.current(selected)
+            frame = selected.stack.frames[-1]
+        if type(frame) is not ToolBatchFrame or frame.phase != "result_retained":
+            raise AuditIntegrityError("attachment application requires its actual retained history")
+        primary = await self._primary_for_phase(runtime, inventory, selected)
+        if context is None:
+            context = await self._tool_context(runtime)
+        applied = await apply_current_attachment_runtime(
+            runtime=runtime,
+            selected=selected,
+            inventory=inventory,
+            ctx=context,
+            call_model=primary.outcome,
+            effect_key=f"attachment:{frame.response.digest}:{frame.next_tool_index}",
+        )
+        self.latest_snapshot = applied.snapshot
+        data = runtime.graph.batch
+        if data is None:
+            raise AuditIntegrityError("attachment application lost its actual completed batch")
+        batch, live = data.batch, runtime.live
+        live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used = (
+            batch.state,
+            batch.last_validation,
+            batch.last_runtime_preflight,
+            batch.advisor_calls_used,
+        )
+        self.runtime = replace(runtime, graph=runtime.graph.without_selected_dispatch())
+        following = await load_selected_continuation(
+            authority=self.authority, running=inventory.running, selected=applied.snapshot, required_work=self.work
+        )
+        await self.current(following)
 
     async def _persist_batch(self, selected: SelectedContinuationState) -> None:
         terminal = self.terminal_completion
@@ -891,6 +1043,23 @@ class ContinuationLivePhases:
             return
         if phase_read is not None:
             raise AuditIntegrityError("live phase handoff belongs only to its retained PRIMARY response")
+        if type(top) is ToolBatchFrame and top.phase == "tool_ready" and top.accumulator.codec == "composer.tool-batch.v1":
+            await self._resume_attachment(selected, unissued=True)
+            return
+        if (
+            type(top) is ToolBatchFrame
+            and top.accumulator.codec == "composer.tool-batch.v1"
+            and (
+                top.phase == "result_retained"
+                or (
+                    top.phase == "effect_reconciling"
+                    and len(selected.stack.pending_owner_results) == 1
+                    and selected.stack.pending_owner_results[0].kind == "read"
+                )
+            )
+        ):
+            await self._resume_attachment(selected, unissued=False)
+            return
         if type(top) is ToolBatchFrame and top.phase == "tool_ready":
             runtime, _inventory = await self.current(selected)
             if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "call_ready":

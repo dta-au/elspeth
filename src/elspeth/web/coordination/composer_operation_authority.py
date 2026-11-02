@@ -7,14 +7,16 @@ reads omit request bodies and every cross-session discovery has a hard limit.
 from __future__ import annotations
 
 import secrets
-from contextlib import nullcontext
-from dataclasses import replace
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast, final
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import JsonValue, ValidationError
 from sqlalchemy import Connection, Engine, Row, and_, false, func, insert, or_, select, update
+from sqlalchemy.engine import RootTransaction
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -90,6 +92,7 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.locking import continuation_connection_deadline_scope, locked_session_transaction, session_data_read_transaction
 from elspeth.web.sessions.models import (
     chat_messages_table,
+    composition_graph_parks_table,
     composition_states_table,
     sessions_table,
     web_instances_table,
@@ -133,6 +136,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_attachment_application import StoredAttachmentApplication
     from elspeth.web.sessions.continuation_attachment_result import AttachmentEffectPreparation, AttachmentResultCheckpoint
     from elspeth.web.sessions.continuation_composition_initialization import CurrentCompositionInitializationSource
+    from elspeth.web.sessions.continuation_graph_recovery_projection import GraphRecoveryProjectionInput
     from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result
     from elspeth.web.sessions.continuation_p4_application_store import (
         StoredP4Application,
@@ -144,7 +148,8 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
     from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
     from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
-    from elspeth.web.sessions.protocol import ChatMessageRecord
+    from elspeth.web.sessions.graph_recovery import GraphRecoverySettlement
+    from elspeth.web.sessions.protocol import ChatMessageRecord, CompositionStateRecord
     from elspeth.web.sessions.service import SessionServiceImpl
 
 
@@ -2061,6 +2066,106 @@ def require_composer_settlement_actor_on_connection(
         raise AuditIntegrityError("composer settlement actor does not match running user")
 
 
+@dataclass(frozen=True, slots=True)
+class _GraphRecoveryPriorRead:
+    transaction: RootTransaction
+    running: ComposerOperationRunning
+    running_snapshot: ComposerOperationRunning
+    state: CompositionStateRecord
+    state_snapshot: CompositionStateRecord
+
+
+_GRAPH_RECOVERY_PRIOR_READ = "elspeth.graph_recovery_prior_read"
+
+
+@contextmanager
+def graph_recovery_prior_read_scope(conn: Connection) -> Iterator[None]:
+    """Keep a prior-row observation within one terminal attempt only."""
+    conn.info.pop(_GRAPH_RECOVERY_PRIOR_READ, None)
+    try:
+        yield
+    finally:
+        conn.info.pop(_GRAPH_RECOVERY_PRIOR_READ, None)
+
+
+def _require_graph_recovery_prior_read(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    prior: CompositionStateRecord | None,
+) -> None:
+    """Consume only this terminal transaction's actual SQL observation."""
+    prior_read = conn.info.pop(_GRAPH_RECOVERY_PRIOR_READ, None)
+    if (
+        type(prior_read) is not _GraphRecoveryPriorRead
+        or prior_read.transaction is not conn.get_transaction()
+        or prior_read.running is not running
+        or prior_read.running_snapshot != running
+        or prior_read.state is not prior
+        or prior_read.state_snapshot != prior
+    ):
+        raise AuditIntegrityError("graph recovery park lost its actual pre-DML transaction read")
+
+
+def read_graph_recovery_prior_state_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    service: SessionServiceImpl,
+    recovery: GraphRecoverySettlement,
+) -> CompositionStateRecord | None:
+    """Read retained park state on the terminal connection before any writes."""
+    from elspeth.web.sessions.content_publication import read_content_publication
+    from elspeth.web.sessions.graph_recovery import GraphRecoverySettlement
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    conn.info.pop(_GRAPH_RECOVERY_PRIOR_READ, None)
+    if type(service) is not SessionServiceImpl or type(recovery) is not GraphRecoverySettlement:
+        raise AuditIntegrityError("graph recovery prior state requires its actual terminal source")
+    if recovery.intent.action != "park" or recovery.state_id is None or recovery.state_id != recovery.expected_state_id:
+        return None
+    if recovery.session_id != running.claim.session_id or recovery.operation_id != running.session_operation_context.fence.operation_id:
+        raise AuditIntegrityError("graph recovery prior state changed its original operation")
+    if recovery.receipt_id is None or recovery.park_id is None:
+        raise AuditIntegrityError("graph recovery prior state lost its planned receipt or bookmark")
+    if (
+        conn.execute(
+            select(chat_messages_table.c.id).where(
+                chat_messages_table.c.id.in_((str(recovery.receipt_id), str(uuid5(recovery.receipt_id, "audit"))))
+            )
+        ).first()
+        is not None
+        or conn.execute(
+            select(composition_graph_parks_table.c.id).where(composition_graph_parks_table.c.id == str(recovery.park_id))
+        ).first()
+        is not None
+    ):
+        raise AuditIntegrityError("graph recovery prior state was read after its terminal writes")
+    row = conn.execute(
+        select(composition_states_table)
+        .where(composition_states_table.c.session_id == str(running.claim.session_id))
+        .order_by(composition_states_table.c.version.desc())
+        .limit(1)
+    ).one_or_none()
+    if row is None:
+        raise AuditIntegrityError("graph recovery park lost its original state before settlement")
+    prior = service._row_to_state_record(row)
+    if prior.id != recovery.expected_state_id or prior.version != recovery.expected_version:
+        raise AuditIntegrityError("graph recovery park changed its original head before settlement")
+    read_content_publication(prior)
+    transaction = conn.get_transaction()
+    if transaction is None:
+        raise AuditIntegrityError("graph recovery prior state lost its actual transaction")
+    running_snapshot = replace(
+        running,
+        claim=replace(running.claim),
+        session_operation_context=replace(running.session_operation_context, fence=replace(running.session_operation_context.fence)),
+    )
+    conn.info[_GRAPH_RECOVERY_PRIOR_READ] = _GraphRecoveryPriorRead(
+        transaction, running, running_snapshot, prior, state_record_from_row(row)
+    )
+    return prior
+
+
 def settle_composer_operation_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
@@ -2070,10 +2175,11 @@ def settle_composer_operation_on_connection(
     prepared_settlement: PreparedSegmentSettlement | None = None,
     terminal_recorded_at: datetime | None = None,
     publication_result: ComposerResult | None = None,
-    publication_projection: PublicationProjectionInput | None = None,
+    publication_projection: PublicationProjectionInput | GraphRecoveryProjectionInput | None = None,
     publication_assistant: ChatMessageRecord | None = None,
     publication_service: SessionServiceImpl | None = None,
     publication_actor: str | None = None,
+    recovery_prior_state: CompositionStateRecord | None = None,
 ) -> ComposerOperationRecord:
     """Sealed terminal CAS. Failed results cannot authorize business mutations."""
     from elspeth.web.sessions.continuation import settle_continuation_on_connection
@@ -2085,25 +2191,42 @@ def settle_composer_operation_on_connection(
         outcome = _select_failure_on_connection(current, outcome, authoritative_failure=authoritative_failure)
     if isinstance(outcome, MessageWithStateResponse):
         from elspeth.web.composer.protocol import ComposerResult
+        from elspeth.web.sessions.continuation_graph_recovery_projection import (
+            GraphRecoveryProjectionInput,
+            require_graph_recovery_postconditions_on_connection,
+        )
         from elspeth.web.sessions.continuation_publication_projection import (
             PublicationProjectionInput,
             require_publication_projection_on_connection,
         )
         from elspeth.web.sessions.continuation_semantic_actions import require_semantic_publication_on_connection
-        from elspeth.web.sessions.continuation_semantic_advisor import require_semantic_iteration_publication_on_connection
+        from elspeth.web.sessions.continuation_semantic_advisor import (
+            require_semantic_iteration_publication_on_connection,
+            require_semantic_owned_iteration_publication_on_connection,
+        )
         from elspeth.web.sessions.protocol import ChatMessageRecord
         from elspeth.web.sessions.routes._helpers import _message_response, composer_turn_end_assistant_row
         from elspeth.web.sessions.service import SessionServiceImpl
 
         selected = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
-        iteration_proof = require_semantic_iteration_publication_on_connection(conn, running, selected=selected)
-        review_proof = require_semantic_publication_on_connection(conn, running, selected=selected) if iteration_proof is None else None
-        if publication_projection is not None and iteration_proof is None and review_proof is None:
+        owned_proof = require_semantic_owned_iteration_publication_on_connection(conn, running, selected=selected)
+        iteration_proof = (
+            require_semantic_iteration_publication_on_connection(conn, running, selected=selected) if owned_proof is None else None
+        )
+        review_proof = (
+            require_semantic_publication_on_connection(conn, running, selected=selected)
+            if owned_proof is None and iteration_proof is None
+            else None
+        )
+        if publication_projection is not None and owned_proof is None and iteration_proof is None and review_proof is None:
             raise AuditIntegrityError("publication projection lacks the original paid whole-request Stop")
-        if iteration_proof is not None or review_proof is not None:
+        if owned_proof is not None or iteration_proof is not None or review_proof is not None:
             if type(publication_result) is not ComposerResult:
                 raise AuditIntegrityError("semantic publication lost its actual shared finalizer result")
-            if iteration_proof is not None:
+            if owned_proof is not None:
+                original = owned_proof.returned.result
+                audit_call = owned_proof.admission.paid.audit_call
+            elif iteration_proof is not None:
                 original = iteration_proof.returned.result
                 audit_call = iteration_proof.admission.paid.audit_call
             else:
@@ -2112,6 +2235,8 @@ def settle_composer_operation_on_connection(
                 original = review_proof.review_result.result
                 audit_call = review_proof.admission.paid.audit_call
             expected = replace(original, llm_calls=(*original.llm_calls, audit_call))
+            if expected.graph_recovery_intent is not None and type(publication_projection) is not GraphRecoveryProjectionInput:
+                raise AuditIntegrityError("semantic graph recovery requires its original SQL projection")
             if publication_projection is None:
                 if publication_result != expected:
                     raise AuditIntegrityError("semantic publication replaced its original reviewed result or paid Stop audit")
@@ -2119,7 +2244,7 @@ def settle_composer_operation_on_connection(
                     raise AuditIntegrityError("semantic publication changed its committed assistant result")
             else:
                 if (
-                    type(publication_projection) is not PublicationProjectionInput
+                    type(publication_projection) not in (PublicationProjectionInput, GraphRecoveryProjectionInput)
                     or type(publication_assistant) is not ChatMessageRecord
                     or type(publication_service) is not SessionServiceImpl
                     or type(publication_actor) is not str
@@ -2127,29 +2252,60 @@ def settle_composer_operation_on_connection(
                     or publication_projection.original_result != expected
                 ):
                     raise AuditIntegrityError("publication projection lost its actual SQL, assistant or actor owner")
-                require_publication_projection_on_connection(
-                    conn,
-                    running,
-                    publication_service,
-                    original_result=expected,
-                    publication_result=publication_result,
-                    assistant=publication_assistant,
-                    actor=publication_actor,
-                    settlement=publication_projection.settlement,
-                    revocation=publication_projection.revocation,
-                )
+                require_composer_settlement_actor_on_connection(conn, running, actor=publication_actor)
                 assistant_row = conn.execute(
                     select(chat_messages_table).where(
                         chat_messages_table.c.id == str(publication_assistant.id),
                         chat_messages_table.c.session_id == str(running.claim.session_id),
                     )
                 ).one_or_none()
-                if (
-                    assistant_row is None
-                    or publication_service._row_to_chat_message_record(assistant_row) != publication_assistant
-                    or outcome.message != _message_response(publication_assistant)
-                ):
+                if assistant_row is None or publication_service._row_to_chat_message_record(assistant_row) != publication_assistant:
                     raise AuditIntegrityError("publication projection substituted its actual assistant or public response")
+                if type(publication_projection) is GraphRecoveryProjectionInput:
+                    if (
+                        owned_proof is None
+                        or owned_proof.outcome_kind != "owned_recovery"
+                        or owned_proof.source_kind != "graph_recovery"
+                        or owned_proof.recovery_context != publication_projection.original_context
+                    ):
+                        raise AuditIntegrityError("graph recovery projection lacks its original owned recovery source")
+                    recovery = publication_projection.recovery
+                    retained_head = (
+                        recovery.intent.action == "park"
+                        and recovery.state_id is not None
+                        and recovery.state_id == recovery.expected_state_id
+                    )
+                    if retained_head:
+                        _require_graph_recovery_prior_read(conn, running, recovery_prior_state)
+                    elif recovery_prior_state is not None:
+                        raise AuditIntegrityError("graph recovery invented a retained prior state")
+                    require_graph_recovery_postconditions_on_connection(
+                        conn,
+                        running,
+                        publication_service,
+                        original_result=expected,
+                        publication_result=publication_result,
+                        assistant=publication_assistant,
+                        outcome=outcome,
+                        projection=publication_projection,
+                        recovery_prior_state=recovery_prior_state,
+                    )
+                elif type(publication_projection) is PublicationProjectionInput:
+                    require_publication_projection_on_connection(
+                        conn,
+                        running,
+                        publication_service,
+                        original_result=expected,
+                        publication_result=publication_result,
+                        assistant=publication_assistant,
+                        actor=publication_actor,
+                        settlement=publication_projection.settlement,
+                        revocation=publication_projection.revocation,
+                    )
+                    if outcome.message != _message_response(publication_assistant):
+                        raise AuditIntegrityError("publication projection substituted its actual public response")
+                else:
+                    raise AuditIntegrityError("publication projection changed its nominal source kind")
         elif publication_assistant is not None or publication_service is not None or publication_actor is not None:
             raise AuditIntegrityError("publication proof inputs were supplied without an original whole-request Stop")
     settle_continuation_on_connection(

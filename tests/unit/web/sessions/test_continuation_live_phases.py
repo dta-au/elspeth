@@ -195,9 +195,16 @@ async def test_post_batch_transition_returns_its_one_actual_current_phase_read(o
 
 @asynccontextmanager
 async def _phase_case(
-    store, tmp_path, monkeypatch, *, tool_call: tuple[str, str, dict[str, Any]] | None = None, before_batch_initialization=None
+    store,
+    tmp_path,
+    monkeypatch,
+    *,
+    tool_call: tuple[str, str, dict[str, Any]] | None = None,
+    following_tool_call: tuple[str, str, dict[str, Any]] | None = None,
+    before_batch_initialization=None,
+    settings_overrides=None,
 ):
-    runtime, work, requests = await initialized_primary_input(store, tmp_path, monkeypatch)
+    runtime, work, requests = await initialized_primary_input(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
     service, authority = runtime.materialization.service, store[2]
     running = work.running
     assert running is not None
@@ -241,6 +248,19 @@ async def _phase_case(
                     }
                 ]
             )
+            if following_tool_call is not None:
+                tool_calls.append(
+                    {
+                        "id": following_tool_call[0],
+                        "type": "function",
+                        "function": {
+                            "name": following_tool_call[1],
+                            "arguments": canonical_json(
+                                encode_semantic_arguments(following_tool_call[1], service._planner_dialect, following_tool_call[2])
+                            ),
+                        },
+                    }
+                )
             return ModelResponse(
                 model="test/model",
                 choices=[

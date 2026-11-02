@@ -15,7 +15,7 @@ import types
 
 APP = "src/elspeth/web/app.py"
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
-TURN = "src/elspeth/web/sessions/composer_turn.py"
+DRIVER = "src/elspeth/web/sessions/continuation_driver.py"
 
 # Populated from the actual mapped source by the standalone preparation script.
 # Application grammar is the actual header and entire executable prefix through
@@ -23,18 +23,12 @@ TURN = "src/elspeth/web/sessions/composer_turn.py"
 REVIEWED_GRAMMARS = {
     "ComposerAsyncWorker.__init__": "7675240c07be3c1db3e375b6ecb8b85aa0d7c890a4e3cfa2c1761adbe64ea402",
     "ComposerAsyncWorker._job": "ebe08f000b83f6477d3035666cce0d85aaf8f85290c8bdceebf4a91b6bc21ab2",
-    "ComposerAsyncWorker._run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
-    "ComposerAsyncWorker._run_started_under_lease": "9102ab313b7bc66ae98b3516d9bce69be08a017686be541ad9435d06fa54e298",
     "_create_app": "2c4a5bf83deefeaa62e0d35b1556f6542b7ecaa8e9af5b93ef27e37e41beaa98",
-    "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (
     (APP, "_create_app", "ORDINARY_FUNCTION"),
     (WORKER, "ComposerAsyncWorker.__init__", "ORDINARY_FUNCTION"),
     (WORKER, "ComposerAsyncWorker._job", "NATIVE_COROUTINE"),
-    (WORKER, "ComposerAsyncWorker._run_started", "NATIVE_COROUTINE"),
-    (WORKER, "ComposerAsyncWorker._run_started_under_lease", "NATIVE_COROUTINE"),
-    (TURN, "run_composer_turn", "NATIVE_COROUTINE"),
 )
 RECEIPT_KEYS = (
     "app_worker_constructor_call",
@@ -42,10 +36,8 @@ RECEIPT_KEYS = (
     "worker_app_store",
     "job_dto_factory_call",
     "job_services_store",
-    "job_turn_call",
-    "wrapper_turn_call",
-    "job_started_call",
-    "started_under_lease_call",
+    "job_segment_calls",
+    "segment_driver_call",
     "reap_dto_factory_call",
 )
 
@@ -204,16 +196,19 @@ def dependencies():
             "actual import/callable identity, current same-app state reads, DTO supplier and later keyword effects",
         ),
         (
-            "elspeth.web.sessions.composer_async_worker.ComposerAsyncWorker._run_started",
+            "elspeth.web.sessions.composer_async_worker.ComposerAsyncWorker._job",
             "ordinary member descriptor lookup, actual callable/code origin and receiver member stability",
         ),
         (
-            "elspeth.web.sessions.composer_async_worker.ComposerAsyncWorker._run_started_under_lease",
+            "elspeth.web.sessions.continuation_driver._SegmentDriver.run",
             "ordinary member descriptor lookup, actual callable/code origin and receiver member stability",
         ),
-        ("elspeth.web.sessions.composer_turn.run_composer_turn", "actual imported native coroutine and retained services argument effects"),
         (
-            "elspeth.web.sessions.composer_turn._run_composer_turn",
+            "elspeth.web.sessions.continuation_driver.run_continuation_segment",
+            "actual imported native coroutine and retained services argument effects",
+        ),
+        (
+            "elspeth.web.composer.continuation_live_phases.ContinuationLivePhases.advance",
             "actual imported/bound native coroutine, services/DTO member stability and provider dispatch",
         ),
         (
@@ -314,61 +309,6 @@ def _drain_owner_transfer(app, init, constructor):
     }
 
 
-def _terminal_handoff(under, call):
-    """Retain the real return before cleanup and refuse a second settlement."""
-    assignments = [
-        node
-        for node in ast.walk(under)
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and chain(node.targets[0]) == ("terminal",)
-        and isinstance(node.value, ast.Await)
-        and node.value.value is call
-    ]
-    if len(assignments) != 1:
-        return ["worker caller: actual terminal return assignment changed"], None
-    assignment = assignments[0]
-    blocks = [
-        value for owner in ast.walk(under) for _field, value in ast.iter_fields(owner) if isinstance(value, list) and assignment in value
-    ]
-    expected = ast.parse(
-        "if type(terminal) is not ComposerOperationRecord:\n"
-        "    raise AuditIntegrityError('Owned composer turn returned without a nominal terminal receipt')\n"
-        "settlement.terminal_receipt = terminal"
-    ).body
-    if len(blocks) != 1:
-        return ["worker caller: actual terminal return scope changed"], None
-    following = blocks[0][blocks[0].index(assignment) + 1 : blocks[0].index(assignment) + 3]
-    if [ast.dump(node) for node in following] != [ast.dump(node) for node in expected]:
-        return ["worker caller: exact terminal receipt handoff changed"], None
-    guard_source = "if _terminal_completion_unknown(exc) or settlement.terminal_receipt is not None:\n    raise"
-    expected_guard = ast.parse(guard_source).body[0]
-    handlers = [
-        node
-        for node in ast.walk(under)
-        if isinstance(node, ast.ExceptHandler)
-        and chain(node.type) == ("BaseException",)
-        and node.name == "exc"
-        and any(ast.dump(statement) == ast.dump(expected_guard) for statement in node.body)
-    ]
-    if len(handlers) != 1:
-        return ["worker caller: retained terminal no-replay guard changed"], None
-    guard = next(node for node in handlers[0].body if ast.dump(node) == ast.dump(expected_guard))
-    failure = [
-        node
-        for node in handlers[0].body
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and chain(node.value.func) == ("_owned_deadline_failure",)
-    ]
-    if len(failure) != 1 or handlers[0].body.index(guard) >= handlers[0].body.index(failure[0]):
-        return ["worker caller: retained terminal guard no longer precedes failure settlement"], None
-    return [], {
-        "assignment": (WORKER, id(assignment)),
-        "nominal_guard": (WORKER, id(following[0])),
-        "receipt_store": (WORKER, id(following[1])),
-        "no_replay_guard": (WORKER, id(guard)),
-    }
-
-
 def worker_caller_local_contracts(units):
     """Return failures plus conditional same-AST facts, never local admission."""
     receipt = dict.fromkeys(RECEIPT_KEYS)
@@ -380,7 +320,7 @@ def worker_caller_local_contracts(units):
     )
     units = list(units)
     index = {str(unit.path): unit for unit in units}
-    if len(index) != len(units) or not all(path in index for path in (APP, WORKER, TURN)):
+    if len(index) != len(units) or not all(path in index for path in (APP, WORKER, DRIVER)):
         return ["worker caller: missing/duplicate actual SourceUnit"], receipt
     failures = []
     selected = {}
@@ -434,9 +374,6 @@ def worker_caller_local_contracts(units):
     app = selected["_create_app"]
     init = selected["ComposerAsyncWorker.__init__"]
     job = selected["ComposerAsyncWorker._job"]
-    started = selected["ComposerAsyncWorker._run_started"]
-    under = selected["ComposerAsyncWorker._run_started_under_lease"]
-    wrapper = selected["run_composer_turn"]
     worker_class, _ = find(index[WORKER].tree, "ComposerAsyncWorker")
     namespace_failures = worker_namespace_contract(worker_class)
     if namespace_failures:
@@ -478,52 +415,10 @@ def worker_caller_local_contracts(units):
     factory_statement = direct_call_statement(job.body, ("services",), ("composer_app_services",))
     if factory_statement is None or not exact_call(factory_statement.value, ("composer_app_services",), [("self", "_app")], []):
         failures.append("worker caller: direct _job same-app factory binding changed")
-    hops = [
-        (job, ("self", "_run_started"), [("services",), ("running",), ("lease",)], [], "job_started_call"),
-        (
-            started,
-            ("self", "_run_started_under_lease"),
-            [("services",), ("running",), ("lease",), ("settlement",), ("setup_ticket",)],
-            [],
-            "started_under_lease_call",
-        ),
-        (
-            under,
-            ("run_composer_turn",),
-            [("services",), ("turn",)],
-            [
-                ("lease", ("lease",)),
-                ("running", ("running",)),
-                ("request_lifecycle", ("lifecycle",)),
-                ("observation", ("observation",)),
-                ("budget_anchor", ("anchor",)),
-            ],
-            "job_turn_call",
-        ),
-        (
-            wrapper,
-            ("_run_composer_turn",),
-            [("services",), ("turn",)],
-            [
-                ("lease", ("lease",)),
-                ("running", ("running",)),
-                ("request_lifecycle", ("request_lifecycle",)),
-                ("observation", ("observation",)),
-                ("budget_anchor", ("budget_anchor",)),
-            ],
-            "wrapper_turn_call",
-        ),
-    ]
-    for owner, callee, args, keywords, key in hops:
-        calls = awaited_calls(owner, callee)
-        if len(calls) != 1 or not exact_call(calls[0], callee, args, keywords):
-            failures.append("worker caller: exact awaited transfer changed " + key)
-        else:
-            receipt[key] = (TURN if owner is wrapper else WORKER, id(calls[0]))
-            if owner is under:
-                handoff_failures, handoff = _terminal_handoff(under, calls[0])
-                failures.extend(handoff_failures)
-                receipt["terminal_handoff"] = handoff
+    flow_failures, flow = continuation_caller_contracts(units)
+    failures.extend(flow_failures)
+    if flow is not None:
+        receipt.update(flow)
     if failures:
         return failures, receipt
     receipt.update(
@@ -542,3 +437,170 @@ def worker_caller_local_contracts(units):
         if statement is not None:
             receipt["reap_dto_factory_call"] = (WORKER, id(statement.value))
     return [], receipt
+
+
+# These are current executable transport contracts, not replacements for the
+# independently retained complete worker/source grammar pins. Deleted V1
+# run-started/turn wrappers no longer transport a selected capability.
+_SEGMENT_ENTRY = """
+async def run_continuation_segment(
+    worker: ComposerAsyncWorker, services: ComposerAppServices,
+    running: ComposerOperationRunning, lease: SessionOperationLease, *,
+    adoption_failure: BaseException | None = None,
+) -> ContinuationSegmentOutcome:
+    from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+    original: BaseException | None = None
+    driver: _SegmentDriver | None = None
+    try:
+        driver = _SegmentDriver(worker, services, running, lease)
+        return await driver.run(adoption_failure)
+    except BaseException as failure:
+        original = failure
+        if driver is not None:
+            original = driver.join_failure(failure)
+        elif adoption_failure is not None:
+            original = combine_failure_objects(adoption_failure, failure)
+        if original is failure:
+            raise
+        raise original from original.__cause__
+    finally:
+        if lease.required_work is not None and lease.required_work.sql_deadline_owner is not None:
+            lease.required_work.sql_deadline_owner.begin_settlement()
+        cleanup_errors = list(driver._progress_cleanup_failures) if driver is not None else []
+        if driver is not None:
+            try:
+                await driver.close_progress()
+            except BaseException as cleanup:
+                cleanup_errors.append(cleanup)
+        try:
+            await lease.close(deadline=worker.drain_deadline)
+        except BaseException as cleanup:
+            cleanup_errors.append(cleanup)
+        if cleanup_errors:
+            cleanup_failure = cleanup_errors[0]
+            additional = (*cleanup_errors[1:], *((original,) if original is not None else ()))
+            if driver is not None:
+                combined = driver.join_failure(cleanup_failure, *additional)
+                if combined is cleanup_failure:
+                    raise cleanup_failure
+                raise combined from combined.__cause__
+            combined = combine_failure_objects(cleanup_failure, *additional)
+            if combined is cleanup_failure:
+                raise cleanup_failure
+            raise combined from combined.__cause__
+"""
+
+_JOIN_OWNED = """
+async def _join_owned[T](task: asyncio.Task[T], *, cancellation_observations: list[asyncio.CancelledError] | None = None) -> T:
+    observed: list[asyncio.CancelledError] = []
+    owner = asyncio.current_task()
+    while not task.done():
+        cancelling_before = owner.cancelling() if owner is not None else 0
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancelled:
+            if not task.cancelled() or (owner is not None and owner.cancelling() > cancelling_before):
+                observed.append(cancelled)
+        except BaseException:
+            break
+    if cancellation_observations is not None:
+        cancellation_observations.extend(observed)
+    try:
+        result = task.result()
+    except BaseException as child_failure:
+        if observed:
+            combined = _combine_operation_failures(child_failure, tuple(observed))
+            raise combined from combined.__cause__
+        raise
+    return result
+"""
+
+_OWNED = """
+async def _owned[T](awaitable: Awaitable[T], *, cancellation_observations: list[asyncio.CancelledError] | None = None) -> T:
+    return await _join_owned(asyncio.ensure_future(awaitable), cancellation_observations=cancellation_observations)
+"""
+
+_ADOPTION_TRANSFER = """
+try:
+    lease = await adoption.join()
+except BaseException as original:
+    retained_lease = adoption.lease
+    if retained_lease is None:
+        raise
+    await run_continuation_segment(self, services, running, retained_lease, adoption_failure=original)
+    raise
+"""
+
+
+def executable_shape(node):
+    """Ignore only the inert leading docstring; retain all executable nodes."""
+    clone = copy.copy(node)
+    clone.body = list(node.body)
+    if clone.body and isinstance(clone.body[0], ast.Expr):
+        value = clone.body[0].value
+        if isinstance(value, ast.Constant) and type(value.value) is str:
+            clone.body = clone.body[1:]
+    return ast.dump(clone, include_attributes=False)
+
+
+def continuation_caller_contracts(units):
+    """Actual adoption success/failure edges and one retained lease finalizer."""
+    units = tuple(units)
+    index = {str(unit.path): unit for unit in units}
+    if len(index) != len(units) or any(path not in index for path in (WORKER, DRIVER)):
+        return ["worker continuation caller: missing/duplicate units"], None
+    job, _ = find(index[WORKER].tree, "ComposerAsyncWorker._job")
+    entry, _ = find(index[DRIVER].tree, "run_continuation_segment")
+    if not isinstance(job, ast.AsyncFunctionDef):
+        return ["worker continuation caller: missing job"], None
+    definitions = []
+    for path, name, template in (
+        (WORKER, "_owned", _OWNED),
+        (WORKER, "_join_owned", _JOIN_OWNED),
+        (DRIVER, "run_continuation_segment", _SEGMENT_ENTRY),
+    ):
+        definition, _ = find(index[path].tree, name)
+        if not isinstance(definition, ast.AsyncFunctionDef) or executable_shape(definition) != executable_shape(
+            ast.parse(template).body[0]
+        ):
+            return ["worker continuation caller: exact transport/cleanup changed " + name], None
+        definitions.append((path, id(definition)))
+    # Exact exception nesting matters: a retained lease is never confused with
+    # successful adoption, and the original exception is re-raised afterward.
+    blocks = [
+        node for node in ast.walk(job) if isinstance(node, ast.Try) and ast.dump(node) == ast.dump(ast.parse(_ADOPTION_TRANSFER).body[0])
+    ]
+    if len(blocks) != 1:
+        return ["worker continuation caller: retained adoption transfer changed"], None
+    block = blocks[0]
+    parents = [value for node in ast.walk(job) for _, value in ast.iter_fields(node) if isinstance(value, list) and block in value]
+    expected = ast.parse("await run_continuation_segment(self, services, running, lease, adoption_failure=started_failure)").body[0]
+    if len(parents) != 1:
+        return ["worker continuation caller: ambiguous adoption owner"], None
+    siblings = parents[0]
+    offset = siblings.index(block)
+    if offset + 1 >= len(siblings) or ast.dump(siblings[offset + 1]) != ast.dump(expected):
+        return ["worker continuation caller: successful adoption transfer changed"], None
+    calls = awaited_calls(job, ("run_continuation_segment",))
+    expected_calls = [node for node in ast.walk(block) if isinstance(node, ast.Call) and chain(node.func) == ("run_continuation_segment",)]
+    expected_calls.append(siblings[offset + 1].value.value)
+    if len(calls) != 2 or {id(node) for node in calls} != {id(node) for node in expected_calls}:
+        return ["worker continuation caller: extra/escaped segment dispatch"], None
+    constructor = next(node for node in ast.walk(entry) if isinstance(node, ast.Call) and chain(node.func) == ("_SegmentDriver",))
+    run = next(node for node in ast.walk(entry) if isinstance(node, ast.Call) and chain(node.func) == ("driver", "run"))
+    close = next(node for node in ast.walk(entry) if isinstance(node, ast.Call) and chain(node.func) == ("lease", "close"))
+    transport = [(WORKER, node) for node in calls] + [(DRIVER, constructor), (DRIVER, run), (DRIVER, close)]
+    return [], {
+        "job_segment_calls": tuple((WORKER, id(node)) for node in calls),
+        "segment_driver_call": (DRIVER, id(constructor)),
+        "segment_run_call": (DRIVER, id(run)),
+        "segment_close_call": (DRIVER, id(close)),
+        "transport_definitions": tuple(definitions),
+        "transport_calls": frozenset((path, id(node)) for path, node in transport),
+        "supplier_arguments": frozenset(
+            (path, id(node), id(argument))
+            for path, node in transport
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+        ),
+        "adoption_transfer": (WORKER, id(block)),
+    }

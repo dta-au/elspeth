@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal
 from weakref import WeakKeyDictionary
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer._compose_loop_carriers import (
     _AdvisorReviewState,
     _ClassifyOutcome,
@@ -28,8 +29,15 @@ from elspeth.web.composer.continuation_classifier_handoff import (
     encode_classify_post_primary,
     encode_classify_source_proof_stop,
 )
+from elspeth.web.composer.continuation_classifier_owned_source import (
+    ClassifierOwnedSourceObservation,
+    ClassifyReplyRefusalReady,
+    decode_classifier_owned_source,
+    encode_classifier_owned_source,
+)
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_response
+from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
 from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchPersistData
 from elspeth.web.composer.continuation_result_codec import RetainedComposerResult, encode_retained_composer_result
 from elspeth.web.composer.continuation_runtime import (
@@ -48,7 +56,11 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-    from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer, ClassifierPrimaryResult
+    from elspeth.web.sessions.continuation_classifier_primary import (
+        ClassifierPrimaryIssuer,
+        ClassifierPrimaryResult,
+        ClassifierReplyDeadline,
+    )
 
 
 @dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
@@ -71,6 +83,20 @@ class ObservedIterationEndInput:
     """Opaque original pre-END input; constructor access issues no binding."""
 
 
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+class ObservedClassifierReplyDeadline:
+    """Opaque reached no-SDK boundary; fields cannot recreate its live source."""
+
+
+@dataclass(frozen=True, slots=True)
+class OriginalClassifierReplyDeadlineData:
+    """Verified source DATA; the ready SQL owner must reverify the marker."""
+
+    selected: SelectedContinuationState
+    inventory: CurrentContinuationEnvInventory
+    token: ClassifierReplyDeadline
+
+
 @dataclass(frozen=True, slots=True)
 class ObservedIterationReturnData:
     result: ComposerResult
@@ -82,6 +108,7 @@ class ObservedIterationReturnData:
     primary_effect_key: str | None = None
     primary_input_sha256: str | None = None
     primary_response: PrivateChunkRef | None = None
+    owned_source_json: str | None = None
 
 
 @dataclass(slots=True)
@@ -97,6 +124,12 @@ class _ClassifyEndInvocationCapture:
     original_terminal: _TerminateOutcome | None = None
     original_outcome: _ClassifyOutcome | None = None
     terminal_kind: Literal["model_end", "owned_refusal", "owned_control", "owned_error", "owned_recovery"] | None = None
+    original_owned_source_json: str | None = None
+
+    def record_original_owned_source(self, observation: ClassifierOwnedSourceObservation) -> None:
+        if self.original_owned_source_json is not None:
+            raise AuditIntegrityError("classifier refusal source observation can only be recorded once")
+        self.original_owned_source_json = encode_classifier_owned_source(observation)
 
     def record_original_model_end(self, terminal: _TerminateOutcome, outcome: _ClassifyOutcome) -> None:
         if (
@@ -165,7 +198,8 @@ class _ClassificationSource:
     completion_capture: _ClassifyEndInvocationCapture | None = None
     original_terminal: _TerminateOutcome | None = None
     terminal_kind: Literal["model_end", "owned_refusal", "owned_control", "owned_error", "owned_recovery"] | None = None
-    resumed_from: ClassifyPostPrimary | ClassifySourceProofStop | None = None
+    resumed_from: ClassifyPostPrimary | ClassifySourceProofStop | ClassifyReplyRefusalReady | None = None
+    owned_source_json: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,10 +229,21 @@ class _EndInputSource:
     binding: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ReplyDeadlineSource:
+    live: _LiveSource
+    inventory: CurrentContinuationEnvInventory
+    issuer: ClassifierPrimaryIssuer
+    token: ClassifierReplyDeadline
+    clock: ContinuationActionClock
+    observation_json: str
+
+
 _early: WeakKeyDictionary[ObservedIterationEarly, _EarlySource] = WeakKeyDictionary()
 _classifications: WeakKeyDictionary[ObservedClassification, _ClassificationSource] = WeakKeyDictionary()
 _returns: WeakKeyDictionary[ObservedIterationReturn, _ReturnSource] = WeakKeyDictionary()
 _end_inputs: WeakKeyDictionary[ObservedIterationEndInput, _EndInputSource] = WeakKeyDictionary()
+_reply_deadlines: WeakKeyDictionary[ObservedClassifierReplyDeadline, _ReplyDeadlineSource] = WeakKeyDictionary()
 
 
 def _counters(outcome: _ClassifyOutcome | ClassifyPostPrimary | ClassifySourceProofStop) -> tuple[int, int, int, int]:
@@ -368,9 +413,9 @@ async def observe_continuation_iteration_classification(
     selected: SelectedContinuationState,
     dispatch: _DispatchOutcome,
     persist: _PersistOutcome | ColdPostBatchPersistData,
-) -> ObservedClassification:
+) -> ObservedClassification | ObservedClassifierReplyDeadline:
     """Observe the actual classifier; preserve its original thrown outcome."""
-    from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer
+    from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer, ClassifierReplyDeadline
 
     source = _live_source(phases, runtime, selected, dispatch, persist)
     service, live, bindings = phases.service, runtime.live, runtime.bindings
@@ -380,17 +425,20 @@ async def observe_continuation_iteration_classification(
     clock = phases.action_clock
     if type(clock) is not ContinuationActionClock or clock.policy != runtime.source.policy.actions.primary:
         raise AuditIntegrityError("iteration classifier lost its original driver PRIMARY clock")
+    deadline = _original_action_deadline(phases, runtime, clock)
+    inventory = runtime.materialization.inventory
     issuer = ClassifierPrimaryIssuer(
         service=service,
         authority=phases.authority,
         running=source.running,
         selected=selected,
-        inventory=runtime.materialization.inventory,
+        inventory=inventory,
         runtime=runtime,
         required_work=phases.work,
         provider_owner=phases.provider_owner,
         clock=clock,
     )
+    issuer.bind_reply_deadline(deadline)
     completion_capture = _ClassifyEndInvocationCapture()
     with composer_quota_scope(service._require_sessions_service(), context), prompt_guard_user_scope(bindings.message):
         outcome = await service._classify_and_budget_turn(
@@ -405,7 +453,7 @@ async def observe_continuation_iteration_classification(
             progress=bindings.progress,
             message=bindings.message,
             initial_version=live.initial_version,
-            deadline=_original_action_deadline(phases, runtime, clock),
+            deadline=deadline,
             runtime_preflight_cache=live.runtime_preflight_cache,
             session_scope=bindings.session_scope,
             session_id=bindings.session_id,
@@ -422,9 +470,52 @@ async def observe_continuation_iteration_classification(
             classifier_primary_issuer=issuer,
             completion_capture=completion_capture,
         )
+    if isinstance(outcome, ClassifierReplyDeadline):
+        observation = issuer.require_reply_deadline(outcome)
+        observed_deadline = ObservedClassifierReplyDeadline()
+        _reply_deadlines[observed_deadline] = _ReplyDeadlineSource(
+            source,
+            inventory,
+            issuer,
+            outcome,
+            clock,
+            encode_classifier_owned_source(observation),
+        )
+        # No await, source refresh, runtime capture or finalizer follows the
+        # reached boundary. The driver owns original deadline disposition.
+        return observed_deadline
     if type(outcome) not in (_ClassifyOutcome, ClassifyPostPrimary, ClassifySourceProofStop):
         raise AuditIntegrityError("iteration classifier lost its original nominal outcome")
     return _register_classification(source, outcome, completion_capture, issuer=issuer)
+
+
+def require_original_classifier_reply_deadline(
+    observed: ObservedClassifierReplyDeadline,
+    *,
+    phases: ContinuationLivePhases,
+    running: ComposerOperationRunning,
+    action_clock: ContinuationActionClock,
+) -> OriginalClassifierReplyDeadlineData:
+    """Revalidate the original uninvoked issuer, never its expired business clock."""
+    if type(observed) is not ObservedClassifierReplyDeadline or observed not in _reply_deadlines:
+        raise AuditIntegrityError("classifier reply deadline requires its original issued observation")
+    source = _reply_deadlines[observed]
+    live = source.live
+    if (
+        phases is not live.phases
+        or running is not live.running
+        or action_clock is not source.clock
+        or phases.action_clock is not action_clock
+        or type(action_clock) is not ContinuationActionClock
+        or action_clock.policy != live.runtime.source.policy.actions.primary
+        or live.runtime.materialization.inventory is not source.inventory
+    ):
+        raise AuditIntegrityError("classifier reply deadline changed its original source, actor or clock")
+    _live_source(phases, live.runtime, live.selected, live.dispatch, live.persist)
+    observation = source.issuer.require_reply_deadline(source.token)
+    if encode_classifier_owned_source(observation) != source.observation_json:
+        raise AuditIntegrityError("classifier reply deadline changed its original complete elapsed observation")
+    return OriginalClassifierReplyDeadlineData(live.selected, source.inventory, source.token)
 
 
 def _register_classification(
@@ -433,7 +524,7 @@ def _register_classification(
     completion_capture: _ClassifyEndInvocationCapture,
     *,
     issuer: ClassifierPrimaryIssuer | None = None,
-    resumed_from: ClassifyPostPrimary | ClassifySourceProofStop | None = None,
+    resumed_from: ClassifyPostPrimary | ClassifySourceProofStop | ClassifyReplyRefusalReady | None = None,
 ) -> ObservedClassification:
     if type(outcome) is _ClassifyOutcome and outcome.action == "return" and completion_capture.original_outcome is not outcome:
         raise AuditIntegrityError("iteration return lost its actual original completion producer")
@@ -451,6 +542,7 @@ def _register_classification(
         original_terminal=completion_capture.original_terminal,
         terminal_kind=completion_capture.terminal_kind,
         resumed_from=resumed_from,
+        owned_source_json=completion_capture.original_owned_source_json,
     )
     return observed
 
@@ -470,6 +562,7 @@ def _original_classification(observed: ObservedClassification) -> _Classificatio
             and (
                 source.completion_capture.original_terminal is not source.original_terminal
                 or source.completion_capture.terminal_kind != source.terminal_kind
+                or source.completion_capture.original_owned_source_json != source.owned_source_json
                 or (
                     type(source.original) is _ClassifyOutcome
                     and source.original.action == "return"
@@ -587,6 +680,17 @@ def require_original_classification_pending(
     return pending
 
 
+def require_original_classification_owned_source(
+    observed: ObservedClassification,
+    running: ComposerOperationRunning,
+    selected: SelectedContinuationState,
+    captured: CapturedContinuationRuntime,
+) -> str | None:
+    """Read source DATA only through the original pending-call capture."""
+    require_original_classification_pending(observed, running, selected, captured)
+    return _original_classification(observed).owned_source_json
+
+
 async def observe_continuation_classifier_end(
     phases: ContinuationLivePhases,
     runtime: RestoredContinuationRuntime,
@@ -596,6 +700,7 @@ async def observe_continuation_classifier_end(
     dispatch: _DispatchOutcome,
     persist: _PersistOutcome | ColdPostBatchPersistData,
     primary_response: PrivateChunk | None,
+    owned_source_json: str | None = None,
 ) -> ObservedClassification:
     """Observe the actual resumed shared END under its new original action."""
     source = _live_source(phases, runtime, selected, dispatch, persist)
@@ -603,6 +708,23 @@ async def observe_continuation_classifier_end(
     if type(clock) is not ContinuationActionClock or clock.policy != runtime.source.policy.actions.advisor:
         raise AuditIntegrityError("classifier END lost its original driver Advisor clock")
     capture = _ClassifyEndInvocationCapture()
+    if type(pending) is ClassifySourceProofStop:
+        if owned_source_json is None:
+            raise AuditIntegrityError("classifier source-stop END lost its original retained observation")
+        observation = decode_classifier_owned_source(owned_source_json)
+        if (
+            observation.kind != "source_proof_refusal"
+            or observation.source_checkpoint_id != pending.source_checkpoint_id
+            or observation.source_cursor != pending.source_cursor
+            or observation.proof_json != pending.proof_json
+            or observation.state_sha256 != stable_hash(dispatch.state.to_dict())
+        ):
+            raise AuditIntegrityError("classifier source-stop END substituted its original pending proof or actual state")
+        # The SQL owner authenticates the observation's original physical
+        # creator separately from this actual END actor after any ready yield.
+        capture.record_original_owned_source(observation)
+    elif owned_source_json is not None:
+        raise AuditIntegrityError("classifier PRIMARY END cannot borrow a source-stop observation")
     context = runtime.bindings.session_operation_context
     if context is None:
         raise AuditIntegrityError("classifier END lost its original current operation context")
@@ -621,6 +743,58 @@ async def observe_continuation_classifier_end(
     return _register_classification(source, outcome, capture, resumed_from=pending)
 
 
+async def observe_continuation_classifier_reply_refusal(
+    phases: ContinuationLivePhases,
+    runtime: RestoredContinuationRuntime,
+    *,
+    selected: SelectedContinuationState,
+    pending: ClassifyReplyRefusalReady,
+    dispatch: _DispatchOutcome,
+    persist: _PersistOutcome | ColdPostBatchPersistData,
+) -> ObservedClassification:
+    """Observe the retained unpaid reply tail under its own actual SQL action."""
+    source = _live_source(phases, runtime, selected, dispatch, persist)
+    clock = phases.action_clock
+    if (
+        type(pending) is not ClassifyReplyRefusalReady
+        or type(clock) is not ContinuationActionClock
+        or clock.policy != runtime.source.policy.actions.session_sql
+    ):
+        raise AuditIntegrityError("classifier reply refusal lost its original ready DATA or current SQL clock")
+    observation = decode_classifier_owned_source(pending.observation_json)
+    if (
+        observation.kind != "reply_deadline_exhausted"
+        or observation.source_checkpoint_id != pending.source_checkpoint_id
+        or observation.source_cursor != pending.source_cursor
+        or observation.state_sha256 != stable_hash(dispatch.state.to_dict())
+    ):
+        raise AuditIntegrityError("classifier reply refusal changed its retained original elapsed source")
+    capture = _ClassifyEndInvocationCapture()
+    capture.record_original_owned_source(observation)
+    context = runtime.bindings.session_operation_context
+    if context is None:
+        raise AuditIntegrityError("classifier reply refusal lost its actual current operation context")
+    deadline = _original_action_deadline(phases, runtime, clock)
+    with composer_quota_scope(phases.service._require_sessions_service(), context), prompt_guard_user_scope(runtime.bindings.message):
+        outcome = await phases.service.resume_continuation_classifier_end(
+            pending=pending,
+            runtime=runtime,
+            dispatch=dispatch,
+            persist=persist,
+            primary_response=None,
+            completion_capture=capture,
+            deadline=deadline,
+        )
+    if (
+        type(outcome) is not _ClassifyOutcome
+        or outcome.action != "return"
+        or capture.terminal_kind != "owned_refusal"
+        or capture.original_terminal is not None
+    ):
+        raise AuditIntegrityError("classifier reply refusal lost its actual unpaid terminal outcome")
+    return _register_classification(source, outcome, capture, resumed_from=pending)
+
+
 def _actual_end_input_binding(
     live: _LiveSource, pending: ClassifyPostPrimary | ClassifySourceProofStop, primary_response: PrivateChunk | None
 ) -> str | None:
@@ -629,7 +803,11 @@ def _actual_end_input_binding(
     if type(pending) is ClassifySourceProofStop:
         if primary_response is not None:
             raise AuditIntegrityError("classifier source stop cannot invent a paid PRIMARY input")
-        return None
+        return live.runtime.live.turn_evidence.review_candidate(
+            candidate=live.dispatch.assistant_message.content or "",
+            request=live.runtime.bindings.message,
+            current_state=live.dispatch.state,
+        ).binding
     if type(pending) is not ClassifyPostPrimary or type(primary_response) is not PrivateChunk:
         raise AuditIntegrityError("classifier END input requires its actual original pending response")
     if primary_response.reference != pending.response:
@@ -780,7 +958,16 @@ async def complete_continuation_iteration_return(
     )
     response = primary.response.reference if primary is not None else pending.response if type(pending) is ClassifyPostPrimary else None
     data = ObservedIterationReturnData(
-        public_result, outcome.publication_binding, encoded, recorder, source.terminal_kind, disposition, effect_key, input_sha, response
+        public_result,
+        outcome.publication_binding,
+        encoded,
+        recorder,
+        source.terminal_kind,
+        disposition,
+        effect_key,
+        input_sha,
+        response,
+        source.owned_source_json,
     )
     returned = ObservedIterationReturn()
     _returns[returned] = _ReturnSource(observed, source.live, captured, data)

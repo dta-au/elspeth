@@ -15,6 +15,7 @@ from sqlalchemy import Connection
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import (
+    AdvisorFrame,
     ComposeFrame,
     ContinuationFrameStack,
     ContinuationValue,
@@ -22,7 +23,11 @@ from elspeth.web.composer.continuation import (
     InitializeFrame,
     ToolBatchFrame,
 )
-from elspeth.web.composer.continuation_next_action import handoff_cut_allowance, next_continuation_action_policy
+from elspeth.web.composer.continuation_next_action import (
+    handoff_cut_allowance,
+    is_consumed_semantic_stop_cut,
+    next_continuation_action_policy,
+)
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 
@@ -52,9 +57,10 @@ def classify_drain_cut(selected: SelectedContinuationState) -> ContinuationDrain
     """Classify only current cuts whose existing selector completes validation.
 
     This pure preparation grants no disposition or dispatch authority. Live
-    later Compose and END review cuts retain source owners for the same
-    sequence (runtime design §2.2). Other future-only handoff allowances still
-    refuse until their actual source and cold-resume owners land.
+    later Compose, retained semantic Advisor, END review and consumed semantic
+    Stop cuts retain source owners for the same sequence (runtime design §2.2).
+    Other future-only handoff allowances still refuse until their actual source
+    and cold-resume owners land.
 
     Do not catch ``ContinuationCutNotResumable`` here: for PRIMARY/P4/unknown
     shapes the current selector raises it before detailed phase validation.
@@ -70,7 +76,11 @@ def classify_drain_cut(selected: SelectedContinuationState) -> ContinuationDrain
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
     next_continuation_action_policy(selected=selected, policy=policy)
     top = root.frames[-1]
-    live_later_cut = (type(top) is ComposeFrame and top.phase == "action_ready") or (type(top) is EndFrame and top.phase == "review_needed")
+    live_later_cut = (
+        (type(top) is ComposeFrame and top.phase == "action_ready")
+        or (type(top) is AdvisorFrame and top.phase in ("response_retained", "decision_ready"))
+        or (type(top) is EndFrame and (top.phase == "review_needed" or is_consumed_semantic_stop_cut(selected)))
+    )
     if handoff_cut_allowance(root, policy) is not None and not live_later_cut:
         raise AuditIntegrityError("drain cut has no landed handoff-lineage owner")
     if type(top) not in (InitializeFrame, ComposeFrame, ToolBatchFrame) and not live_later_cut:

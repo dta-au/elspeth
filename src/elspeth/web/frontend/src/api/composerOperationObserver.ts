@@ -322,7 +322,11 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
             armAcceptedDeadline();
             if (frame.payload.status === "completed" || frame.payload.status === "failed") return "terminal";
           } else if (frame.event === "progress") {
-            deliverComposerObservation(() => options.progress?.({ ...frame.payload, session_id: descriptor.sessionId, inflight_requests: 1 } as ComposerProgressSnapshot));
+            // Progress has no revision of its own. Only the accepted status can
+            // bind it to the current segment attempt, including after reconnect.
+            const segment = gate.latest?.segment;
+            if (segment == null || segment.sequence !== frame.payload.segment_sequence || segment.generation !== frame.payload.segment_generation) continue;
+            deliverComposerObservation(() => options.progress?.({ ...frame.payload, session_id: descriptor.sessionId, inflight_requests: 1 }));
           } else if (frame.event === "terminal") {
             if (frame.payload.status_revision < gate.lastAccepted) continue;
             if (frame.payload.status_revision === gate.lastAccepted) {

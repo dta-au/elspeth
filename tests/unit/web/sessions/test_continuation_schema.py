@@ -106,15 +106,11 @@ def test_current_epoch_with_missing_continuation_table_is_not_repaired(tmp_path)
 
 
 @pytest.fixture
-def continuation_parent(tmp_path):
-    """Explicit SQL fixture only; no V2 runtime admission authority is enabled."""
+def continuation_unadmitted_parent(tmp_path):
+    """A real session and an unused operation identity for original-policy INSERTs."""
     from uuid import uuid4
 
-    from sqlalchemy import insert
-
-    from elspeth.web.coordination.database_clock import database_now
     from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
-    from elspeth.web.sessions.models import composer_async_operations_table as jobs
     from tests.fixtures.identities import ensure_test_identity
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'parent.db'}")
@@ -126,32 +122,53 @@ def continuation_parent(tmp_path):
         user_id="alice", title="Continuation SQL fixture", auth_provider_type="local", owner_instance_id="test-owner", lease_seconds=30
     )
     sid, operation_id = str(session.id), str(uuid4())
-    with engine.begin() as connection:
-        now = database_now(connection)
-        connection.execute(
-            insert(jobs).values(
-                session_id=sid,
-                operation_id=operation_id,
-                kind="compose_message",
-                status="queued",
-                phase="queued",
-                current_segment_sequence=1,
-                ownership_generation=1,
-                checkpoint_id="initial-checkpoint",
-                ingress_phase="pending",
-                reserved_user_message_id="original",
-                request_hash="a" * 64,
-                continuation_policy_version="composer.continuation.policy.v1",
-                actor_user_id="alice",
-                request_json="{}",
-                created_at=now,
-                updated_at=now,
-            )
-        )
     try:
         yield engine, sid, operation_id
     finally:
         engine.dispose()
+
+
+def insert_continuation_parent(
+    connection, sid, operation_id, *, policy_version="composer.continuation.policy.v1", policy_hash=None, limit=None, request_hash="a" * 64
+):
+    """Insert the original policy tuple; fixture setup cannot rewrite admission."""
+    from sqlalchemy import insert
+
+    from elspeth.web.coordination.database_clock import database_now
+    from elspeth.web.sessions.models import composer_async_operations_table as jobs
+
+    now = database_now(connection)
+    connection.execute(
+        insert(jobs).values(
+            session_id=sid,
+            operation_id=operation_id,
+            kind="compose_message",
+            status="queued",
+            phase="queued",
+            current_segment_sequence=1,
+            ownership_generation=1,
+            checkpoint_id="initial-checkpoint",
+            ingress_phase="pending",
+            reserved_user_message_id="original",
+            request_hash=request_hash,
+            continuation_policy_version=policy_version,
+            continuation_policy_sha256=policy_hash,
+            continuation_retained_payload_limit_bytes=limit,
+            actor_user_id="alice",
+            request_json="{}",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+@pytest.fixture
+def continuation_parent(continuation_unadmitted_parent):
+    """Explicit SQL fixture only; no V2 runtime admission authority is enabled."""
+    engine, sid, operation_id = continuation_unadmitted_parent
+    with engine.begin() as connection:
+        insert_continuation_parent(connection, sid, operation_id)
+    return engine, sid, operation_id
 
 
 @pytest.mark.parametrize("field", ["phase", "ingress_phase"])
@@ -278,18 +295,17 @@ def test_v2_terminal_failure_requires_result_schema(continuation_parent):
 
 
 @pytest.fixture
-def snapshot_store(continuation_parent):
+def snapshot_store(continuation_unadmitted_parent):
     """Seed complete owned C1 bytes under a real parent; C3 admission is absent."""
-    from sqlalchemy import insert, update
+    from sqlalchemy import insert
 
     from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
     from elspeth.web.coordination.database_clock import database_now
     from elspeth.web.sessions.continuation import put_chunk
-    from elspeth.web.sessions.models import composer_async_operations_table as jobs
     from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
     from tests.unit.web.composer.test_continuation_frames import initial_stack
 
-    engine, sid, operation_id = continuation_parent
+    engine, sid, operation_id = continuation_unadmitted_parent
     original = initial_stack()
     stack = original.model_copy(
         update={
@@ -299,10 +315,12 @@ def snapshot_store(continuation_parent):
     )
     encoded = encode_continuation_snapshot(stack)
     with engine.begin() as connection:
-        connection.execute(
-            update(jobs)
-            .where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)
-            .values(continuation_policy_version="composer.continuation.policy.v2")
+        insert_continuation_parent(
+            connection,
+            sid,
+            operation_id,
+            policy_version="composer.continuation.policy.v2",
+            request_hash=stack.logical.request_hash,
         )
         put_chunk(
             connection,
@@ -324,7 +342,6 @@ def snapshot_store(continuation_parent):
                 created_at=database_now(connection),
             )
         )
-        connection.execute(update(jobs).where(jobs.c.session_id == sid).values(request_hash=stack.logical.request_hash))
     return engine, sid, operation_id, encoded
 
 

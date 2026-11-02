@@ -260,7 +260,10 @@ class ContinuationFrameStack(ContinuationValue):
         return (
             (isinstance(top, InitializeFrame) and top.ingress_phase == "ready")
             or (isinstance(top, ComposeFrame) and top.phase == "action_ready")
-            or (isinstance(top, ToolBatchFrame) and top.phase == "tool_ready")
+            # An unissued prepared attachment can reclaim the same sequence
+            # through its authenticated preparation lineage. It has no landed
+            # cross-sequence yield lineage, so do not publish that successor.
+            or (isinstance(top, ToolBatchFrame) and top.phase == "tool_ready" and top.accumulator.codec != "composer.tool-batch.v1")
             or (isinstance(top, AdvisorFrame) and top.phase == "input_ready")
             or (isinstance(top, EndFrame) and top.phase in ("review_needed", "repair_needed", "publication_ready"))
         )

@@ -17,12 +17,14 @@ from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 operation_store = _operation_store
 
 
-@pytest.mark.parametrize("kind", ["early", "return", "end_input"])
+@pytest.mark.parametrize("kind", ["early", "return", "end_input", "reply_deadline"])
 def test_unissued_iteration_observation_has_no_capture_authority(kind):
     from elspeth.web.composer.continuation_semantic_advisor_return import (
+        ObservedClassifierReplyDeadline,
         ObservedIterationEarly,
         ObservedIterationEndInput,
         ObservedIterationReturn,
+        require_original_classifier_reply_deadline,
         require_original_iteration_early,
         require_original_iteration_end_input,
         require_original_iteration_return,
@@ -38,10 +40,14 @@ def test_unissued_iteration_observation_has_no_capture_authority(kind):
         observed_return = ObservedIterationReturn()
         with pytest.raises(AuditIntegrityError, match=r"original.*observation"):
             require_original_iteration_return(observed_return, None, None, None)
-    else:
+    elif kind == "end_input":
         end_input = ObservedIterationEndInput()
         with pytest.raises(AuditIntegrityError, match=r"original.*observation"):
             require_original_iteration_end_input(end_input, None, None, pending_json="{}")
+    else:
+        reply_deadline = ObservedClassifierReplyDeadline()
+        with pytest.raises(AuditIntegrityError, match=r"original.*observation"):
+            require_original_classifier_reply_deadline(reply_deadline, phases=None, running=None, action_clock=None)
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from tests.helpers.continuation_app import (
     effects,
     end_admit,
     install_sdk,
+    observe_original_driver_failures,
     sdk_reply,
     semantic_stop_response,
     submit_and_settle,
@@ -57,6 +58,7 @@ async def test_staged_review_classifier_uses_paid_primary_then_next_shared_end(t
     operation_id = str(uuid4())
     calls: list[dict[str, object]] = []
     async with continuation_app(tmp_path, monkeypatch) as harness:
+        original_failures = observe_original_driver_failures(monkeypatch, operation_id, session_id=harness.session_id)
 
         async def provider(**request):
             calls.append(request)
@@ -97,12 +99,21 @@ async def test_staged_review_classifier_uses_paid_primary_then_next_shared_end(t
             raise AssertionError("classifier or END replayed a physical provider call")
 
         install_sdk(monkeypatch, provider)
-        result = await submit_and_settle(
-            harness,
-            message_body("Create a draft that rates how cool pages are, then ask me to review the term.", operation_id=operation_id),
-        )
+        try:
+            result = await submit_and_settle(
+                harness,
+                message_body("Create a draft that rates how cool pages are, then ask me to review the term.", operation_id=operation_id),
+            )
+        except BaseException:
+            print("classifier original worker failures: " + json.dumps(original_failures))
+            raise
 
-        assert result.status == "completed", (result.error, [call["model"] for call in calls])
+        if result.status != "completed":
+            print("classifier original worker failures: " + json.dumps(original_failures))
+        assert result.status == "completed", (
+            None if result.error is None else (result.error.error_type, result.error.failure_code),
+            [call["model"] for call in calls],
+        )
         assert [call["model"] for call in calls] == [
             PRIMARY_MODEL,
             ADVISOR_MODEL,

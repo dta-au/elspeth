@@ -64,7 +64,7 @@ def seed_observed_sql_trial_policy(monkeypatch):
     )
 
 
-async def bootstrap_case(store, *, eligible=True, bound_base=False):
+async def bootstrap_case(store, *, eligible=True, bound_base=False, settings_overrides=None):
     engine, repository, authority, sessions, sid = store
     # An actual settled prior job, read by the real bounded history owner.
     prior, _ = await operations._settled_failure(store, stop=True)
@@ -125,7 +125,7 @@ async def bootstrap_case(store, *, eligible=True, bound_base=False):
     work = inventory_work(running)
     completed = await ingress(store, running, work, selected, request)
     work.coordinator.assert_completed()
-    service, _actors = current_service(store)
+    service, _actors = current_service(store, settings_overrides=settings_overrides)
     return running, completed, service, prior, base
 
 

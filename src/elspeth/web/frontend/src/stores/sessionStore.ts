@@ -468,13 +468,22 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   let result: import("@/types/index").MessageWithStateResponse | null = null;
   let failure: unknown = null;
   // Stop state is scoped to this operation: restored intent comes from custody.
-  if (current() && !reconciliationOnly) useSessionStore.setState({ composerOperationStatus: null, composerLiveUpdatesInterrupted: false, composerStopPendingOperationId: composerStopRequested(descriptor) ? descriptor.operationId : null });
+  if (current() && !reconciliationOnly) useSessionStore.setState({ composerOperationStatus: null, composerProgress: null, composerLiveUpdatesInterrupted: false, composerStopPendingOperationId: composerStopRequested(descriptor) ? descriptor.operationId : null });
   try {
     const options = {
       signal, current,
       progress: (snapshot: ComposerProgressSnapshot) => { if (current() && !reconciliationOnly) useSessionStore.setState({ composerProgress: snapshot }); },
       status: (status: ComposerOperationStatus) => {
-        if (current() && !reconciliationOnly) useSessionStore.setState((state) => ({ composerOperationStatus: status, composerStopPendingOperationId: status.cancel_requested && state.composerStopPendingOperationId === status.operation_id ? null : state.composerStopPendingOperationId }));
+        if (current() && !reconciliationOnly) useSessionStore.setState((state) => {
+          const previous = state.composerOperationStatus;
+          const sameSegment = previous?.operation_id === status.operation_id && status.segment !== null
+            && previous.segment?.sequence === status.segment.sequence && previous.segment.generation === status.segment.generation;
+          return {
+            composerOperationStatus: status,
+            composerProgress: sameSegment ? state.composerProgress : null,
+            composerStopPendingOperationId: status.cancel_requested && state.composerStopPendingOperationId === status.operation_id ? null : state.composerStopPendingOperationId,
+          };
+        });
       },
       stopUnconfirmed: (unconfirmed: boolean) => {
         if (current() && !reconciliationOnly) useSessionStore.setState((state) => ({ composerStopPendingOperationId: unconfirmed ? descriptor.operationId : state.composerStopPendingOperationId === descriptor.operationId ? null : state.composerStopPendingOperationId }));

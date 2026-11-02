@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 import yaml
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.auth.middleware import get_current_user
@@ -19,7 +19,6 @@ from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.sessions.content_publication import read_content_publication
 from elspeth.web.sessions.models import composer_completion_events_table, composition_states_table
 from elspeth.web.sessions.protocol import CompositionStateData
-from elspeth.web.sessions.state_envelope import envelope_state_column
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.composition_state import composition_state_data
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
@@ -140,7 +139,7 @@ async def test_yaml_replacement_rebinds_content_and_preserves_exact_ingress(tmp_
 
 
 @pytest.mark.asyncio
-async def test_export_legacy_uninspected_graph_without_mutation_or_dispatch(tmp_path: Path) -> None:
+async def test_export_uninspected_graph_without_mutation_or_dispatch(tmp_path: Path) -> None:
     app, service = _make_app(tmp_path)
     session = await service.create_session("alice", "Export legacy", "local")
     saved = await _save_test_composition_state(
@@ -168,13 +167,11 @@ async def test_export_legacy_uninspected_graph_without_mutation_or_dispatch(tmp_
         ),
         provenance="session_seed",
     )
-    # Model a pre-publication historical row; ordinary writers must not mint it.
-    with service._engine.begin() as connection:
-        connection.execute(
-            update(composition_states_table).where(composition_states_table.c.id == str(saved.id)).values(composer_meta=None)
-        )
     before = await service.get_current_state(session.id)
-    assert before is not None and read_content_publication(before) is None
+    assert before is not None and before == saved
+    publication = read_content_publication(before)
+    assert publication.state_id == before.id
+    assert publication.to_payload()["applicability"] == "requires_current_inspection"
     client = SyncASGITestClient(app)
     with (
         patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", autospec=True, side_effect=_pass_preflight),
@@ -191,6 +188,7 @@ async def test_export_legacy_uninspected_graph_without_mutation_or_dispatch(tmp_
     assert PUBLIC_EXPORT_REDACTION_HEADER in response.json()["yaml"]
     assert "outputs/authored.csv" not in response.json()["yaml"]
     assert await service.get_current_state(session.id) == before
+    assert read_content_publication(await service.get_current_state(session.id)) == publication
     assert [record.id for record in await service.get_state_versions(session.id)] == [saved.id]
     with service._engine.connect() as connection:
         audit = connection.execute(
@@ -201,26 +199,29 @@ async def test_export_legacy_uninspected_graph_without_mutation_or_dispatch(tmp_
 
 
 @pytest.mark.asyncio
-async def test_revert_current_legacy_state_repairs_publication_without_dispatch(tmp_path: Path) -> None:
+async def test_revert_current_state_rebinds_publication_without_dispatch(tmp_path: Path) -> None:
     app, service = _make_app(tmp_path)
     session = await service.create_session("alice", "Repair legacy metadata", "local")
+    retained_metadata = {"legacy_import": {"source": "manual café"}}
     seeded = await _save_test_composition_state(
         service,
         session.id,
-        CompositionStateData(metadata_={"name": "Authored café", "description": "unchanged"}, is_valid=True),
+        CompositionStateData(
+            metadata_={"name": "Authored café", "description": "unchanged"},
+            composer_meta=retained_metadata,
+            is_valid=True,
+        ),
         provenance="session_seed",
     )
-    legacy_metadata = {"legacy_import": {"source": "manual café"}}
-    with service._engine.begin() as connection:
-        connection.execute(
-            update(composition_states_table)
-            .where(composition_states_table.c.id == str(seeded.id))
-            .values(composer_meta=envelope_state_column(legacy_metadata))
-        )
+    with service._engine.connect() as connection:
         original_row = connection.execute(select(composition_states_table).where(composition_states_table.c.id == str(seeded.id))).one()
-    legacy = await service.get_current_state(session.id)
-    assert legacy is not None and read_content_publication(legacy) is None
-    body = {"operation_id": str(uuid4()), "state_id": str(legacy.id)}
+    current = await service.get_current_state(session.id)
+    assert current is not None and current == seeded
+    original_publication = read_content_publication(current)
+    assert original_publication.state_id == current.id
+    assert original_publication.state_version == 1
+    assert original_publication.to_payload()["applicability"] == "requires_current_inspection"
+    body = {"operation_id": str(uuid4()), "state_id": str(current.id)}
     client = SyncASGITestClient(app)
     with (
         patch("litellm.acompletion", new_callable=AsyncMock, spec=True, side_effect=AssertionError("repair must not dispatch")) as dispatch,
@@ -240,22 +241,23 @@ async def test_revert_current_legacy_state_repairs_publication_without_dispatch(
     assert replay.status_code == 200, replay.text
     assert replay.json() == response.json()
     repaired = await service.get_current_state(session.id)
-    assert repaired is not None and repaired.id != legacy.id
+    assert repaired is not None and repaired.id != current.id
     publication = read_content_publication(repaired)
     assert publication is not None
     assert publication.state_id == repaired.id
     assert publication.state_version == 2
+    assert publication.storage_content_hash == original_publication.storage_content_hash
     assert publication.to_payload()["applicability"] == "requires_current_inspection"
-    assert deep_thaw(repaired.metadata_) == deep_thaw(legacy.metadata_)
-    assert repaired.sources == legacy.sources
-    assert repaired.nodes == legacy.nodes
-    assert repaired.edges == legacy.edges
-    assert repaired.outputs == legacy.outputs
+    assert deep_thaw(repaired.metadata_) == deep_thaw(current.metadata_)
+    assert repaired.sources == current.sources
+    assert repaired.nodes == current.nodes
+    assert repaired.edges == current.edges
+    assert repaired.outputs == current.outputs
     assert repaired.composer_meta is not None
-    assert deep_thaw(repaired.composer_meta["legacy_import"]) == legacy_metadata["legacy_import"]
+    assert deep_thaw(repaired.composer_meta["legacy_import"]) == retained_metadata["legacy_import"]
     assert [record.version for record in await service.get_state_versions(session.id)] == [1, 2]
     with service._engine.connect() as connection:
-        retained_row = connection.execute(select(composition_states_table).where(composition_states_table.c.id == str(legacy.id))).one()
+        retained_row = connection.execute(select(composition_states_table).where(composition_states_table.c.id == str(current.id))).one()
     assert retained_row == original_row
 
 

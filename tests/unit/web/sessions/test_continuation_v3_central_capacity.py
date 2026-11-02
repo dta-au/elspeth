@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import event, update
+from sqlalchemy import event
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -21,12 +21,17 @@ from elspeth.web.sessions.continuation import (
     put_chunk,
 )
 from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
-from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_continuation_frames import initial_stack
-from tests.unit.web.sessions.test_continuation_schema import _retained_payload_rows, _snapshot_rows
+from tests.unit.web.sessions.test_continuation_schema import (
+    _retained_payload_rows,
+    _snapshot_rows,
+    continuation_unadmitted_parent,
+    insert_continuation_parent,
+)
 
 pytest_plugins = ("tests.unit.web.sessions.test_continuation_schema",)
+continuation_parent = continuation_unadmitted_parent
 
 
 def _root(sid, operation_id, limit):
@@ -81,14 +86,13 @@ def _limit(root):
 
 
 def _set_v3_contract(conn, sid, operation_id, root):
-    conn.execute(
-        update(jobs)
-        .where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)
-        .values(
-            continuation_policy_version="composer.continuation.policy.v3",
-            continuation_policy_sha256=root.policy_hash,
-            continuation_retained_payload_limit_bytes=_limit(root),
-        )
+    insert_continuation_parent(
+        conn,
+        sid,
+        operation_id,
+        policy_version="composer.continuation.policy.v3",
+        policy_hash=root.policy_hash,
+        limit=_limit(root),
     )
 
 

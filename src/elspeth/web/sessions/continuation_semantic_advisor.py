@@ -126,6 +126,7 @@ from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.time_normalization import restore_utc
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.graph_recovery import GraphRecoveryContext
     from elspeth.web.sessions.continuation_iteration_return import IterationReturnCommitted
     from elspeth.web.sessions.continuation_semantic_actions import SemanticActionAdmission
     from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
@@ -1689,9 +1690,37 @@ def _paid_result_data(
     elif response is not None and decode_retained_physical_audit_call(response) != call:
         raise AuditIntegrityError("Semantic invalid response changed its actual paid audit")
     frame = _advisor(root)
-    expected_cursor = manifest.source_cursor + (2 if frame.phase == "decision_ready" else 1)
-    if frame.phase not in ("response_retained", "decision_ready") or selected.cursor != expected_cursor:
+    from elspeth.web.sessions.continuation_semantic_recovery import SemanticRecoverySource, semantic_recovery_source
+
+    if decode_continuation_snapshot(selected.payload_json) != root:
+        raise AuditIntegrityError("Semantic cold result changed its complete selected root")
+    selected_source = semantic_recovery_source(conn, sid, operation, selected)
+    original_selected = selected_source.snapshot
+    recoveries: tuple[SemanticRecoverySource, ...]
+    if frame.phase not in ("response_retained", "decision_ready"):
         raise AuditIntegrityError("Semantic cold result moved outside its supported exact selected cut")
+    if frame.phase == "decision_ready":
+        installed_event = conn.execute(
+            select(events.c.tag).where(
+                events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == original_selected.cursor
+            )
+        ).scalar_one_or_none()
+        if installed_event != "checkpoint":
+            raise AuditIntegrityError("Semantic cold decision lost its original installation event")
+        predecessor = _historical_snapshot(conn, sid, operation, cursor=original_selected.cursor - 1)
+        paid_source = semantic_recovery_source(conn, sid, operation, predecessor)
+        recoveries = (paid_source, selected_source)
+    else:
+        paid_source = selected_source
+        recoveries = (selected_source,)
+    if paid_source.snapshot.cursor != manifest.source_cursor + 1:
+        raise AuditIntegrityError("Semantic cold result moved outside its supported exact selected cut")
+    generation = effect.creator_generation
+    for recovery in recoveries:
+        if recovery.previous_generation is not None:
+            if recovery.sequence != effect.creator_sequence or recovery.previous_generation != generation or recovery.generation is None:
+                raise AuditIntegrityError("Semantic cold result changed its original paid recovery lineage")
+            generation = recovery.generation
     begun = _historical_snapshot(conn, sid, operation, checkpoint_id=manifest.source_checkpoint_id)
     source_root = decode_continuation_snapshot(begun.payload_json)
     original_root = decode_continuation_snapshot(data.source.selected_snapshot_json)
@@ -1741,7 +1770,7 @@ def _paid_result_data(
         )
     )
     expected_paid = expected_paid.model_copy(update={"cursor": manifest.source_cursor + 1})
-    if paid_root != expected_paid or (frame.phase == "response_retained" and root != paid_root):
+    if paid_root != expected_paid or decode_continuation_snapshot(paid_source.snapshot.payload_json) != paid_root:
         raise AuditIntegrityError("Semantic cold output changed its original complete retained root")
     _journal_data(
         conn,
@@ -1775,7 +1804,7 @@ def read_current_paid_semantic_decision_on_connection(
     result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
     if (
         _advisor(root).phase != "response_retained"
-        or root != paid_root
+        or root != paid_root.model_copy(update={"cursor": selected.cursor})
         or result.outcome != "success"
         or result.decision is None
         or result.response is None
@@ -1887,7 +1916,10 @@ def _decision_data(
     root: ContinuationFrameStack,
     effect_key: str,
 ) -> SemanticAdvisorDecisionData:
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
     result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
+    original_selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
     if _advisor(root).phase != "decision_ready" or result.outcome != "success" or result.decision is None or result.response is None:
         raise AuditIntegrityError("Semantic cold action lacks an installed successful original decision")
     source = ContinuationActionSource(
@@ -1923,7 +1955,7 @@ def _decision_data(
         conn,
         sid,
         operation,
-        cursor=selected.cursor,
+        cursor=original_selected.cursor,
         tag="checkpoint",
         payload=canonical_json(
             {
@@ -2010,6 +2042,44 @@ class SemanticIterationPublicationProof:
     end_pass_message_id: str
     end_pass_index: int
     publication_binding: str
+
+
+type _OwnedIterationSourceKind = Literal["source_proof_refusal", "reply_protocol_echo", "reply_deadline_exhausted", "graph_recovery"]
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticOwnedIterationPublicationProof:
+    """Original owned terminal DATA and paid Stop, never clean model approval."""
+
+    admission: SemanticActionAdmission
+    returned: IterationReturnCommitted
+    outcome_kind: Literal["owned_refusal", "owned_recovery"]
+    source_kind: _OwnedIterationSourceKind
+    recovery_context: GraphRecoveryContext | None
+
+
+class _OwnedIterationStopBridge(ContinuationValue):
+    schema_version: Literal["composer.semantic-owned-iteration-stop-source.v1"] = "composer.semantic-owned-iteration-stop-source.v1"
+    session_id: str
+    operation_id: str
+    decision_checkpoint_id: str
+    decision_cursor: int
+    consume_cursor: int
+    source: ContinuationActionSource
+    decision_json: str
+    iteration_effect_key: str
+    iteration_checkpoint_id: str
+    iteration_cursor: int
+    result_sha256: str
+    recorder: PrivateChunkRef
+    outcome_kind: Literal["owned_refusal", "owned_recovery"]
+    source_kind: _OwnedIterationSourceKind
+
+
+class _OwnedIterationStopEvent(ContinuationValue):
+    kind: Literal["semantic_iteration_owned_stop_ready"] = "semantic_iteration_owned_stop_ready"
+    bridge_chunk_key: str
+    bridge: _OwnedIterationStopBridge
 
 
 class _IterationWholeStopBridge(ContinuationValue):
@@ -2126,6 +2196,11 @@ def _iteration_stop_bridge(
 def _semantic_iteration_publication_data(
     conn: Connection, sid: str, operation: str, selected: StoredContinuationSnapshot
 ) -> SemanticIterationPublicationProof | None:
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
+    # Current ownership/CAS belongs to the public caller. Reconstruct the
+    # original consumed checkpoint only through proved recovery transitions.
+    selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
     from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
     from elspeth.web.sessions.continuation_semantic_actions import _reprove_installed_snapshot
 
@@ -2258,6 +2333,228 @@ def consume_semantic_advisor_iteration_stop_on_connection(
         if require_semantic_iteration_publication_on_connection(conn, running, selected=consumed) is None:
             raise AuditIntegrityError("Semantic iteration Stop lost its exact consumed final source proof")
         return consumed
+
+
+def _owned_iteration_return_for_stop(
+    conn: Connection, sid: str, operation: str, admission: SemanticActionAdmission
+) -> tuple[IterationReturnCommitted, Literal["owned_refusal", "owned_recovery"], _OwnedIterationSourceKind, GraphRecoveryContext | None]:
+    from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
+    from elspeth.web.sessions.continuation_iteration_return import (
+        OwnedIterationReturnSource,
+        read_original_owned_iteration_return_on_connection,
+    )
+
+    source = admission.paid.invocation.source
+    selected = _historical_snapshot(conn, sid, operation, checkpoint_id=source.checkpoint_id)
+    if (selected.cursor, selected.payload_json) != (source.cursor, source.selected_snapshot_json):
+        raise AuditIntegrityError("Owned iteration Stop changed its exact original assessed terminal")
+    returned = _returned_iteration_source_data(conn, sid, operation, selected)
+    owned = read_original_owned_iteration_return_on_connection(
+        conn, session_id=UUID(sid), operation_id=operation, effect_key=returned.owner_effect_key
+    )
+    if (
+        type(owned) is not OwnedIterationReturnSource
+        or owned.returned != returned
+        or returned.end_disposition == "clean"
+        or returned.result.pipeline_commit_intent is not None
+    ):
+        raise AuditIntegrityError("Owned iteration Stop substituted its original outcome or invented pipeline approval")
+    if owned.kind == "graph_recovery":
+        if (
+            returned.terminal_kind != "owned_recovery"
+            or type(returned.result.graph_recovery_intent) is not GraphRecoveryIntent
+            or type(owned.recovery_context) is not GraphRecoveryContext
+        ):
+            raise AuditIntegrityError("Owned recovery Stop lost its exact original provider-authored recovery")
+        return returned, "owned_recovery", owned.kind, owned.recovery_context
+    if (
+        owned.kind not in ("source_proof_refusal", "reply_protocol_echo", "reply_deadline_exhausted")
+        or returned.terminal_kind != "owned_refusal"
+        or returned.result.graph_recovery_intent is not None
+    ):
+        raise AuditIntegrityError("Owned refusal Stop cannot replace a recovery or model END outcome")
+    return returned, "owned_refusal", owned.kind, None
+
+
+def _owned_iteration_stop_bridge(
+    sid: str,
+    operation: str,
+    decision: StoredContinuationSnapshot,
+    admission: SemanticActionAdmission,
+    returned: IterationReturnCommitted,
+    outcome_kind: Literal["owned_refusal", "owned_recovery"],
+    source_kind: _OwnedIterationSourceKind,
+) -> _OwnedIterationStopBridge:
+    return _OwnedIterationStopBridge(
+        session_id=sid,
+        operation_id=operation,
+        decision_checkpoint_id=decision.checkpoint_id,
+        decision_cursor=decision.cursor,
+        consume_cursor=decision.cursor + 1,
+        source=admission.paid.source,
+        decision_json=admission.paid.decision_json,
+        iteration_effect_key=returned.owner_effect_key,
+        iteration_checkpoint_id=returned.completed.checkpoint_id,
+        iteration_cursor=returned.completed.cursor,
+        result_sha256=sha256(returned.result_json.encode("utf-8")).hexdigest(),
+        recorder=returned.recorder_source.reference,
+        outcome_kind=outcome_kind,
+        source_kind=source_kind,
+    )
+
+
+def _semantic_owned_iteration_publication_data(
+    conn: Connection, sid: str, operation: str, selected: StoredContinuationSnapshot
+) -> SemanticOwnedIterationPublicationProof | None:
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
+    selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
+    from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
+    from elspeth.web.sessions.continuation_semantic_actions import _reprove_installed_snapshot
+
+    actual = _historical_snapshot(conn, sid, operation, checkpoint_id=selected.checkpoint_id)
+    if actual != selected:
+        raise AuditIntegrityError("Owned iteration publication substituted its exact complete checkpoint")
+    row = conn.execute(
+        select(events.c.tag, events.c.payload_chunk_key).where(
+            events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == selected.cursor
+        )
+    ).one_or_none()
+    if row is None or row.tag != "checkpoint":
+        return None
+    text = read_chunk(conn, session_id=sid, operation_id=operation, key=row.payload_chunk_key).decode("utf-8", errors="strict")
+    body, error = parse_json_strict(text)
+    if error is not None or type(body) is not dict or canonical_json(body) != text:
+        raise AuditIntegrityError("Owned iteration publication lost its complete canonical event")
+    if body.get("kind") != "semantic_iteration_owned_stop_ready":
+        return None
+    event = _decode(_OwnedIterationStopEvent, text)
+    bridge = event.bridge
+    if (
+        (bridge.session_id, bridge.operation_id, bridge.consume_cursor) != (sid, operation, selected.cursor)
+        or bridge.decision_cursor + 1 != selected.cursor
+        or event.bridge_chunk_key != f"semantic-owned-iteration-stop-source:{bridge.source.effect_key}"
+        or _blob(conn, sid, operation, event.bridge_chunk_key, bridge.schema_version) != _canonical(bridge)
+    ):
+        raise AuditIntegrityError("Owned iteration publication changed its original Stop bridge")
+    decision = _historical_snapshot(conn, sid, operation, checkpoint_id=bridge.decision_checkpoint_id)
+    if decision.cursor != bridge.decision_cursor:
+        raise AuditIntegrityError("Owned iteration publication changed its original paid Stop checkpoint")
+    admission = _reprove_installed_snapshot(conn, UUID(sid), operation, decision, bridge.source.effect_key)
+    paid_root = decode_continuation_snapshot(decision.payload_json)
+    if (
+        len(paid_root.frames) != 3
+        or _advisor(paid_root).phase != "decision_ready"
+        or type(paid_root.frames[1]) is not ToolBatchFrame
+        or admission.action is not None
+        or admission.action_key is not None
+        or not admission.evidence.coverage.complete
+        or paid_root.active_action_json is not None
+        or paid_root.active_action_source is not None
+        or paid_root.pending_owner_results
+        or paid_root.pending_settlement_ids
+        or any(item.disposition not in ("committed", "refused") for item in paid_root.effect_frontier)
+    ):
+        raise AuditIntegrityError("Owned iteration publication lost its actual closed whole-request Stop")
+    expected = paid_root.model_copy(update={"frames": paid_root.frames[:-1], "cursor": selected.cursor})
+    applied_batch_cut(expected.frames)
+    if decode_continuation_snapshot(selected.payload_json) != expected:
+        raise AuditIntegrityError("Owned iteration publication replaced its complete consumed applied root")
+    returned, outcome_kind, source_kind, recovery_context = _owned_iteration_return_for_stop(conn, sid, operation, admission)
+    if bridge != _owned_iteration_stop_bridge(sid, operation, decision, admission, returned, outcome_kind, source_kind):
+        raise AuditIntegrityError("Owned iteration publication substituted its original terminal kind, source or complete result")
+    return SemanticOwnedIterationPublicationProof(admission, returned, outcome_kind, source_kind, recovery_context)
+
+
+def require_semantic_owned_iteration_publication_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot
+) -> SemanticOwnedIterationPublicationProof | None:
+    """Reprove original owned terminal and paid Stop under current final SQL."""
+    if type(selected) is not StoredContinuationSnapshot:
+        raise AuditIntegrityError("Owned iteration publication requires its actual nominal selected root")
+    _require_current_continuation_running(conn, running, allow_cancel=False, allow_expired_segment=True)
+    if _owed_continuation_p4_active(conn, running.session_operation_context):
+        raise AuditIntegrityError("Owned iteration publication cannot borrow an active P4 finish")
+    current = require_snapshot_cas(
+        conn,
+        session_id=str(running.claim.session_id),
+        operation_id=running.claim.operation_id,
+        expected_checkpoint_id=selected.checkpoint_id,
+        expected_cursor=selected.cursor,
+    )
+    if current != selected:
+        raise ContinuationCASConflict("Owned iteration publication changed its complete current root")
+    return _semantic_owned_iteration_publication_data(conn, str(running.claim.session_id), running.claim.operation_id, selected)
+
+
+def consume_semantic_advisor_owned_iteration_stop_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Consume actual paid Stop over an independently proved owned terminal."""
+    from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
+    from elspeth.web.sessions.continuation_semantic_actions import require_semantic_whole_stop_on_connection
+
+    root = _current(conn, running, selected)
+    admission = require_semantic_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    if len(root.frames) != 3 or _advisor(root).phase != "decision_ready":
+        raise AuditIntegrityError("Owned iteration Stop lost its exact original paid applied stack")
+    applied_batch_cut(root.frames[:-1])
+    if (
+        root.active_action_json is not None
+        or root.active_action_source is not None
+        or root.pending_owner_results
+        or root.pending_settlement_ids
+        or any(item.disposition not in ("committed", "refused") for item in root.effect_frontier)
+    ):
+        raise AuditIntegrityError("Owned iteration Stop cannot leave unresolved source work")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    returned, outcome_kind, source_kind, _recovery_context = _owned_iteration_return_for_stop(conn, sid, operation, admission)
+    bridge = _owned_iteration_stop_bridge(sid, operation, selected, admission, returned, outcome_kind, source_kind)
+    key = f"semantic-owned-iteration-stop-source:{effect_key}"
+    event = _OwnedIterationStopEvent(bridge_chunk_key=key, bridge=bridge)
+    with conn.begin_nested():
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=key,
+            payload=_canonical(bridge).encode("utf-8"),
+            codec=bridge.schema_version,
+        )
+        consumed = append_complete_snapshot(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            expected_checkpoint_id=selected.checkpoint_id,
+            expected_cursor=selected.cursor,
+            snapshot_json=encode_continuation_snapshot(root.model_copy(update={"frames": root.frames[:-1]})),
+            event_batch=(ContinuationEvent("checkpoint", _canonical(event)),),
+            handoff=False,
+        )
+        if require_semantic_owned_iteration_publication_on_connection(conn, running, selected=consumed) is None:
+            raise AuditIntegrityError("Owned iteration Stop lost its exact current cold source proof")
+        return consumed
+
+
+def consume_semantic_advisor_terminal_iteration_stop_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Select an original source arm; each consumer proves its own authority."""
+    from elspeth.web.sessions.continuation_semantic_actions import require_semantic_whole_stop_on_connection
+
+    _current(conn, running, selected)
+    admission = require_semantic_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    source = admission.paid.invocation.source
+    assessed = _historical_snapshot(conn, sid, operation, checkpoint_id=source.checkpoint_id)
+    if (assessed.cursor, assessed.payload_json) != (source.cursor, source.selected_snapshot_json):
+        raise AuditIntegrityError("Iteration Stop selection changed its original assessed source")
+    returned = _returned_iteration_source_data(conn, sid, operation, assessed)
+    if returned.terminal_kind == "model_end":
+        return consume_semantic_advisor_iteration_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    if returned.terminal_kind in ("owned_refusal", "owned_recovery"):
+        return consume_semantic_advisor_owned_iteration_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    raise AuditIntegrityError("Iteration Stop has no implemented original terminal source arm")
 
 
 def consume_semantic_advisor_whole_stop_on_connection(
@@ -2657,6 +2954,14 @@ def _returned_iteration_source_data(
     """
     from elspeth.web.composer.continuation_iteration_transitions import advance_effect_key, applied_batch_cut
     from elspeth.web.sessions.continuation_iteration_return import read_original_iteration_return_on_connection
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
+    recovered_source = semantic_recovery_source(conn, sid, operation, selected).snapshot
+    if recovered_source != selected and _semantic_checkpoint_kind_data(conn, sid, operation, recovered_source.cursor) in (
+        "semantic_iteration_whole_stop_ready",
+        "semantic_iteration_owned_stop_ready",
+    ):
+        selected = recovered_source
 
     actual = _historical_snapshot(conn, sid, operation, checkpoint_id=selected.checkpoint_id)
     if actual != selected:
@@ -2672,6 +2977,13 @@ def _returned_iteration_source_data(
         proof = _semantic_iteration_publication_data(conn, sid, operation, selected)
         if proof is None or proof.returned != original:
             raise AuditIntegrityError("Semantic iteration publication changed its original complete classified result")
+        return replace(original, current_stage="publication_ready")
+    if selected != original.completed and _semantic_checkpoint_kind_data(conn, sid, operation, selected.cursor) == (
+        "semantic_iteration_owned_stop_ready"
+    ):
+        owned = _semantic_owned_iteration_publication_data(conn, sid, operation, selected)
+        if owned is None or owned.returned != original:
+            raise AuditIntegrityError("Owned iteration publication changed its original complete terminal source")
         return replace(original, current_stage="publication_ready")
     _prove_returned_iteration_descendant(conn, sid, operation, selected, original)
     return original

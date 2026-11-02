@@ -19,6 +19,414 @@ from tests.unit.architecture import test_web_landscape_mutation_fencing as fenci
 ROOT = Path(__file__).parents[3]
 
 
+@pytest.mark.parametrize("fault", ("primary_hook", "semantic_hook", "original_attempt", "hook_order"))
+def test_current_provider_cancellation_keeps_original_admitted_issuer_handoff(fault):
+    path = "src/elspeth/web/composer/provider_quota.py"
+    original = _source_units((path,))[0]
+    assert family._check_contracts(original, family._provider_contracts())[0] == []
+    changed = fencing._parse_source(path, original.source)
+    method = fencing._reserve_node_at(changed, "ProviderCallCustody._cancel_undispatched")
+    if fault == "original_attempt":
+        admitted = next(node for node in method.body if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "admitted")
+        assert ast.unparse(admitted.value) == "self.attempt"
+        admitted.value = ast.Name(id="foreign_attempt", ctx=ast.Load())
+    else:
+        spelling = "self._semantic_no_sdk_issuer" if fault == "semantic_hook" else "self._primary_no_sdk_issuer"
+        hook = next(node for node in method.body if isinstance(node, ast.If) and ast.unparse(node.test) == spelling + " is not None")
+        if fault == "hook_order":
+            clear = next(node for node in method.body if isinstance(node, ast.Assign) and ast.unparse(node) == "self.attempt = None")
+            method.body.remove(hook)
+            method.body.insert(method.body.index(clear) + 1, hook)
+        else:
+            call = hook.body[0].value
+            assert ast.unparse(call.func) == spelling + ".note_undispatched_cancel"
+            assert ast.unparse(call.args[1]) == "admitted"
+            call.args[1] = ast.Name(id="foreign_attempt", ctx=ast.Load())
+    ast.fix_missing_locations(changed.tree)
+    assert family._check_contracts(changed, family._provider_contracts())[0] == [
+        path + ":ProviderCallCustody._cancel_undispatched: closed execution contract changed (guard/transfer/effect/branch)"
+    ]
+    assert family._check_contracts(original, family._provider_contracts())[0] == []
+
+
+@pytest.mark.parametrize("fault", ("provider_argument", "phase_argument", "phase_field", "descriptor", "missing_driver"))
+def test_current_compose_proposal_transfer_retains_exact_constructor_owners(fault):
+    units = _source_units((compose.DRIVER, compose.PHASES, compose.PROPOSALS, compose.SETTLEMENT))
+    failures, receipt = compose.compose_proposal_local_transfers(units)
+    assert failures == [] and receipt is not None
+    nodes = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert len(receipt["validated_transfer_nodes"]) == 3
+    assert set(receipt["validated_transfer_nodes"]).issubset(nodes)
+    if fault == "missing_driver":
+        changed = tuple(unit for unit in units if unit.path != compose.DRIVER)
+    else:
+        path = compose.PHASES if fault in {"phase_field", "descriptor"} else compose.DRIVER
+
+        def change(unit):
+            if path == compose.DRIVER:
+                method = fencing._reserve_node_at(unit, "_SegmentDriver.__init__")
+                callee = "ProviderInvocationOwner" if fault == "provider_argument" else "ContinuationLivePhases"
+                call = next(node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == callee)
+                if fault == "provider_argument":
+                    argument = next(keyword for keyword in call.keywords if keyword.arg == "required_work")
+                    argument.value = ast.Name(id="foreign_work", ctx=ast.Load())
+                else:
+                    assert ast.unparse(call.args[2]) == "self.work"
+                    call.args[2] = ast.Name(id="foreign_work", ctx=ast.Load())
+            else:
+                cls = fencing._reserve_node_at(unit, "ContinuationLivePhases")
+                if fault == "descriptor":
+                    cls.body.append(ast.parse("def __getattribute__(self, name):\n    return foreign").body[0])
+                else:
+                    fields = [node for node in cls.body if isinstance(node, ast.AnnAssign)]
+                    work = next(node for node in fields if ast.unparse(node.target) == "work")
+                    provider_field = next(node for node in fields if ast.unparse(node.target) == "provider_owner")
+                    i, j = cls.body.index(work), cls.body.index(provider_field)
+                    cls.body[i], cls.body[j] = cls.body[j], cls.body[i]
+
+        changed = _receiving_changed_units(units, path, change)
+    for changed_unit in changed:
+        ast.fix_missing_locations(changed_unit.tree)
+    failures, refused = compose.compose_proposal_local_transfers(changed)
+    assert failures and refused is None
+    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+
+
+@pytest.mark.parametrize("fault", ("missing_recipes", "current_read", "recipe_base", "nominal_shelf", "extra_call"))
+def test_current_recovery_instruction_transfer_keeps_read_and_recipe_authority(fault):
+    units = _source_units((compose.RECOVERY_MESSAGES, compose.RECOVERY_PRODUCERS, compose.RECOVERY_RECIPES))
+    failures, receipt = compose.recovery_instruction_supplier_contracts(units)
+    assert failures == [] and receipt is not None
+    assert len(receipt["supplier_calls"]) == 2
+    nodes = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert set(receipt["supplier_calls"]).issubset(nodes)
+    if fault == "missing_recipes":
+        changed = tuple(unit for unit in units if unit.path != compose.RECOVERY_RECIPES)
+    else:
+        path = compose.RECOVERY_RECIPES if fault == "recipe_base" else compose.RECOVERY_PRODUCERS
+
+        def change(unit):
+            if fault == "recipe_base":
+                cls = fencing._reserve_node_at(unit, "RecoveryInstructionRecipe")
+                cls.bases[0] = ast.Name(id="ForeignValue", ctx=ast.Load())
+            elif fault == "current_read":
+                method = fencing._reserve_node_at(unit, "CurrentContinuationMessageProducers.restore_shelf")
+                assert ast.unparse(method.body[-2]) == "self._require_current()"
+                method.body.pop(-2)
+            elif fault == "nominal_shelf":
+                method = fencing._reserve_node_at(unit, "CurrentContinuationMessageProducers._rebuild_shelf")
+                guard = next(
+                    node for node in method.body if isinstance(node, ast.If) and "encode_message_shelf(snapshot)" in ast.unparse(node.test)
+                )
+                guard.test = ast.Constant(value=False)
+            else:
+                method = fencing._reserve_node_at(unit, "CurrentContinuationMessageProducers.recovery_instruction")
+                method.body.append(ast.parse("def foreign_capture():\n    return recovery_instruction_message()").body[0])
+
+        changed = _receiving_changed_units(units, path, change)
+    for changed_unit in changed:
+        ast.fix_missing_locations(changed_unit.tree)
+    failures, refused = compose.recovery_instruction_supplier_contracts(changed)
+    assert failures and refused is None
+    assert compose.recovery_instruction_supplier_contracts(units)[1] == receipt
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "family_forwarding",
+        "family_guard",
+        "retired_family",
+        "custody_context",
+        "custody_family",
+        "context_rebind",
+        "primary_clock",
+        "semantic_family",
+        "mixed_issuer",
+        "sdk_event",
+        "title_return",
+        "title_order",
+        "title_readback",
+    ),
+)
+def test_current_provider_lifecycle_guards_refuse_changed_flow_without_body_pins(fault):
+    units = _source_units(("src/elspeth/web/composer/provider_quota.py", "src/elspeth/web/composer/continuation_title_provider.py"))
+    assert provider.current_provider_lifecycle_contract(units) == []
+    path = units[1].path if fault.startswith("title_") else units[0].path
+
+    def change(unit):
+        if fault == "retired_family":
+            cls = fencing._reserve_node_at(unit, "ProviderInvocationFamily")
+            cls.body.append(ast.parse("PLANNER = 2").body[0])
+        elif fault.startswith("family_"):
+            method = fencing._reserve_node_at(unit, "ProviderInvocationOwner.mint")
+            if fault == "family_guard":
+                method.body.pop(0)
+            else:
+                argument = next(keyword for keyword in method.body[-1].value.keywords if keyword.arg == "family")
+                argument.value = ast.Name(id="foreign_family", ctx=ast.Load())
+        elif fault in {"custody_context", "custody_family", "context_rebind"}:
+            method = fencing._reserve_node_at(unit, "ProviderCallCustody.__init__")
+            if fault == "custody_context":
+                statement = next(
+                    statement
+                    for statement in method.body
+                    if isinstance(statement, ast.Expr) and ast.unparse(statement.value.func) == "required_work.validate_context"
+                )
+                method.body.remove(statement)
+            elif fault == "custody_family":
+                guard = next(
+                    statement
+                    for statement in method.body
+                    if isinstance(statement, ast.If) and "type(family)" in ast.unparse(statement.test)
+                )
+                method.body.remove(guard)
+            else:
+                method.body.append(ast.parse("self._context = foreign_context").body[0])
+        elif fault == "primary_clock":
+            method = fencing._reserve_node_at(unit, "ProviderCallCustody.bind_primary_no_sdk_issuer")
+            guard = next(
+                node
+                for node in ast.walk(method)
+                if isinstance(node, ast.Compare) and ast.unparse(node.left) == "self.continuation_primary_clock"
+            )
+            guard.comparators[0] = ast.Name(id="foreign_clock", ctx=ast.Load())
+        elif fault in {"semantic_family", "mixed_issuer"}:
+            method = fencing._reserve_node_at(unit, "ProviderCallCustody.bind_semantic_no_sdk_issuer")
+            if fault == "semantic_family":
+                guard = next(node for node in ast.walk(method) if isinstance(node, ast.Compare) and ast.unparse(node.left) == "self.family")
+                guard.comparators[0] = ast.parse("ProviderInvocationFamily.PRIMARY", mode="eval").body
+            else:
+                guard = next(node for node in method.body if isinstance(node, ast.If))
+                removed = next(node for node in guard.test.values if ast.unparse(node) == "self._primary_no_sdk_issuer is not None")
+                guard.test.values.remove(removed)
+        elif fault == "sdk_event":
+            method = fencing._reserve_node_at(unit, "ProviderCallCustody.mark_sdk_entered")
+            guard = next(
+                node
+                for node in method.body
+                if isinstance(node, ast.If) and ast.unparse(node.test) == "self._semantic_no_sdk_issuer is not None"
+            )
+            method.body.remove(guard)
+        else:
+            method = fencing._reserve_node_at(unit, "run_prepared_title_provider")
+            refusal = next(
+                node
+                for node in method.body
+                if isinstance(node, ast.If) and ast.unparse(node.test) == "type(policy) is ContinuationAdmissionPolicyV3"
+            )
+            if fault == "title_return":
+                assert isinstance(refusal.body[-1], ast.Return) and refusal.body[-1].value is None
+                refusal.body.pop()
+            elif fault == "title_order":
+                mint = next(node for node in method.body if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "custody")
+                method.body.remove(refusal)
+                method.body.insert(method.body.index(mint) + 1, refusal)
+            else:
+                call = next(
+                    node
+                    for node in ast.walk(refusal)
+                    if isinstance(node, ast.Call) and ast.unparse(node.func) == "read_v3_title_no_sdk_refusal_on_connection"
+                )
+                argument = next(keyword for keyword in call.keywords if keyword.arg == "expected_prepared")
+                argument.value = ast.Name(id="foreign_prepared", ctx=ast.Load())
+
+    changed = _receiving_changed_units(units, path, change)
+    for changed_unit in changed:
+        ast.fix_missing_locations(changed_unit.tree)
+    # This checker inspects the original guards and transfers directly, before CONTRACTS pins.
+    assert provider.current_provider_lifecycle_contract(changed)
+    assert provider.current_provider_lifecycle_contract(units) == []
+
+
+def _continuation_receiver_units():
+    return _source_units((receiver.APP, receiver.DTO, receiver.DRIVER, receiver.SERVICE, receiver.PHASES, receiver.INITIALIZATION))
+
+
+@pytest.mark.parametrize(
+    "fault", ("driver_argument", "run_argument", "close_deadline", "original_failure", "adoption_failure", "extra_dispatch", "owned_join")
+)
+def test_current_worker_segment_transport_refuses_foreign_owners_and_cleanup(fault):
+    units = _source_units((worker_caller.WORKER, worker_caller.DRIVER))
+    failures, receipt = worker_caller.continuation_caller_contracts(units)
+    assert failures == [] and receipt is not None
+    assert len(receipt["job_segment_calls"]) == 2 and len(receipt["transport_calls"]) == 5
+    nodes = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+    assert set(receipt["transport_calls"]).issubset(nodes)
+    assert receipt["segment_driver_call"] in receipt["transport_calls"]
+    assert receipt["segment_close_call"] in receipt["transport_calls"]
+    path = worker_caller.WORKER if fault in {"adoption_failure", "extra_dispatch", "owned_join"} else worker_caller.DRIVER
+
+    def change(unit):
+        if path == worker_caller.DRIVER:
+            method = fencing._reserve_node_at(unit, "run_continuation_segment")
+            spellings = {
+                "driver_argument": "_SegmentDriver",
+                "run_argument": "driver.run",
+                "close_deadline": "lease.close",
+                "original_failure": "combine_failure_objects",
+            }
+            calls = [node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == spellings[fault]]
+            assert calls
+            if fault == "close_deadline":
+                deadline = next(keyword for keyword in calls[0].keywords if keyword.arg == "deadline")
+                assert ast.unparse(deadline.value) == "worker.drain_deadline"
+                deadline.value = ast.Constant(value=0)
+            else:
+                index = -1 if fault == "driver_argument" else 0
+                calls[0].args[index] = ast.Name(id="foreign", ctx=ast.Load())
+        elif fault == "owned_join":
+            method = fencing._reserve_node_at(unit, "_join_owned")
+            method.body.append(ast.parse("return foreign_task").body[0])
+        else:
+            method = fencing._reserve_node_at(unit, "ComposerAsyncWorker._job")
+            calls = [
+                node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == "run_continuation_segment"
+            ]
+            assert len(calls) == 2
+            if fault == "adoption_failure":
+                call = next(call for call in calls if ast.unparse(call.args[3]) == "retained_lease")
+                argument = next(keyword for keyword in call.keywords if keyword.arg == "adoption_failure")
+                assert ast.unparse(argument.value) == "original"
+                argument.value = ast.Name(id="foreign_failure", ctx=ast.Load())
+            else:
+                method.body.append(ast.Expr(value=ast.Await(value=copy.deepcopy(calls[0]))))
+
+    changed = _receiving_changed_units(units, path, change)
+    for changed_unit in changed:
+        ast.fix_missing_locations(changed_unit.tree)
+    failures, refused = worker_caller.continuation_caller_contracts(changed)
+    assert failures and refused is None
+    assert worker_caller.continuation_caller_contracts(units)[1] == receipt
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "owner_argument",
+        "missing_argument",
+        "initialization_argument",
+        "initialization_guard",
+        "phase_field",
+        "phase_rebind",
+        "service_rebind",
+        "service_dict",
+        "phase_forwarding",
+    ),
+)
+def test_current_receiver_preserves_driver_phase_and_initialization_owners(fault):
+    units = _continuation_receiver_units()
+    failures, receipt = receiver.composer_receiver_local_contracts(units)
+    assert failures == [] and receipt is not None
+    nodes = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+    assert receipt["phase_dispatch_call"] in nodes
+    assert len(receipt["initialization_calls"]) == len(receipt["phase_owner_calls"]) == 2
+    if fault.startswith("phase_"):
+        path = receiver.PHASES
+    elif fault.startswith("service_") or fault == "phase_forwarding":
+        path = receiver.SERVICE
+    elif fault == "initialization_guard":
+        path = receiver.INITIALIZATION
+    else:
+        path = receiver.DRIVER
+    # phase_forwarding mutates the service's actual owner.advance call.
+    if fault == "phase_forwarding":
+        path = receiver.SERVICE
+
+    def change(unit):
+        if path == receiver.DRIVER:
+            method = fencing._reserve_node_at(unit, "_SegmentDriver.advance")
+            callee = (
+                "initialize_continuation_composition" if fault == "initialization_argument" else "self.service.advance_continuation_phase"
+            )
+            calls = [node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == callee]
+            assert calls
+            argument = next(
+                keyword
+                for keyword in calls[0].keywords
+                if keyword.arg == ("provider_owner" if fault == "initialization_argument" else "owner")
+            )
+            if fault == "missing_argument":
+                calls[0].keywords.remove(argument)
+            else:
+                argument.value = ast.Name(id="foreign_owner", ctx=ast.Load())
+        elif path == receiver.INITIALIZATION:
+            method = fencing._reserve_node_at(unit, "initialize_continuation_composition")
+            guard = next(
+                node
+                for node in ast.walk(method.body[0])
+                if isinstance(node, ast.Compare) and ast.unparse(node.left) == "provider_owner.required_work"
+            )
+            guard.comparators[0] = ast.Name(id="foreign_work", ctx=ast.Load())
+        elif path == receiver.PHASES:
+            cls = fencing._reserve_node_at(unit, "ContinuationLivePhases")
+            if fault == "phase_field":
+                field = next(node for node in cls.body if isinstance(node, ast.AnnAssign) and ast.unparse(node.target) == "provider_owner")
+                field.annotation = ast.Name(id="ForeignOwner", ctx=ast.Load())
+            else:
+                method = fencing._reserve_node_at(unit, "ContinuationLivePhases.advance")
+                method.body.append(ast.parse("self.provider_owner = foreign_owner").body[0])
+        else:
+            method = fencing._reserve_node_at(unit, "ComposerServiceImpl.advance_continuation_phase")
+            if fault == "phase_forwarding":
+                call = next(node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == "owner.advance")
+                call.args[0] = ast.Name(id="foreign_selected", ctx=ast.Load())
+            else:
+                spelling = (
+                    "self.advance_continuation_phase = foreign"
+                    if fault == "service_rebind"
+                    else "self.__dict__['advance_continuation_phase'] = foreign"
+                )
+                method.body.append(ast.parse(spelling).body[0])
+
+    changed = _receiving_changed_units(units, path, change)
+    for changed_unit in changed:
+        ast.fix_missing_locations(changed_unit.tree)
+    failures, _refused = receiver.composer_receiver_local_contracts(changed)
+    assert failures
+    assert receiver.composer_receiver_local_contracts(units)[0] == []
+
+
+@pytest.mark.parametrize("fault", ("foreign_work", "foreign_claim", "owner_rebind", "owner_escape", "mint_family", "clock", "issuer"))
+def test_current_primary_mint_refuses_foreign_and_escaped_capability(fault):
+    units = _source_units((provider.PRIMARY_PATH,))
+    failures, receipt = provider.continuation_primary_mint_contract(units)
+    assert failures == [] and receipt is not None
+    assert receipt["mint"] in tuple(ast.walk(receipt["caller"]))
+
+    def change(unit):
+        method = fencing._reserve_node_at(unit, "run_continuation_primary")
+        if fault == "foreign_claim":
+            guard = fencing._reserve_node_at(unit, "_require_owners")
+            comparison = next(
+                node
+                for node in ast.walk(guard)
+                if isinstance(node, ast.Compare) and ast.unparse(node.left) == "current.durable_operation_id"
+            )
+            comparison.comparators[0] = ast.Constant(value=0)
+        elif fault == "foreign_work":
+            call = next(node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_require_owners")
+            call.args[1] = ast.Name(id="foreign_work", ctx=ast.Load())
+        elif fault in {"owner_rebind", "owner_escape"}:
+            spelling = "provider_owner = foreign_owner" if fault == "owner_rebind" else "foreign_capture(provider_owner)"
+            method.body.append(ast.parse(spelling).body[0])
+        else:
+            spelling = {
+                "mint_family": "provider_owner.mint",
+                "clock": "custody.bind_continuation_primary_clock",
+                "issuer": "custody.bind_primary_no_sdk_issuer",
+            }[fault]
+            call = next(node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == spelling)
+            call.args[0] = ast.parse("ProviderInvocationFamily.ADVISOR" if fault == "mint_family" else "foreign", mode="eval").body
+
+    changed = _receiving_changed_units(units, provider.PRIMARY_PATH, change)
+    for changed_unit in changed:
+        ast.fix_missing_locations(changed_unit.tree)
+    failures, refused = provider.continuation_primary_mint_contract(changed)
+    assert failures and refused is None
+    assert provider.continuation_primary_mint_contract(units)[1] == receipt
+
+
 @pytest.mark.parametrize("fault", ("receiver", "operation", "actor", "provider", "failure", "missing", "extra"))
 def test_actual_owner_cancel_failure_handoff_preserves_exact_original_targets(fault):
     path = "src/elspeth/web/sessions/routes/composer/operations.py"
@@ -91,17 +499,14 @@ def test_native_service_failure_field_requires_exact_none_partition_and_veto(rev
 
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/sessions/service.py"
+INITIALIZATION = "src/elspeth/web/composer/continuation_initialization.py"
 PROTOCOL = "src/elspeth/web/sessions/protocol.py"
 COMPOSER_PROTOCOL = "src/elspeth/web/composer/protocol.py"
 TRANSCRIPT_READER = "src/elspeth/web/composer/transcript_blob_reader.py"
 
 
 def _source_units(paths: tuple[str, ...]) -> tuple[fencing.SourceUnit, ...]:
-    # Complete ordinary-dispatch fixtures now include the actual moved body.
-    # Keep existing caller indices stable and never synthesize its receipt.
-    ordinary_paths = set(compose._METHOD_PATHS) - {compose.FINALIZATION}
-    if ordinary_paths.issubset(paths) and compose.FINALIZATION not in paths:
-        paths = (*paths, compose.FINALIZATION)
+    # V1 moved-finalizer fixture expansion was deleted with its only caller.
     return tuple(fencing._parse_source(path, (ROOT / path).read_text()) for path in paths)
 
 
@@ -308,20 +713,24 @@ def _retained_transfer_units() -> tuple[fencing.SourceUnit, ...]:
         tuple(
             sorted(
                 {
-                    *compose._METHOD_PATHS,
+                    compose.DRIVER,
+                    compose.PHASES,
+                    compose.PROPOSALS,
+                    compose.SETTLEMENT,
+                    TURN,
+                    INITIALIZATION,
                     terminal.SERVICE,
                     terminal.REQUIRED,
                     terminal.WORKERS,
                     terminal.AUTHORITY,
                     "src/elspeth/web/composer/audit_storage.py",
-                    "src/elspeth/web/sessions/composer_finalization.py",
                 }
             )
         )
     )
 
 
-def test_retained_failure_transfer_receipts_identify_exact_actual_four_calls() -> None:
+def test_retained_failure_transfer_receipts_identify_exact_current_calls() -> None:
     units = _retained_transfer_units()
     failures, calls = fencing._reserve_retained_failure_transfer_receipts(units)
     assert failures == []
@@ -331,11 +740,9 @@ def test_retained_failure_transfer_receipts_identify_exact_actual_four_calls() -
         for node in ast.walk(unit.tree)
         if isinstance(node, ast.Call) and (unit.path, id(node)) in calls
     }
-    assert len(calls) == 4
+    assert len(calls) == 2
     assert actual == {
-        (TURN, "lease.create_task"),
-        (TURN, "_capture_retained_operation_read"),
-        (TURN, "_read_retained_operation_context"),
+        (INITIALIZATION, "_read_retained_operation_context"),
         (SERVICE, "private_operation_failure_draft"),
     }
 
@@ -392,7 +799,7 @@ def test_retained_failure_branch_dependency_keeps_only_original_receiver_and_cal
     units = _retained_transfer_units()
     failures, calls = fencing._reserve_retained_failure_transfer_receipts(units)
     assert failures == [], "the real retained-transfer positive is a prerequisite, not an opposition RED"
-    assert len(calls) == 4
+    assert len(calls) == 2
     audit_path = "src/elspeth/web/composer/audit_storage.py"
     assert fencing._reserve_RETAINED_FAILURE_SUPPLIERS[audit_path] == (
         "ComposerOperationFailureFacts",
@@ -417,9 +824,7 @@ def test_retained_failure_branch_dependency_keeps_only_original_receiver_and_cal
         if isinstance(node, ast.Call) and (unit.path, id(node)) in calls
     }
     assert actual == {
-        (TURN, "lease.create_task"),
-        (TURN, "_capture_retained_operation_read"),
-        (TURN, "_read_retained_operation_context"),
+        (INITIALIZATION, "_read_retained_operation_context"),
         (SERVICE, "private_operation_failure_draft"),
     }
 
@@ -515,122 +920,19 @@ def test_retained_failure_branch_dependency_refuses_declaration_header(field: st
     assert fencing._reserve_retained_failure_transfer_receipts(units) == ([], original_calls)
 
 
-@pytest.mark.parametrize("fault", ("missing", "foreign", "swapped", "constant", "none", "coroutine_default"))
-def test_p4_title_limit_refuses_wrong_actual_forwarding(fault: str) -> None:
-    original = _source_units((TURN,))[0]
-    method = fencing._reserve_node_at(original, "_run_composer_turn")
-    invoke = method.body[36].body[24]
-    title = receiver.composer_title_prelude(invoke)
-    dispatch = receiver.composer_dispatch_calls(invoke)
-    assert title is invoke.body[0] and dispatch is not None
-    changed = fencing._parse_source(TURN, original.source)
-    candidate = fencing._reserve_node_at(changed, "_run_composer_turn").body[36].body[24]
-    child = candidate.body[0].body[2]
-    call = next(node for node in ast.walk(child) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session")
-    argument = next(keyword for keyword in call.keywords if keyword.arg == "max_prepared_request_bytes")
-    assert ast.unparse(argument.value) == "settings.composer_max_prepared_request_bytes"
-    if fault == "missing":
-        call.keywords.remove(argument)
-    elif fault == "foreign":
-        argument.value.value = ast.Name(id="foreign_settings", ctx=ast.Load())
-    elif fault == "swapped":
-        argument.value.attr = "composer_max_tool_calls_per_turn"
-    elif fault == "constant":
-        argument.value = ast.Constant(value=2 * 1024 * 1024)
-    elif fault == "none":
-        argument.value = ast.Constant(value=None)
-    else:
-        child.args.args.append(ast.arg(arg="limit"))
-        child.args.defaults.append(copy.deepcopy(argument.value))
-    ast.fix_missing_locations(changed.tree)
-    assert receiver.composer_title_prelude(candidate) is None
-    assert receiver.composer_dispatch_calls(candidate) is None
-    assert receiver.composer_title_prelude(invoke) is title
-    assert receiver.composer_dispatch_calls(invoke) == dispatch
+# Retired test_p4_title_limit_refuses_wrong_actual_forwarding: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize("method_name", ("compose", "compose_recovery"))
-@pytest.mark.parametrize("fault", ("budget", "missing_budget", "message", "unknown_keyword"))
-def test_p4_paired_call_arguments_and_default_escape_remain_closed(method_name: str, fault: str) -> None:
-    original = _source_units((TURN,))[0]
-    invoke = fencing._reserve_node_at(original, "_run_composer_turn").body[36].body[24]
-    dispatch = receiver.composer_dispatch_calls(invoke)
-    assert dispatch is not None
-    changed = fencing._parse_source(TURN, original.source)
-    candidate = fencing._reserve_node_at(changed, "_run_composer_turn").body[36].body[24]
-    calls = receiver.composer_dispatch_calls(candidate)
-    assert calls is not None
-    call = next(node for node in calls if node.func.attr == method_name)
-    budget = next(keyword for keyword in call.keywords if keyword.arg == "budget_seconds")
-    assert ast.unparse(budget.value) == "compose_budget_seconds"
-    if fault == "budget":
-        budget.value = ast.parse("budget_anchor.remaining_at_running_seconds", mode="eval").body
-    elif fault == "missing_budget":
-        call.keywords.remove(budget)
-    elif fault == "message":
-        if method_name == "compose":
-            assert ast.unparse(call.args[0]) == "message_text"
-            call.args[0] = ast.Name(id="foreign_message", ctx=ast.Load())
-        else:
-            message = next(keyword for keyword in call.keywords if keyword.arg == "message")
-            assert ast.unparse(message.value) == "message_text"
-            message.value = ast.Name(id="foreign_message", ctx=ast.Load())
-    else:
-        call.keywords.append(ast.keyword(arg="foreign_argument", value=ast.Name(id="provider_owner", ctx=ast.Load())))
-    ast.fix_missing_locations(changed.tree)
-    assert receiver.composer_title_prelude(candidate) is candidate.body[0]
-    assert receiver.composer_dispatch_calls(candidate) is None
-    assert receiver.composer_dispatch_calls(invoke) == dispatch
+# Retired test_p4_paired_call_arguments_and_default_escape_remain_closed: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize("fault", ("condition", "graph_guard", "extra_effect"))
-def test_p4_paired_dispatch_keeps_actual_closed_branches(fault: str) -> None:
-    original = _source_units((TURN,))[0]
-    invoke = fencing._reserve_node_at(original, "_run_composer_turn").body[36].body[24]
-    dispatch = receiver.composer_dispatch_calls(invoke)
-    assert dispatch is not None
-    changed = fencing._parse_source(TURN, original.source)
-    candidate = fencing._reserve_node_at(changed, "_run_composer_turn").body[36].body[24]
-    branch = candidate.body[2]
-    assert isinstance(branch, ast.If) and ast.unparse(branch.test) == "recovery_context.malformed_head"
-    if fault == "condition":
-        branch.test = ast.Constant(value=True)
-    elif fault == "graph_guard":
-        del branch.orelse[0]
-    else:
-        branch.body.insert(0, ast.parse("foreign(provider_owner)").body[0])
-    ast.fix_missing_locations(changed.tree)
-    assert receiver.composer_dispatch_calls(candidate) is None
-    assert receiver.composer_dispatch_calls(invoke) == dispatch
+# Retired test_p4_paired_dispatch_keeps_actual_closed_branches: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-def test_composer_finalization_namespace_serializes_actual_clone_with_typed_ellipsis() -> None:
-    unit = _source_units((compose.FINALIZATION,))[0]
-    clone = fencing._parse_source(unit.path, unit.source)
-    method = fencing._reserve_node_at(unit, "_turn_audit_cohort_drafts")
-    assert any(isinstance(node, ast.Constant) and node.value is Ellipsis for node in ast.walk(method.returns))
-    actual = compose._finalization_namespace_shape(unit.tree)
-    assert len(actual) == 64
-    assert compose._finalization_namespace_shape(clone.tree) == actual
-    assert compose._canonical_ast(ast.Constant(value=Ellipsis)) == [
-        "Constant",
-        [["value", {"literal_type": "ellipsis"}]],
-    ]
-    marker_literal = ast.parse("{'literal_type': 'ellipsis'}", mode="eval").body
-    assert compose._canonical_ast(marker_literal) != compose._canonical_ast(ast.Constant(value=Ellipsis))
+# Retired test_composer_finalization_namespace_serializes_actual_clone_with_typed_ellipsis: V1 moved-finalizer receipt had no caller after the turn loop was removed.
 
 
-@pytest.mark.parametrize("replacement", ("Ellipsis", "...", None))
-def test_composer_finalization_namespace_distinguishes_actual_ellipsis_from_source_values(replacement: str | None) -> None:
-    unit = _source_units((compose.FINALIZATION,))[0]
-    expected = compose._finalization_namespace_shape(unit.tree)
-    changed = fencing._parse_source(unit.path, unit.source)
-    method = fencing._reserve_node_at(changed, "_turn_audit_cohort_drafts")
-    targets = [node for node in ast.walk(method.returns) if isinstance(node, ast.Constant) and node.value is Ellipsis]
-    assert targets, "the opposed Ellipsis must be in a real retained return annotation"
-    targets[0].value = replacement
-    assert compose._finalization_namespace_shape(changed.tree) != expected
-    assert compose._finalization_namespace_shape(unit.tree) == expected
+# Retired test_composer_finalization_namespace_distinguishes_actual_ellipsis_from_source_values: V1 moved-finalizer receipt had no caller after the turn loop was removed.
 
 
 @pytest.mark.parametrize(
@@ -646,199 +948,22 @@ def test_composer_canonical_literal_addition_preserves_existing_constant_shape(l
     assert compose._canonical_ast(ast.Constant(value=literal)) == expected
 
 
-@pytest.mark.parametrize("fault", ("live-freeze", "missing-nested-freeze", "wrong-thaw"))
-def test_composer_moved_finalizer_value_boundaries_refuse_after_only_source_shapes_are_rebound(monkeypatch, fault):
-    units = _retained_transfer_units()
-    failures, receipt = compose.compose_proposal_local_transfers(units)
-    assert not failures and receipt is not None, failures
-    path = compose.FINALIZATION
-    original = next(unit for unit in units if unit.path == path)
-    changed = fencing._parse_source(path, original.source)
-    method = fencing._reserve_node_at(changed, "settle_composer_result")
-    if fault == "wrong-thaw":
-        calls = [
-            node
-            for node in ast.walk(method)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "deep_thaw"
-        ]
-        assert len(calls) == 4
-        calls[0].args[0] = ast.Name(id="settings", ctx=ast.Load())
-        monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, path, compose._method_shape(method))
-    else:
-        initializer = fencing._reserve_node_at(changed, "ComposerFinalizationInputs.__post_init__")
-        call = initializer.body[0].value
-        if fault == "live-freeze":
-            call.args[1] = ast.Constant(value="lease")
-        else:
-            assert ast.unparse(call.args[-1]) == "'chat_ingress_inputs'"
-            call.args.pop()
-    ast.fix_missing_locations(changed.tree)
-    monkeypatch.setattr(compose, "_FINALIZATION_NAMESPACE_SHAPE", compose._finalization_namespace_shape(changed.tree))
-    failures, refused = compose.compose_proposal_local_transfers(tuple(changed if unit.path == path else unit for unit in units))
-    assert failures and refused is None
-    assert any("value freeze" in failure or "value thaw" in failure for failure in failures), failures
+# Retired test_composer_moved_finalizer_value_boundaries_refuse_after_only_source_shapes_are_rebound: V1 moved-finalizer receipt had no caller after the turn loop was removed.
 
 
-def test_composer_moved_finalizer_receipt_identifies_only_actual_wrapper_nodes() -> None:
-    units = _retained_transfer_units()
-    failures, receipt = compose.compose_proposal_local_transfers(units)
-    assert failures == [], "the actual complete-body prerequisites must close before moved-finalizer oppositions"
-    assert receipt is not None
-    turn = next(unit for unit in units if unit.path == TURN)
-    expected = {
-        name: (TURN, id(node))
-        for name in ("ComposerFinalizationInputs", "settle_composer_result", "settle_post_provider")
-        for node in ast.walk(turn.tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
-    }
-    assert set(expected) == {"ComposerFinalizationInputs", "settle_composer_result", "settle_post_provider"}
-    assert receipt["moved_finalization"] == expected
+# Retired test_composer_moved_finalizer_receipt_identifies_only_actual_wrapper_nodes: V1 moved-finalizer receipt had no caller after the turn loop was removed.
 
 
-@pytest.mark.parametrize(
-    "fault",
-    ("service", "lease", "running", "observation", "provider_binding", "budget_anchor", "result", "duplicate", "owner"),
-)
-def test_composer_moved_finalizer_refuses_changed_actual_handoff(fault: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    units = _retained_transfer_units()
-    failures, receipt = compose.compose_proposal_local_transfers(units)
-    assert failures == [] and receipt is not None
-    original_shape = compose._REVIEWED_METHOD_SHAPES[TURN]
-    mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == TURN else unit for unit in units)
-    turn = next(unit for unit in mutated if unit.path == TURN)
-    method = fencing._reserve_node_at(turn, "_run_composer_turn")
-    wrapper = next(node for node in ast.walk(method) if isinstance(node, ast.AsyncFunctionDef) and node.name == "settle_post_provider")
-    handoff = wrapper.body[0].value.value
-    assert isinstance(handoff, ast.Call) and ast.unparse(handoff.func) == "settle_composer_result"
-    constructor = handoff.args[0]
-    assert isinstance(constructor, ast.Call) and ast.unparse(constructor.func) == "ComposerFinalizationInputs"
-    if fault == "result":
-        assert ast.unparse(handoff.args[1]) == "result"
-        handoff.args[1] = ast.Name(id="foreign_result", ctx=ast.Load())
-    elif fault == "duplicate":
-        wrapper.body.insert(0, ast.Expr(value=ast.Await(value=copy.deepcopy(handoff))))
-    elif fault == "owner":
-        owners = [
-            node
-            for node in ast.walk(method)
-            if isinstance(node, ast.Assign)
-            and ast.unparse(node).startswith("continuation = lease.create_task(_capture_freeform_child(settle_post_provider(result))")
-        ]
-        assert len(owners) == 1
-        owners[0].value.func.value = ast.Name(id="foreign_lease", ctx=ast.Load())
-    else:
-        argument = next(keyword for keyword in constructor.keywords if keyword.arg == fault)
-        assert ast.unparse(argument.value) == fault
-        argument.value = ast.Name(id="foreign_" + fault, ctx=ast.Load())
-    ast.fix_missing_locations(turn.tree)
-    # Re-admit only the changed caller's whole-body pin: the finite join must
-    # distinguish the actual owner/argument/once-only obligation itself.
-    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, compose._method_shape(compose._strip_inert_annotations(method, TURN)))
-    failures, refused = compose.compose_proposal_local_transfers(mutated)
-    assert failures and refused is None
-    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, original_shape)
-    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+# Retired test_composer_moved_finalizer_refuses_changed_actual_handoff: V1 moved-finalizer receipt had no caller after the turn loop was removed.
 
 
-@pytest.mark.parametrize("fault", ("base", "metaclass", "decorator", "default", "descriptor"))
-def test_composer_moved_finalizer_refuses_nonplain_constructor(fault: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    units = _retained_transfer_units()
-    failures, receipt = compose.compose_proposal_local_transfers(units)
-    assert failures == [] and receipt is not None
-    original_namespace_shape = compose._FINALIZATION_NAMESPACE_SHAPE
-    path = "src/elspeth/web/sessions/composer_finalization.py"
-    mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == path else unit for unit in units)
-    source = next(unit for unit in mutated if unit.path == path)
-    cls = fencing._reserve_node_at(source, "ComposerFinalizationInputs")
-    assert isinstance(cls, ast.ClassDef)
-    if fault == "base":
-        cls.bases = [ast.Name(id="foreign", ctx=ast.Load())]
-    elif fault == "metaclass":
-        cls.keywords = [ast.keyword(arg="metaclass", value=ast.Name(id="foreign", ctx=ast.Load()))]
-    elif fault == "decorator":
-        cls.decorator_list = [ast.Name(id="foreign", ctx=ast.Load())]
-    elif fault == "default":
-        field = next(node for node in cls.body if isinstance(node, ast.AnnAssign) and ast.unparse(node.target) == "lease")
-        assert field.value is None
-        field.value = ast.Call(func=ast.Name(id="foreign", ctx=ast.Load()), args=[], keywords=[])
-    else:
-        cls.body.extend(ast.parse("def __getattribute__(self, name):\n return foreign(name)\n").body)
-    ast.fix_missing_locations(source.tree)
-    # Constructor obligations must survive deliberately re-admitted source
-    # seals; this does not grant the changed declaration or its effects.
-    monkeypatch.setattr(compose, "_FINALIZATION_NAMESPACE_SHAPE", compose._finalization_namespace_shape(source.tree))
-    failures, refused = compose.compose_proposal_local_transfers(mutated)
-    assert failures and refused is None
-    monkeypatch.setattr(compose, "_FINALIZATION_NAMESPACE_SHAPE", original_namespace_shape)
-    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+# Retired test_composer_moved_finalizer_refuses_nonplain_constructor: V1 moved-finalizer receipt had no caller after the turn loop was removed.
 
 
-@pytest.mark.parametrize("fault", ("forwarding", "checkpoint", "audit", "cancellation", "response", "return"))
-def test_composer_moved_finalizer_preserves_complete_selected_body(fault: str) -> None:
-    units = _retained_transfer_units()
-    failures, receipt = compose.compose_proposal_local_transfers(units)
-    assert failures == [] and receipt is not None
-    path = "src/elspeth/web/sessions/composer_finalization.py"
-    mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == path else unit for unit in units)
-    source = next(unit for unit in mutated if unit.path == path)
-    method = fencing._reserve_node_at(source, "settle_composer_result")
-    if fault == "forwarding":
-        target = next(node for node in method.body if isinstance(node, ast.Assign) and ast.unparse(node) == "lease = inputs.lease")
-        target.value = ast.Name(id="foreign_lease", ctx=ast.Load())
-    elif fault in {"checkpoint", "audit"}:
-        spelling = "checkpoint_projection.complete_owned()" if fault == "checkpoint" else "observation.audit_cohort_durable = True"
-        targets = [node for node in ast.walk(method) if isinstance(node, (ast.Assign, ast.Expr)) and ast.unparse(node) == spelling]
-        assert targets
-        target = targets[-1]
-        if isinstance(target, ast.Assign):
-            target.value = ast.Constant(value=False)
-        else:
-            target.value = ast.Constant(value=None)
-    elif fault in {"cancellation", "response"}:
-        spelling = "_join_shielded_task_after_cancellation" if fault == "cancellation" else "_message_with_state_response"
-        targets = [node for node in ast.walk(method) if isinstance(node, ast.Name) and node.id == spelling]
-        assert targets
-        targets[-1].id = "foreign"
-    else:
-        assert isinstance(method.body[-1], ast.Return) and ast.unparse(method.body[-1].value) == "record"
-        method.body[-1].value = ast.Name(id="foreign", ctx=ast.Load())
-    ast.fix_missing_locations(source.tree)
-    failures, refused = compose.compose_proposal_local_transfers(mutated)
-    assert failures and refused is None
-    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+# Retired test_composer_moved_finalizer_preserves_complete_selected_body: V1 moved-finalizer receipt had no caller after the turn loop was removed.
 
 
-@pytest.mark.parametrize("fault", ("missing", "duplicate", "foreign_path", "foreign_import"))
-def test_composer_moved_finalizer_refuses_source_substitution(fault: str) -> None:
-    units = _retained_transfer_units()
-    failures, receipt = compose.compose_proposal_local_transfers(units)
-    assert failures == [] and receipt is not None
-    path = "src/elspeth/web/sessions/composer_finalization.py"
-    source = next(unit for unit in units if unit.path == path)
-    if fault == "missing":
-        mutated = tuple(unit for unit in units if unit.path != path)
-    elif fault == "duplicate":
-        mutated = (*units, fencing._parse_source(path, source.source))
-    elif fault == "foreign_path":
-        mutated = (
-            *(unit for unit in units if unit.path != path),
-            fencing._parse_source("src/elspeth/foreign_finalization.py", source.source),
-        )
-    else:
-        mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == TURN else unit for unit in units)
-        turn = next(unit for unit in mutated if unit.path == TURN)
-        imports = [
-            node
-            for node in turn.tree.body
-            if isinstance(node, ast.ImportFrom)
-            and node.module == "elspeth.web.sessions.composer_finalization"
-            and any(alias.name == "settle_composer_result" for alias in node.names)
-        ]
-        assert len(imports) == 1
-        imports[0].module = "foreign.finalization"
-    failures, refused = compose.compose_proposal_local_transfers(mutated)
-    assert failures and refused is None
-    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+# Retired test_composer_moved_finalizer_refuses_source_substitution: V1 moved-finalizer receipt had no caller after the turn loop was removed.
 
 
 @pytest.mark.parametrize(
@@ -892,11 +1017,13 @@ def test_terminal_p4_declaration_roles_survive_readmitted_namespace(
         "authority",
         "binding",
         "callee",
-        "task_supplier",
-        "join",
-        "cancellation",
+        "clock_callback",
+        "context_capture",
+        "late_read",
+        "owner_guard",
+        "argument_rebind",
         "reader_forwarding",
-        "capture_failure",
+        "cancellation",
         "outcome_guard",
         "import",
         "dependency_rebound",
@@ -910,36 +1037,62 @@ def test_retained_failure_transfers_refuse_changed_source(fault: str, monkeypatc
     units = _retained_transfer_units()
     assert fencing._reserve_retained_failure_transfer_receipts(units)[0] == []
     index = {unit.path: unit for unit in units}
-    turn = fencing._reserve_node_at(index[TURN], "_run_composer_turn")
-    history = turn.body[36].body[6]
-    reader = next(
-        node for node in ast.walk(history) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_read_retained_operation_context"
-    )
+    initialization = index[INITIALIZATION]
+    history_failures, reader = fencing._reserve_retained_history_continuation_flow(initialization)
+    assert history_failures == [] and reader is not None
+    outer = fencing._reserve_node_at(initialization, "prepare_pretitle_bootstrap")
+    prepare = next(node for node in outer.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "prepare")
     audit = index["src/elspeth/web/composer/audit_storage.py"]
+    flow_faults = {"authority", "binding", "callee", "clock_callback", "context_capture", "late_read", "owner_guard", "argument_rebind"}
     if fault in {"authority", "binding"}:
         next(keyword for keyword in reader.keywords if keyword.arg == fault).value = ast.Name(id="foreign", ctx=ast.Load())
     elif fault == "callee":
         reader.func = ast.Name(id="foreign_reader", ctx=ast.Load())
-    elif fault == "task_supplier":
-        history.value.func.value = ast.Name(id="foreign_lease", ctx=ast.Load())
-    elif fault == "join":
-        turn.body[36].body[8].value.value.args[0] = ast.Name(id="foreign_task", ctx=ast.Load())
-    elif fault == "cancellation":
-        turn.body[36].body[11].body[0] = ast.Pass()
-    elif fault == "reader_forwarding":
+    elif fault == "clock_callback":
+        run = next(node for node in outer.body if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "prepared")
+        run.value.value.args[1] = ast.Name(id="foreign_callback", ctx=ast.Load())
+    elif fault == "context_capture":
+        capture = next(
+            node for node in ast.walk(prepare) if isinstance(node, ast.Call) and ast.unparse(node.func) == "capture_continuation_bootstrap"
+        )
+        next(keyword for keyword in capture.keywords if keyword.arg == "retained_context").value = ast.Name(
+            id="foreign_context", ctx=ast.Load()
+        )
+    elif fault == "late_read":
+        read_statement = next(
+            node
+            for node in prepare.body
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Await) and node.value.value is reader
+        )
+        prepare.body.remove(read_statement)
+        prepare.body.insert(len(prepare.body) - 1, read_statement)
+    elif fault == "owner_guard":
+        outer.body[0].test = ast.Constant(value=False)
+    elif fault == "argument_rebind":
+        outer.body.insert(5, ast.parse("required_work = foreign").body[0])
+    elif fault in {"reader_forwarding", "cancellation", "outcome_guard"}:
         declaration = fencing._reserve_node_at(index[TURN], "_read_retained_operation_context")
-        declaration.body.insert(1, ast.parse("foreign(authority)").body[0])
-    elif fault == "capture_failure":
-        declaration = fencing._reserve_node_at(index[TURN], "_capture_retained_operation_read")
-        declaration.body[0].handlers[0].body = [ast.parse("return foreign(read)").body[0]]
-    elif fault == "outcome_guard":
-        declaration = fencing._reserve_node_at(index[TURN], "_RetainedOperationReadOutcome.__post_init__")
-        declaration.body[0].test = ast.Constant(value=False)
+        if fault == "reader_forwarding":
+            declaration.body.insert(1, ast.parse("foreign(authority)").body[0])
+        elif fault == "cancellation":
+            original = next(
+                node for node in declaration.body if isinstance(node, ast.Expr) and ast.unparse(node).startswith("errors.extend(")
+            )
+            declaration.body.remove(original)
+        else:
+            guard = next(
+                node
+                for node in declaration.body
+                if isinstance(node, ast.If) and ast.unparse(node.test) == "isinstance(outcome, RequiredSQLRaised)"
+            )
+            guard.test = ast.Constant(value=False)
     elif fault == "import":
         imported = next(
-            node for node in index[TURN].tree.body if isinstance(node, ast.ImportFrom) and node.module == "elspeth.web.async_workers"
+            node
+            for node in initialization.tree.body
+            if isinstance(node, ast.ImportFrom) and node.module == "elspeth.web.sessions.composer_turn"
         )
-        imported.module = "foreign.async_workers"
+        imported.module = "foreign.composer_turn"
     elif fault == "dependency_rebound":
         audit.tree.body.append(
             ast.parse("def mutate():\n global build_private_tool_evidence\n build_private_tool_evidence = foreign\n").body[0]
@@ -953,6 +1106,7 @@ def test_retained_failure_transfers_refuse_changed_source(fault: str, monkeypatc
             call.func = ast.Name(id="foreign_projection", ctx=ast.Load())
         else:
             call.keywords[0].value = ast.Name(id="foreign_failure", ctx=ast.Load())
+        monkeypatch.setitem(terminal.GRAMMARS, terminal.FAIL, terminal.grammar(method))
     else:
         declaration = fencing._reserve_node_at(audit, "private_operation_failure_draft")
         if fault == "private_forwarding":
@@ -961,20 +1115,16 @@ def test_retained_failure_transfers_refuse_changed_source(fault: str, monkeypatc
             declaration.body[1].test = ast.Constant(value=False)
     for unit in units:
         ast.fix_missing_locations(unit.tree)
-    # Re-admit the changed caller grammar: structural history/call checks must
-    # still refuse, rather than succeeding only because an old digest differs.
-    if fault in {"authority", "binding", "callee", "task_supplier", "join", "cancellation"}:
-        monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, compose._method_shape(compose._strip_inert_annotations(turn, TURN)))
-    elif fault in {"private_callee", "private_argument"}:
-        monkeypatch.setitem(terminal.GRAMMARS, terminal.FAIL, terminal.grammar(method))
+    if fault in flow_faults:
+        # This actual callback/argument check is independent of the full caller recipe.
+        assert fencing._reserve_retained_history_continuation_flow(initialization)[0]
     failures, calls = fencing._reserve_retained_failure_transfer_receipts(units)
-    assert failures
-    assert calls == frozenset()
+    assert failures and calls == frozenset()
 
 
 @pytest.mark.parametrize("fault", ("omit_admission", "foreign_worker_app", "foreign_return"))
 def test_reviewed_app_whole_scope_matches_live_source_and_refuses_drift(fault: str) -> None:
-    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN))
+    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_caller.DRIVER))
     assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == []
     assert worker_caller.worker_caller_local_contracts(units)[0] == []
     factory = fencing._reserve_node_at(units[0], "_create_app")
@@ -1181,206 +1331,25 @@ def test_reviewed_u39_source_guard_seals_exact_candidate_and_discovery_transfers
     assert fencing._reserve_full_source_failures(sources) == []
 
 
-def test_retained_operation_context_cannot_be_replaced_at_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    calls = receiver.composer_dispatch_calls(method.body[36].body[24])
-    assert calls is not None
-    ordinary = next(call for call in calls if call.func.attr == "compose")
-    context = next(keyword for keyword in ordinary.keywords if keyword.arg == "retained_operation_context")
-    assert ast.unparse(context.value) == "retained_operation_context"
-    context.value = ast.Name(id="foreign_context", ctx=ast.Load())
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
-    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, compose._method_shape(compose._strip_inert_annotations(method, TURN)))
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer turn exact paired call arguments or closed branches changed"]
+# Retired test_retained_operation_context_cannot_be_replaced_at_dispatch: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize(
-    ("index", "message"),
-    (
-        (1, "composer retained operation context admission changed"),
-        (2, "composer pair admission guard changed"),
-        (3, "composer owner, service, binding or context admission changed"),
-    ),
-)
-@pytest.mark.parametrize("fault", ("alter", "move"))
-def test_composer_admission_structure_refuses_drift_even_with_rebound_grammar(
-    index: int, message: str, fault: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    method = fencing._reserve_node_at(units[1], "ComposerServiceImpl.compose")
-    if fault == "alter":
-        method.body[index].test = ast.Constant(value=False)
-    else:
-        method.body[index], method.body[index + 1] = method.body[index + 1], method.body[index]
-    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, compose.SERVICE, compose._method_shape(method))
-    assert compose.compose_proposal_local_transfers(units)[0] == [message]
+# Retired test_composer_admission_structure_refuses_drift_even_with_rebound_grammar: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize(
-    "fault",
-    ("message", "required_work", "provider_owner", "session_operation_context", "retained_operation_context", "turn_evidence", "branch"),
-)
-def test_common_compose_entry_binds_retained_loop_arguments_and_excludes_extra_branches(fault: str) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[1], "ComposerServiceImpl.compose")
-    calls = [
-        node
-        for node in ast.walk(method)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_compose_loop"
-    ]
-    assert len(calls) == 1
-    call = calls[0]
-    if fault == "message":
-        assert ast.unparse(call.args[0]) == "message"
-        call.args[0] = ast.Name(id="foreign_message", ctx=ast.Load())
-    elif fault == "branch":
-        returns = [node for node in ast.walk(method) if isinstance(node, ast.Return) and call in ast.walk(node)]
-        assert len(returns) == 1
-        blocks = [node.body for node in ast.walk(method) if isinstance(node, ast.Try) and returns[0] in node.body]
-        assert len(blocks) == 1
-        blocks[0].insert(
-            blocks[0].index(returns[0]), ast.parse("if unreviewed_predicate():\n    return await unreviewed_effect()\n").body[0]
-        )
-    else:
-        keywords = [keyword for keyword in call.keywords if keyword.arg == fault]
-        assert len(keywords) == 1 and ast.unparse(keywords[0].value) == fault
-        keywords[0].value = ast.Name(id="foreign_custody", ctx=ast.Load())
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + compose.SERVICE]
+# Retired test_common_compose_entry_binds_retained_loop_arguments_and_excludes_extra_branches: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize("fault", ("authority", "binding", "join", "outcome", "error", "context", "move"))
-def test_history_receiver_prefix_refuses_changed_transfer_without_body_hash(fault: str) -> None:
-    method = fencing._reserve_node_at(_source_units((TURN,))[0], "_run_composer_turn")
-    prefix = method.body[36].body[4:18] + method.body[36].body[19:24]
-    assert receiver.receiver_transfer_prefix(prefix)
-    if fault in {"authority", "binding"}:
-        read = next(
-            node
-            for node in ast.walk(prefix[2])
-            if isinstance(node, ast.Call) and ast.unparse(node.func) == "_read_retained_operation_context"
-        )
-        keyword = next(item for item in read.keywords if item.arg == fault)
-        keyword.value = ast.Name(id="foreign", ctx=ast.Load())
-    elif fault == "join":
-        prefix[4].value.value.args[0] = ast.Name(id="foreign_task", ctx=ast.Load())
-    elif fault == "outcome":
-        prefix[5].test = ast.Constant(value=False)
-    elif fault == "error":
-        prefix[6].body[-1] = ast.Pass()
-    elif fault == "context":
-        prefix[9].value = ast.Name(id="foreign_context", ctx=ast.Load())
-    else:
-        prefix[9], prefix[10] = prefix[10], prefix[9]
-    assert not receiver.receiver_transfer_prefix(prefix)
+# Retired test_history_receiver_prefix_refuses_changed_transfer_without_body_hash: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize(
-    "fault",
-    (None, "session", "message", "lifecycle", "eligibility", "settings", "owner", "factory", "before_history", "after_receiver", "effect"),
-)
-def test_common_cost_capture_binds_original_identity_and_closed_receiver_prefix(fault: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    block = method.body[36].body
-    prefix = block[4:18] + block[19:24]
-    assert receiver.receiver_transfer_prefix(prefix)
-    route_units = (units[0], *_source_units((route.HELPERS, route.FINALIZATION)))
-    assert route.route_helper_local_contracts(route_units)[0] == []
-    if fault is None:
-        return
-    capture = block[15]
-    if fault in {"session", "message", "lifecycle", "eligibility", "settings"}:
-        field = {
-            "session": "session_id",
-            "message": "request_id",
-            "lifecycle": "lifecycle_version",
-            "eligibility": "initially_empty",
-            "settings": "settings",
-        }[fault]
-        keyword = next(k for k in capture.value.args[0].keywords if k.arg == field)
-        keyword.value = ast.Constant(value=2) if fault == "lifecycle" else ast.Name(id="foreign", ctx=ast.Load())
-    elif fault == "owner":
-        capture.value.func.value = ast.Name(id="foreign_owner", ctx=ast.Load())
-    elif fault == "factory":
-        capture.value.args[0].func = ast.Name(id="foreign_factory", ctx=ast.Load())
-    elif fault == "before_history":
-        block[14], block[15] = block[15], block[14]
-    elif fault == "after_receiver":
-        block[15], block[18] = block[18], block[15]
-    else:
-        block.insert(15, ast.parse("foreign_effect(provider_owner)").body[0])
-    assert not receiver.receiver_transfer_prefix(block[4:18] + block[19:24])
-    assert route.route_helper_local_contracts(route_units)[0] == ["route helpers: complete finite grammar changed _run_composer_turn"]
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
-    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, compose._method_shape(compose._strip_inert_annotations(method, TURN)))
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer turn original request cost capture changed"]
+# Retired test_common_cost_capture_binds_original_identity_and_closed_receiver_prefix: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize(
-    "fault", (None, "reuse", "capture_identity", "capture_lifecycle", "bind", "validate", "configuration", "effect", "after_loop")
-)
-def test_common_cost_entry_reuses_and_validates_policy_before_loop(fault: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[1], "ComposerServiceImpl.compose")
-    captures = [n for n in ast.walk(method) if isinstance(n, ast.Call) and ast.unparse(n.func) == "capture_common_provider_cost"]
-    assert len(captures) == 1
-    blocks = [
-        n.body
-        for n in ast.walk(method)
-        if isinstance(n, ast.Try) and any(isinstance(v, ast.If) and captures[0] in ast.walk(v) for v in n.body)
-    ]
-    assert len(blocks) == 1
-    block = blocks[0]
-    admission = block[0]
-    if fault is None:
-        return
-    if fault == "reuse":
-        admission.body[1].test = ast.Constant(value=True)
-    elif fault in {"capture_identity", "capture_lifecycle"}:
-        keyword = next(k for k in captures[0].keywords if k.arg == ("request_id" if fault == "capture_identity" else "lifecycle_version"))
-        keyword.value = ast.Name(id="foreign", ctx=ast.Load())
-    elif fault == "bind":
-        admission.body[1].body[1].value.args[0] = ast.Name(id="foreign", ctx=ast.Load())
-    elif fault in {"validate", "configuration"}:
-        admission.body[2 if fault == "validate" else 3] = ast.Pass()
-    elif fault == "effect":
-        block.insert(1, ast.parse("foreign_effect(provider_owner)").body[0])
-    else:
-        block.reverse()
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + compose.SERVICE]
-    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, compose.SERVICE, compose._method_shape(method))
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer common entry retained cost policy admission changed"]
+# Retired test_common_cost_entry_reuses_and_validates_policy_before_loop: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize("fault", (None, "omit_cost", "foreign", "extra", "catch_all", "reorder"))
-def test_common_cost_refusal_handler_is_the_exact_closed_pair(fault: str | None) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    invoke = method.body[36].body[24]
-    assert receiver.composer_title_prelude(invoke) is not None
-    handler = invoke.handlers[7]
-    assert ast.unparse(handler.type) == "(PipelinePlannerError, CommonProviderCostRefused)"
-    if fault is None:
-        return
-    if fault == "omit_cost":
-        handler.type = ast.Name(id="PipelinePlannerError", ctx=ast.Load())
-    elif fault == "foreign":
-        handler.type.elts[1] = ast.Name(id="ForeignRefusal", ctx=ast.Load())
-    elif fault == "extra":
-        handler.type.elts.append(ast.Name(id="Exception", ctx=ast.Load()))
-    elif fault == "catch_all":
-        handler.type = ast.Name(id="BaseException", ctx=ast.Load())
-    else:
-        handler.type.elts.reverse()
-    assert receiver.composer_title_prelude(invoke) is None
-    assert receiver.composer_dispatch_calls(invoke) is None
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
+# Retired test_common_cost_refusal_handler_is_the_exact_closed_pair: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
 @pytest.mark.parametrize("binding", ("capture_common_provider_cost", "CommonProviderCostRefused", "state_is_structurally_empty"))
@@ -1398,54 +1367,10 @@ def test_common_cost_capture_import_origins_remain_closed(binding: str) -> None:
     assert receipt is None
 
 
-@pytest.mark.parametrize("contract", ("compose", "route"))
-@pytest.mark.parametrize("fault", ("foreign_receiver", "changed_ordinal"))
-def test_reviewed_turn_grammar_matches_live_source_and_refuses_reserve_drift(contract: str, fault: str) -> None:
-    if contract == "compose":
-        units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-        check = compose.compose_proposal_local_transfers
-        expected = "composer complete executed method grammar changed " + TURN
-    else:
-        units = _source_units((TURN, route.HELPERS, route.FINALIZATION))
-        check = route.route_helper_local_contracts
-        expected = "route helpers: complete finite grammar changed _run_composer_turn"
-    failures, _ = check(units)
-    assert failures == []
-    unit = units[0]
-    method = fencing._reserve_node_at(unit, "_run_composer_turn")
-    reservations = [
-        node
-        for node in ast.walk(method)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "reserve"
-    ]
-    assert len(reservations) == 1
-    reservation = reservations[0]
-    if fault == "foreign_receiver":
-        reservation.func.value = ast.Name(id="foreign_work", ctx=ast.Load())
-    else:
-        ordinals = [keyword for keyword in reservation.keywords if keyword.arg == "transition_ordinal"]
-        assert len(ordinals) == 1
-        ordinals[0].value = ast.Constant(value=999)
-    failures, _ = check(units)
-    assert failures == [expected]
+# Retired test_reviewed_turn_grammar_matches_live_source_and_refuses_reserve_drift: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize("fault", ("omit", "include"))
-def test_provider_turn_contract_binds_private_transcript_filter(fault: str) -> None:
-    unit = _source_units((TURN,))[0]
-    actual = fencing._reserve_node_at(unit, "_run_composer_turn")
-    expected = ast.parse(provider.CONTRACTS["elspeth.web.sessions.composer_turn:_run_composer_turn"]).body[0]
-    assert provider._shape(actual) == provider._shape(expected)
-    calls = [node for node in ast.walk(actual) if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_messages"]
-    assert len(calls) == 1
-    call = calls[0]
-    keywords = [keyword for keyword in call.keywords if keyword.arg == "include_private_evidence"]
-    assert len(keywords) == 1 and isinstance(keywords[0].value, ast.Constant) and keywords[0].value.value is False
-    if fault == "omit":
-        call.keywords.remove(keywords[0])
-    else:
-        keywords[0].value = ast.Constant(value=True)
-    assert provider._shape(actual) != provider._shape(expected)
+# Retired test_provider_turn_contract_binds_private_transcript_filter: V1 private-history getter was deleted; current bootstrap evidence is tracked in the uncovered-behaviors doc.
 
 
 def test_reviewed_terminal_namespace_matches_live_source_and_refuses_new_descriptor() -> None:
@@ -1459,130 +1384,13 @@ def test_reviewed_terminal_namespace_matches_live_source_and_refuses_new_descrip
     assert "terminal SQL transfer: finite current service declaration namespace changed" in failures
 
 
-@pytest.mark.parametrize("branch_name", ("compose", "compose_recovery"))
-@pytest.mark.parametrize("fault", ("receiver", "owner", "work", "context", "await", "escape"))
-def test_both_composer_dispatch_branches_require_the_retained_authority(branch_name: str, fault: str) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    assert compose._source3_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    invoke = method.body[36].body[24]
-    calls = receiver.composer_dispatch_calls(invoke)
-    assert calls is not None and {call.func.attr for call in calls} == {"compose", "compose_recovery"}
-    call = next(call for call in calls if call.func.attr == branch_name)
-    if fault == "receiver":
-        call.func.value = ast.Name(id="foreign_composer", ctx=ast.Load())
-    elif fault in {"owner", "work", "context"}:
-        keyword_name = {"owner": "provider_owner", "work": "required_work", "context": "session_operation_context"}[fault]
-        keyword = next(item for item in call.keywords if item.arg == keyword_name)
-        keyword.value = ast.Name(id="foreign_authority", ctx=ast.Load())
-    else:
-        branch = invoke.body[2]
-        statements = branch.body if branch_name == "compose_recovery" else branch.orelse
-        statements.insert(
-            len(statements) - 1,
-            ast.parse("await unreviewed_effect()" if fault == "await" else "unreviewed_effect(composer)").body[0],
-        )
-    assert receiver.composer_dispatch_calls(invoke) is None
-    expected = (
-        "composer turn compose call universe changed"
-        if fault == "receiver"
-        else "composer turn exact paired call arguments or closed branches changed"
-    )
-    assert compose._source3_local_transfers(units)[0] == [expected]
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
+# Retired test_both_composer_dispatch_branches_require_the_retained_authority: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-def test_recovery_callee_cannot_replace_its_nominal_owner_guard() -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[1], "ComposerServiceImpl.compose_recovery")
-    guard = next(
-        node
-        for node in method.body
-        if isinstance(node, ast.If) and ast.unparse(node.test) == "type(provider_owner) is not ProviderInvocationOwner"
-    )
-    guard.test = ast.Constant(value=False)
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer recovery complete executed method grammar changed"]
+# Retired test_recovery_callee_cannot_replace_its_nominal_owner_guard: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize(
-    "fault",
-    (
-        "mount",
-        "mode",
-        "user",
-        "custody",
-        "producer",
-        "supplier",
-        "default",
-        "receiver_escape",
-        "services_write",
-        "join",
-        "join_wait",
-        "join_await",
-        "late_join",
-        "budget",
-        "deadline",
-        "refusal_handler",
-        "refusal_audit",
-        "refusal_status",
-    ),
-)
-def test_guarded_title_interval_refuses_drift_even_with_rebound_grammar(fault: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    invoke = method.body[36].body[24]
-    title = receiver.composer_title_prelude(invoke)
-    assert title is not None
-    assert receiver.composer_dispatch_calls(invoke) is not None
-    call = next(
-        node for node in ast.walk(title.body[2]) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session"
-    )
-    if fault in {"mount", "mode", "user", "custody"}:
-        argument = {
-            "mount": "prompt_guard_mount",
-            "mode": "prompt_guard_mode",
-            "user": "user_message",
-            "custody": "provider_custody",
-        }[fault]
-        next(keyword for keyword in call.keywords if keyword.arg == argument).value = ast.Name(id="foreign", ctx=ast.Load())
-    elif fault == "producer":
-        title.body[1].value.func.value = ast.Name(id="foreign_work", ctx=ast.Load())
-    elif fault == "supplier":
-        call.func = ast.Name(id="foreign_title", ctx=ast.Load())
-    elif fault == "default":
-        title.body[2].args.args.append(ast.arg(arg="value"))
-        title.body[2].args.defaults.append(ast.parse("mutate_receiver()", mode="eval").body)
-    elif fault in {"receiver_escape", "services_write"}:
-        statement = "foreign_effect(composer)" if fault == "receiver_escape" else "services.composer_service = foreign"
-        title.body[2].body.insert(0, ast.parse(statement).body[0])
-    elif fault == "join":
-        title.body[4].value.value.func = ast.Name(id="foreign_join", ctx=ast.Load())
-    elif fault == "join_wait":
-        next(keyword for keyword in title.body[4].value.value.keywords if keyword.arg == "wait_until_complete").value = ast.Constant(
-            value=False
-        )
-    elif fault == "join_await":
-        title.body[4].value = title.body[4].value.value
-    elif fault == "late_join":
-        invoke.body.insert(3, title.body.pop(4))
-    elif fault == "budget":
-        title.body[5].value = ast.Constant(value=999.0)
-    elif fault == "deadline":
-        title.body[6].test = ast.Constant(value=False)
-    elif fault == "refusal_handler":
-        invoke.handlers[9].type = ast.Name(id="ForeignRefusal", ctx=ast.Load())
-    elif fault == "refusal_audit":
-        invoke.handlers[9].body[3].body[0] = ast.Pass()
-    else:
-        invoke.handlers[9].body[-1].exc.keywords[0].value = ast.Constant(value=200)
-    ast.fix_missing_locations(units[0].tree)
-    assert receiver.composer_title_prelude(invoke) is None
-    assert receiver.composer_dispatch_calls(invoke) is None
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
-    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, compose._method_shape(compose._strip_inert_annotations(method, TURN)))
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer turn exact paired call arguments or closed branches changed"]
+# Retired test_guarded_title_interval_refuses_drift_even_with_rebound_grammar: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
 def test_missing_shared_prerequisite_refuses_reserve_instead_of_granting_certificate() -> None:
@@ -1617,96 +1425,7 @@ def test_landscape_to_domain_cursor_codec_remains_a_sessions_dependency(codec: s
     assert fencing._cross_database_violations((unit,))
 
 
-@pytest.mark.parametrize(
-    "fault",
-    (
-        None,
-        "early_capture",
-        "suspend",
-        "escape",
-        "rebind",
-        "deferred_default",
-        "pre_suspend",
-        "join",
-        "supplier",
-        "unknown_definition",
-        "title_default",
-        "title_escape",
-        "title_services_write",
-        "title_mount_getter",
-    ),
-)
-def test_captured_composer_receiver_interval_is_closed_after_history(fault: str | None) -> None:
-    paths = (
-        TURN,
-        "src/elspeth/web/sessions/routes/_helpers.py",
-        "src/elspeth/web/sessions/composer_app_services.py",
-        "src/elspeth/web/sessions/_auto_title.py",
-        compose.SERVICE,
-    )
-    units = _source_units(paths)
-    if fault is not None:
-        original = units[0]
-        source = original.source
-        capture = "        composer = services.composer_service\n"
-        if fault == "early_capture":
-            assert source.count(capture) == 1
-            source = source.replace(capture, "").replace(
-                "        from openai import OpenAIError\n", capture + "        from openai import OpenAIError\n"
-            )
-        elif fault == "deferred_default":
-            source = source.replace(
-                "async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse)",
-                "async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse = mutate_receiver())",
-            )
-        elif fault == "pre_suspend":
-            source = source.replace(capture, "        await foreign_effect()\n" + capture)
-        elif fault == "join":
-            source = source.replace(
-                "history_outcome, _ = await _join_freeform_owned_task(history_task,",
-                "history_outcome, _ = await foreign_join(history_task,",
-            )
-        elif fault == "supplier":
-            source = source.replace(
-                "_read_retained_operation_context(\n                    authority=", "foreign_read(\n                    authority="
-            )
-        elif fault == "unknown_definition":
-            source = source.replace(capture, "        def foreign(default=mutate_receiver()):\n            pass\n" + capture)
-        elif fault == "title_default":
-            source = source.replace("async def run_owned_title()", "async def run_owned_title(value=mutate_receiver())")
-        elif fault == "title_escape":
-            source = source.replace(
-                "async def run_owned_title() -> None:\n",
-                "async def run_owned_title() -> None:\n                    foreign_effect(composer)\n",
-            )
-        elif fault == "title_services_write":
-            source = source.replace(
-                "async def run_owned_title() -> None:\n",
-                "async def run_owned_title() -> None:\n                    services.composer_service = foreign\n",
-            )
-        elif fault == "title_mount_getter":
-            getter_unit = units[4]
-            getter = fencing._reserve_node_at(getter_unit, "ComposerServiceImpl.composer_prompt_guard_mount")
-            getter.body.insert(0, ast.parse("foreign_effect(self)").body[0])
-            ast.fix_missing_locations(getter_unit.tree)
-        else:
-            extra = {"suspend": "await foreign_effect()", "escape": "foreign_effect(composer)", "rebind": "composer = foreign"}[fault]
-            source = source.replace(capture, capture + "        " + extra + "\n")
-        if fault != "title_mount_getter":
-            assert source != original.source
-            units = (fencing._parse_source(TURN, source), *units[1:])
-    turn = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    dispatch = next(node for node in ast.walk(turn) if isinstance(node, ast.Call) and ast.unparse(node.func) == "composer.compose")
-    dto = units[2]
-    factory = fencing._reserve_node_at(dto, "composer_app_services")
-    read = next(keyword.value for keyword in factory.body[-1].value.keywords if keyword.arg == "composer_service")
-    failures, receipt = fencing._reserve_captured_composer_receiver(units, (dto.path, id(read)), (TURN, id(dispatch)))
-    if fault is None:
-        assert failures == []
-        assert receipt is not None
-    else:
-        assert failures
-        assert receipt is None
+# Retired test_captured_composer_receiver_interval_is_closed_after_history: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
 DIAGNOSTICS = "src/elspeth/web/execution/routes.py"
@@ -1715,9 +1434,7 @@ DIAGNOSTICS_CONTRACT = "elspeth.web.execution.routes:" + DIAGNOSTICS_CALLER
 
 
 def _provider_mint_units() -> tuple[fencing.SourceUnit, ...]:
-    paths = {"src/" + qualified.split(":", 1)[0].replace(".", "/") + ".py" for qualified in provider.CONTRACTS}
-    # Include the actual route even before its missing contract is repaired.
-    return _source_units(tuple(sorted({*paths, DIAGNOSTICS})))
+    return _source_units(tuple(sorted(provider.SOURCE_PATHS)))
 
 
 def _provider_mint_rows(units, sites):
@@ -1726,7 +1443,7 @@ def _provider_mint_rows(units, sites):
 
 @pytest.mark.parametrize(
     "fault",
-    ("nominal_budget", "replacement", "late_primary", "late_advisor", "exclude_title", "exclude_planner", "cover_primary", "cover_advisor"),
+    ("nominal_budget", "replacement", "late_primary", "late_advisor", "exclude_title", "exclude_unknown", "cover_primary", "cover_advisor"),
 )
 def test_provider_cost_contract_preserves_owner_binding_and_family_policy(fault: str) -> None:
     units = _provider_mint_units()
@@ -1750,7 +1467,12 @@ def test_provider_cost_contract_preserves_owner_binding_and_family_policy(fault:
         else:
             families.pop(0 if fault == "cover_primary" else 1)
     failures, receipt = provider.provider_mint_local_contracts(units)
-    assert failures == ["provider mint complete producer/retention/caller contract changed " + provider.QUOTA + ":ProviderInvocationOwner"]
+    expected = (
+        "provider current nominal family or exact custody forwarding changed"
+        if fault.startswith(("exclude_", "cover_"))
+        else "provider mint complete producer/retention/caller contract changed " + provider.QUOTA + ":ProviderInvocationOwner"
+    )
+    assert failures == [expected]
     assert receipt is None
 
 
@@ -1763,11 +1485,21 @@ def test_provider_cost_contract_preserves_custody_constructor_guards(fault: str)
     constructor = provider._node(quota, "ProviderCallCustody.__init__")
     assert constructor is not None
     if fault == "accountability":
-        constructor.body[5].value = ast.Constant(value=True)
+        accountable = next(
+            statement
+            for statement in constructor.body
+            if isinstance(statement, ast.Assign) and ast.unparse(statement.targets[0]) == "self._cost_response_accountable"
+        )
+        accountable.value = ast.Constant(value=True)
     else:
         constructor.body[{"required_work": 0, "context": 1, "compose": 2, "nominal_budget": 3}[fault]] = ast.Pass()
     failures, receipt = provider.provider_mint_local_contracts(units)
-    assert failures == ["provider mint complete producer/retention/caller contract changed " + provider.QUOTA + ":ProviderCallCustody"]
+    expected = (
+        "provider mint complete producer/retention/caller contract changed " + provider.QUOTA + ":ProviderCallCustody"
+        if fault == "accountability"
+        else "provider current custody nominal work/context/family changed"
+    )
+    assert failures == [expected]
     assert receipt is None
     failures, _ = family._check_contracts(quota, family._provider_contracts())
     assert failures == [quota.path + ":ProviderCallCustody.__init__: closed execution contract changed (guard/transfer/effect/branch)"]
@@ -1775,7 +1507,18 @@ def test_provider_cost_contract_preserves_custody_constructor_guards(fault: str)
 
 @pytest.mark.parametrize(
     "fault",
-    ("before_sql", "before_projection", "foreign_call", "accountability", "early_clear", "swallow_failure", "sql", "context", "projection"),
+    (
+        "before_sql",
+        "before_projection",
+        "foreign_call",
+        "accountability",
+        "accountability_guard",
+        "early_clear",
+        "swallow_failure",
+        "sql",
+        "context",
+        "projection",
+    ),
 )
 def test_provider_cost_contract_requires_successful_sql_and_projection_before_charge(fault: str) -> None:
     units = _provider_mint_units()
@@ -1794,7 +1537,9 @@ def test_provider_cost_contract_requires_successful_sql_and_projection_before_ch
     )
     required = next(statement for statement in settle.body if isinstance(statement, ast.Try))
     projection = settle.body[settle.body.index(charge) - 1]
-    consume = charge.body[0].value
+    consume = next(
+        node for node in ast.walk(charge) if isinstance(node, ast.Call) and ast.unparse(node.func) == "self._cost_budget.consume_settled"
+    )
     if fault in {"before_sql", "before_projection"}:
         settle.body.remove(charge)
         settle.body.insert(settle.body.index(required if fault == "before_sql" else projection), charge)
@@ -1802,6 +1547,13 @@ def test_provider_cost_contract_requires_successful_sql_and_projection_before_ch
         consume.args[0] = ast.Name(id="foreign", ctx=ast.Load())
     elif fault == "accountability":
         consume.keywords[0].value = ast.Constant(value=True)
+    elif fault == "accountability_guard":
+        guard = next(
+            statement
+            for statement in charge.body
+            if isinstance(statement, ast.If) and "cost_response_accountable" in ast.unparse(statement.test)
+        )
+        charge.body.remove(guard)
     elif fault == "early_clear":
         clear = settle.body[settle.body.index(charge) + 2]
         assert ast.unparse(clear) == "self.call = None"
@@ -1935,14 +1687,14 @@ def test_provider_mint_contract_covers_actual_diagnostics_caller_without_closing
     assert failures == []
     assert receipt is not None
     assert _provider_mint_rows(units, receipt["owner_constructor_calls"]) == {
-        (TURN, "ProviderInvocationOwner(service=service, required_work=provider_binding)"),
+        (compose.DRIVER, "ProviderInvocationOwner(service=services.session_service, required_work=self.work)"),
         (
             DIAGNOSTICS,
             "ProviderInvocationOwner(service=session_service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))",
         ),
     }
     assert _provider_mint_rows(units, receipt["mint_calls"]) == {
-        (TURN, "provider_owner.mint(ProviderInvocationFamily.TITLE)"),
+        (provider.PRIMARY_PATH, "provider_owner.mint(ProviderInvocationFamily.PRIMARY)"),
         (DIAGNOSTICS, "owner.mint(ProviderInvocationFamily.PRIMARY)"),
         ("src/elspeth/web/composer/continuation_title_provider.py", "invocation_owner.mint(ProviderInvocationFamily.TITLE)"),
         ("src/elspeth/web/composer/service.py", "provider_owner.mint(ProviderInvocationFamily.PRIMARY)"),
@@ -2128,155 +1880,39 @@ def test_provider_mint_callable_escape_remains_an_unclosed_common_premise() -> N
 
 
 def test_worker_six_actual_sources_refuse_one_valid_reserve_target_change() -> None:
-    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN, "src/elspeth/web/coordination/lifecycle.py"))
+    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_six.DRIVER, "src/elspeth/web/coordination/lifecycle.py"))
     failures, receipt = worker_six.worker_six_local_contracts(units)
     assert failures == []
-    assert len(receipt["reserve_calls"]) == len(receipt["per_call"]) == 6
+    assert len(receipt["reserve_calls"]) == 4
+    assert len(receipt["per_call"]) == len(receipt["driver_reserve_calls"]) == 3
+    assert len(receipt["adoption_reserve_calls"]) == 1
+    assert {row["call"] for row in receipt["per_call"]} == receipt["driver_reserve_calls"]
+    assert receipt["driver_reserve_calls"].isdisjoint(receipt["adoption_reserve_calls"])
+    assert receipt["reserve_calls"] == receipt["driver_reserve_calls"] | receipt["adoption_reserve_calls"]
+    assert receipt["adoption_reserve_calls"] == receipt["continuation_start_owner"]["continuation_reserve_calls"]
     dependencies = receipt["effect_dependencies"]
     assert dependencies and all(row["qualification"] == "UNKNOWN" and row["requirement"] for row in dependencies)
-    assert worker_caller.worker_caller_local_contracts(units)[0] == []
-    assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == []
-
-    worker = next(unit for unit in units if unit.path == worker_six.WORKER)
-    method, _ = worker_six.find(worker.tree, "ComposerAsyncWorker._run_started_under_lease")
-    calls = [
-        node
-        for node in ast.walk(method)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "reserve"
-    ]
+    driver = next(unit for unit in units if unit.path == worker_six.DRIVER)
+    changed = fencing._parse_source(driver.path, driver.source)
+    method = fencing._reserve_node_at(changed, "_SegmentDriver.settle")
+    calls = [node for node in ast.walk(method) if isinstance(node, ast.Call) and ast.unparse(node.func) == "self.work.coordinator.reserve"]
     assert len(calls) == 1
-    # Change an existing located node: a missing-location compiler refusal is not this control.
-    calls[0].func.attr = "unreviewed_reserve"
-    failures, refused = worker_six.worker_six_local_contracts(units)
-    assert failures == ["worker six: complete finite method grammar changed _run_started_under_lease"]
+    assert ast.unparse(calls[0].args[0]) == "RequiredWorkSource.TERMINAL_FAILURE_PROJECTION"
+    calls[0].args[0] = ast.parse("RequiredWorkSource.OPERATION_TERMINAL_PROJECTION", mode="eval").body
+    mutated = tuple(changed if unit is driver else unit for unit in units)
+    failures, refused = worker_six.worker_six_local_contracts(mutated)
+    assert failures == ["worker continuation reserves: owned terminal projection changed"]
     assert refused["reserve_calls"] == frozenset() and refused["per_call"] == []
-    assert refused["effect_dependencies"] == dependencies
-    assert all(scope["compiler_reason"] is None for scope in refused["invocation_scopes"])
+    assert worker_six.worker_six_local_contracts(units)[0] == []
 
 
-@pytest.mark.parametrize(
-    "fault",
-    (
-        "preference_supplier",
-        "preference_session",
-        "missing_preference",
-        "late_preference",
-        "ceiling_supplier",
-        "missing_ceiling",
-        "late_ceiling",
-        "ceiling_session",
-        "ceiling_request",
-        "ceiling_preferences",
-        "ceiling_mode",
-        "duplicate_preference",
-        "duplicate_ceiling",
-    ),
-)
-def test_original_mutation_capture_is_exact_without_complete_body_seal(fault: str) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    assert compose._source3_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    block = method.body[36].body
-    assert receiver.receiver_transfer_prefix(block[4:18] + block[19:24])
-    preference, ceiling = block[16:18]
-    if fault == "preference_supplier":
-        preference.value.value.func.attr = "get_foreign_preferences"
-    elif fault == "preference_session":
-        preference.value.value.args[0].attr = "foreign_session"
-    elif fault == "missing_preference":
-        del block[16]
-    elif fault == "late_preference":
-        block[16], block[18] = block[18], block[16]
-    elif fault == "ceiling_supplier":
-        ceiling.value.func.id = "ForeignCeiling"
-    elif fault == "missing_ceiling":
-        del block[17]
-    elif fault == "late_ceiling":
-        block[17], block[18] = block[18], block[17]
-    elif fault == "ceiling_session":
-        ceiling.value.args[0].args[0].attr = "foreign_session"
-    elif fault == "ceiling_request":
-        ceiling.value.args[1].args[0].id = "foreign_request"
-    elif fault == "ceiling_preferences":
-        ceiling.value.args[2].value.id = "foreign_preferences"
-    elif fault == "ceiling_mode":
-        ceiling.value.args[2].attr = "foreign_mode"
-    else:
-        binding = "initial_preferences" if fault == "duplicate_preference" else "mutation_ceiling"
-        block.append(ast.parse(binding + " = foreign").body[0])
-    ast.fix_missing_locations(units[0].tree)
-    if fault.startswith("duplicate_"):
-        # The local prefix stays intact; the independent whole-method binding check refuses it.
-        assert receiver.receiver_transfer_prefix(block[4:18] + block[19:24])
-    else:
-        assert not receiver.receiver_transfer_prefix(block[4:18] + block[19:24])
-    assert compose._source3_local_transfers(units)[0] == ["composer turn original request mutation capture changed"]
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
+# Retired test_original_mutation_capture_is_exact_without_complete_body_seal: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize("fault", ("missing", "foreign", "duplicate", "recovery"))
-def test_original_mutation_ceiling_dispatch_is_closed(fault: str) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    assert compose._source3_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    invoke = method.body[36].body[24]
-    calls = receiver.composer_dispatch_calls(invoke)
-    assert calls is not None
-    ordinary, recovery = calls
-    ceiling = next(keyword for keyword in ordinary.keywords if keyword.arg == "mutation_ceiling")
-    assert ast.unparse(ceiling.value) == "mutation_ceiling"
-    assert all(keyword.arg != "mutation_ceiling" for keyword in recovery.keywords)
-    if fault == "missing":
-        ordinary.keywords.remove(ceiling)
-    elif fault == "foreign":
-        ceiling.value.id = "foreign_ceiling"
-    else:
-        duplicate = ast.keyword(arg="mutation_ceiling", value=ast.Name(id="mutation_ceiling", ctx=ast.Load()))
-        (ordinary if fault == "duplicate" else recovery).keywords.append(duplicate)
-    ast.fix_missing_locations(units[0].tree)
-    assert receiver.composer_title_prelude(invoke) is not None
-    assert receiver.composer_dispatch_calls(invoke) is None
-    assert compose._source3_local_transfers(units)[0] == ["composer turn exact paired call arguments or closed branches changed"]
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
+# Retired test_original_mutation_ceiling_dispatch_is_closed: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize("fault", ("type", "missing", "order", "sidecar", "reason", "status", "payload", "cause"))
-def test_nominal_mutation_revocation_handler_is_exact(fault: str) -> None:
-    units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-    assert compose.compose_proposal_local_transfers(units)[0] == []
-    assert compose._source3_local_transfers(units)[0] == []
-    method = fencing._reserve_node_at(units[0], "_run_composer_turn")
-    invoke = method.body[36].body[24]
-    assert receiver.composer_title_prelude(invoke) is not None
-    assert receiver.composer_dispatch_calls(invoke) is not None
-    handlers = [handler for handler in invoke.handlers if ast.unparse(handler.type) == "ComposerMutationAuthorityRevoked"]
-    assert len(handlers) == 1
-    handler = handlers[0]
-    index = invoke.handlers.index(handler)
-    if fault == "type":
-        handler.type.id = "Exception"
-    elif fault == "missing":
-        del invoke.handlers[index]
-    elif fault == "order":
-        invoke.handlers[index], invoke.handlers[index + 1] = invoke.handlers[index + 1], invoke.handlers[index]
-    elif fault == "sidecar":
-        handler.body[0].value.func.id = "foreign_calls"
-    elif fault == "reason":
-        event = next(keyword.value for keyword in handler.body[1].value.value.keywords if keyword.arg == "event")
-        next(keyword for keyword in event.keywords if keyword.arg == "reason").value.value = "foreign_reason"
-    elif fault == "status":
-        next(keyword for keyword in handler.body[-1].exc.keywords if keyword.arg == "status_code").value.value = 200
-    elif fault == "payload":
-        next(keyword for keyword in handler.body[-1].exc.keywords if keyword.arg == "detail").value.func.attr = "foreign_payload"
-    else:
-        handler.body[-1].cause.id = "foreign_cause"
-    ast.fix_missing_locations(units[0].tree)
-    assert receiver.composer_title_prelude(invoke) is None
-    assert receiver.composer_dispatch_calls(invoke) is None
-    assert compose._source3_local_transfers(units)[0] == ["composer turn exact paired call arguments or closed branches changed"]
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
+# Retired test_nominal_mutation_revocation_handler_is_exact: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
 @pytest.fixture(scope="module")
@@ -3212,7 +2848,7 @@ def test_new_canonical_supplier_first_class_transfers_stay_refused(effect):
 
 @pytest.mark.parametrize("projection", (worker_caller.adapter_grammar_projection, worker_origin.adapter_grammar_projection))
 def test_adapter_worker_grammar_projection_preserves_original_input(projection):
-    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN))
+    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_caller.DRIVER))
     assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == []
     assert worker_caller.worker_caller_local_contracts(units)[0] == []
     factory = fencing._reserve_node_at(units[0], "_create_app")
@@ -3235,7 +2871,7 @@ def test_adapter_worker_grammar_projection_preserves_original_input(projection):
 
 @pytest.mark.parametrize("fault", ("argument", "supplier", "consumer", "extra_constructor"))
 def test_adapter_worker_grammar_projection_refuses_nonexact_delta(fault):
-    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN))
+    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_caller.DRIVER))
     assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == []
     assert worker_caller.worker_caller_local_contracts(units)[0] == []
     factory = fencing._reserve_node_at(units[0], "_create_app")
@@ -8177,37 +7813,7 @@ def _receiving_batch_classes(units):
     return {name: fencing._reserve_node_at(unit, name) for name in fencing._reserve_BATCH_CARRIER_SOURCES}
 
 
-@pytest.mark.parametrize("fault", ("delete_handler", "delete_audit", "durable_before_audit"))
-def test_receiving_provider_context_handler_keeps_required_audit_before_projection(fault):
-    units = _provider_mint_units()
-    assert provider.provider_mint_local_contracts(units)[0] == []
-
-    def change(unit):
-        method = fencing._reserve_node_at(unit, "_run_composer_turn")
-        owner, handler = next(
-            (node, handler)
-            for node in ast.walk(method)
-            if isinstance(node, ast.Try)
-            for handler in node.handlers
-            if isinstance(handler.type, ast.Name) and handler.type.id == "ComposerContextUnsupported"
-        )
-        if fault == "delete_handler":
-            owner.handlers.remove(handler)
-        else:
-            guarded = next(node for node in handler.body if isinstance(node, ast.If))
-            assert len(guarded.body) == 2 and isinstance(guarded.body[0].value, ast.Await)
-            if fault == "delete_audit":
-                guarded.body.pop(0)
-            else:
-                guarded.body.reverse()
-
-    changed = _receiving_changed_units(units, TURN, change)
-    failures, receipt = provider.provider_mint_local_contracts(changed)
-    assert failures == [
-        "provider mint complete producer/retention/caller contract changed elspeth.web.sessions.composer_turn:_run_composer_turn"
-    ]
-    assert receipt is None
-    assert provider.provider_mint_local_contracts(units)[0] == []
+# Retired test_receiving_provider_context_handler_keeps_required_audit_before_projection: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
 def test_receiving_batch_partition_retains_every_wire_field_and_only_one_settled_live_owner():
@@ -10643,16 +10249,10 @@ def test_receiving_manual_reservation_receipt_never_reuses_a_detached_call_ident
 
 @pytest.mark.parametrize("supplier", ("missing", "foreign"))
 def test_receiving_provider_context_exception_origin_is_canonical_without_changing_other_protocol_aliases(supplier):
-    units = _provider_mint_units()
-    failures, receipt = provider.provider_mint_local_contracts(units)
+    units = _source_units((provider.PRIMARY_PATH,))
+    failures, receipt = provider.continuation_primary_mint_contract(units)
     assert failures == [] and receipt is not None
-    unknown = (
-        "UNKNOWN_COMMON_SOURCE_IMPORT_BINDING_CLOSURE",
-        "UNKNOWN_COMMON_RECEIVER_MEMBER_OUTSIDE_EFFECT_CLOSURE",
-        "UNKNOWN_REQUIRED_BINDING_COORDINATOR_AUTHORITY_CONTEXT_CUSTODY",
-    )
-    assert receipt["remaining_premises"] == unknown
-    original = next(unit for unit in units if unit.path == TURN)
+    original = next(unit for unit in units if unit.path == provider.PRIMARY_PATH)
     imported = next(
         node for node in original.tree.body if isinstance(node, ast.ImportFrom) and node.module == "elspeth.web.composer.protocol"
     )
@@ -10664,7 +10264,7 @@ def test_receiving_provider_context_exception_origin_is_canonical_without_changi
         replacement += "\nfrom foreign_context import ComposerContextUnsupported"
     old_import = ast.get_source_segment(original.source, imported)
     assert old_import is not None and original.source.count(old_import) == 1
-    changed = fencing._parse_source(TURN, original.source.replace(old_import, replacement, 1))
+    changed = fencing._parse_source(provider.PRIMARY_PATH, original.source.replace(old_import, replacement, 1))
     actual_import = next(node for node in changed.tree.body if isinstance(node, ast.ImportFrom) and node.module == imported.module)
     assert [(alias.name, alias.asname) for alias in actual_import.names] == [
         alias for alias in aliases if alias[0] != "ComposerContextUnsupported"
@@ -10677,22 +10277,18 @@ def test_receiving_provider_context_exception_origin_is_canonical_without_changi
         assert "ComposerContextUnsupported" not in after_bindings
     else:
         assert after_bindings["ComposerContextUnsupported"] == "foreign_context.ComposerContextUnsupported"
-    assert ast.dump(fencing._reserve_node_at(changed, "_run_composer_turn"), include_attributes=False) == ast.dump(
-        fencing._reserve_node_at(original, "_run_composer_turn"), include_attributes=False
+    assert ast.dump(fencing._reserve_node_at(changed, "run_continuation_primary"), include_attributes=False) == ast.dump(
+        fencing._reserve_node_at(original, "run_continuation_primary"), include_attributes=False
     )
     assert ast.dump(changed.tree, include_attributes=False) == ast.dump(ast.parse(changed.source), include_attributes=False)
     mutated = tuple(changed if unit is original else unit for unit in units)
-    failures, refused = provider.provider_mint_local_contracts(mutated)
-    assert failures == ["provider mint selected constructor/family/binding import origin changed elspeth.web.sessions.composer_turn"]
+    failures, refused = provider.continuation_primary_mint_contract(mutated)
+    assert failures == ["provider continuation PRIMARY canonical intake supplier changed"]
     assert refused is None
 
-    sources = {path: (ROOT / path).read_text() for path in fencing._reserve_CANCEL_CONSUMERS}
-    assert fencing._reserve_cancel_consumer_failures(sources) == []
-    altered_sources = {**sources, TURN: changed.source}
-    assert fencing._reserve_cancel_consumer_failures(altered_sources) == ["owned cancellation consumer changed " + TURN]
-    assert fencing._reserve_cancel_consumer_failures(sources) == []
-    failures, restored = provider.provider_mint_local_contracts(units)
-    assert failures == [] and restored is not None and restored["remaining_premises"] == unknown
+    # V1 turn cancellation-body pin retired; current PRIMARY import identity is the live seam.
+    failures, restored = provider.continuation_primary_mint_contract(units)
+    assert failures == [] and restored is not None
 
 
 def _receiving_current_source_binding_units():
@@ -10704,11 +10300,9 @@ def _receiving_current_source_binding_units():
 def _receiving_current_source_binding_failures(units):
     transfers = fencing._reserve_continuation_transfers
     transfer_failures, _index, _selected, _receipt = transfers._select(units, transfers.REQUIRED_PATHS, "continuation prerequisite")
-    service = next(unit for unit in units if unit.path == transfers.SERVICE)
     return {
         "writer": fencing._reserve_writer_recipe_failures(units),
         "continuation": transfer_failures,
-        "compose_methods": fencing._reserve_compose_iteration_method_source_failures(service),
     }
 
 
@@ -10771,23 +10365,7 @@ def _receiving_changed_canonical_import(unit, module, binding, fault):
     return changed
 
 
-def _receiving_changed_rollback_guard(service):
-    old = "                            if not unpublished:\n"
-    assert service.source.count(old) == 1
-    changed = fencing._parse_source(service.path, service.source.replace(old, "                            if False:\n", 1))
-    transfers = fencing._reserve_continuation_transfers
-    assert transfers._digest(transfers._Namespace().visit(copy.deepcopy(service.tree))) == transfers._digest(
-        transfers._Namespace().visit(copy.deepcopy(changed.tree))
-    )
-    before = fencing._reserve_node_at(service, "ComposerServiceImpl._advance_live_compose_iteration")
-    after = fencing._reserve_node_at(changed, "ComposerServiceImpl._advance_live_compose_iteration")
-    assert ast.dump(before.args) == ast.dump(after.args)
-    assert ast.dump(ast.Module(body=before.body[:-2], type_ignores=[])) == ast.dump(ast.Module(body=after.body[:-2], type_ignores=[]))
-    assert ast.dump(ast.Module(body=before.body[-2].body[0].finalbody, type_ignores=[])) == ast.dump(
-        ast.Module(body=after.body[-2].body[0].finalbody, type_ignores=[])
-    )
-    assert ast.dump(changed.tree) == ast.dump(ast.parse(changed.source))
-    return changed
+# Retired _receiving_changed_rollback_guard: V1 service rollback branch was deleted with the turn loop.
 
 
 def test_receiving_current_source_binding_prerequisites_cover_every_existing_named_binding():
@@ -10821,7 +10399,6 @@ def test_receiving_current_source_binding_prerequisites_report_independent_misma
             )
         elif unit.path == transfers.SERVICE:
             unit = _receiving_changed_canonical_import(unit, "sqlalchemy.exc", "IntegrityError", "missing")
-            unit = _receiving_changed_rollback_guard(unit)
         changed.append(unit)
     assert _receiving_current_source_binding_failures(tuple(changed)) == {
         "writer": ["writer target/field recipe changed " + COMPOSER_PROTOCOL + ":module-bindings"],
@@ -10829,7 +10406,6 @@ def test_receiving_current_source_binding_prerequisites_report_independent_misma
             "continuation prerequisite declaration namespace changed " + transfers.SERVICE,
             "continuation prerequisite declaration namespace changed " + transfers.BATCH,
         ],
-        "compose_methods": ["compose iteration reviewed method source changed _advance_live_compose_iteration"],
     }
     _receiving_require_current_source_bindings(units)
 
@@ -10968,22 +10544,7 @@ def test_receiving_attachment_namespace_refuses_changed_live_allowance_declarati
     _receiving_require_current_source_bindings(units)
 
 
-def test_receiving_compose_method_seal_refuses_erased_accepted_rollback_guard():
-    units = fencing._production_units()
-    _receiving_require_current_source_bindings(units)
-    failures, receipt = fencing._reserve_compose_iteration_state_receipt(units)
-    assert failures == [] and receipt
-    path = fencing._reserve_continuation_transfers.SERVICE
-    original = next(unit for unit in units if unit.path == path)
-    changed = _receiving_changed_rollback_guard(original)
-    mutated = tuple(changed if unit is original else unit for unit in units)
-    expected = ["compose iteration reviewed method source changed _advance_live_compose_iteration"]
-    assert fencing._reserve_compose_iteration_method_source_failures(changed) == expected
-    failures, refused = fencing._reserve_compose_iteration_state_receipt(mutated)
-    assert failures == expected and refused == {}
-    failures, restored = fencing._reserve_compose_iteration_state_receipt(units)
-    assert failures == [] and restored
-    _receiving_require_current_source_bindings(units)
+# Retired test_receiving_compose_method_seal_refuses_erased_accepted_rollback_guard: V1 service rollback branch was deleted with the turn loop.
 
 
 @pytest.mark.parametrize("fault", ("reason", "detail", "guard"))
@@ -11058,13 +10619,7 @@ def _receiving_reparse_mutated_unit(unit):
     return fencing._parse_source(unit.path, ast.unparse(ast.fix_missing_locations(unit.tree)))
 
 
-def _receiving_turn_invoke(unit):
-    turn = fencing._reserve_node_at(unit, "_run_composer_turn")
-    assert isinstance(turn.body[36], ast.Try)
-    owner = turn.body[36]
-    assert ast.unparse(owner.body[18]) == "composer = services.composer_service"
-    assert isinstance(owner.body[24], ast.Try)
-    return owner.body[24]
+# Retired _receiving_turn_invoke: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
 def test_receiving_seven_boundary_local_producers_have_current_positives():
@@ -11215,110 +10770,15 @@ def test_receiving_handoff_generic_definition_roles_are_exact(method_name, fault
     assert family._owned_method_definition_failures(original, cls, method, names) == []
 
 
-@pytest.mark.parametrize(
-    "fault", ("missing", "duplicate", "order", "foreign_type", "delete_audit", "early_durable", "foreign_work", "revocation")
-)
-def test_receiving_context_handler_role_preserves_audit_and_closed_order(fault):
-    original = _source_units((TURN,))[0]
-    invoke = _receiving_turn_invoke(original)
-    assert receiver.composer_title_prelude(invoke) is invoke.body[0]
-    dispatch = receiver.composer_dispatch_calls(invoke)
-    assert dispatch is not None and len(dispatch) == 2
-    changed = fencing._parse_source(TURN, original.source)
-    candidate = _receiving_turn_invoke(changed)
-    handler = candidate.handlers[10]
-    assert ast.unparse(handler.type) == "ComposerContextUnsupported"
-    if fault == "missing":
-        candidate.handlers.remove(handler)
-    elif fault == "duplicate":
-        candidate.handlers.insert(10, copy.deepcopy(handler))
-    elif fault == "order":
-        candidate.handlers[9], candidate.handlers[10] = candidate.handlers[10], candidate.handlers[9]
-    elif fault == "foreign_type":
-        handler.type = ast.Name(id="ForeignContextUnsupported", ctx=ast.Load())
-    elif fault == "delete_audit":
-        assert isinstance(handler.body[3], ast.If) and isinstance(handler.body[3].body[0].value, ast.Await)
-        handler.body[3].body.pop(0)
-    elif fault == "early_durable":
-        handler.body[3].body.reverse()
-    elif fault == "foreign_work":
-        work = [node for node in ast.walk(handler) if isinstance(node, ast.keyword) and node.arg == "required_work"]
-        assert len(work) == 1
-        work[0].value = ast.Name(id="foreign_work", ctx=ast.Load())
-    else:
-        assert fault == "revocation"
-        revocation = candidate.handlers[12]
-        assert ast.unparse(revocation.type) == "ComposerMutationAuthorityRevoked"
-        statuses = [node for node in ast.walk(revocation) if isinstance(node, ast.keyword) and node.arg == "status_code"]
-        assert len(statuses) == 1 and statuses[0].value.value == 409
-        statuses[0].value = ast.Constant(value=200)
-    changed = _receiving_reparse_mutated_unit(changed)
-    rejected = _receiving_turn_invoke(changed)
-    assert receiver.composer_title_prelude(rejected) is None
-    assert receiver.composer_dispatch_calls(rejected) is None
-    assert receiver.composer_title_prelude(invoke) is invoke.body[0]
-    assert receiver.composer_dispatch_calls(invoke) == dispatch
+# Retired test_receiving_context_handler_role_preserves_audit_and_closed_order: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
-@pytest.mark.parametrize(
-    ("owner", "fault"),
-    (
-        ("compose_service", "omit"),
-        ("compose_service", "effect"),
-        ("compose_turn", "delete_audit"),
-        ("compose_turn", "early_durable"),
-        ("route_turn", "delete_audit"),
-        ("route_turn", "early_durable"),
-    ),
-)
-def test_receiving_compose_and_route_shapes_bind_the_accepted_context_branch(owner, fault):
-    if owner == "route_turn":
-        units = _source_units((TURN, route.HELPERS, route.FINALIZATION))
-        check = route.route_helper_local_contracts
-    else:
-        units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
-        check = compose.compose_proposal_local_transfers
-    failures, _conditional = check(units)
-    assert failures == []
-    path = compose.SERVICE if owner == "compose_service" else TURN
-    original = next(unit for unit in units if unit.path == path)
-    changed = fencing._parse_source(path, original.source)
-    if owner == "compose_service":
-        method = fencing._reserve_node_at(changed, "ComposerServiceImpl.compose")
-        handlers = [
-            node
-            for node in ast.walk(method)
-            if isinstance(node, ast.ExceptHandler) and ast.unparse(node.type) == "(PromptGuardRefused, ComposerContextUnsupported)"
-        ]
-        assert len(handlers) == 1
-        if fault == "omit":
-            handlers[0].type = ast.Name(id="PromptGuardRefused", ctx=ast.Load())
-        else:
-            assert fault == "effect"
-            handlers[0].body.insert(0, ast.Expr(value=ast.Call(func=ast.Name(id="foreign_effect", ctx=ast.Load()), args=[], keywords=[])))
-    else:
-        handler = _receiving_turn_invoke(changed).handlers[10]
-        assert ast.unparse(handler.type) == "ComposerContextUnsupported"
-        if fault == "delete_audit":
-            handler.body[3].body.pop(0)
-        else:
-            assert fault == "early_durable"
-            handler.body[3].body.reverse()
-    changed = _receiving_reparse_mutated_unit(changed)
-    mutated = tuple(changed if unit is original else unit for unit in units)
-    failures, conditional = check(mutated)
-    if owner == "route_turn":
-        assert failures == ["route helpers: complete finite grammar changed _run_composer_turn"]
-        assert conditional["reserve_calls"] == [] and conditional["caller_calls"] == []
-    else:
-        assert failures == ["composer complete executed method grammar changed " + path]
-        assert conditional is None
-    assert check(units)[0] == []
+# Retired test_receiving_compose_and_route_shapes_bind_the_accepted_context_branch: V1 turn-loop seam was removed; current Continuation handoffs are checked below.
 
 
 @pytest.mark.parametrize("fault", ("missing", "force_v2", "foreign_settings", "key"))
 def test_receiving_worker_status_member_remains_bound_to_actual_gate(fault):
-    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN))
+    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_caller.DRIVER))
     assert worker_origin.worker_whole_scope_origin_local_contracts(units)[0] == []
     original = units[0]
     changed = fencing._parse_source(original.path, original.source)

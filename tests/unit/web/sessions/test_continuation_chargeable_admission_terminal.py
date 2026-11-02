@@ -7,7 +7,10 @@ Only the external provider/guard boundaries use the canonical test harness.
 
 from __future__ import annotations
 
+import json
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -30,6 +33,7 @@ from elspeth.web.sessions.models import (
     quota_provider_attempts_table,
     token_usage_ledger_table,
 )
+from elspeth.web.sessions.schemas import ComposerOperationFailurePageResponse
 from tests.helpers.composer_operations import message_body
 from tests.helpers.continuation_app import ACTOR, continuation_app, install_sdk, submit_and_settle
 
@@ -187,3 +191,43 @@ async def test_actual_worker_chargeable_refusal_keeps_original_durable_owner_and
         for private in (ACTOR, "quota-identity", "quota-container", previous_attempt_id, existing_ledger_id):
             if private is not None:
                 assert private not in public
+
+        # This is the actual authenticated history route after a worker-origin
+        # refusal, not a projector-shaped substitute for the browser's input.
+        async with harness.client() as client:
+            response = await client.get(f"/api/sessions/{harness.session_id}/operations", params={"operation_id": operation_id})
+        assert response.status_code == 200 and response.headers["Cache-Control"] == "no-store"
+        history = ComposerOperationFailurePageResponse.model_validate_json(response.content, strict=True)
+        assert history.session_id == harness.session_id and history.next_cursor is None
+        assert len(history.items) == 1
+        outcome = history.items[0]
+        assert str(outcome.operation_id) == operation_id
+        assert outcome.error_type == error.error_type == "composer_admission_refused"
+        assert outcome.failure_code == error.failure_code == "http_error"
+        assert outcome.diagnostic_id is None and outcome.request_id == error.body["request_id"]
+        assert outcome.saved_revisions.attribution == "fenced" and outcome.saved_revisions.count == 0
+        assert sdk_calls == []
+
+        # Freeze the full producer payload for the real TypeScript decoder and
+        # history client. Normalize only the generated identities and wall
+        # clocks; schema, status/revision, public body and saved facts stay exact.
+        captured = {"terminal": json.loads(snapshot.model_dump_json()), "history": json.loads(history.model_dump_json())}
+        fixed_session = "11111111-1111-4111-8111-111111111111"
+        fixed_operation = "22222222-2222-4222-8222-222222222222"
+        fixed_user = "33333333-3333-4333-8333-333333333333"
+        fixed_time = "2026-11-02T00:00:00Z"
+        captured["terminal"]["operation_id"] = fixed_operation
+        captured["terminal"]["created_at"] = captured["terminal"]["observed_at"] = fixed_time
+        captured["terminal"]["error"]["body"]["request_id"] = "safe-request"
+        captured["history"]["session_id"] = fixed_session
+        item = captured["history"]["items"][0]
+        item["session_id"], item["operation_id"] = fixed_session, fixed_operation
+        if item["user_message_id"] is not None:
+            item["user_message_id"] = fixed_user
+        item["settled_at"], item["request_id"] = fixed_time, "safe-request"
+        fixture_path = Path(__file__).resolve().parents[3] / "fixtures/web/composer/composer_admission_refusal_producer.json"
+        if os.environ.get("ELSPETH_UPDATE_ADMISSION_REFUSAL_FIXTURE") == "1":
+            fixtures = json.loads(fixture_path.read_text()) if fixture_path.exists() else {}
+            fixtures[case] = captured
+            fixture_path.write_text(json.dumps(fixtures, indent=2) + "\n")
+        assert json.loads(fixture_path.read_text())[case] == captured

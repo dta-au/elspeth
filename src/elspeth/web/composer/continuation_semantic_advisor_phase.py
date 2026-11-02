@@ -56,9 +56,9 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
     begin_semantic_advisor_on_connection,
     close_semantic_advisor_no_sdk_on_connection,
     consume_committed_semantic_read_on_connection,
-    consume_semantic_advisor_iteration_stop_on_connection,
     consume_semantic_advisor_primary_on_connection,
     consume_semantic_advisor_review_on_connection,
+    consume_semantic_advisor_terminal_iteration_stop_on_connection,
     consume_semantic_advisor_whole_stop_on_connection,
     install_semantic_advisor_decision_on_connection,
     prepare_semantic_advisor_on_connection,
@@ -193,7 +193,7 @@ async def _consume_current_decision(phases: ContinuationLivePhases, selected: Se
         ):
             return consume_committed_semantic_read_on_connection(conn, running, selected=current, effect_key=effect_key)
         if len(root.frames) == 3 and type(root.frames[1]) is ToolBatchFrame:
-            return consume_semantic_advisor_iteration_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
+            return consume_semantic_advisor_terminal_iteration_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
         return consume_semantic_advisor_whole_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
 
     phases.latest_snapshot = await _registered(

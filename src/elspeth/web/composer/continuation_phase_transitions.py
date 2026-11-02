@@ -39,6 +39,11 @@ from elspeth.web.sessions.continuation import (
     put_chunk,
     read_chunk,
 )
+from elspeth.web.sessions.continuation_attachment_preparation import (
+    AttachmentPreparationSource,
+    read_unissued_attachment_preparation_on_connection,
+    require_fresh_attachment_preparation,
+)
 from elspeth.web.sessions.continuation_primary import (
     read_committed_primary_response_for_settlement_on_connection,
     read_committed_primary_response_on_connection,
@@ -53,7 +58,9 @@ from elspeth.web.sessions.models import composer_operation_segments_table as seg
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from elspeth.web.sessions.time_normalization import restore_utc
 
-type BatchTransition = Literal["batch_initialized", "tool_issued", "tool_completed", "tool_preparation_completed"]
+type BatchTransition = Literal[
+    "batch_initialized", "attachment_prepared", "attachment_reprepared", "tool_issued", "tool_completed", "tool_preparation_completed"
+]
 
 
 def refuse_v3_tool_before_dispatch(
@@ -594,7 +601,14 @@ def retain_batch_transition(
     inventory: CurrentContinuationEnvInventory,
     transition: BatchTransition,
 ) -> StoredContinuationSnapshot:
-    if transition not in ("batch_initialized", "tool_issued", "tool_completed", "tool_preparation_completed"):
+    if transition not in (
+        "batch_initialized",
+        "attachment_prepared",
+        "attachment_reprepared",
+        "tool_issued",
+        "tool_completed",
+        "tool_preparation_completed",
+    ):
         raise ValueError("batch transition has no implemented source owner")
     if (
         type(authority) is not ComposerAsyncOperationAuthority
@@ -641,7 +655,7 @@ def retain_batch_transition(
         if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(before):
             raise AuditIntegrityError("batch transition replaced its actual selected predecessor")
         if (
-            transition == "tool_issued"
+            transition in ("tool_issued", "attachment_prepared", "attachment_reprepared")
             and type(decode_continuation_policy(before.admission_policy_json, before.policy_hash)) is ContinuationAdmissionPolicyV3
         ):
             raise AuditIntegrityError("V3 tool issue requires a complete finite result envelope before dispatch")
@@ -654,6 +668,7 @@ def retain_batch_transition(
             raise AuditIntegrityError("batch transition replaced its exact paid provider response")
         key: str | None = None
         issue: ToolIssueSource | None = None
+        attachment_preparation: AttachmentPreparationSource | None = None
         receipt: str | None = None
         data: RestoredBatchData | RestoredPreparedBatchData
         if transition == "batch_initialized":
@@ -673,6 +688,57 @@ def retain_batch_transition(
                 or after.effect_frontier != before.effect_frontier
             ):
                 raise AuditIntegrityError("batch initialization is not its exact unconsumed provider response")
+        elif transition in ("attachment_prepared", "attachment_reprepared"):
+            previous = before.frames[-1]
+            if type(previous) is not ToolBatchFrame:
+                raise AuditIntegrityError("attachment preparation lost its actual batch predecessor")
+            data = decode_prepared_batch_data(_selected_chunk(following, frame).canonical, env_ref_names=names)
+            original: RestoredBatchData | RestoredPreparedBatchData
+            if transition == "attachment_prepared":
+                original = decode_coupled_batch_chunk(_selected_chunk(selected, previous), env_ref_names=names)
+                if original.batch.tool_outcomes:
+                    require_completed_runtime_prefix_on_connection(conn, running, selected=selected, env_ref_names=names)
+                if original.batch.phase != "call_ready" or original.batch.current_call is not None:
+                    raise AuditIntegrityError("attachment preparation lost its unissued original call")
+            else:
+                original = read_unissued_attachment_preparation_on_connection(conn, running, selected=selected, inventory=inventory)
+                require_fresh_attachment_preparation(original, data, names=names)
+            call = data.batch.current_call
+            if (
+                previous.phase != "tool_ready"
+                or frame.phase != "tool_ready"
+                or previous.response != frame.response
+                or previous.next_tool_index != frame.next_tool_index
+                or original.batch.next_tool_index != frame.next_tool_index
+                or data.calls != original.calls
+                or data.batch.tool_outcomes != original.batch.tool_outcomes
+                or canonical_json(data.batch.state.to_dict()) != canonical_json(original.batch.state.to_dict())
+                or call is None
+                or call.phase != "prepared"
+                or call.index != frame.next_tool_index
+                or call.tool_name not in ("read_attachment", "get_blob_content")
+                or call.effect_key is not None
+                or (call.original_creator_id, call.original_creator_epoch)
+                != (running.session_operation_context.fence.operation_id, running.session_operation_context.fence.operation_epoch)
+                or after.effect_frontier != before.effect_frontier
+                or frame.settled_effect_ids != previous.settled_effect_ids
+                or after.pending_owner_results
+                or after.pending_settlement_ids
+                or after.active_action_json is not None
+                or after.active_action_source is not None
+            ):
+                raise AuditIntegrityError("attachment preparation changed its original provider call or unissued prefix")
+            attachment_preparation = AttachmentPreparationSource(
+                previous_checkpoint_id=stored.checkpoint_id,
+                cursor=stored.cursor + 1,
+                sequence=sequence,
+                generation=generation,
+                creator_operation_id=running.session_operation_context.fence.operation_id,
+                creator_operation_epoch=running.session_operation_context.fence.operation_epoch,
+                response=frame.response,
+                prepared=frame.accumulator,
+                tool_index=call.index,
+            )
         elif transition == "tool_issued":
             previous = before.frames[-1]
             if type(previous) is not ToolBatchFrame:
@@ -832,7 +898,9 @@ def retain_batch_transition(
             .values(next_action_json=action.model_dump_json())
         )
         payload = (
-            {"owner": "composer_tool_phase", "transition": "tool_issued", "issue": issue.model_dump(mode="json")}
+            {"owner": "composer_tool_phase", "transition": transition, "preparation": attachment_preparation.model_dump(mode="json")}
+            if attachment_preparation is not None
+            else {"owner": "composer_tool_phase", "transition": "tool_issued", "issue": issue.model_dump(mode="json")}
             if issue is not None
             else {
                 "owner": "composer_tool_phase",

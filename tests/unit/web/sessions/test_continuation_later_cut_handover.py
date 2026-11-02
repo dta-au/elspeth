@@ -17,7 +17,7 @@ from litellm import ModelResponse
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation import ComposeFrame, EndFrame
+from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame
 from elspeth.web.composer.continuation_clock import SegmentFit
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_handoff import classify_drain_cut
@@ -33,7 +33,17 @@ from elspeth.web.sessions.models import composer_operation_segments_table as seg
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from elspeth.web.sessions.models import session_operation_fences_table as fences
 from tests.helpers.composer_operations import message_body
-from tests.helpers.continuation_app import ScriptedSDK, continuation_app, effects, end_admit, install_sdk, submit_and_settle
+from tests.helpers.continuation_app import (
+    ScriptedSDK,
+    continuation_app,
+    effects,
+    end_admit,
+    install_sdk,
+    semantic_read_response,
+    semantic_review_response,
+    semantic_stop_response,
+    submit_and_settle,
+)
 from tests.unit.web.composer.test_continuation_cut_coverage import HANDOFF_SAFE_CUTS, _selected
 
 
@@ -66,6 +76,7 @@ async def _admit_only(harness, body):
 
 async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fit"):
     unverified_readback = mode in ("missing-candidate", "foreign-candidate")
+    semantic_cut = cut in ("advisor-response", "advisor-decision", "semantic-publication")
     words = "The provider completed the request after a same-sequence handover."
     # A real END publication refusal requests a prose-only correction, whose
     # committed repair transition produces the next Compose action_ready.
@@ -80,7 +91,17 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
             },
         ),
     )
-    sdk = ScriptedSDK([*(() if cut == "end-review" else repair_prefix), ("primary", (words, None)), ("end", end_admit())])
+    sdk = ScriptedSDK(
+        [
+            ("primary", (words, None)),
+            ("semantic", semantic_read_response),
+            ("semantic", semantic_review_response),
+            ("end", end_admit()),
+            ("semantic", semantic_stop_response),
+        ]
+        if semantic_cut
+        else [*(() if cut == "end-review" else repair_prefix), ("primary", (words, None)), ("end", end_admit())]
+    )
 
     async def priced_sdk(**kwargs):
         reply = await sdk(**kwargs)
@@ -129,6 +150,10 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
 
     def matches(selected):
         top = selected.stack.frames[-1]
+        if cut in ("advisor-response", "advisor-decision"):
+            return type(top) is AdvisorFrame and top.phase == ("response_retained" if cut == "advisor-response" else "decision_ready")
+        if cut == "semantic-publication":
+            return type(top) is EndFrame and top.phase == "publication_ready"
         if cut == "later-compose":
             return type(top) is ComposeFrame and top.phase == "action_ready"
         return type(top) is EndFrame and top.phase == "review_needed"
@@ -168,17 +193,23 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
             phase_trace.append(("raised", generation, failure_trace(original)))
             raise
         phase_trace.append(("returned", generation, selected.stack.frames[-1].frame_kind, selected.stack.cursor))
-        if first_resumed_phase:
+        if old_claims and driver.running.claim.ownership_generation == old_claims[0].ownership_generation + 1:
             # Control preflight may restore before advance; current ownership
             # and object identity must still be fresh for the claimed segment.
             runtime = driver.phases.runtime
             previous = old_runtimes[0]
-            assert runtime is not None and previous is not None and runtime is not previous
-            assert runtime.bindings is not previous.bindings
-            assert runtime.materialization is not previous.materialization
-            assert runtime.bindings.required_work is driver.work
-            assert runtime.bindings.session_operation_context is driver.running.session_operation_context
-            assert runtime.bindings.provider_owner is driver.provider
+            if runtime is None:
+                # Installing the retained decision is SQL-only. Its next Read
+                # action restores real runtime under this new generation.
+                assert type(selected.stack.frames[-1]) is AdvisorFrame
+                assert selected.stack.frames[-1].phase == "response_retained"
+            else:
+                assert previous is not None and runtime is not previous
+                assert runtime.bindings is not previous.bindings
+                assert runtime.materialization is not previous.materialization
+                assert runtime.bindings.required_work is driver.work
+                assert runtime.bindings.session_operation_context is driver.running.session_operation_context
+                assert runtime.bindings.provider_owner is driver.provider
         # Observe later Compose only after the actual END repair owner has
         # returned; the selected root is then re-read from its committed SQL.
         probe_produced_cut = cut != "later-compose" or type(selected.stack.frames[-1]) is EndFrame
@@ -350,7 +381,15 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
             assert selected_before, "the actual live owner did not produce the requested later cut"
             assert outcomes and (forced if mode != "drain" else not forced), "the actual worker did not attempt the required disposition"
             assert len(suspend_attempts) == 1
-            expected_before = ["primary", "end"] if cut == "later-compose" else ["primary"]
+            expected_before = (
+                ["primary", "semantic", "semantic", "end", "semantic"]
+                if cut == "semantic-publication"
+                else ["primary", "semantic"]
+                if semantic_cut
+                else ["primary", "end"]
+                if cut == "later-compose"
+                else ["primary"]
+            )
             old_context = old_phases[0].lease.context
             if unverified_readback:
                 assert len(committed) == len(readbacks) == len(read_failures) == 1
@@ -581,7 +620,13 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
             assert after.semantic_frontier == before.semantic_frontier
             assert after.pending_settlement_ids == before.pending_settlement_ids == ()
             assert after.pending_owner_results == before.pending_owner_results == ()
-            expected_roles = ["primary", "end", "primary", "end"] if cut == "later-compose" else ["primary", "end"]
+            expected_roles = (
+                ["primary", "semantic", "semantic", "end", "semantic"]
+                if semantic_cut
+                else ["primary", "end", "primary", "end"]
+                if cut == "later-compose"
+                else ["primary", "end"]
+            )
             assert sdk.roles == expected_roles and not sdk.steps
             final_effects = {row.effect_key: row for row in effects(harness.app, operation_id)}
             for previous in old_effects:
@@ -609,6 +654,13 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
 @pytest.mark.parametrize("cut", ("later-compose", "end-review"))
 async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work(tmp_path, monkeypatch, cut):
     await _run_later_cut_handover(tmp_path, monkeypatch, cut)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cut", ("advisor-response", "advisor-decision", "semantic-publication"))
+@pytest.mark.parametrize("mode", ("action-fit", "drain"))
+async def test_live_semantic_cut_preserves_paid_source_through_handover(tmp_path, monkeypatch, cut, mode):
+    await _run_later_cut_handover(tmp_path, monkeypatch, cut, mode=mode)
 
 
 @pytest.mark.asyncio

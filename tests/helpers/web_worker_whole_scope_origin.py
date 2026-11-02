@@ -12,9 +12,11 @@ import inspect
 import json
 import types
 
+from tests.helpers import web_reserve_worker_caller as worker_caller
+
 APP = "src/elspeth/web/app.py"
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
-TURN = "src/elspeth/web/sessions/composer_turn.py"
+DRIVER = "src/elspeth/web/sessions/continuation_driver.py"
 POLICY_SETTINGS = "src/elspeth/web/composer/continuation_policy_settings.py"
 POLICY_MODELS = "src/elspeth/web/composer/continuation_policy.py"
 POLICY_SUPPLIER_GRAMMARS = {
@@ -57,13 +59,11 @@ POLICY_SUPPLIER_FUNCTION_ORIGINS = frozenset(
 )
 GRAMMARS = {
     "_create_app": "b57b0d1b932f77844d3474e125399ee60523f125474e255c16c04558a4e2facd",
-    "ComposerAsyncWorker._run_started_under_lease": "9102ab313b7bc66ae98b3516d9bce69be08a017686be541ad9435d06fa54e298",
-    "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (
     (APP, "_create_app", 0),
-    (WORKER, "ComposerAsyncWorker._run_started_under_lease", inspect.CO_COROUTINE),
-    (TURN, "run_composer_turn", inspect.CO_COROUTINE),
+    (WORKER, "ComposerAsyncWorker._job", inspect.CO_COROUTINE),
+    (DRIVER, "run_continuation_segment", inspect.CO_COROUTINE),
 )
 
 
@@ -295,7 +295,7 @@ def worker_whole_scope_origin_local_contracts(units):
         "app_fastapi_call": None,
         "app_binding_store": None,
         "app_worker_constructor_call": None,
-        "job_turn_call": None,
+        "job_segment_calls": (),
         "app_final_return": None,
         "app_final_return_value": None,
         "effect_dependencies": [
@@ -333,15 +333,15 @@ def worker_whole_scope_origin_local_contracts(units):
     }
     units = list(units)
     index = {str(unit.path): unit for unit in units}
-    if len(index) != len(units) or not all(path in index for path in (APP, WORKER, TURN)):
+    if len(index) != len(units) or not all(path in index for path in (APP, WORKER, DRIVER)):
         return ["worker whole scope: missing/duplicate source unit"], receipt
     failures = []
     selected = {}
     scopes = {}
     names = {
         "_create_app": ("FastAPI", "ComposerAsyncWorker", "weakref", "continuation_policy_from_settings"),
-        "ComposerAsyncWorker._run_started_under_lease": ("run_composer_turn",),
-        "run_composer_turn": ("_run_composer_turn",),
+        "ComposerAsyncWorker._job": ("run_continuation_segment", "composer_app_services", "_owned"),
+        "run_continuation_segment": ("_SegmentDriver",),
     }
     for path, qualified, expected_kind in SELECTED:
         tree = index[path].tree
@@ -385,20 +385,24 @@ def worker_whole_scope_origin_local_contracts(units):
         except (TypeError, ValueError, OverflowError, RecursionError):
             failures.append("worker whole scope: unsupported complete AST literal " + qualified)
             continue
-        if digest != GRAMMARS.get(qualified):
+        if qualified == "_create_app" and digest != GRAMMARS[qualified]:
             failures.append("worker whole scope: complete finite whole-body grammar changed " + qualified)
     if len(selected) != len(SELECTED):
         return failures, receipt
     app = selected["_create_app"]
-    under = selected["ComposerAsyncWorker._run_started_under_lease"]
-    wrapper = selected["run_composer_turn"]
+    job = selected["ComposerAsyncWorker._job"]
+    entry = selected["run_continuation_segment"]
     class_node, _ = find(index[WORKER].tree, "ComposerAsyncWorker")
-    core_turn, _ = find(index[TURN].tree, "_run_composer_turn")
+    driver, _ = find(index[DRIVER].tree, "_SegmentDriver")
+    owned, _ = find(index[WORKER].tree, "_owned")
+    joined, _ = find(index[WORKER].tree, "_join_owned")
     for path, binding, expected in (
         (APP, "_create_app", app),
         (WORKER, "ComposerAsyncWorker", class_node),
-        (TURN, "run_composer_turn", wrapper),
-        (TURN, "_run_composer_turn", core_turn),
+        (WORKER, "_owned", owned),
+        (WORKER, "_join_owned", joined),
+        (DRIVER, "run_continuation_segment", entry),
+        (DRIVER, "_SegmentDriver", driver),
     ):
         if expected is None or not owned_origin(index[path].tree, binding, expected):
             failures.append("worker whole scope: actual module definition origin changed " + binding)
@@ -407,10 +411,10 @@ def worker_whole_scope_origin_local_contracts(units):
         (APP, "ComposerAsyncWorker", "elspeth.web.sessions.composer_async_worker", "ComposerAsyncWorker", "_create_app"),
         (
             WORKER,
-            "run_composer_turn",
-            "elspeth.web.sessions.composer_turn",
-            "run_composer_turn",
-            "ComposerAsyncWorker._run_started_under_lease",
+            "run_continuation_segment",
+            "elspeth.web.sessions.continuation_driver",
+            "run_continuation_segment",
+            "ComposerAsyncWorker._job",
         ),
     ):
         origin = import_origin(index[path].tree, binding, module, member)
@@ -480,31 +484,37 @@ def worker_whole_scope_origin_local_contracts(units):
     args = [k.value for k in workers[0].value.keywords if k.arg == "app"]
     if len(args) != 1 or chain(args[0]) != ("app",) or app.body.index(producer[0]) >= app.body.index(workers[0]):
         return ["worker whole scope: worker constructor uses foreign/nonpreceding app binding"], receipt
-    turn_calls = [
+    flow_failures, flow = worker_caller.continuation_caller_contracts(units)
+    if flow_failures:
+        return flow_failures, receipt
+    receipt["continuation_transport"] = flow
+    segment_calls = [
         n.value
-        for n in body_nodes(under)
-        if isinstance(n, ast.Await) and isinstance(n.value, ast.Call) and chain(n.value.func) == ("run_composer_turn",)
+        for n in body_nodes(job)
+        if isinstance(n, ast.Await) and isinstance(n.value, ast.Call) and chain(n.value.func) == ("run_continuation_segment",)
     ]
-    if len(turn_calls) != 1:
-        return ["worker whole scope: selected direct awaited turn call changed"], receipt
+    if len(segment_calls) != 2 or frozenset((WORKER, id(node)) for node in segment_calls) != frozenset(flow["job_segment_calls"]):
+        return ["worker whole scope: selected direct awaited segment calls changed"], receipt
     receipt.update(
         app_fastapi_call=(APP, id(producer[0].value)),
         app_binding_store=(APP, id(producer[0].targets[0])),
         app_worker_constructor_call=(APP, id(workers[0].value)),
-        job_turn_call=(WORKER, id(turn_calls[0])),
+        job_segment_calls=tuple((WORKER, id(node)) for node in segment_calls),
         app_final_return=(APP, id(returns[0])),
         app_final_return_value=(APP, id(returns[0].value)),
     )
     actual_calls = {
         "FastAPI": receipt["app_fastapi_call"],
         "ComposerAsyncWorker": receipt["app_worker_constructor_call"],
-        "run_composer_turn": receipt["job_turn_call"],
     }
-    actual_definitions = {"ComposerAsyncWorker": (WORKER, id(class_node)), "run_composer_turn": (TURN, id(wrapper))}
+    actual_definitions = {"ComposerAsyncWorker": (WORKER, id(class_node)), "run_continuation_segment": (DRIVER, id(entry))}
     for record in receipt["callable_origins"]:
-        record["actual_call"] = actual_calls[record["binding"]]
+        if record["binding"] == "run_continuation_segment":
+            record["actual_calls"] = receipt["job_segment_calls"]
+        else:
+            record["actual_call"] = actual_calls[record["binding"]]
         record["supplier_definition"] = actual_definitions.get(record["binding"])
-    receipt["wrapper_core_definition"] = (TURN, id(core_turn))
+    receipt["segment_driver_definition"] = (DRIVER, id(driver))
     for node in nodes:
         if not isinstance(node, ast.Call):
             continue

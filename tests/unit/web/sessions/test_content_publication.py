@@ -134,7 +134,11 @@ async def test_read_refuses_graph_tampering_instead_of_returning_stale_applicabi
 
 
 @pytest.mark.asyncio
-async def test_repository_readers_reject_stale_publication_before_derived_mutation(store):
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    (("graph_content", "immutable graph version"), ("missing_publication", "no content publication")),
+)
+async def test_repository_readers_reject_stale_publication_before_derived_mutation(store, corruption, message):
     service, engine = store
     session = await service.create_session(user_id="alice", title="Content", auth_provider_type="local")
     saved = await service.save_composition_state(session.id, _data(), provenance="session_seed")
@@ -143,7 +147,6 @@ async def test_repository_readers_reject_stale_publication_before_derived_mutati
         table.c.id.label("state_id"),
         table.c.session_id.label("state_session_id"),
         table.c.version.label("state_version"),
-        table.c.source,
         table.c.sources,
         table.c.nodes,
         table.c.edges,
@@ -161,13 +164,17 @@ async def test_repository_readers_reject_stale_publication_before_derived_mutati
         assert read_content_publication(_active_run_state_record(connection.execute(active_projection).one())) == read_content_publication(
             saved
         )
-        connection.execute(
-            update(table).where(table.c.id == str(saved.id)).values(metadata_={"_version": 1, "data": {"description": "changed"}})
-        )
+        tamper = update(table).where(table.c.id == str(saved.id))
+        if corruption == "graph_content":
+            tamper = tamper.values(metadata_={"_version": 1, "data": {"description": "changed"}})
+        else:
+            assert corruption == "missing_publication"
+            tamper = tamper.values(composer_meta={"_version": 1, "data": {}})
+        connection.execute(tamper)
         row = connection.execute(select(table).where(table.c.id == str(saved.id))).one()
-        with pytest.raises(AuditIntegrityError, match="immutable graph version"):
+        with pytest.raises(AuditIntegrityError, match=message):
             _RepositoryInterpretationMutations._state_record(row)
-        with pytest.raises(AuditIntegrityError, match="immutable graph version"):
+        with pytest.raises(AuditIntegrityError, match=message):
             _active_run_state_record(connection.execute(active_projection).one())
 
 

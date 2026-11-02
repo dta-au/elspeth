@@ -22,7 +22,12 @@ from elspeth.web.composer import continuation_codec as codec
 from elspeth.web.composer import diagnostic_evidence as diagnostic
 from elspeth.web.composer import provider_context
 from elspeth.web.composer.state import SourceSpec
-from elspeth.web.continuation_retention_memo import RetentionStageMemo, current_retention_stage_memo, without_retention_stage_memo
+from elspeth.web.continuation_retention_memo import (
+    CanonicalTextEncodingKey,
+    RetentionStageMemo,
+    current_retention_stage_memo,
+    without_retention_stage_memo,
+)
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from tests.helpers.continuation_memo import RetentionMemoTrace, UncachedValidationBudget
 from tests.unit.web.composer.test_continuation_frames import initial_stack
@@ -36,6 +41,7 @@ _SCAN = guard._retention_credential_finding
 _STATE_SCAN = guard._retention_state_options_finding
 _DECODE_WORK = codec._decode_continuation_snapshot_uncached
 _CHUNK_WORK = codec._verify_private_chunk_canonical
+_CANONICAL_WORK = codec._private_chunk_canonical_text_bytes
 _DETECTOR_WORK = find_credential_material
 
 
@@ -52,6 +58,10 @@ class _CallableProfileHook:
 
 def _chunk():
     return codec.encode_private_chunk(codec="composer.messages.v1", canonical='{"message":"ordinary"}')
+
+
+def _canonical_chunk_key(chunk):
+    return CanonicalTextEncodingKey(chunk.canonical, codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, chunk.reference)
 
 
 def _owner():
@@ -876,26 +886,26 @@ def test_actual_family_aliases_accept_hits_and_refuse_extra_real_producer_work(m
     encoded, chunk, owner = codec.encode_continuation_snapshot(initial_stack()), _chunk(), _owner()
     methods = {
         "snapshot": RetentionStageMemo.snapshot,
-        "chunk": RetentionStageMemo.private_chunk,
+        "chunk": RetentionStageMemo.canonical_text_proof,
         "credential": RetentionStageMemo.credential,
         "state": RetentionStageMemo.state_credentials,
     }
     method = methods[family]
     seen = set()
 
-    def controlled(memo, key, producer):
-        result = method(memo, key, producer)
+    def controlled(memo, key, producer, digest_producer=None):
+        result = method(memo, key, producer, digest_producer) if family == "chunk" else method(memo, key, producer)
         if extra_work and (memo, key) in seen:
             if family == "snapshot":
                 assert producer(key.encoded) == result
             elif family == "chunk":
-                assert producer(key.canonical) is result
+                assert producer(key) == result.encoded
             else:
                 assert producer(key) is result
         seen.add((memo, key))
         return result
 
-    names = {"snapshot": "snapshot", "chunk": "private_chunk", "credential": "credential", "state": "state_credentials"}
+    names = {"snapshot": "snapshot", "chunk": "canonical_text_proof", "credential": "credential", "state": "state_credentials"}
     monkeypatch.setattr(RetentionStageMemo, names[family], controlled)
     trace = RetentionMemoTrace(monkeypatch, request)
 
@@ -1039,8 +1049,16 @@ def test_chunk_binding_attempts_follow_real_native_short_circuit_branches(monkey
                 with pytest.raises(AuditIntegrityError, match="canonical strict JSON" if case == "noncanonical" else "bytes differ"):
                     _VERIFY(reference, canonical)
     assert len(trace.records) == 2
-    for record in trace.records:
-        expected = (0, 0, 0) if case == "noncanonical" else (1, 1, 0) if case == "length" else (1, 1, 1)
+    for index, record in enumerate(trace.records):
+        expected = (
+            (1, 0, 0)
+            if case == "noncanonical"
+            else (1, 1, 1)
+            if case == "unsupported-reference"
+            else (2, 1, 1)
+            if index == 0
+            else (0, 1, 0)
+        )
         assert tuple(record.attempts[key] for key in ("utf8", "length", "sha256")) == expected
         if case == "unsupported-reference":
             assert record.group is None and record.attempts["chunk_work"] == 1
@@ -2023,6 +2041,48 @@ def _native_byte_limits(**charges):
     return tuple(NativeByteLimit(channel, charges.get(channel, (0, 0))[0], *charges.get(channel, (0, 0))) for channel in channels)
 
 
+def _canonical_chunk_charges(chunk, size, *, requests=2, parser_work=1, cold_queries=1):
+    """Expected native buffers from the current canonical-proof source grammar."""
+    reference = chunk.reference
+    metadata = (
+        len(reference.codec.encode("utf-8"))
+        + len(reference.digest.encode("utf-8"))
+        + len(str(reference.byte_length))
+        + len(str(codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES))
+    )
+    return {
+        "strict_parse": (parser_work, parser_work * size),
+        "canonical": (parser_work, parser_work * size),
+        "chunk_length": (requests, requests * size),
+        "chunk_digest": (cold_queries, cold_queries * size),
+        "scanner_size": (parser_work, 0),
+        "scanner_extent": (0, 0)
+        if chunk.canonical.isascii()
+        else (parser_work * ((len(chunk.canonical) + 4095) // 4096), parser_work * size),
+        "key_preparation": (
+            4 * requests + 8 * cold_queries,
+            requests * metadata + cold_queries * (2 * size + 128 + metadata),
+        ),
+    }
+
+
+def _canonical_only_chunk_charges(chunk, size, *, requests=2):
+    reference = chunk.reference
+    metadata = (
+        len(reference.codec.encode("utf-8"))
+        + len(reference.digest.encode("utf-8"))
+        + len(str(reference.byte_length))
+        + len(str(codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES))
+    )
+    return {
+        "strict_parse": (1, size),
+        "canonical": (1, size),
+        "chunk_length": (requests, requests * size),
+        "chunk_digest": (requests, requests * size),
+        "key_preparation": (4 * requests, requests * metadata),
+    }
+
+
 def _native_scan_budget(stage, value, size, *, scans=1, requests=2):
     from elspeth.web.continuation_retention_memo import CredentialInputToken, CredentialPolicyKey, CredentialScanKey
     from tests.helpers.continuation_memo import NativeByteBudget
@@ -2183,11 +2243,10 @@ def test_native_byte_budgets_refuse_missing_balanced_wrong_and_altered_channels(
         trace.finish(stages=1, require_snapshot=False, native_byte_limits=budgets)
 
 
-@pytest.mark.parametrize("variation", ["normal", "extra", "direct", "bypass"])
+@pytest.mark.parametrize("variation", ["normal", "extra", "direct", "bypass", "warm-digest", "warm-encoded"])
 def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_charge_each_hit(
     monkeypatch, request, record_property, variation, _native_private_chunk_reader
 ):
-    from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey
     from elspeth.web.sessions import continuation_selection as selection
     from tests.helpers.continuation_memo import NativeByteBudget
 
@@ -2198,15 +2257,17 @@ def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_char
     connection, stack = _native_private_chunk_reader(chunk, payload)
     monkeypatch.setattr(selection, "required_private_chunks", lambda _stack: (chunk.reference,))
 
-    method = RetentionStageMemo.private_chunk
+    method = RetentionStageMemo.canonical_text_proof
+    mutations = []
 
-    def controlled(memo, key, producer):
-        result = method(memo, key, producer)
+    def controlled(memo, key, producer, digest_producer):
+        result = method(memo, key, producer, digest_producer)
         if variation == "extra":
-            producer(key.canonical)
+            mutations.append(key)
+            producer(key)
         return result
 
-    monkeypatch.setattr(RetentionStageMemo, "private_chunk", controlled)
+    monkeypatch.setattr(RetentionStageMemo, "canonical_text_proof", controlled)
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
         for _ in range(2):
@@ -2218,23 +2279,36 @@ def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_char
                 ) == (chunk,)
         if variation == "bypass":
             assert _CHUNK_WORK(canonical) is None
+        if variation in ("warm-digest", "warm-encoded"):
+            cold, warm = [item.owner for item in trace._byte_private_sizes]
+            assert cold.attempts["sha256"] == 1 and warm.attempts["sha256"] == 0
+            assert cold.chunk_binding_returned and warm.chunk_binding_returned
+            proof = warm.chunk_proof
+            assert proof is not None and proof is cold.chunk_proof
+            assert proof.encoded == payload and proof.digest == chunk.reference.digest
+            # Both real SQL loader returns have completed. Corrupt the actual
+            # retained proof reached by the warm read; closure must reject it
+            # even though its recorded native work and public returns remain.
+            if variation == "warm-digest":
+                object.__setattr__(proof, "digest", "0" * 64)
+            else:
+                exchanged = bytes(bytearray(proof.encoded))
+                assert exchanged == proof.encoded and exchanged is not proof.encoded
+                object.__setattr__(proof, "encoded", exchanged)
+            mutations.append(proof)
     budget = NativeByteBudget(
         1,
         "chunk",
-        _native_byte_limits(
-            strict_parse=(1, len(payload)),
-            canonical=(1, len(payload)),
-            chunk_length=(2, 2 * len(payload)),
-            chunk_digest=(2, 2 * len(payload)),
-        ),
-        PrivateChunkVerificationKey(chunk.reference, canonical),
-        _CHUNK_WORK,
+        _native_byte_limits(**_canonical_chunk_charges(chunk, len(payload))),
+        _canonical_chunk_key(chunk),
+        _CANONICAL_WORK,
     )
     if variation in ("normal", "direct"):
         trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
         totals = {row.channel: (row.calls, row.bytes) for row in trace.native_byte_totals()}
         assert totals["strict_parse"] == totals["canonical"] == (1, len(payload))
-        assert totals["chunk_length"] == totals["chunk_digest"] == (2, 2 * len(payload))
+        assert totals["chunk_length"] == (2, 2 * len(payload))
+        assert totals["chunk_digest"] == (1, len(payload))
         assert len(trace._byte_private_sizes) == (2 if variation == "normal" else 0)
         if variation == "normal":
             assert all(
@@ -2251,15 +2325,20 @@ def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_char
                         1,
                         "chunk",
                         1,
-                        strict_parse=(1, len(payload)),
-                        canonical=(1, len(payload)),
-                        chunk_length=(2, 2 * len(payload)),
-                        chunk_digest=(2, 2 * len(payload)),
+                        **_canonical_chunk_charges(chunk, len(payload)),
                     )
                 ),
             )
     else:
-        expected = "native byte call budget exceeded or missing: strict_parse" if variation == "extra" else "native byte provenance invalid"
+        if variation == "extra":
+            assert len(mutations) == 2
+        if variation in ("warm-digest", "warm-encoded"):
+            assert len(mutations) == 1
+            expected = "private resource canonical proof lost its original binding lineage"
+        else:
+            expected = (
+                "native byte call budget exceeded or missing: strict_parse" if variation == "extra" else "native byte provenance invalid"
+            )
         with pytest.raises(AssertionError, match=expected):
             trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
 
@@ -3006,7 +3085,9 @@ def test_native_byte_context_nested_in_real_chunk_producer_cannot_borrow_outer_c
     from tests.helpers.continuation_memo import NativeByteBudget
 
     messages, texts, expected = _provider_fixture()
-    payload = b'{"message":"ordinary"}'
+    # Exercise the actual canonical-only producer, whose complete full-proof
+    # key/value exceeds the bounded cache. Keep the nested capture unchanged.
+    payload, _original_chunk = _chunk_artifact_fixture("canonical-only")
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
     connection, stack = _native_private_chunk_reader(chunk, payload)
     original = codec._verify_private_chunk_canonical
@@ -3031,10 +3112,7 @@ def test_native_byte_context_nested_in_real_chunk_producer_cannot_borrow_outer_c
         1,
         "chunk",
         _native_byte_limits(
-            strict_parse=(1, len(payload)),
-            canonical=(1, len(payload) + (context_size if transfer else 0)),
-            chunk_length=(2, 2 * len(payload)),
-            chunk_digest=(2, 2 * len(payload)),
+            **dict(_canonical_only_chunk_charges(chunk, len(payload)), canonical=(1, len(payload) + (context_size if transfer else 0)))
         ),
         PrivateChunkVerificationKey(chunk.reference, chunk.canonical),
         producing,
@@ -3095,9 +3173,7 @@ def test_native_byte_zero_scalar_capture_does_not_hide_changed_original_validati
 
 @pytest.mark.parametrize("depth", [0, 80])
 def test_native_byte_real_stack_exhaustion_cannot_authorize_a_nearer_chunk_owner(monkeypatch, request, depth, _native_private_chunk_reader):
-    from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey
     from elspeth.web.sessions import continuation_selection as selection
-    from tests.helpers.continuation_memo import NativeByteBudget
 
     payload = b'{"message":"ordinary"}'
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
@@ -3121,18 +3197,7 @@ def test_native_byte_real_stack_exhaustion_cannot_authorize_a_nearer_chunk_owner
     assert sum(record.attempts["chunk_work"] for record in trace.records) == 1
     assert sum(record.attempts["strict_parse"] for record in trace.records) == 1
     assert sum(record.attempts["canonical_encode"] for record in trace.records) == 1
-    budget = NativeByteBudget(
-        1,
-        "chunk",
-        _native_byte_limits(
-            strict_parse=(1, len(payload)),
-            canonical=(1, len(payload)),
-            chunk_length=(2, 2 * len(payload)),
-            chunk_digest=(2, 2 * len(payload)),
-        ),
-        PrivateChunkVerificationKey(chunk.reference, chunk.canonical),
-        _CHUNK_WORK,
-    )
+    budget = _late_chunk_budget(chunk, len(payload))
     if depth:
         # There is deliberately no active capture here. This tests the
         # decisive real-stack invariant: uncertainty cannot authorize the
@@ -3153,36 +3218,145 @@ def test_native_byte_real_stack_exhaustion_cannot_authorize_a_nearer_chunk_owner
 
 
 def _late_chunk_budget(chunk, size, *, requests=2):
-    from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey
     from tests.helpers.continuation_memo import NativeByteBudget
 
     return NativeByteBudget(
         1,
         "chunk",
-        _native_byte_limits(
-            strict_parse=(1, size),
-            canonical=(1, size),
-            chunk_length=(requests, requests * size),
-            chunk_digest=(requests, requests * size),
-        ),
-        PrivateChunkVerificationKey(chunk.reference, chunk.canonical),
-        _CHUNK_WORK,
+        _native_byte_limits(**_canonical_chunk_charges(chunk, size, requests=requests)),
+        _canonical_chunk_key(chunk),
+        _CANONICAL_WORK,
     )
+
+
+@pytest.mark.parametrize("mutation", ("replace", "mutate"))
+def test_retained_chunk_digest_needs_the_original_observed_encoded_proof(monkeypatch, request, mutation):
+    chunk = _chunk()
+    trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True, require_chunk_artifacts=True)
+    with clock.retention_stage_memo_scope() as memo:
+        assert _VERIFY(chunk.reference, chunk.canonical) is None
+        key = (_CANONICAL_WORK, codec.sha256, _canonical_chunk_key(chunk))
+        original = memo._canonical_proofs[key]
+        substituted = b"x" * len(original.encoded)
+        assert substituted != original.encoded
+        if mutation == "replace":
+            memo._canonical_proofs[key] = replace(original, encoded=substituted)
+            assert memo._canonical_proofs[key] is not original
+        else:
+            object.__setattr__(original, "encoded", substituted)
+            assert memo._canonical_proofs[key] is original
+        # The public binding still compares retained digest and equal length.
+        # Its successful return cannot fabricate this observer's SHA lineage.
+        assert _VERIFY(chunk.reference, chunk.canonical) is None
+    assert [record.attempts["sha256"] for record in trace.records] == [1, 0]
+    assert [record.attempts["chunk_work"] for record in trace.records] == [1, 0]
+    assert "chunk retained digest lacks its original observed proof" in trace.errors
+    with pytest.raises(AssertionError, match="original observed proof"):
+        trace.finish(
+            stages=1,
+            require_snapshot=False,
+            chunk_artifact_budget=True,
+            native_byte_limits=(_late_chunk_budget(chunk, chunk.reference.byte_length),),
+        )
+    assert not trace._chunk_artifact_verified and not trace._byte_pending_parses
+
+
+def test_deferred_canonical_metadata_rechecks_its_original_submission_custody(monkeypatch, request):
+    chunk = _chunk()
+    trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
+    original_capture = trace._capture_memo_metadata
+    mutations = []
+
+    def changed(frame, callable_, operand):
+        original_capture(frame, callable_, operand)
+        pending = trace._byte_pending_memo_metadata.get(id(frame))
+        if pending:
+            mutations.append(pending[-1])
+            pending[-1] = replace(pending[-1], expected_memo_id=0)
+
+    monkeypatch.setattr(trace, "_capture_memo_metadata", changed)
+    with clock.retention_stage_memo_scope():
+        assert _VERIFY(chunk.reference, chunk.canonical) is None
+        assert _VERIFY(chunk.reference, chunk.canonical) is None
+    assert mutations and all(event.expected_memo_id is None for event in mutations)
+    assert not trace._byte_pending_memo_metadata and not trace._byte_pending_memo_failures
+    assert "canonical metadata lost its query-return custody" in trace.byte_errors
+    with pytest.raises(AssertionError, match="native byte provenance invalid"):
+        trace.finish(stages=1, require_snapshot=False, native_byte_limits=(_late_chunk_budget(chunk, chunk.reference.byte_length),))
+
+
+def test_deferred_canonical_metadata_capture_failure_retains_original_and_refuses_qualification(monkeypatch, request):
+    from tests.helpers import continuation_memo as accounting
+
+    chunk = _chunk()
+    trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
+    original_capture = trace._capture_memo_metadata
+    original_join = trace._join_memo_metadata
+    failure = RuntimeError("original observation failure")
+    capture_offsets = []
+    joined = []
+    returned = []
+
+    def failed_capture(frame, callable_, operand):
+        original_capture(frame, callable_, operand)
+        capture_offsets.append(frame.f_lasti)
+        raise failure
+
+    def observed_join(frame, expected_id):
+        pending = trace._byte_pending_memo_failures.get(id(frame))
+        joined.append((frame.f_locals.get("hit") is not None, pending, len(trace._byte_pending_memo_metadata.get(id(frame), ()))))
+        original_join(frame, expected_id)
+
+    monkeypatch.setattr(trace, "_capture_memo_metadata", failed_capture)
+    monkeypatch.setattr(trace, "_join_memo_metadata", observed_join)
+    try:
+        with clock.retention_stage_memo_scope():
+            returned.append(_VERIFY(chunk.reference, chunk.canonical))
+            returned.append(_VERIFY(chunk.reference, chunk.canonical))
+    finally:
+        primary = sys.exception()
+        try:
+            with pytest.raises(AssertionError, match="prior profiler failed; observation incomplete"):
+                trace.finish(
+                    stages=1,
+                    require_snapshot=False,
+                    native_byte_limits=(_late_chunk_budget(chunk, chunk.reference.byte_length),),
+                )
+        except BaseException as finalization:
+            if primary is None:
+                raise
+            raise BaseExceptionGroup("original operation and observation finalization failed", (primary, finalization)) from None
+
+    sites = accounting._CHUNK_PROOF_METADATA_SITES
+    assert returned == [None, None]
+    assert len(capture_offsets) == len(sites)
+    assert all(sum(offset in window for offset in capture_offsets) == 1 for window, _ in sites)
+    # The real warm-hit return precedes every metadata site. There are two
+    # original query returns, but only the cold one joins a capture failure.
+    assert joined == [(False, failure, len(sites)), (True, None, 0)]
+    assert joined[0][1] is failure
+    assert [record.attempts["chunk_work"] for record in trace.records] == [1, 0]
+    assert [record.attempts["sha256"] for record in trace.records] == [1, 0]
+    assert not trace._byte_pending_memo_metadata and not trace._byte_pending_memo_failures
+    assert "canonical metadata capture failed: RuntimeError" in trace.byte_errors
+    assert trace._finished and trace._closed and trace._byte_monitor.closed
 
 
 @pytest.mark.parametrize("payload", [b"{}", b'{"a":"ordinary"}', b'{"a":"caf\xc3\xa9\xe2\x98\x83"}'])
 @pytest.mark.parametrize("extra", [False, True])
 def test_native_byte_late_chunk_buffer_charges_each_actual_parse_before_count_guard(monkeypatch, request, record_property, payload, extra):
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
-    method = RetentionStageMemo.private_chunk
+    method = RetentionStageMemo.canonical_text_proof
+    mutations = []
 
-    def controlled(memo, key, producer):
-        result = method(memo, key, producer)
+    def controlled(memo, key, producer, digest_producer):
+        result = method(memo, key, producer, digest_producer)
         if extra:
-            producer(key.canonical)
+            mutations.append(key)
+            producer(key)
         return result
 
-    monkeypatch.setattr(RetentionStageMemo, "private_chunk", controlled)
+    monkeypatch.setattr(RetentionStageMemo, "canonical_text_proof", controlled)
     before, prior = _native_monitor_state(), sys.getprofile()
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
@@ -3190,13 +3364,15 @@ def test_native_byte_late_chunk_buffer_charges_each_actual_parse_before_count_gu
             assert _VERIFY(chunk.reference, chunk.canonical) is None
     budget = _late_chunk_budget(chunk, len(payload))
     if extra:
+        assert len(mutations) == 2
         with pytest.raises(AssertionError, match="native byte call budget exceeded or missing: strict_parse"):
             trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
     else:
         trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
     rows = {row.channel: (row.calls, row.bytes) for row in trace.native_byte_totals()}
     assert rows["strict_parse"] == rows["canonical"] == ((3 if extra else 1), (3 if extra else 1) * len(payload))
-    assert rows["chunk_length"] == rows["chunk_digest"] == (2, 2 * len(payload))
+    assert rows["chunk_length"] == (2, 2 * len(payload))
+    assert rows["chunk_digest"] == (1, len(payload))
     assert [record.byte_calls["strict_parse"] for record in trace.records] == ([2, 1] if extra else [1, 0])
     assert not trace._byte_pending_parses and not trace.byte_errors
     assert _native_monitor_state() == before and sys.getprofile() is prior
@@ -3208,10 +3384,7 @@ def test_native_byte_late_chunk_buffer_charges_each_actual_parse_before_count_gu
                     1,
                     "chunk",
                     1,
-                    strict_parse=(1, 2),
-                    canonical=(1, 2),
-                    chunk_length=(2, 4),
-                    chunk_digest=(2, 4),
+                    **_canonical_chunk_charges(chunk, 2),
                 )
             ),
         )
@@ -3223,16 +3396,18 @@ def test_native_byte_late_chunk_wrong_or_missing_original_source_preserves_nativ
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
     marker_type = {"interrupt": KeyboardInterrupt, "exit": SystemExit, "cancel": asyncio.CancelledError}.get(case, RuntimeError)
     marker = marker_type("original late chunk marker")
-    method = RetentionStageMemo.private_chunk
+    method = RetentionStageMemo.canonical_text_proof
+    mutations = []
 
-    def controlled(memo, key, producer):
+    def controlled(memo, key, producer, digest_producer):
+        mutations.append(key)
         if case == "wrong-text":
-            producer('{"a":"different"}')
-            return method(memo, key, producer)
-        producer(key.canonical)
+            producer(replace(key, canonical='{"a":"different"}'))
+            return method(memo, key, producer, digest_producer)
+        producer(key)
         raise marker
 
-    monkeypatch.setattr(RetentionStageMemo, "private_chunk", controlled)
+    monkeypatch.setattr(RetentionStageMemo, "canonical_text_proof", controlled)
     before, prior = _native_monitor_state(), sys.getprofile()
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
@@ -3242,6 +3417,7 @@ def test_native_byte_late_chunk_wrong_or_missing_original_source_preserves_nativ
             with pytest.raises(marker_type) as caught:
                 _VERIFY(chunk.reference, chunk.canonical)
             assert caught.value is marker
+    assert len(mutations) == 1
     with pytest.raises(AssertionError, match="native byte provenance invalid"):
         trace.finish(stages=1, require_snapshot=False, require_population=False)
     assert "strict parser has no bound native byte provenance" in trace.byte_errors
@@ -3754,24 +3930,29 @@ def test_snapshot_artifact_terminal_flag_tamper_is_still_refused(monkeypatch, re
 def _chunk_artifact_fixture(variation="ascii"):
     from hashlib import sha256
 
-    payload = {
-        "ascii": b'{"topic":"cafe"}',
-        "unicode": b'{"topic":"caf\xc3\xa9\xe2\x98\x83"}',
-        "empty": b"{}",
-    }[variation]
+    if variation == "canonical-only":
+        # A valid document below the original document bound; its complete
+        # text+encoded proof is larger than that independent cache budget.
+        payload = b'{"padding":"' + b"x" * (codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES // 2) + b'"}'
+    else:
+        payload = {
+            "ascii": b'{"topic":"cafe"}',
+            "unicode": b'{"topic":"caf\xc3\xa9\xe2\x98\x83"}',
+            "empty": b"{}",
+        }[variation]
     reference = codec.PrivateChunkRef.model_validate(
         {"codec": "composer.messages.v1", "digest": sha256(payload).hexdigest(), "byte_length": len(payload)}
     )
     return payload, codec.PrivateChunk(reference, payload.decode("utf-8"))
 
 
-def _chunk_artifact_expected(size, *, requests=2, work=1):
+def _chunk_artifact_expected(size, *, requests=2, work=1, producer="_private_chunk_canonical_text_bytes"):
     return {
         "rows": [
             {
                 "stage": 1,
                 "group": 1,
-                "producer": "_verify_private_chunk_canonical",
+                "producer": producer,
                 "basis": "post_observation_source_utf8_extent",
                 "requests": requests,
                 "work_attempts": work,
@@ -3846,7 +4027,7 @@ def test_chunk_artifact_actual_complete_attempt_and_postclose_extent_preserve_ea
     assert _actual_chunk_artifact_metric(trace) == _chunk_artifact_expected(len(payload))
     assert [record.chunk_artifact_attempts for record in trace.records] == [1, 0]
     assert [record.attempts["chunk_work"] for record in trace.records] == [1, 0]
-    assert all(tuple(record.attempts[name] for name in ("utf8", "length", "sha256")) == (1, 1, 1) for record in trace.records)
+    assert [tuple(record.attempts[name] for name in ("utf8", "length", "sha256")) for record in trace.records] == [(2, 1, 1), (0, 1, 0)]
     assert trace.chunk_artifact_complete() and trace._chunk_artifact_verified and not trace.chunk_artifact_errors
     assert not trace._chunk_artifact_requests and sys.getprofile() is prior and _native_monitor_state() == monitor
     exported = json.dumps(_actual_chunk_artifact_metric(trace))
@@ -3857,10 +4038,7 @@ def test_chunk_artifact_actual_complete_attempt_and_postclose_extent_preserve_ea
             1,
             "chunk",
             1,
-            strict_parse=(1, len(payload)),
-            canonical=(1, len(payload)),
-            chunk_length=(2, 2 * len(payload)),
-            chunk_digest=(2, 2 * len(payload)),
+            **_canonical_chunk_charges(chunk, len(payload)),
         )
         assert [asdict(row) for row in trace.native_byte_totals()] == expected
         record_property("chunk_artifact_native_expected", json.dumps(expected))
@@ -3894,7 +4072,7 @@ def test_chunk_artifact_distinct_full_references_and_fresh_stages_keep_separate_
 
 @pytest.mark.parametrize("extra", ["repeat", "eager"])
 def test_chunk_artifact_extra_real_canonical_work_fails_new_work_and_weighted_guards(monkeypatch, request, extra):
-    payload, chunk = _chunk_artifact_fixture("unicode")
+    payload, chunk = _chunk_artifact_fixture("canonical-only")
     lookup = RetentionStageMemo._lookup
 
     def changed(memo, entries, key, compute):
@@ -3915,7 +4093,7 @@ def test_chunk_artifact_extra_real_canonical_work_fails_new_work_and_weighted_gu
     with pytest.raises(AssertionError, match="chunk artifact weighted source extent budget exceeded"):
         trace._assert_chunk_artifact_byte_ratio()
     actual = _actual_chunk_artifact_metric(trace)
-    assert actual == _chunk_artifact_expected(len(payload), work=3)
+    assert actual == _chunk_artifact_expected(len(payload), work=3, producer="_verify_private_chunk_canonical")
     assert not trace._chunk_artifact_verified
 
 
@@ -3939,7 +4117,7 @@ def test_chunk_artifact_extra_real_canonical_work_fails_new_work_and_weighted_gu
 def test_chunk_artifact_wrong_source_cannot_borrow_an_owned_key(monkeypatch, request, change):
     from elspeth.web import continuation_retention_memo as memo_module
 
-    _payload, chunk = _chunk_artifact_fixture()
+    _payload, chunk = _chunk_artifact_fixture("canonical-only")
     lookup, original_value = RetentionStageMemo._lookup, memo_module._chunk_value
 
     def changed(memo, entries, key, compute):
@@ -3987,7 +4165,7 @@ def test_chunk_artifact_wrong_source_cannot_borrow_an_owned_key(monkeypatch, req
 
 @pytest.mark.parametrize("depth", [0, 80])
 def test_chunk_artifact_real_forwarding_stack_requires_proven_query_ancestry(monkeypatch, request, depth):
-    _payload, chunk = _chunk_artifact_fixture()
+    _payload, chunk = _chunk_artifact_fixture("canonical-only")
     lookup = RetentionStageMemo._lookup
 
     def changed(memo, entries, key, compute):
@@ -4043,15 +4221,25 @@ def test_chunk_artifact_refusal_order_and_actual_attempts_remain_native(monkeypa
     ):
         _VERIFY(reference, text)
     record = trace.records[0]
-    assert record.attempts["chunk_work"] == 1
-    expected = (0, 0, 0) if canonical_refusal else (1, 1, 0) if case in ("length", "foreign") else (1, 1, 1)
+    repeated_canonical_refusal = case in ("noncanonical", "invalid-json")
+    assert record.attempts["chunk_work"] == (2 if repeated_canonical_refusal else 1)
+    expected = (
+        (1, 0, 0)
+        if repeated_canonical_refusal
+        else (0, 0, 0)
+        if canonical_refusal
+        else (2, 1, 1)
+        if case in ("length", "digest")
+        else (1, 1, 1)
+    )
     assert tuple(record.attempts[name] for name in ("utf8", "length", "sha256")) == expected
-    if case in ("malformed-first", "missing-first", "fallback", "foreign"):
+    if case in ("malformed-first", "missing-first", "fallback", "foreign", "noncanonical", "invalid-json"):
         with pytest.raises(AssertionError, match="chunk artifact provenance invalid"):
             trace.finish(
                 stages=1, require_snapshot=False, require_population=False, require_valid_chunk_bindings=False, chunk_artifact_budget=True
             )
-        assert not trace._chunk_artifact_verified and trace.chunk_artifact_stage_totals()[0].observed_work_attempts == 1
+        assert not trace._chunk_artifact_verified
+        assert trace.chunk_artifact_stage_totals()[0].observed_work_attempts == (2 if repeated_canonical_refusal else 1)
     else:
         trace.finish(
             stages=1,
@@ -4142,7 +4330,7 @@ async def test_chunk_artifact_actual_required_worker_binds_stage_and_submission(
 def test_chunk_artifact_sizing_failure_preserves_the_original_native_marker(monkeypatch, request, marker_type):
     from tests.helpers import continuation_memo as accounting
 
-    _payload, chunk = _chunk_artifact_fixture()
+    _payload, chunk = _chunk_artifact_fixture("canonical-only")
     marker = None if marker_type is None else marker_type("original chunk artifact marker")
     lookup = RetentionStageMemo._lookup
 
@@ -4258,8 +4446,9 @@ def test_chunk_artifact_warm_hit_preserves_source_and_fresh_binding_refusal(monk
             )
             with pytest.raises(AuditIntegrityError, match="private chunk bytes differ from their binding"):
                 _VERIFY(changed, chunk.canonical)
-    assert all(record.attempts["utf8"] == record.attempts["length"] == 1 for record in trace.records)
-    assert trace.records[-1].attempts["sha256"] == (0 if change == "length" else 1)
+    assert all(record.attempts["length"] == 1 for record in trace.records)
+    assert [record.attempts["utf8"] for record in trace.records] == [2, 0, 0 if change == "canonical" else 2]
+    assert [record.attempts["sha256"] for record in trace.records] == [1, 0, 0 if change == "canonical" else 1]
     if change == "canonical":
         with pytest.raises(AssertionError, match="chunk artifact provenance invalid"):
             trace.finish(stages=1, require_snapshot=False, chunk_artifact_budget=True)
@@ -9492,12 +9681,12 @@ def _structure_store_visitor_predicate_mutant_code(mutation):
     expected = ast.parse(
         "guards = _STRUCTURE_STORE_VISITOR_GUARDS\n"
         "if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[3]:\n"
-        "    return False\n"
+        '    return _structure_source_refused(diagnostic, "sql.store_visitor_guards")\n'
         "for owner, name, present, function, code in guards:\n"
         "    if ((name in owner.__dict__) is not present or owner.__dict__.get(name) is not function "
         "or (present and (type is not _STRUCTURE_GUARD_KIND_ORIGINS[0] "
         "or FunctionType is not _STRUCTURE_GUARD_KIND_ORIGINS[1] or code is None or function.__code__ is not code))):\n"
-        "        return False\n"
+        '        return _structure_source_refused(diagnostic, "sql.store_visitor")\n'
     ).body
     assert [ast.dump(node) for node in block] == [ast.dump(node) for node in expected]
     loop = block[2]
@@ -9517,7 +9706,7 @@ def _structure_store_visitor_predicate_mutant_code(mutation):
     codes = [code for code in compiled.co_consts if type(code) is CodeType and code.co_name == original.__name__]
     assert len(codes) == 1
     assert codes[0].co_freevars == original.__code__.co_freevars == ()
-    assert codes[0].co_argcount == original.__code__.co_argcount == 0
+    assert codes[0].co_argcount == original.__code__.co_argcount == 1
     return codes[0]
 
 
@@ -9711,12 +9900,12 @@ def _structure_guard_kind_predicate_mutant_code(mutation):
     expected = ast.parse(
         "guards = _STRUCTURE_CACHE_SLOT_GUARDS\n"
         "if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[5]:\n"
-        "    return False\n"
+        '    return _structure_source_refused(diagnostic, "cache.slot_guards")\n'
         "for owner, name, present, descriptor, function, code in guards:\n"
         "    if ((name in owner.__dict__) is not present or owner.__dict__.get(name) is not descriptor "
         "or (type is not _STRUCTURE_GUARD_KIND_ORIGINS[0] or FunctionType is not _STRUCTURE_GUARD_KIND_ORIGINS[1] "
         "or (code is not None and function.__code__ is not code))):\n"
-        "        return False\n"
+        '        return _structure_source_refused(diagnostic, "cache.slot")\n'
     ).body
     assert [ast.dump(node) for node in block] == [ast.dump(node) for node in expected]
     if mutation == "cache-origin":
@@ -9727,7 +9916,7 @@ def _structure_guard_kind_predicate_mutant_code(mutation):
     compiled = compile(tree, original.__code__.co_filename, "exec", dont_inherit=True)
     codes = [code for code in compiled.co_consts if type(code) is CodeType and code.co_name == original.__name__]
     assert len(codes) == 1 and codes[0].co_freevars == original.__code__.co_freevars == ()
-    assert codes[0].co_argcount == original.__code__.co_argcount == 0
+    assert codes[0].co_argcount == original.__code__.co_argcount == 1
     return codes[0]
 
 

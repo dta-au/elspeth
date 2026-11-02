@@ -103,11 +103,15 @@ def read_runtime_source_on_connection(
         )
 
         if frame.phase == "effect_reconciling" and frame.accumulator.codec == "composer.tool-batch.v1":
-            require_issued_tool_runtime_on_connection(conn, running, selected=selected, env_ref_names=inventory.names)
+            pending = selected.stack.pending_owner_results
+            if len(pending) != 1 or pending[0].kind != "read":
+                require_issued_tool_runtime_on_connection(conn, running, selected=selected, env_ref_names=inventory.names)
         elif frame.phase == "tool_ready" and frame.accumulator.codec == "composer.coupled-batch-data.v1" and frame.next_tool_index:
             require_completed_runtime_prefix_on_connection(conn, running, selected=selected, env_ref_names=inventory.names)
     # Reuse the installed full ingress/evidence/actor/creator/current-inventory
-    # checks. No historical authorization class or second bootstrap grant.
+    # checks. A pending attachment is proved by the actual attachment SQL owner
+    # inside this current evidence boundary before its original graph restores.
+    # No historical authorization class or second bootstrap grant.
     inputs = _read_current_inputs(conn, selected=selected, inventory=inventory)
     return _runtime_source_from_inputs_on_connection(conn, running, selected=selected, inventory=inventory, inputs=inputs)
 

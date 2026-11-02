@@ -87,7 +87,8 @@ describe("R F2 callback fault ownership", () => {
       const callback = vi.fn(() => { throw thrownValue; });
       const wire = route === "stream status" ? statusFrame() : progressFrame;
       expect(decodeComposerOperationFrame({ id: route === "stream status" ? "4" : null, data: wire }, sid, id).event).toBe(route === "stream status" ? "status" : "progress");
-      const live = stream(sse(wire, route === "stream status" ? 4 : undefined));
+      const initialStatus = route.endsWith("progress") ? sse(statusFrame(), 4) : "";
+      const live = stream(initialStatus + sse(wire, route === "stream status" ? 4 : undefined));
       if (route === "GET status") vi.mocked(api.fetchComposerOperation).mockResolvedValue(snapshot("running"));
       else vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(live.response);
       let settled = false;

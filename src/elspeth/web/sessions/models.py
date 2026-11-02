@@ -76,7 +76,10 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # lifecycle. It also adds the terminal-run and run-counter CHECKs and closed
 # Continuation value CHECKs, and drops the unused sessions_cleanup_claims table.
 # Every epoch-79 store is refused; 0.8.10 starts from a fresh store.
-SESSION_SCHEMA_EPOCH = 81
+# Epoch 82 makes the original Continuation parent policy/version/allowance
+# tuple immutable. Epoch-81 stores retain the weaker trigger and are refused
+# unchanged; there is no automatic upgrade or store reset.
+SESSION_SCHEMA_EPOCH = 82
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -4026,6 +4029,9 @@ def _composer_operation_transition_condition(*, dialect: Literal["sqlite", "post
         "base_state_id",
         "created_at",
         "reserved_user_message_id",
+        "continuation_policy_version",
+        "continuation_policy_sha256",
+        "continuation_retained_payload_limit_bytes",
     )
     clauses = [f"NEW.{name} {different} OLD.{name}" for name in immutable]
     clauses.extend(

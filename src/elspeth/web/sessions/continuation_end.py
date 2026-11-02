@@ -288,7 +288,10 @@ async def publish_semantic_continuation_result(
     from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.continuation import load_snapshot
     from elspeth.web.sessions.continuation_semantic_actions import require_semantic_publication_on_connection
-    from elspeth.web.sessions.continuation_semantic_advisor import require_semantic_iteration_publication_on_connection
+    from elspeth.web.sessions.continuation_semantic_advisor import (
+        require_semantic_iteration_publication_on_connection,
+        require_semantic_owned_iteration_publication_on_connection,
+    )
     from elspeth.web.sessions.locking import locked_session_transaction
 
     runtime, _inventory = await phases.current(selected)
@@ -301,8 +304,12 @@ async def publish_semantic_continuation_result(
             stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
             if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(selected.stack):
                 raise AuditIntegrityError("semantic publication changed its selected source before result preparation")
-            iteration = require_semantic_iteration_publication_on_connection(conn, running, selected=stored)
-            if iteration is not None:
+            owned = require_semantic_owned_iteration_publication_on_connection(conn, running, selected=stored)
+            iteration = require_semantic_iteration_publication_on_connection(conn, running, selected=stored) if owned is None else None
+            if owned is not None:
+                original = owned.returned.result
+                audit_call = owned.admission.paid.audit_call
+            elif iteration is not None:
                 original = iteration.returned.result
                 audit_call = iteration.admission.paid.audit_call
             else:

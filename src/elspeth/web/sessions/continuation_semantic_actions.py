@@ -283,7 +283,7 @@ def install_semantic_action_on_connection(
             operation_id=operation,
             expected_checkpoint_id=selected.checkpoint_id,
             expected_cursor=selected.cursor,
-            snapshot_json=encode_continuation_snapshot(admission.expected_root),
+            snapshot_json=encode_continuation_snapshot(admission.expected_root.model_copy(update={"cursor": selected.cursor})),
             event_batch=(ContinuationEvent("checkpoint", _admission_event(admission)),),
             handoff=False,
         )
@@ -333,8 +333,11 @@ def _reprove_installed_snapshot(
     selected: StoredContinuationSnapshot,
     effect_key: str,
 ) -> SemanticActionAdmission:
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
     root = decode_continuation_snapshot(selected.payload_json)
     paid = _original_paid_for_selected(conn, session_id, operation_id, selected, root, effect_key)
+    original_selected = semantic_recovery_source(conn, str(session_id), operation_id, selected).snapshot
     admission = _admit_paid(conn, paid)
     expected = admission.expected_root.model_copy(update={"cursor": selected.cursor})
     if root != expected:
@@ -344,7 +347,7 @@ def _reprove_installed_snapshot(
     retained = read_chunk(conn, session_id=sid, operation_id=operation, key=f"value:{reference.codec}:{reference.digest}")
     if retained != admission.frontier_chunk.canonical.encode("utf-8"):
         raise AuditIntegrityError("installed semantic action changed its exact retained frontier")
-    _journal_data(conn, sid, operation, cursor=selected.cursor, tag="checkpoint", payload=_admission_event(admission))
+    _journal_data(conn, sid, operation, cursor=original_selected.cursor, tag="checkpoint", payload=_admission_event(admission))
     return admission
 
 
@@ -1093,6 +1096,8 @@ def require_semantic_publication_on_connection(
     An ordinary result without an actual semantic provider source returns None.
     A prior semantic attempt without this exact paid Stop bridge cannot publish.
     """
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
     if type(selected) is not StoredContinuationSnapshot:
         raise AuditIntegrityError("semantic terminal publication lost its original selected snapshot")
     _require_current_continuation_running(conn, running, allow_cancel=False, allow_expired_segment=True)
@@ -1194,7 +1199,8 @@ def require_semantic_publication_on_connection(
         (item.effect_id, item.disposition, item.receipt_id) for item in root.effect_frontier
     }:
         raise AuditIntegrityError("semantic publication found an off-frontier or changed physical effect")
-    installed = _historical_snapshot(conn, sid, operation, cursor=selected.cursor - 1)
+    original_selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
+    installed = _historical_snapshot(conn, sid, operation, cursor=original_selected.cursor - 1)
     admission = _reprove_installed_snapshot(conn, running.claim.session_id, operation, installed, candidate.semantic_source.effect_key)
     if (
         admission.action is not None
@@ -1288,7 +1294,7 @@ def require_semantic_publication_on_connection(
             "operation_id": operation,
             "decision_checkpoint_id": installed.checkpoint_id,
             "decision_cursor": installed.cursor,
-            "consume_cursor": selected.cursor,
+            "consume_cursor": original_selected.cursor,
             "source": admission.paid.source.model_dump(mode="json"),
             "decision_json": admission.paid.decision_json,
             "original_candidate": prior_end.candidate.model_dump(mode="json"),
@@ -1328,5 +1334,5 @@ def require_semantic_publication_on_connection(
             "bridge_chunk_key": bridge_key,
         }
     )
-    _journal_data(conn, sid, operation, cursor=selected.cursor, tag="checkpoint", payload=bridge_event)
+    _journal_data(conn, sid, operation, cursor=original_selected.cursor, tag="checkpoint", payload=bridge_event)
     return SemanticPublicationProof(admission, candidate, review)

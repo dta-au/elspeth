@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { apiErrorFromBody, cancelComposerOperation, fetchActiveComposerOperation, fetchComposerOperation, fetchComposerOperationFailures, fetchComposerOperationStream, submitComposerOperation } from "./client";
 import { liveSnapshot } from "@/test/composerOperationWire";
 import type { SubmittedCustody } from "@/types/composerOperations";
+import admissionFixtures from "../../../../../../tests/fixtures/web/composer/composer_admission_refusal_producer.json";
 const sid = "11111111-1111-4111-8111-111111111111", id = "22222222-2222-4222-8222-222222222222";
 const descriptor: SubmittedCustody = { mode: "submitted", scope: { principalId: "principal", authProvider: "local" }, sessionId: sid, operationId: id, kind: "compose_message", createdAt: Date.now(), body: { operation_id: id, content: "hello", state_id: null } };
 beforeEach(() => { localStorage.setItem("auth_token", "operation-test-token"); });
@@ -22,6 +23,22 @@ describe("authenticated composer operation wire", () => {
     expect(fetch.mock.calls[0][0]).toBe(`/api/sessions/${sid}/operations?cursor=opaque%2B%2F%3D`);
     expect(fetch.mock.calls[1][0]).toBe(`/api/sessions/${sid}/operations?operation_id=${id}`);
     expect(fetch.mock.calls[1][1].signal).toBe(signal);
+  });
+  it.each(Object.entries(admissionFixtures))("retains actual worker %s refusal through the history client and rejects unknown neighbors", async (_case, producer) => {
+    const sessionId = producer.history.session_id, operationId = producer.terminal.operation_id;
+    const fetch = vi.fn().mockImplementation(async () => new Response(JSON.stringify(producer.history)));
+    vi.stubGlobal("fetch", fetch);
+    expect(await fetchComposerOperationFailures(sessionId)).toEqual(producer.history);
+    const exact = await fetchComposerOperationFailures(sessionId, { operationId });
+    expect(exact).toEqual(producer.history);
+    expect(exact.items[0].error_type).toBe("composer_admission_refused");
+    expect(exact.items[0].request_id).toBe(producer.terminal.error.body.request_id);
+    expect(exact.items[0].saved_revisions).toEqual({ attribution: "fenced", count: 0, latest_state_id: null, latest_version: null });
+    const unknown = { ...producer.history, items: [{ ...producer.history.items[0], error_type: "composer_admission_refused_invented" }] };
+    fetch.mockImplementation(async () => new Response(JSON.stringify(unknown)));
+    await expect(fetchComposerOperationFailures(sessionId)).rejects.toThrow("Unknown public failure category");
+    fetch.mockImplementation(async () => new Response(JSON.stringify(producer.history)));
+    expect(await fetchComposerOperationFailures(sessionId)).toEqual(producer.history);
   });
   it("extracts the canonical diagnostic from both public error envelope shapes", async () => {
     for (const body of [{ diagnostic_id: id, request_id: "request-reference", detail: "Failed" }, { detail: { diagnostic_id: id, request_id: "request-reference", detail: "Failed" } }]) {

@@ -8,6 +8,9 @@ APP = "src/elspeth/web/app.py"
 DTO = "src/elspeth/web/sessions/composer_app_services.py"
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/composer/service.py"
+DRIVER = "src/elspeth/web/sessions/continuation_driver.py"
+PHASES = "src/elspeth/web/composer/continuation_live_phases.py"
+INITIALIZATION = "src/elspeth/web/composer/continuation_composition_initialization.py"
 FIELDS = (
     "session_service",
     "composer_service",
@@ -352,160 +355,7 @@ def exact_call(node, callee, args=(), keywords=()):
     )
 
 
-def receiver_transfer_prefix(statements):
-    """The complete actual receiver→await prefix, as explicit operation contracts.
-
-    Calls are preserved as supplier effects to qualify, never trusted by name.
-    The deferred settlement body is a separate captured-function effect premise.
-    """
-    nodes = [n for n in statements if not isinstance(n, ast.Pass)]
-    if len(nodes) != 19:
-        return False
-    imp, deferred = nodes[:2]
-    history = nodes[2:11]
-    expected_history = ast.parse(
-        "history_task = lease.create_task(\n"
-        "    _capture_retained_operation_read(_read_retained_operation_context(\n"
-        "        authority=services.composer_operation_authority, binding=provider_binding,\n"
-        "        session_id=turn.session_id, actor_user_id=turn.actor_user_id)),\n"
-        "    name='composer-retained-operation-history')\n"
-        "history_cancellations: list[asyncio.CancelledError] = []\n"
-        "history_outcome, _ = await _join_freeform_owned_task(history_task, cancellation_observations=history_cancellations)\n"
-        "if type(history_outcome) is not _RetainedOperationReadOutcome:\n"
-        "    raise AuditIntegrityError('Retained history child lost its actual outcome')\n"
-        "if history_outcome.original_error is not None:\n"
-        "    history_failure = history_outcome.original_error\n"
-        "    if history_cancellations:\n"
-        "        raise BaseExceptionGroup('Retained history failure and caller cancellation', [history_failure, *history_cancellations]) "
-        "from history_failure\n"
-        "    raise history_failure\n"
-        "if len(history_cancellations) == 1:\n"
-        "    raise history_cancellations[0]\n"
-        "if history_cancellations:\n"
-        "    raise BaseExceptionGroup('Retained history caller cancellations', history_cancellations)\n"
-        "retained_operation_context = history_outcome.context\n"
-        "if retained_operation_context is None:\n"
-        "    raise AuditIntegrityError('Retained history success lacks its actual projected context')\n"
-    )
-    if ast.dump(ast.Module(body=history, type_ignores=[]), include_attributes=False) != ast.dump(
-        expected_history, include_attributes=False
-    ):
-        return False
-    capture = ast.parse(
-        "provider_owner.bind_cost_budget(capture_common_provider_cost(\n"
-        "    session_id=str(session.id), request_id=str(turn_user_message_id), lifecycle_version=1,\n"
-        "    initially_empty=state is not None and state_is_structurally_empty(state), settings=settings))"
-    ).body[0]
-    if ast.dump(nodes[11], include_attributes=False) != ast.dump(capture, include_attributes=False):
-        return False
-    mutation_capture = ast.parse(
-        "initial_preferences = await service.get_composer_preferences(turn.session_id)\n"
-        "mutation_ceiling = ComposerMutationCeiling("
-        "str(turn.session_id), str(turn_user_message_id), initial_preferences.trust_mode)\n"
-    )
-    if ast.dump(ast.Module(body=nodes[12:14], type_ignores=[]), include_attributes=False) != ast.dump(
-        mutation_capture, include_attributes=False
-    ):
-        return False
-    error, settled, budget, state, guard = nodes[14:]
-    if not (
-        isinstance(imp, ast.ImportFrom)
-        and imp.module == "openai"
-        and imp.level == 0
-        and [(a.name, a.asname) for a in imp.names] == [("OpenAIError", None)]
-    ):
-        return False
-    if not (
-        isinstance(deferred, ast.AsyncFunctionDef)
-        and deferred.name == "settle_post_provider"
-        and not deferred.decorator_list
-        and not getattr(deferred, "type_params", ())
-        and parameters(deferred) == ["result"]
-        and not deferred.args.posonlyargs
-        and not deferred.args.defaults
-        and not deferred.args.kw_defaults
-        and deferred.args.vararg is None
-        and deferred.args.kwarg is None
-    ):
-        return False
-    if not all(
-        isinstance(n, ast.AnnAssign) and name(n.target, target) and n.simple == 1 and literal(n.value, None)
-        for n, target in ((error, "post_provider_error"), (settled, "settled_record"))
-    ):
-        return False
-    if not (
-        isinstance(budget, ast.Assign)
-        and len(budget.targets) == 1
-        and name(budget.targets[0], "compose_budget_seconds")
-        and isinstance(budget.value, ast.Call)
-        and chain(budget.value.func) == ("budget_anchor", "remaining_seconds")
-        and not budget.value.args
-        and [k.arg for k in budget.value.keywords] == ["monotonic_now"]
-        and exact_call(budget.value.keywords[0].value, ("time", "monotonic"))
-    ):
-        return False
-    if not (
-        isinstance(state, ast.Assign)
-        and len(state.targets) == 1
-        and chain(state.targets[0]) == ("observation", "compose_base_state_id")
-        and name(state.value, "compose_base_state_id")
-    ):
-        return False
-    if not (
-        isinstance(guard, ast.If)
-        and not guard.orelse
-        and isinstance(guard.test, ast.Compare)
-        and name(guard.test.left, "compose_budget_seconds")
-        and len(guard.test.ops) == 1
-        and isinstance(guard.test.ops[0], ast.LtE)
-        and len(guard.test.comparators) == 1
-        and literal(guard.test.comparators[0], 0)
-        and len(guard.body) == 3
-    ):
-        return False
-    terminal, progress, raise_ = guard.body
-    if not (
-        isinstance(terminal, ast.Assign)
-        and len(terminal.targets) == 1
-        and name(terminal.targets[0], "terminal_status")
-        and literal(terminal.value, "timed_out")
-    ):
-        return False
-    if not (isinstance(progress, ast.Expr) and isinstance(progress.value, ast.Await) and isinstance(progress.value.value, ast.Call)):
-        return False
-    publish = progress.value.value
-    if not (
-        chain(publish.func) == ("_publish_progress",)
-        and len(publish.args) == 1
-        and name(publish.args[0], "progress_sink")
-        and len(publish.keywords) == 1
-        and publish.keywords[0].arg == "event"
-    ):
-        return False
-    event = publish.keywords[0].value
-    if not (
-        isinstance(event, ast.Call)
-        and name(event.func, "convergence_progress_event")
-        and not event.args
-        and len(event.keywords) == 1
-        and event.keywords[0].arg == "budget_exhausted"
-        and literal(event.keywords[0].value, "timeout")
-    ):
-        return False
-    return (
-        isinstance(raise_, ast.Raise)
-        and raise_.cause is None
-        and exact_call(
-            raise_.exc,
-            ("ComposerTurnDeadlineExpired",),
-            keywords=(
-                ("session_id", ("turn", "session_id")),
-                ("operation_id", ("turn", "operation_id")),
-                ("remaining_seconds", ("compose_budget_seconds",)),
-                ("budget_seconds_at_running", ("budget_anchor", "remaining_at_running_seconds")),
-            ),
-        )
-    )
+# Retired V1 receiver-prefix grammar: _run_composer_turn no longer exists.
 
 
 def module_name(path):
@@ -515,17 +365,23 @@ def module_name(path):
     return ".".join(parts)
 
 
-def origin_inventory(units):
+def origin_inventory(
+    units,
+    *,
+    class_origin="elspeth.web.composer.service.ComposerServiceImpl",
+    members=frozenset({"advance_continuation_phase"}),
+):
     """Canonical class imports/reexports and simple aliases; unknown transfers retained.
 
     This is a finite inventory, not an alias/heap closure theorem. Source6 owns
     qualification of container, parameter, reflection, and first-class effects.
     """
     modules = {module_name(u.path): u for u in units}
-    class_origin = "elspeth.web.composer.service.ComposerServiceImpl"
     bindings = {module: {} for module in modules}
-    if "elspeth.web.composer.service" in bindings:
-        bindings["elspeth.web.composer.service"]["ComposerServiceImpl"] = "CLASS"
+    owner_module, _, owner_name = class_origin.rpartition(".")
+    if owner_module in bindings:
+        bindings[owner_module][owner_name] = "CLASS"
+    fields = {"composer_service"} if class_origin == "elspeth.web.composer.service.ComposerServiceImpl" else set()
     changed = True
     while changed:
         changed = False
@@ -564,11 +420,7 @@ def origin_inventory(units):
             for n in unit.tree.body
         )
         for node in runtime_walk(unit.tree, postponed=postponed):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.ctx, (ast.Store, ast.Del))
-                and node.attr in {"compose", "compose_recovery", "composer_service"}
-            ):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr in members | fields:
                 root = chain(node.value)
                 canonical = canonical_receiver(root)
                 records.append(
@@ -576,18 +428,14 @@ def origin_inventory(units):
                         "path": unit.path,
                         "node_id": id(node),
                         "line": node.lineno,
-                        "kind": "CANONICAL_CLASS_METHOD_WRITE"
-                        if canonical and node.attr in {"compose", "compose_recovery"}
-                        else "RECEIVER_FIELD_WRITE",
+                        "kind": "CANONICAL_CLASS_METHOD_WRITE" if canonical and node.attr in members else "RECEIVER_FIELD_WRITE",
                         "receiver": root,
                         "member": node.attr,
-                        "qualification": "LOCAL_REFUSAL"
-                        if canonical and node.attr in {"compose", "compose_recovery"}
-                        else "UNKNOWN_OWNER_FLOW",
+                        "qualification": "LOCAL_REFUSAL" if canonical and node.attr in members else "UNKNOWN_OWNER_FLOW",
                     }
                 )
             elif isinstance(node, ast.Call) and name(node.func, "setattr") and len(node.args) >= 2:
-                if isinstance(node.args[1], ast.Constant) and node.args[1].value in {"compose", "compose_recovery", "composer_service"}:
+                if isinstance(node.args[1], ast.Constant) and node.args[1].value in members | fields:
                     root = chain(node.args[0])
                     canonical = canonical_receiver(root)
                     records.append(
@@ -604,246 +452,29 @@ def origin_inventory(units):
     return records, class_origin
 
 
-def composer_title_prelude(invoke):
-    """Bind the complete guarded title child, join and original-deadline check.
-
-    This finite source contract permits this one awaited interval before the
-    primary call. It does not qualify foreign mutation by a provider or guard
-    implementation; those remain common supplier/effect obligations.
-    """
-    if not isinstance(invoke, ast.Try) or not invoke.body:
-        return None
-    expected = ast.parse(
-        "if should_auto_title:\n"
-        "    title_custody = provider_owner.mint(ProviderInvocationFamily.TITLE)\n"
-        "    title_producer = required_work.reserve(\n"
-        "        RequiredWorkSource.TITLE_CONTINUATION_PRODUCER,\n"
-        "        transition_ordinal=title_custody.required_work.transition_ordinal,\n"
-        "        semantic_ordinal=title_custody.required_work.semantic_ordinal)\n"
-        "    async def run_owned_title() -> None:\n"
-        "        try:\n"
-        "            await maybe_auto_title_session(\n"
-        "                service=service, session_id=session.id, user_message=message_text,\n"
-        "                model=settings.composer_model, temperature=settings.composer_temperature,\n"
-        "                seed=settings.composer_seed, session_operation_context=lease.context,\n"
-        "                prompt_guard_mount=services.composer_service.composer_prompt_guard_mount,\n"
-        "                prompt_guard_mode=settings.composer_prompt_guard_mode,\n"
-        "                max_prepared_request_bytes=settings.composer_max_prepared_request_bytes,\n"
-        "                api_base=settings.composer_endpoint_base_url,\n"
-        "                api_key=(settings.composer_endpoint_api_key.get_secret_value()\n"
-        "                    if settings.composer_endpoint_api_key is not None else None),\n"
-        "                provider_custody=title_custody)\n"
-        "        except BaseException as failure:\n"
-        "            title_producer.complete_owned(failure)\n"
-        "            raise\n"
-        "        title_producer.complete_owned()\n"
-        "    try:\n"
-        "        auto_title_task = lease.create_task(run_owned_title())\n"
-        "    except BaseException as failure:\n"
-        "        title_producer.complete_owned(failure)\n"
-        "        raise\n"
-        "    await _join_auto_title(auto_title_task, session_id=turn.session_id,\n"
-        "        operation_id=turn.operation_id, cancellation_observations=auto_title_cancellations,\n"
-        "        wait_until_complete=True)\n"
-        "    compose_budget_seconds = budget_anchor.remaining_seconds(monotonic_now=time.monotonic())\n"
-        "    if compose_budget_seconds <= 0:\n"
-        "        terminal_status = 'timed_out'\n"
-        "        raise ComposerTurnDeadlineExpired(session_id=turn.session_id,\n"
-        "            operation_id=turn.operation_id, remaining_seconds=compose_budget_seconds,\n"
-        "            budget_seconds_at_running=budget_anchor.remaining_at_running_seconds)\n"
-    ).body[0]
-    if ast.dump(invoke.body[0], include_attributes=False) != ast.dump(expected, include_attributes=False):
-        return None
-    if [ast.unparse(handler.type) if handler.type is not None else None for handler in invoke.handlers] != [
-        "asyncio.CancelledError",
-        "ComposerToolFailure",
-        "ComposerConvergenceError",
-        "OpenAIError",
-        "_BadRequestLLMError",
-        "ComposerPluginCrashError",
-        "ComposerRuntimePreflightError",
-        "(PipelinePlannerError, CommonProviderCostRefused)",
-        "ChargeableAdmissionRefused",
-        "PromptGuardRefused",
-        "ComposerContextUnsupported",
-        "ComposerAdmissionRefused",
-        "ComposerMutationAuthorityRevoked",
-        "ComposerServiceError",
-    ]:
-        return None
-    expected_refusal = (
-        ast.parse(
-            "try:\n"
-            "    pass\n"
-            "except PromptGuardRefused as exc:\n"
-            "    llm_calls = exc.llm_calls\n"
-            "    observation.pending_exception_llm_calls = llm_calls\n"
-            "    observation.pending_exception_tool_invocations = exc.tool_invocations\n"
-            "    if llm_calls or exc.tool_invocations:\n"
-            "        await _required_audit(observation, _persist_turn_audit_cohort(\n"
-            "            service, session.id, exc.tool_invocations, llm_calls,\n"
-            "            tool_composition_state_id=compose_base_state_id,\n"
-            "            llm_composition_state_id=compose_base_state_id, plugin_crash_pending=True,\n"
-            "            session_operation_context=lease.context, required_audit=True,\n"
-            "            required_work=observation.required_work))\n"
-            "        observation.audit_cohort_durable = True\n"
-            "    raise HTTPException(status_code=exc.http_status,\n"
-            "        detail=exc.to_payload()) from exc\n"
-        )
-        .body[0]
-        .handlers[0]
-    )
-    if ast.dump(invoke.handlers[9], include_attributes=False) != ast.dump(expected_refusal, include_attributes=False):
-        return None
-    expected_context_refusal = (
-        ast.parse(
-            "try:\n"
-            "    pass\n"
-            "except ComposerContextUnsupported as exc:\n"
-            "    llm_calls = exc.llm_calls\n"
-            "    observation.pending_exception_llm_calls = llm_calls\n"
-            "    observation.pending_exception_tool_invocations = exc.tool_invocations\n"
-            "    if llm_calls or exc.tool_invocations:\n"
-            "        await _required_audit(observation, _persist_turn_audit_cohort(\n"
-            "            service, session.id, exc.tool_invocations, llm_calls,\n"
-            "            tool_composition_state_id=compose_base_state_id,\n"
-            "            llm_composition_state_id=compose_base_state_id, plugin_crash_pending=True,\n"
-            "            session_operation_context=lease.context, required_audit=True,\n"
-            "            required_work=observation.required_work))\n"
-            "        observation.audit_cohort_durable = True\n"
-            "    await _publish_progress(progress_sink, event=ComposerProgressEvent(\n"
-            "        phase='failed', headline=\"The model cannot review this request's complete context.\",\n"
-            "        evidence=(exc.to_payload()['detail'],),\n"
-            "        likely_next='Review the pipeline and request size before sending again.',\n"
-            "        reason='context_unsupported'))\n"
-            "    raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc\n"
-        )
-        .body[0]
-        .handlers[0]
-    )
-    if ast.dump(invoke.handlers[10], include_attributes=False) != ast.dump(expected_context_refusal, include_attributes=False):
-        return None
-    expected_revocation = (
-        ast.parse(
-            "try:\n"
-            "    pass\n"
-            "except ComposerMutationAuthorityRevoked as exc:\n"
-            "    observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)\n"
-            "    await _publish_progress(progress_sink, event=ComposerProgressEvent(\n"
-            "        phase='failed', headline='Automatic mutation authority was revoked.',\n"
-            "        evidence=(str(exc),), likely_next='Review the saved session before retrying.',\n"
-            "        reason='mutation_authority_revoked'))\n"
-            "    raise HTTPException(status_code=409, detail=exc.to_payload()) from exc\n"
-        )
-        .body[0]
-        .handlers[0]
-    )
-    if ast.dump(invoke.handlers[12], include_attributes=False) != ast.dump(expected_revocation, include_attributes=False):
-        return None
-    return invoke.body[0]
-
-
-def composer_dispatch_calls(invoke):
-    """Select closed primary branches after the exact guarded title interval."""
-    if composer_title_prelude(invoke) is None or len(invoke.body) < 3:
-        return None
-    annotation, branch = invoke.body[1:3]
-    if (
-        not isinstance(annotation, ast.AnnAssign)
-        or ast.unparse(annotation) != "result: ComposerResult | GraphRecoveryResponse"
-        or not isinstance(branch, ast.If)
-        or ast.unparse(branch.test) != "recovery_context.malformed_head"
-        or len(branch.body) != 1
-        or len(branch.orelse) != 2
-        or ast.unparse(branch.orelse[0])
-        != "if state is None:\n    raise AuditIntegrityError('Ordinary Composer admission lacks its graph')"
-    ):
-        return None
-    expected_calls = {
-        "compose": ast.parse(
-            "composer.compose(message_text, chat_messages, state, session_id=str(turn.session_id), "
-            "current_state_id=str(compose_base_state_id) if compose_base_state_id is not None else None, "
-            "user_id=turn.actor_user_id, progress='<unproved advisory effect>', session_operation_context=lease.context, "
-            "user_message_id=str(turn_user_message_id), mutation_ceiling=mutation_ceiling, "
-            "completion_gates=prior_completion_gates_facts, budget_seconds=compose_budget_seconds, "
-            "required_work=provider_binding, provider_owner=provider_owner, recovery_context=recovery_context, "
-            "retained_operation_context=retained_operation_context, "
-            "advisor_history=AdvisorTranscriptHistory.from_records(session_id=str(turn.session_id), "
-            "actor_user_id=turn.actor_user_id, current_request_id=str(turn_user_message_id), request=message_text, records=records))",
-            mode="eval",
-        ).body,
-        "compose_recovery": ast.parse(
-            "composer.compose_recovery(message=message_text, recovery_context=recovery_context, "
-            "session_operation_context=lease.context, budget_seconds=compose_budget_seconds, "
-            "required_work=provider_binding, provider_owner=provider_owner)",
-            mode="eval",
-        ).body,
-    }
-    calls = []
-    for statement, method in ((branch.orelse[1], "compose"), (branch.body[0], "compose_recovery")):
-        if (
-            not isinstance(statement, ast.Assign)
-            or len(statement.targets) != 1
-            or not name(statement.targets[0], "result")
-            or not isinstance(statement.value, ast.Await)
-            or not isinstance(statement.value.value, ast.Call)
-            or chain(statement.value.value.func) != ("composer", method)
-        ):
-            return None
-        call = statement.value.value
-        for keyword, expected in (
-            ("required_work", "provider_binding"),
-            ("provider_owner", "provider_owner"),
-            ("session_operation_context", "lease.context"),
-        ):
-            values = [item.value for item in call.keywords if item.arg == keyword]
-            if len(values) != 1 or ast.unparse(values[0]) != expected:
-                return None
-        ceilings = [item.value for item in call.keywords if item.arg == "mutation_ceiling"]
-        if method == "compose":
-            if len(ceilings) != 1 or ast.unparse(ceilings[0]) != "mutation_ceiling":
-                return None
-        elif ceilings:
-            return None
-        if any(item.arg is None for item in call.keywords):
-            return None
-        # Preserve the existing unproved advisory-progress boundary; every
-        # other actual argument, default escape, order and keyword is closed.
-        candidate = ast.Call(
-            func=call.func,
-            args=call.args,
-            keywords=[
-                ast.keyword(arg=item.arg, value=ast.Constant(value="<unproved advisory effect>"))
-                if method == "compose" and item.arg == "progress"
-                else item
-                for item in call.keywords
-            ],
-        )
-        if ast.dump(candidate, include_attributes=False) != ast.dump(expected_calls[method], include_attributes=False):
-            return None
-        calls.append(call)
-    return tuple(calls)
+# Retired V1 TITLE/compose branch grammars: dispatch now belongs to the continuation driver.
 
 
 def composer_receiver_local_contracts(units):
+    # The V1 turn/compose/recovery APIs were deleted; the live driver owns this transfer.
+    from tests.helpers.web_reserve_provider_mint_contract import provider_driver_constructor_contract
+
     units = list(units)
     index = {str(u.path): u for u in units}
     failures = []
     receipt = {
-        "status": "CONDITIONAL_RECEIVER_TRANSPORT_COMMON_UNKNOWN",
-        "compose_call": None,
+        "status": "CONDITIONAL_CONTINUATION_RECEIVER_TRANSPORT_COMMON_UNKNOWN",
         "app_state_install": None,
         "dto_field": None,
         "dto_read": None,
         "dto_constructor": None,
-        "compose_method": None,
         "write_inventory": [],
         "effect_dependencies": [],
         "invocation_kinds": [],
     }
-    if len(index) != len(units) or not all(p in index for p in (APP, DTO, TURN, SERVICE)):
+    if len(index) != len(units) or not all(p in index for p in (APP, DTO, DRIVER, SERVICE, PHASES, INITIALIZATION)):
         return ["UNKNOWN Composer receiver: duplicate/missing source owner"], receipt
-    trees = {p: index[p].tree for p in (APP, DTO, TURN, SERVICE)}
+    trees = {p: index[p].tree for p in (APP, DTO, DRIVER, SERVICE, PHASES, INITIALIZATION)}
 
     def require(condition, message):
         if not condition:
@@ -863,16 +494,19 @@ def composer_receiver_local_contracts(units):
         (DTO, "dataclass", "dataclasses", "dataclass"),
         (DTO, "final", "typing", "final"),
         (DTO, "ComposerService", "elspeth.web.composer.protocol", "ComposerService"),
-        (TURN, "capture_common_provider_cost", "elspeth.web.composer.provider_cost", "capture_common_provider_cost"),
-        (TURN, "CommonProviderCostRefused", "elspeth.web.composer.provider_cost", "CommonProviderCostRefused"),
-        (TURN, "state_is_structurally_empty", "elspeth.web.composer.no_tool_policy", "state_is_structurally_empty"),
     ):
         require(imported(trees[path], binding, module, member), path + ": canonical import producer " + binding)
     app = find(trees[APP], "_create_app")
     factory = find(trees[DTO], "composer_app_services")
     dto = find(trees[DTO], "ComposerAppServices")
     service = find(trees[SERVICE], "ComposerServiceImpl")
-    turn = find(trees[TURN], "_run_composer_turn")
+    turn = find(trees[DRIVER], "run_continuation_segment")
+    driver = find(trees[DRIVER], "_SegmentDriver")
+    driver_init = find(trees[DRIVER], "_SegmentDriver.__init__")
+    driver_advance = find(trees[DRIVER], "_SegmentDriver.advance")
+    phases = find(trees[PHASES], "ContinuationLivePhases")
+    phase_advance = find(trees[PHASES], "ContinuationLivePhases.advance")
+    initialization = find(trees[INITIALIZATION], "initialize_continuation_composition")
     require(plain_class(dto, dto=True), "frozen/slotted DTO namespace and dataclass field grammar")
     require(plain_class(service), "ordinary service namespace and definition-time effects")
     if not (
@@ -881,12 +515,17 @@ def composer_receiver_local_contracts(units):
         and isinstance(dto, ast.ClassDef)
         and isinstance(service, ast.ClassDef)
         and isinstance(turn, ast.AsyncFunctionDef)
+        and isinstance(driver, ast.ClassDef)
+        and isinstance(driver_init, ast.FunctionDef)
+        and isinstance(driver_advance, ast.AsyncFunctionDef)
+        and isinstance(phases, ast.ClassDef)
+        and isinstance(phase_advance, ast.AsyncFunctionDef)
+        and isinstance(initialization, ast.AsyncFunctionDef)
     ):
         require(False, "missing/ambiguous concrete definition")
         return failures, receipt
     constructor = find(trees[SERVICE], "ComposerServiceImpl.__init__")
-    method = find(trees[SERVICE], "ComposerServiceImpl.compose")
-    recovery_method = find(trees[SERVICE], "ComposerServiceImpl.compose_recovery")
+    method = find(trees[SERVICE], "ComposerServiceImpl.advance_continuation_phase")
     require(
         isinstance(constructor, ast.FunctionDef)
         and not constructor.decorator_list
@@ -909,9 +548,11 @@ def composer_receiver_local_contracts(units):
         ("application_factory", APP, [app], "ORDINARY_FUNCTION"),
         ("dto_factory", DTO, [factory], "ORDINARY_FUNCTION"),
         ("service_initializer", SERVICE, [service, constructor], "ORDINARY_FUNCTION"),
-        ("compose_method", SERVICE, [service, method], "NATIVE_COROUTINE"),
-        ("recovery_method", SERVICE, [service, recovery_method], "NATIVE_COROUTINE"),
-        ("turn", TURN, [turn], "NATIVE_COROUTINE"),
+        ("phase_method", SERVICE, [service, method], "NATIVE_COROUTINE"),
+        ("phase_owner_method", PHASES, [phases, phase_advance], "NATIVE_COROUTINE"),
+        ("driver_advance", DRIVER, [driver, driver_advance], "NATIVE_COROUTINE"),
+        ("driver_entry", DRIVER, [turn], "NATIVE_COROUTINE"),
+        ("initialization", INITIALIZATION, [initialization], "NATIVE_COROUTINE"),
     ):
         valid, record = invocation_kind(trees[path], owners, expected)
         kinds[label] = valid
@@ -923,6 +564,10 @@ def composer_receiver_local_contracts(units):
         (DTO, "composer_app_services", factory),
         (SERVICE, "ComposerServiceImpl", service),
         (APP, "_create_app", app),
+        (DRIVER, "_SegmentDriver", driver),
+        (DRIVER, "run_continuation_segment", turn),
+        (PHASES, "ContinuationLivePhases", phases),
+        (INITIALIZATION, "initialize_continuation_composition", initialization),
     ):
         require(owned_binding(trees[path], binding, definition), path + ": unique definition binding " + binding)
     require(
@@ -1105,272 +750,472 @@ def composer_receiver_local_contracts(units):
                     ),
                     "reflective app-state overwrite",
                 )
-    bindings = [n for n in runtime_walk(turn) if isinstance(n, ast.Assign) and len(n.targets) == 1 and name(n.targets[0], "composer")]
-    stores = [n for n in runtime_walk(turn) if isinstance(n, ast.Name) and n.id == "composer" and isinstance(n.ctx, (ast.Store, ast.Del))]
-    require(not getattr(turn, "type_params", ()) and "services" in parameters(turn), "turn DTO parameter scope")
-    require(
-        not any(isinstance(n, ast.Name) and n.id == "services" and isinstance(n.ctx, (ast.Store, ast.Del)) for n in executed_body(turn)),
-        "turn retained DTO argument binding",
-    )
-    turn_events = lexical_binding_events(turn)
-    require(
-        [(name_, kind) for name_, kind, node in turn_events if name_ == "services"] == [("services", "PARAMETER")],
-        "complete retained DTO parameter bindings",
-    )
-    composer_events = [event for event in turn_events if event[0] == "composer"]
-    require(
-        len(composer_events) == 1 and len(bindings) == 1 and composer_events[0][2] is bindings[0].targets[0],
-        "unique complete selected-owner receiver binding",
-    )
-    require(
-        len(bindings) == 1 and len(stores) == 1 and chain(bindings[0].value) == ("services", "composer_service"),
-        "turn single DTO receiver identity binding",
-    )
-    if len(bindings) == 1:
-        receipt["turn_receiver_read"] = (TURN, id(bindings[0].value))
-        receipt["turn_receiver_binding"] = (TURN, id(bindings[0]))
-    calls = [n for n in runtime_walk(turn) if isinstance(n, ast.Call) and chain(n.func) == ("composer", "compose")]
-    require(len(calls) == 1, "one executed compose call")
-    if len(calls) == 1:
-        receipt["compose_call"] = (TURN, id(calls[0]))
-    recovery_calls = [n for n in runtime_walk(turn) if isinstance(n, ast.Call) and chain(n.func) == ("composer", "compose_recovery")]
-    require(len(recovery_calls) == 1, "one executed recovery compose call")
-    if len(recovery_calls) == 1:
-        receipt["recovery_call"] = (TURN, id(recovery_calls[0]))
-    # Only the two closed branches selected above can follow the retained capture.
-    active_path = False
-    if len(bindings) == 1 and len(calls) == 1 and len(recovery_calls) == 1:
-        owners = [n for n in turn.body if isinstance(n, ast.Try) and any(x is bindings[0] for x in n.body)]
-        if len(owners) == 1:
-            owner = owners[0]
-            invoke_blocks = []
-            for n in owner.body:
-                dispatch = composer_dispatch_calls(n)
-                if dispatch == (calls[0], recovery_calls[0]):
-                    invoke_blocks.append(n)
-            if len(invoke_blocks) == 1:
-                invoke = invoke_blocks[0]
-                bi = next(i for i, n in enumerate(owner.body) if n is bindings[0])
-                ci = next(i for i, n in enumerate(owner.body) if n is invoke)
-                oi = next(i for i, n in enumerate(turn.body) if n is owner)
-                active_path = bi == 18 and ci == 24 and not early_abrupt(owner.body[:ci]) and not early_abrupt(turn.body[:oi])
-                # The exact import/deferred/history/cost operations precede the
-                # initial preference read and original request ceiling. Only the
-                # five scalar/deadline statements follow receiver capture. The
-                # closed title prelude is the only suspended interval afterwards.
-                prefix = owner.body[4:bi] + owner.body[bi + 1 : ci]
-                active_path = active_path and receiver_transfer_prefix(prefix)
-                deferred = [n for n in prefix if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
-                deferred_valid = False
-                if len(deferred) == 1:
-                    deferred_valid, record = invocation_kind(trees[TURN], [turn, deferred[0]], "NATIVE_COROUTINE")
-                    if record:
-                        receipt["invocation_kinds"].append(
-                            dict(record, label="settlement_callback", path=TURN, local_kind_valid=deferred_valid)
-                        )
-                require(deferred_valid, "actual selected settlement callback must be NATIVE_COROUTINE")
-                active_path = active_path and kinds["turn"] and kinds["compose_method"] and kinds["recovery_method"] and deferred_valid
-                receipt["receiver_dominance_path"] = {
-                    "turn_owner": (TURN, id(turn)),
-                    "outer_try": (TURN, id(owner)),
-                    "receiver_statement": (TURN, id(bindings[0])),
-                    "inner_try": (TURN, id(invoke)),
-                    "await_statement": (TURN, id(invoke.body[2].orelse[1])),
-                    "call": (TURN, id(calls[0])),
-                    "recovery_call": (TURN, id(recovery_calls[0])),
-                    "qualification": "ACTUAL_CLOSED_BRANCH_AWAIT_PATHS_SAME_RETAINED_BINDING",
-                }
-                receipt["receiver_transfer_prefix_nodes"] = [(TURN, id(n)) for n in prefix]
-    require(active_path, "actual direct awaited path and same-block receiver dominance")
-    turn_scope = function_binding_scope(trees[TURN], turn)
-    require(
-        turn_scope is not None and "composer" in turn_scope and "services" in turn_scope,
-        "compiler-derived turn receiver/argument lexical ownership",
-    )
-    for selected_method, receipt_name in ((method, "compose_method"), (recovery_method, "recovery_method")):
+
+    driver_failures, driver_receipt = provider_driver_constructor_contract(units)
+    require(not driver_failures and driver_receipt is not None, "exact current driver work/provider/phase construction")
+    if driver_receipt is None:
+        return failures, receipt
+    for path, binding, module, member in (
+        (DRIVER, "ComposerServiceImpl", "elspeth.web.composer.service", "ComposerServiceImpl"),
+        (DRIVER, "ContinuationLivePhases", "elspeth.web.composer.continuation_live_phases", "ContinuationLivePhases"),
+        (
+            DRIVER,
+            "initialize_continuation_composition",
+            "elspeth.web.composer.continuation_composition_initialization",
+            "initialize_continuation_composition",
+        ),
+        (SERVICE, "AuditIntegrityError", "elspeth.contracts.errors", "AuditIntegrityError"),
+        (PHASES, "dataclass", "dataclasses", "dataclass"),
+        (PHASES, "field", "dataclasses", "field"),
+        (PHASES, "ComposerServiceImpl", "elspeth.web.composer.service", "ComposerServiceImpl"),
+        (PHASES, "ProviderInvocationOwner", "elspeth.web.composer.provider_quota", "ProviderInvocationOwner"),
+        (INITIALIZATION, "ComposerServiceImpl", "elspeth.web.composer.service", "ComposerServiceImpl"),
+        (
+            INITIALIZATION,
+            "ComposerAsyncOperationAuthority",
+            "elspeth.web.coordination.composer_operation_authority",
+            "ComposerAsyncOperationAuthority",
+        ),
+        (INITIALIZATION, "StoredContinuationSnapshot", "elspeth.web.sessions.continuation", "StoredContinuationSnapshot"),
+        (INITIALIZATION, "RequiredWorkBinding", "elspeth.web.required_work", "RequiredWorkBinding"),
+        (INITIALIZATION, "RequiredAuthorityKind", "elspeth.web.required_work", "RequiredAuthorityKind"),
+        (INITIALIZATION, "ProviderInvocationOwner", "elspeth.web.composer.provider_quota", "ProviderInvocationOwner"),
+        (INITIALIZATION, "ComposerOperationRunning", "elspeth.web.sessions.composer_operations", "ComposerOperationRunning"),
+        (INITIALIZATION, "_sessions", "elspeth.web.composer.continuation_initialization", "_sessions"),
+    ):
+        require(imported(trees[path], binding, module, member), path + ": current canonical receiver supplier " + binding)
+    for path in (DRIVER, PHASES, INITIALIZATION):
+        require(builtin_binding(trees[path], "type"), path + ": canonical nominal type predicate")
+    require(plain_class(driver), "ordinary driver namespace and stable definition-time effects")
+    service_stores = [
+        node
+        for node in driver_init.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and chain(node.targets[0]) == ("self", "service")
+        and chain(node.value) == ("services", "composer_service")
+    ]
+    require(len(service_stores) == 1, "single DTO-to-driver service identity binding")
+    protected_driver_fields = {
+        "worker",
+        "services",
+        "running",
+        "lease",
+        "service",
+        "authority",
+        "work",
+        "provider",
+        "phases",
+        "sql_deadline",
+    }
+    constructor_targets = {
+        id(node)
+        for statement in driver_init.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, ast.Store)
+        and name(node.value, "self")
+        and node.attr in protected_driver_fields
+    }
+    for declaration in body(driver):
+        if not isinstance(declaration, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in runtime_walk(declaration):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                require(
+                    not (name(node.value, "self") and node.attr in protected_driver_fields) or id(node) in constructor_targets,
+                    "retained driver service/work/phase owner rebound in " + declaration.name,
+                )
+            if (
+                isinstance(node, ast.Call)
+                and chain(node.func) in {("setattr",), ("delattr",), ("object", "__setattr__"), ("object", "__delattr__")}
+                and len(node.args) >= 2
+                and name(node.args[0], "self")
+            ):
+                require(
+                    isinstance(node.args[1], ast.Constant) and node.args[1].value not in protected_driver_fields,
+                    "retained driver owner changed by reflection in " + declaration.name,
+                )
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                require(
+                    not (
+                        chain(node.value) == ("self", "__dict__")
+                        and (not isinstance(node.slice, ast.Constant) or node.slice.value in protected_driver_fields)
+                    ),
+                    "retained driver owner changed through instance dictionary in " + declaration.name,
+                )
+    entry_calls = [node for node in executed_body(turn) if isinstance(node, ast.Call) and chain(node.func) == ("_SegmentDriver",)]
+    require(len(entry_calls) == 1, "one actual current segment driver construction")
+    if len(entry_calls) == 1:
+        entry_call = entry_calls[0]
         require(
-            isinstance(selected_method, ast.AsyncFunctionDef)
-            and not selected_method.decorator_list
-            and not selected_method.type_params
-            and bool(parameters(selected_method))
-            and parameters(selected_method)[0] == "self",
-            "normal async function descriptor " + receipt_name,
+            [chain(argument) for argument in entry_call.args] == [("worker",), ("services",), ("running",), ("lease",)]
+            and not entry_call.keywords,
+            "segment entry retains exact worker/DTO/running/lease arguments",
         )
-        if selected_method:
-            receipt[receipt_name] = (SERVICE, id(selected_method))
-    for fn in body(service):
-        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for n in runtime_walk(fn):
-                if isinstance(n, ast.Attribute) and isinstance(n.ctx, (ast.Store, ast.Del)):
-                    require(chain(n) not in {("self", "compose"), ("self", "compose_recovery")}, "instance method shadowing in " + fn.name)
-                if isinstance(n, ast.Call) and name(n.func, "setattr") and len(n.args) >= 2:
+        service_arguments = [node for node in runtime_walk(turn) if isinstance(node, ast.Name) and node.id == "services"]
+        require(
+            all(isinstance(node.ctx, ast.Load) and any(node is argument for argument in entry_call.args) for node in service_arguments),
+            "entry DTO argument rebound or escaped",
+        )
+        receipt["driver_constructor_call"] = (DRIVER, id(entry_call))
+    run_returns = [
+        node
+        for node in executed_body(turn)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Await)
+        and isinstance(node.value.value, ast.Call)
+        and ast.unparse(node.value.value) == "driver.run(adoption_failure)"
+    ]
+    require(len(run_returns) == 1, "actual driver native await/return path")
+    require(
+        [(bound, kind) for bound, kind, _node in lexical_binding_events(turn) if bound == "services"] == [("services", "PARAMETER")],
+        "complete native entry DTO argument scope",
+    )
+
+    expected_method = ast.parse(
+        '''async def advance_continuation_phase(
+    self, *, owner: ContinuationLivePhases, authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState, work: RequiredWorkBinding, provider_owner: ProviderInvocationOwner,
+    phase_read: _CurrentPhaseRead | None = None,
+) -> None:
+    """Enter the retained phase owner without re-entering legacy PRIMARY."""
+    from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+    if (
+        type(owner) is not ContinuationLivePhases or owner.service is not self
+        or owner.authority is not authority or owner.work is not work or owner.provider_owner is not provider_owner
+    ):
+        raise AuditIntegrityError("continuation service dispatch changed its actual live owners")
+    if phase_read is None:
+        await owner.advance(selected)
+    else:
+        await owner.advance(selected, phase_read=phase_read)
+'''
+    ).body[0]
+    require(
+        isinstance(method, ast.AsyncFunctionDef)
+        and ast.dump(method, include_attributes=False) == ast.dump(expected_method, include_attributes=False),
+        "exact nominal live phase service dispatch and owner forwarding",
+    )
+    phase_dispatch = [
+        node
+        for node in runtime_walk(driver_advance)
+        if isinstance(node, ast.Call) and chain(node.func) == ("self", "service", "advance_continuation_phase")
+    ]
+    require(len(phase_dispatch) == 1, "one current driver-to-service phase dispatch")
+    expected_dispatch = ast.parse(
+        "self.service.advance_continuation_phase(owner=self.phases, authority=self.authority, selected=selected, work=self.work, provider_owner=self.provider, phase_read=phase_read)",
+        mode="eval",
+    ).body
+    if len(phase_dispatch) == 1:
+        require(
+            ast.dump(phase_dispatch[0], include_attributes=False) == ast.dump(expected_dispatch, include_attributes=False),
+            "driver dispatch keeps exact selected service/work/provider/phase owners",
+        )
+    expected_initialization = ast.parse(
+        "initialize_continuation_composition(service=self.service, authority=self.authority, selected=stored, required_work=self.work, provider_owner=self.provider, progress=self.phases.progress)",
+        mode="eval",
+    ).body
+    initialization_calls = [
+        node
+        for node in runtime_walk(driver_advance)
+        if isinstance(node, ast.Call) and chain(node.func) == ("initialize_continuation_composition",)
+    ]
+    require(
+        len(initialization_calls) == 2
+        and all(
+            ast.dump(node, include_attributes=False) == ast.dump(expected_initialization, include_attributes=False)
+            for node in initialization_calls
+        ),
+        "both current initialization paths keep the retained service/work/provider identity",
+    )
+    bind_calls = [
+        node
+        for node in runtime_walk(driver_advance)
+        if isinstance(node, ast.Call) and chain(node.func) == ("self", "phases", "bind_initial")
+    ]
+    require(
+        len(bind_calls) == 2 and all(ast.unparse(node) == "self.phases.bind_initial(runtime)" for node in bind_calls),
+        "actual initialization runtime is handed to its retained phase owner",
+    )
+    expected_bind = ast.parse(
+        """def bind_initial(self, runtime: RestoredContinuationRuntime) -> None:
+    if (
+        self.runtime is not None or type(runtime) is not RestoredContinuationRuntime
+        or runtime.materialization.service is not self.service
+        or runtime.materialization.authority is not self.authority
+        or runtime.bindings.required_work is not self.work
+        or runtime.bindings.provider_owner is not self.provider_owner
+        or runtime.bindings.progress is not self.progress
+    ):
+        raise AuditIntegrityError("live phase initialization changed its actual runtime owners")
+    self.runtime = runtime
+"""
+    ).body[0]
+    phase_bind = find(trees[PHASES], "ContinuationLivePhases.bind_initial")
+    require(
+        phase_bind is not None and ast.dump(phase_bind, include_attributes=False) == ast.dump(expected_bind, include_attributes=False),
+        "actual initial runtime source/work/provider owner guard",
+    )
+    expected_phase_advance = ast.parse(
+        """async def advance(self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None) -> None:
+    if phase_read is not None:
+        self._require_phase_read(selected, phase_read)
+    if self.terminal_completion is not None:
+        await self._persist_batch(selected)
+        return
+    top = selected.stack.frames[-1]
+    if type(top) is ComposeFrame and top.phase == "response_retained":
+        await self._initialize_batch(selected, phase_read=phase_read)
+        return
+    if phase_read is not None:
+        raise AuditIntegrityError("live phase handoff belongs only to its retained PRIMARY response")
+    if type(top) is ToolBatchFrame and top.phase == "tool_ready":
+        runtime, _inventory = await self.current(selected)
+        if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "call_ready":
+            await self._execute_one(selected)
+            return
+        if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "dispatch_ready":
+            await self._persist_batch(selected)
+            return
+    raise AuditIntegrityError("selected phase has no matching live tool action")
+"""
+    ).body[0]
+    require(
+        ast.dump(phase_advance, include_attributes=False) == ast.dump(expected_phase_advance, include_attributes=False),
+        "closed selected live phase native dispatch grammar",
+    )
+    require(
+        not phases.bases
+        and not phases.keywords
+        and not phases.type_params
+        and [ast.unparse(node) for node in phases.decorator_list] == ["dataclass(slots=True)"]
+        and all(
+            isinstance(node, ast.AnnAssign)
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name not in LOOKUP | {"__init__"})
+            or (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and type(node.value.value) is str)
+            for node in phases.body
+        ),
+        "plain generated phase namespace and normal method lookup",
+    )
+    expected_phase_fields = (
+        ast.parse(
+            """class ContinuationLivePhases:
+    service: ComposerServiceImpl
+    authority: ComposerAsyncOperationAuthority
+    work: RequiredWorkBinding
+    provider_owner: ProviderInvocationOwner
+    lease: SessionOperationLease
+    progress: ComposerProgressSink | None = None
+    runtime: RestoredContinuationRuntime | None = None
+    primary: PrimaryProviderResult | RetainedPrimaryPhaseData | None = None
+    p4: ContinuationLiveP4 | None = None
+    latest_snapshot: StoredContinuationSnapshot | None = None
+    cancellation_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    business_stage: ContinuationStage[None] | None = None
+    failure_custody: ContinuationToolFailureCustody | None = None
+    terminal_completion: TerminalServiceCompletion | None = None
+    finished_batch: tuple[_DispatchOutcome, _PersistOutcome | ColdPostBatchPersistData, CompositionState] | None = None
+    action_clock: ContinuationActionClock | None = None
+"""
+        )
+        .body[0]
+        .body
+    )
+    require(
+        [ast.dump(node, include_attributes=False) for node in phases.body if isinstance(node, ast.AnnAssign)]
+        == [ast.dump(node, include_attributes=False) for node in expected_phase_fields],
+        "exact generated live phase field/descriptor layout",
+    )
+    expected_initial_guard = ast.parse(
+        """if (
+    type(service) is not ComposerServiceImpl
+    or type(authority) is not ComposerAsyncOperationAuthority
+    or type(selected) is not StoredContinuationSnapshot
+    or type(required_work) is not RequiredWorkBinding
+    or type(provider_owner) is not ProviderInvocationOwner
+    or provider_owner.required_work is not required_work
+    or provider_owner.service is not _sessions(service)
+    or _sessions(service)._engine is not authority._engine
+):
+    raise AuditIntegrityError("first Compose initialization requires actual service/SQL/provider-work owners")
+running = required_work.running
+custody = required_work.coordinator.authority
+if (
+    type(running) is not ComposerOperationRunning
+    or custody.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE
+    or custody.durable_operation_id != running.claim.operation_id
+    or custody.claim_attempt != running.claim.attempt
+):
+    raise AuditIntegrityError("first Compose initialization changed its current required-work claim")
+required_work.validate_context(running.session_operation_context)
+"""
+    ).body
+    require(
+        [ast.dump(node, include_attributes=False) for node in body(initialization)[:5]]
+        == [ast.dump(node, include_attributes=False) for node in expected_initial_guard],
+        "actual initialization nominal service/SQL/claim/provider-work owner guards",
+    )
+    protected_phase_fields = {"service", "authority", "work", "provider_owner", "lease"}
+    for node in ast.walk(phases):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            require(
+                not (name(node.value, "self") and node.attr in protected_phase_fields),
+                "retained live phase service/work/provider/context rebound",
+            )
+        if (
+            isinstance(node, ast.Call)
+            and chain(node.func) in {("setattr",), ("delattr",), ("object", "__setattr__"), ("object", "__delattr__")}
+            and len(node.args) >= 2
+            and name(node.args[0], "self")
+        ):
+            require(
+                isinstance(node.args[1], ast.Constant) and node.args[1].value not in protected_phase_fields,
+                "retained live phase owner changed by reflection",
+            )
+    for source, member_names in ((service, {"advance_continuation_phase"}), (phases, {"advance", "bind_initial"})):
+        for declaration in body(source):
+            if not isinstance(declaration, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in runtime_walk(declaration):
+                if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                    require(
+                        not (name(node.value, "self") and node.attr in member_names),
+                        "instance callable shadowing in " + declaration.name,
+                    )
+                if isinstance(node, ast.Call) and name(node.func, "setattr") and len(node.args) >= 2 and name(node.args[0], "self"):
+                    require(
+                        isinstance(node.args[1], ast.Constant) and node.args[1].value not in member_names,
+                        "instance reflective callable shadowing in " + declaration.name,
+                    )
+                if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
                     require(
                         not (
-                            name(n.args[0], "self")
-                            and isinstance(n.args[1], ast.Constant)
-                            and n.args[1].value in {"compose", "compose_recovery"}
+                            chain(node.value) == ("self", "__dict__")
+                            and (not isinstance(node.slice, ast.Constant) or node.slice.value in member_names)
                         ),
-                        "instance reflective method shadowing in " + fn.name,
+                        "instance dictionary callable shadowing in " + declaration.name,
                     )
-                if isinstance(n, ast.Subscript) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                if isinstance(node, ast.Call) and HARMFUL_REFLECTOR(node):
                     require(
-                        not (
-                            chain(n.value) == ("self", "__dict__")
-                            and isinstance(n.slice, ast.Constant)
-                            and n.slice.value in {"compose", "compose_recovery"}
-                        ),
-                        "instance dictionary method shadowing in " + fn.name,
+                        not (name(node.args[0], "self") and node.args[1].value in member_names),
+                        "instance low-level descriptor shadowing in " + declaration.name,
                     )
-                if isinstance(n, ast.Call) and HARMFUL_REFLECTOR(n):
-                    require(
-                        not (name(n.args[0], "self") and n.args[1].value in {"compose", "compose_recovery"}),
-                        "instance low-level descriptor shadowing in " + fn.name,
-                    )
+    phase_owner_calls = (
+        [node for node in ast.walk(method) if isinstance(node, ast.Call) and chain(node.func) == ("owner", "advance")]
+        if method is not None
+        else []
+    )
+    require(len(phase_owner_calls) == 2, "both checked service branches await the actual phase owner")
     records, origin = origin_inventory(units)
+    phase_records, _phase_origin = origin_inventory(
+        units,
+        class_origin="elspeth.web.composer.continuation_live_phases.ContinuationLivePhases",
+        members=frozenset({"advance", "bind_initial"}),
+    )
+    records.extend(phase_records)
     receipt["write_inventory"] = records
-    for r in records:
-        if r["qualification"] == "LOCAL_REFUSAL":
-            require(False, "canonical method write " + r["path"] + ":" + str(r["line"]))
+    for record in records:
+        if record["qualification"] == "LOCAL_REFUSAL":
+            require(False, "canonical method write " + record["path"] + ":" + str(record["line"]))
+    receipt.update(
+        {
+            "driver_class": (DRIVER, id(driver)),
+            "driver_constructor": (DRIVER, id(driver_init)),
+            "driver_entry": (DRIVER, id(turn)),
+            "driver_advance": (DRIVER, id(driver_advance)),
+            "driver_service_read": (DRIVER, id(service_stores[0].value)) if len(service_stores) == 1 else None,
+            "driver_service_binding": (DRIVER, id(service_stores[0])) if len(service_stores) == 1 else None,
+            "phase_class": (PHASES, id(phases)),
+            "phase_method": (SERVICE, id(method)) if method is not None else None,
+            "phase_owner_method": (PHASES, id(phase_advance)),
+            "phase_bind_method": (PHASES, id(phase_bind)) if phase_bind is not None else None,
+            "phase_dispatch_call": (DRIVER, id(phase_dispatch[0])) if len(phase_dispatch) == 1 else None,
+            "phase_owner_calls": frozenset((SERVICE, id(node)) for node in phase_owner_calls),
+            "initialization_calls": frozenset((DRIVER, id(node)) for node in initialization_calls),
+            "initialization_binding_calls": frozenset((DRIVER, id(node)) for node in bind_calls),
+            "driver_constructor_stores": driver_receipt["owner_constructor_stores"] | driver_receipt["binding_constructor_stores"],
+            "current_binding_reads": frozenset(
+                (DRIVER, id(node))
+                for call in (*phase_dispatch, *initialization_calls)
+                for node in ast.walk(call)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and name(node.value, "self")
+                and node.attr in {"service", "authority", "work", "provider", "phases"}
+            ),
+        }
+    )
     dependencies = [
-        ("fastapi.FastAPI", "application constructor/state initial ownership and external metaclass"),
-        ("starlette.datastructures.State", "state field storage/read identity and no descriptor/replacement effect"),
-        ("dataclasses.dataclass", "frozen/slots generated constructor and exact member descriptor"),
-        ("typing.final", "canonical decorator returns class and generated namespace effects"),
-        ("builtins.property", "canonical service definition decorator and stable builtin supplier"),
-        ("builtins.classmethod", "canonical service definition decorator and stable builtin supplier"),
-        ("builtins.staticmethod", "canonical service definition decorator and stable builtin supplier"),
-        ("builtins.__build_class__", "canonical class builder/default metaclass and stable class origins"),
-        ("builtins.object", "default construction and ordinary instance attribute/method lookup"),
-        (origin, "constructor actual return object/class origin, callback effects and no instance compose or compose_recovery shadow"),
-        (origin + ".compose", "function descriptor lookup on exact installed ordinary class; outside method/namespace mutation"),
-        (origin + ".compose_recovery", "function descriptor lookup on exact installed ordinary class; outside method/namespace mutation"),
+        ("fastapi.FastAPI", "application constructor/state and external metaclass"),
+        ("starlette.datastructures.State", "state storage/read identity and no external replacement"),
+        ("dataclasses.dataclass", "generated DTO and phase constructor/member descriptors"),
+        (origin, "installed ordinary service instance and external mutation closure"),
+        (origin + ".advance_continuation_phase", "normal descriptor and retained receiver/class stability"),
+        ("elspeth.web.sessions.continuation_driver.run_continuation_segment", "actual native entry/custody/close ownership and callers"),
+        ("elspeth.web.sessions.continuation_driver._SegmentDriver.advance", "current selected action before dispatch and external effects"),
         (
-            "SELECTED_SOURCE_CODE_OBJECTS",
-            "actual callable objects/code/decorators match compiled source owner/kind; outside __code__/function replacement cannot change invocation semantics",
+            "elspeth.web.composer.continuation_composition_initialization.initialize_continuation_composition",
+            "current guarded runtime construction, retained service/work/provider and original state",
         ),
-        ("elspeth.web.sessions.composer_app_services.ComposerAppServices", "generated field member descriptor; outside class mutation"),
         (
-            "elspeth.web.sessions.composer_app_services.composer_app_services",
-            "factory callers carry the same actual app; outside rebinding",
+            "elspeth.web.composer.continuation_live_phases.ContinuationLivePhases",
+            "actual generated phase fields and outside class/instance mutation closure",
         ),
+        (
+            "elspeth.web.composer.continuation_live_phases.ContinuationLivePhases._require_phase_read",
+            "exact selected/read/runtime/lease provenance before live phase dispatch",
+        ),
+        ("elspeth.web.sessions.composer_app_services.ComposerAppServices", "generated immutable fields and outside class mutation"),
+        ("elspeth.web.sessions.composer_app_services.composer_app_services", "factory callers carry the actual retained application"),
         (
             "elspeth.web.sessions.routes._helpers.composer_session_lock_registry",
-            "later constructor argument effect cannot mutate prior read service/DTO supplier",
+            "later constructor effect cannot replace prior read service",
         ),
-        (
-            "elspeth.web.sessions.composer_async_worker",
-            "worker _app provenance, job DTO binding and awaiting/external effects before dispatch",
-        ),
-        (
-            "elspeth.web.sessions.composer_turn._run_composer_turn",
-            "services argument provenance, earlier awaited/callback effects and retained receiver stability",
-        ),
-        (
-            "elspeth.web.sessions.composer_turn._run_composer_turn.<locals>.settle_post_provider",
-            "actual deferred local function body/capture effects; no body occurrence authorizes outer dispatch",
-        ),
-        (
-            "elspeth.web.sessions.composer_turn._read_retained_operation_context",
-            "exact authenticated authority and required-work binding, SQL/projection completion, original outcome custody and receiver stability",
-        ),
-        (
-            "elspeth.web.sessions.composer_turn._capture_retained_operation_read",
-            "exact owned outcome wrapper, registered lease child and join/cancellation effects before provider dispatch",
-        ),
-        (
-            "elspeth.web.sessions.composer_turn._run_composer_turn.<locals>.run_owned_title",
-            "exact title custody, mounted guard, original deadline and completed join; guard/provider effects cannot mutate the retained receiver",
-        ),
-        (
-            "elspeth.web.composer.service.ComposerServiceImpl.composer_prompt_guard_mount",
-            "normal property lookup returns the deployment-owned guard mount; no receiver mutation or replacement through the title supplier",
-        ),
-        (
-            "elspeth.web.sessions.routes._helpers._publish_progress",
-            "actual awaited timeout-branch call effects and retained receiver/class stability",
-        ),
-        (
-            "elspeth.web.sessions.routes._helpers.convergence_progress_event",
-            "actual timeout event producer and retained receiver/class stability",
-        ),
-        (
-            "elspeth.web.sessions.composer_turn.ComposerBudgetAnchor",
-            "actual remaining_seconds receiver origin, field/descriptor effects and return producer",
-        ),
-        ("time.monotonic", "actual budget supplier call with no argument; callback/module stability"),
-        (
-            "elspeth.web.composer.provider_cost.capture_common_provider_cost",
-            "exact original session/message/lifecycle/applicability capture; supplier and returned budget effects remain unknown",
-        ),
-        (
-            "elspeth.web.composer.provider_quota.ProviderInvocationOwner.bind_cost_budget",
-            "actual retained provider owner and nominal budget identity; receiver/member/callback effects remain unknown",
-        ),
-        (
-            "elspeth.web.composer.no_tool_policy.state_is_structurally_empty",
-            "actual original state eligibility predicate; source origin and outside effects remain unknown",
-        ),
-        ("openai.OpenAIError", "actual definition import before dispatch; module/loader effects"),
-        (
-            "PROVIDER_TEST_SEAMS",
-            "fresh app.state read preserves replacement identity; fixture composers do not certify canonical compose semantics",
-        ),
+        ("elspeth.web.sessions.composer_async_worker", "actual app/DTO argument and native segment-entry transport"),
     ]
     receipt["effect_dependencies"] = [
-        {
-            "identity": a,
-            "requirement": b,
-            "qualification": "UNKNOWN",
-            "dependency_kind": "SOURCE_CALLER_FLOW"
-            if a.endswith(("composer_async_worker", "_run_composer_turn"))
-            else "LOCAL_DEFERRED_CAPTURE"
-            if "<locals>" in a
-            else "FIXTURE_SCOPE_ONLY"
-            if a == "PROVIDER_TEST_SEAMS"
-            else "SUPPLIER_OR_RECEIVER_EFFECT",
-        }
-        for a, b in dependencies
+        {"identity": identity, "requirement": requirement, "qualification": "UNKNOWN", "dependency_kind": "SUPPLIER_OR_RECEIVER_EFFECT"}
+        for identity, requirement in dependencies
     ]
-    # Postponed annotations do not execute as Python expressions, but dataclass
-    # field discovery interprets selected annotation names through module globals.
-    # Keep that supplier premise distinct from nominal receiver classification.
     imports = {
-        a.asname or a.name: n.module + "." + a.name
-        for n in trees[DTO].body
-        if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module
-        for a in n.names
-        if a.name != "*"
+        alias.asname or alias.name: statement.module + "." + alias.name
+        for statement in trees[DTO].body
+        if isinstance(statement, ast.ImportFrom) and statement.level == 0 and statement.module
+        for alias in statement.names
+        if alias.name != "*"
     }
     receipt["dto_annotation_interpretation"] = []
     for declaration in body(dto):
-        if isinstance(declaration, ast.AnnAssign) and isinstance(declaration.target, ast.Name):
-            annotation = declaration.annotation
-            while isinstance(annotation, (ast.Subscript, ast.BinOp)):
-                annotation = annotation.value if isinstance(annotation, ast.Subscript) else annotation.left
-            head = chain(annotation)
-            origin = imports.get(head[0]) if head else None
-            receipt["dto_annotation_interpretation"].append(
+        if not isinstance(declaration, ast.AnnAssign) or not isinstance(declaration.target, ast.Name):
+            continue
+        annotation = declaration.annotation
+        while isinstance(annotation, (ast.Subscript, ast.BinOp)):
+            annotation = annotation.value if isinstance(annotation, ast.Subscript) else annotation.left
+        head = chain(annotation)
+        supplier = imports.get(head[0]) if head else None
+        receipt["dto_annotation_interpretation"].append(
+            {
+                "field": declaration.target.id,
+                "annotation_node_id": id(declaration.annotation),
+                "head": head,
+                "canonical_binding": supplier,
+                "python_execution_role": "POSTPONED_ANNOTATION_ONLY",
+                "dataclass_role": "FIELD_DISCOVERY_CLASSVAR_INITVAR_KW_ONLY_EXCLUSION_UNKNOWN",
+            }
+        )
+        if supplier:
+            receipt["effect_dependencies"].append(
                 {
-                    "field": declaration.target.id,
-                    "annotation_node_id": id(declaration.annotation),
-                    "head": head,
-                    "canonical_binding": origin,
-                    "python_execution_role": "POSTPONED_ANNOTATION_ONLY",
-                    "dataclass_role": "FIELD_DISCOVERY_CLASSVAR_INITVAR_KW_ONLY_EXCLUSION_UNKNOWN",
+                    "identity": supplier,
+                    "dependency_kind": "DATACLASS_FIELD_INTERPRETATION",
+                    "qualification": "UNKNOWN",
+                    "requirement": "Stable annotation head "
+                    + declaration.target.id
+                    + " cannot become a ClassVar/InitVar/KW_ONLY discriminator",
                 }
             )
-            if origin:
-                receipt["effect_dependencies"].append(
-                    {
-                        "identity": origin,
-                        "dependency_kind": "DATACLASS_FIELD_INTERPRETATION",
-                        "qualification": "UNKNOWN",
-                        "requirement": "Stable annotation head "
-                        + declaration.target.id
-                        + " cannot resolve to ClassVar/InitVar/KW_ONLY during dataclass field discovery; no nominal receiver proof",
-                    }
-                )
-    receipt["return_relation"] = "DTO_FIELD_IS_CURRENT_APP_STATE_VALUE; TURN_RECEIVER_IS_DTO_FIELD"
+    receipt["return_relation"] = "DTO_FIELD_IS_CURRENT_APP_STATE_VALUE; DRIVER_SERVICE_IS_DTO_FIELD; PHASE_OWNER_IS_DRIVER_CONSTRUCTION"
     return failures, receipt
 
 

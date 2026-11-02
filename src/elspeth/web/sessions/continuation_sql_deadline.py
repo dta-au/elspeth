@@ -15,6 +15,7 @@ from typing import final
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
     ContinuationAdmissionPolicy,
@@ -52,6 +53,7 @@ class ContinuationSQLDeadlineOwner:
     _settlement_expires_at: float
     _settling: bool
     _active_action: ContinuationActionPolicy | None
+    _action_started_at: float | None
     _lock: threading.RLock
 
     def __init__(
@@ -86,6 +88,7 @@ class ContinuationSQLDeadlineOwner:
         self._settlement_expires_at = self.hard_expires_at
         self._settling = False
         self._active_action = None
+        self._action_started_at = None
         self._lock = threading.RLock()
 
     def validate_context(self, context: SessionOperationContext, *, operation_id: str | None, attempt: int | None) -> None:
@@ -115,9 +118,21 @@ class ContinuationSQLDeadlineOwner:
             raise AuditIntegrityError("SQL timing substituted an unretained action or clock")
         with self._lock:
             self._active_action = action
+            self._action_started_at = started_at
             self._action_expires_at = min(self.hard_expires_at, started_at + action.total)
             self._settlement_expires_at = min(self.hard_expires_at, self._action_expires_at + self.policy.segment.reserve)
             self._settling = False
+
+    def require_action_clock(self, clock: ContinuationActionClock) -> None:
+        """Verify original active timing DATA without admitting or renewing work."""
+        with self._lock:
+            if (
+                type(clock) is not ContinuationActionClock
+                or clock.policy is not self._active_action
+                or clock.started_monotonic != self._action_started_at
+                or self._action_expires_at != min(self.hard_expires_at, clock.started_monotonic + clock.policy.total)
+            ):
+                raise AuditIntegrityError("SQL timing lost its original active action clock")
 
     def begin_settlement(self) -> None:
         # Settlement consumes the reserve attached to the original action,

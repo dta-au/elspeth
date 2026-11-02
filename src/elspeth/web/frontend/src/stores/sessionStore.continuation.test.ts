@@ -6,6 +6,7 @@ import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import type { CompositionState } from "@/types/index";
 import { completedSnapshot, liveSnapshot, streamUnavailable } from "@/test/composerOperationWire";
 import type { ComposerOperationSnapshot, ComposerOperationStatus } from "@/types/composerOperations";
+import { sseFrame } from "@/test/composerOperationWire";
 vi.mock("@/api/client", () => ({ submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), fetchComposerOperationFailures: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(), apiErrorFromBody: vi.fn(), composerActiveOperation: vi.fn(), isDefinitiveComposerRefusal: vi.fn(), fetchMessages: vi.fn(), fetchCompositionState: vi.fn(), fetchCompositionProposals: vi.fn(), fetchComposerPreferences: vi.fn(), revertToVersion: vi.fn(), fetchStateVersions: vi.fn(), fetchSessions: vi.fn(), fetchCurrentUser: vi.fn(), fetchAuthConfig: vi.fn(), listBlobs: vi.fn(), listInterpretationEvents: vi.fn(), fetchActiveComposerOperation: vi.fn() }));
 vi.mock("./executionStore", () => ({ useExecutionStore: { getState: () => ({ clearValidation: vi.fn() }) } }));
 import * as api from "@/api/client";
@@ -31,6 +32,86 @@ beforeEach(() => {
   vi.mocked(api.fetchAuthConfig).mockResolvedValue({ provider: "local", registration_mode: "closed", sso_start_url: null });
 });
 afterEach(() => { detachComposerObservers(); vi.useRealTimers(); purgeComposerCustody(); });
+
+describe("accepted operation status owns visible progress", () => {
+  function status(revision: number, sequence: number, generation = 1): ComposerOperationStatus {
+    return { ...continuationStatus(), status_revision: revision, segment: { sequence, generation, state: "running", deadline_at: new Date(Date.now() + 60_000).toISOString() } };
+  }
+  function progress(sequence: number, generation = 1, headline = `Working on segment ${sequence}`) {
+    return { request_id: `request-${sequence}-${generation}`, phase: "calling_model", headline, evidence: [], likely_next: null, reason: null, updated_at: new Date().toISOString(), segment_sequence: sequence, segment_generation: generation };
+  }
+  function controlledStream(signal: AbortSignal) {
+    let enqueue!: (event: string, sequence: number, payload?: unknown, revision?: number) => void;
+    const response = new Response(new ReadableStream<Uint8Array>({ start(controller) {
+      enqueue = (event, sequence, payload, revision) => controller.enqueue(new TextEncoder().encode(sseFrame(sid, operationId, event, sequence, payload, revision)));
+      signal.addEventListener("abort", () => controller.error(new Error("observer detached")), { once: true });
+    } }), { headers: { "Content-Type": "text/event-stream" } });
+    return { response, enqueue };
+  }
+  beforeEach(() => {
+    vi.useFakeTimers();
+    adoptComposerObserver(scope, sid, { operation_id: operationId, kind: "compose_message" });
+  });
+
+  it.each(["successor", "new generation", "reconnect", "durable GET"])("retires predecessor progress on %s before any new progress exists", async (transition) => {
+    const streams: ReturnType<typeof controlledStream>[] = [];
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_session, _operation, signal) => {
+      const stream = controlledStream(signal); streams.push(stream); return stream.response;
+    });
+    await useSessionStore.getState().resumeComposerOperation(sid);
+    await vi.advanceTimersByTimeAsync(0);
+    const old = status(4, 1), next = status(5, transition === "new generation" ? 1 : 2, transition === "new generation" ? 2 : 1);
+    streams[0].enqueue("status", 0, old, 4);
+    streams[0].enqueue("progress", 1, progress(1));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useSessionStore.getState().composerProgress?.headline).toBe("Working on segment 1");
+    if (transition === "durable GET") {
+      vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...next, result: null, error: null });
+      streams[0].enqueue("terminal", 2, { status: "completed", phase: "settled", status_revision: 5 }, 5);
+    } else if (transition === "reconnect") {
+      streams[0].enqueue("reconnect", 2);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(streams).toHaveLength(2);
+      streams[1].enqueue("status", 0, next, 5);
+    } else streams[0].enqueue("status", 2, next, 5);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useSessionStore.getState().composerOperationStatus?.segment).toEqual(next.segment);
+    expect(useSessionStore.getState().composerProgress).toBeNull();
+    expect(useSessionStore.getState().isComposing).toBe(true);
+    expect(findComposerOperationCustody(scope, sid).foreground?.operationId).toBe(operationId);
+    detachComposerObservers(); await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it("drops unbound and mismatched progress while preserving the accepted generation across rejected statuses", async () => {
+    let stream!: ReturnType<typeof controlledStream>;
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_session, _operation, signal) => {
+      stream = controlledStream(signal); return stream.response;
+    });
+    await useSessionStore.getState().resumeComposerOperation(sid);
+    await vi.advanceTimersByTimeAsync(0);
+    stream.enqueue("progress", 0, progress(1));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useSessionStore.getState().composerProgress).toBeNull();
+    const accepted = status(8, 2, 3);
+    stream.enqueue("status", 1, accepted, 8);
+    stream.enqueue("progress", 2, progress(1, 3, "Wrong segment"));
+    stream.enqueue("progress", 3, progress(2, 2, "Wrong generation"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useSessionStore.getState().composerProgress).toBeNull();
+    stream.enqueue("progress", 4, progress(2, 3, "Current generation"));
+    await vi.advanceTimersByTimeAsync(0);
+    const currentProgress = useSessionStore.getState().composerProgress;
+    expect(currentProgress?.headline).toBe("Current generation");
+    stream.enqueue("status", 5, status(7, 1), 7);
+    stream.enqueue("status", 6, accepted, 8);
+    stream.enqueue("status", 7, { ...accepted, status_revision: 9, phase: "reconciling" }, 9);
+    stream.enqueue("progress", 8, progress(2, 2, "Old generation returned"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useSessionStore.getState().composerOperationStatus?.status_revision).toBe(9);
+    expect(useSessionStore.getState().composerProgress).toBe(currentProgress);
+    detachComposerObservers(); await vi.advanceTimersByTimeAsync(0);
+  });
+});
 
 describe("adopting a live operation without custody (D-8)", () => {
   const activeId = "55555555-5555-4555-8555-555555555555";

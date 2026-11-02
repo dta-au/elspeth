@@ -40,6 +40,7 @@ ROUTE_HELPERS = "src/elspeth/web/sessions/routes/_helpers.py"
 SERVICE = "src/elspeth/web/composer/service.py"
 SESSIONS = "src/elspeth/web/sessions/service.py"
 LIVE_PHASES = "src/elspeth/web/composer/continuation_live_phases.py"
+SEMANTIC_SOURCE = "src/elspeth/web/composer/continuation_semantic_source.py"
 BATCH = "src/elspeth/web/composer/tool_batch.py"
 MESSAGE_BUILDERS = "src/elspeth/web/composer/continuation_message_builders.py"
 FAMILY_BUILDERS = "src/elspeth/web/composer/continuation_message_family_builders.py"
@@ -1509,7 +1510,8 @@ def runtime_initialization_prerequisite_transfers(units):
 
 def iteration_local_transfers(units):
     """Exact extra state/bindings construction and the first-state SQL join."""
-    paths = (CARRIERS, RUNTIME, INITIALIZATION, INITIAL_DATA, INITIAL_PUBLICATION, FIRST_RUNTIME, FREEZE, CACHES, SERVICE)
+    # The deleted service loop no longer constructs or owns these live carriers.
+    paths = (CARRIERS, RUNTIME, INITIALIZATION, INITIAL_DATA, INITIAL_PUBLICATION, FIRST_RUNTIME, FREEZE, CACHES)
     failures, index, selected, receipt = _select(units, paths, "continuation iteration")
     if failures:
         return failures, {}
@@ -1557,12 +1559,13 @@ def iteration_local_transfers(units):
         for node in ast.walk(owner)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in names
     )
+    constructor_uses = set()
     for path, owner in extra_owners:
-        receipt["constructor_calls"].update(
-            (path, id(node))
-            for node in ast.walk(owner)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in names
-        )
+        constructors = [
+            node for node in ast.walk(owner) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in names
+        ]
+        receipt["constructor_calls"].update((path, id(node)) for node in constructors)
+        constructor_uses.update((path, id(node.func)) for node in constructors)
     check = selected[INITIAL_DATA, "capture_initial_composition"]
     receipt["typecheck_uses"].update(
         (INITIAL_DATA, id(node)) for node in ast.walk(check) if isinstance(node, ast.Name) and node.id == "_ComposeIterationState"
@@ -1601,17 +1604,65 @@ def iteration_local_transfers(units):
         nominal_use = (INITIAL_PUBLICATION, id(publication_guard.test.values[2].comparators[0]))
         receipt["class_uses"].add(nominal_use)
         receipt["typecheck_uses"].add(nominal_use)
-    loop = _find(index[SERVICE].tree, "ComposerServiceImpl._compose_loop")
-    advance = _find(index[SERVICE].tree, "ComposerServiceImpl._advance_live_compose_iteration")
-    ordinary = {
-        (SERVICE, id(node))
-        for owner in (loop, advance)
-        for node in ast.walk(owner)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in names
-    }
-    _require(
-        failures, _references(units, names) == ordinary | receipt["class_uses"], "continuation iteration class reference inventory changed"
+    semantic_units = [unit for unit in units if unit.path == SEMANTIC_SOURCE]
+    semantic = semantic_units[0] if len(semantic_units) == 1 else None
+    capture = _find(semantic.tree, "capture_semantic_advisor_source") if semantic is not None else None
+    expected_readonly_guard = """if (
+    type(runtime) is not RestoredContinuationRuntime
+    or type(runtime.live) is not _ComposeIterationState
+    or type(runtime.bindings) is not _ComposeIterationBindings
+    or type(runtime.source) is not ContinuationRuntimeSource
+    or type(runtime.source.selected) is not SelectedContinuationState
+    or type(runtime.materialization) is not CurrentContinuationMessageProducers
+):
+    raise TypeError("raw semantic capture requires its actual restored runtime DATA")
+"""
+    capture_body = receiver.body(capture) if isinstance(capture, ast.FunctionDef) else []
+    readonly_guard = capture_body[0] if capture_body else None
+    guard_valid = (
+        semantic is not None
+        and isinstance(capture, ast.FunctionDef)
+        and not capture.decorator_list
+        and not capture.type_params
+        and receiver.owned_binding(semantic.tree, "capture_semantic_advisor_source", capture)
+        and receiver.builtin_binding(semantic.tree, "type")
+        and receiver.builtin_binding(semantic.tree, "TypeError")
+        and all(
+            receiver.imported(semantic.tree, name, module, name)
+            for name, module in (
+                ("_ComposeIterationState", _module(CARRIERS)),
+                ("_ComposeIterationBindings", _module(CARRIERS)),
+                ("RestoredContinuationRuntime", _module(RUNTIME)),
+                ("ContinuationRuntimeSource", "elspeth.web.sessions.continuation_runtime"),
+                ("SelectedContinuationState", "elspeth.web.composer.continuation_selection"),
+                ("CurrentContinuationMessageProducers", _module(PRODUCERS)),
+            )
+        )
+        and not any(
+            bound
+            in {
+                "type",
+                "TypeError",
+                "_ComposeIterationState",
+                "_ComposeIterationBindings",
+                "RestoredContinuationRuntime",
+                "ContinuationRuntimeSource",
+                "SelectedContinuationState",
+                "CurrentContinuationMessageProducers",
+            }
+            for bound, _kind, _node in receiver.lexical_binding_events(capture)
+        )
+        and readonly_guard is not None
+        and _same(readonly_guard, expected_readonly_guard)
     )
+    _require(failures, guard_valid, "continuation iteration read-only semantic nominal guard changed")
+    readonly_uses = set()
+    if guard_valid:
+        readonly_uses = {(SEMANTIC_SOURCE, id(readonly_guard.test.values[index].comparators[0])) for index in (1, 2)}
+        receipt["class_uses"].update(readonly_uses)
+        receipt["typecheck_uses"].update(readonly_uses)
+        receipt["supplier_bindings"].update(_module(SEMANTIC_SOURCE) + "." + name for name in names)
+    _require(failures, _references(units, names) == receipt["class_uses"], "continuation iteration class reference inventory changed")
     restore = selected[RUNTIME, "_restore_live"]
     history_arguments = [
         keyword.value
@@ -1694,7 +1745,29 @@ def iteration_local_transfers(units):
     receipt["receiver_members"].setdefault(_module(CARRIERS) + "._ComposeIterationBindings", set()).update(
         node.target.id for node in binding.body if isinstance(node, ast.AnnAssign)
     )
-    return _finish(failures, receipt)
+    initialization_constructors = frozenset(site for site in receipt["constructor_calls"] if site[0] == INITIALIZATION)
+    runtime_constructors = frozenset(site for site in receipt["constructor_calls"] if site[0] == RUNTIME)
+    first_state_writes = frozenset(site for site in receipt["state_writes"] if site[0] == INITIALIZATION)
+    phase_state_writes = frozenset(site for site in receipt["state_writes"] if site[0] == LIVE_PHASES)
+    _require(
+        failures,
+        len(initialization_constructors) == 1
+        and len(runtime_constructors) == 2
+        and len(first_state_writes) == 1
+        and len(phase_state_writes) == 1,
+        "continuation iteration current constructor/state-write map is incomplete",
+    )
+    failures, completed = _finish(failures, receipt)
+    if failures:
+        return failures, completed
+    return [], {
+        **completed,
+        "initialization_constructor_calls": initialization_constructors,
+        "runtime_constructor_calls": runtime_constructors,
+        "readonly_class_uses": frozenset(receipt["class_uses"] - constructor_uses),
+        "first_state_writes": first_state_writes,
+        "phase_state_writes": phase_state_writes,
+    }
 
 
 _ATTACHMENT_ADMISSION = """if retained_attachment is not None:
@@ -4078,6 +4151,7 @@ def closed_source_record_transfers(units):
         ),
         (
             EVIDENCE_GRAPH,
+            SEMANTIC_SOURCE,
             "_finish_current_evidence",
             "RestoredTurnEvidence(owner, messages, recorder, drained, graph.selected, snapshot.application_entry, graph.selected_audit, graph.selected_dialect)",
         ),

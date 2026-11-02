@@ -22,11 +22,12 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_classifier_handoff import ClassifyPostPrimary, ClassifySourceProofStop
+    from elspeth.web.composer.continuation_classifier_owned_source import ClassifyReplyRefusalReady
     from elspeth.web.composer.continuation_codec import PrivateChunk
     from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchPersistData
     from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.composer.turn_effects import BlobDeliveryAttempt, TurnEvidence
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
-    from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer
+    from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryIssuer, ClassifierReplyDeadline
     from elspeth.web.sessions.protocol import (
         SessionServiceProtocol,
     )
@@ -58,6 +59,7 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
     PROMPT_GUARD_THINKING_PARTS_KEY,
@@ -1097,7 +1099,7 @@ class ComposerServiceImpl:
         provider_owner: ProviderInvocationOwner | None = None,
         classifier_primary_issuer: ClassifierPrimaryIssuer | None = None,
         completion_capture: _ClassifyEndInvocationCapture | None = None,
-    ) -> _ClassifyOutcome | ClassifyPostPrimary | ClassifySourceProofStop:
+    ) -> _ClassifyOutcome | ClassifyPostPrimary | ClassifySourceProofStop | ClassifierReplyDeadline:
         """Phase P5 of the compose loop — anti-anchor + turn accounting.
 
         Three concerns share this phase because their decision flow is
@@ -1159,6 +1161,7 @@ class ComposerServiceImpl:
         # the current preview's observation without resolving the blob again:
         # newly ready bytes cannot reopen this request's primary dialogue.
         source_stop: ProofUnavailable | MalformedSourceProofClaim | None = None
+        source_stop_origin: Literal["preview", "source_assessment"] | None = None
         if dispatch.tool_outcomes:
             terminal = dispatch.tool_outcomes[-1]
             if (
@@ -1167,6 +1170,8 @@ class ComposerServiceImpl:
                 and isinstance(terminal.response, ToolResult)
             ):
                 source_stop = preview_source_proof_stop(admit_discovery_result("preview_pipeline", terminal.response), state)
+                if source_stop is not None:
+                    source_stop_origin = "preview"
         terminal_without_preview = _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes) or (
             turn_has_mutation and composition_turns_used + 1 >= self._max_composition_turns
         )
@@ -1176,11 +1181,41 @@ class ComposerServiceImpl:
             )
             if type(assessment) in (ProofUnavailable, MalformedSourceProofClaim):
                 source_stop = cast(ProofUnavailable | MalformedSourceProofClaim, assessment)
+                source_stop_origin = "source_assessment"
         if source_stop is not None:
             if classifier_primary_issuer is not None:
                 from elspeth.web.composer.continuation_classifier_handoff import (
                     ClassifySourceProofStop,
                     encode_classifier_source_stop_proof,
+                )
+                from elspeth.web.composer.continuation_classifier_owned_source import ClassifierOwnedSourceObservation
+
+                if completion_capture is None or source_stop_origin is None:
+                    raise AuditIntegrityError("Continuation source stop lost its actual original observation owner")
+                original_fence = classifier_primary_issuer.running.session_operation_context.fence
+                completion_capture.record_original_owned_source(
+                    ClassifierOwnedSourceObservation(
+                        kind="source_proof_refusal",
+                        source_checkpoint_id=classifier_primary_issuer.selected.checkpoint_id,
+                        source_cursor=classifier_primary_issuer.selected.stack.cursor,
+                        state_sha256=stable_hash(state.to_dict()),
+                        physical_operation_id=original_fence.operation_id,
+                        physical_operation_epoch=original_fence.operation_epoch,
+                        proof_json=encode_classifier_source_stop_proof(source_stop),
+                        proof_origin=source_stop_origin,
+                        terminal_tool_call_id=dispatch.tool_outcomes[-1].call.id if source_stop_origin == "preview" else None,
+                        assessment_trigger=(
+                            "staged_review"
+                            if _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes)
+                            else "composition_limit"
+                        )
+                        if source_stop_origin == "source_assessment"
+                        else None,
+                        composition_limit=self._max_composition_turns
+                        if source_stop_origin == "source_assessment"
+                        and not _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes)
+                        else None,
+                    )
                 )
 
                 return ClassifySourceProofStop(
@@ -1338,7 +1373,34 @@ class ComposerServiceImpl:
                     session_operation_context=session_operation_context,
                 )
                 reply: _AdmittedAssistantMessage | None = None
-                remaining = deadline - asyncio.get_event_loop().time()
+                reply_clock_sample = asyncio.get_event_loop().time()
+                remaining = deadline - reply_clock_sample
+                reply_refusal_kind: Literal["reply_protocol_echo", "reply_deadline_exhausted"] | None = (
+                    "reply_deadline_exhausted" if remaining <= 0 else None
+                )
+                if remaining <= 0 and classifier_primary_issuer is not None:
+                    from elspeth.web.composer.continuation_classifier_handoff import encode_classifier_runtime_preflight
+                    from elspeth.web.composer.continuation_classifier_owned_source import ClassifierOwnedSourceObservation
+
+                    original_fence = classifier_primary_issuer.running.session_operation_context.fence
+                    # This is the actual reached no-SDK boundary. Return to
+                    # the driver synchronously; the expired action cannot
+                    # prepare a request, finalize, or capture runtime owners.
+                    return classifier_primary_issuer.seal_reply_deadline(
+                        ClassifierOwnedSourceObservation(
+                            kind="reply_deadline_exhausted",
+                            source_checkpoint_id=classifier_primary_issuer.selected.checkpoint_id,
+                            source_cursor=classifier_primary_issuer.selected.stack.cursor,
+                            state_sha256=stable_hash(state.to_dict()),
+                            physical_operation_id=original_fence.operation_id,
+                            physical_operation_epoch=original_fence.operation_epoch,
+                            deadline=deadline,
+                            observed_monotonic=reply_clock_sample,
+                            clock_started_monotonic=classifier_primary_issuer.clock.started_monotonic,
+                            clock_policy_json=canonical_json(classifier_primary_issuer.clock.policy.model_dump(mode="json")),
+                        ),
+                        runtime_preflight_json=encode_classifier_runtime_preflight(runtime_result),
+                    )
                 # A reply with no advertised tools cannot carry protocol tool
                 # blocks on providers such as Bedrock Converse. Preserve each
                 # complete historical record as attributed text instead; the
@@ -1403,6 +1465,7 @@ class ComposerServiceImpl:
                             user_message=message,
                         ):
                             reply = None
+                            reply_refusal_kind = "reply_protocol_echo"
                         if reply is not None and not completion.tool_batch.calls and reply_delivery is not None:
                             turn_evidence.confirm_delivery(reply_delivery, recorder.llm_calls)
                 if classifier_primary_issuer is not None and reply is not None:
@@ -1428,6 +1491,30 @@ class ComposerServiceImpl:
                         discovery_turns_used=discovery_turns_used,
                         composition_turns_delta=int(turn_has_mutation),
                         discovery_turns_delta=int(turn_has_discovery),
+                    )
+                if classifier_primary_issuer is not None and reply is None:
+                    from elspeth.web.composer.continuation_classifier_owned_source import ClassifierOwnedSourceObservation
+
+                    if completion_capture is None or reply_refusal_kind is None:
+                        raise AuditIntegrityError("Continuation reply refusal lost its original branch observation")
+                    original_fence = classifier_primary_issuer.running.session_operation_context.fence
+                    completion_capture.record_original_owned_source(
+                        ClassifierOwnedSourceObservation(
+                            kind=reply_refusal_kind,
+                            source_checkpoint_id=classifier_primary_issuer.selected.checkpoint_id,
+                            source_cursor=classifier_primary_issuer.selected.stack.cursor,
+                            state_sha256=stable_hash(state.to_dict()),
+                            physical_operation_id=original_fence.operation_id,
+                            physical_operation_epoch=original_fence.operation_epoch,
+                            deadline=deadline if reply_refusal_kind == "reply_deadline_exhausted" else None,
+                            observed_monotonic=reply_clock_sample if reply_refusal_kind == "reply_deadline_exhausted" else None,
+                            clock_started_monotonic=classifier_primary_issuer.clock.started_monotonic
+                            if reply_refusal_kind == "reply_deadline_exhausted"
+                            else None,
+                            clock_policy_json=canonical_json(classifier_primary_issuer.clock.policy.model_dump(mode="json"))
+                            if reply_refusal_kind == "reply_deadline_exhausted"
+                            else None,
+                        )
                     )
                 return await self._complete_staged_classifier_reply(context=completion_context, reply=reply, runtime_result=runtime_result)
 
@@ -1616,7 +1703,7 @@ class ComposerServiceImpl:
     async def resume_continuation_classifier_end(
         self,
         *,
-        pending: ClassifyPostPrimary | ClassifySourceProofStop,
+        pending: ClassifyPostPrimary | ClassifySourceProofStop | ClassifyReplyRefusalReady,
         runtime: RestoredContinuationRuntime,
         dispatch: _DispatchOutcome,
         persist: _PersistOutcome | ColdPostBatchPersistData,
@@ -1637,6 +1724,7 @@ class ComposerServiceImpl:
             decode_classifier_runtime_preflight,
             decode_classifier_source_stop_proof,
         )
+        from elspeth.web.composer.continuation_classifier_owned_source import ClassifyReplyRefusalReady
         from elspeth.web.composer.continuation_codec import (
             PrivateChunk,
             decode_continuation_response,
@@ -1650,7 +1738,7 @@ class ComposerServiceImpl:
 
         if (
             type(runtime) is not RestoredContinuationRuntime
-            or type(pending) not in (ClassifyPostPrimary, ClassifySourceProofStop)
+            or type(pending) not in (ClassifyPostPrimary, ClassifySourceProofStop, ClassifyReplyRefusalReady)
             or runtime.materialization.service is not self
             or type(dispatch) is not _DispatchOutcome
             or type(persist) not in (_PersistOutcome, ColdPostBatchPersistData)
@@ -1699,6 +1787,12 @@ class ComposerServiceImpl:
             provider_owner=bindings.provider_owner,
             completion_capture=completion_capture,
         )
+        if type(pending) is ClassifyReplyRefusalReady:
+            if primary_response is not None or not _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes):
+                raise AuditIntegrityError("unpaid reply refusal changed its original staged-review source")
+            return await self._complete_staged_classifier_reply(
+                context=context, reply=None, runtime_result=decode_classifier_runtime_preflight(pending.runtime_preflight_json)
+            )
         if type(pending) is ClassifySourceProofStop:
             if primary_response is not None or (
                 pending.composition_turns_delta,

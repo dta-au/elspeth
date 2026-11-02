@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore } from "./sessionStore";
 import { COMPOSER_STOP_KEY, acquireComposerOperationCustody, authenticateComposerCustody, composerCustodyRecoveryNotice, composerStopRequested, findComposerOperationCustody, purgeComposerCustody } from "./composerOperationCustody";
 import { detachComposerObservers } from "@/api/composerOperationObserver";
-import { decodeComposerOperationSnapshot } from "@/api/composerOperationDecoder";
+import { decodeComposerOperationFrame, decodeComposerOperationSnapshot } from "@/api/composerOperationDecoder";
 import { advanceAuthGeneration } from "@/api/authSession";
+import { operationStatus } from "@/test/composerOperationWire";
 import type { ComposerOperationFailureNotice, ComposerOperationSnapshot, OperationKind } from "@/types/composerOperations";
 
 vi.mock("@/api/client", async (importOriginal) => ({
@@ -33,9 +34,13 @@ function resetSessionGeneration() {
 }
 function progressResponse(sessionId: string, operationId: string) {
   const payload = { request_id: null, phase: "calling_model", headline: "Working", evidence: [], likely_next: null, reason: null, updated_at: iso, segment_sequence: 1, segment_generation: 1 };
-  const frame = { session_id: sessionId, operation_id: operationId, sequence: 0, event: "progress", payload };
+  const accepted = operationStatus(operationId, { status_revision: 4, created_at: iso, observed_at: iso });
+  const status = { session_id: sessionId, operation_id: operationId, sequence: 0, event: "status", payload: accepted };
+  const frame = { session_id: sessionId, operation_id: operationId, sequence: 1, event: "progress", payload };
+  expect(decodeComposerOperationFrame({ id: String(accepted.status_revision), data: status }, sessionId, operationId).event).toBe("status");
+  expect(decodeComposerOperationFrame({ id: null, data: frame }, sessionId, operationId).event).toBe("progress");
   return new Response(new ReadableStream<Uint8Array>({ start(controller) {
-    controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
+    controller.enqueue(new TextEncoder().encode(`id: ${accepted.status_revision}\ndata: ${JSON.stringify(status)}\n\ndata: ${JSON.stringify(frame)}\n\n`));
   } }), { headers: { "Content-Type": "text/event-stream" } });
 }
 

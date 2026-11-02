@@ -1,29 +1,26 @@
-"""Nominal manual-Advisor admission through the real B2 preparation/execution.
+"""Nominal manual-Advisor admission through the current Continuation owner.
 
-These focused unit tests use the existing raw SDK response fixture and real
-session/service/context/argument decoder/Advisor validator. Budget zero makes
-the post-admission provider decision observable without a synthetic Advisor
-answer. Primary gateway admission and audit run before the scripted SDK reply.
-Existing required-guard/settlement tests remain separate obligations.
+The existing phase harness initializes a real composition, dispatches PRIMARY
+through the SDK boundary, and prepares its provider-authored tool call. These
+controls advance that one issued tool through its real execution owner; they
+do not recreate the deleted compose loop or substitute an Advisor result.
 """
 
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from dataclasses import replace
 
 import pytest
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer import tool_batch
+from elspeth.web.composer import continuation_live_phases
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
-from tests.helpers.composer_sdk import ComposerSDKScript
-from tests.unit.web.composer import _helpers as composer_helpers
-from tests.unit.web.composer import test_advisor_tool as advisor_fixtures
+from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store
+from tests.unit.web.sessions.test_continuation_live_phases import _advance, _phase_case
 
-_stub_advisor_end_gate_clean = composer_helpers._stub_advisor_end_gate_clean
-_composer_available_by_default = advisor_fixtures._composer_available_by_default
+operation_store = _operation_store
 
 
 def _arguments():
@@ -40,19 +37,12 @@ def _arguments():
 @pytest.mark.parametrize("instance_override", [False, True], ids=["ordinary-owner", "instance-override-ignored"])
 @pytest.mark.parametrize("payload_kind", ["valid", "unknown-key", "prompt-cap"])
 async def test_actual_owner_receives_complete_arguments_and_its_actual_prompt_cap(
+    operation_store,
     monkeypatch,
     tmp_path,
     instance_override,
     payload_kind,
 ):
-    settings = advisor_fixtures._make_settings(budget=0, data_dir=tmp_path).model_copy(update={"composer_advisor_max_prompt_tokens": 1000})
-    service, session_id = composer_helpers._composer_service_with_session(
-        catalog=advisor_fixtures._mock_catalog(),
-        settings=settings,
-    )
-    owner = service._advisor_checkpoint
-    assert type(owner) is AdvisorCheckpointOwner
-    assert owner._settings is settings
     payload = _arguments()
     if payload_kind == "unknown-key":
         payload["unknown_complete_input_marker"] = "must not be projected away"
@@ -62,7 +52,7 @@ async def test_actual_owner_receives_complete_arguments_and_its_actual_prompt_ca
     prepared = []
     admitted = []
     overrides = []
-    execute = tool_batch._execute_continuation_call_live
+    execute = continuation_live_phases._execute_continuation_call_live
     validate = AdvisorCheckpointOwner._validate_advisor_arguments
 
     async def observe_execute(**kwargs):
@@ -77,77 +67,69 @@ async def test_actual_owner_receives_complete_arguments_and_its_actual_prompt_ca
         overrides.append(arguments)
         raise AssertionError("an instance attribute must not replace nominal admission")
 
-    monkeypatch.setattr(tool_batch, "_execute_continuation_call_live", observe_execute)
+    monkeypatch.setattr(continuation_live_phases, "_execute_continuation_call_live", observe_execute)
     monkeypatch.setattr(AdvisorCheckpointOwner, "_validate_advisor_arguments", observe_actual_validator)
-    if instance_override:
-        monkeypatch.setattr(owner, "_validate_advisor_arguments", forbidden_instance_override)
+    async with _phase_case(
+        operation_store,
+        tmp_path,
+        monkeypatch,
+        tool_call=("nominal_advisor", "request_advisor_hint", payload),
+        settings_overrides={"composer_advisor_max_calls_per_compose": 0, "composer_advisor_max_prompt_tokens": 1000},
+    ) as (phases, _running, _primary, sdk):
+        service = phases.service
+        owner = service._advisor_checkpoint
+        assert type(owner) is AdvisorCheckpointOwner
+        assert owner._settings is service._settings
+        assert owner._settings.composer_advisor_max_prompt_tokens == 1000
+        assert service._settings.composer_advisor_max_calls_per_compose == 0
+        if instance_override:
+            monkeypatch.setattr(owner, "_validate_advisor_arguments", forbidden_instance_override)
+        initial_state = phases.runtime.live.state
+        await _advance(phases)
 
-    initial_state = advisor_fixtures._empty_state()
-    turns = [
-        advisor_fixtures._make_raw_tool_call("nominal_advisor", "request_advisor_hint", payload),
-        advisor_fixtures._make_raw_text_only_response("The request remains available for the next turn."),
-    ]
-    script = ComposerSDKScript(
-        primary_model=service._provider_gateway._model,
-        primary=turns,
-        advisor_model=settings.composer_advisor_model,
-        advisor=[AssertionError("budget zero or argument refusal must precede Advisor SDK dispatch")],
-    )
-    primary, sdk = script.primary, script.advisor
-    with patch("litellm.acompletion", new=script):
-        result = await service.compose(
-            "Review the complete input safely.",
-            [],
-            initial_state,
-            session_id=session_id,
-        )
-
-    assert primary.call_count == 2
-    assert sdk.call_count == 0
-    assert overrides == []
-    assert len(prepared) == len(admitted) == 1
-    assert prepared[0][0] is admitted[0][0] is owner
-    assert prepared[0][1] is admitted[0][1]
-    assert admitted[0][1] == payload
-    assert admitted[0][1]["schema_excerpt"] == payload["schema_excerpt"]
-    invocations = [item for item in result.tool_invocations if item.tool_name == "request_advisor_hint"]
-    assert len(invocations) == 1
-    invocation = invocations[0]
-    assert json.loads(invocation.arguments_canonical) == payload
-    assert invocation.version_before == 1
-    assert result.state == initial_state
-    assert invocation.result_canonical is not None
-    response = json.loads(invocation.result_canonical)
-    if payload_kind == "valid":
-        assert invocation.version_after == 1
-        assert invocation.status.name == "SUCCESS"
-        assert response["status"] == "BUDGET_EXHAUSTED"
-        assert response["budget_used"] == response["budget_remaining"] == 0
-    else:
-        assert invocation.version_after is None
-        assert invocation.status.name == "ARG_ERROR"
-        assert response["status"] == "ARG_ERROR"
-        if payload_kind == "prompt-cap":
-            assert invocation.error_category is ToolArgumentErrorCategory.PROMPT_BUDGET
-            assert "prompt size" in response["error"]
+        # Only the real PRIMARY call reached the SDK. Budget zero and argument
+        # refusal each stop manual Advisor dispatch before another SDK call.
+        assert len(sdk) == 1
+        assert overrides == []
+        assert len(prepared) == len(admitted) == 1
+        assert prepared[0][0] is admitted[0][0] is owner
+        assert prepared[0][1] is admitted[0][1]
+        assert admitted[0][1] == payload
+        assert admitted[0][1]["schema_excerpt"] == payload["schema_excerpt"]
+        invocations = [item for item in phases.runtime.live.recorder.invocations if item.tool_name == "request_advisor_hint"]
+        assert len(invocations) == 1
+        invocation = invocations[0]
+        assert json.loads(invocation.arguments_canonical) == payload
+        assert invocation.version_before == initial_state.version
+        assert phases.runtime.live.state == initial_state
+        assert invocation.result_canonical is not None
+        response = json.loads(invocation.result_canonical)
+        if payload_kind == "valid":
+            assert invocation.version_after == initial_state.version
+            assert invocation.status.name == "SUCCESS"
+            assert response["status"] == "BUDGET_EXHAUSTED"
+            assert response["budget_used"] == response["budget_remaining"] == 0
         else:
-            assert invocation.error_category is ToolArgumentErrorCategory.SCHEMA_SHAPE
-            assert "must conform to the published schema" in response["error"]
+            assert invocation.version_after is None
+            assert invocation.status.name == "ARG_ERROR"
+            assert response["status"] == "ARG_ERROR"
+            if payload_kind == "prompt-cap":
+                assert invocation.error_category is ToolArgumentErrorCategory.PROMPT_BUDGET
+                assert "prompt size" in response["error"]
+            else:
+                assert invocation.error_category is ToolArgumentErrorCategory.SCHEMA_SHAPE
+                assert "must conform to the published schema" in response["error"]
+    phases.work.coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("receiver_kind", ["foreign", "subclass"])
 async def test_foreign_or_subclass_receiver_is_a_first_party_invariant_before_admission(
+    operation_store,
     monkeypatch,
     tmp_path,
     receiver_kind,
 ):
-    settings = advisor_fixtures._make_settings(budget=0, data_dir=tmp_path)
-    service, session_id = composer_helpers._composer_service_with_session(
-        catalog=advisor_fixtures._mock_catalog(),
-        settings=settings,
-    )
-    owned = service._advisor_checkpoint
     attempts = []
 
     class ForeignOwner:
@@ -160,50 +142,47 @@ async def test_foreign_or_subclass_receiver_is_a_first_party_invariant_before_ad
             attempts.append(arguments)
             raise AssertionError("subclass receiver reached admission")
 
-    if receiver_kind == "foreign":
-        replacement = ForeignOwner()
-    else:
-        replacement = DerivedOwner(
-            settings=owned._settings,
-            composer_skill_text=owned._composer_skill_text,
-            advisor_endpoint_base_url=owned._advisor_endpoint_base_url,
-            advisor_endpoint_api_key=owned._advisor_endpoint_api_key,
-            sessions_service=owned._sessions_service,
-            chargeable_admission=owned._chargeable_admission,
-            prompt_guard_mount=owned._prompt_guard_mount,
-            secret_service=owned._secret_service,
-        )
-    monkeypatch.setattr(service, "_advisor_checkpoint", replacement)
-    prepared = []
-    execute = tool_batch._execute_continuation_call_live
-
-    async def observe_execute(**kwargs):
-        prepared.append((kwargs["ctx"].advisor_checkpoint, kwargs["call"].arguments))
-        return await execute(**kwargs)
-
-    monkeypatch.setattr(tool_batch, "_execute_continuation_call_live", observe_execute)
     payload = _arguments()
-    script = ComposerSDKScript(
-        primary_model=service._provider_gateway._model,
-        primary=[advisor_fixtures._make_raw_tool_call("nominal_advisor", "request_advisor_hint", payload)],
-        advisor_model=settings.composer_advisor_model,
-        advisor=[AssertionError("foreign receiver must fail before Advisor SDK dispatch")],
-    )
-    primary, sdk = script.primary, script.advisor
-    with (
-        patch("litellm.acompletion", new=script),
-        pytest.raises(AuditIntegrityError, match="Manual Advisor admission requires the owned checkpoint owner"),
-    ):
-        await service.compose(
-            "Review the complete input safely.",
-            [],
-            advisor_fixtures._empty_state(),
-            session_id=session_id,
-        )
+    async with _phase_case(
+        operation_store,
+        tmp_path,
+        monkeypatch,
+        tool_call=("nominal_advisor", "request_advisor_hint", payload),
+        settings_overrides={"composer_advisor_max_calls_per_compose": 0},
+    ) as (phases, _running, _primary, sdk):
+        owned = phases.service._advisor_checkpoint
+        if receiver_kind == "foreign":
+            replacement = ForeignOwner()
+        else:
+            replacement = DerivedOwner(
+                settings=owned._settings,
+                composer_skill_text=owned._composer_skill_text,
+                advisor_endpoint_base_url=owned._advisor_endpoint_base_url,
+                advisor_endpoint_api_key=owned._advisor_endpoint_api_key,
+                sessions_service=owned._sessions_service,
+                chargeable_admission=owned._chargeable_admission,
+                prompt_guard_mount=owned._prompt_guard_mount,
+                secret_service=owned._secret_service,
+            )
+        prepared = []
+        execute = continuation_live_phases._execute_continuation_call_live
 
-    assert primary.call_count == 1
-    assert sdk.call_count == 0
-    assert attempts == []
-    assert len(prepared) == 1
-    assert prepared[0][0] is replacement
-    assert prepared[0][1] == payload
+        async def substitute_receiver(**kwargs):
+            # Current inventory already refuses a foreign service owner.
+            # Substitute at the issued tool's execution boundary to exercise
+            # manual admission's independent nominal receiver invariant.
+            assert kwargs["ctx"].advisor_checkpoint is owned
+            context = replace(kwargs["ctx"], advisor_checkpoint=replacement)
+            prepared.append((context.advisor_checkpoint, kwargs["call"].arguments))
+            return await execute(**{**kwargs, "ctx": context})
+
+        monkeypatch.setattr(continuation_live_phases, "_execute_continuation_call_live", substitute_receiver)
+        with pytest.raises(AuditIntegrityError, match="Manual Advisor admission requires the owned checkpoint owner"):
+            await _advance(phases)
+
+        assert len(sdk) == 1
+        assert attempts == []
+        assert len(prepared) == 1
+        assert prepared[0][0] is replacement
+        assert prepared[0][1] == payload
+    phases.work.coordinator.assert_completed()

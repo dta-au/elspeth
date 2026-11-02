@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 from functools import partial
 from uuid import UUID, uuid4
 
+import httpx
 import litellm
 import pytest
 from sqlalchemy import select
@@ -23,6 +24,7 @@ from elspeth.web.composer.continuation_semantic_invocation import make_semantic_
 from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.sessions.composer_finalization import _message_with_state_response
 from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite, ComposerOperationCancelledDuringTurn
 from elspeth.web.sessions.continuation import load_snapshot
@@ -39,6 +41,7 @@ from elspeth.web.sessions.continuation_semantic_review_result import retain_sema
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
+from tests.unit.web.composer.test_prompt_guard_admission import _checks
 from tests.unit.web.sessions import test_continuation_end_shared_execution as shared_fixture
 from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
 
@@ -99,13 +102,44 @@ async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
         )
         stop_sdk = []
         guard_inputs = []
+        guard_part_lengths = []
+        azure_requests = []
         original_request_builder = original_guard._request
+        guard_mount = request.prepared.mount
+        assert guard_mount is not None
+        guard_client = guard_mount.client
+        assert type(guard_client) is AzurePromptGuardClient
+        transport = guard_client._http_transport
+        assert type(transport) is httpx.MockTransport
+        original_http_request = transport.handle_async_request
+
+        async def count_actual_azure_request(actual_request):
+            azure_requests.append(1)
+            return await original_http_request(actual_request)
 
         def record_actual_guard_request(**kwargs):
             guarded, supported = original_request_builder(**kwargs)
             guard_inputs.append(
                 (guarded.role, supported, len(guarded.user_prompt), len(guarded.documents), max(map(len, guarded.documents), default=0))
             )
+            partitions = kwargs["content_parts"]
+            message_two = partitions[2] if partitions is not None and len(partitions) > 2 else None
+            parts = () if message_two is None else message_two
+            lengths = sorted(
+                (
+                    (
+                        index,
+                        len(part.text if part.inspection_text is None else part.inspection_text),
+                        len(f"Message 2, content part {index}:\n")
+                        + len(part.text if part.inspection_text is None else part.inspection_text),
+                        part.trust is None,
+                    )
+                    for index, part in enumerate(parts)
+                ),
+                key=lambda item: item[2],
+                reverse=True,
+            )
+            guard_part_lengths.append((tuple(sorted(kwargs["trusted_message_indexes"])), len(parts), lengths[:5]))
             return guarded, supported
 
         async def complete_stop(**kwargs):
@@ -114,6 +148,7 @@ async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
 
         monkeypatch.setattr(litellm, "acompletion", complete_stop)
         monkeypatch.setattr(original_guard, "_request", record_actual_guard_request)
+        monkeypatch.setattr(transport, "handle_async_request", count_actual_azure_request)
         stop_case = {
             **case,
             "runtime": runtime,
@@ -130,12 +165,24 @@ async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
             # retention owner's provenance refusal below.
             observed.error.add_note(f"actual Stop SDK entries before original failure: {len(stop_sdk)}")
             if type(observed.error) is PromptGuardRefused:
+                try:
+                    checks = [check for check in _checks(store[0]) if check["audit_id"] == observed.error.audit_id]
+                except Exception as probe_error:
+                    checks = []
+                    observed.error.add_note(f"actual Stop guard audit lookup failed: {type(probe_error).__name__}")
                 observed.error.add_note(
                     f"actual Stop guard refusal: disposition={observed.error.disposition}; "
-                    f"reason={observed.error._decision.reason}; audit_id={observed.error.audit_id}"
+                    f"http_status={observed.error.http_status}; audit_id={observed.error.audit_id}; "
+                    f"matching_audit_checks={len(checks)}"
                 )
                 observed.error.add_note(
-                    f"actual guard inputs (role, supported, user characters, documents, largest document characters): {guard_inputs}"
+                    "actual Stop guard audit (reason, role, mode, adapter, request_hash, disposition): "
+                    f"{[(check['reason'], check['role'], check['mode'], check['adapter'], check['request_hash'], check['disposition']) for check in checks]}"
+                )
+                observed.error.add_note(
+                    "actual guard inputs (role, supported, user characters, documents, largest document characters): "
+                    f"{guard_inputs}; message 2 (trusted indexes, part count, top part index/inspection characters/prefixed unit characters/untrusted): "
+                    f"{guard_part_lengths}; Azure mock requests: {len(azure_requests)}"
                 )
             raise observed.error
         with locked_session_transaction(store[0], sid) as conn:

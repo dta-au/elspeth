@@ -465,7 +465,7 @@ def handoff_cut_allowance(
     if (
         type(top) is ToolBatchFrame
         and top.phase == "tool_ready"
-        and top.accumulator.codec != "composer.coupled-batch-data.v1"
+        and top.accumulator.codec not in ("composer.coupled-batch-data.v1", "composer.tool-batch.v1")
         and len(root.frames) == 2
         and type(root.frames[0]) is ComposeFrame
     ):
@@ -527,7 +527,7 @@ def iteration_stage_action_policy(
         return policy.actions.advisor
     if stage.stage == "end_ready":
         return policy.actions.advisor
-    if stage.stage == "publication_ready":
+    if stage.stage in ("publication_ready", "reply_refusal_ready"):
         return policy.actions.session_sql
     if stage.stage == "classify_ready":
         return policy.actions.primary
@@ -806,6 +806,26 @@ def next_continuation_action_policy(
     if top.accumulator.codec == "composer.tool-batch.v1":
         prefix = f"attachment:{top.response.digest}:"
         pending = root.pending_owner_results
+        if top.phase == "tool_ready":
+            if (
+                len(root.frames) != 2
+                or type(root.frames[0]) is not ComposeFrame
+                or root.frames[0].pending_response != top.response
+                or pending
+                or root.pending_settlement_ids
+                or root.active_action_json is not None
+                or root.active_action_source is not None
+                or any(item.disposition not in ("committed", "refused") for item in root.effect_frontier)
+                or any(item.effect_id == f"{prefix}{top.next_tool_index}" for item in root.effect_frontier)
+            ):
+                raise AuditIntegrityError("next allowance lost its unissued attachment preparation cut")
+            # Sizing only. The current SQL runtime reader must authenticate the
+            # original preparation event and recovery chain, and prove no read
+            # effect exists, before a fresh current preparation opens its timer.
+            return max(
+                (policy.actions.read, policy.actions.session_sql, policy.actions.blob, policy.actions.external),
+                key=lambda value: value.total,
+            )
         if top.phase == "effect_reconciling" and len(pending) == 1 and pending[0].kind == "read":
             attachment_key = pending[0].effect_key
             admitted = pending[0].result.codec == "composer.owner-result.v1" and attachment_key not in top.settled_effect_ids
@@ -835,7 +855,7 @@ def next_continuation_action_policy(
     if (
         top.phase == "tool_ready"
         and top.accumulator.codec == "composer.coupled-batch-data.v1"
-        and (not top.settled_effect_ids or all(key.startswith(f"tool:{top.response.digest}:") for key in top.settled_effect_ids))
+        and all(key.startswith((f"tool:{top.response.digest}:", f"attachment:{top.response.digest}:")) for key in top.settled_effect_ids)
     ):
         if (
             len(root.frames) != 2
@@ -846,39 +866,28 @@ def next_continuation_action_policy(
             or root.active_action_json is not None
             or root.active_action_source is not None
             or any(item.disposition not in ("committed", "refused") for item in root.effect_frontier)
+            or len(top.settled_effect_ids) != len(set(top.settled_effect_ids))
+            or any(
+                len(
+                    tuple(
+                        item
+                        for item in root.effect_frontier
+                        if item.effect_id == key and item.disposition == "committed" and item.receipt_id is not None
+                    )
+                )
+                != 1
+                for key in top.settled_effect_ids
+            )
         ):
             raise AuditIntegrityError("next allowance lost its complete current tool-batch prefix")
         # Sizing does not replace actual source-name admission or decode tool
         # arguments with an invented empty inventory. The current graph/phase
-        # reader chooses the real tool/P4 owner after the actual claim starts.
+        # reader proves the complete native/attachment prefix and chooses the
+        # real next tool/P4 owner after the actual claim starts. A completed
+        # attachment closes only its own call, including in a mixed batch.
         return max(
             (policy.actions.read, policy.actions.session_sql, policy.actions.blob, policy.actions.external), key=lambda value: value.total
         )
-    if top.phase == "tool_ready" and top.accumulator.codec == "composer.coupled-batch-data.v1":
-        key = f"attachment:{top.response.digest}:{top.next_tool_index - 1}"
-        frontier = tuple(item for item in root.effect_frontier if item.effect_id == key)
-        if (
-            len(root.frames) != 2
-            or type(root.frames[0]) is not ComposeFrame
-            or root.frames[0].pending_response != top.response
-            or top.next_tool_index < 1
-            or root.pending_owner_results
-            or root.pending_settlement_ids
-            or root.active_action_json is not None
-            or root.active_action_source is not None
-            or not top.settled_effect_ids
-            or top.settled_effect_ids[-1] != key
-            or top.settled_effect_ids.count(key) != 1
-            or len(frontier) != 1
-            or frontier[0].disposition != "committed"
-            or not frontier[0].receipt_id
-            or any(item.disposition not in ("committed", "refused") for item in root.effect_frontier)
-        ):
-            raise AuditIntegrityError("next allowance lost its completed attachment application cut")
-        # SQL-only structural allowance. The actual current runtime reader must
-        # reprove the immutable application event/checkpoints/result/receipt;
-        # no subsequent read/provider/business action is admitted by this DATA.
-        return policy.actions.session_sql
     effect_key = f"batch:{top.response.digest}:p4"
     if top.phase == "effect_reconciling" and top.accumulator.codec == "composer.p4-pending-batch.v1":
         pending = root.pending_owner_results

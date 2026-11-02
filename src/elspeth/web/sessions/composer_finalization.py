@@ -46,6 +46,7 @@ from elspeth.web.execution.completion_gates import (
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite
+from elspeth.web.sessions.continuation_graph_recovery_projection import GraphRecoveryProjectionInput
 from elspeth.web.sessions.continuation_publication_projection import PublicationProjectionInput
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.routes._helpers import (
@@ -100,7 +101,7 @@ if TYPE_CHECKING:
 class _ProviderAuditFinalizationKwargs(TypedDict, total=False):
     provider_audit_calls: tuple[ComposerLLMCall, ...]
     publication_result: ComposerResult
-    publication_projection: PublicationProjectionInput
+    publication_projection: PublicationProjectionInput | GraphRecoveryProjectionInput
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +317,7 @@ async def settle_composer_result(
             audit_cohort = result.recovery_audit_drafts + audit_cohort
         if type(inputs.budget_anchor) is ContinuationFinalizationBudget and isinstance(result, ComposerResult):
             provider_options["publication_result"] = result
+            provider_options["publication_projection"] = GraphRecoveryProjectionInput(result, recovery_context, recovery)
         record = await _join_shielded_task_after_cancellation(
             asyncio.create_task(
                 service.complete_composer_async_operation(

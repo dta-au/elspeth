@@ -14,7 +14,7 @@ from sqlalchemy import Connection, select
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.async_workers import run_required_sql_finish_once
-from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef
+from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef, ToolBatchFrame
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_continuation_snapshot, verify_private_chunk
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, decode_turn_evidence, require_admitted_turn_evidence
@@ -65,7 +65,22 @@ def read_turn_evidence_on_connection(
         raise AuditIntegrityError("cold evidence changed the complete selected root")
     root = selected.stack
     if root.pending_owner_results:
-        raise AuditIntegrityError("cold pre-P4 evidence cannot consume a pending owner result")
+        frame = root.frames[-1]
+        if (
+            type(frame) is not ToolBatchFrame
+            or frame.phase != "effect_reconciling"
+            or frame.accumulator.codec != "composer.tool-batch.v1"
+            or len(root.pending_owner_results) != 1
+            or root.pending_owner_results[0].kind != "read"
+        ):
+            raise AuditIntegrityError("cold pre-P4 evidence cannot consume a pending owner result")
+        from elspeth.web.sessions.continuation_attachment_result import read_attachment_result_on_connection
+
+        # A pending shape only selects this verifier. Before restoring any
+        # original evidence, prove the actual committed attachment effect,
+        # receipt, creator, prepared input and result bytes under current SQL
+        # custody. This does not consume the result or authorize another read.
+        read_attachment_result_on_connection(conn, running, selected=selected, inventory=inventory)
     snapshot = read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=names)
     if snapshot.snapshot.application_entry is not None:
         from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection

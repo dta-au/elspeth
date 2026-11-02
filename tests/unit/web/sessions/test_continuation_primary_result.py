@@ -125,12 +125,12 @@ async def primary_input(store, tmp_path, monkeypatch):
     return kwargs, produced, recorder, requests
 
 
-async def initialized_primary_input(store, tmp_path, monkeypatch):
+async def initialized_primary_input(store, tmp_path, monkeypatch, *, settings_overrides=None):
     """Enter PRIMARY from the actual complete composition initialization owner."""
     from tests.helpers.fenced_session import seed_token_policies
     from tests.unit.web.sessions.test_continuation_composition_initialization import construct, ready_case
 
-    running, service, work, ready, title_sdk = await ready_case(store, tmp_path, monkeypatch)
+    running, service, work, ready, title_sdk = await ready_case(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
     assert not title_sdk
     runtime = await construct(store, running, service, work, ready)
     assert runtime.source.selected.stack.semantic_frontier is not None

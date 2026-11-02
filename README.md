@@ -106,7 +106,7 @@ Public draft reapplication strips private custody and resolves current metadata.
 MCP argument audits retain safe evidence on capture faults, and workers retain
 an actual committed terminal return through late cleanup. See the
 [upgrade notes](docs/release/0.8.10-upgrade-notes-draft.md) for the single
-Composer lifecycle, the Sessions epoch 80 hard cut, unchanged Landscape epoch 50
+Composer lifecycle, the Sessions epoch 82 hard cut, unchanged Landscape epoch 50
 and fresh-store procedures. Reload open browser tabs after deploying.
 
 Existing Composer, Azure Container Apps and engine improvements remain.
@@ -143,15 +143,22 @@ verification and later web connections are outside that measurement. Offline
 instruction rehearsal does not establish live cloud acceptance. These ACA
 enhancements were developed under 0.8.8 and are included in 0.8.9.
 
-Session epoch 80 replaces session epoch 79 and retains its committed graph-review
-authority, quota custody and shared rate-limit policy binding while adding
-versioned Composer continuation segments, exact byte chunks, journal events and
-snapshots for the single Composer lifecycle, with terminal-run database checks.
-Epoch 79 existed only on pre-release 0.8.10 builds. Landscape epoch 50 remains unchanged and retains durable
+Session epoch 82 replaces session epoch 81 and retains its committed graph-review
+authority, quota custody and shared rate-limit policy binding, versioned Composer
+continuation segments, exact byte chunks, journal events and snapshots for the
+single Composer lifecycle, with terminal-run database checks. Epoch 82 makes
+the admitted continuation policy version, hash and retained-payload allowance
+immutable in the parent operation. Epoch 79 existed only on pre-release 0.8.10
+builds. Landscape epoch 50 remains unchanged and retains durable
 provider-attempt identity on run calls. Preserve epoch 75, both epoch 76
 session-store contracts, epoch 77, epoch 78 and epoch 79 session stores and epoch 49
-Landscape stores; use a separately provisioned epoch 80 session store and epoch
-50 Landscape store. Keep old workers isolated from the new stores.
+Landscape stores. Preserve epoch-80 and epoch-81 Sessions stores unchanged too;
+use a separately provisioned epoch 82 session store and epoch 50 Landscape store.
+There is no automatic upgrade of an epoch-81 store. Retained V1/V2 policies
+remain supported for creation and resume within a compatible epoch-82 store;
+that does not permit reopening an epoch-81 database. This schema repair does
+not activate V3 admission or change the application policy default.
+Keep old workers isolated from the new stores.
 Compatible stores still require exact schema admission; unsupported stores are
 preserved and refused before incompatible writes. Backwards compatibility is
 permitted and considered from 0.8.5 within explicitly supported boundaries. This
