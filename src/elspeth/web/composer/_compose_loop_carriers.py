@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -312,6 +313,13 @@ class _CallModelOutcome:
     audit_call: ComposerLLMCall | None = field(default=None, repr=False)
 
 
+class _EndCompletionDisposition(StrEnum):
+    """Actual shared END control flow after every terminal barrier."""
+
+    CLEAN = "clean"
+    BLOCKED = "blocked"
+
+
 @dataclass(frozen=True, slots=True)
 class _TerminateOutcome:
     """Decision returned by P2 (``_try_terminate_no_tools``).
@@ -343,6 +351,7 @@ class _TerminateOutcome:
     advisor_injection_index: int | None = None
     advisor_review_state: _AdvisorReviewState | None = None
     publication_binding: str | None = None
+    end_disposition: _EndCompletionDisposition = _EndCompletionDisposition.BLOCKED
 
 
 @dataclass(frozen=True, slots=True)

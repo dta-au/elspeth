@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
     from elspeth.web.composer.pipeline_proposal import PipelineProposal
+    from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry, TokenUsageSource
     from elspeth.web.execution.envelope import RunExecutionInput
@@ -3147,6 +3148,7 @@ class SessionServiceProtocol(Protocol):
         required_work: RequiredWorkCoordinator | None = None,
         recovery: GraphRecoverySettlement | None = None,
         provider_audit_calls: tuple[ComposerLLMCall, ...] = (),
+        publication_result: ComposerResult | None = None,
     ) -> ComposerOperationRecord: ...
 
     async def load_graph_recovery_context(

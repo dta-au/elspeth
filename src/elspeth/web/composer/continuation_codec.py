@@ -32,7 +32,12 @@ from elspeth.web.composer.continuation import (
     PrivateChunkRef,
 )
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
-from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey, SnapshotDecodeKey, current_retention_stage_memo
+from elspeth.web.continuation_retention_memo import (
+    CanonicalTextEncodingKey,
+    PrivateChunkVerificationKey,
+    SnapshotDecodeKey,
+    current_retention_stage_memo,
+)
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_progress import ContinuationFrontier
@@ -103,13 +108,19 @@ def encode_private_chunk(
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
 
-    if utf8_size(canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
-        raise AuditIntegrityError("private chunk exceeds the complete JSON admission bound")
-    encoded = canonical.encode("utf-8")
-    value, error = parse_json_strict(canonical)
-    if error is not None or canonical_json(value) != canonical:
-        raise AuditIntegrityError("private chunk must retain canonical strict JSON")
+    proof_key = CanonicalTextEncodingKey(canonical, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    memo = current_retention_stage_memo()
+    encoded = (
+        memo.canonical_text_encoding(proof_key, _private_chunk_canonical_text_bytes)
+        if memo is not None and type(canonical) is str
+        else _private_chunk_canonical_text_bytes(proof_key)
+    )
     if codec == "composer.state.v1":
+        # The state constructor needs a fresh mutable tree. Only the text
+        # encoding proof is retained across calls.
+        value, error = parse_json_strict(canonical)
+        if error is not None:
+            raise AuditIntegrityError("private chunk must retain canonical strict JSON")
         if type(value) is not dict:
             raise AuditIntegrityError("state chunk is not an owned state object")
         state = CompositionState.from_dict(value)
@@ -133,6 +144,17 @@ def encode_private_chunk(
         }
     )
     return PrivateChunk(reference, canonical)
+
+
+def _private_chunk_canonical_text_bytes(key: CanonicalTextEncodingKey) -> bytes:
+    canonical = key.canonical
+    if utf8_size(canonical, limit=key.max_utf8_bytes) > key.max_utf8_bytes:
+        raise AuditIntegrityError("private chunk exceeds the complete JSON admission bound")
+    encoded = canonical.encode("utf-8")
+    value, error = parse_json_strict(canonical)
+    if error is not None or canonical_json(value) != canonical:
+        raise AuditIntegrityError("private chunk must retain canonical strict JSON")
+    return encoded
 
 
 def verify_private_chunk(reference: PrivateChunkRef, canonical: str) -> None:

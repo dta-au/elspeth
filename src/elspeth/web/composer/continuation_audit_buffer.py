@@ -19,8 +19,10 @@ from elspeth.web.composer.continuation_codec import (
     owned_json,
     verify_private_chunk,
 )
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply
+from elspeth.web.continuation_retention_memo import RecorderRequestTextKey, RecorderRequestTextProof, current_retention_stage_memo
 
 
 @dataclass(frozen=True, slots=True, config=ConfigDict(extra="forbid", strict=True))
@@ -112,6 +114,10 @@ class _RecorderBlocks:
         self._values.setdefault(key, value)
         return key
 
+    def store_proven_text(self, key: str, value: object) -> None:
+        """First-wins insertion after the private immutable text transfer binds the key."""
+        self._values.setdefault(key, value)
+
     def resolve(self, key: object) -> object:
         if type(key) is not str or key not in self._values:
             raise AuditIntegrityError("audit buffer retained request names an absent block")
@@ -132,23 +138,60 @@ def _deduplicate_request(request: object, blocks: _RecorderBlocks) -> object:
         return request
     if set(request) != {"disposition", "canonical", "reasons"} or request["reasons"] or type(request["canonical"]) is not str:
         raise AuditIntegrityError("retained provider context lost its closed receipt shape")
-    context, error = parse_json_strict(request["canonical"])
+    key = RecorderRequestTextKey(request["canonical"], CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    memo = current_retention_stage_memo()
+    prepared = memo.recorder_request_text(key, _prepared_request_text) if memo is not None else _prepared_request_text(key)
+    return request if prepared is None else _transfer_prepared_request_text(prepared, blocks)
+
+
+def _prepared_request_text(key: RecorderRequestTextKey) -> RecorderRequestTextProof | None:
+    """Only immutable complete-text/ref/block encodings cross a stage memo."""
+    context, error = parse_json_strict(key.canonical)
     if (
         error is not None
         or type(context) is not dict
         or set(context) != _CONTEXT_KEYS
         or type(context["messages"]) is not list
-        or canonical_json(context) != request["canonical"]
+        or canonical_json(context) != key.canonical
     ):
         # Not the prepared capture document: retain its exact bytes unchanged.
-        return request
-    return {
+        return None
+    proven_blocks: dict[str, str] = {}
+
+    def block_key(value: object) -> str:
+        canonical = canonical_json(value)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        proven_blocks.setdefault(digest, canonical)
+        return digest
+
+    ref_document = {
         "disposition": "retained",
         "schema_version": context["schema_version"],
         "capture_boundary": context["capture_boundary"],
-        "messages": [blocks.store(message) for message in context["messages"]],
-        "tools": None if context["tools"] is None else blocks.store(context["tools"]),
+        "messages": [block_key(message) for message in context["messages"]],
+        "tools": None if context["tools"] is None else block_key(context["tools"]),
     }
+    return RecorderRequestTextProof(canonical_json(ref_document), tuple(proven_blocks.items()))
+
+
+def _transfer_prepared_request_text(proof: RecorderRequestTextProof, blocks: _RecorderBlocks) -> object:
+    """Rebuild fresh mutable values from a private producer's immutable proof."""
+    if type(proof) is not RecorderRequestTextProof:
+        raise AuditIntegrityError("recorder request lost its exact text proof")
+    stored, error = parse_json_strict(proof.ref_document_json)
+    if error is not None or type(stored) is not dict or set(stored) != _STORED_REQUEST_KEYS or type(stored["messages"]) is not list:
+        raise AuditIntegrityError("recorder request lost its prepared ref document")
+    expected = (*stored["messages"], *((stored["tools"],) if stored["tools"] is not None else ()))
+    if any(type(item) is not str for item in expected) or set(expected) != {key for key, _ in proof.blocks}:
+        raise AuditIntegrityError("recorder request lost its complete block references")
+    for key, canonical in proof.blocks:
+        if type(key) is not str or type(canonical) is not str or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != key:
+            raise AuditIntegrityError("recorder request block text differs from its content address")
+        value, error = parse_json_strict(canonical)
+        if error is not None:
+            raise AuditIntegrityError("recorder request block is not strict JSON")
+        blocks.store_proven_text(key, value)
+    return stored
 
 
 def _restore_request(stored: object, blocks: _RecorderBlocks) -> object:

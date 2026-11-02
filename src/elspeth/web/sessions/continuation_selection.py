@@ -74,7 +74,7 @@ def required_private_chunks(stack: ContinuationFrameStack) -> tuple[PrivateChunk
             refs.extend((frame.response, frame.accumulator))
         elif type(frame) is AdvisorFrame:
             if frame.review.codec != "composer.advisor.v1" or (
-                frame.response is not None and frame.response.codec != "composer.response.v1"
+                frame.response is not None and frame.response.codec not in ("composer.response.v1", "composer.semantic-no-sdk-refusal.v1")
             ):
                 raise AuditIntegrityError("Advisor frame changed its actual private source codecs")
             refs.append(frame.review)

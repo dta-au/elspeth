@@ -5,7 +5,7 @@ import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
-from elspeth.web import async_workers
+from elspeth.web import async_workers, credential_guard
 from elspeth.web.composer import continuation_codec as codec
 from elspeth.web.composer.continuation_codec import encode_private_chunk, verify_private_chunk
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
@@ -90,6 +90,89 @@ def test_private_chunk_admission_inspects_the_complete_tail_before_retention():
     unsafe = canonical_json({"prefix": "x" * 8192, "tail": {"api_key": "synthetic-literal-credential"}})
     with pytest.raises(CredentialMaterialRefused):
         encode_private_chunk(codec="composer.messages.v1", canonical=unsafe)
+
+
+def test_private_chunk_stage_reuses_text_bytes_but_rechecks_each_credential_policy(monkeypatch):
+    text = canonical_json({"text": "ordinary value"})
+    proof_calls: list[str] = []
+    credential_calls: list[frozenset[str]] = []
+    original_proof = codec._private_chunk_canonical_text_bytes
+    original_guard = credential_guard.require_no_credential_material
+
+    def counted_proof(key):
+        proof_calls.append(key.canonical)
+        return original_proof(key)
+
+    def counted_guard(value, *, surface, env_ref_names, max_string_bytes):
+        credential_calls.append(env_ref_names)
+        return original_guard(value, surface=surface, env_ref_names=env_ref_names, max_string_bytes=max_string_bytes)
+
+    monkeypatch.setattr(codec, "_private_chunk_canonical_text_bytes", counted_proof)
+    monkeypatch.setattr(credential_guard, "require_no_credential_material", counted_guard)
+    with retention_stage_memo_scope() as memo:
+        first = encode_private_chunk(codec="composer.messages.v1", canonical=text, env_ref_names=frozenset({"FIRST"}))
+        second = encode_private_chunk(codec="composer.messages.v1", canonical=text, env_ref_names=frozenset({"SECOND"}))
+        assert first == second and first is not second
+        assert proof_calls == [text]
+        assert credential_calls == [frozenset({"FIRST"}), frozenset({"SECOND"})]
+    assert memo.cached_entry_count == 0
+
+
+def test_private_chunk_stage_keeps_state_guard_outside_text_proof(monkeypatch):
+    state_text = canonical_json(_field_mapper_state().to_dict())
+    proof_calls: list[str] = []
+    guard_calls: list[str] = []
+    original_proof = codec._private_chunk_canonical_text_bytes
+    original_state_guard = credential_guard.require_no_credential_material_in_state
+
+    def counted_proof(key):
+        proof_calls.append(key.canonical)
+        return original_proof(key)
+
+    def counted_state_guard(state, *, surface, env_ref_names):
+        guard_calls.append(surface)
+        return original_state_guard(state, surface=surface, env_ref_names=env_ref_names)
+
+    monkeypatch.setattr(codec, "_private_chunk_canonical_text_bytes", counted_proof)
+    monkeypatch.setattr(credential_guard, "require_no_credential_material_in_state", counted_state_guard)
+    with retention_stage_memo_scope():
+        generic = encode_private_chunk(codec="composer.messages.v1", canonical=state_text)
+        first = encode_private_chunk(codec="composer.state.v1", canonical=state_text)
+        second = encode_private_chunk(codec="composer.state.v1", canonical=state_text)
+    assert generic.reference.codec == "composer.messages.v1"
+    assert first.reference.codec == second.reference.codec == "composer.state.v1"
+    assert proof_calls == [state_text]
+    assert guard_calls == ["composer_continuation_state", "composer_continuation_state"]
+
+
+@pytest.mark.parametrize("invalid", ['{"b":2,"a":1}', '{"a":1,"a":2}', "NaN", '{"a": 1}', '{"text":"' + chr(0xD800) + '"}'])
+def test_private_chunk_stage_safe_hit_cannot_admit_invalid_changed_text(invalid):
+    with retention_stage_memo_scope():
+        encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}')
+        with pytest.raises((AuditIntegrityError, UnicodeEncodeError)):
+            encode_private_chunk(codec="composer.messages.v1", canonical=invalid)
+
+
+def test_private_chunk_stage_rechecks_changed_bound_subclass_and_mutable_source(monkeypatch):
+    text = canonical_json({"text": "ordinary"})
+    original_bound = codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+
+    class ForeignText(str):
+        def encode(self, encoding="utf-8", errors="strict"):
+            raise AssertionError("foreign string must not use a cached proof")
+
+    source = {"text": "ordinary"}
+    with retention_stage_memo_scope():
+        encode_private_chunk(codec="composer.messages.v1", canonical=text)
+        with pytest.raises(AssertionError, match="foreign string"):
+            encode_private_chunk(codec="composer.messages.v1", canonical=ForeignText(text))
+        monkeypatch.setattr(codec, "CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES", len(text.encode("utf-8")) - 1)
+        with pytest.raises(AuditIntegrityError, match="complete JSON admission bound"):
+            encode_private_chunk(codec="composer.messages.v1", canonical=text)
+        monkeypatch.setattr(codec, "CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES", original_bound)
+        source["api_key"] = "synthetic-literal-credential"
+        with pytest.raises(CredentialMaterialRefused):
+            encode_private_chunk(codec="composer.messages.v1", canonical=canonical_json(source))
 
 
 def test_state_chunks_keep_field_mapper_labels_under_the_real_state_projection():

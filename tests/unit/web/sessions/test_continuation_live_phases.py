@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
-from elspeth.web.composer.continuation import ToolBatchFrame
+from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
 from elspeth.web.composer.continuation_clock import freeze_observation
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import (
@@ -23,21 +23,174 @@ from elspeth.web.composer.continuation_env_inventory import (
 from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases, _require_runtime_source_refresh
 from elspeth.web.composer.continuation_primary import run_continuation_primary
-from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
+from elspeth.web.composer.continuation_runtime import _CurrentPhaseRead, restore_continuation_runtime
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
+from elspeth.web.sessions import continuation_next_iteration as post_batch
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
+from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot
+from elspeth.web.sessions.continuation_end import primary_issued_no_tools
+from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application
+from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from tests.helpers.continuation_budgets import OWNER_LEASE_SECONDS
 from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import _assert_required_guard_admitted, initialized_primary_input, stored_rows
 
 operation_store = _operation_store
+
+
+def _observe_explicit_phase_handoff(monkeypatch, before_dispatch=None):
+    actual_dispatch = ComposerServiceImpl.advance_continuation_phase
+    actual_current = ContinuationLivePhases._current_phase_read
+    reads, handoffs = [], []
+
+    async def current(owner, selected):
+        phase_read = await actual_current(owner, selected)
+        reads.append(phase_read)
+        return phase_read
+
+    async def dispatch(service, **kwargs):
+        owner, selected = kwargs["owner"], kwargs["selected"]
+        frame = selected.stack.frames[-1]
+        if type(frame) is not ComposeFrame or frame.phase != "response_retained":
+            return await actual_dispatch(service, **kwargs)
+        phase_read = await owner._current_phase_read(selected)
+        handoffs.append(phase_read)
+        assert not await primary_issued_no_tools(owner, selected, phase_read=phase_read)
+
+        async def forward(facet=phase_read):
+            return await actual_dispatch(service, **{**kwargs, "phase_read": facet})
+
+        if before_dispatch is not None:
+            return await before_dispatch(owner, selected, phase_read, forward)
+        return await forward()
+
+    monkeypatch.setattr(ContinuationLivePhases, "_current_phase_read", current)
+    monkeypatch.setattr(ComposerServiceImpl, "advance_continuation_phase", dispatch)
+    return reads, handoffs
+
+
+@pytest.mark.asyncio
+async def test_paid_classifier_and_initializer_share_one_explicit_current_phase_source(operation_store, tmp_path, monkeypatch):
+    reads, handoffs = _observe_explicit_phase_handoff(monkeypatch)
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
+        assert len(handoffs) == 1 and len(sdk) == 1
+        handed = handoffs[0]
+        same_cut = [
+            phase
+            for phase in reads
+            if (phase.selected.checkpoint_id, phase.selected.stack.cursor) == (handed.selected.checkpoint_id, handed.selected.stack.cursor)
+        ]
+        assert same_cut == [handed]
+        assert handed.lease is owner.lease and not owner.lease.closed
+        assert type(owner.runtime.source.selected.stack.frames[-1]) is ToolBatchFrame
+    owner.work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_explicit_phase_handoff_refuses_substituted_selected_runtime_or_lease_before_effects(operation_store, tmp_path, monkeypatch):
+    async def check(owner, selected, phase_read, forward):
+        assert owner._require_phase_read(selected, phase_read) is phase_read
+        before = stored_rows(operation_store[0])
+        for altered in (
+            replace(phase_read, selected=replace(selected)),
+            replace(phase_read, runtime=replace(phase_read.runtime)),
+            replace(phase_read, lease=None),
+        ):
+            with pytest.raises(AuditIntegrityError, match="handoff"):
+                await forward(altered)
+            assert stored_rows(operation_store[0]) == before
+        await forward()
+
+    _observe_explicit_phase_handoff(monkeypatch, check)
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
+        assert len(sdk) == 1 and type(owner.runtime.source.selected.stack.frames[-1]) is ToolBatchFrame
+    owner.work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("stop", "cas"))
+async def test_explicit_phase_handoff_keeps_fresh_stop_and_cas_effect_admission(operation_store, tmp_path, monkeypatch, change):
+    after_change = []
+
+    async def change_source(owner, selected, phase_read, forward):
+        running = phase_read.inventory.running
+        if change == "stop":
+            stopped = owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
+            assert stopped.cancel_requested_at is not None
+        else:
+            with locked_session_transaction(operation_store[0], str(running.claim.session_id)) as conn:
+                append_complete_snapshot(
+                    conn,
+                    session_id=str(running.claim.session_id),
+                    operation_id=running.claim.operation_id,
+                    expected_checkpoint_id=selected.checkpoint_id,
+                    expected_cursor=selected.stack.cursor,
+                    snapshot_json=encode_continuation_snapshot(selected.stack),
+                    event_batch=(ContinuationEvent("checkpoint", '{"test_scope":"after classifier before initializer"}'),),
+                    handoff=False,
+                )
+        after_change.append(stored_rows(operation_store[0]))
+        await forward()
+
+    _reads, handoffs = _observe_explicit_phase_handoff(monkeypatch, change_source)
+    expected = ComposerOperationCancelledDuringTurn if change == "stop" else AuditIntegrityError
+    with pytest.raises(expected):
+        async with _phase_case(operation_store, tmp_path, monkeypatch):
+            raise AssertionError("stale phase handoff created a batch effect")
+    assert len(handoffs) == len(after_change) == 1
+    assert stored_rows(operation_store[0]) == after_change[0]
+    with operation_store[0].connect() as conn:
+        observed = conn.execute(select(effects.c.effect_key, effects.c.disposition)).all()
+    assert len(observed) == 1 and observed[0].effect_key.startswith("provider:") and observed[0].disposition == "committed"
+    handoffs[0].runtime.bindings.required_work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_post_batch_transition_returns_its_one_actual_current_phase_read(operation_store, tmp_path, monkeypatch):
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, primary, sdk):
+        # Execute the actual provider-authored calls and their P4 publication
+        # through the existing live owner before entering the post-batch cut.
+        for _ in range(len(primary.outcome.completion.tool_batch.calls) + 1):
+            await _advance(owner)
+        # P4 owns its actual committing return; the worker ordinarily selects
+        # that new SQL head on its next loop. The warm runtime still points to
+        # the pre-publication cut until that real selection is joined.
+        assert owner.p4 is not None and type(owner.p4.application) is StoredP4Application
+        selected = await load_selected_continuation(
+            authority=owner.authority,
+            running=owner.work.running,
+            selected=owner.p4.application.snapshot,
+            required_work=owner.work,
+        )
+        await owner.current(selected)
+        assert post_batch.is_applied_batch_cut(selected)
+        assert owner.finished_batch is not None
+        actual_read = ContinuationLivePhases._current_phase_read
+        reads = []
+
+        async def read(phases, following):
+            value = await actual_read(phases, following)
+            reads.append(value)
+            return value
+
+        monkeypatch.setattr(ContinuationLivePhases, "_current_phase_read", read)
+        phase_read = await post_batch._retain(owner, selected, "iteration_review_dispatched")
+        assert type(phase_read) is _CurrentPhaseRead and reads == [phase_read]
+        assert phase_read.selected.checkpoint_id != selected.checkpoint_id
+        assert phase_read.selected.stack.cursor == selected.stack.cursor + 1
+        assert phase_read.runtime is owner.runtime and phase_read.runtime.source.selected is phase_read.selected
+        assert phase_read.inventory is owner.runtime.materialization.inventory and phase_read.lease is owner.lease
+        assert owner._require_phase_read(phase_read.selected, phase_read) is phase_read
+        assert len(sdk) == 1
+    owner.work.coordinator.assert_completed()
 
 
 @asynccontextmanager

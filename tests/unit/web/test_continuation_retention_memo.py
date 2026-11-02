@@ -22,11 +22,15 @@ from elspeth.web.composer.continuation_codec import (
     encode_continuation_snapshot,
     encode_private_chunk,
 )
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.continuation_retention_memo import (
+    CanonicalTextEncodingKey,
     CredentialInputToken,
     CredentialPolicyKey,
     CredentialScanKey,
     PrivateChunkVerificationKey,
+    RecorderRequestTextKey,
+    RecorderRequestTextProof,
     RetentionStageMemo,
     SnapshotDecodeKey,
     StateCredentialStepKey,
@@ -66,6 +70,150 @@ def _scan(key: CredentialScanKey) -> CredentialMaterialFinding | None:
             max_string_bytes=policy.max_string_bytes,
         ),
     )
+
+
+def test_canonical_text_proof_is_one_entry_exact_producer_and_stage_bounded() -> None:
+    calls: list[tuple[str, int]] = []
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls.append((key.canonical, key.max_utf8_bytes))
+        return key.canonical.encode("utf-8")
+
+    def other_encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls.append(("other:" + key.canonical, key.max_utf8_bytes))
+        return key.canonical.encode("utf-8")
+
+    first = CanonicalTextEncodingKey('{"text":"first"}', 1_048_576)
+    second = CanonicalTextEncodingKey('{"text":"other"}', 1_048_576)
+    changed_bound = CanonicalTextEncodingKey(first.canonical, 1_048_575)
+    with retention_stage_memo_scope() as memo:
+        assert memo.canonical_text_encoding(first, encode) == first.canonical.encode()
+        assert memo.canonical_text_encoding(first, encode) == first.canonical.encode()
+        assert calls == [(first.canonical, first.max_utf8_bytes)]
+        assert memo.cached_entry_count == 1
+        assert memo.canonical_text_encoding(changed_bound, encode) == first.canonical.encode()
+        assert memo.canonical_text_encoding(first, other_encode) == first.canonical.encode()
+        assert memo.canonical_text_encoding(second, encode) == second.canonical.encode()
+        assert memo.cached_entry_count == 1
+        assert memo.canonical_text_encoding(first, encode) == first.canonical.encode()
+        assert calls == [
+            (first.canonical, first.max_utf8_bytes),
+            (first.canonical, changed_bound.max_utf8_bytes),
+            ("other:" + first.canonical, first.max_utf8_bytes),
+            (second.canonical, second.max_utf8_bytes),
+            (first.canonical, first.max_utf8_bytes),
+        ]
+    assert memo.cached_entry_count == 0 and not memo.active
+    memo.canonical_text_encoding(first, encode)
+    assert memo.cached_entry_count == 0
+
+
+def test_canonical_text_proof_does_not_cache_failed_or_foreign_producers() -> None:
+    memo = RetentionStageMemo()
+    key = CanonicalTextEncodingKey('{"safe":true}', 1_048_576)
+
+    def fails(_key: CanonicalTextEncodingKey) -> bytes:
+        raise ValueError("original failure")
+
+    def foreign(_key: CanonicalTextEncodingKey) -> str:
+        return "not bytes"
+
+    with pytest.raises(ValueError, match="original failure"):
+        memo.canonical_text_encoding(key, fails)
+    with pytest.raises(TypeError, match="immutable bytes"):
+        memo.canonical_text_encoding(key, foreign)
+    assert memo.cached_entry_count == 0
+    memo.close()
+
+
+def test_canonical_text_proof_never_retains_more_than_existing_private_document_bound() -> None:
+    memo = RetentionStageMemo()
+    oversized = CanonicalTextEncodingKey(
+        "x" * (CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES + 1), CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES + 1
+    )
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        return key.canonical.encode("utf-8")
+
+    assert len(memo.canonical_text_encoding(oversized, encode)) == CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES + 1
+    assert memo.cached_entry_count == 0
+    memo.close()
+
+
+def test_recorder_request_proof_counts_complete_aggregate_and_one_entry() -> None:
+    calls: list[str] = []
+
+    def produce(key: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        calls.append(key.canonical)
+        return RecorderRequestTextProof('{"messages":[]}', (("a" * 64, "block-one"), ("b" * 64, "block-two")))
+
+    key_text = "request"
+    proof = produce(RecorderRequestTextKey(key_text, 1_048_576))
+    calls.clear()
+    exact = (
+        len(key_text.encode())
+        + len(proof.ref_document_json.encode())
+        + sum(len(digest.encode()) + len(text.encode()) for digest, text in proof.blocks)
+    )
+    with retention_stage_memo_scope() as memo:
+        key = RecorderRequestTextKey(key_text, exact)
+        assert memo.recorder_request_text(key, produce) == proof
+        assert memo.recorder_request_text(key, produce) == proof
+        assert calls == [key_text] and memo.cached_entry_count == 1
+        short = RecorderRequestTextKey(key_text, exact - 1)
+        assert memo.recorder_request_text(short, produce) == proof
+        assert memo.cached_entry_count == 1
+        assert memo.recorder_request_text(key, produce) == proof
+        assert calls == [key_text, key_text]
+    assert memo.cached_entry_count == 0
+
+
+def test_recorder_request_proof_fallback_producer_identity_nested_scope_and_close() -> None:
+    calls: list[str] = []
+    key = RecorderRequestTextKey("prepared", 1_048_576)
+
+    def produce(actual: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        calls.append(actual.canonical)
+        return RecorderRequestTextProof("{}", ())
+
+    def other_produce(actual: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        calls.append("other:" + actual.canonical)
+        return RecorderRequestTextProof("{}", ())
+
+    def fallback(_actual: RecorderRequestTextKey) -> None:
+        return None
+
+    with retention_stage_memo_scope() as outer:
+        assert outer.recorder_request_text(key, produce) == RecorderRequestTextProof("{}", ())
+        assert outer.recorder_request_text(key, fallback) is None
+        assert outer.recorder_request_text(key, other_produce) == RecorderRequestTextProof("{}", ())
+        assert outer.cached_entry_count == 1
+        with retention_stage_memo_scope() as inner:
+            assert inner.recorder_request_text(key, produce) == RecorderRequestTextProof("{}", ())
+            assert inner is not outer and inner.cached_entry_count == 1
+        assert outer.recorder_request_text(key, other_produce) == RecorderRequestTextProof("{}", ())
+        assert calls == ["prepared", "other:prepared", "prepared"]
+    assert outer.cached_entry_count == 0 and inner.cached_entry_count == 0
+
+
+def test_recorder_request_proof_close_during_miss_cannot_publish() -> None:
+    memo = RetentionStageMemo()
+    entered = threading.Event()
+    release = threading.Event()
+    key = RecorderRequestTextKey("prepared", 1_048_576)
+
+    def produce(_actual: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        entered.set()
+        assert release.wait(timeout=5)
+        return RecorderRequestTextProof("{}", ())
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(memo.recorder_request_text, key, produce)
+        assert entered.wait(timeout=5)
+        memo.close()
+        release.set()
+        assert future.result(timeout=5) == RecorderRequestTextProof("{}", ())
+    assert memo.cached_entry_count == 0 and not memo.active
 
 
 def test_closed_families_keep_none_and_exact_inputs_separate() -> None:

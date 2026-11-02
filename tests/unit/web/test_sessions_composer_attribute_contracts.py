@@ -6,15 +6,26 @@ import ast
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer import discovery_cache, llm_response_parsing
 from elspeth.web.composer.implicit_decisions import _is_auto_wired_control
 from elspeth.web.composer.state import NodeSpec
 from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
-from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED, ComposerOperationCancelReason
-from elspeth.web.sessions.composer_turn import _composer_operation_cancel_of
+from elspeth.web.required_work import (
+    ComposerFailureReceipt,
+    OwnedCompletionWitness,
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkSource,
+    make_required_work_key,
+    reduce_composer_failures,
+    required_failure_leaves,
+)
+from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED
 from tests.helpers.tree_gate import iter_gate_sources
 
 
@@ -161,11 +172,23 @@ def test_auto_wired_disclosure_rejects_malformed_owned_requirements() -> None:
         _is_auto_wired_control(node)
 
 
-def test_worker_marker_requires_the_owned_nominal_cancel_type() -> None:
+def test_required_work_cancel_marker_requires_the_owned_nominal_type() -> None:
     class MasqueradingMessage:
         def __eq__(self, _other: object) -> bool:
             return True
 
-    assert _composer_operation_cancel_of(asyncio.CancelledError(MasqueradingMessage())) is None
-    actual = _composer_operation_cancel_of(asyncio.CancelledError(COMPOSER_CANCEL_REQUESTED))
-    assert actual is COMPOSER_CANCEL_REQUESTED and actual.reason is ComposerOperationCancelReason.CANCEL_REQUESTED
+    context = SessionOperationContext(SessionOperationFence(str(uuid4()), str(uuid4()), "private-token", 1), SessionOperationKind.COMPOSE)
+    authority = RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    masquerader = asyncio.CancelledError(MasqueradingMessage())
+    actual = asyncio.CancelledError(COMPOSER_CANCEL_REQUESTED)
+
+    def receipt(error: asyncio.CancelledError, *, recurrence_ordinal: int) -> ComposerFailureReceipt:
+        key = make_required_work_key(authority, RequiredWorkSource.LOCAL_CANCELLATION_SIGNAL, recurrence_ordinal=recurrence_ordinal)
+        return ComposerFailureReceipt(key, error, required_failure_leaves(error), OwnedCompletionWitness(key))
+
+    fake_first = receipt(masquerader, recurrence_ordinal=0)
+    actual_second = receipt(actual, recurrence_ordinal=1)
+    reduced = reduce_composer_failures((fake_first, actual_second))
+    assert reduced.winner is actual_second and reduced.winner.original_root is actual
+    assert reduced.category_rank == 60
+    assert reduced.original_roots == (masquerader, actual)

@@ -26,7 +26,6 @@ from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf, encode_message_shelf
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerMutationAuthorityRevoked
-from elspeth.web.sessions.composer_operation_versions import COMPOSER_OPERATION_VERSION_HEADER
 from elspeth.web.sessions.models import (
     blob_deletion_cleanups_table,
     blob_replacement_cleanups_table,
@@ -41,7 +40,8 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.advisor_review import parse_advisor_publication_review
-from tests.helpers.composer_operations import message_body, running_operation_sync, settle_sync, submit_and_settle
+from tests.helpers.composer_operations import message_body, running_operation_async, running_operation_sync, settle_sync
+from tests.helpers.continuation_app import continuation_app
 from tests.integration.web.composer.test_freeform_pipeline_planner import _pipeline
 from tests.integration.web.composer.test_freeform_planner_failure_translation import (
     _build_app,
@@ -56,6 +56,14 @@ from tests.integration.web.composer.test_freeform_planner_failure_translation im
 
 
 def _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count, mixed_order=None, downgrade=False, late_p4=False):
+    async def run():
+        async with continuation_app(tmp_path, monkeypatch) as harness, harness.client() as client:
+            await _exercise_request_live(tmp_path, monkeypatch, harness, client, upgrade, mutation_count, mixed_order, downgrade, late_p4)
+
+    asyncio.run(run())
+
+
+async def _exercise_request_live(tmp_path, monkeypatch, harness, client, upgrade, mutation_count, mixed_order, downgrade, late_p4):
     """Exercise initial and current authority through the actual held SDK call."""
     holder: dict[str, str] = {}
     authored = _valid_pipeline_completion(tmp_path, holder)
@@ -93,17 +101,33 @@ def _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count, mixed_orde
                 by_name = {"set_pipeline": calls[0], "list_sources": _ToolCall("a1-discovery", _Function("list_sources", "{}"))}
                 response.choices[0].message.tool_calls = [by_name[name] for name in mixed_order]
             response.id = "a1-primary-mutations"
+            response.model = kwargs["model"]
             return response
         if mixed_order and primaries == 2:
             return _Response(
                 [_Choice(_Message(None, [_ToolCall("a1-second-batch", _Function("get_pipeline_state", "{}"))]))],
                 usage,
+                model=kwargs["model"],
                 id="a1-primary-inspect",
             )
         assert primaries == (3 if mixed_order else 2)
-        return _Response([_Choice(_Message("The requested pipeline update is ready for review."))], usage, id="a1-primary-reply")
+        return _Response(
+            [_Choice(_Message("The requested pipeline update is ready for review."))], usage, model=kwargs["model"], id="a1-primary-reply"
+        )
 
-    client, engine, _sessions = _build_app(tmp_path, monkeypatch, sdk)
+    monkeypatch.setattr(litellm, "acompletion", sdk)
+    engine = harness.app.state.session_engine
+    _sessions = harness.app.state.session_service
+    owner_failures: list[BaseException] = []
+    worker = harness.app.state.composer_async_worker
+    job_finished = worker._job_finished
+
+    def capture_job_failure(key, task):
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            owner_failures.append(failure)
+        job_finished(key, task)
+
+    monkeypatch.setattr(worker, "_job_finished", capture_job_failure)
     actual_p4 = _sessions.persist_compose_turn_async
 
     async def held_p4(**kwargs):
@@ -114,17 +138,15 @@ def _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count, mixed_orde
         return await actual_p4(**kwargs)
 
     monkeypatch.setattr(_sessions, "persist_compose_turn_async", held_p4)
-    observed = _observe_authority(monkeypatch, client.app.state.composer_service) if mixed_order else None
-    created = client.post("/api/sessions", json={"title": "A1 initial authority witness"})
-    assert created.status_code == 201, created.text
-    holder["id"] = created.json()["id"]
+    observed = _observe_authority(monkeypatch, harness.app.state.composer_service) if mixed_order else None
+    holder["id"] = str(harness.session_id)
     session_id = holder["id"]
     preferences_path = f"/api/sessions/{session_id}/composer/preferences"
-    prefs = client.get(preferences_path)
+    prefs = await client.get(preferences_path)
     assert prefs.status_code == 200, prefs.text
     density = prefs.json()["density_default"]
     initial_mode = "auto_commit" if mixed_order or downgrade or late_p4 else "explicit_approve"
-    initial = client.patch(preferences_path, json={"trust_mode": initial_mode, "density_default": density})
+    initial = await client.patch(preferences_path, json={"trust_mode": initial_mode, "density_default": density})
     assert initial.status_code == 200, initial.text
     assert initial.json()["trust_mode"] == initial_mode
     source_dir = tmp_path / "blobs" / session_id
@@ -134,7 +156,18 @@ def _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count, mixed_orde
 
     async def observe(http, operation):
         try:
-            await asyncio.wait_for(entered.wait(), timeout=10)
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=10)
+            except TimeoutError as error:
+                if owner_failures:
+
+                    def leaves(failure: BaseException) -> list[str]:
+                        if isinstance(failure, BaseExceptionGroup):
+                            return [leaf for child in failure.exceptions for leaf in leaves(child)]
+                        return [f"{type(failure).__name__}: {str(failure).splitlines()[0]}"]
+
+                    raise AssertionError(f"Current worker failed before first PRIMARY: {leaves(owner_failures[0])}") from error
+                raise
             held = await http.get(preferences_path)
             assert held.status_code == 200 and held.json()["trust_mode"] == initial_mode, held.text
             if upgrade or downgrade:
@@ -157,13 +190,13 @@ def _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count, mixed_orde
             release.set()
             p4_release.set()
 
-    terminal = running_operation_sync(
+    async with running_operation_async(
         client,
-        client.app,
+        harness.app,
         path=f"/api/sessions/{session_id}/messages",
         body=message_body("Build a CSV to JSON pipeline from input.csv.", state_id=None),
-        observe=observe,
-    )
+    ) as operation:
+        terminal = await observe(client, operation)
     with engine.connect() as conn:
         states = list(conn.execute(select(composition_states_table)).mappings())
         proposals = list(conn.execute(select(composition_proposals_table)).mappings())
@@ -198,15 +231,15 @@ def _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count, mixed_orde
         assert ceiling.request_id == evidence.request_id == users[0]["id"]
         assert ceiling.session_id == session_id
         assert len(observed["loop"]) == 1 and len(observed["p4"]) == 2
-        assert all(item is ceiling for item in observed["p4"])
+        assert all(item == ceiling for item in observed["p4"])
         assert observed["candidate"] == [ceiling]
         names = [name for name, _ in observed["worker"]]
         assert names == [*mixed_order, "get_pipeline_state"]
         for (name, selected), context in zip(observed["worker"], observed["contexts"], strict=True):
             expected = ceiling if name == "set_pipeline" else None
-            assert selected is expected
-            assert context.mutation_ceiling is expected
-        assert all(item is ceiling for item in observed["batches"])
+            assert selected == expected
+            assert context.mutation_ceiling == expected
+        assert all(item == ceiling for item in observed["batches"])
         assert len(observed["batches"]) == 2
     elif late_p4:
         assert p4_entered.is_set(), "the real P4 candidate boundary must be reached"
@@ -228,21 +261,20 @@ def _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count, mixed_orde
 
 
 def _observe_authority(monkeypatch, composer):
-    from elspeth.web.composer import tool_batch, turn_audit
+    from elspeth.web.composer import tool_batch
     from elspeth.web.composer.tools import _dispatch
 
     observed = {name: [] for name in ("loop", "batches", "candidate", "worker", "contexts", "p4")}
-    actual_loop, actual_batch = composer._compose_loop, composer._dispatch_tool_batch
+    actual_initialize = tool_batch._initialize_continuation_batch_live
     actual_candidate, actual_worker = tool_batch._finalize_complete_set_pipeline_candidate, tool_batch.execute_tool
-    actual_context, actual_p4 = _dispatch.ToolContext, turn_audit.persist_turn_audit
+    actual_context, actual_p4 = _dispatch.ToolContext, composer._persist_turn_audit
 
-    async def loop(*args, **kwargs):
-        observed["loop"].append((kwargs["mutation_ceiling"], kwargs["turn_evidence"]))
-        return await actual_loop(*args, **kwargs)
-
-    async def batch(**kwargs):
-        observed["batches"].append(kwargs["mutation_ceiling"])
-        return await actual_batch(**kwargs)
+    async def initialize(**kwargs):
+        context = kwargs["ctx"]
+        if not observed["loop"]:
+            observed["loop"].append((context.mutation_ceiling, context.turn_evidence))
+        observed["batches"].append(context.mutation_ceiling)
+        return await actual_initialize(**kwargs)
 
     async def candidate(arguments, state, context, **kwargs):
         observed["candidate"].append(context.mutation_ceiling)
@@ -261,12 +293,11 @@ def _observe_authority(monkeypatch, composer):
         observed["p4"].append(kwargs["mutation_ceiling"])
         return await actual_p4(**kwargs)
 
-    monkeypatch.setattr(composer, "_compose_loop", loop)
-    monkeypatch.setattr(composer, "_dispatch_tool_batch", batch)
+    monkeypatch.setattr(tool_batch, "_initialize_continuation_batch_live", initialize)
     monkeypatch.setattr(tool_batch, "_finalize_complete_set_pipeline_candidate", candidate)
     monkeypatch.setattr(tool_batch, "execute_tool", worker)
     monkeypatch.setattr(_dispatch, "ToolContext", context)
-    monkeypatch.setattr(turn_audit, "persist_turn_audit", p4)
+    monkeypatch.setattr(composer, "_persist_turn_audit", p4)
     return observed
 
 
@@ -332,7 +363,6 @@ def run_authority_case(
     cap_errors=None,
     create_ack_loss=False,
     rootless_mixed=False,
-    explicit_v1=False,
     observed=None,
 ):
     entered, release = threading.Event(), threading.Event()
@@ -589,17 +619,17 @@ def run_authority_case(
         return value
 
     monkeypatch.setattr(repository, "mutate", lose_committed_create_ack)
-    original_compose = composer.compose
+    original_cap = composer._enforce_tool_call_cap
 
-    async def observe_compose(*args, **kwargs):
+    def observe_cap(**kwargs):
         try:
-            return await original_compose(*args, **kwargs)
+            return original_cap(**kwargs)
         except ComposerConvergenceError as error:
             if cap_errors is not None:
                 cap_errors.append(error)
             raise
 
-    monkeypatch.setattr(composer, "compose", observe_compose)
+    monkeypatch.setattr(composer, "_enforce_tool_call_cap", observe_cap)
     original_module_p4 = composer._persist_turn_audit
 
     async def observe_module_p4(**kwargs):
@@ -612,15 +642,9 @@ def run_authority_case(
 
     monkeypatch.setattr(composer, "_persist_turn_audit", observe_module_p4)
 
-    async def settle_explicit_v1(http):
-        http.headers[COMPOSER_OPERATION_VERSION_HEADER] = "1"
-        return await submit_and_settle(http, client.app, path=path, body=body)
-
     with ThreadPoolExecutor(max_workers=2) as executor:
-        if explicit_v1:
-            pending = executor.submit(client.run_in_one_loop, settle_explicit_v1)
-        else:
-            pending = executor.submit(settle_sync, client, client.app, path=path, body=body)
+        # The version-1 header arm is retired; the sole current operation route owns this request.
+        pending = executor.submit(settle_sync, client, client.app, path=path, body=body)
         try:
             assert entered.wait(15), "Actual selected owner was never reached"
             if barrier == "p4_locked":
@@ -651,11 +675,7 @@ def run_authority_case(
             .mappings()
             .one()
         )
-        if explicit_v1:
-            assert settled.accepted.request.headers[COMPOSER_OPERATION_VERSION_HEADER] == "1"
-            assert settled.accepted.headers[COMPOSER_OPERATION_VERSION_HEADER] == "1"
-            assert operation["operation_id"] == body["operation_id"]
-            assert operation["lifecycle_version"] == 1
+        assert operation["operation_id"] == body["operation_id"]
         blobs = conn.execute(select(blobs_table).where(blobs_table.c.session_id == sid)).mappings().all()
         rejections = conn.execute(
             select(composition_rejection_events_table).where(composition_rejection_events_table.c.session_id == sid)
@@ -803,7 +823,7 @@ def _assert_revoked_graph_replays_as_refusal(event):
 def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monkeypatch):
     observed = {}
     settled, states, proposals, chat, phases, primary, physical = run_authority_case(
-        tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4", explicit_v1=True, observed=observed
+        tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4", observed=observed
     )
     assert states == [] and proposals == []
     status, body = settled.error()
@@ -1233,8 +1253,10 @@ def test_sticky_refusal_selects_entire_mixed_cohort_and_preserves_prior_checkpoi
     (tmp_path / "outputs" / sid).mkdir(parents=True, exist_ok=True)
     preference_path = f"/api/sessions/{sid}/composer/preferences"
     assert client.patch(preference_path, json={"trust_mode": "auto_commit", "density_default": "high"}).status_code == 200
-    actual_execute, actual_batch = tool_batch_module.execute_tool, composer._dispatch_tool_batch
-    actual_p4, actual_compose = sessions.persist_compose_turn_async, composer.compose
+    from elspeth.web.sessions import continuation_driver
+
+    actual_execute, actual_batch = tool_batch_module.execute_tool, tool_batch_module._initialize_continuation_batch_live
+    actual_p4, actual_iteration = sessions.persist_compose_turn_async, continuation_driver.advance_continuation_iteration
     actual_module_p4 = composer._persist_turn_audit
     actual_checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
 
@@ -1254,22 +1276,22 @@ def test_sticky_refusal_selects_entire_mixed_cohort_and_preserves_prior_checkpoi
         return result
 
     async def batch(**kwargs):
-        batches.append((kwargs["state"], kwargs["mutation_ceiling"]))
+        batches.append((kwargs["acc"].state, kwargs["ctx"].mutation_ceiling))
         return await actual_batch(**kwargs)
 
     async def p4(**kwargs):
         p4_inputs.append(kwargs)
         if len(p4_inputs) == 2:
-            assert kwargs["authority_revocation"] is refusals[0]
+            assert kwargs["authority_revocation"] == refusals[0]
             p4_entered.set()
             await asyncio.wait_for(p4_release.wait(), 15)
         result = await actual_p4(**kwargs)
         p4_outcomes.append(result)
         return result
 
-    async def compose(*args, **kwargs):
+    async def iteration(*args, **kwargs):
         try:
-            return await actual_compose(*args, **kwargs)
+            return await actual_iteration(*args, **kwargs)
         except ComposerMutationAuthorityRevoked as error:
             public_errors.append(error)
             raise
@@ -1284,9 +1306,9 @@ def test_sticky_refusal_selects_entire_mixed_cohort_and_preserves_prior_checkpoi
         return await actual_checkpoint(**kwargs)
 
     monkeypatch.setattr(tool_batch_module, "execute_tool", execute)
-    monkeypatch.setattr(composer, "_dispatch_tool_batch", batch)
+    monkeypatch.setattr(tool_batch_module, "_initialize_continuation_batch_live", batch)
     monkeypatch.setattr(sessions, "persist_compose_turn_async", p4)
-    monkeypatch.setattr(composer, "compose", compose)
+    monkeypatch.setattr(continuation_driver, "advance_continuation_iteration", iteration)
     monkeypatch.setattr(composer, "_persist_turn_audit", module_p4)
     monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", checkpoint)
     prefix = []
@@ -1368,19 +1390,19 @@ def test_sticky_refusal_selects_entire_mixed_cohort_and_preserves_prior_checkpoi
     assert all(call["provider_cost"] == 0.01 and call["prompt_tokens"] == 10 and call["completion_tokens"] == 5 for call in calls)
     assert len(batches) == len(p4_inputs) == len(p4_outcomes) == 2
     ceiling = batches[0][1]
-    assert batches[1][1] is ceiling and refusals[0].ceiling is ceiling
-    assert p4_outcomes[1].authority_revocation is refusals[0]
-    assert public_errors[0].revocation is refusals[0] and public_errors[0].partial_state is batches[1][0]
+    assert batches[1][1] == ceiling and refusals[0].ceiling == ceiling
+    assert p4_outcomes[1].authority_revocation == refusals[0]
+    assert public_errors[0].revocation == refusals[0] and public_errors[0].partial_state == batches[1][0]
     assert p4_outcomes[1].current_state_id == prefix[0]["id"] and p4_outcomes[1].checkpoint_disposition == "no_new_checkpoint"
     assert p4_outcomes[1].published_assistant_content == ""
     assert module_outcomes[1].audit_outcome is p4_outcomes[1]
     assert module_outcomes[1].redacted_tool_rows is p4_outcomes[1].published_tool_rows
     assert module_outcomes[1].persisted_assistant_content == p4_outcomes[1].published_assistant_content
-    assert module_outcomes[1].authority_revocation is refusals[0]
+    assert module_outcomes[1].authority_revocation == refusals[0]
     assert module_outcomes[1].persisted_assistant_matches_current_dispatch is False
     expected_tools = ["create_blob", "set_pipeline", "set_metadata", "create_blob", "set_metadata", "update_blob"]
     assert [name for name, _ in executed] == expected_tools
-    assert all(selected is (None if name == "create_blob" else ceiling) for name, selected in executed)
+    assert all(selected == (None if name == "create_blob" else ceiling) for name, selected in executed)
     tools = [row for row in chat if row["role"] == "tool"]
     assert len(tools) == 6 and "sticky-never-dispatch" not in {row["tool_call_id"] for row in tools}
     inputs = p4_inputs[1]

@@ -26,6 +26,7 @@ from uuid import UUID
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+    from elspeth.web.composer.continuation_runtime import _CurrentPhaseRead
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
@@ -1677,6 +1678,7 @@ class ComposerServiceImpl:
         selected: SelectedContinuationState,
         work: RequiredWorkBinding,
         provider_owner: ProviderInvocationOwner,
+        phase_read: _CurrentPhaseRead | None = None,
     ) -> None:
         """Enter the retained phase owner without re-entering legacy PRIMARY."""
         from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
@@ -1689,7 +1691,10 @@ class ComposerServiceImpl:
             or owner.provider_owner is not provider_owner
         ):
             raise AuditIntegrityError("continuation service dispatch changed its actual live owners")
-        await owner.advance(selected)
+        if phase_read is None:
+            await owner.advance(selected)
+        else:
+            await owner.advance(selected, phase_read=phase_read)
 
     def _new_primary_custody(self, provider_owner: ProviderInvocationOwner | None) -> ProviderCallCustody | None:
         if provider_owner is None:

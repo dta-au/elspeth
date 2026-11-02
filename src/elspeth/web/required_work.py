@@ -29,7 +29,9 @@ from elspeth.web.sessions.pipeline_publication import (
 from elspeth.web.sessions.pipeline_rejection import PipelineRejectionSQLResult
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.tools._common import ToolResult
     from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRunning
+    from elspeth.web.sessions.continuation_owner_results import ContinuationReadOwnerResult
     from elspeth.web.sessions.manual_proposal_failure import ComposerManualProposalFailure, _ClosedInvocation
     from elspeth.web.sessions.pipeline_revocation import ComposerRevocationSQLResult
     from elspeth.web.sessions.protocol import CompositionProposalRecord
@@ -41,6 +43,37 @@ class RequiredAuthorityKind(Enum):
     DURABLE_COMPOSE = "durable_compose"
     MANUAL_PROPOSAL = "manual_proposal"
     SYNCHRONOUS_COMPOSE = "synchronous_compose"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RequiredReadProduced:
+    """The real read return and its complete retained DATA; not SQL authority."""
+
+    result: ToolResult
+    owned_result: ContinuationReadOwnerResult
+    env_ref_names: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        from elspeth.contracts.hashing import canonical_json
+        from elspeth.web.composer.continuation_tool_batch import encode_tool_result_value
+        from elspeth.web.composer.tools._common import ToolResult
+        from elspeth.web.sessions.continuation_owner_results import ContinuationReadOwnerResult, re_admit_read_owner_result
+
+        if (
+            type(self.result) is not ToolResult
+            or type(self.owned_result) is not ContinuationReadOwnerResult
+            or type(self.env_ref_names) is not frozenset
+            or any(type(name) is not str for name in self.env_ref_names)
+        ):
+            raise AuditIntegrityError("Read disposition requires the actual nominal result and retained DATA")
+        re_admit_read_owner_result(self.owned_result, env_ref_names=self.env_ref_names)
+        actual = encode_tool_result_value(self.owned_result.tool_name, self.result, env_ref_names=self.env_ref_names)
+        if canonical_json(actual.model_dump(mode="json")) != self.owned_result.tool_result_json:
+            raise AuditIntegrityError("Read disposition replaced the actual returned ToolResult")
 
 
 class ComposerRequiredStage(IntEnum):
@@ -137,10 +170,20 @@ class RequiredWorkSource(IntEnum):
     CONTINUATION_DISPOSITION_READ_PROJECTION = 61
     CONTINUATION_HANDOFF_READBACK_SQL = 62
     CONTINUATION_HANDOFF_READBACK_PROJECTION = 63
+    CONTINUATION_READ_RESULT_SQL = 64
+    CONTINUATION_READ_RESULT_PROJECTION = 65
 
 
 SOURCE_MAPPING = MappingProxyType(
     {
+        RequiredWorkSource.CONTINUATION_READ_RESULT_SQL: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.SQL_INITIAL,
+        ),
+        RequiredWorkSource.CONTINUATION_READ_RESULT_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
         RequiredWorkSource.PROPOSAL_CREATION_SQL: (ComposerRequiredStage.CREATION_BINDING, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.PROPOSAL_CREATION_PROJECTION: (ComposerRequiredStage.CREATION_BINDING, RequiredWorkSubphase.PROJECTION),
         RequiredWorkSource.PREPARATION_READ_SQL: (ComposerRequiredStage.PREPARATION_READ, RequiredWorkSubphase.SQL_INITIAL),
@@ -1150,6 +1193,7 @@ class RequiredWorkCoordinator:
     ) -> None:
         if type(expected_source) is not RequiredWorkSource or expected_source not in (
             RequiredWorkSource.CONTINUATION_STATE_SQL,
+            RequiredWorkSource.CONTINUATION_READ_RESULT_SQL,
             RequiredWorkSource.CONTINUATION_READ_SQL,
             RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
             RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,

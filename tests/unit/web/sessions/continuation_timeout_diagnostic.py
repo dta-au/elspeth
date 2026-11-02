@@ -3,6 +3,7 @@
 import sys
 import threading
 import time
+from collections import deque
 from contextvars import ContextVar
 from pathlib import Path
 from traceback import extract_tb
@@ -20,6 +21,7 @@ from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.sessions import continuation_runtime as sql_runtime_owner
 from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+from elspeth.web.sessions.composer_operations import ComposerOperationCancel
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_driver import _SegmentDriver
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
@@ -37,6 +39,39 @@ def _error(error):
     except CredentialMaterialRefused:
         message = "<credential material omitted>"
     return ((type(error).__name__, message),)
+
+
+def _error_identity(error, seen=None):
+    if error is None:
+        return None
+    visited = set() if seen is None else seen
+    if id(error) in visited:
+        return {"id": id(error), "cycle": True}
+    visited.add(id(error))
+    return {
+        "id": id(error),
+        "leaves": _error(error),
+        "cancel_reasons": tuple(arg.reason.value for arg in error.args if type(arg) is ComposerOperationCancel),
+        "children": tuple(_error_identity(child, visited) for child in error.exceptions) if isinstance(error, BaseExceptionGroup) else (),
+        "cause": _error_identity(error.__cause__, visited),
+    }
+
+
+def _driver_clocks(driver):
+    now = time.monotonic()
+    result = {"monotonic": now}
+    _section(
+        result,
+        "deadlines",
+        lambda: {
+            "sequence": driver.running.claim.segment_sequence,
+            "generation": driver.running.claim.ownership_generation,
+            "hard_remaining": driver.sql_deadline.hard_expires_at - now,
+            "action_remaining": driver.sql_deadline.remaining_action(monotonic_now=now),
+            "settling": driver.sql_deadline._settling,
+        },
+    )
+    return result
 
 
 def _task(task):
@@ -86,9 +121,12 @@ class G1TimeoutProbe:
         self.phase_sql_reads = []
         self._phase_read = ContextVar("g1_timeout_probe_phase_read", default=None)
         self.originals: list[BaseException] = []
+        self.watch_events = deque(maxlen=64)
+        self.settlement_events = deque(maxlen=32)
         worker = app.state.composer_async_worker
         target = f"/api/sessions/{session_id}/operations/{operation_id}"
         get, advance = httpx.AsyncClient.get, _SegmentDriver.advance
+        watch_stage, settle, failure_read = _SegmentDriver.watch_stage, _SegmentDriver.settle, _SegmentDriver.read_failure
         job_finished, loop_finished = ComposerAsyncWorker._job_finished, ComposerAsyncWorker._loop_finished
         registered_read, capture_owners = runtime_owner._registered_read, runtime_owner._capture_owners
         phase_registered_read = phase_owner._registered_read
@@ -247,6 +285,70 @@ class G1TimeoutProbe:
             self.phases.append(("return", stored.cursor, projection))
             return result
 
+        async def observe_watch(owner, stage, reader):
+            if owner.running.claim.operation_id != operation_id:
+                return await watch_stage(owner, stage, reader)
+            self.watch_events.append(("watch_started", _driver_clocks(owner), _task(stage)))
+            actual_read = type(reader).read
+
+            async def observe_read(current_reader):
+                try:
+                    current, now = await actual_read(current_reader)
+                except BaseException as original:
+                    if current_reader is reader:
+                        self.watch_events.append(("read_raised", _driver_clocks(owner), _error_identity(original)))
+                    raise
+                if current_reader is reader:
+                    self.watch_events.append(
+                        (
+                            "read",
+                            _driver_clocks(owner),
+                            None
+                            if current is None
+                            else (current.attempt, current.current_segment_sequence, current.ownership_generation, current.status),
+                            current is not None and current.cancel_requested_at is not None,
+                            owner.worker._local_cancels[(session_id, operation_id)].is_set(),
+                            now.isoformat(),
+                        )
+                    )
+                return current, now
+
+            with monkeypatch.context() as observation:
+                observation.setattr(type(reader), "read", observe_read)
+                try:
+                    return await watch_stage(owner, stage, reader)
+                except BaseException as original:
+                    self.watch_events.append(("watch_raised", _driver_clocks(owner), _error_identity(original)))
+                    raise
+                finally:
+                    self.watch_events.append(("watch_finished", _driver_clocks(owner), _task(stage)))
+
+        async def observe_failure_read(owner, names):
+            value = await failure_read(owner, names)
+            if owner.running.claim.operation_id == operation_id:
+                self.settlement_events.append(("actual_source", _driver_clocks(owner), type(value.source).__name__))
+            return value
+
+        async def observe_settle(owner, record, original=None, *, expired_failure=None):
+            if owner.running.claim.operation_id != operation_id:
+                return await settle(owner, record, original, expired_failure=expired_failure)
+            self.settlement_events.append(
+                (
+                    "entered",
+                    _driver_clocks(owner),
+                    _error_identity(original),
+                    record.cancel_requested_at is not None,
+                    None if expired_failure is None else expired_failure.failure_code,
+                )
+            )
+            try:
+                result = await settle(owner, record, original, expired_failure=expired_failure)
+            except BaseException as failure:
+                self.settlement_events.append(("raised", _driver_clocks(owner), _error_identity(failure)))
+                raise
+            self.settlement_events.append(("returned", _driver_clocks(owner), type(result).__name__))
+            return result
+
         def observe_job(owner, key, task):
             if owner is worker and key == (session_id, operation_id) and not task.cancelled():
                 failure = task.exception()
@@ -263,6 +365,9 @@ class G1TimeoutProbe:
 
         monkeypatch.setattr(httpx.AsyncClient, "get", observe_get)
         monkeypatch.setattr(_SegmentDriver, "advance", observe_advance)
+        monkeypatch.setattr(_SegmentDriver, "watch_stage", observe_watch)
+        monkeypatch.setattr(_SegmentDriver, "settle", observe_settle)
+        monkeypatch.setattr(_SegmentDriver, "read_failure", observe_failure_read)
         monkeypatch.setattr(ComposerAsyncWorker, "_job_finished", observe_job)
         monkeypatch.setattr(ComposerAsyncWorker, "_loop_finished", observe_loop)
         monkeypatch.setattr(runtime_owner, "_registered_read", observe_registered_read)
@@ -333,6 +438,9 @@ class G1TimeoutProbe:
             "remaining_sdk_roles": tuple(role for role, _payload in self.sdk.steps),
             "phase_boundaries": tuple(self.phases),
             "original_leaves": tuple(item for original in self.originals for item in _error(original)),
+            "original_identities": tuple(_error_identity(original) for original in self.originals),
+            "watch_events": tuple(self.watch_events),
+            "settlement_events": tuple(self.settlement_events),
         }
         _section(result, "runtime_capture", self._physical_runtime_capture)
         _section(result, "phase_sql_reads", self._physical_phase_sql_reads)

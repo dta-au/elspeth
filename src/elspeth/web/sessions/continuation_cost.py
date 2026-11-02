@@ -101,6 +101,22 @@ def _require_primary_effect_if_present(
     if len(found) != 1:
         raise AuditIntegrityError("Continuation cost source duplicated a PRIMARY physical effect")
     effect = found[0]
+    parts = effect.effect_key.split(":") if type(effect.effect_key) is str else ()
+    if (
+        len(parts) != 3
+        or parts[0] != "provider"
+        or not parts[1].isascii()
+        or not parts[1].isdigit()
+        or str(int(parts[1])) != parts[1]
+        or not parts[2].isascii()
+        or not parts[2].isdigit()
+        or str(int(parts[2])) != parts[2]
+    ):
+        raise AuditIntegrityError("Continuation cost source changed its canonical provider family/ordinal")
+    if parts[1] != "0":
+        # Family-1 Advisor and family-3 TITLE remain in the shared paid cost
+        # ledger; their own response codecs are not PRIMARY response.v1.
+        return
     key = effect.result_chunk_key
     prefix = "value:composer.response.v1:"
     if effect.disposition != "committed" or type(key) is not str or not key.startswith(prefix):

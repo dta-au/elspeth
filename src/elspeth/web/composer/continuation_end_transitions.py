@@ -20,19 +20,20 @@ Two transitions exist:
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import insert, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
-from elspeth.web.composer.continuation import ComposeFrame, EffectFrontierEntry, EndFrame, PrivateChunkRef
+from elspeth.web.composer.continuation import ComposeFrame, EffectFrontierEntry, EndFrame
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     decode_continuation_response,
     decode_continuation_snapshot,
     encode_continuation_snapshot,
 )
+from elspeth.web.composer.continuation_end_effects import end_effect_key, semantic_end_effect_key
 from elspeth.web.composer.continuation_end_values import EndContinuationCandidate, decode_end_candidate
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
@@ -45,25 +46,24 @@ from elspeth.web.sessions.continuation import (
     StoredContinuationSnapshot,
     _require_current_continuation_running,
     append_complete_snapshot,
+    bound_action_json,
     load_snapshot,
     private_chunk_key,
     put_chunk,
+    read_chunk,
+    retain_action_execution_receipt_on_connection,
 )
 from elspeth.web.sessions.continuation_primary import read_committed_primary_response_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_semantic_actions import SemanticActionAdmission
+
 END_EFFECT_OWNER = "composer_end"
 
 type EndTransition = Literal["end_entered", "end_review_dispatched", "end_repair_continued"]
-
-
-def end_effect_key(response: PrivateChunkRef) -> str:
-    """The one END review effect of one paid PRIMARY response."""
-    if type(response) is not PrivateChunkRef or response.codec != "composer.response.v1":
-        raise AuditIntegrityError("END effect requires its actual paid PRIMARY response")
-    return f"end:{response.digest}"
 
 
 def _quiescent_compose(stack_frames: tuple[object, ...]) -> ComposeFrame:
@@ -125,17 +125,45 @@ def retain_end_transition(
         stored = load_snapshot(conn, session_id=sid, operation_id=operation_id)
         if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(before):
             raise AuditIntegrityError("END transition replaced its actual selected predecessor")
-        if before.pending_owner_results or before.pending_settlement_ids or before.active_action_json is not None:
+        if before.pending_owner_results or before.pending_settlement_ids:
             raise AuditIntegrityError("END transition requires a quiescent selected cut")
+        review_admission: SemanticActionAdmission | None = None
+        action_json = None
+        if before.active_action_json is not None:
+            from elspeth.web.sessions.continuation_semantic_actions import (
+                installed_action_json,
+                require_consumed_semantic_review_on_connection,
+                require_dispatched_semantic_review_on_connection,
+            )
+
+            source = before.active_action_source
+            if source is None or transition == "end_entered":
+                raise AuditIntegrityError("END transition requires a quiescent selected cut")
+            if transition == "end_review_dispatched":
+                review_admission = require_consumed_semantic_review_on_connection(
+                    conn, running, selected=stored, effect_key=source.effect_key
+                )
+            else:
+                review_admission = require_dispatched_semantic_review_on_connection(
+                    conn, running, selected=stored, effect_key=source.effect_key
+                )
+            action_json = bound_action_json(before, action_owner="review", read_tool_name=None, read_tool_arguments_json=None)
+            if action_json != installed_action_json(review_admission) or source != review_admission.paid.source:
+                raise AuditIntegrityError("END review changed its original paid action/source")
+        elif before.active_action_source is not None:
+            raise AuditIntegrityError("END transition lost its actual prescribed action")
         compose = _quiescent_compose(before.frames)
         paid = compose.pending_response
         if paid is None:
             raise AuditIntegrityError("END lost its actual paid PRIMARY response")
+        key = end_effect_key(paid)
+        if review_admission is not None:
+            if review_admission.action_key is None:
+                raise AuditIntegrityError("semantic END review lost its original action key")
+            key = semantic_end_effect_key(paid, review_admission.action_key)
         open_effects = tuple(item for item in before.effect_frontier if item.disposition not in ("committed", "refused"))
         expected_open = (
-            (EffectFrontierEntry(effect_id=end_effect_key(paid), disposition="dispatched", receipt_id=None),)
-            if transition == "end_repair_continued"
-            else ()
+            (EffectFrontierEntry(effect_id=key, disposition="dispatched", receipt_id=None),) if transition == "end_repair_continued" else ()
         )
         if open_effects != expected_open:
             raise AuditIntegrityError("END transition found another open effect")
@@ -145,7 +173,6 @@ def retain_end_transition(
         if response.tool_batch.calls:
             raise AuditIntegrityError("END requires a PRIMARY response that issued no tool calls")
         policy = decode_continuation_policy(before.admission_policy_json, before.policy_hash)
-        key = end_effect_key(paid)
         if transition == "end_entered":
             if len(before.frames) != 1 or candidate is None:
                 raise AuditIntegrityError("END entry requires its exact single Compose predecessor")
@@ -227,6 +254,17 @@ def retain_end_transition(
                     ),
                 }
             )
+            if review_admission is not None:
+                after = decode_continuation_snapshot(
+                    retain_action_execution_receipt_on_connection(
+                        conn,
+                        session_id=sid,
+                        operation_id=operation_id,
+                        effect_key=key,
+                        disposition="committed",
+                        snapshot_json=encode_continuation_snapshot(after),
+                    )
+                )
             event = ContinuationEvent(
                 "checkpoint",
                 canonical_json(
@@ -245,8 +283,20 @@ def retain_end_transition(
                 raise AuditIntegrityError("END review requires its exact retained review cut")
             end = selected_end
             value = decode_end_candidate(next(chunk for chunk in selected.chunks if chunk.reference == end.candidate))
-            if value != end_candidate_for(compose, candidate_text=response.message.content or ""):
-                raise AuditIntegrityError("END review changed its retained candidate")
+            original_candidate = end_candidate_for(compose, candidate_text=response.message.content or "")
+            if review_admission is None:
+                if value != original_candidate:
+                    raise AuditIntegrityError("END review changed its retained candidate")
+            else:
+                original = review_admission.evidence.coverage.end_candidate
+                if (
+                    original is None
+                    or original.model_copy(update={"state": compose.state, "evidence": compose.evidence, "iteration": compose.iteration})
+                    != original_candidate
+                ):
+                    raise AuditIntegrityError("semantic END review changed its original paid PRIMARY candidate")
+                if value != review_admission.review_candidate or end.candidate != review_admission.review_candidate_source:
+                    raise AuditIntegrityError("semantic END review changed its checked candidate rebinding")
             if any(item.effect_id == key for item in before.effect_frontier):
                 raise AuditIntegrityError("END review already recorded its single provider effect")
             input_sha256 = stable_hash({"schema": "composer.end-review.v1", "candidate": end.candidate.digest})
@@ -260,6 +310,7 @@ def retain_end_transition(
                     disposition="dispatched",
                     creator_sequence=running.claim.segment_sequence,
                     creator_generation=running.claim.ownership_generation,
+                    action_json=action_json,
                 )
             )
             after = before.model_copy(
@@ -270,6 +321,17 @@ def retain_end_transition(
                     )
                 }
             )
+            if review_admission is not None:
+                after = decode_continuation_snapshot(
+                    retain_action_execution_receipt_on_connection(
+                        conn,
+                        session_id=sid,
+                        operation_id=operation_id,
+                        effect_key=key,
+                        disposition="dispatched",
+                        snapshot_json=encode_continuation_snapshot(after),
+                    )
+                )
             event = ContinuationEvent(
                 "may_dispatch",
                 canonical_json({"owner": END_EFFECT_OWNER, "transition": transition, "effect_key": key, "input_sha256": input_sha256}),
@@ -302,6 +364,15 @@ def retain_end_transition(
             from elspeth.web.composer.continuation_runtime import _selected_chunks
 
             root = decode_continuation_snapshot(retained.payload_json)
-            current = SelectedContinuationState(retained.checkpoint_id, root, _selected_chunks(root, captured.chunks, ()))
+            added: tuple[PrivateChunk, ...] = ()
+            if review_admission is not None:
+                frontier = root.semantic_frontier
+                if frontier is None:
+                    raise AuditIntegrityError("semantic END repair lost its committed action frontier")
+                canonical = read_chunk(
+                    conn, session_id=sid, operation_id=operation_id, key=f"value:{frontier.codec}:{frontier.digest}"
+                ).decode("utf-8", errors="strict")
+                added = (PrivateChunk(frontier, canonical),)
+            current = SelectedContinuationState(retained.checkpoint_id, root, _selected_chunks(root, captured.chunks, added))
             read_selected_turn_evidence_graph_on_connection(conn, running, selected=current, names=inventory.names)
         return retained

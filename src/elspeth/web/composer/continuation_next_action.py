@@ -14,6 +14,8 @@ from uuid import UUID
 from sqlalchemy import Connection, select
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer.advisor_output import ContinuationAdvisorDecision, ReadContinuationAction, ReviewContinuationAction
 from elspeth.web.composer.continuation import (
     AdvisorFrame,
     ComposeFrame,
@@ -23,6 +25,7 @@ from elspeth.web.composer.continuation import (
     ToolBatchFrame,
 )
 from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
+from elspeth.web.composer.continuation_end_values import decode_end_candidate
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
     ContinuationAdmissionPolicy,
@@ -30,6 +33,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicyV3,
     decode_continuation_policy,
 )
+from elspeth.web.composer.continuation_progress import decode_prescribed_continuation_action
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 
 if TYPE_CHECKING:
@@ -117,6 +121,14 @@ def validate_continuation_structure_data_on_connection(
         raise AuditIntegrityError("structural admission lost its exact SQL effect frontier")
     ambiguous = tuple(entry.effect_id for entry in root.effect_frontier if entry.disposition in ("prepared", "dispatched", "unknown"))
     top = root.frames[-1]
+    if type(top) is AdvisorFrame and top.provider_effect_key is not None:
+        from elspeth.web.sessions.continuation_semantic_advisor import validate_semantic_advisor_source_data_on_connection
+
+        unresolved = validate_semantic_advisor_source_data_on_connection(
+            conn, session_id=session_id, operation_id=operation_id, selected=stored
+        )
+        if top.phase == "awaiting_response":
+            return unresolved
     if type(top) is InitializeFrame and (top.provider_effect_key is not None or top.title_response is not None):
         # Includes original bootstrap, every stage/recovery event, descriptor,
         # frontier and the original physical provider/accounting cohort.
@@ -192,8 +204,7 @@ def validate_continuation_structure_data_on_connection(
             or top.pending_response is not None
             or root.pending_owner_results
             or root.pending_settlement_ids
-            or root.active_action_json is not None
-            or root.active_action_source is not None
+            or (root.active_action_json is None) != (root.active_action_source is None)
             or root.semantic_frontier is None
             or ambiguous != (top.provider_effect_key,)
         ):
@@ -241,12 +252,26 @@ def validate_continuation_structure_data_on_connection(
                 raise AuditIntegrityError("structural admission mixed a tool result with another unresolved owner")
             return ambiguous
     if type(top) is EndFrame and ambiguous:
-        from elspeth.web.composer.continuation_end_transitions import END_EFFECT_OWNER, end_effect_key
+        from elspeth.web.composer.continuation_end_effects import end_effect_key
+        from elspeth.web.composer.continuation_end_transitions import END_EFFECT_OWNER
 
         compose_root = root.frames[0]
         if type(compose_root) is not ComposeFrame or compose_root.pending_response is None:
             raise AuditIntegrityError("structural admission lost the END review's paid PRIMARY response")
         key = end_effect_key(compose_root.pending_response)
+        if root.active_action_source is not None:
+            from elspeth.web.sessions.continuation_semantic_actions import read_original_dispatched_semantic_review_on_connection
+
+            admission = read_original_dispatched_semantic_review_on_connection(
+                conn,
+                session_id=session_id,
+                operation_id=operation_id,
+                dispatch_checkpoint_id=stored.checkpoint_id,
+                semantic_effect_key=root.active_action_source.effect_key,
+            )
+            if admission.owner_effect_key is None:
+                raise AuditIntegrityError("structural END source lost its original prescribed Review effect")
+            key = admission.owner_effect_key
         review = tuple(row for row in actual if row.effect_key == key)
         if (
             len(root.frames) != 2
@@ -418,7 +443,9 @@ def handoff_cut_allowance(
             raise AuditIntegrityError("next allowance lost its closed later Compose iteration cut")
         if root.semantic_frontier is None:
             raise AuditIntegrityError("later Compose iteration lost its retained semantic frontier")
-        return policy.actions.primary
+        if (root.active_action_json is None) != (root.active_action_source is None):
+            raise AuditIntegrityError("later Compose iteration lost its paired prescribed action source")
+        return policy.actions.advisor if root.active_action_json is None else policy.actions.primary
     if type(top) is AdvisorFrame and top.phase == "input_ready":
         _require_quiescent_handoff_cut(root)
         if top.provider_effect_key is not None or top.response is not None:
@@ -450,6 +477,23 @@ def handoff_cut_allowance(
     return None
 
 
+def is_consumed_semantic_stop_cut(selected: SelectedContinuationState) -> bool:
+    """Structural dispatch only; the final SQL owner must replay the real Stop."""
+    end = selected.stack.frames[-1]
+    if type(end) is not EndFrame or end.phase != "publication_ready":
+        return False
+    matches = tuple(chunk for chunk in selected.chunks if chunk.reference == end.candidate)
+    if len(matches) != 1:
+        raise AuditIntegrityError("semantic END classifier lost its complete candidate")
+    candidate = decode_end_candidate(matches[0])
+    if candidate.semantic_source is None or candidate.semantic_decision_json is None:
+        return False
+    decision = ContinuationAdvisorDecision.model_validate_json(candidate.semantic_decision_json, strict=True)
+    if canonical_json(decision.model_dump(mode="json")) != candidate.semantic_decision_json:
+        raise AuditIntegrityError("semantic END classifier changed its exact stored decision")
+    return decision.decision == "STOP_CONFIRMED" and decision.scope == "whole_request" and decision.prescribed_action is None
+
+
 def next_continuation_action_policy(
     *,
     selected: SelectedContinuationState,
@@ -466,10 +510,59 @@ def next_continuation_action_policy(
     if decode_continuation_policy(root.admission_policy_json, root.policy_hash) != policy:
         raise AuditIntegrityError("next allowance changed its retained complete policy")
     require_resumable_cut(root)
+    top = root.frames[-1]
+    if type(top) is EndFrame:
+        if (
+            len(root.frames) != 2
+            or type(root.frames[0]) is not ComposeFrame
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+            or any(item.disposition not in ("committed", "refused") for item in root.effect_frontier)
+        ):
+            raise AuditIntegrityError("semantic END sizing lost its complete quiescent current source")
+        if root.active_action_json is not None:
+            if (
+                root.active_action_source is None
+                or top.phase != "review_needed"
+                or type(decode_prescribed_continuation_action(root.active_action_json)) is not ReviewContinuationAction
+            ):
+                raise AuditIntegrityError("semantic END sizing lost its original prescribed Review")
+            return policy.actions.advisor
+        if root.active_action_source is not None:
+            raise AuditIntegrityError("semantic END sizing lost its paired action")
+        return policy.actions.session_sql if is_consumed_semantic_stop_cut(selected) else policy.actions.advisor
     handoff = handoff_cut_allowance(root, policy)
     if handoff is not None:
         return handoff
     top = root.frames[-1]
+    if type(top) is AdvisorFrame and top.phase in ("response_retained", "decision_ready"):
+        if (
+            len(root.frames) not in (2, 3)
+            or type(root.frames[0]) is not ComposeFrame
+            or (
+                len(root.frames) == 3
+                and (
+                    type(root.frames[1]) is not EndFrame
+                    or root.frames[1].phase not in ("review_needed", "repair_needed", "publication_ready")
+                )
+            )
+            or top.provider_effect_key is None
+            or top.provider_input_sha256 is None
+            or (top.phase == "decision_ready" and top.response is None)
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+            or any(item.disposition in ("prepared", "dispatched", "unknown") for item in root.effect_frontier)
+        ):
+            raise AuditIntegrityError("semantic next allowance lost its complete retained original source")
+        if (
+            top.phase == "decision_ready"
+            and root.active_action_json is not None
+            and type(decode_prescribed_continuation_action(root.active_action_json)) is ReadContinuationAction
+        ):
+            return policy.actions.read
+        return policy.actions.session_sql
+    if type(top) is AdvisorFrame and top.phase == "awaiting_response":
+        raise AuditIntegrityError("semantic next allowance cannot replay unresolved prepared/begun provider work")
     if type(top) is InitializeFrame and top.provider_effect_key is not None:
         entries = root.effect_frontier
         if (

@@ -4,7 +4,7 @@ conversation through the reference gateway.
 This is design acceptance criterion 8 and the criterion the whole
 "endpoint affordance" phase exists for: an ordinary LiteLLM call, pointed at
 ``composer_endpoint_base_url``, must be indistinguishable in shape from any
-other OpenAI-compatible provider call, and Composer's real compose loop must
+other OpenAI-compatible provider call, and Composer's Continuation worker must
 be able to drive a full turn against it.
 
 Harness: reuses the proven pattern from
@@ -57,7 +57,7 @@ What is proven here, durably:
   ``.function.name`` / ``.function.arguments``, ``finish_reason``) when
   consumed via a real ``litellm.acompletion`` call.
 - **Criterion 8**: a real tool-call / tool-result round trip through
-  Composer's actual compose loop against the live gateway -- the provider's
+  Composer's actual Continuation worker against the live gateway -- the provider's
   tool call is admitted, dispatched, and its result recorded.
 - A real text (non-tool) round trip through the same loop.
 - Sessionless boot descriptions remain unqualified without contacting the
@@ -71,14 +71,13 @@ What is proven here, durably:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -87,27 +86,25 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+import pytest_asyncio
 import uvicorn
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_mutation import ComposerMutationCeiling
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import provider_gateway
-from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
-from elspeth.web.composer.provider_quota import ProviderInvocationOwner, composer_quota_scope
-from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl, _ComposeLoopDiagnostics
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.composer.turn_effects import TurnEvidence
-from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.required_work import (
-    RequiredAuthorityKind,
-    RequiredWorkAuthority,
-    RequiredWorkBinding,
-    RequiredWorkCoordinator,
-    RequiredWorkRole,
-)
+from elspeth.web.composer.protocol import RetainedOperationContext
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
+from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.required_work import required_failure_leaves
+from elspeth.web.sessions import continuation_driver
+from elspeth.web.sessions.composer_operations import ComposerOperationCancel
+from elspeth.web.sessions.models import quota_policies_table, token_usage_ledger_table
+from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.composer_operations import message_body
+from tests.helpers.continuation_app import ACTOR, ContinuationApp, continuation_app, effects, submit_and_settle
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -381,85 +378,86 @@ def _build_service(tmp_path: Path, base_url: str, sessions_service: SessionServi
     )
 
 
-async def _run_gateway_loop_turn(
-    service: ComposerServiceImpl,
-    *,
-    session_id: str,
-    message: str,
-) -> ComposeLoopTestResult:
-    """Mirror the direct loop test driver under actual provider audit custody."""
-    sessions = service._require_sessions_service()
-    async with await SessionOperationLease.acquire(
-        sessions.session_operation_authority,
-        session_id=UUID(session_id),
-        operation_kind=SessionOperationKind.COMPOSE,
-        owner_instance_id=sessions.session_operation_owner_instance_id,
-        lease_seconds=sessions.session_operation_lease_seconds,
-    ) as lease:
-        coordinator = RequiredWorkCoordinator(
-            RequiredWorkAuthority(
-                RequiredAuthorityKind.SYNCHRONOUS_COMPOSE,
-                lease.context,
-                invocation_id=str(uuid4()),
-            )
+@pytest_asyncio.fixture
+async def gateway_composer(
+    tmp_path: Path, gateway_base_url: str, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> AsyncIterator[ContinuationApp]:
+    """Use the canonical production app/worker harness with a live PRIMARY route."""
+    from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
+    from tests.helpers import fenced_session
+
+    settings = _settings(tmp_path, endpoint_base_url=f"{gateway_base_url}/v1", endpoint_api_key=_INBOUND_BEARER)
+    # The live mock reports conversation characters/4, unlike ScriptedSDK's
+    # tiny fixed usage. Fund the controlled two-PRIMARY/one-END scenario (or
+    # the failure retry cohort) within actual admitted per-call byte/token
+    # bounds. This is a finite operator policy for these isolated sessions.
+    calls = max(3, LLM_API_MAX_ATTEMPTS)
+    token_capacity = calls * (settings.composer_planner_max_request_bytes // 4 + settings.composer_planner_max_completion_tokens)
+    actual_seed = fenced_session.seed_token_policies
+
+    def gateway_policies(conn, *, identity_id):
+        return actual_seed(
+            conn,
+            identity_id=identity_id,
+            identity_tokens_per_day=token_capacity,
+            container_tokens_per_day=token_capacity,
         )
-        lease.bind_required_work(coordinator)
-        binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
-        owner = ProviderInvocationOwner(service=sessions, required_work=binding)
-        state = CompositionState(
-            source=None,
-            nodes=(),
-            edges=(),
-            outputs=(),
-            metadata=PipelineMetadata(),
-            version=1,
-        )
-        plugin_snapshot, policy_catalog = service._policy_context.build(None)
-        diagnostics = _ComposeLoopDiagnostics()
-        # Mirror the direct driver: a session-bound loop carries its original ceiling and turn evidence.
-        preferences = await sessions.get_composer_preferences(UUID(session_id))
-        mutation_ceiling = ComposerMutationCeiling(session_id, str(uuid4()), preferences.trust_mode)
-        turn_evidence = TurnEvidence(
-            session_id=session_id,
-            session_operation_context=lease.context,
-            request_id=mutation_ceiling.request_id,
-            request=message,
-            initial_state_id=None,
-            initial_state=state,
-        )
-        with composer_quota_scope(sessions, lease.context), prompt_guard_user_scope(message):
-            result = await service._compose_loop(
-                message,
-                [],
-                state,
-                session_id=session_id,
-                initial_current_state_id=None,
-                deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
-                plugin_snapshot=plugin_snapshot,
-                policy_catalog=policy_catalog,
-                mutation_ceiling=mutation_ceiling,
-                session_operation_context=lease.context,
-                diagnostics=diagnostics,
-                required_work=binding,
-                provider_owner=owner,
-                turn_evidence=turn_evidence,
-            )
-        outcome = ComposeLoopTestResult(
-            assistant_message=result.message,
-            raw_assistant_content=result.raw_assistant_content,
-            persisted_assistant_content=result.persisted_assistant_content,
-            persisted_assistant_matches_terminal_model_turn=result.persisted_assistant_matches_terminal_model_turn,
-            tool_outcomes=diagnostics.tool_outcomes,
-            persisted_assistant_tool_calls=diagnostics.redacted_assistant_tool_calls,
-            persisted_tool_row_content=tuple(row.content for row in diagnostics.redacted_tool_rows),
-            audit_outcome=diagnostics.audit_outcome,
-            pre_state_id=diagnostics.pre_state_id,
-            tool_invocations=result.tool_invocations,
-            runtime_preflight=result.runtime_preflight,
-            advisor_gate_decision=result.advisor_gate_decision,
-        )
-    coordinator.assert_completed()
-    return outcome
+
+    monkeypatch.setattr(fenced_session, "seed_token_policies", gateway_policies)
+    async with continuation_app(
+        tmp_path,
+        monkeypatch,
+        composer_model=_MODEL_ALIAS,
+        composer_endpoint_base_url=f"{gateway_base_url}/v1",
+        composer_endpoint_api_key=_INBOUND_BEARER,
+        plugin_allowlist=("source:csv", "sink:csv", "transform:passthrough"),
+    ) as harness:
+        with harness.app.state.session_engine.connect() as conn:
+            policies = conn.execute(
+                select(quota_policies_table.c.policy_id, quota_policies_table.c.tokens_per_day)
+                .where(quota_policies_table.c.revoked_at.is_(None))
+                .order_by(quota_policies_table.c.policy_id)
+            ).all()
+        assert policies == [("quota-container", token_capacity), ("quota-identity", token_capacity)]
+        request.node.user_properties.append(("gateway_fixture_token_policies", json.dumps([tuple(row) for row in policies])))
+        yield harness
+
+
+def _retained_history(harness: ContinuationApp) -> dict[str, Any]:
+    # The production route authenticates and loads this session's bounded
+    # history; the deleted direct loop supplied no history authority.
+    return json.loads(RetainedOperationContext(harness.session_id, ACTOR, "available").provider_message())
+
+
+async def _run_gateway_turn(harness: ContinuationApp, message: str) -> ComposerOperationSnapshot:
+    return await submit_and_settle(harness, message_body(message, operation_id=str(uuid4())))
+
+
+def _observe_gateway_originals(harness: ContinuationApp, monkeypatch: pytest.MonkeyPatch):
+    observations = []
+    actual_settle = continuation_driver._SegmentDriver.settle
+
+    async def observe_settle(driver, record, original=None, **kwargs):
+        if driver.running.claim.session_id == harness.session_id and original is not None:
+            for leaf in required_failure_leaves(original):
+                frames = []
+                trace = leaf.__traceback__
+                while trace is not None:
+                    frames.append((Path(trace.tb_frame.f_code.co_filename).name, trace.tb_frame.f_code.co_name, trace.tb_lineno))
+                    trace = trace.tb_next
+                reason = str(leaf).splitlines()[0] if isinstance(leaf, (AuditIntegrityError, CommonProviderCostRefused)) else None
+                if type(leaf) is ChargeableAdmissionRefused:
+                    refusal = leaf.decision.refusal_reason
+                    assert refusal is not None
+                    reason = refusal.value
+                cancellation = leaf.args[0] if leaf.args else None
+                if type(cancellation) is ComposerOperationCancel:
+                    reason = cancellation.reason.value
+                observations.append((type(leaf).__name__, reason, tuple(frames)))
+        return await actual_settle(driver, record, original, **kwargs)
+
+    monkeypatch.setattr(continuation_driver._SegmentDriver, "settle", observe_settle)
+    return observations
 
 
 # ---------------------------------------------------------------------------
@@ -535,29 +533,32 @@ class TestGatewayResponseShapeSatisfiesFreeformAttributeAccess:
 
 
 # ---------------------------------------------------------------------------
-# Text (non-tool) round trip through the real compose loop.
+# Text (non-tool) round trip through the actual Continuation worker.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_base_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drive one real compose-loop turn with exact fenced provider custody
-    through the local direct-loop driver so the REAL ``self._call_llm``
-    -> real ``litellm.acompletion`` -> live gateway path runs, end to end,
-    for a plain text turn. Only the independent END role's SDK response is
-    faked; its request construction, strict parser, binding, and audit run."""
+async def test_composer_text_round_trip_against_gateway(
+    gateway_composer: ContinuationApp, gateway_base_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Admit a real worker request whose PRIMARY traverses the live gateway.
+
+    Only the independent END SDK reply is scripted; its request, strict
+    parser, current-source binding and durable audit remain production code.
+    """
     import litellm
 
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
     from tests.helpers.advisor_review import parse_advisor_publication_review
 
-    sessions_service = _build_sessions_service(tmp_path)
-    session_id = str(uuid4())
-    _insert_session_row(sessions_service, session_id)
-    service = _build_service(tmp_path, gateway_base_url, sessions_service)
+    sessions_service = gateway_composer.app.state.session_service
+    session_id = str(gateway_composer.session_id)
+    service = gateway_composer.app.state.composer_service
+    initial_head = await sessions_service.get_composition_head(gateway_composer.session_id)
     real_acompletion = litellm.acompletion
     primary_requests: list[dict[str, Any]] = []
     primary_replies: list[str] = []
+    primary_usage: list[tuple[int, int]] = []
     end_requests: list[dict[str, Any]] = []
     unexpected_models: list[str] = []
 
@@ -571,22 +572,15 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
             messages = kwargs["messages"]
             assert {"role": "user", "content": "hello composer-against-gateway"} in messages
             assert messages[-1]["role"] == "system"
-            assert json.loads(messages[-1]["content"]) == {
-                "retained_operation_history": {
-                    "availability": "unknown",
-                    "has_more": False,
-                    "outcomes": [],
-                    "scope": (
-                        "No authenticated retained operation history was supplied; do not infer prior success or zero saved progress."
-                    ),
-                }
-            }
+            assert json.loads(messages[-1]["content"]) == _retained_history(gateway_composer)
             # The real mock upstream echoes the last transmitted content,
             # including the role-independent retained-history tail.
             response = await real_acompletion(**kwargs)
             reply = response.choices[0].message.content
             assert reply == "MOCK:" + messages[-1]["content"]
             primary_replies.append(reply)
+            assert response.usage is not None
+            primary_usage.append((response.usage.prompt_tokens, response.usage.completion_tokens))
             return response
         if model == service._settings.composer_advisor_model:
             end_requests.append(kwargs)
@@ -624,16 +618,31 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
                         },
                     }
                 ],
-                usage={"prompt_tokens": 10, "completion_tokens": 20},
+                usage={"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30, "cost": 0.01},
             )
         unexpected_models.append(model)
         raise AssertionError(f"No provider response is supplied for {model!r}")
 
     monkeypatch.setattr(litellm, "acompletion", role_bound_acompletion)
 
-    result = await _run_gateway_loop_turn(service, session_id=session_id, message="hello composer-against-gateway")
+    terminal = await _run_gateway_turn(gateway_composer, "hello composer-against-gateway")
+    assert terminal.status == "completed" and terminal.error is None and terminal.result is not None, (
+        "gateway text worker failed",
+        terminal.status,
+        (terminal.error.failure_code, terminal.error.error_type) if terminal.error is not None else None,
+        {"primary_started": len(primary_requests), "primary_returned": len(primary_replies), "end_started": len(end_requests)},
+    )
+    result = terminal.result
     assert unexpected_models == []
     assert len(primary_requests) == len(end_requests) == 1
+    with gateway_composer.app.state.session_engine.connect() as conn:
+        metered = conn.execute(
+            select(token_usage_ledger_table.c.prompt_tokens, token_usage_ledger_table.c.completion_tokens).where(
+                token_usage_ledger_table.c.session_id == session_id, token_usage_ledger_table.c.model == _MODEL_ALIAS
+            )
+        ).all()
+    assert metered == primary_usage
+    assert all(prompt > 0 and completion > 0 for prompt, completion in metered)
 
     from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
 
@@ -644,15 +653,18 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
         "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
         "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
     )
-    assert result.raw_assistant_content == raw
-    assert result.assistant_message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
-    assert visible_message_segments(content=result.assistant_message, raw_content=result.raw_assistant_content) == (
+    stored = await sessions_service.get_messages(UUID(session_id), limit=None)
+    (assistant,) = (row for row in stored if str(row.id) == result.message.id)
+    assert assistant.raw_content == raw
+    assert result.message.content == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    assert assistant.content == result.message.content
+    assert visible_message_segments(content=assistant.content, raw_content=assistant.raw_content) == (
         AssistantTextSegment(raw),
         TrustedSystemNoticeSegment(notice),
     )
-    assert result.tool_outcomes == ()
-    assert result.tool_invocations == ()
-    stored = await sessions_service.get_messages(UUID(session_id), limit=None)
+    assert [row for row in stored if row.role == "tool"] == []
+    assert result.state is None and result.proposals == []
+    assert await sessions_service.get_composition_head(gateway_composer.session_id) == initial_head
     passes = [
         row.tool_calls[0]["pass"]
         for row in stored
@@ -670,7 +682,7 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
 
 # ---------------------------------------------------------------------------
 # Design acceptance criterion 8 -- the tool-call / tool-result round trip
-# through the real compose loop. This is the criterion the whole "endpoint
+# through the actual Continuation worker. This is the criterion the whole "endpoint
 # affordance" phase exists for, and the one that was blocked by the
 # ``_admit_tool_batch`` Protocol-isinstance defect (elspeth-9ea866438b):
 # every genuine LiteLLM tool call was rejected at admission with
@@ -680,7 +692,9 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
 
 
 @pytest.mark.asyncio
-async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_base_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_composer_tool_round_trip_against_gateway(
+    gateway_composer: ContinuationApp, gateway_base_url: str, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
     """Provider tool call -> admission -> dispatch -> tool result -> next turn.
 
     A test-local upstream selector reads the actual user's trigger past the
@@ -693,12 +707,22 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
     import mock.upstream as mock_upstream
 
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.audit import BufferingRecorder
     from tests.helpers.advisor_review import parse_advisor_publication_review
 
-    sessions_service = _build_sessions_service(tmp_path)
-    session_id = str(uuid4())
-    _insert_session_row(sessions_service, session_id)
-    service = _build_service(tmp_path, gateway_base_url, sessions_service)
+    sessions_service = gateway_composer.app.state.session_service
+    session_id = str(gateway_composer.session_id)
+    service = gateway_composer.app.state.composer_service
+    initial_head = await sessions_service.get_composition_head(gateway_composer.session_id)
+    invocations = []
+    actual_append = BufferingRecorder._append_invocation_locked
+
+    def observe_invocation(recorder, invocation, **kwargs):
+        recorded = actual_append(recorder, invocation, **kwargs)
+        invocations.append(recorded)
+        return recorded
+
+    monkeypatch.setattr(BufferingRecorder, "_append_invocation_locked", observe_invocation)
     original_last_text = mock_upstream._last_text
     conversations: list[list[dict[str, Any]]] = []
 
@@ -709,16 +733,7 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
             trigger = {"speaker": "user", "text": "USE_TOOL list_sources {}"}
             assert trigger in conversation
             assert conversation[-1]["speaker"] == "system"
-            assert json.loads(original_last_text(conversation)) == {
-                "retained_operation_history": {
-                    "availability": "unknown",
-                    "has_more": False,
-                    "outcomes": [],
-                    "scope": (
-                        "No authenticated retained operation history was supplied; do not infer prior success or zero saved progress."
-                    ),
-                }
-            }
+            assert json.loads(original_last_text(conversation)) == _retained_history(gateway_composer)
             return conversation[conversation.index(trigger)]["text"]
         assert conversation[-1]["speaker"] == "tool"
         assert conversation[-1]["operation_ref"] == "mock-call-ref-1"
@@ -731,6 +746,7 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
     primary_replies: list[Any] = []
     end_calls: list[dict[str, Any]] = []
     unexpected_models: list[str] = []
+    original_observations = _observe_gateway_originals(gateway_composer, monkeypatch)
 
     async def role_bound_acompletion(**kwargs: Any) -> Any:
         model = kwargs["model"]
@@ -775,30 +791,54 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
                         },
                     }
                 ],
-                usage={"prompt_tokens": 10, "completion_tokens": 20},
+                usage={"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30, "cost": 0.01},
             )
         unexpected_models.append(model)
         raise AssertionError(f"No response is supplied for provider role {model!r}")
 
     monkeypatch.setattr(litellm, "acompletion", role_bound_acompletion)
 
-    result = await _run_gateway_loop_turn(service, session_id=session_id, message="USE_TOOL list_sources {}")
+    terminal = await _run_gateway_turn(gateway_composer, "USE_TOOL list_sources {}")
+    request.node.user_properties.append(
+        (
+            "gateway_tool_closed_observations",
+            json.dumps(
+                {
+                    "originals": original_observations,
+                    "calls": {
+                        "primary_started": len(primary_calls),
+                        "primary_returned": len(primary_replies),
+                        "end_started": len(end_calls),
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+    )
+    assert terminal.status == "completed" and terminal.error is None and terminal.result is not None, (
+        "gateway tool worker failed",
+        (terminal.error.failure_code, terminal.error.error_type) if terminal.error is not None else None,
+        {"primary_started": len(primary_calls), "primary_returned": len(primary_replies), "end_started": len(end_calls)},
+        tuple(original_observations),
+    )
+    result = terminal.result
     assert unexpected_models == []
     assert len(primary_calls) == len(primary_replies) == len(conversations) == 2
     assert len(end_calls) == 1
 
     # The tool call was admitted and dispatched -- the defect made this an
-    # AuditIntegrityError before the first await, so an empty tuple here is
-    # exactly the regression.
-    assert len(result.tool_outcomes) == 1
-    outcome = result.tool_outcomes[0]
-    assert outcome.call.id == "mock-call-ref-1"
-    assert outcome.call.function.name == "list_sources"
-    assert outcome.call.function.arguments == "{}"
+    # AuditIntegrityError before the first await. Require the single actual
+    # recorded dispatch, including its original provider call identity.
+    (outcome,) = invocations
+    assert outcome.tool_call_id == "mock-call-ref-1"
+    assert outcome.tool_name == "list_sources"
+    assert outcome.arguments_canonical == "{}"
     assert outcome.error_class is None
     assert outcome.error_message is None
-    assert outcome.response is not None
-    assert outcome.response.success is True
+    assert outcome.status.value == "success"
+    assert outcome.result_canonical is not None
+    assert json.loads(outcome.result_canonical)["success"] is True
 
     # The tool result was fed back and the provider produced a second,
     # terminal turn from it -- i.e. a full round trip, not just a dispatch.
@@ -806,17 +846,22 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
     # text is the serialized ``list_sources`` result: asserting the catalog's
     # own source name survives that trip is what proves the tool RESULT (not
     # merely the tool CALL) crossed the boundary in both directions.
-    assert result.assistant_message is not None
-    assert result.assistant_message.startswith("MOCK:")
-    assert '"success": true' in result.assistant_message
-    assert "csv" in result.assistant_message
+    assert result.message.content.startswith("MOCK:")
+    assert '"success": true' in result.message.content
+    assert "csv" in result.message.content
 
     # The admitted call is recorded in the audit trail, under the provider's
     # own tool-call id.
-    assert len(result.tool_invocations) == 1
-    assert result.tool_invocations[0].tool_call_id == "mock-call-ref-1"
-    assert result.tool_invocations[0].tool_name == "list_sources"
     stored = await sessions_service.get_messages(UUID(session_id), limit=None)
+    (tool_row,) = (row for row in stored if row.role == "tool" and row.tool_call_id == "mock-call-ref-1")
+    assert json.loads(tool_row.content)["success"] is True and "csv" in tool_row.content
+    assert tool_row.content == original_last_text(conversations[1])
+    (issued,) = (row for row in stored if row.id == tool_row.parent_assistant_id)
+    assert issued.role == "assistant" and issued.tool_calls is not None
+    (call,) = issued.tool_calls
+    assert call["id"] == "mock-call-ref-1" and call["function"] == {"name": "list_sources", "arguments": "{}"}
+    assert result.state is None and result.proposals == []
+    assert await sessions_service.get_composition_head(gateway_composer.session_id) == initial_head
     passes = [
         row.tool_calls[0]["pass"]
         for row in stored
@@ -885,7 +930,7 @@ async def test_sessionless_gateway_boot_probe_is_unqualified_without_dispatch(
         composer_prompt_guard_mode=mode,
     )
     assert [request.surface for request in requests] == ["loop_tools"]
-    assert requests[0].tool_count == 46
+    assert requests[0].tool_count == 47
 
     for request in requests:
         assert request.model == model
@@ -917,7 +962,7 @@ _LEAK_MARKERS: tuple[str, ...] = (
 
 @pytest.mark.asyncio
 async def test_gateway_internals_never_leak_on_a_real_failure(
-    tmp_path: Path,
+    gateway_composer: ContinuationApp,
     gateway_base_url: str,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -933,18 +978,17 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     from litellm.exceptions import ServiceUnavailableError
 
     from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-    from elspeth.web.composer.provider_config import LLM_API_MAX_ATTEMPTS
 
     caplog.set_level(logging.DEBUG)
-    sessions_service = _build_sessions_service(tmp_path)
-    session_id = str(uuid4())
-    _insert_session_row(sessions_service, session_id)
-    service = _build_service(tmp_path, gateway_base_url, sessions_service)
+    sessions_service = gateway_composer.app.state.session_service
+    session_id = str(gateway_composer.session_id)
     trigger = "TRIGGER_FAULT overloaded"
     conversations: list[list[dict[str, Any]]] = []
     upstream_statuses: list[int] = []
     primary_requests: list[dict[str, Any]] = []
     sdk_failures: list[ServiceUnavailableError] = []
+    settlement_originals: list[BaseException] = []
+    actual_settle = continuation_driver._SegmentDriver.settle
     original_last_text = mock_upstream._last_text
     original_transport = _HostRoutedTransport.handle_async_request
     original_acompletion = litellm.acompletion
@@ -969,6 +1013,7 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
         assert kwargs["model"] == _MODEL_ALIAS, "No independent advisor response is supplied for this failed primary turn"
         assert kwargs["api_base"] == f"{gateway_base_url}/v1"
         assert kwargs["api_key"] == _INBOUND_BEARER
+        assert kwargs["num_retries"] == 0
         primary_requests.append(kwargs)
         try:
             return await original_acompletion(**kwargs)
@@ -977,39 +1022,61 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
             assert exc.response.status_code == 503
             raise
 
+    async def observe_settle(driver, record, original=None, **kwargs):
+        if driver.running.claim.session_id == gateway_composer.session_id and original is not None:
+            settlement_originals.append(original)
+        return await actual_settle(driver, record, original, **kwargs)
+
     monkeypatch.setattr(mock_upstream, "_last_text", select_mock_trigger)
     monkeypatch.setattr(_HostRoutedTransport, "handle_async_request", record_upstream_status)
     monkeypatch.setattr(litellm, "acompletion", primary_gateway_acompletion)
+    monkeypatch.setattr(continuation_driver._SegmentDriver, "settle", observe_settle)
 
     # The exact exception class the mock upstream's 503 ("overloaded")
     # deterministically maps to, confirmed empirically. Narrowed
     # deliberately (not `Exception`): an unrelated failure elsewhere in the
-    # turn must not satisfy this `raises` and cause the leak assertions
-    # below to scan the wrong exception's message and pass vacuously.
-    with pytest.raises(ServiceUnavailableError) as excinfo:
-        await _run_gateway_loop_turn(service, session_id=session_id, message=trigger)
+    # turn must not satisfy the public failure assertion while causing the
+    # leak checks to inspect an unrelated exception. The real worker must
+    # settle with the exact SDK failure retained as its original.
+    terminal = await _run_gateway_turn(gateway_composer, trigger)
+    assert terminal.status == "failed" and terminal.error is not None and terminal.result is None
 
-    assert len(primary_requests) == len(conversations) == len(sdk_failures) == LLM_API_MAX_ATTEMPTS
-    assert upstream_statuses == [503] * LLM_API_MAX_ATTEMPTS
-    assert excinfo.value is sdk_failures[-1]
-    calls = excinfo.value.__dict__["llm_calls"]
-    assert len(calls) == LLM_API_MAX_ATTEMPTS
+    # Continuation's bound physical provider owner enters the SDK once.
+    # An entered SDK failure leaves unknown provider work; the deleted loop's
+    # generic transport retry cohort cannot authorize paid replay here.
+    await gateway_composer.app.state.composer_async_worker.run_until_idle()
+    assert len(primary_requests) == len(conversations) == len(sdk_failures) == 1
+    assert upstream_statuses == [503]
+    assert any(leaf is sdk_failures[-1] for error in settlement_originals for leaf in required_failure_leaves(error))
+    calls = sdk_failures[-1].__dict__["llm_calls"]
+    assert len(calls) == 1
     for call in calls:
         assert call.status is ComposerLLMCallStatus.API_ERROR
         assert call.error_class == call.error_message == "ServiceUnavailableError"
+        assert call.prompt_tokens is call.completion_tokens is call.provider_cost is None
         assert call.private_failure is not None
         facts = json.loads(call.private_failure.canonical)
         assert facts["nodes"][0]["class"] == "ServiceUnavailableError"
         assert facts["edges"], "The genuine SDK failure's causal graph must survive private audit capture"
         assert "private_failure" not in call.to_dict()
+    (provider_effect,) = (row for row in effects(gateway_composer.app, terminal.operation_id) if row.owner == "provider")
+    assert provider_effect.disposition == "unknown" and provider_effect.receipt_key is provider_effect.result_chunk_key is None
+    with gateway_composer.app.state.session_engine.connect() as conn:
+        (usage,) = conn.execute(
+            select(token_usage_ledger_table.c.prompt_tokens, token_usage_ledger_table.c.completion_tokens).where(
+                token_usage_ledger_table.c.session_id == session_id
+            )
+        ).all()
+    assert usage.prompt_tokens is usage.completion_tokens is None
 
-    exception_text = str(excinfo.value)
+    exception_text = str(sdk_failures[-1])
     provider_history = json.dumps([request["messages"] for request in primary_requests])
     for marker in _LEAK_MARKERS:
         assert marker not in exception_text, f"leak marker found in exception message: {marker!r}"
         assert marker not in caplog.text, f"leak marker found in captured logs: {marker!r}"
         assert marker not in provider_history, f"leak marker found in provider history: {marker!r}"
         assert marker not in json.dumps([call.to_dict() for call in calls]), f"leak marker found in public call audit: {marker!r}"
+        assert marker not in terminal.model_dump_json(), f"leak marker found in sealed public failure: {marker!r}"
 
     with sessions_service._engine.begin() as conn:
         rows = conn.execute(select(chat_messages_table.c.content).where(chat_messages_table.c.session_id == session_id)).fetchall()
@@ -1075,12 +1142,12 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 
 
 def _loop_tools_stamped(flag: bool) -> list[dict[str, Any]]:
-    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (36 true, 10 false)."""
+    """The current ``openai_strict`` palette, including its checkpoint control (37 true, 10 false)."""
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
     from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     tools = [tool for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT) if tool["function"]["strict"] is flag]
-    assert len(tools) == (36 if flag else 10)
+    assert len(tools) == (37 if flag else 10)
     return tools
 
 
@@ -1143,7 +1210,7 @@ async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: s
     resolution = resolve_strict_transport(model=_MODEL_ALIAS, api_base=f"{gateway_base_url}/v1", setting="preferred", env={})
     assert resolution.transport is StrictTransport.NONE
     tools = composer_loop_tool_definitions(dialect_for(resolution.transport))
-    assert len(tools) == 46
+    assert len(tools) == 47
     assert [tool for tool in tools if "strict" in tool["function"]] == []
 
     response = await litellm.acompletion(

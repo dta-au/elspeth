@@ -5,14 +5,19 @@ native admission; the shared driver and drain-cleanup joins remain separate.
 """
 
 import asyncio
+from concurrent.futures import Future
+from time import monotonic
 
 import pytest
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
-from elspeth.web.composer.progress import ComposerProgressRegistry
-from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.async_workers import ProgressCleanupDeadlineExpired, ProgressRequestCleanup, ProgressSQLInvocation
+from elspeth.web.composer.progress import ComposerProgressRegistry, ComposerRequestLease
+from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, SessionComposerProgressAuthority
 from elspeth.web.required_executor import RequiredGenerationUnavailable
-from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
+from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
+from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner, ProgressCloseDeadlineExpired
 from tests.unit.web.sessions import test_continuation_live_phases as phase_cases
 from tests.unit.web.sessions.test_continuation_live_phases import _phase_case
 from tests.unit.web.sessions.test_continuation_live_phases import operation_store as _operation_store
@@ -33,7 +38,7 @@ def _priced_phase_response(monkeypatch):
     monkeypatch.setattr(phase_cases, "ModelResponse", response)
 
 
-def _progress_owner(owner, running, registry, *, interval=60.0):
+def _progress_owner(owner, running, registry, *, interval=60.0, hard_expires_at=None, drain_deadline=None):
     record = owner.authority.get(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
     assert record is not None
     return ContinuationProgressOwner(
@@ -42,6 +47,8 @@ def _progress_owner(owner, running, registry, *, interval=60.0):
         lease=owner.lease,
         record=record,
         renew_interval_seconds=interval,
+        hard_expires_at=hard_expires_at,
+        drain_deadline=drain_deadline,
     )
 
 
@@ -97,8 +104,9 @@ async def test_progress_heartbeat_distinguishes_advisory_loss_from_native_defect
         original = ComposerRequestLeaseLost("actual progress lease loss") if advisory else RuntimeError("actual progress defect")
         original.__cause__ = cause
 
-        async def renew(lease):
+        async def renew(lease, *, deadline=None):
             assert progress.request_lease is lease
+            assert deadline is None
             entered.set()
             raise original
 
@@ -180,8 +188,9 @@ async def test_progress_cleanup_refusal_is_visible_without_admission_bypass(oper
         progress = _progress_owner(owner, running, registry)
         await progress.start()
 
-        async def finish(lease):
+        async def finish(lease, *, deadline=None, on_cleanup=None):
             assert lease is progress.request_lease
+            assert deadline is None and on_cleanup is not None
             raise original
 
         monkeypatch.setattr(registry, "finish_request", finish)
@@ -192,5 +201,136 @@ async def test_progress_cleanup_refusal_is_visible_without_admission_bypass(oper
         assert (await registry.get_latest(str(running.claim.session_id))).inflight_requests == 1
         # Test teardown uses the exact original registry API. This is not a
         # production bypass and does not claim real begin_drain coverage.
+        assert progress.request_lease is not None
+        await actual_finish(progress.request_lease)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_retained_close_cannot_release_pending_late_begin_custody(operation_store, tmp_path, monkeypatch):
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, _sdk):
+        registry = ComposerProgressRegistry()
+        progress = _progress_owner(owner, running, registry, hard_expires_at=monotonic() + 0.05)
+        authority = object.__new__(SessionComposerProgressAuthority)
+        submission = ProgressSQLInvocation(authority.begin_request, (str(running.claim.session_id), progress.record.actor_user_id))
+        native: Future[ComposerRequestLease] = Future()
+        submission.future = native
+        progress._retain_start_submission(submission)
+        try:
+            with pytest.raises(ProgressCloseDeadlineExpired):
+                await progress.close()
+            assert progress._closing is not None and registry.pending_owner_count == 1
+            progress._closing.cancel("retained close task interrupted")
+            await asyncio.gather(progress._closing, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert progress.request_lease is None and registry.pending_owner_count == 1
+            with pytest.raises(AuditIntegrityError, match="unfinished segment custody"):
+                registry.assert_pending_settled()
+            native.set_result(ComposerRequestLease("late-token", str(running.claim.session_id), progress.record.actor_user_id))
+            submission.observe_if_done()
+            assert type(submission.late_outcome) is ComposerRequestLease
+            assert registry.pending_owner_count == 1
+        finally:
+            registry.release_pending_owner(progress)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_close", [False, True])
+async def test_progress_close_retains_stalled_coroutine_when_later_drain_shortens_original_cutoff(
+    operation_store, tmp_path, monkeypatch, cancel_close
+):
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, _sdk):
+        registry = ComposerProgressRegistry()
+        actual_claim = registry.claim_request
+        entered, release = asyncio.Event(), asyncio.Event()
+        drain: list[ComposerDrainDeadline | None] = [None]
+
+        async def claim(**kwargs):
+            actual = await actual_claim(**kwargs)
+
+            async def publish(event):
+                entered.set()
+                await release.wait()
+                await actual(event)
+
+            return publish
+
+        monkeypatch.setattr(registry, "claim_request", claim)
+        progress = _progress_owner(
+            owner,
+            running,
+            registry,
+            hard_expires_at=monotonic() + 20,
+            drain_deadline=lambda: drain[0],
+        )
+        await progress.start()
+        publishing = asyncio.create_task(progress.sink(ComposerProgressEvent(phase="calling_model", headline="Owned publication")))
+        try:
+            async with asyncio.timeout(5):
+                await entered.wait()
+            drain[0] = ComposerDrainDeadline(expires_at=monotonic() + 0.05)
+            if cancel_close:
+                closing = asyncio.create_task(progress.close())
+                async with asyncio.timeout(5):
+                    while progress._closing is None:
+                        await asyncio.sleep(0)
+                closing.cancel("retained close cancellation")
+                with pytest.raises(BaseExceptionGroup) as caught_group:
+                    await closing
+                assert _cancellations(caught_group.value)
+                assert any(type(error) is ProgressCloseDeadlineExpired for error in caught_group.value.exceptions)
+            else:
+                with pytest.raises(ProgressCloseDeadlineExpired) as caught:
+                    await progress.close()
+                assert caught.value.owner is progress
+            assert progress.contained_pending and not progress.unregistered
+            assert registry.pending_owner_count == 1
+            assert type(progress.cleanup_failure) is ProgressCloseDeadlineExpired
+            assert progress.request_lease is not None
+            assert (await registry.get_latest(str(running.claim.session_id))).inflight_requests == 1
+            release.set()
+            await asyncio.gather(publishing, return_exceptions=True)
+            assert progress._closing is not None
+            async with asyncio.timeout(5):
+                await asyncio.gather(progress._closing, return_exceptions=True)
+            assert progress.unregistered
+            assert registry.pending_owner_count == 0
+            assert (await registry.get_latest(str(running.claim.session_id))).inflight_requests == 0
+        finally:
+            release.set()
+            await asyncio.gather(publishing, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_progress_owner_reconciles_late_exact_cleanup_without_erasing_original_timeout(operation_store, tmp_path, monkeypatch):
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, _sdk):
+        registry = ComposerProgressRegistry()
+        actual_finish = registry.finish_request
+        progress = _progress_owner(owner, running, registry, hard_expires_at=monotonic() + 10)
+        await progress.start()
+        authority = object.__new__(SessionComposerProgressAuthority)
+        observed: list[tuple[ProgressRequestCleanup, Future[None]]] = []
+
+        async def delayed_finish(lease, *, deadline=None, on_cleanup=None):
+            capability = ProgressRequestCleanup(authority.end_request, lease)
+            assert on_cleanup is not None
+            on_cleanup(capability)
+            native: Future[None] = Future()
+            capability.future = native
+            observed.append((capability, native))
+            raise ProgressCleanupDeadlineExpired(capability, native_pending=True)
+
+        monkeypatch.setattr(registry, "finish_request", delayed_finish)
+        with pytest.raises(ProgressCleanupDeadlineExpired) as caught:
+            await progress.close()
+        assert len(observed) == 1 and caught.value.cleanup is observed[0][0]
+        assert progress.contained_pending and not progress.unregistered
+        assert registry.pending_owner_count == 1
+        assert progress.cleanup_failure is caught.value
+        observed[0][1].set_result(None)
+        with pytest.raises(ProgressCleanupDeadlineExpired) as repeated:
+            await progress.close()
+        assert repeated.value is caught.value
+        assert progress.unregistered and progress.cleanup_failure is caught.value
+        assert registry.pending_owner_count == 0
         assert progress.request_lease is not None
         await actual_finish(progress.request_lease)

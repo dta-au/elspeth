@@ -24,7 +24,7 @@ from elspeth.web.composer.continuation_batch_data import (
 )
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
-from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
 from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -43,6 +43,7 @@ from elspeth.web.sessions.continuation_primary import (
     read_committed_primary_response_for_settlement_on_connection,
     read_committed_primary_response_on_connection,
 )
+from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, refuse_v3_tool_no_execution_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
@@ -53,6 +54,26 @@ from elspeth.web.sessions.models import composer_segment_attempts_table as attem
 from elspeth.web.sessions.time_normalization import restore_utc
 
 type BatchTransition = Literal["batch_initialized", "tool_issued", "tool_completed", "tool_preparation_completed"]
+
+
+def refuse_v3_tool_before_dispatch(
+    authority: ComposerAsyncOperationAuthority,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+) -> ToolNoExecutionRefusal:
+    """The V3 tool-ready terminal before preparation, issue or execution."""
+    if (
+        type(authority) is not ComposerAsyncOperationAuthority
+        or type(running) is not ComposerOperationRunning
+        or type(selected) is not SelectedContinuationState
+        or type(inventory) is not CurrentContinuationEnvInventory
+        or inventory.running is not running
+    ):
+        raise AuditIntegrityError("V3 tool pre-dispatch refusal lost its actual owners")
+    with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
+        return refuse_v3_tool_no_execution_on_connection(conn, running, selected=selected, inventory=inventory)
 
 
 class ToolIssueSource(ContinuationValue):
@@ -619,6 +640,11 @@ def retain_batch_transition(
         stored = load_snapshot(conn, session_id=before.logical.session_id, operation_id=before.logical.operation_id)
         if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(before):
             raise AuditIntegrityError("batch transition replaced its actual selected predecessor")
+        if (
+            transition == "tool_issued"
+            and type(decode_continuation_policy(before.admission_policy_json, before.policy_hash)) is ContinuationAdmissionPolicyV3
+        ):
+            raise AuditIntegrityError("V3 tool issue requires a complete finite result envelope before dispatch")
         response = (
             read_committed_primary_response_for_settlement_on_connection(conn, running, selected=selected, reference=frame.response)
             if transition == "tool_completed"

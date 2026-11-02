@@ -33,9 +33,10 @@ from elspeth.web.required_executor import (
     RequiredGenerationDrainExpired as RequiredGenerationDrainExpired,
 )
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
-from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
+from elspeth.web.required_work import RequiredReadProduced, RequiredWorkSource, RequiredWorkTicket
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.progress import ComposerRequestLease
     from elspeth.web.sessions.composer_operations import ComposerOperationClaim
 
 #: Threads in the process-wide worker pool.
@@ -85,6 +86,184 @@ class QueuedClaimRelease:
 
     def invoke(self) -> None:
         self.release(self.claim)
+
+
+@final
+class ProgressRequestCleanup:
+    """One exact progress token deletion during drain, never a publish grant."""
+
+    def __init__(self, end_request: Callable[[ComposerRequestLease], None], lease: ComposerRequestLease) -> None:
+        from elspeth.web.composer.progress import ComposerRequestLease
+        from elspeth.web.coordination.composer_progress_authority import SessionComposerProgressAuthority
+
+        if (
+            not isinstance(end_request, MethodType)
+            or end_request.__func__ is not SessionComposerProgressAuthority.end_request
+            or type(end_request.__self__) is not SessionComposerProgressAuthority
+            or type(lease) is not ComposerRequestLease
+        ):
+            raise AuditIntegrityError("Drain-time progress cleanup requires the bound exact-token authority deletion")
+        self.end_request, self.lease = end_request, lease
+        self.generation: RequiredExecutorGenerationCustodian | None = None
+        self.reservation: InvocationReservation | None = None
+        self.future: ConcurrentFuture[Any] | None = None
+        self.late_outcome: BaseException | None = None
+        self.late_observed = False
+        self._deadline: Callable[[], float] | None = None
+        self._late_observer: Callable[[], None] | None = None
+        self._observer_loop: asyncio.AbstractEventLoop | None = None
+
+    def set_late_observer(self, observer: Callable[[], None]) -> None:
+        if self._late_observer is not None:
+            raise AuditIntegrityError("Progress cleanup late observer was bound twice")
+        self._late_observer = observer
+        self._observer_loop = asyncio.get_running_loop()
+
+    def bind_deadline(self, deadline: Callable[[], float]) -> None:
+        if self._deadline is not None:
+            raise AuditIntegrityError("Progress cleanup deadline was bound twice")
+        self._deadline = deadline
+
+    def cutoff(self) -> float:
+        deadline = self._deadline
+        if deadline is None:
+            raise AuditIntegrityError("Progress cleanup lacks its original deadline")
+        cutoff = deadline()
+        if type(cutoff) not in (int, float) or not math.isfinite(cutoff):
+            raise AuditIntegrityError("Progress cleanup cutoff changed to a nonfinite value")
+        return cutoff
+
+    def bind(
+        self,
+        generation: RequiredExecutorGenerationCustodian,
+        reservation: InvocationReservation,
+        future: ConcurrentFuture[Any],
+    ) -> None:
+        if self.future is not None or self.generation is not None or self.reservation is not None:
+            raise AuditIntegrityError("Progress cleanup was bound twice")
+        self.generation, self.reservation, self.future = generation, reservation, future
+
+        def observe(done: ConcurrentFuture[Any]) -> None:
+            try:
+                done.result()
+            except BaseException as original:
+                self.late_outcome = original
+            self.late_observed = True
+            observer = self._late_observer
+            loop = self._observer_loop
+            if observer is not None and loop is not None:
+                loop.call_soon_threadsafe(observer)
+
+        future.add_done_callback(observe)
+
+    def observe_if_done(self) -> None:
+        future = self.future
+        if future is None or not future.done() or self.late_observed:
+            return
+        try:
+            future.result()
+        except BaseException as original:
+            self.late_outcome = original
+        self.late_observed = True
+
+    def invoke(self) -> None:
+        self.end_request(self.lease)
+
+
+@final
+class ProgressSQLInvocation:
+    """Retain the actual generation and future of one advisory progress SQL call."""
+
+    def __init__(self, method: Callable[..., Any], args: tuple[Any, ...]) -> None:
+        from elspeth.web.coordination.composer_progress_authority import SessionComposerProgressAuthority
+
+        if (
+            not isinstance(method, MethodType)
+            or type(method.__self__) is not SessionComposerProgressAuthority
+            or method.__func__
+            not in (
+                SessionComposerProgressAuthority.begin_request,
+                SessionComposerProgressAuthority.heartbeat_request,
+                SessionComposerProgressAuthority.bind_request,
+                SessionComposerProgressAuthority.publish,
+            )
+            or type(args) is not tuple
+        ):
+            raise AuditIntegrityError("Progress SQL invocation requires an exact bound authority method")
+        self.method = method
+        self.args = args
+        self.generation: RequiredExecutorGenerationCustodian | None = None
+        self.reservation: InvocationReservation | None = None
+        self.future: ConcurrentFuture[Any] | None = None
+        self.late_outcome: Any | BaseException | None = None
+        self.late_observed = False
+        self._deadline: Callable[[], float] | None = None
+
+    def bind_deadline(self, deadline: Callable[[], float]) -> None:
+        if self._deadline is not None:
+            raise AuditIntegrityError("Progress SQL deadline was bound twice")
+        self._deadline = deadline
+
+    def cutoff(self) -> float:
+        deadline = self._deadline
+        if deadline is None:
+            raise AuditIntegrityError("Progress SQL lacks its original deadline")
+        cutoff = deadline()
+        if type(cutoff) not in (int, float) or not math.isfinite(cutoff):
+            raise AuditIntegrityError("Progress SQL cutoff changed to a nonfinite value")
+        return cutoff
+
+    def invoke(self) -> Any:
+        return self.method(*self.args)
+
+    def bind(
+        self,
+        generation: RequiredExecutorGenerationCustodian,
+        reservation: InvocationReservation,
+        future: ConcurrentFuture[Any],
+    ) -> None:
+        if self.future is not None or self.generation is not None or self.reservation is not None:
+            raise AuditIntegrityError("Progress SQL invocation was bound twice")
+        self.generation, self.reservation, self.future = generation, reservation, future
+
+        def observe(done: ConcurrentFuture[Any]) -> None:
+            try:
+                self.late_outcome = done.result()
+            except BaseException as original:
+                self.late_outcome = original
+            self.late_observed = True
+
+        future.add_done_callback(observe)
+
+    def observe_if_done(self) -> None:
+        future = self.future
+        if future is None or not future.done() or self.late_observed:
+            return
+        try:
+            self.late_outcome = future.result()
+        except BaseException as original:
+            self.late_outcome = original
+        self.late_observed = True
+
+
+@final
+class ProgressSQLDeadlineExpired(TimeoutError):
+    """The original Progress deadline expired with its actual SQL custody retained."""
+
+    def __init__(self, invocation: ProgressSQLInvocation, *, native_pending: bool) -> None:
+        super().__init__("Progress SQL exceeded its original segment/drain deadline")
+        self.invocation = invocation
+        self.native_pending = native_pending
+
+
+@final
+class ProgressCleanupDeadlineExpired(TimeoutError):
+    """Exact-token cleanup remains owned after the original cutoff."""
+
+    def __init__(self, cleanup: ProgressRequestCleanup, *, native_pending: bool) -> None:
+        super().__init__("Progress cleanup exceeded its original segment/drain deadline")
+        self.cleanup = cleanup
+        self.native_pending = native_pending
 
 
 _SHARED_EXECUTOR: ThreadPoolExecutor | None = None
@@ -160,16 +339,35 @@ def _submission_unavailable(
     *,
     claim_release: QueuedClaimRelease | None = None,
     watch_reader: ComposerOperationWatchReader | None = None,
+    progress_cleanup: ProgressRequestCleanup | None = None,
 ) -> bool:
     _assert_recovery_registered()
     if finalizer is not None and (_APPLICATION_FINALIZER_OWNER is None or not _APPLICATION_FINALIZER_OWNER.owns_claimed(finalizer)):
         raise AuditIntegrityError("Invalid application finalizer authority")
-    if claim_release is not None and (type(claim_release) is not QueuedClaimRelease or ticket is not None or finalizer is not None):
+    if claim_release is not None and (
+        type(claim_release) is not QueuedClaimRelease
+        or ticket is not None
+        or finalizer is not None
+        or watch_reader is not None
+        or progress_cleanup is not None
+    ):
         raise AuditIntegrityError("Invalid drain-time claim release authority")
     if watch_reader is not None and (
-        type(watch_reader) is not ComposerOperationWatchReader or ticket is not None or finalizer is not None or claim_release is not None
+        type(watch_reader) is not ComposerOperationWatchReader
+        or ticket is not None
+        or finalizer is not None
+        or claim_release is not None
+        or progress_cleanup is not None
     ):
         raise AuditIntegrityError("Invalid drain-time operation observation authority")
+    if progress_cleanup is not None and (
+        type(progress_cleanup) is not ProgressRequestCleanup
+        or ticket is not None
+        or finalizer is not None
+        or claim_release is not None
+        or watch_reader is not None
+    ):
+        raise AuditIntegrityError("Invalid drain-time progress cleanup authority")
     allowed_finalizer = (
         finalizer is not None and _APPLICATION_FINALIZER_OWNER is not None and _APPLICATION_FINALIZER_OWNER.owns_claimed(finalizer)
     )
@@ -177,6 +375,7 @@ def _submission_unavailable(
         _INSTANCE_DRAINING.is_set()
         and not allowed_finalizer
         and claim_release is None
+        and progress_cleanup is None
         and (ticket is None or not ticket.permits_process_drain)
         and (watch_reader is None or not watch_reader.permits_process_drain(_INSTANCE_DRAINING))
     )
@@ -189,9 +388,12 @@ def _generation_for(
     *,
     claim_release: QueuedClaimRelease | None = None,
     watch_reader: ComposerOperationWatchReader | None = None,
+    progress_cleanup: ProgressRequestCleanup | None = None,
 ) -> RequiredExecutorGenerationCustodian:
     global _GENERATION_COUNTER, _GENERATION_CUSTODIAN
-    if _submission_unavailable(ticket, finalizer, claim_release=claim_release, watch_reader=watch_reader):
+    if _submission_unavailable(
+        ticket, finalizer, claim_release=claim_release, watch_reader=watch_reader, progress_cleanup=progress_cleanup
+    ):
         raise RequiredGenerationUnavailable("Shared executor lifecycle unavailable")
     callback = _RECOVERY_CALLBACK
     if callback is None:
@@ -228,12 +430,27 @@ async def _submit_shared[T](
     deferred_cancellations: list[asyncio.CancelledError] | None = None,
     watch_reader: ComposerOperationWatchReader | None = None,
     claim_release: QueuedClaimRelease | None = None,
+    progress_cleanup: ProgressRequestCleanup | None = None,
+    progress_sql: ProgressSQLInvocation | None = None,
 ) -> ConcurrentFuture[T]:
+    if progress_sql is not None and (
+        type(progress_sql) is not ProgressSQLInvocation
+        or ticket is not None
+        or finalizer is not None
+        or watch_reader is not None
+        or claim_release is not None
+        or progress_cleanup is not None
+        or type(callable_) is not MethodType
+        or callable_.__self__ is not progress_sql
+        or callable_.__func__ is not ProgressSQLInvocation.invoke
+    ):
+        raise AuditIntegrityError("Progress SQL dispatch changed its prebound authority invocation")
     if claim_release is not None and (
         type(claim_release) is not QueuedClaimRelease
         or ticket is not None
         or finalizer is not None
         or watch_reader is not None
+        or progress_cleanup is not None
         or type(callable_) is not MethodType
         or callable_.__self__ is not claim_release
         or callable_.__func__ is not QueuedClaimRelease.invoke
@@ -243,11 +460,24 @@ async def _submit_shared[T](
         type(watch_reader) is not ComposerOperationWatchReader
         or ticket is not None
         or finalizer is not None
+        or claim_release is not None
+        or progress_cleanup is not None
         or type(callable_) is not MethodType
         or callable_.__self__ is not watch_reader
         or callable_.__func__ is not ComposerOperationWatchReader.invoke
     ):
         raise AuditIntegrityError("Operation observation dispatch is not its prebound read")
+    if progress_cleanup is not None and (
+        type(progress_cleanup) is not ProgressRequestCleanup
+        or ticket is not None
+        or finalizer is not None
+        or watch_reader is not None
+        or claim_release is not None
+        or type(callable_) is not MethodType
+        or callable_.__self__ is not progress_cleanup
+        or callable_.__func__ is not ProgressRequestCleanup.invoke
+    ):
+        raise AuditIntegrityError("Progress cleanup dispatch changed its prebound exact-token deletion")
     if finalizer is not None and (
         type(finalizer) is not ApplicationFinalizerCapability
         or type(callable_) is not MethodType
@@ -258,10 +488,13 @@ async def _submit_shared[T](
     loop = asyncio.get_running_loop()
     try:
         executor = _get_shared_executor()
-        generation = (
-            _generation_for(executor, ticket, finalizer, watch_reader=watch_reader)
-            if claim_release is None
-            else _generation_for(executor, claim_release=claim_release)
+        generation = _generation_for(
+            executor,
+            ticket,
+            finalizer,
+            watch_reader=watch_reader,
+            claim_release=claim_release,
+            progress_cleanup=progress_cleanup,
         )
         if watch_reader is not None:
             watch_reader.pin_generation(executor, generation)
@@ -304,9 +537,13 @@ async def _submit_shared[T](
     with generation.submission_lock:
         try:
             if generation.state != "active" or _submission_unavailable(
-                ticket, finalizer, claim_release=claim_release, watch_reader=watch_reader
+                ticket, finalizer, claim_release=claim_release, watch_reader=watch_reader, progress_cleanup=progress_cleanup
             ):
                 raise RequiredGenerationUnavailable("Shared executor generation quarantined")
+            if progress_sql is not None and time.monotonic() >= progress_sql.cutoff():
+                raise ProgressSQLDeadlineExpired(progress_sql, native_pending=False)
+            if progress_cleanup is not None and progress_cleanup._deadline is not None and time.monotonic() >= progress_cleanup.cutoff():
+                raise ProgressCleanupDeadlineExpired(progress_cleanup, native_pending=False)
             if watch_reader is not None:
                 _assert_current_watch_generation(watch_reader, executor, generation)
         except BaseException as failure:
@@ -331,6 +568,10 @@ async def _submit_shared[T](
         else:
             reservation.future = future
             try:
+                if progress_sql is not None:
+                    progress_sql.bind(generation, reservation, future)
+                if progress_cleanup is not None:
+                    progress_cleanup.bind(generation, reservation, future)
                 if finalizer is not None:
                     finalizer._bind_physical_future(_FINALIZER_PHYSICAL_ISSUER_SEAL, future)
                 if ticket is not None:
@@ -474,6 +715,41 @@ def _validate_finish_once_ticket(ticket: RequiredWorkTicket) -> None:
         raise TypeError("Required SQL needs an owned ticket")
     if ticket.complete:
         raise AuditIntegrityError("Completed required SQL ticket cannot be reused")
+
+
+async def run_required_read_finish_once[T](
+    ticket: RequiredWorkTicket,
+    produce: Callable[[], RequiredReadProduced],
+    finish: Callable[[RequiredReadProduced], T],
+) -> RequiredSQLFinishOnce[T]:
+    """Join an actual prepared read and its late result in one physical job."""
+    from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+    from elspeth.web.sessions.locking import _READ_RESULT_ISSUER_SEAL, continuation_read_result_deadline_scope
+
+    _validate_finish_once_ticket(ticket)
+    owner = ticket.sql_deadline_owner
+    if ticket.key.source is not RequiredWorkSource.CONTINUATION_READ_RESULT_SQL or owner is None:
+        raise AuditIntegrityError("Owned read finish requires its exact registered read-result ticket")
+    clock = owner.capture_read_result_deadline()
+
+    def execute_owned() -> T:
+        # The source grants no process-drain admission. Also refuse a queued
+        # producer whose original action expired or whose process began drain.
+        if owner.capture_read_result_deadline() != clock:
+            raise AuditIntegrityError("Queued read changed its original action timing")
+        if owner.drain_signal.started_at is not None or owner.remaining_dispatch(monotonic_now=time.monotonic()) <= 0:
+            raise TimeoutError("Read producer exhausted its original dispatch deadline")
+        produced = produce()
+        if type(produced) is not RequiredReadProduced:
+            raise AuditIntegrityError("Read producer returned no actual owned result")
+        with continuation_read_result_deadline_scope(ticket, produced, clock, issuer=_READ_RESULT_ISSUER_SEAL):
+            return finish(produced)
+
+    def execute() -> T:
+        with retention_stage_memo_scope():
+            return execute_owned()
+
+    return await run_required_sql_finish_once(ticket, execute)
 
 
 async def run_required_sql_finish_once[**P, T](
@@ -766,6 +1042,82 @@ async def run_claim_release_in_worker(release: QueuedClaimRelease) -> None:
         raise AuditIntegrityError("Claim release requires its owned drain-time capability")
     concurrent_future = await _submit_shared(release.invoke, claim_release=release)
     await _await_worker_future(concurrent_future, cancel_queued=True)
+
+
+async def run_progress_cleanup_in_worker(cleanup: ProgressRequestCleanup, *, deadline: Callable[[], float] | None = None) -> None:
+    """Delete one exact progress request token during process drain."""
+    if type(cleanup) is not ProgressRequestCleanup:
+        raise AuditIntegrityError("Progress cleanup requires its owned exact-token capability")
+    if deadline is not None:
+        cleanup.bind_deadline(deadline)
+        if time.monotonic() >= cleanup.cutoff():
+            raise ProgressCleanupDeadlineExpired(cleanup, native_pending=False)
+    concurrent_future = await _submit_shared(cleanup.invoke, progress_cleanup=cleanup)
+    if deadline is None:
+        await _await_worker_future(concurrent_future, cancel_queued=True)
+        return
+    try:
+        while not concurrent_future.done():
+            remaining = cleanup.cutoff() - time.monotonic()
+            if remaining <= 0:
+                if concurrent_future.cancel():
+                    raise ProgressCleanupDeadlineExpired(cleanup, native_pending=False)
+                if concurrent_future.done():
+                    return concurrent_future.result()
+                generation = cleanup.generation
+                if generation is None:
+                    raise AuditIntegrityError("Progress cleanup lost its registered executor generation")
+                generation.quarantine()
+                raise ProgressCleanupDeadlineExpired(cleanup, native_pending=True)
+            await asyncio.sleep(min(0.01, remaining))
+    except asyncio.CancelledError as original:
+        if not concurrent_future.done() and not concurrent_future.cancel():
+            if concurrent_future.done():
+                cleanup.observe_if_done()
+            else:
+                generation = cleanup.generation
+                if generation is None:
+                    raise AuditIntegrityError("Cancelled Progress cleanup lost its registered generation") from original
+                generation.quarantine()
+        raise
+    concurrent_future.result()
+
+
+async def run_progress_sql_in_worker(invocation: ProgressSQLInvocation, *, deadline: Callable[[], float]) -> Any:
+    """Observe one exact Progress SQL future until completion or its original cutoff."""
+    if type(invocation) is not ProgressSQLInvocation:
+        raise AuditIntegrityError("Progress SQL requires its owned authority invocation")
+    invocation.bind_deadline(deadline)
+    cutoff = invocation.cutoff()
+    if time.monotonic() >= cutoff:
+        raise ProgressSQLDeadlineExpired(invocation, native_pending=False)
+    future = await _submit_shared(invocation.invoke, progress_sql=invocation)
+    try:
+        while not future.done():
+            cutoff = invocation.cutoff()
+            remaining = cutoff - time.monotonic()
+            if remaining <= 0:
+                if future.cancel():
+                    raise ProgressSQLDeadlineExpired(invocation, native_pending=False)
+                if future.done():
+                    return future.result()
+                generation = invocation.generation
+                if generation is None:
+                    raise AuditIntegrityError("Progress SQL lost its registered executor generation")
+                generation.quarantine()
+                raise ProgressSQLDeadlineExpired(invocation, native_pending=True)
+            await asyncio.sleep(min(0.01, remaining))
+    except asyncio.CancelledError as original:
+        if not future.done() and not future.cancel():
+            if future.done():
+                invocation.observe_if_done()
+            else:
+                generation = invocation.generation
+                if generation is None:
+                    raise AuditIntegrityError("Cancelled Progress SQL lost its registered generation") from original
+                generation.quarantine()
+        raise
+    return future.result()
 
 
 async def run_stream_read_in_worker[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:

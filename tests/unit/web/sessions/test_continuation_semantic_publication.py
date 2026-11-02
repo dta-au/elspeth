@@ -1,0 +1,177 @@
+"""A real reviewed result and paid whole Stop bind the terminal SQL composite."""
+
+import json
+from contextlib import asynccontextmanager
+from dataclasses import asdict, replace
+from functools import partial
+from uuid import UUID, uuid4
+
+import litellm
+import pytest
+from sqlalchemy import select
+
+from elspeth.contracts.composer_content import ComposerContentScope
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
+from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
+from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
+from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.continuation_semantic_advisor import prepare_semantic_advisor_request
+from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
+from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.sessions.composer_finalization import _message_with_state_response
+from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite, ComposerOperationCancelledDuringTurn
+from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.continuation_semantic_actions import (
+    install_semantic_action_on_connection,
+    require_semantic_publication_on_connection,
+)
+from elspeth.web.sessions.continuation_semantic_advisor import (
+    consume_semantic_advisor_whole_stop_on_connection,
+    read_semantic_advisor_retained_inputs_on_connection,
+    retain_semantic_advisor_outcome_on_connection,
+)
+from elspeth.web.sessions.continuation_semantic_review_result import retain_semantic_review_result_on_connection
+from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import chat_messages_table as messages
+from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
+from tests.unit.web.sessions import test_continuation_end_shared_execution as shared_fixture
+from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
+
+operation_store = shared_fixture.operation_store
+
+
+@asynccontextmanager
+async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
+    async with shared_fixture.actual_shared_end_case(store, tmp_path, monkeypatch) as case:
+        running, execution = case["running"], case["execution"]
+        service, authority = case["phases"].service, case["phases"].authority
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        with locked_session_transaction(store[0], sid) as conn:
+            dispatched = load_snapshot(conn, session_id=sid, operation_id=operation)
+            reviewed = retain_semantic_review_result_on_connection(
+                conn,
+                running,
+                selected=dispatched,
+                semantic_effect_key=case["semantic_effect_key"],
+                execution=execution,
+                captured=case["captured"],
+            )
+            retained_inputs = read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=reviewed)
+        selected = await load_selected_continuation(authority=authority, running=running, selected=reviewed, required_work=case["work"])
+        inventory = await materialize_continuation_env_inventory(
+            advisor=service._advisor_checkpoint, authority=authority, selected=selected, required_work=case["work"]
+        )
+        runtime = await restore_continuation_runtime(
+            service=service,
+            authority=authority,
+            selected=selected,
+            inventory=inventory,
+            required_work=case["work"],
+            provider_owner=case["provider"],
+            progress=execution.runtime.bindings.progress,
+        )
+        invocation = make_semantic_advisor_invocation(capture_semantic_advisor_source(runtime))
+        request = prepare_semantic_advisor_request(
+            owner=service._advisor_checkpoint,
+            provider_owner=case["provider"],
+            source=invocation.invocation,
+            frontier=invocation.frontier,
+            state=runtime.live.state,
+            content_scope=ComposerContentScope(running.claim.session_id, composition_content_hash(runtime.live.state)),
+            user_message=runtime.bindings.message,
+            runtime=runtime,
+            env_ref_names=runtime.env_ref_names,
+            retained_inputs=retained_inputs,
+        )
+        original_request = next(item for item in request.frontier.obligations if item.obligation_id == "request")
+        answer = semantic_fixture._answer(request)
+        answer.update(
+            decision="STOP_CONFIRMED",
+            reason="The real reviewed result completes the original request.",
+            remaining_actionable_ids=[],
+            prescribed_action=None,
+            obligations=[{**asdict(original_request), "status": "satisfied"}],
+        )
+        stop_sdk = []
+
+        async def complete_stop(**kwargs):
+            stop_sdk.append(kwargs)
+            return semantic_fixture._reply(json.dumps(answer))
+
+        monkeypatch.setattr(litellm, "acompletion", complete_stop)
+        stop_case = {
+            **case,
+            "runtime": runtime,
+            "recorder": runtime.live.recorder,
+            "invocation": invocation,
+            "request": request,
+            "clock": ContinuationActionClock(runtime.source.policy.actions.advisor),
+        }
+        issuer, prepared, dispatched = semantic_fixture._begin(store, stop_case)
+        observed = await semantic_fixture._invoke(stop_case, issuer)
+        with locked_session_transaction(store[0], sid) as conn:
+            paid = retain_semantic_advisor_outcome_on_connection(
+                conn, prepared, selected=dispatched, outcome=observed, recorder=runtime.live.recorder, issuer=issuer
+            )
+            installed = install_semantic_action_on_connection(conn, running, selected=paid.snapshot, effect_key=prepared.binding.effect_key)
+            consumed = consume_semantic_advisor_whole_stop_on_connection(
+                conn, running, selected=installed, effect_key=prepared.binding.effect_key
+            )
+            proof = require_semantic_publication_on_connection(conn, running, selected=consumed)
+            assert proof is not None
+        assert len(stop_sdk) == 1
+        original = proof.review_result.result
+        result = replace(original, llm_calls=(*original.llm_calls, proof.admission.paid.audit_call))
+        yield {**case, "publication": consumed, "publication_proof": proof, "publication_result": result}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("none", "result", "assistant", "missing_result", "public_stop"))
+async def test_actual_whole_stop_binds_terminal_result_and_rolls_back_substitution(operation_store, tmp_path, monkeypatch, change):
+    async with actual_semantic_publication_case(operation_store, tmp_path, monkeypatch) as case:
+        running, phases = case["running"], case["phases"]
+        service = phases.service._require_sessions_service()
+        original = case["publication_result"]
+        actual = replace(original, message="A different result was substituted.") if change == "result" else original
+        draft = composer_turn_end_assistant_row(actual)
+        if change == "public_stop":
+            stopped = phases.authority.request_owner_cancel(
+                session_id=running.claim.session_id,
+                operation_id=running.claim.operation_id,
+                actor_user_id=case["execution"].runtime.bindings.user_id,
+                auth_provider_type="local",
+            )
+            assert stopped is not None and stopped.cancel_requested_at is not None
+        with operation_store[0].connect() as conn:
+            before = semantic_fixture._rows_on_connection(conn)
+            assistants_before = tuple(conn.execute(select(messages.c.id).where(messages.c.role == "assistant")))
+
+        async def finish():
+            return await service.complete_composer_async_operation(
+                running,
+                assistant=ComposerOperationAssistantWrite(
+                    message_id=uuid4(),
+                    content="Foreign assistant words." if change == "assistant" else draft.content,
+                    raw_content=draft.raw_content,
+                    composition_state_id=None if original.final_persisted_state_id is None else UUID(original.final_persisted_state_id),
+                ),
+                assistant_record=None,
+                audit_cohort=(),
+                audit_composition_state_id=None,
+                required_work=case["work"].coordinator,
+                provider_audit_calls=original.llm_calls,
+                publication_result=None if change == "missing_result" else actual,
+                build_response=partial(_message_with_state_response, state_response=None, live_validation=None),
+            )
+
+        if change == "none":
+            terminal = await finish()
+            assert terminal.status == "completed" and terminal.result.message.content == draft.content
+        else:
+            with pytest.raises((AuditIntegrityError, ComposerOperationCancelledDuringTurn)):
+                await finish()
+            with operation_store[0].connect() as conn:
+                assert semantic_fixture._rows_on_connection(conn) == before
+                assert tuple(conn.execute(select(messages.c.id).where(messages.c.role == "assistant"))) == assistants_before

@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 import threading
 import time
+from dataclasses import dataclass
+from typing import final
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -28,6 +30,16 @@ from elspeth.web.sessions.composer_drain import (
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class ContinuationReadResultDeadline:
+    """Snapshot of original finite read timing, never permission to read/write."""
+
+    owner: ContinuationSQLDeadlineOwner
+    action_expires_at: float
+    expires_at: float
+
+
 class ContinuationSQLDeadlineOwner:
     running: ComposerOperationRunning
     policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3
@@ -39,6 +51,7 @@ class ContinuationSQLDeadlineOwner:
     _action_expires_at: float
     _settlement_expires_at: float
     _settling: bool
+    _active_action: ContinuationActionPolicy | None
     _lock: threading.RLock
 
     def __init__(
@@ -72,6 +85,7 @@ class ContinuationSQLDeadlineOwner:
         self._action_expires_at = self.hard_expires_at
         self._settlement_expires_at = self.hard_expires_at
         self._settling = False
+        self._active_action = None
         self._lock = threading.RLock()
 
     def validate_context(self, context: SessionOperationContext, *, operation_id: str | None, attempt: int | None) -> None:
@@ -100,6 +114,7 @@ class ContinuationSQLDeadlineOwner:
         ):
             raise AuditIntegrityError("SQL timing substituted an unretained action or clock")
         with self._lock:
+            self._active_action = action
             self._action_expires_at = min(self.hard_expires_at, started_at + action.total)
             self._settlement_expires_at = min(self.hard_expires_at, self._action_expires_at + self.policy.segment.reserve)
             self._settling = False
@@ -110,6 +125,12 @@ class ContinuationSQLDeadlineOwner:
         # change the business-action clock. This grants no write authority.
         with self._lock:
             self._settling = True
+
+    def capture_read_result_deadline(self) -> ContinuationReadResultDeadline:
+        with self._lock:
+            if self._active_action is not self.policy.actions.read:
+                raise AuditIntegrityError("Read result timing requires the original begun read action")
+            return ContinuationReadResultDeadline(self, self._action_expires_at, self._settlement_expires_at)
 
     def remaining_action(self, *, monotonic_now: float) -> float:
         """Observe the original action/hard/drain bound for a nested action."""
@@ -137,6 +158,7 @@ class ContinuationSQLDeadlineOwner:
         deadline: ComposerDrainDeadline | None = None,
         lifecycle: bool = False,
         paid_settlement: bool = False,
+        read_result: ContinuationReadResultDeadline | None = None,
     ) -> float:
         if session_id != str(self.running.claim.session_id):
             raise AuditIntegrityError("SQL timing cannot cover another session")
@@ -144,9 +166,27 @@ class ContinuationSQLDeadlineOwner:
             raise AuditIntegrityError("SQL timing cannot combine paid settlement with lifecycle scope")
         now = time.monotonic()
         with self._lock:
+            if read_result is not None and (
+                type(read_result) is not ContinuationReadResultDeadline
+                or read_result.owner is not self
+                or self._active_action is not self.policy.actions.read
+                or lifecycle
+                or paid_settlement
+                or read_result.action_expires_at != self._action_expires_at
+                or read_result.expires_at != self._settlement_expires_at
+            ):
+                raise AuditIntegrityError("Read disposition changed its original action timing")
             settlement = paid_settlement or self._settling
-            disposition = lifecycle or settlement
-            expires_at = self.hard_expires_at if lifecycle else self._settlement_expires_at if settlement else self._action_expires_at
+            disposition = lifecycle or settlement or read_result is not None
+            expires_at = (
+                read_result.expires_at
+                if read_result is not None
+                else self.hard_expires_at
+                if lifecycle
+                else self._settlement_expires_at
+                if settlement
+                else self._action_expires_at
+            )
         signal_start = self.drain_signal.started_at
         statement_cap = self.statement_cap
         if signal_start is not None:

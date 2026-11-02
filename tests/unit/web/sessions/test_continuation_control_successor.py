@@ -125,7 +125,16 @@ async def test_paid_control_yields_once_then_cold_primary_sees_original_call_and
                 else:
                     original.add_note(f"G1 timeout owners (no payload): {observed!r}")
             raise
-        assert snapshot.status == "completed", snapshot.error
+        try:
+            assert snapshot.status == "completed", snapshot.error
+        except AssertionError as original:
+            try:
+                observed = probe.capture()
+            except Exception as diagnostic_failure:
+                original.add_note(f"G1 terminal observation failed: {_capture_error(diagnostic_failure)!r}")
+            else:
+                original.add_note(f"G1 terminal owners (no payload): {observed!r}")
+            raise
         assert snapshot.result is not None
         assert [request["role"] for request in sdk.requests] == ["primary"] * (3 if prior_read else 2) + ["end"]
         assert not sdk.steps

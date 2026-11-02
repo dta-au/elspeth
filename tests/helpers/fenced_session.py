@@ -40,14 +40,23 @@ class FencedSessionWithPolicy:
     container_policy_id: str
 
 
-def seed_token_policies(conn: Connection, *, identity_id: str) -> tuple[str, str]:
-    """Insert one active identity policy and one active container ceiling; return their ids."""
+def seed_token_policies(
+    conn: Connection,
+    *,
+    identity_id: str,
+    identity_tokens_per_day: int = IDENTITY_TOKENS_PER_DAY,
+    container_tokens_per_day: int = CONTAINER_TOKENS_PER_DAY,
+) -> tuple[str, str]:
+    """Insert real fixture policies, retaining the small accounting-test defaults."""
+    for limit in (identity_tokens_per_day, container_tokens_per_day):
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("fixture token policy requires an exact positive integer")
     set_at = datetime(2026, 9, 1, tzinfo=UTC)
     conn.execute(
         insert(quota_policies_table).values(
             policy_id="quota-identity",
             identity_id=identity_id,
-            tokens_per_day=IDENTITY_TOKENS_PER_DAY,
+            tokens_per_day=identity_tokens_per_day,
             storage_bytes=1_000_000,
             set_by_actor="operator",
             set_by_identity_id=None,
@@ -58,7 +67,7 @@ def seed_token_policies(conn: Connection, *, identity_id: str) -> tuple[str, str
         insert(quota_policies_table).values(
             policy_id="quota-container",
             identity_id=None,
-            tokens_per_day=CONTAINER_TOKENS_PER_DAY,
+            tokens_per_day=container_tokens_per_day,
             storage_bytes=10_000_000,
             set_by_actor="config",
             set_by_identity_id=None,

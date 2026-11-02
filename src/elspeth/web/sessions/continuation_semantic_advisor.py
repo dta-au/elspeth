@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy import Connection, Row, insert, select, update
@@ -17,10 +18,14 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCal
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.readonly_json import JsonValue
 from elspeth.web.composer.advisor_output import (
     ContinuationAdvisorDecision,
+    ContinuationEvidenceRef,
     PrescribedContinuationAction,
+    PrimaryContinuationAction,
+    ReviewContinuationAction,
     parse_continuation_advisor_decision,
 )
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
@@ -30,6 +35,7 @@ from elspeth.web.composer.continuation import (
     ContinuationActionSource,
     ContinuationFrameStack,
     ContinuationValue,
+    EndFrame,
     PrivateChunkRef,
 )
 from elspeth.web.composer.continuation_advisor import (
@@ -41,24 +47,34 @@ from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     decode_continuation_response,
     decode_continuation_snapshot,
+    decode_frontier_chunk,
     decode_retained_physical_audit_call,
     encode_continuation_snapshot,
     encode_continuation_text_response,
+    encode_frontier_chunk,
     encode_private_chunk,
     verify_private_chunk,
 )
+from elspeth.web.composer.continuation_end_values import EndContinuationCandidate, decode_end_candidate, encode_end_candidate
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence
+from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence, state_from_evidence_json
 from elspeth.web.composer.continuation_evidence_application_data import append_primary_call_to_evidence
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
-from elspeth.web.composer.continuation_progress import retain_advisor_action
+from elspeth.web.composer.continuation_progress import continuation_action_key, decode_prescribed_continuation_action, retain_advisor_action
 from elspeth.web.composer.continuation_provider_outcomes import (
     decode_physical_audit_call,
     encode_physical_audit_call,
     require_successful_response_audit,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
-from elspeth.web.composer.continuation_semantic_advisor import PreparedSemanticAdvisorRequest, _SemanticAdvisorOptions
+from elspeth.web.composer.continuation_semantic_advisor import (
+    PreparedSemanticAdvisorRequest,
+    SemanticAdvisorReadInput,
+    SemanticAdvisorRetainedInputs,
+    SemanticAdvisorReviewInput,
+    _SemanticAdvisorOptions,
+    semantic_retained_json,
+)
 from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationRaised, SemanticAdvisorInvocationReturned
 from elspeth.web.composer.continuation_semantic_invocation import SemanticAdvisorInvocationData, make_semantic_advisor_invocation
 from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer, SemanticAdvisorNoSdkRefusalPermit
@@ -66,12 +82,13 @@ from elspeth.web.composer.continuation_semantic_source import RawSemanticAdvisor
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource, provider_attempt_audit_drafts_for_source
 from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.composer.turn_effects import authored_state_hash
 from elspeth.web.coordination.quota_authority import (
     _undispatched_cancellation_event_id,
     _usage_entry_id,
     token_usage_entry_from_llm_call_envelope,
 )
-from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+from elspeth.web.sessions.composer_operations import ComposerOperationRecord, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
     ContinuationEvent,
@@ -82,12 +99,15 @@ from elspeth.web.sessions.continuation import (
     _owed_continuation_p4_active,
     _require_current_continuation_running,
     append_complete_snapshot,
+    bound_action_json,
+    load_snapshot,
     private_chunk_key,
     put_chunk,
     read_chunk,
     require_snapshot_cas,
 )
-from elspeth.web.sessions.continuation_runtime import read_runtime_source_on_connection
+from elspeth.web.sessions.continuation_primary import read_original_committed_primary_response_data_on_connection
+from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource, read_runtime_source_on_connection
 from elspeth.web.sessions.continuation_selection import load_private_chunks
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
@@ -209,6 +229,29 @@ class SemanticAdvisorDecisionData:
     action: PrescribedContinuationAction | None
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticAdvisorPaidDecisionData:
+    """Original paid DATA observed under current admission, never a writer grant."""
+
+    selected: StoredContinuationSnapshot
+    paid_root: ContinuationFrameStack
+    invocation: SemanticAdvisorInvocationData
+    decision: ContinuationAdvisorDecision
+    decision_json: str
+    decision_sha256: str
+    source: ContinuationActionSource
+    audit_call: ComposerLLMCall
+    session_id: UUID
+    operation_id: str
+    claim_attempt: int
+    operation_epoch: int
+    creator_sequence: int
+    creator_generation: int
+    creator_operation_id: str
+    creator_operation_epoch: int
+    creator_lease_token: str = field(repr=False)
+
+
 def _canonical(value: ContinuationValue) -> str:
     return canonical_json(value.model_dump(mode="json"))
 
@@ -263,6 +306,71 @@ def _current(conn: Connection, running: ComposerOperationRunning, selected: Stor
     return root
 
 
+def _current_original_paid_finish(
+    conn: Connection,
+    prepared: PreparedContinuationProvider,
+    selected: StoredContinuationSnapshot,
+    outcome: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised,
+    issuer: SemanticAdvisorNoSdkIssuer,
+) -> ContinuationFrameStack:
+    """Only the original completed physical owner may finish after Stop/expiry.
+
+    This is not an action admission or an owed-P4 capability. Original minted
+    custody and the sealed actual outcome precede the narrower fenced read;
+    all physical accounting, recorder and complete source checks still run
+    before retention writes.
+    """
+    if type(issuer) is not SemanticAdvisorNoSdkIssuer or issuer.running is not prepared.binding.running:
+        raise AuditIntegrityError("Semantic paid finish requires its original nominal issuer/running owner")
+    issuer.require_original_paid_outcome(prepared, selected, outcome)
+    observed = outcome.observation
+    if not observed.sdk_entered or not observed.recorder_completed or observed.audit_call is None or observed.attempt is None:
+        raise AuditIntegrityError("Semantic paid finish cannot borrow authority from a status-only observation")
+    running = prepared.binding.running
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    if _owed_continuation_p4_active(conn, running.session_operation_context):
+        raise AuditIntegrityError("Semantic paid finish cannot borrow owed P4 authority")
+    if type(selected) is not StoredContinuationSnapshot:
+        raise AuditIntegrityError("Semantic paid finish requires its exact original selected DATA")
+    actual = require_snapshot_cas(
+        conn,
+        session_id=str(running.claim.session_id),
+        operation_id=running.claim.operation_id,
+        expected_checkpoint_id=selected.checkpoint_id,
+        expected_cursor=selected.cursor,
+    )
+    if actual != selected:
+        raise ContinuationCASConflict("Semantic paid finish substituted its complete original dispatched root")
+    root = decode_continuation_snapshot(actual.payload_json)
+    if (root.logical.session_id, root.logical.operation_id) != (str(running.claim.session_id), running.claim.operation_id):
+        raise AuditIntegrityError("Semantic paid finish changed its exact logical owner")
+    return root
+
+
+def _current_original_no_sdk_finish(conn: Connection, permit: SemanticAdvisorNoSdkRefusalPermit) -> ContinuationFrameStack:
+    """Finish only the original proved unentered/cancelled physical owner."""
+    permit.issuer.require_refusal_permit(permit)
+    running = permit.prepared.binding.running
+    if permit.issuer.running is not running:
+        raise AuditIntegrityError("Semantic no-SDK finish changed its original running owner")
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    if _owed_continuation_p4_active(conn, running.session_operation_context):
+        raise AuditIntegrityError("Semantic no-SDK finish cannot borrow owed P4 authority")
+    actual = require_snapshot_cas(
+        conn,
+        session_id=str(running.claim.session_id),
+        operation_id=running.claim.operation_id,
+        expected_checkpoint_id=permit.dispatched.checkpoint_id,
+        expected_cursor=permit.dispatched.cursor,
+    )
+    if actual != permit.dispatched:
+        raise ContinuationCASConflict("Semantic no-SDK finish substituted its complete original dispatched root")
+    root = decode_continuation_snapshot(actual.payload_json)
+    if (root.logical.session_id, root.logical.operation_id) != (str(running.claim.session_id), running.claim.operation_id):
+        raise AuditIntegrityError("Semantic no-SDK finish changed its exact logical owner")
+    return root
+
+
 def _parent(root: ContinuationFrameStack) -> ComposeFrame:
     frame = root.frames[0]
     if type(frame) is not ComposeFrame or sum(type(item) is ComposeFrame for item in root.frames) != 1:
@@ -272,9 +380,92 @@ def _parent(root: ContinuationFrameStack) -> ComposeFrame:
 
 def _advisor(root: ContinuationFrameStack) -> AdvisorFrame:
     frame = root.frames[-1]
-    if len(root.frames) != 2 or type(frame) is not AdvisorFrame:
+    if (
+        type(frame) is not AdvisorFrame
+        or len(root.frames) not in (2, 3)
+        or (len(root.frames) == 3 and type(root.frames[1]) is not EndFrame)
+    ):
         raise AuditIntegrityError("Semantic SQL requires its dedicated selected Advisor frame")
+    _parent(root)
     return frame
+
+
+def _input_end_source_data(
+    conn: Connection, sid: str, operation: str, root: ContinuationFrameStack, *, checkpoint_id: str, cursor: int
+) -> EndContinuationCandidate | None:
+    """Original complete input shape, including a genuine retained END reply.
+
+    The historical PRIMARY reader proves its actual SDK response, creator,
+    descriptor, accounting and source checkpoint; an End-shaped DTO cannot
+    substitute its candidate or invent publication permission.
+    """
+    parent = _parent(root)
+    if (
+        root.pending_owner_results
+        or root.pending_settlement_ids
+        or root.active_action_json is not None
+        or root.active_action_source is not None
+        or any(item.disposition not in ("committed", "refused") for item in root.effect_frontier)
+    ):
+        raise AuditIntegrityError("Semantic input requires its complete quiescent unprescribed source")
+    if len(root.frames) == 1:
+        if (
+            parent.phase != "action_ready"
+            or parent.provider_effect_key is not None
+            or parent.provider_input_sha256 is not None
+            or parent.pending_response is not None
+        ):
+            raise AuditIntegrityError("Semantic Compose input lost its original quiescent action-ready source")
+        return None
+    if len(root.frames) != 2 or type(root.frames[1]) is not EndFrame:
+        raise AuditIntegrityError("Semantic input cannot replace an unowned intermediate frame")
+    end = root.frames[1]
+    if (
+        end.state != parent.state
+        or parent.phase != "response_retained"
+        or parent.pending_response is None
+        or parent.provider_effect_key is None
+        or parent.provider_input_sha256 is None
+    ):
+        raise AuditIntegrityError("Semantic END input lost its original unreviewed paid reply")
+    candidate = decode_end_candidate(_ref(conn, sid, operation, end.candidate))
+    if candidate.semantic_source is not None:
+        from elspeth.web.sessions.continuation_semantic_actions import read_original_semantic_review_for_advisor_on_connection
+
+        review = read_original_semantic_review_for_advisor_on_connection(
+            conn, session_id=UUID(sid), operation_id=operation, original_candidate=candidate
+        )
+        expected_phase = "publication_ready" if review.outcome == "clean" else "repair_needed"
+        expected_binding = review.publication_binding if review.outcome == "clean" else None
+        if end.phase != expected_phase or end.publication_binding != expected_binding:
+            raise AuditIntegrityError("Semantic END input substituted its actual clean/blocked Review disposition")
+        return candidate
+    if end.phase != "review_needed" or end.publication_binding is not None:
+        raise AuditIntegrityError("Semantic END input cannot invent an original shared Review result")
+    original = read_original_committed_primary_response_data_on_connection(
+        conn,
+        session_id=UUID(sid),
+        operation_id=operation,
+        source_checkpoint_id=checkpoint_id,
+        source_cursor=cursor,
+        response=parent.pending_response,
+    )
+    response = decode_continuation_response(original)
+    if response.tool_batch.calls:
+        raise AuditIntegrityError("Semantic END reply cannot invent a candidate from a tool response")
+    expected = EndContinuationCandidate(
+        kind="reply",
+        response=parent.pending_response,
+        primary_effect_key=parent.provider_effect_key,
+        primary_input_sha256=parent.provider_input_sha256,
+        candidate_text=response.message.content or "",
+        state=parent.state,
+        evidence=parent.evidence,
+        iteration=parent.iteration,
+    )
+    if candidate != expected:
+        raise AuditIntegrityError("Semantic END input substituted its exact original paid candidate/source")
+    return candidate
 
 
 def _call_id(call: ComposerLLMCall) -> str:
@@ -285,16 +476,18 @@ def _call_id(call: ComposerLLMCall) -> str:
 
 
 def _effect(conn: Connection, running: ComposerOperationRunning, root: ContinuationFrameStack, key: str) -> Row[Any]:
+    return _effect_data(conn, str(running.claim.session_id), running.claim.operation_id, root, key)
+
+
+def _effect_data(conn: Connection, sid: str, operation: str, root: ContinuationFrameStack, key: str) -> Row[Any]:
     _parent(root)
-    if len(root.frames) != 2 or type(root.frames[-1]) is not AdvisorFrame:
-        raise AuditIntegrityError("Semantic SQL requires its dedicated selected Advisor frame")
-    frame = root.frames[-1]
+    frame = _advisor(root)
     if frame.provider_effect_key != key or frame.provider_input_sha256 is None:
         raise AuditIntegrityError("Semantic SQL substituted its selected provider locator")
     row = conn.execute(
         select(effects).where(
-            effects.c.session_id == str(running.claim.session_id),
-            effects.c.operation_id == running.claim.operation_id,
+            effects.c.session_id == sid,
+            effects.c.operation_id == operation,
             effects.c.effect_key == key,
         )
     ).one_or_none()
@@ -319,14 +512,19 @@ def _effect(conn: Connection, running: ComposerOperationRunning, root: Continuat
 def _descriptor(
     conn: Connection, running: ComposerOperationRunning, effect: Row[Any]
 ) -> tuple[_Input, SemanticAdvisorInvocationData, _PhysicalInput]:
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    return _descriptor_data(conn, str(running.claim.session_id), running.claim.operation_id, effect)
+
+
+def _descriptor_data(
+    conn: Connection, sid: str, operation: str, effect: Row[Any]
+) -> tuple[_Input, SemanticAdvisorInvocationData, _PhysicalInput]:
     value = _decode(
         _Input, _blob(conn, sid, operation, f"semantic-provider-input:{effect.input_sha256}", "composer.semantic-provider-input.v1")
     )
     body = _decode(_RawBody, value.raw_source_body_json)
     original = decode_continuation_snapshot(body.selected_snapshot_json)
     frame = _parent(original)
-    if len(body.source_chunks) != 6 or len(original.frames) != 1:
+    if len(body.source_chunks) != 6:
         raise AuditIntegrityError("Semantic input lost its complete original quiescent source")
     if _blob(conn, sid, operation, f"snapshot:{body.checkpoint_id}", "snapshot.v2") != body.selected_snapshot_json:
         raise AuditIntegrityError("Semantic input substituted its original complete SQL checkpoint")
@@ -366,6 +564,10 @@ def _descriptor(
     )
     data = make_semantic_advisor_invocation(raw)
     physical_input = _decode(_PhysicalInput, value.physical_request_json)
+    retained_inputs = _retained_inputs_data(conn, sid, operation, original, checkpoint_id=body.checkpoint_id, cursor=body.cursor)
+    _require_retained_input_document(
+        conn, sid, operation, original, physical_input, retained_inputs, env_ref_names=frozenset(body.env_ref_names)
+    )
     if (
         value.invocation_json != canonical_json(data.invocation.model_dump(mode="json"))
         or value.request_input_json != data.request_input_json
@@ -422,13 +624,11 @@ def prepare_semantic_advisor_on_connection(
         raise AuditIntegrityError("Semantic preparation requires its actual original owned values")
     stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
     root = _current(conn, running, stored)
-    parent = _parent(root)
+    _input_end_source_data(
+        conn, str(running.claim.session_id), running.claim.operation_id, root, checkpoint_id=stored.checkpoint_id, cursor=stored.cursor
+    )
     if (
-        len(root.frames) != 1
-        or parent.phase != "action_ready"
-        or parent.provider_effect_key is not None
-        or parent.pending_response is not None
-        or root.active_action_json is not None
+        root.active_action_json is not None
         or root.pending_owner_results
         or root.pending_settlement_ids
         or any(item.disposition in ("prepared", "dispatched", "unknown") for item in root.effect_frontier)
@@ -479,6 +679,18 @@ def prepare_semantic_advisor_on_connection(
     )
     if sha256(physical_json.encode("utf-8")).hexdigest() != request.request_sha256:
         raise AuditIntegrityError("Semantic preparation lost its original physical input SHA")
+    retained_inputs = _retained_inputs_data(
+        conn, str(running.claim.session_id), running.claim.operation_id, root, checkpoint_id=stored.checkpoint_id, cursor=stored.cursor
+    )
+    _require_retained_input_document(
+        conn,
+        str(running.claim.session_id),
+        running.claim.operation_id,
+        root,
+        _decode(_PhysicalInput, physical_json),
+        retained_inputs,
+        env_ref_names=invocation.source.env_ref_names,
+    )
     descriptor = _Input(
         raw_source_body_json=invocation.source.source_body_json,
         invocation_json=canonical_json(invocation.invocation.model_dump(mode="json")),
@@ -556,7 +768,7 @@ def prepare_semantic_advisor_on_connection(
             conn,
             running,
             stored,
-            root.model_copy(update={"frames": (parent, advisor)}),
+            root.model_copy(update={"frames": (*root.frames, advisor)}),
             key,
             "prepared",
             None,
@@ -605,7 +817,7 @@ def begin_semantic_advisor_on_connection(
         != (binding.running.claim.segment_sequence, binding.running.claim.ownership_generation)
     ):
         raise ContinuationCASConflict("Semantic begin cannot retry unresolved or foreign preparation")
-    _descriptor(conn, binding.running, effect)
+    _inflight_source_data(conn, str(binding.running.claim.session_id), binding.running.claim.operation_id, prepared.snapshot, root)
     with conn.begin_nested():
         conn.execute(
             update(effects)
@@ -634,8 +846,13 @@ def begin_semantic_advisor_on_connection(
 def _original_input(
     conn: Connection, running: ComposerOperationRunning, root: ContinuationFrameStack, effect: Row[Any]
 ) -> tuple[SemanticAdvisorInvocationData, _PhysicalInput]:
-    _stored, data, physical_input = _descriptor(conn, running, effect)
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    return _original_input_data(conn, str(running.claim.session_id), running.claim.operation_id, root, effect)
+
+
+def _original_input_data(
+    conn: Connection, sid: str, operation: str, root: ContinuationFrameStack, effect: Row[Any]
+) -> tuple[SemanticAdvisorInvocationData, _PhysicalInput]:
+    _stored, data, physical_input = _descriptor_data(conn, sid, operation, effect)
     frame = root.frames[-1]
     if type(frame) is not AdvisorFrame:
         raise AuditIntegrityError("Semantic outcome lost its actual selected Advisor frame")
@@ -654,10 +871,14 @@ def _original_input(
 
 
 def _creator(conn: Connection, running: ComposerOperationRunning, effect: Row[Any]) -> Row[Any]:
+    return _creator_data(conn, str(running.claim.session_id), running.claim.operation_id, effect)
+
+
+def _creator_data(conn: Connection, sid: str, operation: str, effect: Row[Any]) -> Row[Any]:
     row = conn.execute(
         select(attempts).where(
-            attempts.c.session_id == str(running.claim.session_id),
-            attempts.c.operation_id == running.claim.operation_id,
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation,
             attempts.c.sequence == effect.creator_sequence,
             attempts.c.generation == effect.creator_generation,
         )
@@ -669,6 +890,12 @@ def _creator(conn: Connection, running: ComposerOperationRunning, effect: Row[An
 
 def _physical_source(
     conn: Connection, running: ComposerOperationRunning, effect: Row[Any], call: ComposerLLMCall, physical_input: _PhysicalInput
+) -> None:
+    _physical_source_data(conn, str(running.claim.session_id), running.claim.operation_id, effect, call, physical_input)
+
+
+def _physical_source_data(
+    conn: Connection, sid: str, operation: str, effect: Row[Any], call: ComposerLLMCall, physical_input: _PhysicalInput
 ) -> None:
     if type(call) is not ComposerLLMCall or call.call_id is None:
         raise AuditIntegrityError("Semantic retention requires its actual original paid audit")
@@ -686,9 +913,9 @@ def _physical_source(
         or call.private_request != capture_provider_context(messages=wire, tools=None)
     ):
         raise AuditIntegrityError("Semantic physical audit changed its exact original physical request")
-    creator = _creator(conn, running, effect)
+    creator = _creator_data(conn, sid, operation, effect)
     actual = conn.execute(select(physical).where(physical.c.attempt_id == call.call_id)).one_or_none()
-    principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == str(running.claim.session_id))).scalar_one()
+    principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one()
     if (
         actual is None
         or (
@@ -701,7 +928,7 @@ def _physical_source(
             actual.identity_id,
         )
         != (
-            str(running.claim.session_id),
+            sid,
             "composer",
             None,
             creator.session_operation_id,
@@ -765,7 +992,10 @@ def _physical_source(
 
 
 def _journal(conn: Connection, running: ComposerOperationRunning, *, cursor: int, tag: str, payload: str) -> None:
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    _journal_data(conn, str(running.claim.session_id), running.claim.operation_id, cursor=cursor, tag=tag, payload=payload)
+
+
+def _journal_data(conn: Connection, sid: str, operation: str, *, cursor: int, tag: str, payload: str) -> None:
     row = conn.execute(
         select(events).where(events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == cursor)
     ).one_or_none()
@@ -907,7 +1137,7 @@ def refuse_semantic_advisor_no_sdk_on_connection(
     permit.issuer.require_refusal_permit(permit)
     binding = permit.prepared.binding
     running = binding.running
-    root = _current(conn, running, permit.dispatched)
+    root = _current_original_no_sdk_finish(conn, permit)
     effect = _effect(conn, running, root, binding.effect_key)
     _original_input(conn, running, root, effect)
     if (
@@ -971,13 +1201,39 @@ def refuse_semantic_advisor_no_sdk_on_connection(
             conn,
             running,
             permit.dispatched,
-            root.model_copy(update={"frames": (root.frames[0], advisor)}),
+            root.model_copy(update={"frames": (*root.frames[:-1], advisor)}),
             data.effect_key,
             "refused",
             data.receipt_key,
             ContinuationEvent("effect_refused", _no_sdk_event(data, key)),
         )
         return SemanticAdvisorNoSdkRefusalReceipt(selected, data.effect_key, data.receipt_key, key)
+
+
+def close_semantic_advisor_no_sdk_on_connection(conn: Connection, permit: SemanticAdvisorNoSdkRefusalPermit) -> ComposerOperationRecord:
+    """Retain the original no-SDK receipt and failed parent atomically."""
+    from elspeth.web.coordination.composer_operation_authority import (
+        _read,
+        _select_failure_on_connection,
+        settle_composer_operation_on_connection,
+    )
+    from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
+
+    if type(permit) is not SemanticAdvisorNoSdkRefusalPermit:
+        raise AuditIntegrityError("Semantic terminal no-SDK close requires its original permit")
+    running = permit.prepared.binding.running
+    with conn.begin_nested():
+        receipt = refuse_semantic_advisor_no_sdk_on_connection(conn, permit)
+        parent = _read(conn, running.claim.session_id, running.claim.operation_id)
+        if parent is None or parent.status != "running":
+            raise AuditIntegrityError("Semantic terminal no-SDK close lost its actual current parent")
+        failure = _select_failure_on_connection(
+            parent, project_composer_operation_error(permit.original_failure, request_id=parent.request_id), authoritative_failure=False
+        )
+        terminal = settle_composer_operation_on_connection(conn, running, outcome=failure, authoritative_failure=True)
+        if terminal.status != "failed" or terminal.journal_cursor != receipt.snapshot.cursor + 1:
+            raise AuditIntegrityError("Semantic no-SDK close lost its atomic receipt/failed terminal")
+        return terminal
 
 
 def read_semantic_advisor_no_sdk_refusal_on_connection(
@@ -1044,7 +1300,7 @@ def read_semantic_advisor_no_sdk_refusal_on_connection(
     advisor = _advisor(source).model_copy(update={"phase": "response_retained", "response": chunk.reference})
     expected = decode_continuation_snapshot(
         _effect_snapshot(
-            encode_continuation_snapshot(source.model_copy(update={"frames": (source.frames[0], advisor)})),
+            encode_continuation_snapshot(source.model_copy(update={"frames": (*source.frames[:-1], advisor)})),
             effect_key=effect_key,
             disposition="refused",
             receipt_id=data.receipt_key,
@@ -1061,13 +1317,17 @@ def read_semantic_advisor_no_sdk_refusal_on_connection(
 def _extended_evidence(
     conn: Connection, running: ComposerOperationRunning, data: SemanticAdvisorInvocationData, call: ComposerLLMCall, recorder: PrivateChunk
 ) -> PrivateChunk:
+    return _extended_evidence_data(conn, str(running.claim.session_id), running.claim.operation_id, data, call, recorder)
+
+
+def _extended_evidence_data(
+    conn: Connection, sid: str, operation: str, data: SemanticAdvisorInvocationData, call: ComposerLLMCall, recorder: PrivateChunk
+) -> PrivateChunk:
     original = decode_continuation_snapshot(data.source.selected_snapshot_json)
     admitted = decode_turn_evidence(
         data.source.evidence,
         env_ref_names=data.source.env_ref_names,
-        source_chunks=load_private_chunks(
-            conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, stack=original
-        ),
+        source_chunks=load_private_chunks(conn, session_id=sid, operation_id=operation, stack=original),
     )
     snapshot = decode_recorder_snapshot(recorder)
     if not snapshot.llm_calls or snapshot.llm_calls[-1] != call:
@@ -1109,7 +1369,7 @@ def retain_semantic_advisor_outcome_on_connection(
     ):
         raise AuditIntegrityError("Semantic retention requires its original owned physical outcome and recorder")
     running, binding = prepared.binding.running, prepared.binding
-    root = _current(conn, running, selected)
+    root = _current_original_paid_finish(conn, prepared, selected, outcome, issuer)
     effect = _effect(conn, running, root, binding.effect_key)
     data, physical_input = _original_input(conn, running, root, effect)
     observed, call = outcome.observation, outcome.observation.audit_call
@@ -1250,7 +1510,7 @@ def retain_semantic_advisor_outcome_on_connection(
             conn,
             running,
             selected,
-            root.model_copy(update={"frames": (parent, advisor)}),
+            root.model_copy(update={"frames": (parent, *root.frames[1:-1], advisor)}),
             binding.effect_key,
             disposition,
             receipt_key,
@@ -1272,9 +1532,24 @@ def _paid_result(
     conn: Connection, running: ComposerOperationRunning, selected: StoredContinuationSnapshot, effect_key: str
 ) -> tuple[SemanticAdvisorProviderResult, SemanticAdvisorInvocationData, ContinuationFrameStack]:
     root = _current(conn, running, selected)
-    effect = _effect(conn, running, root, effect_key)
-    data, physical_input = _original_input(conn, running, root, effect)
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    return _paid_result_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key)
+
+
+def _paid_result_data(
+    conn: Connection,
+    sid: str,
+    operation: str,
+    selected: StoredContinuationSnapshot,
+    root: ContinuationFrameStack,
+    effect_key: str,
+) -> tuple[SemanticAdvisorProviderResult, SemanticAdvisorInvocationData, ContinuationFrameStack]:
+    """Reconstruct immutable physical DATA after a separate admission proof.
+
+    Primitive identities identify stored facts. They grant no current claim,
+    live session context, quota custody or writer permission.
+    """
+    effect = _effect_data(conn, sid, operation, root, effect_key)
+    data, physical_input = _original_input_data(conn, sid, operation, root, effect)
     if effect.result_chunk_key is None or effect.receipt_key is None:
         raise AuditIntegrityError("Semantic cold result requires actual retained paid output")
     manifest_json = _blob(conn, sid, operation, effect.result_chunk_key, "composer.semantic-provider-outcome.v1")
@@ -1303,7 +1578,7 @@ def _paid_result(
         or effect.disposition != ("committed" if manifest.outcome == "success" else "refused")
     ):
         raise AuditIntegrityError("Semantic cold result changed its original complete physical/effect identity")
-    _physical_source(conn, running, effect, call, physical_input)
+    _physical_source_data(conn, sid, operation, effect, call, physical_input)
     record = _ref(conn, sid, operation, manifest.recorder)
     if record.reference.codec != "composer.audit-buffer.v2":
         raise AuditIntegrityError("Semantic cold result changed its recorder source role")
@@ -1313,7 +1588,7 @@ def _paid_result(
     if not captured.llm_calls or captured.llm_calls[-1] != call or replace(previous, llm_calls=(*previous.llm_calls, call)) != captured:
         raise AuditIntegrityError("Semantic cold result changed its complete original recorder prefix")
     call = captured.llm_calls[-1]
-    evidence = _extended_evidence(conn, running, data, call, record)
+    evidence = _extended_evidence_data(conn, sid, operation, data, call, record)
     expected_parent = original_parent.model_copy(
         update={"audit_buffer": record.reference, "evidence": evidence.reference, "advisor_calls": original_parent.advisor_calls + 1}
     )
@@ -1351,13 +1626,37 @@ def _paid_result(
     expected_cursor = manifest.source_cursor + (2 if frame.phase == "decision_ready" else 1)
     if frame.phase not in ("response_retained", "decision_ready") or selected.cursor != expected_cursor:
         raise AuditIntegrityError("Semantic cold result moved outside its supported exact selected cut")
-    source_root = decode_continuation_snapshot(_blob(conn, sid, operation, f"snapshot:{manifest.source_checkpoint_id}", "snapshot.v2"))
+    begun = _historical_snapshot(conn, sid, operation, checkpoint_id=manifest.source_checkpoint_id)
+    source_root = decode_continuation_snapshot(begun.payload_json)
+    original_root = decode_continuation_snapshot(data.source.selected_snapshot_json)
+    original_advisor = _advisor(root).model_copy(update={"phase": "awaiting_response", "response": None})
+    expected_begun = decode_continuation_snapshot(
+        _effect_snapshot(
+            encode_continuation_snapshot(original_root.model_copy(update={"frames": (*original_root.frames, original_advisor)})),
+            effect_key=effect_key,
+            disposition="dispatched",
+            receipt_id=None,
+        )
+    ).model_copy(update={"cursor": data.source.cursor + 2})
     if (
         source_root.cursor != manifest.source_cursor
+        or begun.cursor != manifest.source_cursor
+        or source_root != expected_begun
         or _advisor(source_root).provider_effect_key != effect_key
         or _advisor(source_root).phase != "awaiting_response"
     ):
         raise AuditIntegrityError("Semantic result lost its original begun source checkpoint")
+    _journal_data(
+        conn,
+        sid,
+        operation,
+        cursor=data.source.cursor + 1,
+        tag="input_prepared",
+        payload=canonical_json({"effect_key": effect_key, "input_sha256": effect.input_sha256}),
+    )
+    _journal_data(
+        conn, sid, operation, cursor=data.source.cursor + 2, tag="may_dispatch", payload=canonical_json({"effect_key": effect_key})
+    )
     retained_row = conn.execute(
         select(checkpoints).where(
             checkpoints.c.session_id == sid, checkpoints.c.operation_id == operation, checkpoints.c.cursor == manifest.source_cursor + 1
@@ -1369,7 +1668,9 @@ def _paid_result(
     paid_advisor = _advisor(source_root).model_copy(update={"phase": "response_retained", "response": manifest.response})
     expected_paid = decode_continuation_snapshot(
         _effect_snapshot(
-            encode_continuation_snapshot(source_root.model_copy(update={"frames": (expected_parent, paid_advisor)})),
+            encode_continuation_snapshot(
+                source_root.model_copy(update={"frames": (expected_parent, *source_root.frames[1:-1], paid_advisor)})
+            ),
             effect_key=effect_key,
             disposition="committed" if manifest.outcome == "success" else "refused",
             receipt_id=manifest.receipt_key,
@@ -1378,8 +1679,13 @@ def _paid_result(
     expected_paid = expected_paid.model_copy(update={"cursor": manifest.source_cursor + 1})
     if paid_root != expected_paid or (frame.phase == "response_retained" and root != paid_root):
         raise AuditIntegrityError("Semantic cold output changed its original complete retained root")
-    _journal(
-        conn, running, cursor=manifest.source_cursor + 1, tag="response_retained", payload=_outcome_event(manifest, effect.result_chunk_key)
+    _journal_data(
+        conn,
+        sid,
+        operation,
+        cursor=manifest.source_cursor + 1,
+        tag="response_retained",
+        payload=_outcome_event(manifest, effect.result_chunk_key),
     )
     return SemanticAdvisorProviderResult(selected, effect_key, call, response, record, decision, manifest.outcome), data, paid_root
 
@@ -1389,6 +1695,50 @@ def read_semantic_advisor_outcome_on_connection(
 ) -> SemanticAdvisorProviderResult:
     result, _data, _paid_root = _paid_result(conn, running, selected, effect_key)
     return result
+
+
+def read_current_paid_semantic_decision_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> SemanticAdvisorPaidDecisionData:
+    """Prove an uninstalled original decision before a separate action owner.
+
+    Read/review/coverage owners must derive their actual admission inputs and
+    re-enter their own current writer. This API grants no read permission,
+    complete-coverage claim, physical quota custody or publication authority.
+    """
+    root = _current(conn, running, selected)
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
+    if (
+        _advisor(root).phase != "response_retained"
+        or root != paid_root
+        or result.outcome != "success"
+        or result.decision is None
+        or result.response is None
+    ):
+        raise AuditIntegrityError("Semantic action admission requires its uninstalled original successful paid decision")
+    effect = _effect_data(conn, sid, operation, root, effect_key)
+    creator = _creator_data(conn, sid, operation, effect)
+    canonical = canonical_json(result.decision.model_dump(mode="json"))
+    return SemanticAdvisorPaidDecisionData(
+        selected=selected,
+        paid_root=paid_root,
+        invocation=data,
+        decision=result.decision,
+        decision_json=canonical,
+        decision_sha256=sha256(canonical.encode("utf-8")).hexdigest(),
+        source=ContinuationActionSource(effect_key=effect_key, input_sha256=effect.input_sha256, response=result.response.reference),
+        audit_call=result.audit_call,
+        session_id=running.claim.session_id,
+        operation_id=operation,
+        claim_attempt=running.claim.attempt,
+        operation_epoch=running.session_operation_context.fence.operation_epoch,
+        creator_sequence=effect.creator_sequence,
+        creator_generation=effect.creator_generation,
+        creator_operation_id=creator.session_operation_id,
+        creator_operation_epoch=creator.session_operation_epoch,
+        creator_lease_token=creator.session_operation_lease_token,
+    )
 
 
 def install_semantic_advisor_decision_on_connection(
@@ -1419,7 +1769,9 @@ def install_semantic_advisor_decision_on_connection(
         permitted_read_tools=frozenset(),
         complete_required_coverage=False,
     )
-    changed = changed.model_copy(update={"frames": (changed.frames[0], changed.frames[-1].model_copy(update={"phase": "decision_ready"}))})
+    changed = changed.model_copy(
+        update={"frames": (*changed.frames[:-1], changed.frames[-1].model_copy(update={"phase": "decision_ready"}))}
+    )
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     with conn.begin_nested():
         put_chunk(
@@ -1459,12 +1811,25 @@ def install_semantic_advisor_decision_on_connection(
 def read_semantic_advisor_decision_on_connection(
     conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
 ) -> SemanticAdvisorDecisionData:
-    result, data, paid_root = _paid_result(conn, running, selected, effect_key)
     root = _current(conn, running, selected)
+    return _decision_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key)
+
+
+def _decision_data(
+    conn: Connection,
+    sid: str,
+    operation: str,
+    selected: StoredContinuationSnapshot,
+    root: ContinuationFrameStack,
+    effect_key: str,
+) -> SemanticAdvisorDecisionData:
+    result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
     if _advisor(root).phase != "decision_ready" or result.outcome != "success" or result.decision is None or result.response is None:
         raise AuditIntegrityError("Semantic cold action lacks an installed successful original decision")
     source = ContinuationActionSource(
-        effect_key=effect_key, input_sha256=_effect(conn, running, root, effect_key).input_sha256, response=result.response.reference
+        effect_key=effect_key,
+        input_sha256=_effect_data(conn, sid, operation, root, effect_key).input_sha256,
+        response=result.response.reference,
     )
     premise = data.invocation.premise
     if premise is None:
@@ -1485,14 +1850,15 @@ def read_semantic_advisor_decision_on_connection(
     expected = expected.model_copy(
         update={
             "cursor": selected.cursor,
-            "frames": (expected.frames[0], _advisor(expected).model_copy(update={"phase": "decision_ready"})),
+            "frames": (*expected.frames[:-1], _advisor(expected).model_copy(update={"phase": "decision_ready"})),
         }
     )
-    if root != expected or _ref(conn, str(running.claim.session_id), running.claim.operation_id, frontier.reference) != frontier:
+    if root != expected or _ref(conn, sid, operation, frontier.reference) != frontier:
         raise AuditIntegrityError("Semantic cold action changed its original decision/frontier/source binding")
-    _journal(
+    _journal_data(
         conn,
-        running,
+        sid,
+        operation,
         cursor=selected.cursor,
         tag="checkpoint",
         payload=canonical_json(
@@ -1507,3 +1873,933 @@ def read_semantic_advisor_decision_on_connection(
         ),
     )
     return SemanticAdvisorDecisionData(result.decision, source, result.decision.prescribed_action)
+
+
+class _PrimarySourceBridge(ContinuationValue):
+    schema_version: Literal["composer.semantic-primary-source.v1"] = "composer.semantic-primary-source.v1"
+    session_id: str
+    operation_id: str
+    primary_effect_key: str
+    action_json: str
+    action_key: str
+    source: ContinuationActionSource
+    decision_checkpoint_id: str
+    decision_cursor: int
+    consume_cursor: int
+
+
+class _ReviewSourceBridge(ContinuationValue):
+    schema_version: Literal["composer.semantic-review-source.v1"] = "composer.semantic-review-source.v1"
+    session_id: str
+    operation_id: str
+    action_json: str
+    action_key: str
+    source: ContinuationActionSource
+    decision_checkpoint_id: str
+    decision_cursor: int
+    consume_cursor: int
+    original_candidate: PrivateChunkRef
+    candidate: PrivateChunkRef
+    candidate_ref: str
+    evidence_binding: str
+
+
+class _ReadSourceBridge(ContinuationValue):
+    schema_version: Literal["composer.semantic-read-source.v1"] = "composer.semantic-read-source.v1"
+    session_id: str
+    operation_id: str
+    semantic_effect_key: str
+    owner_effect_key: str
+    commit_checkpoint_id: str
+    commit_cursor: int
+    consume_cursor: int
+    source: ContinuationActionSource
+    reference: ContinuationEvidenceRef
+    semantic_result_json: str
+    original_result_sha256: str
+
+
+class _WholeStopSourceBridge(ContinuationValue):
+    schema_version: Literal["composer.semantic-whole-stop-source.v1"] = "composer.semantic-whole-stop-source.v1"
+    session_id: str
+    operation_id: str
+    decision_checkpoint_id: str
+    decision_cursor: int
+    consume_cursor: int
+    source: ContinuationActionSource
+    decision_json: str
+    original_candidate: PrivateChunkRef
+    candidate: PrivateChunkRef
+    review_effect_key: str
+    review_result_chunk_key: str
+    review_checkpoint_id: str
+    review_cursor: int
+    publication_binding: str
+
+
+def consume_semantic_advisor_whole_stop_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Consume an actual whole-request Stop without replacing its reviewed result."""
+    from elspeth.web.sessions.continuation_semantic_actions import (
+        read_original_semantic_review_for_stop_on_connection,
+        require_semantic_publication_on_connection,
+        require_semantic_whole_stop_on_connection,
+    )
+
+    root = _current(conn, running, selected)
+    admission = require_semantic_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    if len(root.frames) != 3 or _advisor(root).phase != "decision_ready" or type(root.frames[1]) is not EndFrame:
+        raise AuditIntegrityError("Semantic whole Stop lost its exact original reviewed END stack")
+    parent, end = _parent(root), root.frames[1]
+    original = admission.evidence.coverage.end_candidate
+    if original is None or admission.evidence.coverage.candidate_source != end.candidate or end.phase != "publication_ready":
+        raise AuditIntegrityError("Semantic whole Stop cannot invent an original clean shared result")
+    review = read_original_semantic_review_for_stop_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, original_candidate=original
+    )
+    if review.outcome != "clean" or review.publication_binding is None or review.publication_binding != end.publication_binding:
+        raise AuditIntegrityError("Semantic whole Stop cannot grant blocked or substituted publication")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    result_key = conn.execute(
+        select(effects.c.result_chunk_key).where(
+            effects.c.session_id == sid,
+            effects.c.operation_id == operation,
+            effects.c.effect_key == review.owner_effect_key,
+            effects.c.owner == "composer_end",
+            effects.c.disposition == "committed",
+        )
+    ).scalar_one_or_none()
+    if type(result_key) is not str:
+        raise AuditIntegrityError("Semantic whole Stop lost its original complete Review result chunk")
+    candidate = encode_end_candidate(
+        original.model_copy(
+            update={
+                "state": parent.state,
+                "evidence": parent.evidence,
+                "iteration": parent.iteration,
+                "semantic_source": admission.paid.source,
+                "semantic_decision_json": admission.paid.decision_json,
+            }
+        )
+    )
+    bridge = _WholeStopSourceBridge(
+        session_id=sid,
+        operation_id=operation,
+        decision_checkpoint_id=selected.checkpoint_id,
+        decision_cursor=selected.cursor,
+        consume_cursor=selected.cursor + 1,
+        source=admission.paid.source,
+        decision_json=admission.paid.decision_json,
+        original_candidate=end.candidate,
+        candidate=candidate.reference,
+        review_effect_key=review.owner_effect_key,
+        review_result_chunk_key=result_key,
+        review_checkpoint_id=review.completed.checkpoint_id,
+        review_cursor=review.completed.cursor,
+        publication_binding=review.publication_binding,
+    )
+    bridge_key = f"semantic-whole-stop-source:{effect_key}"
+    event = canonical_json(
+        {
+            "kind": "semantic_whole_stop_ready",
+            "decision_checkpoint_id": bridge.decision_checkpoint_id,
+            "decision_cursor": bridge.decision_cursor,
+            "source": bridge.source.model_dump(mode="json"),
+            "decision_json": bridge.decision_json,
+            "original_candidate": bridge.original_candidate.model_dump(mode="json"),
+            "candidate": bridge.candidate.model_dump(mode="json"),
+            "review_effect_key": bridge.review_effect_key,
+            "review_result_chunk_key": bridge.review_result_chunk_key,
+            "review_checkpoint_id": bridge.review_checkpoint_id,
+            "review_cursor": bridge.review_cursor,
+            "publication_binding": bridge.publication_binding,
+            "bridge_chunk_key": bridge_key,
+        }
+    )
+    ready = root.model_copy(update={"frames": (parent, end.model_copy(update={"state": parent.state, "candidate": candidate.reference}))})
+    with conn.begin_nested():
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=private_chunk_key(candidate),
+            payload=candidate.canonical.encode("utf-8"),
+            codec=candidate.reference.codec,
+        )
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=bridge_key,
+            payload=_canonical(bridge).encode("utf-8"),
+            codec=bridge.schema_version,
+        )
+        consumed = append_complete_snapshot(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            expected_checkpoint_id=selected.checkpoint_id,
+            expected_cursor=selected.cursor,
+            snapshot_json=encode_continuation_snapshot(ready),
+            event_batch=(ContinuationEvent("checkpoint", event),),
+            handoff=False,
+        )
+        if require_semantic_publication_on_connection(conn, running, selected=consumed) is None:
+            raise AuditIntegrityError("Semantic whole Stop lost its exact consumed final SQL proof")
+        return consumed
+
+
+def _read_consumed_root(
+    conn: Connection, sid: str, operation: str, committed: StoredContinuationSnapshot, reference: ContinuationEvidenceRef
+) -> tuple[ContinuationFrameStack, PrivateChunk, PrivateChunk | None]:
+    root = decode_continuation_snapshot(committed.payload_json)
+    if (
+        _advisor(root).phase != "decision_ready"
+        or root.active_action_json is not None
+        or root.active_action_source is not None
+        or root.semantic_frontier is None
+        or root.pending_owner_results
+        or root.pending_settlement_ids
+        or any(item.disposition not in ("committed", "refused") for item in root.effect_frontier)
+    ):
+        raise AuditIntegrityError("Semantic read consume lost its exact completed quiescent original result")
+    frontier = decode_frontier_chunk(_ref(conn, sid, operation, root.semantic_frontier))
+    if any(item.receipt_id == reference.receipt_id for item in frontier.evidence):
+        raise AuditIntegrityError("Semantic read consume cannot repeat or substitute an existing evidence receipt")
+    changed = encode_frontier_chunk(replace(frontier, evidence=(*frontier.evidence, reference)))
+    frames = root.frames[:-1]
+    candidate_chunk = None
+    if len(frames) == 2 and type(frames[1]) is EndFrame:
+        parent, end = _parent(root), frames[1]
+        candidate = decode_end_candidate(_ref(conn, sid, operation, end.candidate))
+        # Initial unreviewed candidate refs may follow actual read capture.
+        # A prior completed Review retains its immutable original result locator.
+        if candidate.semantic_source is None:
+            candidate_chunk = encode_end_candidate(
+                candidate.model_copy(update={"state": parent.state, "evidence": parent.evidence, "iteration": parent.iteration})
+            )
+            frames = (parent, end.model_copy(update={"state": parent.state, "candidate": candidate_chunk.reference}))
+    return root.model_copy(update={"frames": frames, "semantic_frontier": changed.reference}), changed, candidate_chunk
+
+
+def _read_bridge_event(bridge: _ReadSourceBridge) -> str:
+    return canonical_json(
+        {
+            "kind": "semantic_read_applied",
+            "semantic_effect_key": bridge.semantic_effect_key,
+            "owner_effect_key": bridge.owner_effect_key,
+            "commit_checkpoint_id": bridge.commit_checkpoint_id,
+            "commit_cursor": bridge.commit_cursor,
+            "source": bridge.source.model_dump(mode="json"),
+            "reference": bridge.reference.model_dump(mode="json"),
+            "original_result_sha256": bridge.original_result_sha256,
+            "bridge_chunk_key": f"semantic-read-source:{bridge.owner_effect_key}",
+        }
+    )
+
+
+def consume_committed_semantic_read_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Expose actual non-provider read values; a receipt alone is not novelty."""
+    from elspeth.web.composer.continuation_semantic_advisor_evidence import derive_semantic_read_evidence
+    from elspeth.web.sessions.continuation_semantic_actions import read_original_committed_semantic_read_on_connection
+
+    _current(conn, running, selected)
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    original = read_original_committed_semantic_read_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=operation,
+        commit_checkpoint_id=selected.checkpoint_id,
+        semantic_effect_key=effect_key,
+    )
+    if original.committed.snapshot != selected:
+        raise AuditIntegrityError("Semantic read consume substituted its exact original committed source")
+    evidence = derive_semantic_read_evidence(original.admission, original.committed)
+    ready, frontier, candidate = _read_consumed_root(conn, sid, operation, selected, evidence.reference)
+    bridge = _ReadSourceBridge(
+        session_id=sid,
+        operation_id=operation,
+        semantic_effect_key=effect_key,
+        owner_effect_key=original.committed.owner_effect_key,
+        commit_checkpoint_id=selected.checkpoint_id,
+        commit_cursor=selected.cursor,
+        consume_cursor=selected.cursor + 1,
+        source=original.admission.paid.source,
+        reference=evidence.reference,
+        semantic_result_json=evidence.semantic_result_json,
+        original_result_sha256=evidence.original_result_sha256,
+    )
+    with conn.begin_nested():
+        for chunk in (frontier, *((candidate,) if candidate is not None else ())):
+            put_chunk(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                key=private_chunk_key(chunk),
+                payload=chunk.canonical.encode("utf-8"),
+                codec=chunk.reference.codec,
+            )
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=f"semantic-read-source:{bridge.owner_effect_key}",
+            payload=_canonical(bridge).encode("utf-8"),
+            codec=bridge.schema_version,
+        )
+        return append_complete_snapshot(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            expected_checkpoint_id=selected.checkpoint_id,
+            expected_cursor=selected.cursor,
+            snapshot_json=encode_continuation_snapshot(ready),
+            event_batch=(ContinuationEvent("checkpoint", _read_bridge_event(bridge)),),
+            handoff=False,
+        )
+
+
+def _read_input_data(conn: Connection, sid: str, operation: str, reference: ContinuationEvidenceRef) -> SemanticAdvisorReadInput:
+    from elspeth.web.composer.continuation_semantic_advisor_evidence import derive_semantic_read_evidence
+    from elspeth.web.sessions.continuation_semantic_actions import read_original_committed_semantic_read_on_connection
+
+    bridge = _decode(
+        _ReadSourceBridge, _blob(conn, sid, operation, f"semantic-read-source:{reference.receipt_id}", "composer.semantic-read-source.v1")
+    )
+    if (bridge.session_id, bridge.operation_id, bridge.owner_effect_key, bridge.reference) != (
+        sid,
+        operation,
+        reference.receipt_id,
+        reference,
+    ):
+        raise AuditIntegrityError("Semantic read input substituted its original scoped source bridge")
+    original = read_original_committed_semantic_read_on_connection(
+        conn,
+        session_id=UUID(sid),
+        operation_id=operation,
+        commit_checkpoint_id=bridge.commit_checkpoint_id,
+        semantic_effect_key=bridge.semantic_effect_key,
+    )
+    evidence = derive_semantic_read_evidence(original.admission, original.committed)
+    if (
+        bridge.commit_cursor != original.committed.snapshot.cursor
+        or bridge.consume_cursor != bridge.commit_cursor + 1
+        or bridge.source != original.admission.paid.source
+        or bridge.owner_effect_key != original.committed.owner_effect_key
+        or bridge.reference != evidence.reference
+        or bridge.semantic_result_json != evidence.semantic_result_json
+        or bridge.original_result_sha256 != evidence.original_result_sha256
+    ):
+        raise AuditIntegrityError("Semantic read input changed its exact original result or stable semantic values")
+    expected, frontier, candidate = _read_consumed_root(conn, sid, operation, original.committed.snapshot, evidence.reference)
+    consumed = _historical_snapshot(conn, sid, operation, cursor=bridge.consume_cursor)
+    if (
+        consumed.payload_json != encode_continuation_snapshot(expected.model_copy(update={"cursor": consumed.cursor}))
+        or _ref(conn, sid, operation, frontier.reference) != frontier
+        or (candidate is not None and _ref(conn, sid, operation, candidate.reference) != candidate)
+    ):
+        raise AuditIntegrityError("Semantic read input lost its complete original consumed root")
+    _journal_data(conn, sid, operation, cursor=consumed.cursor, tag="checkpoint", payload=_read_bridge_event(bridge))
+    return SemanticAdvisorReadInput(
+        reference,
+        evidence.semantic_result_json,
+        evidence.original_result_sha256,
+        bridge.semantic_effect_key,
+        bridge.owner_effect_key,
+        bridge.commit_checkpoint_id,
+        bridge.commit_cursor,
+    )
+
+
+def _retained_inputs_data(
+    conn: Connection, sid: str, operation: str, root: ContinuationFrameStack, *, checkpoint_id: str, cursor: int
+) -> SemanticAdvisorRetainedInputs:
+    candidate = _input_end_source_data(conn, sid, operation, root, checkpoint_id=checkpoint_id, cursor=cursor)
+    if root.semantic_frontier is None:
+        raise AuditIntegrityError("Semantic retained inputs lost their actual source frontier")
+    frontier = decode_frontier_chunk(_ref(conn, sid, operation, root.semantic_frontier))
+    reads = tuple(_read_input_data(conn, sid, operation, reference) for reference in frontier.evidence if reference.source_kind == "read")
+    review_input = None
+    if candidate is not None and candidate.semantic_source is not None:
+        from elspeth.web.sessions.continuation_semantic_actions import read_original_semantic_review_for_advisor_on_connection
+        from elspeth.web.sessions.continuation_semantic_review_result import RetainedSemanticReviewResult, encode_semantic_review_result
+
+        review = read_original_semantic_review_for_advisor_on_connection(
+            conn, session_id=UUID(sid), operation_id=operation, original_candidate=candidate
+        )
+        review_input = SemanticAdvisorReviewInput(
+            encode_semantic_review_result(RetainedSemanticReviewResult(review.result, review.publication_binding)),
+            review.owner_effect_key,
+            review.completed.checkpoint_id,
+            review.completed.cursor,
+            review.outcome,
+        )
+    return SemanticAdvisorRetainedInputs(sid, operation, checkpoint_id, cursor, reads, review_input)
+
+
+def read_semantic_advisor_retained_inputs_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot
+) -> SemanticAdvisorRetainedInputs:
+    root = _current(conn, running, selected)
+    return _retained_inputs_data(
+        conn, str(running.claim.session_id), running.claim.operation_id, root, checkpoint_id=selected.checkpoint_id, cursor=selected.cursor
+    )
+
+
+def _require_retained_input_document(
+    conn: Connection,
+    sid: str,
+    operation: str,
+    root: ContinuationFrameStack,
+    physical: _PhysicalInput,
+    retained: SemanticAdvisorRetainedInputs,
+    *,
+    env_ref_names: frozenset[str],
+) -> None:
+    if len(physical.messages) != 3 or physical.messages[-1].get("role") != "user":
+        raise AuditIntegrityError("Semantic physical input lost its original complete source document")
+    text = physical.messages[-1].get("content")
+    if type(text) is not str:
+        raise AuditIntegrityError("Semantic physical source document lost its original text")
+    document, error = parse_json_strict(text)
+    if error is not None or type(document) is not dict or canonical_json(document) != text:
+        raise AuditIntegrityError("Semantic physical input substituted its canonical invocation/source document")
+    parent = _parent(root)
+    expected_evidence = decode_turn_evidence(
+        _ref(conn, sid, operation, parent.evidence),
+        env_ref_names=env_ref_names,
+        source_chunks=load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root),
+    ).snapshot.model_dump(mode="json", by_alias=True, exclude={"transcript"})
+    expected_document: dict[str, JsonValue] = {
+        "source": physical.source.model_dump(mode="json"),
+        "frontier": _ref(conn, sid, operation, root.semantic_frontier).canonical if root.semantic_frontier is not None else None,
+        "evidence": expected_evidence,
+        "iteration": semantic_retained_json(_ref(conn, sid, operation, parent.iteration).canonical),
+    }
+    end = root.frames[-1]
+    if type(end) is EndFrame:
+        expected_document["end_candidate"] = decode_end_candidate(_ref(conn, sid, operation, end.candidate)).model_dump(mode="json")
+    if retained.reads:
+        expected_document["read_results"] = [semantic_retained_json(item.semantic_result_json) for item in retained.reads]
+    if retained.review is not None:
+        expected_document["review_result"] = semantic_retained_json(retained.review.result_json)
+    if canonical_json(expected_document) != text:
+        raise AuditIntegrityError("Semantic physical input omitted, added or substituted its complete original source/result DATA")
+
+
+def _historical_snapshot(
+    conn: Connection, sid: str, operation: str, *, checkpoint_id: str | None = None, cursor: int | None = None
+) -> StoredContinuationSnapshot:
+    """Read one immutable checkpoint; this supplies no live owner authority."""
+    if (checkpoint_id is None) == (cursor is None):
+        raise ValueError("historical semantic source requires exactly one checkpoint locator")
+    query = select(checkpoints).where(checkpoints.c.session_id == sid, checkpoints.c.operation_id == operation)
+    query = (
+        query.where(checkpoints.c.checkpoint_id == checkpoint_id)
+        if checkpoint_id is not None
+        else query.where(checkpoints.c.cursor == cursor)
+    )
+    row = conn.execute(query).one_or_none()
+    if row is None or row.snapshot_chunk_key != f"snapshot:{row.checkpoint_id}":
+        raise AuditIntegrityError("Semantic source lost its exact original checkpoint row")
+    payload = _blob(conn, sid, operation, row.snapshot_chunk_key, "snapshot.v2")
+    root = decode_continuation_snapshot(payload)
+    if root.cursor != row.cursor or (root.logical.session_id, root.logical.operation_id) != (sid, operation):
+        raise AuditIntegrityError("Semantic source changed its complete historical checkpoint identity")
+    return StoredContinuationSnapshot(payload_json=payload, cursor=row.cursor, checkpoint_id=row.checkpoint_id)
+
+
+def _primary_action_with_evidence(conn: Connection, sid: str, operation: str, root: ContinuationFrameStack) -> tuple[str, str]:
+    action_json = bound_action_json(root, action_owner="primary_turn", read_tool_name=None, read_tool_arguments_json=None)
+    if action_json is None or root.active_action_source is None or root.semantic_frontier is None:
+        raise AuditIntegrityError("Semantic PRIMARY bridge requires its exact selected action/source/frontier")
+    action = decode_prescribed_continuation_action(action_json)
+    if type(action) is not PrimaryContinuationAction or canonical_json(action.model_dump(mode="json")) != action_json:
+        raise AuditIntegrityError("Semantic PRIMARY bridge changed its canonical model-authored action")
+    frontier = decode_frontier_chunk(_ref(conn, sid, operation, root.semantic_frontier))
+    return action_json, continuation_action_key(action, retained_evidence={item.receipt_id: item for item in frontier.evidence})
+
+
+def _primary_ready_root(root: ContinuationFrameStack) -> ContinuationFrameStack:
+    if _advisor(root).phase != "decision_ready":
+        raise AuditIntegrityError("Semantic PRIMARY consume requires its original installed decision")
+    parent = _parent(root)
+    if len(root.frames) == 3:
+        end = root.frames[1]
+        if (
+            type(end) is not EndFrame
+            or end.phase not in ("review_needed", "repair_needed", "publication_ready")
+            or parent.phase != "response_retained"
+            or parent.pending_response is None
+        ):
+            raise AuditIntegrityError("Semantic PRIMARY consume lost its original superseded END candidate")
+        parent = parent.model_copy(
+            update={"phase": "action_ready", "provider_effect_key": None, "provider_input_sha256": None, "pending_response": None}
+        )
+    elif parent.phase != "action_ready" or parent.provider_effect_key is not None or parent.pending_response is not None:
+        raise AuditIntegrityError("Semantic PRIMARY consume cannot discard an unresolved Compose source")
+    return root.model_copy(update={"frames": (parent,)})
+
+
+def _primary_bridge_event(value: _PrimarySourceBridge) -> str:
+    return canonical_json(
+        {
+            "kind": "semantic_primary_ready",
+            "primary_effect_key": value.primary_effect_key,
+            "action_json": value.action_json,
+            "action_key": value.action_key,
+            "source": value.source.model_dump(mode="json"),
+            "decision_checkpoint_id": value.decision_checkpoint_id,
+            "decision_cursor": value.decision_cursor,
+            "bridge_chunk_key": f"semantic-primary-source:{value.primary_effect_key}",
+        }
+    )
+
+
+def consume_semantic_advisor_primary_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Consume one proved paid family-1 decision without allocating PRIMARY.
+
+    The immutable bridge binds the next family-0 key. Its execution owner
+    independently allocates that ordinal and records actual execution receipts.
+    """
+    root = _current(conn, running, selected)
+    decision = _decision_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key)
+    if type(decision.action) is not PrimaryContinuationAction or root.active_action_source != decision.source:
+        raise AuditIntegrityError("Semantic PRIMARY consume lost its original prescribed action source")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    action_json, action_key = _primary_action_with_evidence(conn, sid, operation, root)
+    ready = _primary_ready_root(root)
+    ordinal = conn.execute(
+        select(ordinals.c.next_ordinal).where(ordinals.c.session_id == sid, ordinals.c.operation_id == operation, ordinals.c.family == 0)
+    ).scalar_one_or_none()
+    primary_key = f"provider:0:{0 if ordinal is None else ordinal}"
+    if (
+        conn.execute(
+            select(effects.c.effect_key).where(
+                effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == primary_key
+            )
+        ).one_or_none()
+        is not None
+    ):
+        raise AuditIntegrityError("Semantic PRIMARY bridge cannot substitute an already allocated effect")
+    bridge = _PrimarySourceBridge(
+        session_id=sid,
+        operation_id=operation,
+        primary_effect_key=primary_key,
+        action_json=action_json,
+        action_key=action_key,
+        source=decision.source,
+        decision_checkpoint_id=selected.checkpoint_id,
+        decision_cursor=selected.cursor,
+        consume_cursor=selected.cursor + 1,
+    )
+    with conn.begin_nested():
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=f"semantic-primary-source:{primary_key}",
+            payload=_canonical(bridge).encode("utf-8"),
+            codec=bridge.schema_version,
+        )
+        return append_complete_snapshot(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            expected_checkpoint_id=selected.checkpoint_id,
+            expected_cursor=selected.cursor,
+            snapshot_json=encode_continuation_snapshot(ready),
+            event_batch=(ContinuationEvent("checkpoint", _primary_bridge_event(bridge)),),
+            handoff=False,
+        )
+
+
+def consume_semantic_advisor_review_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Return the original paid Review action to its genuine retained END owner."""
+    from elspeth.web.sessions.continuation_semantic_actions import (
+        installed_action_json,
+        require_consumed_semantic_review_on_connection,
+        require_installed_semantic_action_on_connection,
+    )
+
+    root = _current(conn, running, selected)
+    admission = require_installed_semantic_action_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    if (
+        type(admission.action) is not ReviewContinuationAction
+        or admission.action_key is None
+        or _advisor(root).phase != "decision_ready"
+        or len(root.frames) != 3
+    ):
+        raise AuditIntegrityError("Semantic Review consume lost its exact installed original paid action")
+    parent, end = _parent(root), root.frames[1]
+    original = admission.evidence.coverage.end_candidate
+    candidate_ref = admission.evidence.coverage.candidate_ref
+    evidence_binding = admission.evidence.coverage.evidence_binding
+    if (
+        type(end) is not EndFrame
+        or end.phase != "review_needed"
+        or original is None
+        or admission.evidence.coverage.candidate_source != end.candidate
+        or candidate_ref is None
+        or evidence_binding is None
+        or original.publication_source is not None
+        or original.publication_record_json is not None
+    ):
+        raise AuditIntegrityError("Semantic Review consume cannot invent or replace the genuine unpaid END candidate")
+    candidate = encode_end_candidate(
+        original.model_copy(
+            update={
+                "state": parent.state,
+                "evidence": parent.evidence,
+                "iteration": parent.iteration,
+                "semantic_source": admission.paid.source,
+                "semantic_decision_json": admission.paid.decision_json,
+            }
+        )
+    )
+    bridge = _ReviewSourceBridge(
+        session_id=str(running.claim.session_id),
+        operation_id=running.claim.operation_id,
+        action_json=installed_action_json(admission),
+        action_key=admission.action_key,
+        source=admission.paid.source,
+        decision_checkpoint_id=selected.checkpoint_id,
+        decision_cursor=selected.cursor,
+        consume_cursor=selected.cursor + 1,
+        original_candidate=end.candidate,
+        candidate=candidate.reference,
+        candidate_ref=candidate_ref,
+        evidence_binding=evidence_binding,
+    )
+    bridge_key = f"semantic-review-source:{effect_key}"
+    event = canonical_json(
+        {
+            "kind": "semantic_review_ready",
+            "action_json": bridge.action_json,
+            "action_key": bridge.action_key,
+            "source": bridge.source.model_dump(mode="json"),
+            "decision_checkpoint_id": bridge.decision_checkpoint_id,
+            "decision_cursor": bridge.decision_cursor,
+            "original_candidate": bridge.original_candidate.model_dump(mode="json"),
+            "candidate": bridge.candidate.model_dump(mode="json"),
+            "candidate_ref": bridge.candidate_ref,
+            "evidence_binding": bridge.evidence_binding,
+            "bridge_chunk_key": bridge_key,
+        }
+    )
+    ready = root.model_copy(update={"frames": (parent, end.model_copy(update={"state": parent.state, "candidate": candidate.reference}))})
+    with conn.begin_nested():
+        put_chunk(
+            conn,
+            session_id=bridge.session_id,
+            operation_id=bridge.operation_id,
+            key=private_chunk_key(candidate),
+            payload=candidate.canonical.encode("utf-8"),
+            codec=candidate.reference.codec,
+        )
+        put_chunk(
+            conn,
+            session_id=bridge.session_id,
+            operation_id=bridge.operation_id,
+            key=bridge_key,
+            payload=_canonical(bridge).encode("utf-8"),
+            codec=bridge.schema_version,
+        )
+        consumed = append_complete_snapshot(
+            conn,
+            session_id=bridge.session_id,
+            operation_id=bridge.operation_id,
+            expected_checkpoint_id=selected.checkpoint_id,
+            expected_cursor=selected.cursor,
+            snapshot_json=encode_continuation_snapshot(ready),
+            event_batch=(ContinuationEvent("checkpoint", event),),
+            handoff=False,
+        )
+        require_consumed_semantic_review_on_connection(conn, running, selected=consumed, effect_key=effect_key)
+        return consumed
+
+
+def read_original_prescribed_primary_source_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, action_json: str, effect_key: str
+) -> ContinuationActionSource:
+    """Reprove original paid decision and consumption after active fields clear.
+
+    This is immutable DATA only. The PRIMARY execution owner must separately
+    prove its current effect, creator and actual evolving action receipt.
+    """
+    sid, operation = str(session_id), operation_id
+    pieces = effect_key.split(":")
+    if len(pieces) != 3 or pieces[:2] != ["provider", "0"] or not pieces[2].isdigit() or str(int(pieces[2])) != pieces[2]:
+        raise AuditIntegrityError("Semantic PRIMARY source requires its exact family-0 effect key")
+    bridge = _decode(
+        _PrimarySourceBridge, _blob(conn, sid, operation, f"semantic-primary-source:{effect_key}", "composer.semantic-primary-source.v1")
+    )
+    if (bridge.session_id, bridge.operation_id, bridge.primary_effect_key, bridge.action_json) != (
+        sid,
+        operation,
+        effect_key,
+        action_json,
+    ) or bridge.consume_cursor != bridge.decision_cursor + 1:
+        raise AuditIntegrityError("Semantic PRIMARY source substituted its original bridge identity")
+    selected = _historical_snapshot(conn, sid, operation, checkpoint_id=bridge.decision_checkpoint_id)
+    root = decode_continuation_snapshot(selected.payload_json)
+    if selected.cursor != bridge.decision_cursor:
+        raise AuditIntegrityError("Semantic PRIMARY source changed its original decision cursor")
+    decision = _decision_data(conn, sid, operation, selected, root, bridge.source.effect_key)
+    actual_action_json, actual_action_key = _primary_action_with_evidence(conn, sid, operation, root)
+    if (decision.source, root.active_action_source, actual_action_json, actual_action_key) != (
+        bridge.source,
+        bridge.source,
+        bridge.action_json,
+        bridge.action_key,
+    ):
+        raise AuditIntegrityError("Semantic PRIMARY source changed its original paid decision/action/frontier")
+    consumed = _historical_snapshot(conn, sid, operation, cursor=bridge.consume_cursor)
+    expected = _primary_ready_root(root).model_copy(update={"cursor": bridge.consume_cursor})
+    if decode_continuation_snapshot(consumed.payload_json) != expected:
+        raise AuditIntegrityError("Semantic PRIMARY source changed its complete consume checkpoint")
+    _journal_data(conn, sid, operation, cursor=bridge.consume_cursor, tag="checkpoint", payload=_primary_bridge_event(bridge))
+    return bridge.source
+
+
+def require_current_prescribed_primary_action_on_connection(
+    conn: Connection, running: ComposerOperationRunning, root: ContinuationFrameStack
+) -> str | None:
+    """Current execution admission, separate from the historical DATA reader."""
+    if type(root) is not ContinuationFrameStack:
+        raise AuditIntegrityError("Semantic PRIMARY admission requires its nominal current root")
+    selected = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+    actual = _current(conn, running, selected)
+    if actual != root:
+        raise ContinuationCASConflict("Semantic PRIMARY admission changed its complete current root")
+    if root.active_action_json is None and root.active_action_source is None:
+        return None
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    action_json, _action_key = _primary_action_with_evidence(conn, sid, operation, root)
+    parent = _parent(root)
+    primary_key = parent.provider_effect_key
+    if primary_key is None:
+        ordinal = conn.execute(
+            select(ordinals.c.next_ordinal).where(
+                ordinals.c.session_id == sid, ordinals.c.operation_id == operation, ordinals.c.family == 0
+            )
+        ).scalar_one_or_none()
+        primary_key = f"provider:0:{0 if ordinal is None else ordinal}"
+    original = read_original_prescribed_primary_source_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=operation, action_json=action_json, effect_key=primary_key
+    )
+    if original != root.active_action_source:
+        raise AuditIntegrityError("Semantic PRIMARY admission substituted its original source")
+    return action_json
+
+
+def _inflight_source_data(
+    conn: Connection, sid: str, operation: str, selected: StoredContinuationSnapshot, root: ContinuationFrameStack
+) -> Row[Any]:
+    frame = _advisor(root)
+    if frame.phase != "awaiting_response" or frame.provider_effect_key is None or frame.response is not None:
+        raise AuditIntegrityError("Semantic in-flight source changed its original selected frame")
+    effect = _effect_data(conn, sid, operation, root, frame.provider_effect_key)
+    _value, data, _physical = _descriptor_data(conn, sid, operation, effect)
+    _original_input_data(conn, sid, operation, root, effect)
+    _creator_data(conn, sid, operation, effect)
+    if effect.disposition not in ("prepared", "dispatched") or any(
+        value is not None
+        for value in (
+            effect.receipt_key,
+            effect.result_chunk_key,
+            effect.provider_attempt_id,
+            effect.physical_sequence,
+            effect.physical_generation,
+            effect.requested_model,
+            effect.response_finished_at,
+        )
+    ):
+        raise AuditIntegrityError("Semantic in-flight source cannot infer a complete known output")
+    original = _historical_snapshot(conn, sid, operation, checkpoint_id=data.source.checkpoint_id)
+    if original.payload_json != data.source.selected_snapshot_json:
+        raise AuditIntegrityError("Semantic preparation changed its original complete source checkpoint")
+    original_root = decode_continuation_snapshot(original.payload_json)
+    expected = original_root.model_copy(update={"frames": (*original_root.frames, frame)})
+    expected = decode_continuation_snapshot(
+        _effect_snapshot(
+            encode_continuation_snapshot(expected), effect_key=effect.effect_key, disposition=effect.disposition, receipt_id=None
+        )
+    ).model_copy(update={"cursor": original.cursor + (1 if effect.disposition == "prepared" else 2)})
+    if root != expected or selected.cursor != expected.cursor:
+        raise AuditIntegrityError("Semantic in-flight source changed its complete original preparation/begin root")
+    _journal_data(
+        conn,
+        sid,
+        operation,
+        cursor=original.cursor + 1,
+        tag="input_prepared",
+        payload=canonical_json(
+            {
+                "effect_key": effect.effect_key,
+                "input_sha256": effect.input_sha256,
+            }
+        ),
+    )
+    if effect.disposition == "dispatched":
+        _journal_data(
+            conn, sid, operation, cursor=original.cursor + 2, tag="may_dispatch", payload=canonical_json({"effect_key": effect.effect_key})
+        )
+    return effect
+
+
+def _semantic_checkpoint_kind_data(conn: Connection, sid: str, operation: str, cursor: int) -> str:
+    row = conn.execute(
+        select(events.c.tag, events.c.payload_chunk_key).where(
+            events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == cursor
+        )
+    ).one_or_none()
+    if row is None or row.tag != "checkpoint":
+        raise AuditIntegrityError("Semantic current action lost its exact checkpoint event")
+    text = read_chunk(conn, session_id=sid, operation_id=operation, key=row.payload_chunk_key).decode("utf-8", errors="strict")
+    value, error = parse_json_strict(text)
+    if error is not None or type(value) is not dict or canonical_json(value) != text:
+        raise AuditIntegrityError("Semantic current action lost its closed checkpoint discriminator")
+    kind = value.get("kind")
+    if type(kind) is not str:
+        raise AuditIntegrityError("Semantic current action lost its checkpoint kind")
+    return kind
+
+
+def validate_semantic_advisor_source_data_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, selected: StoredContinuationSnapshot
+) -> tuple[str, ...]:
+    """Full original selected source proof for the structural SQL reader.
+
+    A known prepared/begun effect remains unresolved DATA. This never grants
+    SDK replay, caller custody or an invented successful response.
+    """
+    sid, operation = str(session_id), operation_id
+    original = _historical_snapshot(conn, sid, operation, checkpoint_id=selected.checkpoint_id)
+    if original != selected:
+        raise AuditIntegrityError("Semantic structural source substituted its complete checkpoint")
+    root = decode_continuation_snapshot(selected.payload_json)
+    frame = _advisor(root)
+    if frame.phase == "awaiting_response":
+        effect = _inflight_source_data(conn, sid, operation, selected, root)
+        return (effect.effect_key,)
+    if frame.provider_effect_key is None:
+        raise AuditIntegrityError("Semantic structural source lost its actual original provider effect")
+    if frame.phase == "decision_ready":
+        if (
+            root.active_action_json is None
+            and _semantic_checkpoint_kind_data(conn, sid, operation, selected.cursor) == "semantic_read_committed"
+        ):
+            from elspeth.web.sessions.continuation_semantic_actions import read_original_committed_semantic_read_on_connection
+
+            read_original_committed_semantic_read_on_connection(
+                conn,
+                session_id=session_id,
+                operation_id=operation_id,
+                commit_checkpoint_id=selected.checkpoint_id,
+                semantic_effect_key=frame.provider_effect_key,
+            )
+            return ()
+        if (
+            root.active_action_json is not None
+            and type(decode_prescribed_continuation_action(root.active_action_json)) is PrimaryContinuationAction
+        ):
+            _decision_data(conn, sid, operation, selected, root, frame.provider_effect_key)
+        else:
+            from elspeth.web.sessions.continuation_semantic_actions import _reprove_installed_snapshot
+
+            _reprove_installed_snapshot(conn, session_id, operation_id, selected, frame.provider_effect_key)
+    elif frame.phase == "response_retained":
+        _paid_result_data(conn, sid, operation, selected, root, frame.provider_effect_key)
+    else:
+        raise AuditIntegrityError("Semantic structural source has no installed original producer for this cut")
+    return ()
+
+
+def read_semantic_advisor_runtime_source_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+) -> ContinuationRuntimeSource:
+    """Restore the actual full Advisor cut after its original paid proof.
+
+    The shared runtime read receives the unchanged selection and inventory;
+    no Compose-only surrogate or historical authorization is constructed.
+    """
+    if type(selected) is not SelectedContinuationState or type(inventory) is not CurrentContinuationEnvInventory:
+        raise AuditIntegrityError("Semantic runtime source requires its nominal full selected source/inventory")
+    stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
+    root = _current(conn, running, stored)
+    frame = _advisor(root)
+    if frame.phase not in ("response_retained", "decision_ready"):
+        raise AuditIntegrityError("Semantic runtime cannot replay unresolved prepared/begun provider work")
+    validate_semantic_advisor_source_data_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, selected=stored
+    )
+    return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+
+
+def select_semantic_advisor_current_graph_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+) -> StoredContinuationSnapshot:
+    """Select only the actual retained authored graph's semantic projection.
+
+    Every obligation, source evidence, pending review and action receipt keeps
+    its original value. This authors no graph and declares no timer/note progress.
+    """
+    stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
+    root = _current(conn, running, stored)
+    parent = _parent(root)
+    _input_end_source_data(
+        conn, str(running.claim.session_id), running.claim.operation_id, root, checkpoint_id=stored.checkpoint_id, cursor=stored.cursor
+    )
+    if (
+        root.active_action_json is not None
+        or root.active_action_source is not None
+        or root.semantic_frontier is None
+        or any(item.disposition in ("prepared", "dispatched", "unknown") for item in root.effect_frontier)
+    ):
+        raise AuditIntegrityError("Semantic graph selection requires its quiescent unprescribed original Compose source")
+    read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    state = state_from_evidence_json(_ref(conn, sid, operation, parent.state).canonical)
+    previous = decode_frontier_chunk(_ref(conn, sid, operation, root.semantic_frontier))
+    changed = encode_frontier_chunk(replace(previous, graph_hash=authored_state_hash(state)))
+    if changed.reference == root.semantic_frontier:
+        return stored
+    with conn.begin_nested():
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=private_chunk_key(changed),
+            payload=changed.canonical.encode("utf-8"),
+            codec=changed.reference.codec,
+        )
+        return append_complete_snapshot(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            expected_checkpoint_id=stored.checkpoint_id,
+            expected_cursor=stored.cursor,
+            snapshot_json=encode_continuation_snapshot(root.model_copy(update={"semantic_frontier": changed.reference})),
+            event_batch=(
+                ContinuationEvent(
+                    "checkpoint",
+                    canonical_json(
+                        {
+                            "kind": "semantic_current_graph",
+                            "predecessor": root.semantic_frontier.model_dump(mode="json"),
+                            "selected": changed.reference.model_dump(mode="json"),
+                            "state": parent.state.model_dump(mode="json"),
+                        }
+                    ),
+                ),
+            ),
+            handoff=False,
+        )

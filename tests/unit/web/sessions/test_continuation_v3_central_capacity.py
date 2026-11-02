@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import event, update
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation import ContinuationProviderCostPolicyV2
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
@@ -59,8 +60,14 @@ def _sized_root(sid, operation_id, *, extra_bytes, events=()):
         root = _root(sid, operation_id, limit)
         initial = encode_continuation_snapshot(root)
         final = encode_continuation_snapshot(root.model_copy(update={"cursor": len(events)})) if events else ""
-        sized = len(initial.encode("utf-8")) + len(final.encode("utf-8"))
-        sized += sum(len(item.payload_json.encode("utf-8")) for item in events) + extra_bytes
+        terminal_event = ContinuationEvent(
+            "settled",
+            canonical_json({"version": 1, "sequence": 1, "generation": 1, "status": "failed", "failure_code": "http_error"}),
+        )
+        terminal = encode_continuation_snapshot(root.model_copy(update={"cursor": len(events) + 1}))
+        sized = len(initial.encode("utf-8")) + len(final.encode("utf-8")) + len(terminal.encode("utf-8"))
+        sized += sum(len(item.payload_json.encode("utf-8")) for item in events)
+        sized += len(terminal_event.payload_json.encode("utf-8")) + extra_bytes
         if sized == limit:
             return root, initial
         limit = sized
@@ -100,6 +107,15 @@ def _initialize(connection, sid, operation_id, root_json, *, policy_hash, overri
 
 def _used(connection, sid, operation_id):
     return sum(size for _codec, size in _retained_payload_rows(connection, sid, operation_id).values())
+
+
+def _reserved_failed_tail_bytes(root, cursor):
+    terminal_event = ContinuationEvent(
+        "settled",
+        canonical_json({"version": 1, "sequence": 1, "generation": 1, "status": "failed", "failure_code": "http_error"}),
+    )
+    terminal = encode_continuation_snapshot(root.model_copy(update={"cursor": cursor + 1}))
+    return len(terminal_event.payload_json.encode("utf-8")) + len(terminal.encode("utf-8"))
 
 
 def _observe_dml(engine, writes):
@@ -171,9 +187,9 @@ def test_v3_direct_chunk_uses_policy_without_override_and_counts_off_head_keys(c
         _set_v3_contract(conn, sid, operation_id, root)
         _initialize(conn, sid, operation_id, encoded, policy_hash=root.policy_hash)
         put_chunk(conn, session_id=sid, operation_id=operation_id, key="off-head", payload=b"{}", codec="event.v2")
-        assert _used(conn, sid, operation_id) == _limit(root)
+        assert _used(conn, sid, operation_id) + _reserved_failed_tail_bytes(root, 0) == _limit(root)
         put_chunk(conn, session_id=sid, operation_id=operation_id, key="off-head", payload=b"{}", codec="event.v2")
-        assert _used(conn, sid, operation_id) == _limit(root)
+        assert _used(conn, sid, operation_id) + _reserved_failed_tail_bytes(root, 0) == _limit(root)
         with pytest.raises(ContinuationRetainedCapacityExceeded):
             put_chunk(conn, session_id=sid, operation_id=operation_id, key="another", payload=b"{}", codec="event.v2")
         with pytest.raises(AuditIntegrityError, match="immutable admission policy"):
@@ -267,7 +283,7 @@ def test_v3_append_charges_final_root_and_all_raw_utf8_events_before_dml(continu
                     prepared_append=prepared_value,
                 )
                 assert retained.payload_json == final_json and retained.cursor == 2
-                assert _used(conn, sid, operation_id) == _limit(root)
+                assert _used(conn, sid, operation_id) + _reserved_failed_tail_bytes(root, 2) == _limit(root)
         if extra_bytes < 0:
             assert _snapshot_rows(engine) == before
         else:

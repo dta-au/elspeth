@@ -98,6 +98,7 @@ if TYPE_CHECKING:
 
 class _ProviderAuditFinalizationKwargs(TypedDict, total=False):
     provider_audit_calls: tuple[ComposerLLMCall, ...]
+    publication_result: ComposerResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +312,8 @@ async def settle_composer_result(
         )
         if isinstance(result, ComposerResult):
             audit_cohort = result.recovery_audit_drafts + audit_cohort
+        if type(inputs.budget_anchor) is ContinuationFinalizationBudget and isinstance(result, ComposerResult):
+            provider_options["publication_result"] = result
         record = await _join_shielded_task_after_cancellation(
             asyncio.create_task(
                 service.complete_composer_async_operation(
@@ -579,6 +582,8 @@ async def settle_composer_result(
     # the terminal and persists the cancelled-turn audit. Its own outcome is
     # authoritative: it commits (completed wins), or raises
     # ComposerOperationCancelledDuringTurn / a fence loss having written nothing.
+    if type(inputs.budget_anchor) is ContinuationFinalizationBudget:
+        provider_options["publication_result"] = result
     record = await _join_shielded_task_after_cancellation(
         asyncio.create_task(
             service.complete_composer_async_operation(

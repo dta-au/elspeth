@@ -27,6 +27,7 @@ from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
     _AdvisorReviewState,
+    _EndCompletionDisposition,
     _TerminateOutcome,
 )
 from elspeth.web.composer._producer_resolver import source_producer_id
@@ -1921,7 +1922,13 @@ class CompositionCompletion:
             result = _with_advisor_gate_decision(
                 result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
             )
-            return _TerminateOutcome(action="return", result=result, publication_binding=advisor_gate.publication_binding)
+            return _TerminateOutcome(
+                action="return",
+                result=result,
+                advisor_passes_delta=advisor_gate.advisor_passes_delta,
+                advisor_review_state=advisor_gate.advisor_review_state,
+                publication_binding=advisor_gate.publication_binding,
+            )
 
         # Fail-closed orphaned-interpretation gate. The repair budget is now
         # exhausted (every repair-injection branch above is gated on
@@ -1991,7 +1998,35 @@ class CompositionCompletion:
             persisted_assistant_content=persisted_assistant_content,
             persisted_tool_call_turn=persisted_tool_call_turn,
         )
-        return _TerminateOutcome(action="return", result=threaded, publication_binding=advisor_gate.publication_binding)
+        # Only this final return has crossed all proof and orphan barriers.
+        # Earlier blocked returns retain the default nonpublication disposition
+        # even when an earlier graph review happened to pass.
+        disposition = _EndCompletionDisposition.BLOCKED
+        identity = threaded.graph_review_identity
+        readiness = None if threaded.runtime_preflight is None else threaded.runtime_preflight.readiness
+        if (
+            type(identity) is AdvisorGraphReviewIdentity
+            and identity.source == "model"
+            and advisor_gate.publication_binding is not None
+            and identity.binding == advisor_gate.publication_binding
+            and (
+                (_state_is_structurally_empty(threaded.state) and threaded.runtime_preflight is None)
+                or (
+                    type(threaded.advisor_gate_decision) is AdvisorGatePassed
+                    and type(readiness) is ValidationReadiness
+                    and readiness.completion_ready
+                )
+            )
+        ):
+            disposition = _EndCompletionDisposition.CLEAN
+        return _TerminateOutcome(
+            action="return",
+            result=threaded,
+            end_disposition=disposition,
+            advisor_passes_delta=advisor_gate.advisor_passes_delta,
+            advisor_review_state=advisor_gate.advisor_review_state,
+            publication_binding=advisor_gate.publication_binding,
+        )
 
     async def _surface_pt_and_gate_orphans_or_none(
         self,
@@ -2693,8 +2728,9 @@ class CompositionCompletion:
                 advisor_review_state=review_state,
             )
 
-        # Fall-through terminates the turn (the caller finalizes and returns),
-        # so the consumed passes need not be charged forward.
+        # The ordinary caller finalizes this result. A retained Continuation
+        # review can have a later action, so preserve its actual consumed passes
+        # and review state without issuing or charging another review.
         graph_preflight_qualified = runtime_preflight is not None and runtime_preflight.is_valid
         if (
             not graph_preflight_qualified
@@ -2726,6 +2762,8 @@ class CompositionCompletion:
             )
         return _TerminalNoToolAdvisorGateOutcome(
             action="fall_through",
+            advisor_passes_delta=passes_delta,
+            advisor_review_state=review_state,
             advisor_gate_decision=(
                 AdvisorGatePassed(for_graph=completion_gate_fingerprint(state))
                 if not _state_is_structurally_empty(state)

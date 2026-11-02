@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import secrets
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast, final
 from uuid import UUID, uuid4
@@ -125,6 +126,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+    from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.sessions.continuation import ContinuationOwnerCommit, PreparedSegmentSettlement
@@ -1023,6 +1025,8 @@ class ComposerAsyncOperationAuthority:
         inventory: CurrentContinuationEnvInventory,
         retention_memo: RetentionStageMemo | None = None,
     ) -> ContinuationRuntimeSource:
+        from elspeth.web.composer.continuation import AdvisorFrame
+        from elspeth.web.composer.continuation_selection import SelectedContinuationState
         from elspeth.web.sessions.continuation_runtime import read_runtime_source_on_connection
 
         if type(running) is not ComposerOperationRunning:
@@ -1035,6 +1039,13 @@ class ComposerAsyncOperationAuthority:
             raise AuditIntegrityError("runtime read requires its exact active retention memo")
         memo_scope = retention_stage_memo_scope() if retention_memo is None else nullcontext(retention_memo)
         with session_data_read_transaction(self._engine, str(running.claim.session_id)) as conn, memo_scope:
+            if type(selected) is SelectedContinuationState and selected.stack.frames and type(selected.stack.frames[-1]) is AdvisorFrame:
+                from elspeth.web.sessions.continuation_semantic_advisor import read_semantic_advisor_runtime_source_on_connection
+
+                # Retain the actual full selected root. The semantic owner
+                # reproves its original outcome/decision and refuses unresolved
+                # prepared/begun work before the ordinary runtime DATA read.
+                return read_semantic_advisor_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
             return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
     def read_continuation_tool_failure(
@@ -1720,6 +1731,11 @@ class ComposerAsyncOperationAuthority:
                     raise ComposerOperationFenceLost(
                         session_id=UUID(hint.session_id), operation_id=hint.operation_id, attempt=row.parent_attempt + 1
                     )
+                from elspeth.web.sessions.continuation import require_v3_unpaid_terminal_reserve_on_connection
+
+                # Validate the V3 terminal reserve under the final claimed
+                # parent. Refusal must roll back its token and attempt too.
+                require_v3_unpaid_terminal_reserve_on_connection(conn, session_id=str(hint.session_id), operation_id=hint.operation_id)
                 claimed.append(
                     ComposerOperationClaim(
                         session_id=UUID(hint.session_id),
@@ -2050,6 +2066,7 @@ def settle_composer_operation_on_connection(
     authoritative_failure: bool = False,
     prepared_settlement: PreparedSegmentSettlement | None = None,
     terminal_recorded_at: datetime | None = None,
+    publication_result: ComposerResult | None = None,
 ) -> ComposerOperationRecord:
     """Sealed terminal CAS. Failed results cannot authorize business mutations."""
     from elspeth.web.sessions.continuation import settle_continuation_on_connection
@@ -2059,6 +2076,22 @@ def settle_composer_operation_on_connection(
         return _record_from_row(current)
     if current is not None and isinstance(outcome, ComposerOperationError):
         outcome = _select_failure_on_connection(current, outcome, authoritative_failure=authoritative_failure)
+    if isinstance(outcome, MessageWithStateResponse):
+        from elspeth.web.composer.protocol import ComposerResult
+        from elspeth.web.sessions.continuation_semantic_actions import require_semantic_publication_on_connection
+        from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
+
+        selected = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+        proof = require_semantic_publication_on_connection(conn, running, selected=selected)
+        if proof is not None:
+            if type(publication_result) is not ComposerResult:
+                raise AuditIntegrityError("semantic publication lost its actual shared finalizer result")
+            original = proof.review_result.result
+            expected = replace(original, llm_calls=(*original.llm_calls, proof.admission.paid.audit_call))
+            if publication_result != expected:
+                raise AuditIntegrityError("semantic publication replaced its original reviewed result or paid Stop audit")
+            if outcome.message.content != composer_turn_end_assistant_row(expected).content:
+                raise AuditIntegrityError("semantic publication changed its committed assistant result")
     settle_continuation_on_connection(
         conn,
         running,

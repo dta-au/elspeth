@@ -1215,6 +1215,10 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.execution_lease_release_registry.assert_completed()
         except BaseException as failure:
             shutdown_failures.append(failure)
+        try:
+            app.state.composer_progress_registry.assert_pending_settled()
+        except BaseException as failure:
+            shutdown_failures.append(failure)
         await observe_shutdown(app.state.web_instance_membership.stop)
         await observe_shutdown(app.state.operator_telemetry.shutdown)
         from elspeth.web.async_workers import shutdown_async_workers

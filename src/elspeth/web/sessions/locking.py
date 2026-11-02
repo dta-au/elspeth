@@ -24,10 +24,10 @@ from sqlalchemy.engine.interfaces import DBAPICursor, ExecutionContext
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
-from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+from elspeth.web.sessions.continuation_sql_deadline import ContinuationReadResultDeadline, ContinuationSQLDeadlineOwner
 
 if TYPE_CHECKING:
-    from elspeth.web.required_work import RequiredWorkTicket
+    from elspeth.web.required_work import RequiredReadProduced, RequiredWorkTicket
 
 
 class _ContinuationSQLDeadlineMode(Enum):
@@ -59,9 +59,10 @@ class ContinuationPaidSettlementScope:
         )
 
 
-_CONTINUATION_SQL_DEADLINE: ContextVar[tuple[ContinuationSQLDeadlineOwner, bool | _ContinuationSQLDeadlineMode] | None] = ContextVar(
-    "continuation_sql_deadline", default=None
-)
+_READ_RESULT_ISSUER_SEAL = object()
+_CONTINUATION_SQL_DEADLINE: ContextVar[
+    tuple[ContinuationSQLDeadlineOwner, bool | _ContinuationSQLDeadlineMode | ContinuationReadResultDeadline] | None
+] = ContextVar("continuation_sql_deadline", default=None)
 _CONTINUATION_METADATA_ENGINE: ContextVar[Engine | None] = ContextVar("continuation_metadata_engine", default=None)
 
 
@@ -89,6 +90,42 @@ def continuation_sql_deadline_scope(
     if previous is not None and previous != (owner, mode):
         raise AuditIntegrityError("physical SQL cannot replace another operation's deadline")
     token = _CONTINUATION_SQL_DEADLINE.set((owner, mode))
+    try:
+        yield
+    finally:
+        _CONTINUATION_SQL_DEADLINE.reset(token)
+
+
+@contextlib.contextmanager
+def continuation_read_result_deadline_scope(
+    ticket: RequiredWorkTicket,
+    produced: RequiredReadProduced,
+    clock: ContinuationReadResultDeadline,
+    *,
+    issuer: object,
+) -> Iterator[None]:
+    """Only the actual returned-read worker may enter its nested finish clock."""
+    from elspeth.web.required_work import RequiredReadProduced, RequiredWorkSource, RequiredWorkTicket
+
+    if (
+        issuer is not _READ_RESULT_ISSUER_SEAL
+        or type(ticket) is not RequiredWorkTicket
+        or ticket.key.source is not RequiredWorkSource.CONTINUATION_READ_RESULT_SQL
+        or ticket.complete
+        or type(produced) is not RequiredReadProduced
+        or type(clock) is not ContinuationReadResultDeadline
+        or ticket.sql_deadline_owner is not clock.owner
+        or _CONTINUATION_SQL_DEADLINE.get() != (clock.owner, False)
+    ):
+        raise AuditIntegrityError("Read disposition lost its actual returned-result worker")
+    produced.validate()
+    clock.owner.validate_context(
+        ticket.key.authority.context,
+        operation_id=ticket.key.authority.durable_operation_id,
+        attempt=ticket.key.authority.claim_attempt,
+    )
+    clock.owner.remaining_statement(session_id=ticket.key.authority.context.fence.session_id, read_result=clock)
+    token = _CONTINUATION_SQL_DEADLINE.set((clock.owner, clock))
     try:
         yield
     finally:
@@ -130,6 +167,7 @@ def continuation_metadata_connection_deadline_scope(conn: Connection) -> Iterato
         session_id=session_id,
         lifecycle=mode is True,
         paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+        read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
     )
     with continuation_connection_deadline_scope(conn, session_id):
         yield
@@ -137,6 +175,7 @@ def continuation_metadata_connection_deadline_scope(conn: Connection) -> Iterato
         session_id=session_id,
         lifecycle=mode is True,
         paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+        read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
     )
 
 
@@ -441,6 +480,7 @@ def continuation_connection_deadline_scope(
                 deadline=deadline,
                 lifecycle=mode is True,
                 paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+                read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
             )
         elif deadline is not None:
             remaining = deadline.remaining_seconds(now=time.monotonic())

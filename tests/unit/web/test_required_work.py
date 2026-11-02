@@ -130,6 +130,12 @@ def test_each_source_has_exact_plan_mapping(authority, source):
         11,
         11,
         14,
+        11,
+        11,
+        14,
+        14,
+        11,
+        11,
     )
     expected_phases = (
         2,
@@ -192,13 +198,42 @@ def test_each_source_has_exact_plan_mapping(authority, source):
         4,
         5,
         2,
+        4,
+        5,
+        4,
+        5,
+        2,
+        5,
     )
-    assert len(RequiredWorkSource) == len(SOURCE_MAPPING) == 60
+    assert len(RequiredWorkSource) == len(SOURCE_MAPPING) == 66
+    assert set(RequiredWorkSource) == set(SOURCE_MAPPING)
     key = make_required_work_key(authority, source)
     assert (key.stage.value, key.subphase.value) == (expected_stages[source.value], expected_phases[source.value])
     assert key.invocation_ordinal == source.value * (source.value + 1) // 2
     with pytest.raises(AuditIntegrityError):
         replace(key, stage=ComposerRequiredStage((key.stage.value + 1) % 15))
+    with pytest.raises(AuditIntegrityError):
+        replace(
+            key,
+            subphase=(
+                RequiredWorkSubphase.SQL_INITIAL if key.subphase is RequiredWorkSubphase.PROJECTION else RequiredWorkSubphase.PROJECTION
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        RequiredWorkSource.CONTINUATION_STATE_SQL,
+        RequiredWorkSource.CONTINUATION_READ_SQL,
+        RequiredWorkSource.CONTINUATION_READ_RESULT_SQL,
+        RequiredWorkSource.CONTINUATION_READ_RESULT_PROJECTION,
+    ),
+)
+def test_read_result_identity_does_not_admit_new_business_during_process_drain(authority, source):
+    coordinator = RequiredWorkCoordinator(authority)
+    assert coordinator.reserve(source).permits_process_drain is False
+    assert coordinator.reserve(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL).permits_process_drain is True
 
 
 def test_authority_scope_nullability_and_nominal_kind(authority):

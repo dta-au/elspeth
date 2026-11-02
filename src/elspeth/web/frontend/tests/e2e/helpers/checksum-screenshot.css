@@ -1,0 +1,6 @@
+/* Screenshot-only: keep block flow, height and wrapping bounds while limiting
+   the mask to the volatile checksum text instead of its full-width line. */
+.graph-checksum-value {
+  width: fit-content;
+  max-width: 100%;
+}

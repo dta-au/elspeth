@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
-
 import litellm
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import select
 
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors
 from elspeth.web.composer.continuation_policy import (
@@ -20,10 +18,10 @@ from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
-from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, read_primary_no_sdk_refusal_on_connection
+from elspeth.web.sessions.continuation import V3UnboundedTailRefusal, read_v3_retained_tail_refusal_on_connection
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
-from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.coordination import test_composer_operation_authority
@@ -98,45 +96,33 @@ async def test_v3_primary_without_complete_tail_envelope_refuses_before_sdk(oper
                 provider_owner=ProviderInvocationOwner(service=store[3], required_work=work),
                 timeout=5,
             )
-        assert type(result) is PrimaryNoSdkRefusalReceipt
-        assert result.terminal.status == "failed"
+        assert type(result) is V3UnboundedTailRefusal
+        assert result.reason == "retained_tail_unbounded"
+        assert result.terminal.cursor == selected.stack.cursor + 1
         assert sdk_entries == []
         assert recorder.llm_calls == ()
         with store[0].connect() as conn:
-            refusal = conn.execute(
-                select(chunks.c.payload).where(
-                    chunks.c.session_id == str(store[4]),
-                    chunks.c.operation_id == running.claim.operation_id,
-                    chunks.c.chunk_key == result.result_chunk_key,
+            terminal = conn.execute(
+                select(jobs.c.status, jobs.c.checkpoint_id, jobs.c.journal_cursor).where(
+                    jobs.c.session_id == str(store[4]), jobs.c.operation_id == running.claim.operation_id
                 )
-            ).scalar_one()
+            ).one()
             effect_rows = conn.execute(
-                select(effects.c.disposition, effects.c.provider_attempt_id).where(
+                select(effects.c.effect_key).where(
                     effects.c.session_id == str(store[4]), effects.c.operation_id == running.claim.operation_id
                 )
             ).all()
-            paid_ledger_rows = conn.execute(select(usage).where(usage.c.session_id == str(store[4]))).all()
-            cold_chunk_queries: list[str] = []
-
-            def capture_receipt_query(_conn, _cursor, statement, parameters, _context, _executemany):
-                if "composer_continuation_chunks" in statement and result.result_chunk_key in repr(parameters):
-                    cold_chunk_queries.append(" ".join(statement.lower().split()))
-
-            event.listen(conn, "before_cursor_execute", capture_receipt_query)
-            try:
-                replay = read_primary_no_sdk_refusal_on_connection(
-                    conn, session_id=store[4], operation_id=running.claim.operation_id, effect_key=result.effect_key
+            physical_rows = conn.execute(
+                select(physical.c.attempt_id).where(
+                    physical.c.session_id == str(store[4]), physical.c.operation_id == running.claim.operation_id
                 )
-            finally:
-                event.remove(conn, "before_cursor_execute", capture_receipt_query)
-        assert len(effect_rows) == 1
-        assert json.loads(refusal)["reason"] == "retained_tail_unbounded"
-        assert effect_rows[0].disposition == "refused" and effect_rows[0].provider_attempt_id is None
-        assert paid_ledger_rows == []
+            ).all()
+            paid_ledger_rows = conn.execute(select(usage).where(usage.c.session_id == str(store[4]))).all()
+            replay = read_v3_retained_tail_refusal_on_connection(conn, session_id=store[4], operation_id=running.claim.operation_id)
+        assert terminal.status == "failed"
+        assert (terminal.checkpoint_id, terminal.journal_cursor) == (result.terminal.checkpoint_id, result.terminal.cursor)
+        assert effect_rows == physical_rows == paid_ledger_rows == []
         assert replay == result
-        assert len(cold_chunk_queries) >= 2
-        assert "codec" in cold_chunk_queries[0] and "payload" not in cold_chunk_queries[0]
-        assert all("payload" not in query or ("case" in query and "length" in query) for query in cold_chunk_queries)
         work.coordinator.assert_completed()
     finally:
         store[1].release(running.session_operation_context)

@@ -1,0 +1,247 @@
+"""Real app/worker/driver semantic consumer; only external SDK/guard are scripted."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from traceback import extract_tb
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import select
+
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+from elspeth.web.sessions.composer_operations import ComposerOperationCancel
+from elspeth.web.sessions.continuation import read_chunk
+from elspeth.web.sessions.continuation_driver import _SegmentDriver
+from elspeth.web.sessions.continuation_semantic_actions import read_original_committed_semantic_read_on_connection
+from elspeth.web.sessions.continuation_semantic_advisor import read_original_prescribed_primary_source_on_connection
+from elspeth.web.sessions.models import quota_provider_attempts_table as physical
+from tests.helpers.composer_operations import message_body
+from tests.helpers.continuation_app import (
+    ScriptedSDK,
+    continuation_app,
+    effects,
+    end_admit,
+    install_sdk,
+    semantic_primary_response,
+    semantic_read_response,
+    semantic_review_response,
+    semantic_stop_response,
+    submit_and_settle,
+    tool_call,
+)
+from tests.unit.web.composer.test_prompt_guard_admission import _checks
+
+
+def _observe_original_driver(monkeypatch, operation):
+    """Payload-free delegation until the actual first live failure is known."""
+    observations = []
+    original_advance, original_settle = _SegmentDriver.advance, _SegmentDriver.settle
+    original_cancel = ContinuationLivePhases.cancel_business
+
+    def failure_data(error):
+        return {
+            "class": type(error).__name__,
+            "cancel_reasons": tuple(arg.reason.value for arg in error.args if type(arg) is ComposerOperationCancel),
+            "trace": tuple((Path(frame.filename).name, frame.name, frame.lineno) for frame in extract_tb(error.__traceback__)),
+            "members": tuple(failure_data(member) for member in error.exceptions) if isinstance(error, BaseExceptionGroup) else (),
+        }
+
+    async def advance(driver, stored, selected):
+        if driver.running.claim.operation_id != operation:
+            return await original_advance(driver, stored, selected)
+        frame = selected.stack.frames[-1]
+        now = time.monotonic()
+        observed = {
+            "boundary": "advance",
+            "cursor": stored.cursor,
+            "kind": frame.frame_kind,
+            "phase": frame.phase if frame.frame_kind != "initialize" else frame.ingress_phase,
+            "remaining": driver.sql_deadline.remaining_action(monotonic_now=now),
+        }
+        observations.append(observed)
+        try:
+            return await original_advance(driver, stored, selected)
+        except BaseException as error:
+            observed["error"] = failure_data(error)
+            raise
+        finally:
+            observed["elapsed"] = time.monotonic() - now
+
+    async def settle(driver, record, original=None, *, expired_failure=None):
+        if driver.running.claim.operation_id == operation:
+            observations.append(
+                {
+                    "boundary": "settle",
+                    "cursor": record.journal_cursor,
+                    "original": None if original is None else failure_data(original),
+                    "expired": None if expired_failure is None else expired_failure.failure_code,
+                }
+            )
+        return await original_settle(driver, record, original, expired_failure=expired_failure)
+
+    def cancel(phases, reason):
+        if phases.work.running is not None and phases.work.running.claim.operation_id == operation:
+            observations.append({"boundary": "cancel_business", "reason": reason.reason.value})
+        return original_cancel(phases, reason)
+
+    monkeypatch.setattr(_SegmentDriver, "advance", advance)
+    monkeypatch.setattr(_SegmentDriver, "settle", settle)
+    monkeypatch.setattr(ContinuationLivePhases, "cancel_business", cancel)
+    return observations
+
+
+@pytest.mark.asyncio
+async def test_actual_driver_runs_paid_semantic_advisor_before_prescribed_primary_and_reproves_cold_source(tmp_path, monkeypatch):
+    instruction = "Use the retained inspection to explain why the current pipeline is empty."
+    actual_decisions = []
+
+    def semantic(request):
+        answer = semantic_primary_response(request, instruction=instruction)
+        actual_decisions.append(answer)
+        return answer
+
+    def semantic_review(request):
+        answer = semantic_review_response(request)
+        actual_decisions.append(answer)
+        return answer
+
+    def semantic_stop(request):
+        answer = semantic_stop_response(request)
+        actual_decisions.append(answer)
+        return answer
+
+    app_ref = []
+    sdk = ScriptedSDK(
+        [
+            ("primary", lambda app: ("Inspecting the current graph.", [tool_call(app, "inspect_live_k7", "get_pipeline_state", {})])),
+            ("semantic", semantic),
+            ("primary", ("The current pipeline has no configured nodes.", None)),
+            ("semantic", semantic_review),
+            ("end", end_admit()),
+            ("semantic", semantic_stop),
+        ],
+        app_ref=app_ref,
+    )
+    install_sdk(monkeypatch, sdk)
+    operation = str(uuid4())
+    original_observations = _observe_original_driver(monkeypatch, operation)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        app_ref.append(harness.app)
+        result = await submit_and_settle(
+            harness, message_body("Explain the current pipeline after inspecting its state.", operation_id=operation)
+        )
+        if result.status != "completed":
+            # Preserve every original cancellation/settlement observation.
+            # Pytest shortens nested list reprs inside assertion messages.
+            print("K7 original driver observations: " + canonical_json(original_observations))
+        assert result.status == "completed", (result.error, original_observations)
+        assert sdk.roles == ["primary", "semantic", "primary", "semantic", "end", "semantic"] and not sdk.steps
+        assert len(actual_decisions) == 3
+        assert "inspect_live_k7" in canonical_json(sdk.requests[1]["messages"])
+        assert any(message["role"] == "assistant" and message.get("content") == instruction for message in sdk.requests[2]["messages"])
+        assert [check["role"] for check in _checks(harness.app.state.session_engine)] == [
+            "composer",
+            "advisor",
+            "composer",
+            "advisor",
+            "advisor",
+            "advisor",
+        ]
+        final_document = json.loads(sdk.requests[-1]["messages"][-1]["content"])
+        assert final_document["review_result"]["message"] == "The current pipeline has no configured nodes."
+        retained = {row.effect_key: row for row in effects(harness.app, operation)}
+        semantic_effect = retained["provider:1:0"]
+        prescribed = retained["provider:0:1"]
+        assert semantic_effect.disposition == prescribed.disposition == "committed"
+        assert semantic_effect.provider_attempt_id is not None and prescribed.provider_attempt_id is not None
+        assert semantic_effect.provider_attempt_id != prescribed.provider_attempt_id
+        assert json.loads(prescribed.action_json) == actual_decisions[0]["prescribed_action"]
+        with harness.app.state.session_engine.connect() as conn:
+            attempts = tuple(conn.execute(select(physical).where(physical.c.session_id == str(harness.session_id))).all())
+            assert len(attempts) == 6 and all(attempt.settled_at is not None for attempt in attempts)
+            source = read_original_prescribed_primary_source_on_connection(
+                conn,
+                session_id=harness.session_id,
+                operation_id=operation,
+                action_json=prescribed.action_json,
+                effect_key=prescribed.effect_key,
+            )
+            assert (source.effect_key, source.input_sha256) == (semantic_effect.effect_key, semantic_effect.input_sha256)
+            substituted = json.loads(prescribed.action_json)
+            substituted["instruction"] = "An instruction the actual semantic provider never produced."
+            with pytest.raises(AuditIntegrityError):
+                read_original_prescribed_primary_source_on_connection(
+                    conn,
+                    session_id=harness.session_id,
+                    operation_id=operation,
+                    action_json=canonical_json(substituted),
+                    effect_key=prescribed.effect_key,
+                )
+            assert tuple(conn.execute(select(physical).where(physical.c.session_id == str(harness.session_id))).all()) == attempts
+        assert sdk.roles == ["primary", "semantic", "primary", "semantic", "end", "semantic"]
+
+
+@pytest.mark.asyncio
+async def test_actual_driver_read_result_reaches_next_advisor_then_real_review_and_whole_stop(tmp_path, monkeypatch):
+    operation = str(uuid4())
+    sdk = ScriptedSDK(
+        [
+            ("primary", ("The current pipeline has no configured nodes.", None)),
+            ("semantic", semantic_read_response),
+            ("semantic", semantic_review_response),
+            ("end", end_admit()),
+            ("semantic", semantic_stop_response),
+        ]
+    )
+    install_sdk(monkeypatch, sdk)
+    observations = _observe_original_driver(monkeypatch, operation)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        result = await submit_and_settle(
+            harness, message_body("Inspect the current pipeline and explain what it contains.", operation_id=operation)
+        )
+        if result.status != "completed":
+            print("K7 original read driver observations: " + canonical_json(observations))
+        assert result.status == "completed", result.error
+        assert sdk.roles == ["primary", "semantic", "semantic", "end", "semantic"] and not sdk.steps
+        before_read = json.loads(sdk.requests[1]["messages"][-1]["content"])
+        after_read = json.loads(sdk.requests[2]["messages"][-1]["content"])
+        assert "read_results" not in before_read and len(after_read["read_results"]) == 1
+        actual_read = after_read["read_results"][0]
+        assert actual_read["tool_name"] == "get_pipeline_state"
+        assert json.loads(actual_read["response_json"])["success"] is True
+        assert "prescribing_provider_call_id" not in actual_read
+        assert before_read["source"]["premise"]["input_hash"] == after_read["source"]["premise"]["input_hash"]
+        final_document = json.loads(sdk.requests[-1]["messages"][-1]["content"])
+        assert final_document["review_result"]["message"] == "The current pipeline has no configured nodes."
+        rows = effects(harness.app, operation)
+        reads = tuple(row for row in rows if row.owner == "read")
+        assert len(reads) == 1 and reads[0].disposition == "committed" and reads[0].provider_attempt_id is None
+        with harness.app.state.session_engine.connect() as conn:
+            bridge = json.loads(
+                read_chunk(
+                    conn, session_id=str(harness.session_id), operation_id=operation, key=f"semantic-read-source:{reads[0].effect_key}"
+                ).decode("utf-8", errors="strict")
+            )
+            original = read_original_committed_semantic_read_on_connection(
+                conn,
+                session_id=harness.session_id,
+                operation_id=operation,
+                commit_checkpoint_id=bridge["commit_checkpoint_id"],
+                semantic_effect_key=bridge["semantic_effect_key"],
+            )
+            assert original.committed.original_result.tool_name == actual_read["tool_name"]
+            assert original.committed.original_result.response_json == actual_read["response_json"]
+            attempts = tuple(conn.execute(select(physical).where(physical.c.session_id == str(harness.session_id))).all())
+            assert len(attempts) == 5 and all(attempt.settled_at is not None for attempt in attempts)
+        assert [check["role"] for check in _checks(harness.app.state.session_engine)] == [
+            "composer",
+            "advisor",
+            "advisor",
+            "advisor",
+            "advisor",
+        ]

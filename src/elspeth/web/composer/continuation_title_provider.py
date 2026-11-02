@@ -24,7 +24,12 @@ from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLRetu
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions._auto_title import _maybe_auto_title_session_required
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
-from elspeth.web.sessions.continuation import StoredContinuationSnapshot, load_snapshot
+from elspeth.web.sessions.continuation import (
+    StoredContinuationSnapshot,
+    V3UnboundedTailRefusal,
+    load_snapshot,
+    refuse_v3_retained_tail_before_paid,
+)
 from elspeth.web.sessions.continuation_title_provider import (
     CurrentTitleNames,
     CurrentTitleResult,
@@ -56,7 +61,7 @@ async def prepare_current_title_provider(
     authority: ComposerAsyncOperationAuthority,
     selected: StoredContinuationSnapshot,
     required_work: RequiredWorkBinding,
-) -> PreparedTitleProvider:
+) -> PreparedTitleProvider | V3UnboundedTailRefusal:
     running = _running(required_work)
     if (
         type(service) is not ComposerServiceImpl
@@ -72,6 +77,13 @@ async def prepare_current_title_provider(
     inventory = await materialize_continuation_env_inventory(
         advisor=service._advisor_checkpoint, authority=authority, selected=current, required_work=required_work
     )
+    if type(policy) is ContinuationAdmissionPolicyV3:
+        return await _registered(
+            work=required_work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=lambda: refuse_v3_retained_tail_before_paid(authority, running, selected=current, inventory=inventory),
+            expected=V3UnboundedTailRefusal,
+        )
 
     def prepare() -> PreparedTitleProvider:
         with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:

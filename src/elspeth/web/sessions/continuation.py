@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -83,6 +85,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.models import (
     composition_states_table as states,
 )
+from elspeth.web.sessions.models import quota_provider_attempts_table as physical_attempts
 from elspeth.web.sessions.models import (
     session_operation_fences_table as fences,
 )
@@ -92,10 +95,15 @@ from elspeth.web.sessions.state_decoder import state_record_from_row
 from elspeth.web.sessions.time_normalization import restore_utc
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
     from elspeth.web.composer.continuation_handoff import ContinuationYieldReason
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 
 _OWED_P4_SCOPE_KEY = "elspeth.continuation.owed-p4"
 _OWED_P4_SEAL = object()
+_V3_TERMINAL_SCOPE_KEY = "elspeth.continuation.v3-terminal-append"
+_V3_TERMINAL_SCOPE_SEAL = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +228,14 @@ class StoredContinuationSnapshot:
     checkpoint_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class V3UnboundedTailRefusal:
+    terminal: StoredContinuationSnapshot
+    source_checkpoint_id: str
+    source_cursor: int
+    reason: Literal["retained_tail_unbounded"] = "retained_tail_unbounded"
+
+
 def initialize_continuation(
     conn: Connection,
     *,
@@ -251,11 +267,16 @@ def initialize_continuation(
     snapshot_key = f"snapshot:{checkpoint_id}"
     initial_chunk = ProspectiveContinuationChunk(snapshot_key, snapshot_json.encode("utf-8"), "snapshot.v2")
     if limit is not None:
+        reserved = (
+            _v3_unpaid_terminal_reserve(conn, session_id=session_id, operation_id=operation_id, post_root_json=snapshot_json, post_cursor=0)
+            if type(policy) is ContinuationAdmissionPolicyV3
+            else ()
+        )
         admit_retained_payload_chunks(
             conn,
             session_id=session_id,
             operation_id=operation_id,
-            prospective=(initial_chunk,),
+            prospective=(initial_chunk, *reserved),
             retained_payload_limit_bytes=limit,
         )
     _insert_chunk_after_admission(conn, session_id=session_id, operation_id=operation_id, chunk=initial_chunk)
@@ -340,6 +361,7 @@ def put_chunk(
     if existing is None and contract.version == "composer.continuation.policy.v3":
         raise AuditIntegrityError("V3 chunk write requires its admitted initial checkpoint")
     limit = retained_payload_limit_bytes
+    selected: StoredContinuationSnapshot | None = None
     if existing is not None:
         selected = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
         root = decode_continuation_snapshot(selected.payload_json)
@@ -348,11 +370,18 @@ def put_chunk(
         limit = _retained_payload_limit(decode_continuation_policy(root.admission_policy_json, root.policy_hash), limit)
     candidate = ProspectiveContinuationChunk(key, payload, codec)
     if limit is not None:
+        reserved = (
+            _v3_unpaid_terminal_reserve(
+                conn, session_id=session_id, operation_id=operation_id, post_root_json=selected.payload_json, post_cursor=selected.cursor
+            )
+            if contract.version == "composer.continuation.policy.v3" and selected is not None
+            else ()
+        )
         admit_retained_payload_chunks(
             conn,
             session_id=session_id,
             operation_id=operation_id,
-            prospective=(candidate,),
+            prospective=(candidate, *reserved),
             retained_payload_limit_bytes=limit,
         )
     _insert_chunk_after_admission(conn, session_id=session_id, operation_id=operation_id, chunk=candidate)
@@ -635,19 +664,23 @@ def _published_end_review(
 ) -> tuple[str, str, str] | None:
     """The END review effect a successful publication commits, if any.
 
-    Only a ``MessageWithStateResponse`` publishes. Its END review effect is the
-    one ``dispatched`` ``end:<response>`` entry of the top ``EndFrame``; the
-    published assistant row is its receipt and the retained candidate is its
-    result. Every other dispatched effect still becomes ``unknown``.
+    Only a ``MessageWithStateResponse`` publishes. An END still at
+    ``review_needed`` has the legacy ``dispatched`` ``end:<response>`` entry;
+    the published assistant row is its receipt and the retained candidate is
+    its result. A ``publication_ready`` END already committed its per-action
+    effect before terminal publication. Every other dispatched effect still
+    becomes ``unknown``.
     """
     from elspeth.web.composer.continuation import ComposeFrame, EndFrame, ToolBatchFrame
-    from elspeth.web.composer.continuation_end_transitions import end_effect_key
+    from elspeth.web.composer.continuation_end_effects import end_effect_key
     from elspeth.web.composer.continuation_iteration_transitions import advance_effect_key, applied_batch_cut
 
     top = stack.frames[-1]
     if type(outcome) is not MessageWithStateResponse:
         return None
     if type(top) is EndFrame:
+        if top.phase == "publication_ready":
+            return None
         compose = stack.frames[0]
         if type(compose) is not ComposeFrame or compose.pending_response is None:
             raise AuditIntegrityError("END publication lost its actual paid PRIMARY response")
@@ -709,6 +742,125 @@ def _settlement_transition(
         ),
     )
     return stack.model_copy(update={"effect_frontier": frontier}), unresolved, attribution
+
+
+def _v3_unbounded_tail_error(request_id: str | None) -> ComposerOperationError:
+    return ComposerOperationError(
+        http_status=409,
+        failure_code="http_error",
+        error_type="retained_tail_unbounded",
+        body={
+            "error_type": "retained_tail_unbounded",
+            "detail": "The complete provider result cannot be retained under this operation's admitted allowance.",
+            "reason": "retained_tail_unbounded",
+            "request_id": request_id,
+        },
+        diagnostic_id=None,
+    )
+
+
+def _v3_unpaid_terminal_reserve(
+    conn: Connection, *, session_id: str, operation_id: str, post_root_json: str, post_cursor: int
+) -> tuple[ProspectiveContinuationChunk, ...]:
+    """Exact encoded no-effect failed terminal from the proposed V3 root.
+
+    The reservation is checked with the proposed write in one locked SQL
+    transaction. No reserved row is inserted. A later segment claim must
+    recheck the same root if its sequence or generation changes.
+    """
+    root = decode_continuation_snapshot(post_root_json)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if type(policy) is not ContinuationAdmissionPolicyV3:
+        return ()
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == session_id, jobs.c.operation_id == operation_id)).one()
+    if (
+        parent.continuation_policy_version != policy.schema_version
+        or parent.continuation_policy_sha256 != policy.policy_hash
+        or parent.continuation_retained_payload_limit_bytes != policy.max_retained_payload_bytes
+        or root.logical.session_id != session_id
+        or root.logical.operation_id != operation_id
+    ):
+        raise AuditIntegrityError("V3 unpaid terminal reserve lost its original persisted contract")
+    if parent.status in ("completed", "failed"):
+        raise AuditIntegrityError("V3 unpaid terminal reserve cannot admit a post-terminal write")
+    segment = conn.execute(
+        select(segments).where(
+            segments.c.session_id == session_id,
+            segments.c.operation_id == operation_id,
+            segments.c.sequence == parent.current_segment_sequence,
+        )
+    ).one_or_none()
+    error = _v3_unbounded_tail_error(parent.request_id)
+    terminal_events: tuple[ContinuationEvent, ...]
+    if segment is None:
+        if root.effect_frontier or root.pending_owner_results or root.pending_settlement_ids:
+            raise AuditIntegrityError("V3 unclaimed reserve has no unissued original root")
+        terminal_events = (
+            ContinuationEvent(
+                "settled",
+                canonical_json(
+                    {
+                        "version": 1,
+                        "sequence": parent.current_segment_sequence,
+                        "generation": parent.ownership_generation,
+                        "status": "failed",
+                        "failure_code": error.failure_code,
+                    }
+                ),
+            ),
+        )
+        terminal_root = root
+    else:
+        terminal_root, _unresolved, terminal_events = _settlement_transition(
+            StoredContinuationSnapshot(post_root_json, post_cursor, "reserve"),
+            segment=segment,
+            outcome=error,
+            published_at=database_now(conn),
+            settled_by="owner_terminal",
+        )
+    encoded = encode_continuation_snapshot(terminal_root.model_copy(update={"cursor": post_cursor + len(terminal_events)}))
+    return (
+        *(
+            ProspectiveContinuationChunk(f"event:{post_cursor + index}", item.payload_json.encode("utf-8"), "event.v2")
+            for index, item in enumerate(terminal_events, start=1)
+        ),
+        ProspectiveContinuationChunk(f"reserve:snapshot:{uuid4()}", encoded.encode("utf-8"), "snapshot.v2"),
+    )
+
+
+def require_v3_unpaid_terminal_reserve_on_connection(conn: Connection, *, session_id: str, operation_id: str) -> None:
+    """Recheck the current root after a claim changes its terminal attribution."""
+    contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
+    if contract.version != "composer.continuation.policy.v3":
+        return
+    current = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+    if contract.allowance is None:
+        raise AuditIntegrityError("V3 unpaid terminal reserve lost its original allowance")
+    admit_retained_payload_chunks(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        prospective=_v3_unpaid_terminal_reserve(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            post_root_json=current.payload_json,
+            post_cursor=current.cursor,
+        ),
+        retained_payload_limit_bytes=contract.allowance,
+    )
+
+
+@contextmanager
+def _v3_terminal_append_scope(conn: Connection) -> Iterator[None]:
+    if _V3_TERMINAL_SCOPE_KEY in conn.info:
+        raise AuditIntegrityError("V3 terminal append scope already has an owner")
+    conn.info[_V3_TERMINAL_SCOPE_KEY] = _V3_TERMINAL_SCOPE_SEAL
+    try:
+        yield
+    finally:
+        if conn.info.pop(_V3_TERMINAL_SCOPE_KEY, None) is not _V3_TERMINAL_SCOPE_SEAL:
+            raise AuditIntegrityError("V3 terminal append scope lost its original transaction")
 
 
 def prepare_segment_settlement_on_connection(
@@ -833,11 +985,18 @@ def append_complete_snapshot(
         ProspectiveContinuationChunk(snapshot_key, snapshot_json.encode("utf-8"), "snapshot.v2"),
     )
     if limit is not None:
+        reserved = (
+            _v3_unpaid_terminal_reserve(
+                conn, session_id=session_id, operation_id=operation_id, post_root_json=snapshot_json, post_cursor=next_cursor
+            )
+            if type(policy) is ContinuationAdmissionPolicyV3 and conn.info.get(_V3_TERMINAL_SCOPE_KEY) is not _V3_TERMINAL_SCOPE_SEAL
+            else ()
+        )
         admit_retained_payload_chunks(
             conn,
             session_id=session_id,
             operation_id=operation_id,
-            prospective=prospective,
+            prospective=(*prospective, *reserved),
             retained_payload_limit_bytes=limit,
         )
     cursor = expected_cursor
@@ -1208,6 +1367,7 @@ def recover_segment_on_connection(
     )
     if previous.rowcount != 1 or recovered.rowcount != 1 or advanced.rowcount != 1:
         raise AuditIntegrityError("continuation recovery lost its exact generation transition")
+    require_v3_unpaid_terminal_reserve_on_connection(conn, session_id=session_id, operation_id=operation_id)
     return ComposerSegmentRecoveryReceipt(
         UUID(session_id),
         operation_id,
@@ -1447,17 +1607,18 @@ def settle_segment_on_connection(
         stored, segment=segment, outcome=outcome, published_at=now, settled_by=settled_by
     )
     terminal_values = _terminal_values(outcome, now=now, settled_by=settled_by)
-    retained = append_complete_snapshot(
-        conn,
-        session_id=session_id,
-        operation_id=operation_id,
-        expected_checkpoint_id=stored.checkpoint_id,
-        expected_cursor=stored.cursor,
-        snapshot_json=encode_continuation_snapshot(stack),
-        event_batch=event_batch,
-        handoff=False,
-        prepared_append=None if prepared_settlement is None else prepared_settlement.append,
-    )
+    with _v3_terminal_append_scope(conn):
+        retained = append_complete_snapshot(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            expected_checkpoint_id=stored.checkpoint_id,
+            expected_cursor=stored.cursor,
+            snapshot_json=encode_continuation_snapshot(stack),
+            event_batch=event_batch,
+            handoff=False,
+            prepared_append=None if prepared_settlement is None else prepared_settlement.append,
+        )
     if unresolved:
         marked = conn.execute(
             update(effects)
@@ -1596,6 +1757,168 @@ def settle_continuation_on_connection(
         now=terminal_recorded_at if terminal_recorded_at is not None else database_now(conn),
         prepared_settlement=prepared_settlement,
     )
+
+
+def refuse_v3_retained_tail_before_paid_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+) -> V3UnboundedTailRefusal:
+    """Durably fail an original V3 operation before any paid effect is prepared."""
+    from elspeth.web.composer.continuation_env_inventory import (
+        CurrentContinuationEnvInventory,
+        require_current_env_inventory_on_connection,
+    )
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+
+    if (
+        type(running) is not ComposerOperationRunning
+        or type(selected) is not SelectedContinuationState
+        or type(inventory) is not CurrentContinuationEnvInventory
+        or inventory.running is not running
+    ):
+        raise AuditIntegrityError("V3 unpaid refusal lost its actual current owners")
+    _require_current_continuation_running(conn, running)
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    source = load_snapshot(conn, session_id=sid, operation_id=operation)
+    root = selected.stack
+    require_current_env_inventory_on_connection(
+        conn, running, inventory=inventory, expected_checkpoint_id=source.checkpoint_id, expected_cursor=source.cursor
+    )
+    if source.checkpoint_id != selected.checkpoint_id or source.payload_json != encode_continuation_snapshot(root):
+        raise AuditIntegrityError("V3 unpaid refusal changed its exact original selected root")
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
+    if (
+        type(policy) is not ContinuationAdmissionPolicyV3
+        or parent.status != "running"
+        or parent.continuation_policy_version != policy.schema_version
+        or parent.continuation_policy_sha256 != policy.policy_hash
+        or parent.continuation_retained_payload_limit_bytes != policy.max_retained_payload_bytes
+    ):
+        raise AuditIntegrityError("V3 unpaid refusal lacks its original persisted admission")
+    if root.effect_frontier or root.pending_owner_results or root.pending_settlement_ids:
+        raise AuditIntegrityError("V3 unpaid refusal cannot rewrite a prepared or paid effect")
+    if conn.execute(select(effects.c.effect_key).where(effects.c.session_id == sid, effects.c.operation_id == operation)).first():
+        raise AuditIntegrityError("V3 unpaid refusal found an off-frontier effect")
+    if conn.execute(
+        select(physical_attempts.c.attempt_id).where(physical_attempts.c.session_id == sid, physical_attempts.c.operation_id == operation)
+    ).first():
+        raise AuditIntegrityError("V3 unpaid refusal found an existing physical provider attempt")
+    admit_retained_payload_chunks(
+        conn,
+        session_id=sid,
+        operation_id=operation,
+        prospective=_v3_unpaid_terminal_reserve(
+            conn, session_id=sid, operation_id=operation, post_root_json=source.payload_json, post_cursor=source.cursor
+        ),
+        retained_payload_limit_bytes=policy.max_retained_payload_bytes,
+    )
+    settle_continuation_on_connection(conn, running, outcome=_v3_unbounded_tail_error(parent.request_id), authoritative_failure=True)
+    terminal = load_snapshot(conn, session_id=sid, operation_id=operation)
+    if terminal.cursor != source.cursor + 1:
+        raise AuditIntegrityError("V3 unpaid refusal did not retain one exact failed terminal")
+    return V3UnboundedTailRefusal(terminal, source.checkpoint_id, source.cursor)
+
+
+def refuse_v3_retained_tail_before_paid(
+    authority: ComposerAsyncOperationAuthority,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+) -> V3UnboundedTailRefusal:
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from elspeth.web.sessions.locking import locked_session_transaction
+
+    if type(authority) is not ComposerAsyncOperationAuthority:
+        raise AuditIntegrityError("V3 unpaid refusal requires its actual authority")
+    with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
+        return refuse_v3_retained_tail_before_paid_on_connection(conn, running, selected=selected, inventory=inventory)
+
+
+def read_v3_retained_tail_refusal_on_connection(conn: Connection, *, session_id: UUID, operation_id: str) -> V3UnboundedTailRefusal | None:
+    """Strict cold proof for the no-effect, no-physical V3 administrative refusal."""
+    sid = str(session_id)
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one_or_none()
+    if parent is None or parent.status != "failed":
+        return None
+    terminal = load_snapshot(conn, session_id=sid, operation_id=operation_id)
+    root = decode_continuation_snapshot(terminal.payload_json)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if type(policy) is not ContinuationAdmissionPolicyV3:
+        return None
+    expected_error = _v3_unbounded_tail_error(parent.request_id)
+    if parent.result_json != canonical_json(expected_error.model_dump(mode="json")):
+        return None
+    if (
+        parent.continuation_policy_version != policy.schema_version
+        or parent.continuation_policy_sha256 != policy.policy_hash
+        or parent.continuation_retained_payload_limit_bytes != policy.max_retained_payload_bytes
+        or parent.failure_code != expected_error.failure_code
+        or parent.settled_by != "owner_terminal"
+        or terminal.cursor < 1
+        or parent.journal_cursor != terminal.cursor
+        or root.effect_frontier
+        or root.pending_owner_results
+        or root.pending_settlement_ids
+    ):
+        raise AuditIntegrityError("V3 unpaid refusal changed its original terminal contract")
+    source_row = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid, checkpoints.c.operation_id == operation_id, checkpoints.c.cursor == terminal.cursor - 1
+        )
+    ).one_or_none()
+    terminal_row = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation_id,
+            checkpoints.c.checkpoint_id == terminal.checkpoint_id,
+        )
+    ).one_or_none()
+    event_row = conn.execute(
+        select(events).where(events.c.session_id == sid, events.c.operation_id == operation_id, events.c.sequence == terminal.cursor)
+    ).one_or_none()
+    segment = conn.execute(
+        select(segments).where(
+            segments.c.session_id == sid, segments.c.operation_id == operation_id, segments.c.sequence == parent.current_segment_sequence
+        )
+    ).one_or_none()
+    if source_row is None or terminal_row is None or event_row is None or segment is None:
+        raise AuditIntegrityError("V3 unpaid refusal lost its original source and settled event")
+    source_root = decode_continuation_snapshot(
+        read_chunk(conn, session_id=sid, operation_id=operation_id, key=source_row.snapshot_chunk_key).decode("utf-8", errors="strict")
+    )
+    expected_event = canonical_json(
+        {
+            "version": 1,
+            "sequence": segment.sequence,
+            "generation": segment.generation,
+            "status": "failed",
+            "failure_code": expected_error.failure_code,
+        }
+    )
+    if (
+        source_row.kind not in ("transition", "handoff")
+        or terminal_row.kind != "transition"
+        or source_root.cursor != terminal.cursor - 1
+        or source_root.model_copy(update={"cursor": root.cursor}) != root
+        or source_root.effect_frontier
+        or source_root.pending_owner_results
+        or source_root.pending_settlement_ids
+        or event_row.tag != "settled"
+        or read_chunk(conn, session_id=sid, operation_id=operation_id, key=event_row.payload_chunk_key) != expected_event.encode("utf-8")
+        or conn.execute(select(effects.c.effect_key).where(effects.c.session_id == sid, effects.c.operation_id == operation_id)).first()
+        or conn.execute(
+            select(physical_attempts.c.attempt_id).where(
+                physical_attempts.c.session_id == sid, physical_attempts.c.operation_id == operation_id
+            )
+        ).first()
+    ):
+        raise AuditIntegrityError("V3 unpaid refusal lost its no-effect/no-physical cold proof")
+    return V3UnboundedTailRefusal(terminal, source_row.checkpoint_id, source_row.cursor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1762,6 +2085,7 @@ def yield_segment_on_connection(
     )
     if advanced.rowcount != 1:
         raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=operation, attempt=claim.attempt)
+    require_v3_unpaid_terminal_reserve_on_connection(conn, session_id=sid, operation_id=operation)
     return ComposerSegmentYieldReceipt(
         claim.session_id,
         operation,

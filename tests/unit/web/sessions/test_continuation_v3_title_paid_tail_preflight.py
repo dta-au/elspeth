@@ -13,7 +13,9 @@ from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
+from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     ContinuationAdmissionPolicyV2,
@@ -21,11 +23,23 @@ from elspeth.web.composer.continuation_policy import (
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
+from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostSnapshot
+from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
-from elspeth.web.sessions.continuation import load_snapshot, private_chunk_key, read_chunk
-from elspeth.web.sessions.continuation_title_provider import read_v3_title_no_sdk_refusal_on_connection
+from elspeth.web.sessions.continuation import (
+    V3UnboundedTailRefusal,
+    load_snapshot,
+    private_chunk_key,
+    read_chunk,
+    read_v3_retained_tail_refusal_on_connection,
+)
+from elspeth.web.sessions.continuation_title_provider import (
+    prepare_title_provider_on_connection,
+    read_v3_title_no_sdk_refusal_on_connection,
+)
+from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
@@ -38,6 +52,39 @@ from tests.unit.web.sessions import test_continuation_initialization as initiali
 from tests.unit.web.sessions import test_continuation_title_provider as title_cases
 
 operation_store = operations.operation_store
+
+
+async def _historical_prepared_title(store, admitted, tmp_path, monkeypatch):
+    """Construct a persisted old V3 prepared cut via its actual SQL owner."""
+    running, completed, service, _prior, _base = await title_cases.bootstrap_case(store)
+    published = await title_cases.publish(store, running, completed, service)
+    with store[0].begin() as conn:
+        title_cases.grant_test_pipeline_user(conn, identity_id="alice")
+        title_cases.seed_token_policies(conn, identity_id="alice")
+    settings, guard_requests = title_cases._required_guard_settings(tmp_path, monkeypatch)
+    service._settings = settings
+    service._provider_gateway = ProviderGateway(
+        model=settings.composer_model, settings=settings, endpoint_base_url=None, endpoint_api_key=None
+    )
+    work = title_cases.inventory_work(running)
+    current = await load_selected_continuation(authority=store[2], running=running, selected=published.selected, required_work=work)
+    inventory = await materialize_continuation_env_inventory(
+        advisor=service._advisor_checkpoint, authority=store[2], selected=current, required_work=work
+    )
+    clock = ContinuationActionClock(admitted.actions.title)
+    with locked_session_transaction(store[0], str(running.claim.session_id)) as conn:
+        prepared = prepare_title_provider_on_connection(
+            conn,
+            service,
+            running,
+            selected=published.selected,
+            clock=clock,
+            authority=store[2],
+            inventory=inventory,
+            work=work,
+        )
+    clock.finish_preparation()
+    return running, service, work, prepared, guard_requests
 
 
 def _replace_chunk(conn, *, session_id: str, operation_id: str, key: str, payload: bytes) -> None:
@@ -84,7 +131,7 @@ def _title_owner(store, work, prepared):
 @pytest.mark.asyncio
 async def test_v3_title_without_complete_tail_envelope_refuses_before_attempt_or_sdk(operation_store, tmp_path, monkeypatch):
     store, admitted = _title_store(operation_store, monkeypatch, version="v3")
-    running, _service, work, prepared, _guard_requests = await title_cases.title_case(store, tmp_path, monkeypatch)
+    running, _service, work, prepared, _guard_requests = await _historical_prepared_title(store, admitted, tmp_path, monkeypatch)
     sdk_entries: list[object] = []
 
     async def forbidden_sdk(**sdk_kwargs):
@@ -210,6 +257,31 @@ async def test_v3_title_without_complete_tail_envelope_refuses_before_attempt_or
                 prepared=changed_prepared, invocation_owner=_title_owner(store, work, changed_prepared)
             )
         assert sdk_entries == []
+        work.coordinator.assert_completed()
+    finally:
+        store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_fresh_v3_title_uses_reserved_no_effect_terminal_before_preparation(operation_store, tmp_path, monkeypatch):
+    store, policy = _title_store(operation_store, monkeypatch, version="v3")
+    running, _service, work, result, _guard_requests = await title_cases.title_case(store, tmp_path, monkeypatch)
+    try:
+        assert type(policy) is ContinuationAdmissionPolicyV3
+        assert type(result) is V3UnboundedTailRefusal
+        assert result.reason == "retained_tail_unbounded"
+        with store[0].connect() as conn:
+            assert read_v3_retained_tail_refusal_on_connection(conn, session_id=store[4], operation_id=running.claim.operation_id) == result
+            assert not conn.execute(
+                select(effects.c.effect_key).where(
+                    effects.c.session_id == str(store[4]), effects.c.operation_id == running.claim.operation_id
+                )
+            ).all()
+            assert not conn.execute(
+                select(physical.c.attempt_id).where(
+                    physical.c.session_id == str(store[4]), physical.c.operation_id == running.claim.operation_id
+                )
+            ).all()
         work.coordinator.assert_completed()
     finally:
         store[1].release(running.session_operation_context)

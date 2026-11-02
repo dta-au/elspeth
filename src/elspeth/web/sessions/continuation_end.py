@@ -15,11 +15,13 @@ it inside the terminal transaction.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer._compose_loop_carriers import _EndCompletionDisposition
 from elspeth.web.composer.continuation import ComposeFrame, EndFrame
 from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
 from elspeth.web.composer.continuation_end_transitions import EndTransition, end_candidate_for, retain_end_transition
@@ -36,10 +38,29 @@ from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, Ret
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_codec import PrivateChunk
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-    from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, RestoredContinuationRuntime
+    from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, RestoredContinuationRuntime, _CurrentPhaseRead
     from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.composer_app_services import ComposerAppServices
     from elspeth.web.sessions.composer_operations import ComposerOperationRecord
+
+
+@dataclass(frozen=True, slots=True)
+class EndReviewExecution:
+    """The real shared END gates returned a result that has not been published."""
+
+    current: SelectedContinuationState
+    runtime: RestoredContinuationRuntime
+    public_result: ComposerResult
+    publication_binding: str | None
+    disposition: _EndCompletionDisposition = _EndCompletionDisposition.BLOCKED
+
+
+@dataclass(frozen=True, slots=True)
+class EndReviewContinued:
+    """The real shared END gates retained the next provider turn instead."""
+
+    current: SelectedContinuationState
+    runtime: RestoredContinuationRuntime
 
 
 def is_end_cut(selected: SelectedContinuationState) -> bool:
@@ -49,15 +70,21 @@ def is_end_cut(selected: SelectedContinuationState) -> bool:
 
 
 async def _primary(
-    phases: ContinuationLivePhases, selected: SelectedContinuationState
+    phases: ContinuationLivePhases, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None
 ) -> tuple[RestoredContinuationRuntime, PrimaryProviderResult | RetainedPrimaryPhaseData]:
-    runtime, inventory = await phases.current(selected)
+    if phase_read is None:
+        runtime, inventory = await phases.current(selected)
+    else:
+        current = phases._require_phase_read(selected, phase_read)
+        runtime, inventory = current.runtime, current.inventory
     result = await phases._primary_for_phase(runtime, inventory, selected)
     return runtime, result
 
 
-async def primary_issued_no_tools(phases: ContinuationLivePhases, selected: SelectedContinuationState) -> bool:
-    _runtime, result = await _primary(phases, selected)
+async def primary_issued_no_tools(
+    phases: ContinuationLivePhases, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None
+) -> bool:
+    _runtime, result = await _primary(phases, selected, phase_read=phase_read)
     return not result.outcome.completion.tool_batch.calls
 
 
@@ -95,9 +122,11 @@ async def _retain(
     return following
 
 
-async def enter_continuation_end(phases: ContinuationLivePhases, selected: SelectedContinuationState) -> None:
+async def enter_continuation_end(
+    phases: ContinuationLivePhases, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None
+) -> None:
     """Retain the provider's no-tool reply as the END candidate (no provider call)."""
-    _runtime, result = await _primary(phases, selected)
+    _runtime, result = await _primary(phases, selected, phase_read=phase_read)
     completion = result.outcome.completion
     if completion.tool_batch.calls:
         raise AuditIntegrityError("END entry requires a PRIMARY response that issued no tool calls")
@@ -112,6 +141,25 @@ async def review_continuation_end(
     phases: ContinuationLivePhases, services: ComposerAppServices, selected: SelectedContinuationState
 ) -> ComposerOperationRecord | None:
     """Run the shared terminal gates; publish, or return the next turn to the provider."""
+    if selected.stack.active_action_json is not None:
+        raise AuditIntegrityError("prescribed END review requires its owned action consumer")
+    execution = await execute_continuation_end_review(phases, selected)
+    if type(execution) is EndReviewContinued:
+        return None
+    if not isinstance(execution, EndReviewExecution):
+        raise AuditIntegrityError("END review lost its actual gate execution")
+    return await publish_continuation_result(phases, services, execution.current, execution.runtime, execution.public_result)
+
+
+async def execute_continuation_end_review(
+    phases: ContinuationLivePhases, selected: SelectedContinuationState
+) -> EndReviewExecution | EndReviewContinued:
+    """Execute the one shared review without granting publication authority.
+
+    A prescribed Review must retain its actual action result and coverage before
+    a later whole-request Stop can authorize publication. The ordinary END owner
+    publishes the same result through ``review_continuation_end``.
+    """
     top = selected.stack.frames[-1]
     if type(top) is not EndFrame or top.phase != "review_needed":
         raise AuditIntegrityError("END review has no landed owner for this END phase")
@@ -197,12 +245,16 @@ async def review_continuation_end(
                     live.pending_advisor_elision_indices.append(superseded_reply_index)
         live.turn_evidence.transcript.observe_messages(live.llm_messages)
         captured = await capture_continuation_runtime_owners(runtime, selected=current, inventory=runtime.materialization.inventory)
-        await _retain(phases, current, "end_repair_continued", captured=captured)
-        return None
+        following = await _retain(phases, current, "end_repair_continued", captured=captured)
+        following_runtime = phases.runtime
+        if following_runtime is None or following_runtime.source.selected is not following:
+            raise AuditIntegrityError("continued END review lost its actual retained runtime")
+        return EndReviewContinued(current=following, runtime=following_runtime)
     if superseded_reply_index is not None:
         del live.llm_messages[superseded_reply_index]
     if terminate.result is None:
         raise AuditIntegrityError("END return lost its actual result")
+    live.advisor_checkpoint_passes_used += terminate.advisor_passes_delta
     public_result = terminate.result
     if live.advisor_repair_context_introduced:
         public_result = await service._completion._qualified_advisor_repair_public_result(
@@ -219,7 +271,51 @@ async def review_continuation_end(
             user_message=bindings.message,
         )
     public_result = service._completion._append_checkpoint_receipt(public_result, turn_evidence=live.turn_evidence)
-    return await publish_continuation_result(phases, services, current, runtime, public_result)
+    return EndReviewExecution(
+        current=current,
+        runtime=runtime,
+        public_result=public_result,
+        publication_binding=terminate.publication_binding,
+        disposition=terminate.end_disposition,
+    )
+
+
+async def publish_semantic_continuation_result(
+    phases: ContinuationLivePhases, services: ComposerAppServices, selected: SelectedContinuationState
+) -> ComposerOperationRecord:
+    """Derive the actual cold-reviewed result; the final transaction re-proves it."""
+    from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
+    from elspeth.web.sessions.continuation import load_snapshot
+    from elspeth.web.sessions.continuation_semantic_actions import (
+        SemanticPublicationProof,
+        require_semantic_publication_on_connection,
+    )
+    from elspeth.web.sessions.locking import locked_session_transaction
+
+    runtime, _inventory = await phases.current(selected)
+    running = phases.work.running
+    if running is None or runtime.bindings.session_operation_context is not running.session_operation_context:
+        raise AuditIntegrityError("semantic publication lost its actual runtime/claim owners")
+
+    def read_result() -> SemanticPublicationProof:
+        with locked_session_transaction(phases.authority._engine, str(running.claim.session_id)) as conn:
+            stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+            if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(selected.stack):
+                raise AuditIntegrityError("semantic publication changed its selected source before result preparation")
+            proof = require_semantic_publication_on_connection(conn, running, selected=stored)
+            if proof is None:
+                raise AuditIntegrityError("semantic publication requires its actual retained paid Stop")
+            return proof
+
+    proof = await _registered(
+        work=phases.work,
+        source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+        operation=read_result,
+        expected=SemanticPublicationProof,
+    )
+    original = proof.review_result.result
+    public_result = replace(original, llm_calls=(*original.llm_calls, proof.admission.paid.audit_call))
+    return await publish_continuation_result(phases, services, selected, runtime, public_result)
 
 
 async def publish_continuation_result(

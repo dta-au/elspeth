@@ -37,7 +37,7 @@ import elspeth.web.external_state_startup as external_state_startup_module
 import elspeth.web.operator_telemetry as operator_telemetry_module
 from elspeth import __version__
 from elspeth.contracts import RunStatus
-from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
@@ -73,6 +73,7 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
 from elspeth.web.process_watchdog_codec import RecoveryReason
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
+from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identity_roles_table, runs_table
 from elspeth.web.sessions.protocol import (
@@ -5058,6 +5059,49 @@ class TestWebInstanceMembershipWiring:
                 assert not app.state.instance_draining.is_set()
         assert spy.order == ["start", "begin_drain", "stop"]
         assert app.state.instance_draining.is_set()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_reports_retained_progress_owner_and_still_finishes_shutdown(self, tmp_path) -> None:
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+        registry = app.state.composer_progress_registry
+        # This test controls the shutdown boundary: a nominal retained owner
+        # stands in for a live segment whose completion is proven elsewhere.
+        pending = object.__new__(ContinuationProgressOwner)
+        registry.retain_pending_owner(pending)
+        assert registry.pending_owner_count == 1
+
+        class _SpyMembership(WebInstanceMembership):
+            __slots__ = ("stopped",)
+
+            def __init__(self, instance_draining: threading.Event) -> None:
+                super().__init__(instance_draining=instance_draining)
+                self.stopped = False
+
+            async def start(self) -> None:
+                return None
+
+            async def begin_drain(self) -> MembershipShutdownOutcome:
+                self._draining.set()
+                return MembershipShutdownOutcome.NO_MEMBERSHIP
+
+            async def stop(self) -> MembershipShutdownOutcome:
+                self.stopped = True
+                return MembershipShutdownOutcome.NO_MEMBERSHIP
+
+        membership = _SpyMembership(app.state.instance_draining)
+        app.state.web_instance_membership = membership
+        try:
+            with (
+                patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+                pytest.raises(AuditIntegrityError, match="Progress retains unfinished segment custody"),
+            ):
+                async with lifespan(app):
+                    pass
+            assert membership.stopped
+            assert registry.pending_owner_count == 1
+        finally:
+            registry.release_pending_owner(pending)
+        registry.assert_pending_settled()
 
     def test_ready_route_passes_the_process_draining_signal(self, tmp_path, monkeypatch) -> None:
         app = create_app(_settings(tmp_path))

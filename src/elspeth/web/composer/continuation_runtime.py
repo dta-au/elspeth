@@ -62,6 +62,7 @@ from elspeth.web.sessions.continuation_selection import nested_private_chunks, r
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
     from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.coordination.lifecycle import SessionOperationLease
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,12 +79,13 @@ class RestoredContinuationRuntime:
 
 @dataclass(frozen=True, slots=True)
 class _CurrentPhaseRead:
-    """One phase's actual read cohort; every use still re-enters SQL proof."""
+    """Explicit phase DATA; later action/effect owners retain SQL admission."""
 
     runtime: RestoredContinuationRuntime
     selected: SelectedContinuationState
     inventory: CurrentContinuationEnvInventory
     finish_read: ContinuationFinishRead | None
+    lease: SessionOperationLease
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +460,7 @@ async def build_runtime_tool_batch_context(
         or selected.stack.logical.session_id != str(running.claim.session_id)
         or selected.stack.logical.operation_id != running.claim.operation_id
         or (finish_read is not None and finish_read.running is not running)
+        or (phase_read is not None and (phase_read.lease.closed or phase_read.lease.context is not running.session_operation_context))
     ):
         raise AuditIntegrityError("runtime context crossed its actual phase session/current owner")
 

@@ -20,12 +20,14 @@ from threading import Lock
 from types import FunctionType
 from typing import TYPE_CHECKING, Literal, cast
 
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.credential_material import (
     CREDENTIAL_DETECTOR_VERSION,
     CredentialMaterialFinding,
     CredentialTraversalPolicy,
     find_credential_material,
 )
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation import ContinuationFrameStack, PrivateChunkRef
@@ -40,6 +42,24 @@ class SnapshotDecodeKey:
 class PrivateChunkVerificationKey:
     reference: PrivateChunkRef
     canonical: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalTextEncodingKey:
+    canonical: str
+    max_utf8_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecorderRequestTextKey:
+    canonical: str
+    cache_bound_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class RecorderRequestTextProof:
+    ref_document_json: str
+    blocks: tuple[tuple[str, str], ...]
 
 
 type CredentialInputKind = Literal["null", "bool", "int", "float", "string", "mapping", "mapping_proxy", "list", "tuple", "end"]
@@ -133,7 +153,7 @@ def _require_function_producer(producer: Callable[..., object]) -> None:
 
 
 class RetentionStageMemo:
-    """Four closed value families; close and miss publication share one lock.
+    """Closed value families; close and miss publication share one lock.
 
     Sequential awaited Futures establish visibility between ordinary hops.
     The lock additionally protects overlapping publication/closure; computation
@@ -146,6 +166,11 @@ class RetentionStageMemo:
         self._closed = False
         self._snapshots: dict[tuple[Callable[[str], ContinuationFrameStack], SnapshotDecodeKey], ContinuationFrameStack] = {}
         self._chunks: dict[tuple[Callable[[str], None], PrivateChunkVerificationKey], None] = {}
+        self._canonical_text: tuple[Callable[[CanonicalTextEncodingKey], bytes], CanonicalTextEncodingKey, bytes] | None = None
+        self._recorder_request: (
+            tuple[Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None], RecorderRequestTextKey, RecorderRequestTextProof]
+            | None
+        ) = None
         self._credentials: dict[
             tuple[Callable[[CredentialScanKey], CredentialMaterialFinding | None], CredentialScanKey], CredentialMaterialFinding | None
         ] = {}
@@ -162,13 +187,22 @@ class RetentionStageMemo:
     @property
     def cached_entry_count(self) -> int:
         with self._lock:
-            return len(self._snapshots) + len(self._chunks) + len(self._credentials) + len(self._states)
+            return (
+                len(self._snapshots)
+                + len(self._chunks)
+                + len(self._credentials)
+                + len(self._states)
+                + int(self._canonical_text is not None)
+                + int(self._recorder_request is not None)
+            )
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
             self._snapshots.clear()
             self._chunks.clear()
+            self._canonical_text = None
+            self._recorder_request = None
             self._credentials.clear()
             self._states.clear()
 
@@ -195,6 +229,74 @@ class RetentionStageMemo:
             raise TypeError("Chunk memo requires its exact key")
         _require_function_producer(producer)
         self._lookup(self._chunks, (producer, key), lambda: _chunk_value(key, producer))
+
+    def canonical_text_encoding(self, key: CanonicalTextEncodingKey, producer: Callable[[CanonicalTextEncodingKey], bytes]) -> bytes:
+        """Retain only one immutable exact-text proof, never its parsed graph."""
+        if (
+            type(key) is not CanonicalTextEncodingKey
+            or type(key.canonical) is not str
+            or type(key.max_utf8_bytes) is not int
+            or key.max_utf8_bytes < 1
+        ):
+            raise TypeError("Canonical text memo requires its exact bounded key")
+        _require_function_producer(producer)
+        with self._lock:
+            entry = self._canonical_text if not self._closed else None
+            if entry is not None and entry[0] is producer and entry[1] == key:
+                return entry[2]
+        value = producer(key)
+        if type(value) is not bytes or len(value) > key.max_utf8_bytes or value != key.canonical.encode("utf-8"):
+            raise TypeError("Canonical text memo requires exact immutable bytes")
+        with self._lock:
+            if not self._closed and len(value) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+                entry = self._canonical_text
+                if entry is not None and entry[0] is producer and entry[1] == key:
+                    return entry[2]
+                self._canonical_text = (producer, key, value)
+        return value
+
+    def recorder_request_text(
+        self, key: RecorderRequestTextKey, producer: Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None]
+    ) -> RecorderRequestTextProof | None:
+        """Retain one immutable prepared-request projection under its complete byte budget."""
+        if (
+            type(key) is not RecorderRequestTextKey
+            or type(key.canonical) is not str
+            or type(key.cache_bound_bytes) is not int
+            or key.cache_bound_bytes < 1
+        ):
+            raise TypeError("Recorder request memo requires its exact bounded key")
+        _require_function_producer(producer)
+        with self._lock:
+            entry = self._recorder_request if not self._closed else None
+            if entry is not None and entry[0] is producer and entry[1] == key:
+                return entry[2]
+        value = producer(key)
+        if value is None:
+            return None
+        if (
+            type(value) is not RecorderRequestTextProof
+            or type(value.ref_document_json) is not str
+            or type(value.blocks) is not tuple
+            or any(
+                type(block) is not tuple or len(block) != 2 or type(block[0]) is not str or type(block[1]) is not str
+                for block in value.blocks
+            )
+        ):
+            raise TypeError("Recorder request memo requires exact immutable text proof")
+        remaining = min(key.cache_bound_bytes, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+        for item in (key.canonical, value.ref_document_json, *(part for block in value.blocks for part in block)):
+            size = utf8_size(item, limit=remaining)
+            remaining -= size
+            if remaining < 0:
+                return value
+        with self._lock:
+            if not self._closed:
+                entry = self._recorder_request
+                if entry is not None and entry[0] is producer and entry[1] == key:
+                    return entry[2]
+                self._recorder_request = (producer, key, value)
+        return value
 
     def credential(
         self, key: CredentialScanKey, producer: Callable[[CredentialScanKey], CredentialMaterialFinding | None]

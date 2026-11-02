@@ -292,7 +292,7 @@ def construct_application_llm(source: ApplicationRecorderSource, slot: int) -> C
     if type(slot) is not int or not 0 <= slot < len(source.snapshot.llm_calls):
         raise AuditIntegrityError("application LLM lost its exact recorder slot")
     encoded = _atom_json(source.snapshot.llm_calls[slot], ComposerLLMCall)
-    restored = TypeAdapter(ComposerLLMCall).validate_json(encoded, strict=True, extra="forbid")
+    restored = _LLM_ADAPTER.validate_json(encoded, strict=True, extra="forbid")
     if _atom_json(restored, ComposerLLMCall) != encoded:
         raise AuditIntegrityError("application LLM changed its complete original fields")
     return restored
@@ -307,11 +307,20 @@ _ATOMS: dict[str, type[Any]] = {
     "application_cursors": RecorderDrainCursors,
 }
 
+# Compile only the closed nominal schemas. Every value dump, strict parse and
+# canonical round trip below remains fresh for its current source and graph.
+_LLM_ADAPTER = TypeAdapter(ComposerLLMCall)
+_ATOM_ADAPTERS: dict[type[Any], TypeAdapter[Any]] = {
+    ComposerLLMCall: _LLM_ADAPTER,
+    ComposerToolInvocation: TypeAdapter(ComposerToolInvocation),
+    **{owner: TypeAdapter(owner) for owner in _ATOMS.values()},
+}
+
 
 def _atom_json(value: Any, owner: type[Any]) -> str:
     if type(value) is VisibleToolEvent and VisibleToolEvent.from_envelope(value.to_envelope()) != value:
         raise AuditIntegrityError("application visible event changed its actual historical envelope")
-    adapter = TypeAdapter(owner)
+    adapter = _ATOM_ADAPTERS[owner]
     encoded = canonical_json(adapter.dump_python(value, mode="json", warnings="error", fallback=owned_json))
     checked = adapter.validate_json(encoded, strict=True, extra="forbid")
     if canonical_json(adapter.dump_python(checked, mode="json", warnings="error", fallback=owned_json)) != encoded:
@@ -440,12 +449,12 @@ def construct_application_member(kind: str, members: dict[str, Any]) -> Any:
         raise AuditIntegrityError("application graph changed its exact nominal field set/order")
     if kind in _ATOMS:
         owner = _ATOMS[kind]
-        restored = TypeAdapter(owner).validate_json(members["canonical"], strict=True, extra="forbid")
+        restored = _ATOM_ADAPTERS[owner].validate_json(members["canonical"], strict=True, extra="forbid")
         if _atom_json(restored, owner) != members["canonical"]:
             raise AuditIntegrityError("application atom changed its retained inner bytes")
         return restored
     if kind == "application_invocation":
-        invocation = TypeAdapter(ComposerToolInvocation).validate_json(members["canonical"], strict=True, extra="forbid")
+        invocation = _ATOM_ADAPTERS[ComposerToolInvocation].validate_json(members["canonical"], strict=True, extra="forbid")
         if invocation.private_authoring != members["private_authoring"] or invocation.private_failure != members["private_failure"]:
             raise AuditIntegrityError("application invocation changed its private source links")
         linked = replace(invocation, private_authoring=members["private_authoring"], private_failure=members["private_failure"])

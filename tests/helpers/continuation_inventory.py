@@ -13,6 +13,7 @@ from elspeth.web.required_work import (
     RequiredWorkCoordinator,
     RequiredWorkRole,
 )
+from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 
 
 def inventory_advisor(sessions, *, secret_service=None):
@@ -33,11 +34,12 @@ def inventory_advisor(sessions, *, secret_service=None):
     )
 
 
-def inventory_work(running):
+def inventory_work(running, *, sql_deadline_owner: ContinuationSQLDeadlineOwner | None = None):
     coordinator = RequiredWorkCoordinator(
         RequiredWorkAuthority(
             RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt
-        )
+        ),
+        sql_deadline_owner=sql_deadline_owner,
     )
     return RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN, running)
 

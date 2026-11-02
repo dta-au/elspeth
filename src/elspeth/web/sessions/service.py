@@ -430,6 +430,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
     from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+    from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -9674,6 +9675,7 @@ class SessionServiceImpl:
         required_work: RequiredWorkCoordinator | None = None,
         recovery: GraphRecoverySettlement | None = None,
         provider_audit_calls: tuple[ComposerLLMCall, ...] = (),
+        publication_result: ComposerResult | None = None,
     ) -> ComposerOperationRecord:
         """Publish final assistant/audit/snapshot/result in one exact COMPOSE transaction."""
         if (assistant is None) == (assistant_record is None):
@@ -9871,7 +9873,7 @@ class SessionServiceImpl:
                     )
                 response = MessageWithStateResponse.model_validate(response.model_dump(mode="python"), strict=True)
                 attempted_response = response
-                result = settle_composer_operation_on_connection(conn, running, outcome=response)
+                result = settle_composer_operation_on_connection(conn, running, outcome=response, publication_result=publication_result)
             # Telemetry is after commit and cannot change the stored terminal.
             for draft in active_drafts:
                 record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)

@@ -26,9 +26,12 @@ from litellm import ModelResponse
 from pydantic import SecretStr
 from sqlalchemy import select
 
+from elspeth.contracts.hashing import canonical_json
 from elspeth.web.app import create_app
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.composer import prompt_guard_clients
+from elspeth.web.composer.continuation_advisor import ContinuationAdvisorInvocation
+from elspeth.web.composer.continuation_progress import decode_continuation_frontier
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.config import WebSettings
 from elspeth.web.prompt_guard_config import PromptGuardSettings
@@ -119,7 +122,12 @@ async def continuation_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **se
         yield ContinuationApp(app=app, token=token, session_id=session.id)
 
 
-def sdk_reply(content: str | None, tool_calls: Sequence[dict[str, Any]] | None = None, *, model: str = PRIMARY_MODEL) -> ModelResponse:
+def sdk_reply(
+    content: str | None, tool_calls: Sequence[dict[str, Any]] | None = None, *, model: str = PRIMARY_MODEL, cost: float | None = 0.01
+) -> ModelResponse:
+    usage = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    if cost is not None:
+        usage["cost"] = cost
     return ModelResponse(
         model=model,
         choices=[
@@ -128,7 +136,7 @@ def sdk_reply(content: str | None, tool_calls: Sequence[dict[str, Any]] | None =
                 "message": {"role": "assistant", "content": content, "tool_calls": list(tool_calls) if tool_calls else None},
             }
         ],
-        usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        usage=usage,
     )
 
 
@@ -142,6 +150,98 @@ def end_admit(findings: str = "The reply answers the request and changes nothing
         "note": None,
         "publication_verdict": "ADMIT",
     }
+
+
+def semantic_primary_response(
+    request: dict[str, Any], *, instruction: str = "Use the retained inspection to explain the current pipeline to the user."
+) -> dict[str, Any]:
+    """One SDK response bound to the actual semantic request's own premise.
+
+    This runs only at the external scripted SDK boundary. It does not produce
+    a graph, tell a custody it dispatched, or replace the production parser.
+    """
+    assert request["model"] == ADVISOR_MODEL and "tools" not in request
+    schema = request["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["schema_version"]["const"] == "composer.continuation-decision.v1"
+    retained = json.loads(request["messages"][-1]["content"])
+    source = ContinuationAdvisorInvocation.model_validate_json(canonical_json(retained["source"]), strict=True)
+    frontier = decode_continuation_frontier(retained["frontier"])
+    assert source.kind == "semantic" and source.premise is not None
+    obligations = [item.obligation_id for item in frontier.obligations if item.status == "open"]
+    assert obligations
+    return {
+        "schema_version": "composer.continuation-decision.v1",
+        "decision": "CONTINUE",
+        "scope": "whole_request",
+        "obligation_ids": obligations,
+        "obligations": [],
+        "evidence": [],
+        "reason": "The actual inspected state supports one concrete explanatory PRIMARY turn.",
+        "remaining_actionable_ids": obligations,
+        "prescribed_action": {
+            "kind": "primary_turn",
+            "obligation_ids": obligations,
+            "evidence_ids": [],
+            "input_hash": source.premise.input_hash,
+            "graph_hash": frontier.graph_hash,
+            "policy_hash": source.premise.policy_hash,
+            "tool_manifest_hash": source.premise.tool_manifest_hash,
+            "instruction": instruction,
+        },
+    }
+
+
+def semantic_read_response(request: dict[str, Any], *, tool_name: str = "get_pipeline_state", arguments_json: str = "{}") -> dict[str, Any]:
+    answer = semantic_primary_response(request)
+    action = answer["prescribed_action"]
+    action.pop("instruction")
+    action.update(kind="read", tool_name=tool_name, arguments_json=arguments_json)
+    answer["reason"] = "Use the real read owner to inspect an unresolved source fact before review."
+    return answer
+
+
+def semantic_review_response(request: dict[str, Any]) -> dict[str, Any]:
+    from elspeth.web.composer.continuation_end_values import EndContinuationCandidate, continuation_candidate_id
+
+    answer = semantic_primary_response(request)
+    retained = json.loads(request["messages"][-1]["content"])
+    candidate = EndContinuationCandidate.model_validate_json(canonical_json(retained["end_candidate"]), strict=True)
+    source = ContinuationAdvisorInvocation.model_validate_json(canonical_json(retained["source"]), strict=True)
+    action = answer["prescribed_action"]
+    action.pop("instruction")
+    action.update(kind="review", candidate_ref=continuation_candidate_id(candidate), evidence_binding=source.coverage_binding)
+    answer["reason"] = "The actual retained candidate must pass the original shared END review."
+    return answer
+
+
+def semantic_stop_response(request: dict[str, Any]) -> dict[str, Any]:
+    from elspeth.web.sessions.continuation_semantic_review_result import decode_semantic_review_result
+
+    answer = semantic_primary_response(request)
+    retained = json.loads(request["messages"][-1]["content"])
+    actual_review = decode_semantic_review_result(canonical_json(retained["review_result"]))
+    assert actual_review.publication_binding is not None
+    frontier = decode_continuation_frontier(retained["frontier"])
+    answer.update(
+        decision="STOP_CONFIRMED",
+        remaining_actionable_ids=[],
+        prescribed_action=None,
+        obligation_ids=[item.obligation_id for item in frontier.obligations],
+        obligations=[
+            {
+                "obligation_id": item.obligation_id,
+                "parent_id": item.parent_id,
+                "description": item.description,
+                "original_message_id": item.original_message_id,
+                "start": item.start,
+                "end": item.end,
+                "status": "satisfied",
+            }
+            for item in frontier.obligations
+        ],
+        reason="The complete real reviewed result addresses the originating request; no actionable work remains.",
+    )
+    return answer
 
 
 def tool_call(app: FastAPI, call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -166,7 +266,9 @@ class ScriptedSDK:
     ``("primary", (content, tool_calls))`` serves the composer model with the
     full palette; the payload may also be a callable taking the app, for tool
     calls that need the app's planner dialect. ``("end", verdict)`` serves the
-    END Advisor review. ``("raise", exception)`` raises the original exception
+    END Advisor review. ``("semantic", response_factory)`` serves the actual
+    semantic Advisor request; its callable receives the real SDK kwargs.
+    ``("raise", exception)`` raises the original exception
     object at the SDK boundary, whatever the request.
     """
 
@@ -188,11 +290,15 @@ class ScriptedSDK:
                 payload = payload(self.app_ref[0])
             content, calls = payload
             return sdk_reply(content, calls)
+        if role == "semantic":
+            assert kwargs["model"] == ADVISOR_MODEL and "tools" not in kwargs
+            response = payload(kwargs) if callable(payload) else payload
+            return sdk_reply(json.dumps(response), model=ADVISOR_MODEL)
         assert role == "end" and kwargs["model"] == ADVISOR_MODEL and "response_format" in kwargs, role
         return ModelResponse(
             model=ADVISOR_MODEL,
             choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(payload), "tool_calls": None}}],
-            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
         )
 
     @property

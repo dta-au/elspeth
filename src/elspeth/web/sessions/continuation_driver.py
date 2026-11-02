@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation import ComposeFrame, EndFrame, InitializeFrame
+from elspeth.web.composer.advisor_output import ReadContinuationAction
+from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame, InitializeFrame
 from elspeth.web.composer.continuation_clock import ContinuationTimingObservation, SegmentFit, admit_action
 from elspeth.web.composer.continuation_composition_initialization import initialize_continuation_composition
 from elspeth.web.composer.continuation_control_transitions import StoredContinuationControlIntent, read_pending_control_on_connection
@@ -25,11 +26,19 @@ from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_next_action import (
     _has_committed_primary,
     _is_first_compose_iteration,
+    is_consumed_semantic_stop_cut,
     next_continuation_action_policy,
 )
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_primary import run_continuation_primary
+from elspeth.web.composer.continuation_progress import decode_prescribed_continuation_action
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
+from elspeth.web.composer.continuation_semantic_advisor_phase import (
+    SemanticAdvisorNoSdkTerminal,
+    run_continuation_semantic_advisor,
+    run_prescribed_semantic_read,
+)
+from elspeth.web.composer.continuation_semantic_advisor_review import review_prescribed_continuation_end
 from elspeth.web.composer.continuation_title_application import apply_current_title_success
 from elspeth.web.composer.continuation_title_provider import (
     prepare_current_title_provider,
@@ -67,11 +76,14 @@ from elspeth.web.sessions.continuation import (
     ComposerSegmentSuspendObservation,
     ComposerSegmentYieldReceipt,
     StoredContinuationSnapshot,
+    V3UnboundedTailRefusal,
+    read_v3_retained_tail_refusal_on_connection,
 )
-from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, review_continuation_end
+from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, publish_semantic_continuation_result
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
 from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
 from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt
+from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
 from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.schemas import SendMessageRequest
@@ -97,7 +109,7 @@ class ContinuationSegmentSettled:
 
 
 type ContinuationSegmentOutcome = ContinuationSegmentYielded | ContinuationSegmentHandedOver | ContinuationSegmentSettled
-type _ActionResult = ComposerOperationRecord | PrimaryNoSdkRefusalReceipt | None
+type _ActionResult = ComposerOperationRecord | PrimaryNoSdkRefusalReceipt | SemanticAdvisorNoSdkTerminal | V3UnboundedTailRefusal | None
 
 
 @dataclass(slots=True)
@@ -195,6 +207,38 @@ class _SegmentDriver:
         self._consumed_native: list[BaseException] = []
         self._committed_failure: CommittedContinuationFailure | None = None
         self._action_ordinal = 0
+        self.progress_owner: ContinuationProgressOwner | None = None
+        self._progress_cleanup_failures: list[BaseException] = []
+
+    async def start_progress(self, record: ComposerOperationRecord) -> None:
+        if self.progress_owner is not None:
+            return
+        if self.phases.runtime is not None:
+            raise AuditIntegrityError("segment progress cannot replace an already bound runtime sink")
+        owner = ContinuationProgressOwner(
+            registry=self.services.progress_registry,
+            running=self.running,
+            lease=self.lease,
+            record=record,
+            renew_interval_seconds=self.services.progress_registry.renew_interval_seconds,
+            hard_expires_at=self.sql_deadline.hard_expires_at,
+            drain_deadline=lambda: self.worker.drain_deadline,
+        )
+        # Retain partial start custody before its first await so the outer
+        # physical cleanup always joins this exact owner.
+        self.progress_owner = owner
+        self.phases.progress = owner.sink
+        await owner.start()
+
+    async def close_progress(self, *, retain_failure: bool = False) -> None:
+        if self.progress_owner is not None:
+            try:
+                await self.progress_owner.close()
+            except BaseException as error:
+                if not retain_failure:
+                    raise
+                if not any(error is previous for previous in self._progress_cleanup_failures):
+                    self._progress_cleanup_failures.append(error)
 
     def join_failure(self, error: BaseException, *additional: BaseException) -> BaseException:
         from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
@@ -437,6 +481,7 @@ class _SegmentDriver:
     async def dispose(self, original: BaseException | None = None) -> ContinuationSegmentOutcome:
         if original is not None and not any(original is item for item in self._consumed_native):
             self._consumed_native.append(original)
+        await self.close_progress(retain_failure=True)
         self.sql_deadline.begin_settlement()
         record = await self.record()
         if record.cancel_requested_at is not None:
@@ -516,9 +561,7 @@ class _SegmentDriver:
             return await self.settle(await self.record(), original)
         return ContinuationSegmentHandedOver(receipt)
 
-    async def advance(
-        self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState
-    ) -> ComposerOperationRecord | PrimaryNoSdkRefusalReceipt | None:
+    async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> _ActionResult:
         root, top = selected.stack, selected.stack.frames[-1]
         if type(top) is InitializeFrame:
             if top.ingress_phase == "reserved":
@@ -556,20 +599,38 @@ class _SegmentDriver:
                     prepared = await prepare_current_title_provider(
                         service=self.service, authority=self.authority, selected=stored, required_work=self.work
                     )
+                    if isinstance(prepared, V3UnboundedTailRefusal):
+                        return prepared
                     await run_prepared_title_provider(prepared=prepared, invocation_owner=self.provider)
                 else:
                     current = await settle_current_title_result(service=self.service, running=self.running, required_work=self.work)
                     await apply_current_title_success(service=self.service, selected=current.selected, required_work=self.work)
                 return None
             runtime = await initialize_continuation_composition(
-                service=self.service, authority=self.authority, selected=stored, required_work=self.work, provider_owner=self.provider
+                service=self.service,
+                authority=self.authority,
+                selected=stored,
+                required_work=self.work,
+                provider_owner=self.provider,
+                progress=self.phases.progress,
             )
             self.phases.bind_initial(runtime)
             return None
         if type(top) is ComposeFrame and top.phase == "action_ready":
+            if (
+                (not _is_first_compose_iteration(top) or _has_committed_primary(root))
+                and root.active_action_json is None
+                and root.active_action_source is None
+            ):
+                return await run_continuation_semantic_advisor(self.phases, selected)
             if self.phases.runtime is None and _is_first_compose_iteration(top) and not _has_committed_primary(root):
                 runtime = await initialize_continuation_composition(
-                    service=self.service, authority=self.authority, selected=stored, required_work=self.work, provider_owner=self.provider
+                    service=self.service,
+                    authority=self.authority,
+                    selected=stored,
+                    required_work=self.work,
+                    provider_owner=self.provider,
+                    progress=self.phases.progress,
                 )
                 self.phases.bind_initial(runtime)
             else:
@@ -599,26 +660,51 @@ class _SegmentDriver:
                 required_work=self.work,
                 provider_owner=self.provider,
                 timeout=policy.actions.primary.total,
+                on_sdk_entry=self.progress_owner.notify_sdk_entry if self.progress_owner is not None else None,
             )
-            if isinstance(primary_result, PrimaryNoSdkRefusalReceipt):
+            if isinstance(primary_result, (PrimaryNoSdkRefusalReceipt, V3UnboundedTailRefusal)):
                 return primary_result
             if delivery is not None:
                 runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
             self.phases.accept_primary(primary_result)
             return None
+        if type(top) is AdvisorFrame:
+            if (
+                top.phase == "decision_ready"
+                and root.active_action_json is not None
+                and type(decode_prescribed_continuation_action(root.active_action_json)) is ReadContinuationAction
+            ):
+                await run_prescribed_semantic_read(self.phases, selected)
+                return None
+            return await run_continuation_semantic_advisor(self.phases, selected)
         if is_applied_batch_cut(selected):
             # The post-batch phase either returns the next authoring
             # transition to the provider or publishes the result it reached.
             return await advance_continuation_iteration(self.phases, self.services, selected)
         if type(top) is EndFrame:
-            # END publishes through the shared terminal owner in its own
-            # transaction; the returned record is that committed terminal.
-            return await review_continuation_end(self.phases, self.services, selected)
-        if type(top) is ComposeFrame and top.phase == "response_retained" and await primary_issued_no_tools(self.phases, selected):
-            await enter_continuation_end(self.phases, selected)
+            if root.active_action_json is not None:
+                await review_prescribed_continuation_end(self.phases, self.services, selected)
+                return None
+            if is_consumed_semantic_stop_cut(selected):
+                return await publish_semantic_continuation_result(self.phases, self.services, selected)
+            return await run_continuation_semantic_advisor(self.phases, selected)
+        phase_read = None
+        if type(top) is ComposeFrame and top.phase == "response_retained":
+            phase_read = await self.phases._current_phase_read(selected)
+        if (
+            type(top) is ComposeFrame
+            and top.phase == "response_retained"
+            and await primary_issued_no_tools(self.phases, selected, phase_read=phase_read)
+        ):
+            await enter_continuation_end(self.phases, selected, phase_read=phase_read)
             return None
         await self.service.advance_continuation_phase(
-            owner=self.phases, authority=self.authority, selected=selected, work=self.work, provider_owner=self.provider
+            owner=self.phases,
+            authority=self.authority,
+            selected=selected,
+            work=self.work,
+            provider_owner=self.provider,
+            phase_read=phase_read,
         )
         return None
 
@@ -639,6 +725,7 @@ class _SegmentDriver:
 
     async def yield_control(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> ContinuationSegmentOutcome:
         """Yield only after the actual phase and watcher cohorts have joined."""
+        await self.close_progress(retain_failure=True)
         self.sql_deadline.begin_settlement()
         top = selected.stack.frames[-1]
         if type(top) is not ComposeFrame or top.phase != "action_ready" or not selected.stack.is_handoff_safe:
@@ -706,9 +793,7 @@ class _SegmentDriver:
             return await self.settle(await self.record())
         return ContinuationSegmentYielded(receipt)
 
-    async def watch_stage(
-        self, stage: asyncio.Task[ComposerOperationRecord | PrimaryNoSdkRefusalReceipt | None], reader: ComposerOperationWatchReader
-    ) -> None:
+    async def watch_stage(self, stage: asyncio.Task[_ActionResult], reader: ComposerOperationWatchReader) -> None:
         key = (self.running.claim.session_id, self.running.claim.operation_id)
         stop_delivered = False
         try:
@@ -775,6 +860,7 @@ class _SegmentDriver:
             stored, selected = await self.selected()
             if await self.pending_control(selected) is not None:
                 return await self.yield_control(stored, selected)
+            await self.start_progress(record)
             policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
             started_read = time.monotonic()
             timing = await _registered(
@@ -924,6 +1010,46 @@ class _SegmentDriver:
                     return await self.dispose(original)
                 return await self.settle(await self.record(), original)
             if result is not None:
+                if isinstance(result, V3UnboundedTailRefusal):
+                    refusal = result
+
+                    def verify_refusal(expected_refusal: V3UnboundedTailRefusal = refusal) -> V3UnboundedTailRefusal:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_v3_retained_tail_refusal_on_connection(
+                                conn, session_id=self.running.claim.session_id, operation_id=self.running.claim.operation_id
+                            )
+                        if actual is None or actual != expected_refusal:
+                            raise AuditIntegrityError("V3 unpaid refusal lost its exact original cold source")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_refusal,
+                        expected=V3UnboundedTailRefusal,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.terminal.checkpoint_id,
+                        result.terminal.cursor,
+                    ):
+                        raise AuditIntegrityError("V3 unpaid refusal lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal)
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is SemanticAdvisorNoSdkTerminal:
+                    if result.terminal.status != "failed":
+                        raise AuditIntegrityError("Semantic no-SDK close lost its actual failed terminal")
+                    self._consumed_native.append(result.original_error)
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        result.terminal,
+                        _StartedSettlement(terminal_receipt=result.terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(result.terminal)
                 if type(result) is PrimaryNoSdkRefusalReceipt:
                     from elspeth.web.sessions.composer_async_worker import _StartedSettlement
 
@@ -976,17 +1102,25 @@ async def run_continuation_segment(
     finally:
         if lease.required_work is not None and lease.required_work.sql_deadline_owner is not None:
             lease.required_work.sql_deadline_owner.begin_settlement()
+        cleanup_errors = list(driver._progress_cleanup_failures) if driver is not None else []
+        if driver is not None:
+            try:
+                await driver.close_progress()
+            except BaseException as cleanup:
+                cleanup_errors.append(cleanup)
         try:
             await lease.close(deadline=worker.drain_deadline)
         except BaseException as cleanup:
+            cleanup_errors.append(cleanup)
+        if cleanup_errors:
+            cleanup_failure = cleanup_errors[0]
+            additional = (*cleanup_errors[1:], *((original,) if original is not None else ()))
             if driver is not None:
-                combined = driver.join_failure(cleanup, *((original,) if original is not None else ()))
-                if combined is cleanup:
-                    raise
+                combined = driver.join_failure(cleanup_failure, *additional)
+                if combined is cleanup_failure:
+                    raise cleanup_failure
                 raise combined from combined.__cause__
-            if original is None:
-                raise
-            combined = combine_failure_objects(original, cleanup)
-            if combined is cleanup:
-                raise
+            combined = combine_failure_objects(cleanup_failure, *additional)
+            if combined is cleanup_failure:
+                raise cleanup_failure
             raise combined from combined.__cause__

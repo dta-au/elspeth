@@ -37,6 +37,7 @@ from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
 from elspeth.web.composer.continuation_message_family_recipes import ControlResultMessageRecipe
 from elspeth.web.composer.continuation_phase_transitions import BatchTransition, retain_batch_transition
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3
 from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
     RestoredContinuationRuntime,
@@ -66,7 +67,7 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.coordination.lifecycle import ContinuationStage, SessionOperationLease
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions.composer_operations import ComposerOperationCancel, ComposerOperationCancelledDuringTurn, ComposerOperationRunning
-from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+from elspeth.web.sessions.continuation import StoredContinuationSnapshot, V3UnboundedTailRefusal, refuse_v3_retained_tail_before_paid
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
 from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -208,6 +209,39 @@ class ContinuationLivePhases:
         phase = await self._current_phase_read(selected)
         return phase.runtime, phase.inventory
 
+    def _require_phase_read(self, selected: SelectedContinuationState, phase_read: _CurrentPhaseRead) -> _CurrentPhaseRead:
+        """Consume an explicit adjacent phase cohort, never implicit cached DATA."""
+        if type(phase_read) is not _CurrentPhaseRead or type(selected) is not SelectedContinuationState:
+            raise AuditIntegrityError("live phase handoff requires its actual nominal source cohort")
+        runtime, inventory, running = phase_read.runtime, phase_read.inventory, self.work.running
+        if (
+            type(runtime) is not RestoredContinuationRuntime
+            or type(inventory) is not CurrentContinuationEnvInventory
+            or type(running) is not ComposerOperationRunning
+            or phase_read.finish_read is not None
+        ):
+            raise AuditIntegrityError("live phase handoff changed its ordinary source owners")
+        if (
+            phase_read.selected is not selected
+            or runtime is not self.runtime
+            or runtime.source.selected is not selected
+            or runtime.materialization.selected is not selected
+            or runtime.materialization.inventory is not inventory
+            or runtime.materialization.service is not self.service
+            or runtime.materialization.authority is not self.authority
+            or runtime.bindings.required_work is not self.work
+            or runtime.bindings.provider_owner is not self.provider_owner
+            or inventory.running is not running
+            or running.session_operation_context is not self.lease.context
+            or runtime.bindings.session_operation_context is not running.session_operation_context
+            or phase_read.lease is not self.lease
+            or self.lease.closed
+        ):
+            raise AuditIntegrityError("live phase handoff replaced its exact selected/runtime/claim/lease owners")
+        self.work.validate_context(running.session_operation_context)
+        self.lease.raise_if_lost()
+        return phase_read
+
     async def _current_phase_read(self, selected: SelectedContinuationState) -> _CurrentPhaseRead:
         running = self.work.running
         if type(running) is not ComposerOperationRunning or running.session_operation_context is not self.lease.context:
@@ -345,7 +379,7 @@ class ContinuationLivePhases:
             raise AuditIntegrityError("live phase read lost its actual fresh selection")
         if finish_read is not None:
             finish_read.require_selection(selected, inventory)
-        return _CurrentPhaseRead(self.runtime, selected, inventory, finish_read)
+        return _CurrentPhaseRead(self.runtime, selected, inventory, finish_read, self.lease)
 
     async def _retain(
         self, captured: CapturedContinuationRuntime, inventory: CurrentContinuationEnvInventory, transition: BatchTransition
@@ -389,8 +423,8 @@ class ContinuationLivePhases:
 
         return await _registered_read(self.work, CapturedContinuationRuntime, capture)
 
-    async def _initialize_batch(self, selected: SelectedContinuationState) -> None:
-        phase_read = await self._current_phase_read(selected)
+    async def _initialize_batch(self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None) -> None:
+        phase_read = await self._current_phase_read(selected) if phase_read is None else self._require_phase_read(selected, phase_read)
         runtime, inventory = phase_read.runtime, phase_read.inventory
         result, live = await self._primary_for_phase(runtime, inventory, selected), runtime.live
         frame = selected.stack.frames[-1]
@@ -521,6 +555,16 @@ class ContinuationLivePhases:
         if data is None:
             raise AuditIntegrityError("live dispatch lost its actual batch/provider owners")
         result = await self._primary_for_phase(runtime, inventory, selected)
+        if type(runtime.source.policy) is ContinuationAdmissionPolicyV3:
+            await _registered(
+                work=self.work,
+                source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+                operation=partial(
+                    refuse_v3_retained_tail_before_paid, self.authority, inventory.running, selected=selected, inventory=inventory
+                ),
+                expected=V3UnboundedTailRefusal,
+            )
+            return
         batch, accumulator, live = data.batch, data.accumulator, runtime.live
         if batch.phase != "call_ready" or batch.current_call is not None or batch.next_tool_index >= len(data.calls):
             raise AuditIntegrityError("live dispatch lost its actual unissued next call")
@@ -784,14 +828,18 @@ class ContinuationLivePhases:
         if data.batch.phase == "dispatch_ready":
             await self._persist_batch(selected)
 
-    async def advance(self, selected: SelectedContinuationState) -> None:
+    async def advance(self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None) -> None:
+        if phase_read is not None:
+            self._require_phase_read(selected, phase_read)
         if self.terminal_completion is not None:
             await self._persist_batch(selected)
             return
         top = selected.stack.frames[-1]
         if type(top) is ComposeFrame and top.phase == "response_retained":
-            await self._initialize_batch(selected)
+            await self._initialize_batch(selected, phase_read=phase_read)
             return
+        if phase_read is not None:
+            raise AuditIntegrityError("live phase handoff belongs only to its retained PRIMARY response")
         if type(top) is ToolBatchFrame and top.phase == "tool_ready":
             runtime, _inventory = await self.current(selected)
             if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "call_ready":

@@ -32,7 +32,7 @@ from elspeth.web.sessions.continuation_end import publish_continuation_result
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-    from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
+    from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, _CurrentPhaseRead
     from elspeth.web.sessions.composer_app_services import ComposerAppServices
     from elspeth.web.sessions.composer_operations import ComposerOperationRecord
 
@@ -50,7 +50,7 @@ async def _retain(
     selected: SelectedContinuationState,
     transition: IterationTransition,
     captured: CapturedContinuationRuntime | None = None,
-) -> SelectedContinuationState:
+) -> _CurrentPhaseRead:
     runtime = phases.runtime
     if runtime is None or runtime.source.selected is not selected:
         raise AuditIntegrityError("post-batch transition lost its actual current runtime selection")
@@ -73,8 +73,7 @@ async def _retain(
         expected=StoredContinuationSnapshot,
     )
     following = await load_selected_continuation(authority=phases.authority, running=running, selected=stored, required_work=phases.work)
-    await phases.current(following)
-    return following
+    return await phases._current_phase_read(following)
 
 
 async def advance_continuation_iteration(
@@ -110,8 +109,16 @@ async def advance_continuation_iteration(
             initial_version=runtime.live.initial_version,
         )
     await phases.current(selected)
-    current = await _retain(phases, selected, "iteration_review_dispatched")
-    runtime, _inventory = await phases.current(current)
+    phase_read = await _retain(phases, selected, "iteration_review_dispatched")
+    current = phase_read.selected
+    if phase_read.finish_read is None:
+        # The transition already returned this exact new current SQL cohort.
+        # Reuse its explicit DATA only; later capture/effect writers still
+        # reprove currentness. Owed Stop keeps its original fresh read path.
+        phases._require_phase_read(current, phase_read)
+        runtime = phase_read.runtime
+    else:
+        runtime, _inventory = await phases.current(current)
     service, live, bindings = phases.service, runtime.live, runtime.bindings
     context = bindings.session_operation_context
     if context is None:

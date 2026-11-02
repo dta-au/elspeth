@@ -33,7 +33,6 @@ from tests.unit.web.sessions.test_continuation_recovery_candidates import (
 from tests.unit.web.sessions.test_continuation_recovery_candidates import (
     test_terminal_parent_excluded_even_if_segment_still_running as test_terminal_parent_excluded_even_if_segment_still_running,
 )
-from tests.unit.web.sessions.test_continuation_recovery_candidates import test_v1_running_parent_excluded as test_v1_running_parent_excluded
 
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.continuation_recovery_candidates import ContinuationRecoveryCandidate, list_recoverable_segments
@@ -42,6 +41,7 @@ from elspeth.web.sessions.models import web_instances_table
 
 operation_store = _operation_store
 
+# Retired V1 running-parent wrapper: current segment/fence and terminal-parent exclusion controls above remain.
 pytestmark = pytest.mark.testcontainer
 
 

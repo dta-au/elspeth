@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from uuid import uuid4
 
 import httpx
@@ -64,6 +65,7 @@ async def _admit_only(harness, body):
 
 
 async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fit"):
+    unverified_readback = mode in ("missing-candidate", "foreign-candidate")
     words = "The provider completed the request after a same-sequence handover."
     # A real END publication refusal requests a prose-only correction, whose
     # committed repair transition produces the next Compose action_ready.
@@ -101,6 +103,7 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
     owner_jobs = []
     suspend_attempts, committed, verified, readbacks, immutable_verified, released = [], [], [], [], [], []
     read_receipts = []
+    read_failures = []
     original = RuntimeError("controlled actual later-cut suspend failure")
     rolled_back = False
     phase_trace = []
@@ -233,7 +236,7 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
     monkeypatch.setattr(driver_module._SegmentDriver, "dispose", observe_dispose)
     monkeypatch.setattr(driver_module._SegmentDriver, "settle", observe_settle)
     monkeypatch.setattr(driver_module, "admit_action", refuse_one_fit)
-    async with _later_cut_app(tmp_path, monkeypatch, expect_unknown=mode == "rollback-before-release") as harness:
+    async with _later_cut_app(tmp_path, monkeypatch, expect_unknown=mode == "rollback-before-release" or unverified_readback) as harness:
         sdk.app_ref.append(harness.app)
         repository = harness.app.state.session_service.session_operation_authority
         repository_type = type(repository)
@@ -255,7 +258,12 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
                 assert stopped is not None and stopped.cancel_requested_at is not None
             receipt = actual_suspend(owner, running, **kwargs)
             committed.append(receipt)
-            if mode == "ambiguous-after-commit":
+            if unverified_readback:
+                # The real commit remains immediately eligible to a peer, but
+                # this process must not start its next generation while the
+                # negative readback's retained custody is inspected.
+                harness.app.state.composer_drain_signal.request()
+            if mode == "ambiguous-after-commit" or unverified_readback:
                 raise original
             return receipt
 
@@ -281,7 +289,21 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
         def readback(owner, observation, **kwargs):
             if observation.running.claim.operation_id == operation_id:
                 readbacks.append(observation)
-            receipt = actual_readback(owner, observation, **kwargs)
+                if unverified_readback:
+                    # Alter the actual writer observation only after the
+                    # driver has selected readback. The real repository must
+                    # reject it, rather than receiving an injected refusal.
+                    assert observation.candidate is committed[0]
+                    if mode == "missing-candidate":
+                        observation.candidate = None
+                    else:
+                        observation.candidate = replace(observation.candidate, operation_id=str(uuid4()))
+            try:
+                receipt = actual_readback(owner, observation, **kwargs)
+            except BaseException as error:
+                if observation.running.claim.operation_id == operation_id:
+                    read_failures.append(error)
+                raise
             if observation.running.claim.operation_id == operation_id:
                 read_receipts.append(receipt)
             return receipt
@@ -303,7 +325,7 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
         monkeypatch.setattr(continuation_store, "recover_segment_on_connection", recover)
         monkeypatch.setattr(continuation_store, "verify_recovery_on_connection", immutable_verify)
         body = message_body("Explain the current pipeline.", operation_id=operation_id)
-        admission_only = mode in ("drain", "rollback-before-release")
+        admission_only = mode in ("drain", "rollback-before-release") or unverified_readback
         settling = asyncio.create_task(_admit_only(harness, body) if admission_only else submit_and_settle(harness, body))
         disposed = asyncio.create_task(disposition_finished.wait())
         try:
@@ -330,6 +352,78 @@ async def _run_later_cut_handover(tmp_path, monkeypatch, cut, *, mode="action-fi
             assert len(suspend_attempts) == 1
             expected_before = ["primary", "end"] if cut == "later-compose" else ["primary"]
             old_context = old_phases[0].lease.context
+            if unverified_readback:
+                assert len(committed) == len(readbacks) == len(read_failures) == 1
+                assert verified == read_receipts == immutable_verified == []
+                observation = readbacks[0]
+                assert observation.running is suspend_attempts[0]
+                assert observation.running.claim is old_claims[0]
+                assert observation.running.session_operation_context is old_context
+                if mode == "missing-candidate":
+                    assert observation.candidate is None
+                    expected_error = "suspend readback has no actual writer candidate"
+                else:
+                    assert observation.candidate is not None
+                    assert observation.candidate.operation_id != operation_id
+                    assert observation.candidate.released_context is old_context
+                    expected_error = "suspend readback substituted the live writer's candidate"
+                refusal = read_failures[0]
+                assert type(refusal) is AuditIntegrityError and str(refusal) == expected_error
+                assert isinstance(outcomes[0], BaseException)
+                leaves = required_failure_leaves(outcomes[0])
+                assert any(leaf is original for leaf in leaves) and any(leaf is refusal for leaf in leaves)
+                assert all(leaf is original or leaf is refusal for leaf in leaves)
+                assert len(owner_jobs) == 1
+                job = owner_jobs[0]
+                try:
+                    await asyncio.wait_for(asyncio.shield(job), timeout=harness.app.state.settings.composer_timeout_seconds)
+                except BaseException as owner_failure:
+                    owner_leaves = required_failure_leaves(owner_failure)
+                    if not owner_leaves or any(leaf is not original and leaf is not refusal for leaf in owner_leaves):
+                        raise
+                assert job.done() and not job.cancelled()
+                coordinator = old_phases[0].work.coordinator
+                for source, expected in (
+                    (RequiredWorkSource.CONTINUATION_HANDOFF_SQL, original),
+                    (RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL, refusal),
+                ):
+                    (ticket,) = tuple(ticket for ticket in coordinator.tickets if ticket.key.source is source)
+                    assert ticket.complete
+                    actual = ticket._finish_once_handoff
+                    assert type(actual) is RequiredSQLRaised and actual.error is expected
+                coordinator.assert_completed()
+                lease = old_phases[0].lease
+                assert lease.closed and lease.disposition is SessionOperationLeaseDisposition.UNKNOWN
+                assert not lease.continuation_finished
+                assert lease._close_task is not None and lease._close_task.done()
+                assert lease._renewal_task is not None and lease._renewal_task.done()
+                key = (harness.session_id, operation_id)
+                assert harness.app.state.composer_async_worker._continuation_adoptions[key].lease is lease
+                assert sum(context is old_context for context in released) == 0
+                with harness.app.state.session_engine.connect() as conn:
+                    assert conn.execute(
+                        select(segments.c.sequence, segments.c.generation, segments.c.state).where(segments.c.operation_id == operation_id)
+                    ).all() == [(1, 2, "interrupted")]
+                    (attempt,) = conn.execute(select(attempts).where(attempts.c.operation_id == operation_id)).all()
+                    assert attempt.revoked_at is not None and attempt.outcome == "interrupted"
+                    assert (attempt.session_operation_id, attempt.session_operation_epoch) == (
+                        old_context.fence.operation_id,
+                        old_context.fence.operation_epoch,
+                    )
+                    fence = conn.execute(select(fences).where(fences.c.session_id == str(harness.session_id))).one()
+                    assert fence.released_at is not None
+                    assert (fence.operation_id, fence.operation_epoch) == (
+                        old_context.fence.operation_id,
+                        old_context.fence.operation_epoch,
+                    )
+                    (recovered,) = conn.execute(
+                        select(events).where(events.c.operation_id == operation_id, events.c.tag == "recovered")
+                    ).all()
+                    assert recovered.sequence == committed[0].cursor
+                assert committed[0].released_context is old_context
+                assert sdk.roles == expected_before and resumed_cold == []
+                assert {row.effect_key: row for row in effects(harness.app, operation_id)} == {row.effect_key: row for row in old_effects}
+                return
             if mode in ("stop-before-suspend", "rollback-before-release"):
                 assert committed == [] and verified == []
                 assert read_receipts == [] and immutable_verified == []
@@ -520,6 +614,12 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ("drain", "stop-before-suspend", "ambiguous-after-commit", "rollback-before-release"))
 async def test_live_later_cut_drain_stop_and_actual_suspend_outcomes(tmp_path, monkeypatch, mode):
+    await _run_later_cut_handover(tmp_path, monkeypatch, "end-review", mode=mode)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("missing-candidate", "foreign-candidate"))
+async def test_live_later_cut_ambiguous_suspend_refuses_unbound_candidate_and_retains_custody(tmp_path, monkeypatch, mode):
     await _run_later_cut_handover(tmp_path, monkeypatch, "end-review", mode=mode)
 
 

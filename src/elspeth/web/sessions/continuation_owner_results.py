@@ -262,11 +262,13 @@ def re_admit_read_owner_result(
     if envelope["success"]:
         if "data" not in envelope:
             raise AuditIntegrityError("retained successful read has no actual data")
-        admitted = contract.admit(envelope["data"])
-        if canonical_json(admitted.to_wire()) != canonical_json(envelope["data"]):
-            raise AuditIntegrityError("retained read changed under current selected response admission")
     elif "data" in envelope:
         raise AuditIntegrityError("retained failed read invented data")
+    # This is retained wire data, not a live producer value. The complete
+    # result codec restores selected nominal producers through their closed
+    # wire parser (including PluginSchemaInfo), then checks exact wire parity.
+    # Passing envelope["data"] directly to producer admission loses that
+    # distinction and rejects genuine get_plugin_schema results.
     nominal = decode_tool_result_json(result.tool_result_json, env_ref_names=env_ref_names)
     if nominal.affected_nodes:
         raise AuditIntegrityError("retained read contains an authored graph effect")
@@ -275,7 +277,8 @@ def re_admit_read_owner_result(
         != result.tool_result_json
     ):
         raise AuditIntegrityError("retained read changed its complete selected nominal result")
-    if canonical_json(admit_discovery_result(result.tool_name, nominal).to_dict()) != result.response_json:
+    discovery = admit_discovery_result(result.tool_name, nominal)
+    if discovery.contract is not contract or canonical_json(discovery.to_dict()) != result.response_json:
         raise AuditIntegrityError("retained read envelope differs from its actual complete nominal result")
     for observed in result.blob_versions:
         if observed.status not in BLOB_STATUSES or observed.creation_modality not in CreationModality:

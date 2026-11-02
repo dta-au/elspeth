@@ -17,6 +17,7 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_title_source import ContinuationTitleSource, read_title_source_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.service import SessionServiceImpl
 
 
@@ -39,6 +40,8 @@ def _read_current_title_input(
         settings = service._settings
         request = None
         if source.eligible:
+            if type(source.request) is not SendMessageRequest:
+                raise AuditIntegrityError("eligible current title source requires the original send-message request")
             request = prepare_auto_title_request(
                 user_message=source.request.content,
                 model=settings.composer_model,

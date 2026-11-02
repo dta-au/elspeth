@@ -34,7 +34,6 @@ from elspeth.web.composer.continuation_policy import (
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_primary_no_sdk import (
-    ContinuationRetainedTailUnbounded,
     PrimaryNoSdkIssuer,
     PrimaryNoSdkRefusalReason,
 )
@@ -57,9 +56,14 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
-from elspeth.web.sessions.continuation import PreparedContinuationProvider, StoredContinuationSnapshot
+from elspeth.web.sessions.continuation import (
+    PreparedContinuationProvider,
+    StoredContinuationSnapshot,
+    V3UnboundedTailRefusal,
+    refuse_v3_retained_tail_before_paid,
+)
 from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
-from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, PrimaryProviderResult
+from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, PrimaryProviderResult, primary_action_wire_message
 from elspeth.web.sessions.locking import locked_session_transaction
 
 
@@ -115,6 +119,7 @@ def _project[T](
                 PreparedContinuationProvider,
                 StoredContinuationSnapshot,
                 PrimaryProviderResult,
+                V3UnboundedTailRefusal,
             ):
                 raise AuditIntegrityError("primary SQL returned an unfamiliar owned result")
             value = outcome.value
@@ -344,7 +349,11 @@ def _freeze_input(
         raise AuditIntegrityError("primary input requires the actual current message/recorder producers")
 
     def prepared_from_current(
-        current_inputs: _CurrentProducerInputs, budget: CommonProviderCostBudget | None, *, reprove_after: bool
+        current_inputs: _CurrentProducerInputs,
+        budget: CommonProviderCostBudget | None,
+        *,
+        action_json: str | None,
+        reprove_after: bool,
     ) -> PreparedPrimaryInvocation:
         frame = selected.stack.frames[-1]
         if type(frame) is not ComposeFrame or frame.phase != "action_ready" or frame.pending_response is not None:
@@ -372,11 +381,14 @@ def _freeze_input(
             raise AuditIntegrityError("primary input changed its selected complete message/shelf join")
         if recorder.snapshot_for_continuation(drained=drained) != decode_recorder_snapshot(by_ref[frame.audit_buffer]):
             raise AuditIntegrityError("primary input changed its complete current recorder prefix")
+        physical_messages = [*messages]
+        if action_json is not None:
+            physical_messages.append(primary_action_wire_message(action_json))
         # The SQL worker does not carry the async prompt ContextVar. The
         # current bootstrap owns the original authenticated human input.
         try:
             request = service._provider_gateway.prepare_continuation_primary(
-                messages, tools, user_prompt=current_inputs.values.message, cost_budget=budget
+                physical_messages, tools, user_prompt=current_inputs.values.message, cost_budget=budget
             )
         except ComposerContextUnsupported:
             if reprove_after:
@@ -395,8 +407,10 @@ def _freeze_input(
     elif type(policy) is ContinuationAdmissionPolicyV3:
         cost_policy = policy
     else:
+        if selected.stack.active_action_json is not None:
+            raise AuditIntegrityError("legacy PRIMARY cannot consume a current prescribed action")
         current_inputs = producers._require_current()
-        return prepared_from_current(current_inputs, cost_budget, reprove_after=True)
+        return prepared_from_current(current_inputs, cost_budget, action_json=None, reprove_after=True)
     # This one fresh lock/memo brackets the current producer proof, full SQL
     # cost replay, and local input freeze. It closes before any DML or SDK.
     with (
@@ -405,7 +419,12 @@ def _freeze_input(
     ):
         current_inputs = producers._require_current_on_connection(conn)
         current_budget = _current_cost_budget(conn, selected, cost_policy, cost_budget)
-        return prepared_from_current(current_inputs, current_budget, reprove_after=False)
+        action_json = None
+        if selected.stack.active_action_json is not None:
+            from elspeth.web.sessions.continuation_semantic_advisor import require_current_prescribed_primary_action_on_connection
+
+            action_json = require_current_prescribed_primary_action_on_connection(conn, producers.inventory.running, selected.stack)
+        return prepared_from_current(current_inputs, current_budget, action_json=action_json, reprove_after=False)
 
 
 async def run_continuation_primary(
@@ -422,7 +441,7 @@ async def run_continuation_primary(
     provider_owner: ProviderInvocationOwner,
     timeout: float,
     on_sdk_entry: Callable[[], None] | None = None,
-) -> PrimaryProviderResult | PrimaryNoSdkRefusalReceipt:
+) -> PrimaryProviderResult | PrimaryNoSdkRefusalReceipt | V3UnboundedTailRefusal:
     _require_owners(authority, required_work)
     running = required_work.running
     if (
@@ -455,6 +474,28 @@ async def run_continuation_primary(
         deadline = min(deadline, started + deadline_owner.remaining_dispatch(monotonic_now=started))
     if deadline <= started:
         raise TimeoutError("primary action exhausted its original allowance before input preparation")
+    if type(policy) is ContinuationAdmissionPolicyV3:
+        if deadline_owner is not None:
+            deadline_owner.begin_settlement()
+        sql, projection = required_work.reserve_pair(
+            RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+        )
+        try:
+            outcome = await run_required_sql_finish_once(
+                sql,
+                refuse_v3_retained_tail_before_paid,
+                authority,
+                running,
+                selected=selected,
+                inventory=producers.inventory,
+            )
+        except BaseException:
+            projection.complete_without_submission()
+            raise
+        refusal = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_STATE_SQL, outcome)
+        if type(refusal) is not V3UnboundedTailRefusal:
+            raise AuditIntegrityError("V3 retained-tail refusal lost its actual terminal owner")
+        return refusal
     sql, projection = required_work.reserve_pair(RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION)
     try:
         captured = await run_required_sql_finish_once(
@@ -585,14 +626,6 @@ async def run_continuation_primary(
             issuer=issuer,
             reason=PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED,
             original_failure=error,
-        )
-    if type(policy) is ContinuationAdmissionPolicyV3:
-        return await _finish_primary_no_sdk(
-            authority=authority,
-            required_work=required_work,
-            issuer=issuer,
-            reason=PrimaryNoSdkRefusalReason.RETAINED_TAIL_UNBOUNDED,
-            original_failure=ContinuationRetainedTailUnbounded("V3 PRIMARY has no proven finite complete paid result bound"),
         )
     sql, projection = required_work.reserve_pair(
         RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION

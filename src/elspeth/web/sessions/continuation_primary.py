@@ -117,15 +117,87 @@ def _primary_frame(stack: ContinuationFrameStack) -> ComposeFrame:
         or type(frame) is not ComposeFrame
         or stack.pending_settlement_ids
         or stack.pending_owner_results
-        or stack.active_action_json is not None
-        or stack.active_action_source is not None
         or any(
             item.disposition in ("prepared", "dispatched", "unknown") and item.effect_id != frame.provider_effect_key
             for item in stack.effect_frontier
         )
     ):
-        raise AuditIntegrityError("primary result owner requires the sole ordinary compose frame without an active child/action")
+        raise AuditIntegrityError("primary result owner requires the sole compose frame without an active child")
+    if stack.active_action_json is not None:
+        from elspeth.web.sessions.continuation import bound_action_json
+
+        bound_action_json(stack, action_owner="primary_turn", read_tool_name=None, read_tool_arguments_json=None)
     return frame
+
+
+def primary_action_wire_message(action_json: str) -> dict[str, str]:
+    """Carry exact model-authored PRIMARY advice in the physical request."""
+    from elspeth.web.composer.advisor_output import PrimaryContinuationAction
+    from elspeth.web.composer.continuation_progress import decode_prescribed_continuation_action
+
+    action = decode_prescribed_continuation_action(action_json)
+    if type(action) is not PrimaryContinuationAction or canonical_json(action.model_dump(mode="json")) != action_json:
+        raise AuditIntegrityError("PRIMARY wire advice differs from its canonical prescribed action")
+    return {"role": "assistant", "content": action.instruction}
+
+
+def _require_primary_effect_action_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    stack: ContinuationFrameStack,
+    effect: Row[Any],
+    current_effect: bool,
+) -> None:
+    """Join an exact PRIMARY effect to its original paid prescription and receipt."""
+    if effect.action_json is None:
+        if current_effect and stack.active_action_json is not None:
+            raise AuditIntegrityError("ordinary PRIMARY effect cannot consume an unrelated prescribed action")
+        return
+    from elspeth.web.composer.continuation_progress import (
+        continuation_action_key,
+        current_action_receipts,
+        decode_continuation_frontier,
+        decode_prescribed_continuation_action,
+    )
+    from elspeth.web.sessions.continuation_semantic_advisor import read_original_prescribed_primary_source_on_connection
+
+    primary_action_wire_message(effect.action_json)
+    source = read_original_prescribed_primary_source_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        action_json=effect.action_json,
+        effect_key=effect.effect_key,
+    )
+    if current_effect:
+        active = stack.active_action_json
+        if active is None:
+            if effect.disposition not in ("committed", "refused") or stack.active_action_source is not None:
+                raise AuditIntegrityError("unsettled prescribed PRIMARY lost its active original source")
+        elif active != effect.action_json or stack.active_action_source != source:
+            raise AuditIntegrityError("prescribed PRIMARY effect differs from its current original source")
+    if stack.semantic_frontier is None:
+        raise AuditIntegrityError("prescribed PRIMARY effect lost its semantic frontier")
+    ref = stack.semantic_frontier
+    canonical = read_chunk(conn, session_id=str(session_id), operation_id=operation_id, key=f"value:{ref.codec}:{ref.digest}").decode(
+        "utf-8", errors="strict"
+    )
+    verify_private_chunk(ref, canonical)
+    frontier = decode_continuation_frontier(canonical)
+    action = decode_prescribed_continuation_action(effect.action_json)
+    action_key = continuation_action_key(action, retained_evidence={item.receipt_id: item for item in frontier.evidence})
+    matching = tuple(item for item in current_action_receipts(frontier.action_receipts) if item.action_key == action_key)
+    # A lost terminal may mark a dispatched physical effect unknown. The
+    # action history retains the last witnessed dispatch; it is never a
+    # completion claim or permission to issue the physical call again.
+    witnessed_disposition = "dispatched" if effect.disposition == "unknown" else effect.disposition
+    if len(matching) != 1 or (matching[0].owner_receipt_id, matching[0].disposition) != (
+        effect.effect_key,
+        witnessed_disposition,
+    ):
+        raise AuditIntegrityError("prescribed PRIMARY effect lost its exact execution receipt")
 
 
 def _owned_text(conn: Connection, running: ComposerOperationRunning, key: str) -> str:
@@ -196,7 +268,7 @@ def _input_value(canonical: str | None, digest: str) -> RetainedPrimaryInput:
 
 
 def _wire_input_data(
-    conn: Connection, session_id: UUID, operation_id: str, frame: ComposeFrame, value: RetainedPrimaryInput
+    conn: Connection, session_id: UUID, operation_id: str, frame: ComposeFrame, value: RetainedPrimaryInput, action_json: str | None
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     selected, error = parse_json_strict(_chunk_data(conn, session_id, operation_id, frame.messages).canonical)
     if (
@@ -218,6 +290,8 @@ def _wire_input_data(
         if message_error is not None or type(message) is not dict:
             raise AuditIntegrityError("primary prepared input lost its complete message object")
         wire.append(message)
+    if action_json is not None:
+        wire.append(primary_action_wire_message(action_json))
     tools: list[dict[str, Any]] = []
     if frame.tools is not None:
         if frame.tools.codec != "composer.tools.v1":
@@ -263,7 +337,7 @@ def stored_primary_input_data_on_connection(
 ) -> tuple[RetainedPrimaryInput, list[dict[str, Any]], list[dict[str, Any]]]:
     """Original complete prepared input after the caller's SQL admission."""
     value = _stored_descriptor_data(conn, session_id, operation_id, effect)
-    wire, tools = _wire_input_data(conn, session_id, operation_id, frame, value)
+    wire, tools = _wire_input_data(conn, session_id, operation_id, frame, value, effect.action_json)
     return value, wire, tools
 
 
@@ -322,7 +396,12 @@ def prepare_primary_provider_on_connection(
     if frame.phase != "action_ready" or frame.pending_response is not None or frame.provider_effect_key is not None:
         raise ContinuationCASConflict("primary preparation would replace an unresolved response/effect")
     request = _input_value(input_json, input_sha256)
-    _wire_input_data(conn, running.claim.session_id, running.claim.operation_id, frame, request)
+    action_json = None
+    if root.active_action_json is not None:
+        from elspeth.web.sessions.continuation_semantic_advisor import require_current_prescribed_primary_action_on_connection
+
+        action_json = require_current_prescribed_primary_action_on_connection(conn, running, root)
+    _wire_input_data(conn, running.claim.session_id, running.claim.operation_id, frame, request, action_json)
     ordinal = conn.execute(
         select(ordinals.c.next_ordinal).where(
             ordinals.c.session_id == sid,
@@ -353,7 +432,7 @@ def prepare_primary_provider_on_connection(
             disposition="prepared",
             creator_sequence=running.claim.segment_sequence,
             creator_generation=running.claim.ownership_generation,
-            action_json=None,
+            action_json=action_json,
         )
     )
     put_chunk(
@@ -389,6 +468,12 @@ def prepare_primary_provider_on_connection(
         disposition="prepared",
         receipt_id=None,
     )
+    if action_json is not None:
+        from elspeth.web.sessions.continuation import retain_action_execution_receipt_on_connection
+
+        encoded = retain_action_execution_receipt_on_connection(
+            conn, session_id=sid, operation_id=operation, effect_key=key, disposition="prepared", snapshot_json=encoded
+        )
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
     conn.execute(
         update(segments)
@@ -476,7 +561,6 @@ def selected_primary_effect_data_on_connection(
     if (
         effect.owner != "provider"
         or effect.input_sha256 != input_sha256
-        or effect.action_json is not None
         or len(frontier) != 1
         or (frontier[0].disposition, frontier[0].receipt_id) != (effect.disposition, effect.receipt_key)
         or effect.committed_state_ids_json is not None
@@ -535,6 +619,9 @@ def selected_primary_effect_data_on_connection(
             raise AuditIntegrityError("refused primary lost its terminal no-SDK receipt shape")
     else:
         raise AuditIntegrityError("primary effect has an unknown durable disposition")
+    _require_primary_effect_action_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, stack=stack, effect=effect, current_effect=True
+    )
     return selected, stack, frame, effect
 
 
@@ -587,6 +674,17 @@ def begin_primary_provider_on_connection(
         .values(disposition="dispatched")
     )
     encoded = _effect_snapshot(encode_continuation_snapshot(root), effect_key=binding.effect_key, disposition="dispatched", receipt_id=None)
+    if effect.action_json is not None:
+        from elspeth.web.sessions.continuation import retain_action_execution_receipt_on_connection
+
+        encoded = retain_action_execution_receipt_on_connection(
+            conn,
+            session_id=str(running.claim.session_id),
+            operation_id=running.claim.operation_id,
+            effect_key=binding.effect_key,
+            disposition="dispatched",
+            snapshot_json=encoded,
+        )
     result = append_complete_snapshot(
         conn,
         session_id=str(running.claim.session_id),
@@ -748,6 +846,17 @@ def refuse_primary_no_sdk_on_connection(conn: Connection, permit: PrimaryNoSdkRe
     encoded = _effect_snapshot(
         encode_continuation_snapshot(root), effect_key=data.effect_key, disposition="refused", receipt_id=data.receipt_key
     )
+    if effect.action_json is not None:
+        from elspeth.web.sessions.continuation import retain_action_execution_receipt_on_connection
+
+        encoded = retain_action_execution_receipt_on_connection(
+            conn,
+            session_id=data.session_id,
+            operation_id=data.operation_id,
+            effect_key=data.effect_key,
+            disposition="refused",
+            snapshot_json=encoded,
+        )
     refused = append_complete_snapshot(
         conn,
         session_id=data.session_id,
@@ -872,6 +981,38 @@ def read_primary_no_sdk_refusal_on_connection(
     except UnicodeDecodeError as error:
         raise AuditIntegrityError("PRIMARY no-SDK journal lost strict snapshot bytes") from error
     source_frontier = tuple(item for item in source_stack.effect_frontier if item.effect_id == effect_key)
+    expected_root = source_stack.model_copy(update={"effect_frontier": root.effect_frontier, "cursor": root.cursor})
+    if effect.action_json is not None:
+        from elspeth.web.composer.continuation_progress import (
+            ActionExecutionReceipt,
+            continuation_action_key,
+            decode_continuation_frontier,
+            decode_prescribed_continuation_action,
+            encode_continuation_frontier,
+            record_action_receipt,
+        )
+
+        if source_stack.semantic_frontier is None:
+            raise AuditIntegrityError("PRIMARY no-SDK source lost its original semantic frontier")
+        semantic_ref = source_stack.semantic_frontier
+        semantic_canonical = read_chunk(
+            conn, session_id=sid, operation_id=operation_id, key=f"value:{semantic_ref.codec}:{semantic_ref.digest}"
+        ).decode("utf-8", errors="strict")
+        verify_private_chunk(semantic_ref, semantic_canonical)
+        original_frontier = decode_continuation_frontier(semantic_canonical)
+        action = decode_prescribed_continuation_action(effect.action_json)
+        action_key = continuation_action_key(action, retained_evidence={item.receipt_id: item for item in original_frontier.evidence})
+        updated_frontier = record_action_receipt(
+            original_frontier,
+            ActionExecutionReceipt(action_key, effect_key, "refused"),
+            actual_owner_receipt_id=effect_key,
+        )
+        expected_ref = encode_private_chunk(
+            codec="composer.semantic-frontier.v1", canonical=encode_continuation_frontier(updated_frontier)
+        ).reference
+        expected_root = expected_root.model_copy(
+            update={"semantic_frontier": expected_ref, "active_action_json": None, "active_action_source": None}
+        )
     if (
         source_row.kind != "transition"
         or refusal_row.kind != "transition"
@@ -883,7 +1024,10 @@ def read_primary_no_sdk_refusal_on_connection(
         or source_stack.frames[-1].provider_input_sha256 != effect.input_sha256
         or refused_stack.cursor != data.source_cursor + 1
         or refused_stack.effect_frontier != root.effect_frontier
-        or source_stack.model_copy(update={"effect_frontier": root.effect_frontier, "cursor": root.cursor}) != root
+        or refused_stack.semantic_frontier != root.semantic_frontier
+        or refused_stack.active_action_json != root.active_action_json
+        or refused_stack.active_action_source != root.active_action_source
+        or expected_root != root
         or refusal_event.tag != "effect_refused"
         or read_chunk(conn, session_id=sid, operation_id=operation_id, key=refusal_event.payload_chunk_key)
         != _primary_no_sdk_event(data, effect.result_chunk_key).encode("utf-8")
@@ -1200,6 +1344,17 @@ def publish_primary_provider_on_connection(
         disposition="committed",
         receipt_id=call.call_id,
     )
+    if effect.action_json is not None:
+        from elspeth.web.sessions.continuation import retain_action_execution_receipt_on_connection
+
+        encoded = retain_action_execution_receipt_on_connection(
+            conn,
+            session_id=str(running.claim.session_id),
+            operation_id=running.claim.operation_id,
+            effect_key=binding.effect_key,
+            disposition="committed",
+            snapshot_json=encoded,
+        )
     committed = append_complete_snapshot(
         conn,
         session_id=str(running.claim.session_id),
@@ -1379,6 +1534,69 @@ def read_committed_primary_response_data_on_connection(
         != selected.chunks
     ):
         raise ContinuationCASConflict("primary source read changed its complete selected chunk cohort")
+    return _verify_committed_primary_response_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=reference
+    )
+
+
+def read_original_committed_primary_response_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    source_checkpoint_id: str,
+    source_cursor: int,
+    response: PrivateChunkRef,
+) -> PrivateChunk:
+    """Prove immutable PRIMARY paid DATA from one original checkpoint.
+
+    This grants no current-head, effect-write, provider or replay authority.
+    The caller separately proves why this historical checkpoint is its source.
+    """
+    from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
+
+    sid = str(session_id)
+    row = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation_id,
+            checkpoints.c.checkpoint_id == source_checkpoint_id,
+            checkpoints.c.cursor == source_cursor,
+        )
+    ).one_or_none()
+    if (
+        row is None
+        or row.kind not in ("transition", "handoff")
+        or row.frame_stack_version != 1
+        or row.snapshot_chunk_key != f"snapshot:{source_checkpoint_id}"
+    ):
+        raise AuditIntegrityError("historical PRIMARY source lost its exact original checkpoint")
+    snapshot_json = read_chunk(conn, session_id=sid, operation_id=operation_id, key=row.snapshot_chunk_key).decode("utf-8", errors="strict")
+    stack = decode_continuation_snapshot(snapshot_json)
+    decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
+    if stack.cursor != source_cursor or (stack.logical.session_id, stack.logical.operation_id) != (sid, operation_id):
+        raise AuditIntegrityError("historical PRIMARY source changed its original root identity")
+    stored = StoredContinuationSnapshot(snapshot_json, source_cursor, source_checkpoint_id)
+    selected = SelectedContinuationState(
+        source_checkpoint_id,
+        stack,
+        load_snapshot_private_data_on_connection(conn, session_id=sid, operation_id=operation_id, selected=stored),
+    )
+    if all(chunk.reference != response for chunk in selected.chunks):
+        raise AuditIntegrityError("historical PRIMARY response is absent from its original complete private closure")
+    return _verify_committed_primary_response_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=response
+    )
+
+
+def _verify_committed_primary_response_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    reference: PrivateChunkRef,
+) -> PrivateChunk:
     if type(reference) is not PrivateChunkRef or reference.codec != "composer.response.v1":
         raise AuditIntegrityError("historical primary response lost its actual source codec")
     key = f"value:{reference.codec}:{reference.digest}"
@@ -1405,7 +1623,6 @@ def read_committed_primary_response_data_on_connection(
     frontier = tuple(item for item in selected.stack.effect_frontier if item.effect_id == effect.effect_key)
     if (
         effect.disposition != "committed"
-        or effect.action_json is not None
         or type(effect.creator_sequence) is not int
         or effect.creator_sequence < 1
         or type(effect.creator_generation) is not int
@@ -1416,6 +1633,9 @@ def read_committed_primary_response_data_on_connection(
         or (frontier[0].disposition, frontier[0].receipt_id) != ("committed", effect.receipt_key)
     ):
         raise AuditIntegrityError("historical primary response lost its exact committed current frontier")
+    _require_primary_effect_action_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, stack=selected.stack, effect=effect, current_effect=False
+    )
     response = _chunk_data(conn, session_id, operation_id, reference)
     completion = decode_continuation_response(response)
     call = decode_retained_physical_audit_call(response)

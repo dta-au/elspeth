@@ -24,6 +24,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCal
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
     PROMPT_GUARD_TRUST_KEY,
@@ -37,12 +38,14 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_content import PreparedAdvisorContent
 from elspeth.web.composer.advisor_output import (
     ContinuationAdvisorDecision,
+    ContinuationEvidenceRef,
     continuation_advisor_response_format,
     parse_continuation_advisor_decision,
 )
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.continuation import EndFrame
 from elspeth.web.composer.continuation_advisor import (
     ContinuationAdvisorInvocation,
     decode_continuation_advisor_invocation,
@@ -55,6 +58,7 @@ from elspeth.web.composer.continuation_codec import (
     encode_private_chunk,
     verify_private_chunk,
 )
+from elspeth.web.composer.continuation_end_values import decode_end_candidate
 from elspeth.web.composer.continuation_iteration import encode_continuation_iteration, iteration_values
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
 from elspeth.web.composer.continuation_progress import ContinuationFrontier
@@ -131,6 +135,58 @@ _SEMANTIC_ADVISOR_OPTIONS = TypeAdapter(_SemanticAdvisorOptions)
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticAdvisorReadInput:
+    """Original SQL-proved read DATA; no provider or current writer authority."""
+
+    reference: ContinuationEvidenceRef
+    semantic_result_json: str
+    original_result_sha256: str
+    semantic_effect_key: str
+    owner_effect_key: str
+    commit_checkpoint_id: str
+    commit_cursor: int
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticAdvisorReviewInput:
+    """Complete original shared END result, including a genuine blocked return."""
+
+    result_json: str
+    owner_effect_key: str
+    completed_checkpoint_id: str
+    completed_cursor: int
+    outcome: Literal["clean", "blocked"]
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticAdvisorRetainedInputs:
+    session_id: str
+    operation_id: str
+    checkpoint_id: str
+    cursor: int
+    reads: tuple[SemanticAdvisorReadInput, ...] = ()
+    review: SemanticAdvisorReviewInput | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.cursor) is not int
+            or self.cursor < 0
+            or type(self.reads) is not tuple
+            or any(type(item) is not SemanticAdvisorReadInput for item in self.reads)
+            or (self.review is not None and type(self.review) is not SemanticAdvisorReviewInput)
+        ):
+            raise AuditIntegrityError("Semantic retained inputs lost their nominal complete DATA")
+
+
+def semantic_retained_json(value: str) -> JsonValue:
+    """Restore complete canonical source DATA without a lossy prompt projection."""
+    parsed, error = parse_json_strict(value)
+    if error is not None or type(parsed) is not dict or canonical_json(parsed) != value:
+        raise AuditIntegrityError("Semantic retained result lost its complete canonical DATA")
+    return parsed
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedSemanticAdvisorRequest:
     """One exact physical request; its historical source grants no SQL write."""
 
@@ -199,6 +255,7 @@ def prepare_semantic_advisor_request(
     user_message: str,
     runtime: RestoredContinuationRuntime,
     env_ref_names: frozenset[str] = frozenset(),
+    retained_inputs: SemanticAdvisorRetainedInputs | None = None,
 ) -> PreparedSemanticAdvisorRequest:
     """Use the existing complete Advisor graph/provenance producer.
 
@@ -218,6 +275,17 @@ def prepare_semantic_advisor_request(
     if runtime.materialization.service._advisor_checkpoint is not owner or runtime.bindings.provider_owner is not provider_owner:
         raise AuditIntegrityError("Semantic Advisor changed its actual runtime/service/provider owners")
     resolved = runtime.source
+    if retained_inputs is not None and (
+        type(retained_inputs) is not SemanticAdvisorRetainedInputs
+        or (retained_inputs.session_id, retained_inputs.operation_id, retained_inputs.checkpoint_id, retained_inputs.cursor)
+        != (
+            resolved.selected.stack.logical.session_id,
+            resolved.selected.stack.logical.operation_id,
+            resolved.selected.checkpoint_id,
+            resolved.selected.stack.cursor,
+        )
+    ):
+        raise AuditIntegrityError("Semantic retained result inputs changed their exact selected source")
     if user_message != runtime.bindings.message or resolved.evidence.request_content_hash != stable_hash(user_message):
         raise AuditIntegrityError("Semantic Advisor source changed its complete originating request")
     if resolved.evidence.logical != resolved.selected.stack.logical:
@@ -271,16 +339,28 @@ def prepare_semantic_advisor_request(
     owner._require_complete_graph_summary(arguments["_elspeth_advisor_summary_parts"])
     arguments["problem_summary"] = _SEMANTIC_INSTRUCTIONS
     context = advisor_context.build_advisor_user_message(arguments)
-    retained = canonical_json(
-        {
-            "source": source.model_dump(mode="json"),
-            "frontier": encode_frontier_chunk(frontier).canonical,
-            # The complete visible transcript uses its existing owned producer
-            # above; do not duplicate its private shelf as an atomic document.
-            "evidence": resolved.evidence.model_dump(mode="json", by_alias=True, exclude={"transcript"}),
-            "iteration": resolved.iteration.model_dump(mode="json", by_alias=True),
-        }
-    )
+    retained_values: dict[str, JsonValue] = {
+        "source": source.model_dump(mode="json"),
+        "frontier": encode_frontier_chunk(frontier).canonical,
+        # The complete visible transcript uses its existing owned producer
+        # above; do not duplicate its private shelf as an atomic document.
+        "evidence": resolved.evidence.model_dump(mode="json", by_alias=True, exclude={"transcript"}),
+        "iteration": resolved.iteration.model_dump(mode="json", by_alias=True),
+    }
+    frames = resolved.selected.stack.frames
+    if len(frames) == 2 and type(frames[-1]) is EndFrame:
+        end = frames[-1]
+        candidates = tuple(chunk for chunk in resolved.selected.chunks if chunk.reference == end.candidate)
+        if len(candidates) != 1:
+            raise AuditIntegrityError("Semantic Advisor lost its complete selected END candidate")
+        verify_private_chunk(end.candidate, candidates[0].canonical)
+        retained_values["end_candidate"] = decode_end_candidate(candidates[0]).model_dump(mode="json")
+    if retained_inputs is not None:
+        if retained_inputs.reads:
+            retained_values["read_results"] = [semantic_retained_json(item.semantic_result_json) for item in retained_inputs.reads]
+        if retained_inputs.review is not None:
+            retained_values["review_result"] = semantic_retained_json(retained_inputs.review.result_json)
+    retained = canonical_json(retained_values)
     messages: list[PromptGuardTextMessage] = [
         {
             "role": "system",
