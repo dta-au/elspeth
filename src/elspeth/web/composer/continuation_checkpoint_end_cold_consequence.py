@@ -185,14 +185,22 @@ async def compute_first_cold_checkpoint_end_gate(*, source: ColdCheckpointEndCon
     review_state = _decode_owned(_REVIEW, gate.review_state_json)
     initial_review_state = _decode_owned(_REVIEW, gate.initial_review_state_json)
     publication = _decode_owned(_PUBLICATION, gate.publication_review_json)
+    source_operation_id = (
+        source.owed.retry_history.owed.new_hold.session_operation_id
+        if source.owed.retry_history is not None
+        else source.owed.new_hold.session_operation_id
+    )
     observed = await runtime.materialization.service._completion._interpretation_surfacing.observe_pending_interpretation_review_sites(
         runtime.live.state, session_id=runtime.bindings.session_id
     )
     if (
         observed.source_sha256 != gate.orphan_source_sha256
         or observed.missing_sites != gate.orphaned_precheck
-        or runtime.live.turn_evidence.review_candidate(
-            candidate=assistant.content or "", request=runtime.bindings.message, current_state=runtime.live.state
+        or runtime.live.turn_evidence.review_candidate_for_source_operation(
+            source_operation_id=source_operation_id,
+            candidate=assistant.content or "",
+            request=runtime.bindings.message,
+            current_state=runtime.live.state,
         )
         != publication
     ):
@@ -226,6 +234,7 @@ async def compute_first_cold_checkpoint_end_gate(*, source: ColdCheckpointEndCon
         max_passes=gate.max_passes,
         allow_repair_continue=gate.allow_repair_continue,
         dialogue_length=len(runtime.live.llm_messages) if type(gate.caller) is CheckpointOrdinaryEndCaller else None,
+        original_source_operation_id=source_operation_id,
     )
     issued = ColdCheckpointEndGate(source, computation)
     _issued_gates[issued] = source

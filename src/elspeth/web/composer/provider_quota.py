@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         V4ProviderResultIncomplete,
         V4ProviderSdkReturn,
     )
+    from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
     from elspeth.web.sessions.continuation import PreparedContinuationProvider, StoredContinuationSnapshot
     from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
     from elspeth.web.sessions.continuation_classifier_primary import (
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
         PrimaryProviderResult,
         V4PrimaryProviderAdmission,
     )
+    from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, V4SemanticProviderAdmission
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
     from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
@@ -116,6 +118,20 @@ class V4PaidIncompleteCommitted(Exception):
         if type(finalization) is not V4ReturnedIncompleteFinalization:
             raise AuditIntegrityError("Paid incomplete control lacks its verified custody transition")
         super().__init__("paid_incomplete_committed")
+        self.finalization = finalization
+
+
+@dataclass(frozen=True, slots=True)
+class V4SdkFinalization:
+    verified: VerifiedSdkTerminal
+    deferred_cancellations: tuple[asyncio.CancelledError, ...]
+
+
+class V4SdkTerminalCommitted(Exception):
+    def __init__(self, finalization: V4SdkFinalization) -> None:
+        if type(finalization) is not V4SdkFinalization:
+            raise AuditIntegrityError("SDK terminal control requires its original finalization")
+        super().__init__("sdk_terminal_committed")
         self.finalization = finalization
 
 
@@ -215,6 +231,7 @@ class ProviderCallCustody:
         "_undispatched_recurrence",
         "_v4_returned_incomplete_committed",
         "_v4_returned_incomplete_finalizer",
+        "_v4_sdk_finalizer",
         "_v4_sdk_return",
         "_v4_sdk_return_claimed",
         "attempt",
@@ -241,6 +258,8 @@ class ProviderCallCustody:
         "continuation_title_v4_admission",
         "continuation_title_v4_terminal",
         "v4_returned_incomplete_result",
+        "v4_sdk_failure",
+        "v4_sdk_terminal_result",
     )
 
     def __init__(
@@ -275,6 +294,11 @@ class ProviderCallCustody:
         self.attempt: ProviderAttempt | None = None
         self.call: ComposerLLMCall | None = None
         self._sdk_entered = False
+        self.v4_sdk_failure: V4SdkFailureObservation | None = None
+        self._v4_sdk_finalizer: (
+            Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]] | None
+        ) = None
+        self.v4_sdk_terminal_result: V4SdkFinalization | None = None
         self._admitting = False
         self._admitted_ns = 0
         self._undispatched_recurrence = 0
@@ -502,6 +526,7 @@ class ProviderCallCustody:
             type(prepared) is not PreparedCheckpointProvider
             or type(issuer) is not CheckpointNoSdkIssuer
             or issuer.prepared is not prepared
+            or issuer.clock is not prepared.clock
             or type(self.service) is not SessionServiceImpl
             or self.family is not ProviderInvocationFamily.ADVISOR
             or self.required_work.role is not RequiredWorkRole.TURN
@@ -515,6 +540,7 @@ class ProviderCallCustody:
             or self.attempt is not None
         ):
             raise AuditIntegrityError("V4 checkpoint custody requires its original prepared ADVISOR invocation")
+        issuer.require_original_clock()
         issuer.bind_custody(self)
         self.continuation_checkpoint_v4 = prepared
         self._checkpoint_no_sdk_issuer = issuer
@@ -549,6 +575,16 @@ class ProviderCallCustody:
     @property
     def family(self) -> ProviderInvocationFamily | None:
         return self._family
+
+    @property
+    def continuation_checkpoint_clock(self) -> ContinuationActionClock | None:
+        issuer = self._checkpoint_no_sdk_issuer
+        if issuer is None:
+            return None
+        if self.family is not ProviderInvocationFamily.ADVISOR or self.continuation_checkpoint_v4 is not issuer.prepared:
+            raise AuditIntegrityError("Checkpoint timing requires its original prepared ADVISOR custody")
+        issuer.require_original_clock()
+        return issuer.clock
 
     @property
     def continuation_semantic_clock(self) -> ContinuationActionClock | None:
@@ -634,6 +670,7 @@ class ProviderCallCustody:
     def require_cost_output(self) -> None:
         if (
             self._v4_returned_incomplete_committed
+            or self.v4_sdk_terminal_result is not None
             or self._continuation_primary_v4_terminal
             or self._continuation_classifier_v4_terminal
             or self._continuation_semantic_v4_terminal
@@ -1142,6 +1179,75 @@ class ProviderCallCustody:
         if len(admissions) != 1 or self.attempt is not admissions[0].attempt or not self._sdk_entered:
             raise AuditIntegrityError("V4 provider SDK return changed its original paid attempt")
         return True
+
+    def bind_v4_sdk_finalizer(
+        self,
+        callback: Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]],
+    ) -> None:
+        if self._v4_sdk_finalizer is not None or not callable(callback) or self.attempt is not None:
+            raise AuditIntegrityError("SDK finalizer requires one original pre-admission owner")
+        self._v4_sdk_finalizer = callback
+
+    def has_v4_sdk_finalizer(self) -> bool:
+        return self._v4_sdk_finalizer is not None
+
+    async def finalize_v4_sdk_failure(self, observation: V4SdkFailureObservation, *, preserve_sdk_cancellation: bool) -> V4SdkFinalization:
+        from elspeth.web.composer.provider_sdk_observation import forget_v4_sdk_failure, require_original_v4_sdk_failure
+        from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
+
+        require_original_v4_sdk_failure(observation, custody=self)
+        finalizer = self._v4_sdk_finalizer
+        admission = self.continuation_primary_v4_admission
+        if finalizer is None or admission is None or self.attempt is not admission.attempt or self.v4_sdk_terminal_result is not None:
+            raise AuditIntegrityError("SDK terminal lost its original PRIMARY finalizer")
+        sql, projection = self.required_work.reserve_pair(
+            RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
+        )
+        try:
+            outcome, cancellations = await self._join(finalizer(observation, sql))
+        except BaseException:
+            if sql.complete:
+                projection.complete_without_submission()
+            raise
+        if type(outcome) is RequiredSQLRaised:
+            if sql.complete:
+                projection.complete_without_submission()
+            failures: list[BaseException] = [outcome.error]
+            for cancellation in (*outcome.deferred_cancellations, *cancellations):
+                if all(cancellation is not prior for prior in failures):
+                    failures.append(cancellation)
+            if len(failures) == 1:
+                raise outcome.error
+            raise BaseExceptionGroup("SDK terminal SQL and original cancellations", failures)
+        if type(outcome) is not RequiredSQLReturned or not sql.complete:
+            raise AuditIntegrityError("SDK terminal lost its completed required SQL outcome")
+        verified = outcome.value
+        if (
+            type(verified) is not VerifiedSdkTerminal
+            or verified.source != admission.hold
+            or verified.provider_attempt_id != admission.attempt.attempt_id
+            or verified.hold_state != "consumed"
+        ):
+            raise AuditIntegrityError("SDK terminal changed its cold-proved original hold")
+        deferred: list[asyncio.CancelledError] = []
+        original_cancel = (
+            (observation.original,) if preserve_sdk_cancellation and isinstance(observation.original, asyncio.CancelledError) else ()
+        )
+        for cancellation in (*original_cancel, *outcome.deferred_cancellations, *cancellations):
+            if all(cancellation is not prior for prior in deferred):
+                deferred.append(cancellation)
+        result = V4SdkFinalization(verified, tuple(deferred))
+        self.v4_sdk_terminal_result = result
+        forget_v4_sdk_failure(observation, custody=self)
+        self.attempt = None
+        self.call = None
+        self._sdk_entered = False
+        projection.begin_projection()
+        projection.complete_owned()
+        return result
+
+    def has_v4_sdk_return(self) -> bool:
+        return self._v4_sdk_return is not None
 
     def note_v4_sdk_returned(self, response: object) -> None:
         from elspeth.web.composer.provider_result_admission import V4ProviderSdkReturn

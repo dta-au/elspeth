@@ -25,6 +25,7 @@ from elspeth.web.sessions.continuation_p4 import (
     planned_p4_chat_hash,
     planned_p4_rejection_hash,
     planned_p4_state_hash,
+    prepare_issued_preview_p4_result_tail,
     prepare_p4_on_connection,
     prepare_p4_preparation_tail,
     prepare_p4_receipt_data,
@@ -166,7 +167,13 @@ def _retain_value_batch_tail_on_connection(
         ),
         env_ref_names=names,
     )
-    result = prepare_p4_result_tail(selected=p4_selected, receipt=receipt, published_at=published_at, env_ref_names=names)
+    result = (
+        prepare_p4_result_tail(selected=p4_selected, receipt=receipt, published_at=published_at, env_ref_names=names)
+        if issued_preview is None
+        else prepare_issued_preview_p4_result_tail(
+            selected=p4_selected, receipt=receipt, publication=publication, published_at=published_at, env_ref_names=names
+        )
+    )
     result_selected = _future(result.append, p4_selected, (result.chunk,))
     compose = result_selected.stack.frames[0]
     if type(compose) is not ComposeFrame:

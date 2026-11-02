@@ -916,7 +916,7 @@ def admit_v4_primary_provider_on_connection(
         raise TypeError("V4 PRIMARY admission requires actual sessions service and prepared source")
     if type(no_sdk_issuer) is not PrimaryNoSdkIssuer or no_sdk_issuer.prepared_candidate is not prepared:
         raise AuditIntegrityError("V4 PRIMARY admission changed its original no-SDK issuer")
-    no_sdk_issuer.clock.require_preparation_time()
+    no_sdk_issuer.clock.require_active_quota_time()
     binding, current = prepared.binding, prepared.snapshot
     running = binding.running
     _require_current_continuation_running(conn, running)
@@ -1085,7 +1085,7 @@ def admit_v4_primary_provider_on_connection(
     )
     if stored != admitted:
         raise AuditIntegrityError("V4 PRIMARY dispatch changed its reserved complete snapshot")
-    no_sdk_issuer.clock.require_preparation_time()
+    no_sdk_issuer.clock.require_active_quota_time()
     no_sdk_issuer.note_dispatched_candidate(admitted)
     return V4PrimaryProviderAdmission(attempt, admitted, hold, tail, no_sdk_tail, incomplete_tail)
 

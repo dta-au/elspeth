@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from pydantic import JsonValue, TypeAdapter
@@ -35,6 +37,9 @@ from elspeth.web.sessions._persist_payload import RedactedToolRow, RejectionReco
 from elspeth.web.sessions.content_publication import prepare_content_publication
 from elspeth.web.sessions.continuation_value_batch_transitions import PreparedValueBatchTransitions
 from elspeth.web.sessions.protocol import ChatMessageRecord, ChatMessageRole, CompositionStateData, CompositionStateRecord
+
+if TYPE_CHECKING:
+    from elspeth.web.required_work import RequiredPreviewProduced
 
 _REVOCATION = TypeAdapter(ComposerMutationRevocation)
 
@@ -99,6 +104,7 @@ class PreparedValueBatchPublication:
     retained_outcome: RetainedAuditOutcome
     retained_outcome_json: str
     message_payload_bytes: tuple[tuple[int, int, int], ...]
+    issued_preview: RequiredPreviewProduced | None = None
 
     def require_original(self) -> None:
         expected = plan_value_batch_publication(
@@ -113,20 +119,81 @@ class PreparedValueBatchPublication:
             state_ids=self.state_ids,
             rejection_ids=self.rejection_ids,
             env_ref_names=self.env_ref_names,
+            issued_preview=self.issued_preview,
         )
         if self != expected:
             raise AuditIntegrityError("value-batch publication differs from its original source")
 
 
 def _source(batch: PreparedValueBatch, env_ref_names: frozenset[str]) -> tuple[ValueBatchPublicationSource, PreparedP4Members]:
-    require_prepared_value_batch(batch)
-    if type(env_ref_names) is not frozenset or env_ref_names != batch.inventory.names:
-        raise AuditIntegrityError("value-batch publication changed its credential environment")
-    members = prepared_p4_members(batch.prepared, env_ref_names=env_ref_names)
+    members = _publication_members(batch, env_ref_names)
     frames = batch.selected.stack.frames
     top = frames[-1]
     if sum(type(frame) is ComposeFrame for frame in frames) != 1 or type(top) is not ToolBatchFrame or top.phase != "tool_ready":
         raise AuditIntegrityError("value-batch publication lost its one original Compose frame and ready batch")
+    return _source_identity(batch, members, top)
+
+
+def _publication_members(batch: PreparedValueBatch, env_ref_names: frozenset[str]) -> PreparedP4Members:
+    require_prepared_value_batch(batch)
+    if type(env_ref_names) is not frozenset or env_ref_names != batch.inventory.names:
+        raise AuditIntegrityError("value-batch publication changed its credential environment")
+    return prepared_p4_members(batch.prepared, env_ref_names=env_ref_names)
+
+
+def _issued_preview_source(
+    batch: PreparedValueBatch, env_ref_names: frozenset[str], produced: RequiredPreviewProduced
+) -> tuple[ValueBatchPublicationSource, PreparedP4Members]:
+    from elspeth.web.composer.continuation_value_batch_preparation import require_prepared_issued_preview_batch
+    from elspeth.web.sessions.continuation_preview_result import CompletePreviewReturn, preview_return_fields
+
+    require_prepared_issued_preview_batch(batch, produced)
+    if type(produced.returned) is not CompletePreviewReturn:
+        raise AuditIntegrityError("issued preview publication has no complete original returned result")
+    source, _result, _tolerant = preview_return_fields(produced.returned)
+    members = _publication_members(batch, env_ref_names)
+    root, calls = batch.selected.stack, batch.requested_calls
+    top = root.frames[-1]
+    if (
+        len(root.frames) != 2
+        or type(root.frames[0]) is not ComposeFrame
+        or type(top) is not ToolBatchFrame
+        or top.phase != "effect_reconciling"
+        or top.accumulator.codec != "composer.tool-batch.v1"
+        or top.next_tool_index != 0
+        or top.settled_effect_ids
+        or root.frames[0].pending_response != top.response
+        or root.frames[0].slice_sequence != source.sequence
+        or batch.inventory.running.claim.segment_sequence != source.sequence
+        or batch.inventory.running.claim.ownership_generation != source.generation
+        or batch.inventory.running.claim.attempt != source.claim_attempt
+        or root.pending_owner_results
+        or root.pending_settlement_ids
+        or root.active_action_json is not None
+        or root.active_action_source is not None
+        or root.logical.session_id != source.session_id
+        or root.logical.operation_id != source.operation_id
+        or root.policy_hash != source.policy_sha256
+        or root.cursor != source.cursor + 1
+        or batch.selected.checkpoint_id == source.checkpoint_id
+        or top.response != source.response
+        or len(calls) != 1
+        or calls[0].function.name != "preview_pipeline"
+        or calls[0].id != source.tool_call_id
+        or sha256(calls[0].function.arguments.encode("utf-8")).hexdigest() != source.raw_arguments_sha256
+        or batch.prepared.creator_operation_id != source.creator_operation_id
+        or batch.prepared.creator_operation_epoch != source.creator_operation_epoch
+    ):
+        raise AuditIntegrityError("issued preview publication lost its original dispatched source")
+    frontier = tuple(item for item in root.effect_frontier if item.effect_id == f"tool:{source.response.digest}:0")
+    if len(frontier) != 1 or frontier[0].disposition != "dispatched" or frontier[0].receipt_id is not None:
+        raise AuditIntegrityError("issued preview publication lost its original dispatched effect")
+    return _source_identity(batch, members, top)
+
+
+def _source_identity(
+    batch: PreparedValueBatch, members: PreparedP4Members, top: ToolBatchFrame
+) -> tuple[ValueBatchPublicationSource, PreparedP4Members]:
     calls = members.redacted_calls
     ids = tuple(call["id"] for call in calls)
     if (
@@ -170,8 +237,9 @@ def value_batch_publication_shape(
     *,
     locked_refusal: ComposerMutationRevocation | None,
     env_ref_names: frozenset[str],
+    issued_preview: RequiredPreviewProduced | None = None,
 ) -> ValueBatchPublicationShape:
-    _, members = _source(batch, env_ref_names)
+    _, members = _source(batch, env_ref_names) if issued_preview is None else _issued_preview_source(batch, env_ref_names, issued_preview)
     refusal = _selected_refusal(members, locked_refusal)
     return _shape(members, refusal)
 
@@ -209,8 +277,11 @@ def plan_value_batch_publication(
     state_ids: tuple[UUID, ...],
     env_ref_names: frozenset[str],
     rejection_ids: tuple[UUID, ...] = (),
+    issued_preview: RequiredPreviewProduced | None = None,
 ) -> PreparedValueBatchPublication:
-    source, members = _source(batch, env_ref_names)
+    source, members = (
+        _source(batch, env_ref_names) if issued_preview is None else _issued_preview_source(batch, env_ref_names, issued_preview)
+    )
     if (
         type(transitions) is not PreparedValueBatchTransitions
         or transitions.prepared is not batch
@@ -431,4 +502,5 @@ def plan_value_batch_publication(
         retained_outcome=outcome,
         retained_outcome_json=outcome_json,
         message_payload_bytes=tuple(_message_bytes(message) for message in messages),
+        issued_preview=issued_preview,
     )

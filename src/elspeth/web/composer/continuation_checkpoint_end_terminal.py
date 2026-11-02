@@ -17,6 +17,7 @@ from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
 
 if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_checkpoint_end_retry import VerifiedEndFormatRetry
     from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
 
 
@@ -79,9 +80,42 @@ class _EndCheckpointRepairContinuedControl(Exception):
         self.continued = continued
 
 
+@dataclass(frozen=True, slots=True)
+class EndCheckpointFormatRetryReady:
+    """The first paid END child closed; a later action must restore its retry gate."""
+
+    proof: VerifiedEndFormatRetry
+    completed: StoredContinuationSnapshot
+
+    def __post_init__(self) -> None:
+        from elspeth.web.sessions.continuation_checkpoint_end_retry import VerifiedEndFormatRetry
+
+        if (
+            type(self.proof) is not VerifiedEndFormatRetry
+            or type(self.completed) is not StoredContinuationSnapshot
+            or self.completed != self.proof.selected
+        ):
+            raise AuditIntegrityError("END format retry handoff changed its original current retained source")
+
+
+class _EndCheckpointFormatRetryReadyControl(Exception):
+    def __init__(self, ready: EndCheckpointFormatRetryReady) -> None:
+        if type(ready) is not EndCheckpointFormatRetryReady:
+            raise TypeError("END format retry control requires its nominal retained source")
+        super().__init__("format_retry_ready")
+        self.ready = ready
+
+
 async def observe_end_checkpoint_terminal[T](
     execution: Awaitable[T],
-) -> T | EndCheckpointPaidIncompleteTerminal | EndCheckpointDisposition | EndCheckpointCompleteReview | EndCheckpointRepairContinued:
+) -> (
+    T
+    | EndCheckpointPaidIncompleteTerminal
+    | EndCheckpointDisposition
+    | EndCheckpointCompleteReview
+    | EndCheckpointRepairContinued
+    | EndCheckpointFormatRetryReady
+):
     """Stop before the original END caller's effectful continuation tail."""
     try:
         return await execution
@@ -93,3 +127,5 @@ async def observe_end_checkpoint_terminal[T](
         return control.completed
     except _EndCheckpointRepairContinuedControl as control:
         return control.continued
+    except _EndCheckpointFormatRetryReadyControl as control:
+        return control.ready

@@ -65,6 +65,7 @@ if TYPE_CHECKING:
         StoredTerminalP4Application,
         StoredTerminalP4Preparation,
     )
+    from elspeth.web.sessions.continuation_value_batch_publication import PreparedValueBatchPublication
 from elspeth.web.sessions.chat_message_decoder import chat_message_record_from_row
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
@@ -130,7 +131,8 @@ class PreparedP4ResultData:
 
     receipt: PersistedComposerTurnReceipt
     outcome: RetainedAuditOutcome
-    historical_effect: HistoricalEffectLocator
+    historical_effect: HistoricalEffectLocator | None
+    preview_publication: PreparedValueBatchPublication | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -838,6 +840,146 @@ def prepare_p4_result_tail(
         or receipt.authored_state_hash is None
     ):
         raise AuditIntegrityError("prepared P4 result requires its ordinary successful publication")
+    locator = HistoricalEffectLocator(
+        receipt.effect_key,
+        receipt.input_sha256,
+        receipt.creator_operation_id,
+        str(receipt.assistant_id),
+        receipt.inserted_state_ids,
+        receipt.authored_state_hash,
+    )
+    return _prepare_p4_result_tail_values(
+        selected=selected,
+        receipt=receipt,
+        published_at=published_at,
+        env_ref_names=env_ref_names,
+        historical_effect=locator,
+        preview_publication=None,
+    )
+
+
+def require_prepared_issued_preview_p4_result(result: PreparedP4ResultData, *, env_ref_names: frozenset[str]) -> None:
+    """Prove nongraph prospective DATA from the original issued publication.
+
+    The live source seal is required here. Cold readers instead prove the
+    actual committed receipt, input and immutable rows; they never recreate
+    this prospective publication or its process-local permit.
+    """
+    from elspeth.web.sessions.continuation_value_batch_publication import PreparedValueBatchPublication
+
+    if type(result) is not PreparedP4ResultData:
+        raise TypeError("preview P4 source requires its nominal prospective result DATA")
+    publication = result.preview_publication
+    if (
+        type(publication) is not PreparedValueBatchPublication
+        or publication.issued_preview is None
+        or result.historical_effect is not None
+        or env_ref_names != publication.env_ref_names
+    ):
+        raise AuditIntegrityError("prepared nongraph P4 requires its original issued preview publication")
+    publication.require_original()
+    if (
+        publication.states
+        or publication.state_inputs
+        or result.outcome != publication.retained_outcome
+        or result.outcome.checkpoint_disposition not in ("empty", "no_new_checkpoint")
+        or result.outcome.checkpoint is not None
+        or result.receipt.authored_state_hash is not None
+        or result.receipt.inserted_state_ids
+        or result.receipt.state_row_hashes
+        or result.receipt.assistant_id is None
+    ):
+        raise AuditIntegrityError("prepared preview P4 invented an authored checkpoint or changed its original publication")
+    top = publication.batch.selected.stack.frames[-1]
+    if type(top) is not ToolBatchFrame:
+        raise AuditIntegrityError("prepared preview P4 lost its original issued batch")
+    ordered_rejections = tuple(sorted(publication.rejections, key=lambda rejection: str(rejection.id)))
+    expected = prepare_p4_receipt_data(
+        effect_key=f"batch:{top.response.digest}:p4",
+        input_sha256=stable_hash(_read_json_value(p4_semantic_input(publication.batch.prepared, env_ref_names=env_ref_names))),
+        prepared=publication.batch.prepared,
+        outcome=publication.retained_outcome,
+        chat_message_ids=tuple(message.id for message in publication.messages),
+        chat_message_hashes=tuple(planned_p4_chat_hash(message) for message in publication.messages),
+        state_row_hashes=(),
+        rejection_ids=tuple(str(rejection.id) for rejection in ordered_rejections),
+        rejection_hashes=tuple(
+            planned_p4_rejection_hash(
+                rejection_id=str(rejection.id),
+                session_id=publication.source_identity.session_id,
+                composition_state_id=rejection.composition_state_id,
+                tool_call_id=rejection.record.tool_call_id,
+                tool_name=rejection.record.tool_name,
+                error_code=rejection.record.error_code,
+                message=rejection.record.message,
+                planner_payload=rejection.record.planner_payload,
+                created_at=rejection.created_at,
+            )
+            for rejection in ordered_rejections
+        ),
+        env_ref_names=env_ref_names,
+    )
+    if result.receipt != expected:
+        raise AuditIntegrityError("prepared preview P4 changed its exact original receipt/input/row cohort")
+
+
+def prepare_issued_preview_p4_result_tail(
+    *,
+    selected: SelectedContinuationState,
+    receipt: PersistedComposerTurnReceipt,
+    publication: PreparedValueBatchPublication,
+    published_at: datetime,
+    env_ref_names: frozenset[str],
+) -> PreparedP4ResultTail:
+    """Plan only the actual issued preview's complete nongraph P4 result."""
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+
+    if type(selected) is not SelectedContinuationState or type(receipt) is not PersistedComposerTurnReceipt:
+        raise TypeError("preview P4 result preparation requires its complete prospective selection")
+    selected.__post_init__()
+    encoded = _dump_owned(_RECEIPT, receipt)
+    checked, outcome = decode_p4_receipt(encoded, env_ref_names=env_ref_names)
+    result = PreparedP4ResultData(checked, outcome, None, publication)
+    require_prepared_issued_preview_p4_result(result, env_ref_names=env_ref_names)
+    root, original = selected.stack, publication.batch.selected.stack
+    frame = root.frames[-1]
+    if (
+        type(frame) is not ToolBatchFrame
+        or frame.phase != "effect_reconciling"
+        or root.active_action_json is not None
+        or root.active_action_source is not None
+        or root.pending_owner_results
+        or root.logical != original.logical
+        or root.policy_hash != original.policy_hash
+        or root.admission_policy_json != original.admission_policy_json
+        or root.mutation_ceiling != original.mutation_ceiling
+        or root.provider_cost_policy != original.provider_cost_policy
+        or root.cursor <= original.cursor
+        or receipt.effect_key != f"batch:{frame.response.digest}:p4"
+    ):
+        raise AuditIntegrityError("prepared preview P4 lost its original prospective result cut")
+    return _prepare_p4_result_tail_values(
+        selected=selected,
+        receipt=receipt,
+        published_at=published_at,
+        env_ref_names=env_ref_names,
+        historical_effect=None,
+        preview_publication=publication,
+    )
+
+
+def _prepare_p4_result_tail_values(
+    *,
+    selected: SelectedContinuationState,
+    receipt: PersistedComposerTurnReceipt,
+    published_at: datetime,
+    env_ref_names: frozenset[str],
+    historical_effect: HistoricalEffectLocator | None,
+    preview_publication: PreparedValueBatchPublication | None,
+) -> PreparedP4ResultTail:
+    root, frame = selected.stack, selected.stack.frames[-1]
+    if type(frame) is not ToolBatchFrame:
+        raise AuditIntegrityError("prepared P4 result lost its original tool frame")
     encoded = _dump_owned(_RECEIPT, receipt)
     checked_receipt, outcome = decode_p4_receipt(encoded, env_ref_names=env_ref_names)
     pending = tuple(chunk for chunk in selected.chunks if chunk.reference == frame.accumulator)
@@ -853,15 +995,7 @@ def prepare_p4_result_tail(
     ):
         raise AuditIntegrityError("prepared P4 result changed its original complete input/effect")
     chunk = encode_private_chunk(codec="composer.owner-result.v1", canonical=encoded, env_ref_names=env_ref_names)
-    locator = HistoricalEffectLocator(
-        receipt.effect_key,
-        receipt.input_sha256,
-        receipt.creator_operation_id,
-        str(receipt.assistant_id),
-        receipt.inserted_state_ids,
-        receipt.authored_state_hash,
-    )
-    result = PreparedP4ResultData(checked_receipt, outcome, locator)
+    result = PreparedP4ResultData(checked_receipt, outcome, historical_effect, preview_publication)
     following = root.model_copy(
         update={
             "pending_owner_results": (

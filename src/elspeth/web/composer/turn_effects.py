@@ -462,10 +462,13 @@ class TurnEvidence:
 
     @property
     def identity(self) -> str:
+        return self._identity_for_operation_id(self.operation_id)
+
+    def _identity_for_operation_id(self, operation_id: str | None) -> str:
         identity = stable_hash(
             {
                 "session_id": self.session_id,
-                "operation_id": self.operation_id,
+                "operation_id": operation_id,
                 "request_id": self.request_id,
                 "request_hash": self.request_hash,
                 "initial_state_id": self.effects.initial_state_id,
@@ -731,6 +734,39 @@ class TurnEvidence:
     def review_candidate(
         self, *, candidate: str, request: str, current_state: CompositionState, scope: DeliveryScope = "primary"
     ) -> AdvisorPublicationReview:
+        return self._review_candidate_for_operation_id(
+            operation_id=self.operation_id, candidate=candidate, request=request, current_state=current_state, scope=scope
+        )
+
+    def review_candidate_for_source_operation(
+        self,
+        *,
+        source_operation_id: str,
+        candidate: str,
+        request: str,
+        current_state: CompositionState,
+        scope: DeliveryScope = "primary",
+    ) -> AdvisorPublicationReview:
+        """Project original publication identity from current evidence without rebinding its claim.
+
+        The caller must supply a separately verified retained source operation ID.
+        This pure projection grants no current SQL or provider authority.
+        """
+        if type(source_operation_id) is not str or not source_operation_id:
+            raise AuditIntegrityError("Publication source operation ID is invalid")
+        return self._review_candidate_for_operation_id(
+            operation_id=source_operation_id, candidate=candidate, request=request, current_state=current_state, scope=scope
+        )
+
+    def _review_candidate_for_operation_id(
+        self,
+        *,
+        operation_id: str | None,
+        candidate: str,
+        request: str,
+        current_state: CompositionState,
+        scope: DeliveryScope,
+    ) -> AdvisorPublicationReview:
         if stable_hash(request) != self.request_hash:
             raise AuditIntegrityError("Publication candidate belongs to a different user request")
         if type(current_state) is not CompositionState or type(candidate) is not str:
@@ -883,7 +919,7 @@ class TurnEvidence:
                     for outcome in history["outcomes"]
                 ]
             }
-        evidence_identity = self.identity
+        evidence_identity = self._identity_for_operation_id(operation_id)
         if scope == "planner":
             evidence_identity = stable_hash(
                 {
@@ -907,7 +943,7 @@ class TurnEvidence:
         # still requires the exact binding above, including its physical call.
         semantic_repair_key = stable_hash(
             {
-                "request_scope": (self.session_id, self.operation_id, self.request_id, self.request_hash),
+                "request_scope": (self.session_id, operation_id, self.request_id, self.request_hash),
                 "candidate": candidate,
                 "request": request,
                 "current_graph": authored_state_hash(current_state),

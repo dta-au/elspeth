@@ -55,7 +55,12 @@ from elspeth.web.composer.continuation_tool_batch import _read_json_value
 from elspeth.web.composer.turn_effects import PersistedTurnEffects, TurnEvidence, authored_state_hash
 from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.sessions.continuation import HistoricalEffectLocator
-from elspeth.web.sessions.continuation_p4 import PreparedP4ResultData, ReadmittedP4Result, decode_p4_receipt
+from elspeth.web.sessions.continuation_p4 import (
+    PreparedP4ResultData,
+    ReadmittedP4Result,
+    decode_p4_receipt,
+    require_prepared_issued_preview_p4_result,
+)
 
 Verification = Literal["verified", "not_applicable", "authored_state_mismatch", "checkpoint_decode_or_compare_failed"]
 
@@ -225,9 +230,14 @@ def _checked_prepared_result(
     if (
         type(result) is not PreparedP4ResultData
         or type(result_chunk) is not PrivateChunk
-        or type(result.historical_effect) is not HistoricalEffectLocator
         or result_chunk.reference.codec != "composer.owner-result.v1"
     ):
+        raise TypeError("prepared application requires its separate prospective result DATA")
+    if result.preview_publication is not None:
+        require_prepared_issued_preview_p4_result(result, env_ref_names=env_ref_names)
+        _checked_result_values(result_chunk, result, producer, env_ref_names=env_ref_names)
+        return
+    if type(result.historical_effect) is not HistoricalEffectLocator:
         raise TypeError("prepared application requires its separate prospective result DATA")
     _checked_result_values(result_chunk, result, producer, env_ref_names=env_ref_names)
     receipt, locator = result.receipt, result.historical_effect

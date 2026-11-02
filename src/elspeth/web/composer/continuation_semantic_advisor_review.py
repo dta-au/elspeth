@@ -20,6 +20,7 @@ from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
 )
 from elspeth.web.composer.continuation_checkpoint_end_terminal import (
     EndCheckpointCompleteReview,
+    EndCheckpointFormatRetryReady,
     EndCheckpointPaidIncompleteTerminal,
     EndCheckpointRepairContinued,
 )
@@ -131,6 +132,11 @@ async def review_prescribed_continuation_end(
     if candidate is None or admitted.action_key is None:
         raise AuditIntegrityError("prescribed Review lost its original paid END candidate")
     execution = await execute_continuation_end_review(phases, selected)
+    if type(execution) is EndCheckpointFormatRetryReady:
+        if execution.completed.cursor <= selected.stack.cursor:
+            raise AuditIntegrityError("prescribed Review format retry lost its committed successor")
+        phases.latest_snapshot = execution.completed
+        return None
     if type(execution) is EndCheckpointCompleteReview:
         if execution.review.original_source != source or execution.review.completed.cursor <= selected.stack.cursor:
             raise AuditIntegrityError("prescribed Review lost its exact retained paid END action")

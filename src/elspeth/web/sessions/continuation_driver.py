@@ -94,7 +94,12 @@ from elspeth.web.sessions.continuation import (
     ComposerSegmentYieldReceipt,
     StoredContinuationSnapshot,
     V3UnboundedTailRefusal,
+    _require_current_continuation_running,
     read_v3_retained_tail_refusal_on_connection,
+)
+from elspeth.web.sessions.continuation_checkpoint_end_retry import (
+    VerifiedEndFormatRetry,
+    read_retry_ready_action_source_on_connection,
 )
 from elspeth.web.sessions.continuation_checkpoint_no_sdk_terminal import (
     VerifiedCheckpointNoSdkTerminal,
@@ -144,7 +149,9 @@ from elspeth.web.sessions.continuation_primary_paid_overflow_terminal import (
     VerifiedPrimaryPaidOverflowTerminal,
     read_v4_primary_paid_overflow_terminal_on_connection,
 )
+from elspeth.web.sessions.continuation_primary_sdk_terminal import read_v4_primary_sdk_terminal_verified_on_connection
 from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
+from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal, VerifiedSdkTerminal
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_terminal import read_v4_semantic_paid_incomplete_terminal_on_connection
 from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import (
     VerifiedSemanticPaidOverflowTerminal,
@@ -204,6 +211,11 @@ class _TitleNoSdkResult:
     deferred_cancellations: tuple[asyncio.CancelledError, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _EndRetryReadyRead:
+    proof: VerifiedEndFormatRetry | None
+
+
 type ContinuationSegmentOutcome = ContinuationSegmentYielded | ContinuationSegmentHandedOver | ContinuationSegmentSettled
 type _ActionResult = (
     ComposerOperationRecord
@@ -222,6 +234,7 @@ type _ActionResult = (
     | PrimaryNoSdkRefusalReceipt
     | PrimaryPaidOverflowTerminal
     | PrimaryPaidIncompleteTerminal
+    | PrimarySdkTerminal
     | SemanticAdvisorNoSdkTerminal
     | V3UnboundedTailRefusal
     | ToolNoExecutionRefusal
@@ -978,7 +991,13 @@ class _SegmentDriver:
             )
             if isinstance(
                 primary_result,
-                (PrimaryNoSdkRefusalReceipt, PrimaryPaidOverflowTerminal, PrimaryPaidIncompleteTerminal, V3UnboundedTailRefusal),
+                (
+                    PrimaryNoSdkRefusalReceipt,
+                    PrimaryPaidOverflowTerminal,
+                    PrimaryPaidIncompleteTerminal,
+                    PrimarySdkTerminal,
+                    V3UnboundedTailRefusal,
+                ),
             ):
                 return primary_result
             if delivery is not None:
@@ -1022,6 +1041,53 @@ class _SegmentDriver:
 
                 await resume_first_cold_end_repair(phases=self.phases, selected=selected)
                 return None
+            if type(self.sql_deadline.policy) is ContinuationAdmissionPolicyV4:
+                from elspeth.web.composer.continuation_checkpoint_end_format_retry import restore_checkpoint_end_format_retry_source
+                from elspeth.web.composer.continuation_checkpoint_end_live import run_v4_checkpoint_end_live
+                from elspeth.web.composer.continuation_checkpoint_end_terminal import (
+                    EndCheckpointCompleteReview,
+                    EndCheckpointFormatRetryReady,
+                    EndCheckpointRepairContinued,
+                    observe_end_checkpoint_terminal,
+                )
+                from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+                from elspeth.web.composer.provider_quota import composer_quota_scope
+
+                retry = await restore_checkpoint_end_format_retry_source(phases=self.phases, selected=selected)
+                if retry is not None:
+                    bindings = retry.phase_owner.runtime.bindings
+                    context = bindings.session_operation_context
+                    if context is None:
+                        raise AuditIntegrityError("END retry lost its original current operation context")
+                    with composer_quota_scope(self.service._require_sessions_service(), context), prompt_guard_user_scope(bindings.message):
+                        outcome = await observe_end_checkpoint_terminal(
+                            run_v4_checkpoint_end_live(
+                                advisor=self.service._advisor_checkpoint,
+                                phase_owner=retry.phase_owner,
+                                gate_locals=retry.gate_locals,
+                                deadline=bindings.deadline,
+                                format_retry=retry,
+                            )
+                        )
+                    if type(outcome) is EndCheckpointCompleteReview:
+                        self.phases.latest_snapshot = outcome.review.completed
+                        return None
+                    if type(outcome) is EndCheckpointRepairContinued:
+                        self.phases.latest_snapshot = outcome.completed
+                        return None
+                    if type(outcome) is EndCheckpointFormatRetryReady:
+                        raise AuditIntegrityError("END retry cannot issue a third physical action")
+                    if isinstance(
+                        outcome,
+                        (
+                            EndCheckpointPaidIncompleteTerminal,
+                            EndCheckpointPaidOverflowTerminal,
+                            EndCheckpointNoSdkTerminal,
+                            EndCheckpointUnboundRefusalTerminal,
+                        ),
+                    ):
+                        return outcome
+                    raise AuditIntegrityError("END retry returned an unfamiliar committed consequence")
             if root.active_action_json is not None:
                 return await review_prescribed_continuation_end(self.phases, self.services, selected)
             if is_consumed_semantic_stop_cut(selected):
@@ -1060,6 +1126,30 @@ class _SegmentDriver:
         if intent is not None and type(intent) is not StoredContinuationControlIntent:
             raise AuditIntegrityError("model yield lost its actual durable intent DATA")
         return intent
+
+    async def end_retry_ready(
+        self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState
+    ) -> VerifiedEndFormatRetry | None:
+        if (
+            type(self.sql_deadline.policy) is not ContinuationAdmissionPolicyV4
+            or type(selected.stack.frames[-1]) is not EndFrame
+            or selected.stack.pending_settlement_ids
+        ):
+            return None
+
+        def read() -> _EndRetryReadyRead:
+            with session_data_read_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                _require_current_continuation_running(conn, self.running)
+                return _EndRetryReadyRead(
+                    read_retry_ready_action_source_on_connection(
+                        conn, session_id=str(self.running.claim.session_id), operation_id=self.running.claim.operation_id, selected=stored
+                    )
+                )
+
+        observed = await _registered(
+            work=self.work, source=RequiredWorkSource.CONTINUATION_READ_SQL, operation=read, expected=_EndRetryReadyRead
+        )
+        return observed.proof
 
     async def iteration_stage(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> IterationStageData | None:
         if not is_applied_batch_cut(selected):
@@ -1240,6 +1330,7 @@ class _SegmentDriver:
             # observation and actual stage writer admission. Each paid stage
             # returns here before the next original scalar action begins.
             self._iteration_stage = await self.iteration_stage(stored, selected)
+            retry_ready = await self.end_retry_ready(stored, selected)
             started_read = time.monotonic()
             timing = await _registered(
                 work=self.work,
@@ -1251,7 +1342,7 @@ class _SegmentDriver:
             if is_applied_batch_cut(selected):
                 action = iteration_stage_action_policy(selected=stored, stage=self._iteration_stage, policy=policy)
             else:
-                action = next_continuation_action_policy(selected=selected, policy=policy)
+                action = next_continuation_action_policy(selected=selected, policy=policy, retry_ready=retry_ready)
             hard_remaining = max(0.0, timing.hard_remaining_seconds - elapsed)
             cooperative_remaining = max(0.0, timing.cooperative_remaining_seconds - elapsed)
             if (
@@ -1867,6 +1958,47 @@ class _SegmentDriver:
                         result.verified.terminal.cursor,
                     ):
                         raise AuditIntegrityError("TITLE paid incomplete lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is PrimarySdkTerminal:
+                    primary_sdk_result = result
+
+                    def verify_sdk_terminal(expected_terminal: PrimarySdkTerminal = primary_sdk_result) -> VerifiedSdkTerminal:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_v4_primary_sdk_terminal_verified_on_connection(
+                                conn,
+                                session_id=self.running.claim.session_id,
+                                operation_id=self.running.claim.operation_id,
+                                effect_key=expected_terminal.receipt.identity.effect_key,
+                            )
+                        if (
+                            actual is None
+                            or actual.receipt != expected_terminal.receipt
+                            or actual.terminal != expected_terminal.snapshot
+                            or actual.provider_attempt_id != expected_terminal.receipt.identity.attempt_id
+                            or actual.hold_state != "consumed"
+                        ):
+                            raise AuditIntegrityError("PRIMARY SDK outcome lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_sdk_terminal,
+                        expected=VerifiedSdkTerminal,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.snapshot.checkpoint_id,
+                        result.snapshot.cursor,
+                    ):
+                        raise AuditIntegrityError("PRIMARY SDK outcome lost its actual committed failed terminal")
                     await self.worker._verify_terminal_before_release(
                         self.running,
                         self.lease,

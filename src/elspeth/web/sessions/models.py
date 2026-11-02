@@ -92,7 +92,9 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # Epoch 87 binds each H-preserving recovery edge to its exact original paid
 # END checkpoint without adding an unreserved continuation-journal append.
 # Epoch-86 stores are preserved and refused; there is no automatic migration.
-SESSION_SCHEMA_EPOCH = 87
+# Epoch 88 adds the distinct original-attempt SDK terminal disposition.
+# Preserve epoch-87 stores unchanged; no migration or reset is authorized.
+SESSION_SCHEMA_EPOCH = 88
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -4024,17 +4026,21 @@ composer_continuation_effects_table = Table(
         ["provider_attempt_id"], ["quota_provider_attempts.attempt_id"], name="fk_composer_effects_attempt", ondelete="RESTRICT"
     ),
     CheckConstraint(
-        "disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown', 'paid_overflow', 'paid_incomplete', 'validation_incomplete')",
+        "disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown', 'paid_overflow', 'paid_incomplete', 'validation_incomplete', 'sdk_terminal')",
         name="ck_composer_effects_disposition",
     ),
     CheckConstraint(_CONTINUATION_EFFECT_OWNER_CHECK, name="ck_composer_effects_owner"),
     CheckConstraint(
-        "disposition NOT IN ('committed', 'refused', 'paid_overflow', 'paid_incomplete', 'validation_incomplete') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
+        "disposition NOT IN ('committed', 'refused', 'paid_overflow', 'paid_incomplete', 'validation_incomplete', 'sdk_terminal') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
         name="ck_composer_effects_receipt",
     ),
     CheckConstraint(
         "disposition != 'paid_incomplete' OR (owner = 'provider' AND provider_attempt_id IS NOT NULL)",
         name="ck_composer_effects_paid_incomplete_original_attempt",
+    ),
+    CheckConstraint(
+        "disposition != 'sdk_terminal' OR (owner = 'provider' AND provider_attempt_id IS NOT NULL)",
+        name="ck_composer_effects_sdk_terminal_original_attempt",
     ),
     CheckConstraint(
         "disposition != 'validation_incomplete' OR (owner = 'tool_dispatch' AND provider_attempt_id IS NULL)",

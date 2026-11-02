@@ -622,6 +622,21 @@ async def try_admit_preview_tool(
                 await adopt_issued_preview_batch(prepared=prepared, permit=permit)
 
             def finish(actual: RequiredPreviewProduced) -> StoredContinuationSnapshot | PreviewValidationIncompleteTerminal:
+                # Capture retains its original fence/message reproofs, which
+                # open their own transactions. Complete that DATA planning in
+                # this same owned result job before the atomic result writer.
+                batch = (
+                    prepare_issued_preview_batch(
+                        owner,
+                        prepared=prepared,
+                        produced=actual,
+                        runtime=current,
+                        selected=current_selected,
+                        inventory=current_inventory,
+                    )
+                    if type(actual.returned) is CompletePreviewReturn
+                    else None
+                )
                 with (
                     locked_session_transaction(owner.authority._engine, source.session_id) as conn,
                     sessions._session_write_lock(conn, source.session_id),
@@ -632,14 +647,8 @@ async def try_admit_preview_tool(
                         )
                         value: StoredContinuationSnapshot | PreviewValidationIncompleteTerminal = terminal
                     else:
-                        batch = prepare_issued_preview_batch(
-                            owner,
-                            prepared=prepared,
-                            produced=actual,
-                            runtime=current,
-                            selected=current_selected,
-                            inventory=current_inventory,
-                        )
+                        if batch is None:
+                            raise AuditIntegrityError("preview disposition lost its complete original tail preparation")
                         value = retain_value_batch_tail_on_connection(
                             conn, inventory.running, service=sessions, batch=batch, published_at=datetime.now(UTC), issued_preview=actual
                         ).snapshot

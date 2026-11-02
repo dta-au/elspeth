@@ -19,7 +19,10 @@ from elspeth.web.composer.continuation import ComposeFrame, EndFrame
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, load_snapshot
-from elspeth.web.sessions.continuation_checkpoint_end_complete_action import require_original_end_outer_creator_on_connection
+from elspeth.web.sessions.continuation_checkpoint_end_complete_action import (
+    require_original_end_outer_creator_after_paid_overflow_on_connection,
+    require_original_end_outer_creator_on_connection,
+)
 from elspeth.web.sessions.continuation_checkpoint_end_owed import (
     VerifiedCheckpointEndOwed,
     _bounded_event_text,
@@ -298,7 +301,10 @@ def verify_end_h_recovery_receipt_on_connection(conn: Connection, receipt: Compo
         raise AuditIntegrityError("END H recovery changed its paid child disposition")
     if owed.selected.checkpoint_id != receipt.checkpoint_id or owed.selected.cursor != receipt.cursor:
         raise AuditIntegrityError("END H recovery substituted another complete paid response")
-    require_original_end_outer_creator_on_connection(conn, owed=owed)
+    if effect.disposition == "paid_overflow":
+        require_original_end_outer_creator_after_paid_overflow_on_connection(conn, owed=owed, names=names)
+    else:
+        require_original_end_outer_creator_on_connection(conn, owed=owed)
     history = conn.execute(
         select(attempts).where(
             attempts.c.session_id == sid,

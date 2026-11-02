@@ -29,10 +29,15 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import _require_current_continuation_running, retain_action_execution_receipt_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_owed import VerifiedCheckpointEndOwed
 from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
+from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
+    VerifiedCheckpointPaidOverflowTerminal,
+    read_v4_checkpoint_end_owed_overflow_terminal_on_connection,
+)
 from elspeth.web.sessions.continuation_selection import load_private_chunks
 from elspeth.web.sessions.continuation_semantic_actions import (
     SemanticActionAdmission,
     installed_action_json,
+    read_original_dispatched_semantic_review_after_end_overflow_on_connection,
     read_original_dispatched_semantic_review_on_connection,
 )
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -53,13 +58,70 @@ def require_original_end_outer_creator_on_connection(
     conn: Connection, *, owed: VerifiedCheckpointEndOwed
 ) -> tuple[int, int, SemanticActionAdmission | None]:
     """Bind the historical D effect/creator separately from the current writer."""
+    return _require_original_end_outer_creator_on_connection(conn, owed=owed, terminal=None, terminal_names=None)
+
+
+def require_original_end_outer_creator_after_paid_overflow_on_connection(
+    conn: Connection, *, owed: VerifiedCheckpointEndOwed, names: frozenset[str]
+) -> tuple[int, int, SemanticActionAdmission | None]:
+    """Prove original D after its outer effect became terminal-unknown."""
+    terminal = read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
+        conn,
+        session_id=UUID(owed.session_id),
+        operation_id=owed.operation_id,
+        effect_key=owed.effect_key,
+        names=names,
+    )
+    if (
+        type(terminal) is not VerifiedCheckpointPaidOverflowTerminal
+        or terminal.source != owed.new_hold
+        or terminal.provider_attempt_id != owed.attempt_id
+        or terminal.outer_effect_key != owed.outer_effect_key
+        or terminal.hold_state != "consumed"
+        or terminal.phase != "end"
+        or terminal.receipt.representation != "retained_tail"
+    ):
+        raise AuditIntegrityError("END outer creator lacks its exact paid-overflow terminal")
+    return _require_original_end_outer_creator_on_connection(conn, owed=owed, terminal=terminal, terminal_names=names)
+
+
+def _require_original_end_outer_creator_on_connection(
+    conn: Connection,
+    *,
+    owed: VerifiedCheckpointEndOwed,
+    terminal: VerifiedCheckpointPaidOverflowTerminal | None,
+    terminal_names: frozenset[str] | None,
+) -> tuple[int, int, SemanticActionAdmission | None]:
+    """Reprove immutable D lineage and its exact live or terminal SQL effect."""
     if type(owed) is not VerifiedCheckpointEndOwed or owed.phase_source is None or owed.prepared_selected is None or owed.end_input is None:
         raise AuditIntegrityError("END outer creator lacks its original semantic dispatch D")
     sid, operation = owed.session_id, owed.operation_id
-    original = decode_continuation_snapshot(owed.phase_source.payload_json)
-    prepared = decode_continuation_snapshot(owed.prepared_selected.payload_json)
-    dispatched = decode_continuation_snapshot(owed.original_selected.payload_json)
-    retained = decode_continuation_snapshot(owed.selected.payload_json)
+    original_owed = owed.retry_history.owed if owed.retry_history is not None else owed
+    if (
+        original_owed.phase_source is None
+        or original_owed.prepared_selected is None
+        or original_owed.end_input is None
+        or original_owed.retry_ordinal != 0
+        or original_owed.retry_history is not None
+        or (owed.retry_history is None and owed.retry_ordinal != 0)
+        or (
+            owed.retry_history is not None
+            and (
+                owed.retry_ordinal != 1
+                or original_owed.selected.checkpoint_id != owed.retry_history.marker.owed_checkpoint_id
+                or original_owed.selected.cursor != owed.retry_history.marker.owed_cursor
+            )
+        )
+        or original_owed.phase_source != owed.phase_source
+        or original_owed.outer_effect_key != owed.outer_effect_key
+        or original_owed.session_id != sid
+        or original_owed.operation_id != operation
+    ):
+        raise AuditIntegrityError("END outer creator lost its original first paid source")
+    original = decode_continuation_snapshot(original_owed.phase_source.payload_json)
+    prepared = decode_continuation_snapshot(original_owed.prepared_selected.payload_json)
+    dispatched = decode_continuation_snapshot(original_owed.original_selected.payload_json)
+    retained = decode_continuation_snapshot(original_owed.selected.payload_json)
     outer_entries = tuple(item for item in original.effect_frontier if item.effect_id == owed.outer_effect_key)
     if (
         len(original.frames) != 2
@@ -70,7 +132,7 @@ def require_original_end_outer_creator_on_connection(
         or prepared.model_copy(update={"frames": original.frames, "cursor": original.cursor}) != original
         or prepared.frames != dispatched.frames
         or dispatched.frames != retained.frames
-        or owed.end_input.original_checkpoint_id != owed.phase_source.checkpoint_id
+        or original_owed.end_input.original_checkpoint_id != original_owed.phase_source.checkpoint_id
         or len(outer_entries) != 1
         or outer_entries[0].disposition != "dispatched"
         or outer_entries[0].receipt_id is not None
@@ -98,13 +160,26 @@ def require_original_end_outer_creator_on_connection(
         ):
             raise AuditIntegrityError("END outer creator changed its original paid PRIMARY identity")
     else:
-        admission = read_original_dispatched_semantic_review_on_connection(
-            conn,
-            session_id=UUID(sid),
-            operation_id=operation,
-            dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
-            semantic_effect_key=owed.outer_effect_key,
-        )
+        if terminal is None:
+            admission = read_original_dispatched_semantic_review_on_connection(
+                conn,
+                session_id=UUID(sid),
+                operation_id=operation,
+                dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
+                semantic_effect_key=owed.outer_effect_key,
+            )
+        else:
+            if terminal_names is None:
+                raise AuditIntegrityError("END outer creator lost its terminal credential inventory")
+            admission = read_original_dispatched_semantic_review_after_end_overflow_on_connection(
+                conn,
+                session_id=UUID(sid),
+                operation_id=operation,
+                dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
+                semantic_effect_key=owed.outer_effect_key,
+                names=terminal_names,
+                terminal=terminal,
+            )
         if admission.owner_effect_key != owed.outer_effect_key or installed_action_json(admission) != original.active_action_json:
             raise AuditIntegrityError("END outer creator changed its original paid semantic Review")
     effect = conn.execute(
@@ -116,7 +191,7 @@ def require_original_end_outer_creator_on_connection(
     if (
         effect is None
         or effect.owner != "composer_end"
-        or effect.disposition != "dispatched"
+        or effect.disposition != ("unknown" if terminal is not None else "dispatched")
         or effect.input_sha256 != expected_input
         or effect.action_json != original.active_action_json
         or effect.receipt_key is not None

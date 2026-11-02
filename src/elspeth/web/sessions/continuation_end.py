@@ -31,6 +31,7 @@ from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
 )
 from elspeth.web.composer.continuation_checkpoint_end_terminal import (
     EndCheckpointCompleteReview,
+    EndCheckpointFormatRetryReady,
     EndCheckpointPaidIncompleteTerminal,
     EndCheckpointRepairContinued,
     observe_end_checkpoint_terminal,
@@ -186,6 +187,11 @@ async def review_continuation_end(
     if selected.stack.active_action_json is not None:
         raise AuditIntegrityError("prescribed END review requires its owned action consumer")
     execution = await execute_continuation_end_review(phases, selected)
+    if type(execution) is EndCheckpointFormatRetryReady:
+        if execution.completed.cursor <= selected.stack.cursor:
+            raise AuditIntegrityError("END format retry lost its committed successor")
+        phases.latest_snapshot = execution.completed
+        return None
     if isinstance(
         execution,
         (
@@ -210,6 +216,7 @@ async def execute_continuation_end_review(
     | EndReviewContinued
     | EndCheckpointCompleteReview
     | EndCheckpointRepairContinued
+    | EndCheckpointFormatRetryReady
     | EndCheckpointPaidIncompleteTerminal
     | EndCheckpointPaidOverflowTerminal
     | EndCheckpointNoSdkTerminal
@@ -304,6 +311,7 @@ async def execute_continuation_end_review(
             EndCheckpointPaidIncompleteTerminal,
             EndCheckpointCompleteReview,
             EndCheckpointRepairContinued,
+            EndCheckpointFormatRetryReady,
             EndCheckpointPaidOverflowTerminal,
             EndCheckpointNoSdkTerminal,
             EndCheckpointUnboundRefusalTerminal,

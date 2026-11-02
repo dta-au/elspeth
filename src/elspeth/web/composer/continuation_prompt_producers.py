@@ -1125,6 +1125,7 @@ class CurrentContinuationMessageProducers:
             type(message) is not dict
             or tool_call.function.name != "preview_pipeline"
             or outcome.response != admitted.to_tool_result()
+            or type(message["content"]) is not str
             or message["content"] != serialized
             or invocation.private_authoring is not authoring
             or any(item.message is message for item in self._feedback_produced)
@@ -1136,7 +1137,7 @@ class CurrentContinuationMessageProducers:
             tool_index=prepared.call.index,
             call=tool_call,
             result=admitted,
-            serialized=serialized,
+            serialized=message["content"],
             message=message,
         )
         registered = tuple((actual_recipe, wire) for actual, actual_recipe, wire in self._produced if actual is message)

@@ -415,11 +415,13 @@ def build_prepared_issued_preview_batch(
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
 ) -> PreparedValueBatch:
-    """Pure full-tail DATA from the actual issued root and returned result.
+    """Capture full-tail DATA from the actual issued root and returned result.
 
     The physical result writer independently reproves the current source and
-    reserves every prefix before writing. This performs no resource read,
-    ordinary clock renewal, current SQL admission or user publication.
+    reserves every prefix before writing. Capture retains its original fence
+    and message-source SQL reproofs, so callers must finish it before opening
+    the result writer's transaction. It performs no new resource producer,
+    ordinary clock renewal or user publication.
     """
     from elspeth.web.composer.continuation_preview_dispatch import original_adopted_preview_result
 

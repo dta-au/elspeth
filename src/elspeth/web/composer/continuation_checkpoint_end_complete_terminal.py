@@ -26,7 +26,7 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
     require_original_checkpoint_end_physical_source,
 )
 from elspeth.web.composer.continuation_checkpoint_observation import CheckpointReturnedResponseObservation
-from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
+from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff, state_is_structurally_empty
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.interpretation_state import interpretation_sites
@@ -71,6 +71,22 @@ def _original_absent_preflight_is_qualified(state: CompositionState, *, initial_
         and bool(state.outputs)
         and not _state_contains_blob_ref(state)
         and state.validate().is_valid
+        and not interpretation_sites(state)
+    )
+
+
+def _original_blocked_absent_preflight_is_qualified(state: CompositionState, *, initial_version: int, last_preflight: object) -> bool:
+    """An unchanged empty candidate may be withheld without graph validation.
+
+    The shared preflight intentionally returns None for empty state. A blocked
+    Review retains that absence; it never treats the candidate as a valid graph
+    or grants the clean publication branch its stronger qualification.
+    """
+    return _original_absent_preflight_is_qualified(state, initial_version=initial_version, last_preflight=last_preflight) or (
+        last_preflight is None
+        and state.version == initial_version
+        and state_is_structurally_empty(state)
+        and not _state_contains_blob_ref(state)
         and not interpretation_sites(state)
     )
 
@@ -120,7 +136,7 @@ def project_end_complete_terminal(
             (
                 "original_absent_preflight",
                 gate.runtime_preflight is None
-                and not _original_absent_preflight_is_qualified(
+                and not _original_blocked_absent_preflight_is_qualified(
                     live.state, initial_version=gate.initial_version, last_preflight=live.last_runtime_preflight
                 ),
             ),

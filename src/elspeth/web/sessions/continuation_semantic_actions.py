@@ -83,6 +83,7 @@ from elspeth.web.sessions.models import composer_continuation_effects_table as e
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 
 if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_checkpoint_paid_terminal import VerifiedCheckpointPaidOverflowTerminal
     from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
 
 
@@ -998,6 +999,53 @@ def read_original_dispatched_semantic_review_on_connection(
     return _reprove_dispatched_review(conn, session_id, operation_id, selected, semantic_effect_key, current_running=None)
 
 
+def read_original_dispatched_semantic_review_after_end_overflow_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    dispatch_checkpoint_id: str,
+    semantic_effect_key: str,
+    names: frozenset[str],
+    terminal: VerifiedCheckpointPaidOverflowTerminal,
+) -> SemanticActionAdmission:
+    """Reprove Review's original D under an independently cold-verified terminal."""
+    from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
+        VerifiedCheckpointPaidOverflowTerminal,
+        read_v4_checkpoint_end_owed_overflow_terminal_on_connection,
+    )
+
+    if (
+        type(terminal) is not VerifiedCheckpointPaidOverflowTerminal
+        or type(names) is not frozenset
+        or terminal.source.session_id != str(session_id)
+        or terminal.source.operation_id != operation_id
+        or terminal.phase != "end"
+        or terminal.hold_state != "consumed"
+        or terminal.outer_effect_key != semantic_effect_key
+        or terminal.receipt.representation != "retained_tail"
+        or read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            effect_key=terminal.source.effect_key,
+            names=names,
+        )
+        != terminal
+    ):
+        raise AuditIntegrityError("semantic END historical Review lacks its exact paid-overflow terminal")
+    selected = _historical_snapshot(conn, str(session_id), operation_id, checkpoint_id=dispatch_checkpoint_id)
+    return _reprove_dispatched_review(
+        conn,
+        session_id,
+        operation_id,
+        selected,
+        semantic_effect_key,
+        current_running=None,
+        paid_overflow_terminal=terminal,
+    )
+
+
 def _reprove_dispatched_review(
     conn: Connection,
     session_id: UUID,
@@ -1006,6 +1054,7 @@ def _reprove_dispatched_review(
     effect_key: str,
     *,
     current_running: ComposerOperationRunning | None,
+    paid_overflow_terminal: VerifiedCheckpointPaidOverflowTerminal | None = None,
 ) -> SemanticActionAdmission:
     root = decode_continuation_snapshot(selected.payload_json)
     sid, operation = str(session_id), operation_id
@@ -1025,7 +1074,14 @@ def _reprove_dispatched_review(
     if (
         row is None
         or row.owner != "composer_end"
-        or row.disposition not in (("dispatched",) if current_running is not None else ("dispatched", "committed", "refused"))
+        or row.disposition
+        not in (
+            ("dispatched",)
+            if current_running is not None
+            else ("unknown",)
+            if paid_overflow_terminal is not None
+            else ("dispatched", "committed", "refused")
+        )
         or row.action_json != installed_action_json(admission)
         or row.input_sha256 != input_hash
         or row.provider_attempt_id is not None

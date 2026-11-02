@@ -24,6 +24,7 @@ from elspeth.web.composer.continuation_checkpoint_observation import (
     observe_v4_checkpoint_returned_response,
 )
 from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_runtime import (
@@ -52,6 +53,7 @@ class CheckpointEndPhysicalSource:
     prepared: CheckpointPreparedSource
     capture: _AdvisorInvocationCapture = field(repr=False)
     detached: RestoredContinuationRuntime = field(repr=False)
+    clock: ContinuationActionClock = field(repr=False)
 
 
 @dataclass(slots=True)
@@ -64,6 +66,8 @@ class _OriginalPhysicalSource:
     capture: _AdvisorInvocationCapture
     detached: RestoredContinuationRuntime
     detached_capture: CapturedContinuationRuntime
+    clock: ContinuationActionClock
+    prepared_request: PreparedCheckpointProvider | None = None
     custody: ProviderCallCustody | None = None
     issuer: CheckpointNoSdkIssuer | None = None
     unbound_refusal: ReferenceType[CheckpointUnboundRefusalPermit] | None = None
@@ -144,6 +148,7 @@ def require_original_checkpoint_end_physical_source(source: CheckpointEndPhysica
             (source.prepared, original.prepared),
             (source.capture, original.capture),
             (source.detached, original.detached),
+            (source.clock, original.clock),
         )
     ):
         raise AuditIntegrityError("END physical invocation lost its original source producer")
@@ -151,6 +156,40 @@ def require_original_checkpoint_end_physical_source(source: CheckpointEndPhysica
     chunk = require_original_checkpoint_end_input(source.end_input, phase_source=source.phase_owner.phase_source, captured=source.captured)
     if source.prepared.end_input_ref != chunk.reference:
         raise AuditIntegrityError("END physical source changed its retained gate input")
+
+
+def require_checkpoint_end_prepared_clock(prepared: PreparedCheckpointProvider) -> ContinuationActionClock:
+    """Reprove the original live request and driver clock before SDK admission."""
+    if type(prepared) is not PreparedCheckpointProvider:
+        raise AuditIntegrityError("END timing requires its original nominal prepared request")
+    if type(prepared.physical_source) is not ReferenceType:
+        raise AuditIntegrityError("END timing requires its original physical source reference")
+    source = prepared.physical_source()
+    if source is None:
+        raise AuditIntegrityError("END timing lost its original live physical source")
+    require_original_checkpoint_end_physical_source(source)
+    original = _issued[source]
+    phases = source.phase_owner.phases
+    clock = original.clock
+    if (
+        original.prepared_request is not prepared
+        or prepared.clock is not clock
+        or type(clock) is not ContinuationActionClock
+        or phases.action_clock is not clock
+        or prepared.running is not phases.work.running
+        or prepared.prepared_source is not source.prepared
+        or prepared.work.coordinator is not phases.work.coordinator
+        or prepared.composer is not phases.service
+        or prepared.authority is not phases.authority
+        or clock.policy != source.phase_owner.runtime.source.policy.actions.advisor
+    ):
+        raise AuditIntegrityError("END timing replaced its original request, phase owner or driver clock")
+    sql_deadline = phases.work.coordinator.sql_deadline_owner
+    if sql_deadline is not None:
+        if sql_deadline.running is not prepared.running:
+            raise AuditIntegrityError("END timing changed its original SQL owner")
+        sql_deadline.require_action_clock(clock)
+    return clock
 
 
 def require_checkpoint_end_detached_source(source: CheckpointEndPhysicalSource) -> None:
@@ -176,6 +215,14 @@ async def prepare_checkpoint_end_physical_source(
     sessions = phases.service._sessions_service
     if running is None or type(sessions) is not SessionServiceImpl:
         raise AuditIntegrityError("END source requires the original running session SQL owner")
+    clock = phases.action_clock
+    if type(clock) is not ContinuationActionClock or clock.policy != phase_owner.runtime.source.policy.actions.advisor:
+        raise AuditIntegrityError("END source lost its original driver action clock")
+    sql_deadline = phases.work.coordinator.sql_deadline_owner
+    if sql_deadline is not None:
+        if sql_deadline.running is not running:
+            raise AuditIntegrityError("END source changed its original SQL timing owner")
+        sql_deadline.require_action_clock(clock)
     captured = await capture_continuation_runtime_owners(
         phase_owner.runtime, selected=phase_owner.selected, inventory=phase_owner.inventory
     )
@@ -204,8 +251,10 @@ async def prepare_checkpoint_end_physical_source(
 
     detached, detached_capture = await restore_prepared_end_runtime(phase_owner=phase_owner, prepared=prepared, captured=captured)
     capture = _AdvisorInvocationCapture()
-    source = CheckpointEndPhysicalSource(phase_owner, gate_locals, captured, end_input, prepared, capture, detached)
-    _issued[source] = _OriginalPhysicalSource(phase_owner, gate_locals, captured, end_input, prepared, capture, detached, detached_capture)
+    source = CheckpointEndPhysicalSource(phase_owner, gate_locals, captured, end_input, prepared, capture, detached, clock)
+    _issued[source] = _OriginalPhysicalSource(
+        phase_owner, gate_locals, captured, end_input, prepared, capture, detached, detached_capture, clock
+    )
     _gate_sources[gate_locals] = ref(source)
     require_original_checkpoint_end_physical_source(source)
     return source
@@ -225,6 +274,7 @@ def bind_checkpoint_end_physical_request(
         or prepared_input.role != "advisor"
         or running is None
         or original.custody is not None
+        or original.prepared_request is not None
         or original.unbound_refusal is not None
         or not source.capture.claimed
         or custody.required_work.coordinator is not owner.phases.work.coordinator
@@ -244,8 +294,12 @@ def bind_checkpoint_end_physical_request(
         requested_model=prepared_input.model,
         env_ref_names=owner.runtime.env_ref_names,
         publication_binding=source.gate_locals.publication_review.binding,
+        clock=source.clock,
+        physical_source=ref(source),
     )
-    issuer = CheckpointNoSdkIssuer(prepared)
+    original.prepared_request = prepared
+    clock = require_checkpoint_end_prepared_clock(prepared)
+    issuer = CheckpointNoSdkIssuer(prepared, clock=clock)
     custody.bind_continuation_checkpoint_v4(prepared, issuer)
     original.custody, original.issuer = custody, issuer
 
@@ -270,6 +324,7 @@ def bind_checkpoint_end_physical_request(
         )
 
     custody.bind_v4_returned_incomplete_finalizer(finalize_incomplete)
+    clock.finish_preparation()
 
 
 def checkpoint_end_physical_custody(source: CheckpointEndPhysicalSource) -> ProviderCallCustody:

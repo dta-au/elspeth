@@ -55,8 +55,10 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # Published epoch-84 stores are preserved and refused unchanged.
 # Epoch 87 binds H-preserving recovery attempt edges to the original paid END
 # checkpoint. Epoch-86 stores are preserved and refused without migration.
+# Epoch 88 adds the original-attempt SDK terminal effect/receipt contract.
+# Epoch-87 stores are preserved and refused without migration or reset.
 # Incompatible stores require a separately reviewed compatibility disposition.
-_COORDINATION_HARD_CUT_EPOCH = 87
+_COORDINATION_HARD_CUT_EPOCH = 88
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "auth_session_families": "ix_auth_session_families_expires_at",
     "web_instances": "ix_web_instances_lease_expires_at",

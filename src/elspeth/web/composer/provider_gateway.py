@@ -58,11 +58,17 @@ from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
     V4PaidIncompleteCommitted,
+    V4SdkTerminalCommitted,
     provider_call_scope,
     quota_provider_calls,
     required_provider_audit_scope,
 )
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+from elspeth.web.composer.provider_sdk_observation import (
+    _observe_v4_sdk_await,
+    current_v4_sdk_failure,
+    failure_contains_original_sdk_observation,
+)
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.request_limits import DEFAULT_MAX_PREPARED_REQUEST_BYTES
 from elspeth.web.composer.state import CompositionState
@@ -573,6 +579,12 @@ async def _litellm_acompletion(
             raise AuditIntegrityError("Semantic timing cannot replace TITLE, PRIMARY or a different physical role")
         clock = provider_custody.continuation_semantic_clock
         timed_role = "ADVISOR"
+    checkpoint_clock = provider_custody.continuation_checkpoint_clock
+    if checkpoint_clock is not None:
+        if title is not None or clock is not None or prompt_guard_role != "advisor":
+            raise AuditIntegrityError("Checkpoint timing cannot replace another clock or physical role")
+        clock = checkpoint_clock
+        timed_role = "ADVISOR"
     if on_sdk_entry is not None and (clock is None or continuation_input_sha256 is None):
         raise AuditIntegrityError("SDK-entry progress requires an actual timed continuation PRIMARY")
     if prepared_input is None:
@@ -754,7 +766,11 @@ async def _litellm_acompletion(
         raise
     if clock is None:
         provider_custody.mark_sdk_entered()
-        response = await litellm.acompletion(**kwargs)
+        if provider_custody.requires_v4_original_result():
+            with _observe_v4_sdk_await(provider_custody):
+                response = await litellm.acompletion(**kwargs)
+        else:
+            response = await litellm.acompletion(**kwargs)
         provider_custody.note_v4_sdk_returned(response)
         return response
 
@@ -767,7 +783,11 @@ async def _litellm_acompletion(
             # The segment owner queues this without yielding or raising. It
             # must not delay or cancel an already-accountable physical call.
             on_sdk_entry()
-        response = await litellm.acompletion(**kwargs)
+        if provider_custody.requires_v4_original_result():
+            with _observe_v4_sdk_await(provider_custody):
+                response = await litellm.acompletion(**kwargs)
+        else:
+            response = await litellm.acompletion(**kwargs)
         provider_custody.note_v4_sdk_returned(response)
         return response
 
@@ -1735,6 +1755,24 @@ class ProviderGateway:
                     raise
                 finalization = await provider_custody.finalize_v4_returned_incomplete(incomplete)
                 raise V4PaidIncompleteCommitted(finalization) from None
+            except BaseException as failure:
+                observed = current_v4_sdk_failure(provider_custody)
+                if (
+                    observed is None
+                    or not provider_custody.has_v4_sdk_finalizer()
+                    or not failure_contains_original_sdk_observation(failure, observed)
+                ):
+                    raise
+                direct = failure is observed.original or (type(failure) is TimeoutError and failure.__cause__ is observed.original)
+                finalized = await provider_custody.finalize_v4_sdk_failure(
+                    observed, preserve_sdk_cancellation=isinstance(failure, asyncio.CancelledError)
+                )
+                control = V4SdkTerminalCommitted(finalized)
+                if not direct:
+                    # The terminal closes the original physical attempt, but
+                    # an owned audit/other companion remains an actual error.
+                    raise failure from control
+                raise control from failure
             if provider_custody.continuation_primary_v4 is not None:
                 await provider_custody.finalize_continuation_primary_v4(outcome)
             elif provider_custody.continuation_classifier_v4 is not None:

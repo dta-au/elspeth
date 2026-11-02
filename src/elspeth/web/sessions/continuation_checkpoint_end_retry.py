@@ -9,13 +9,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from hashlib import sha256
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+from weakref import WeakKeyDictionary
 
 from pydantic import ValidationError, model_validator
 from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX, canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
 from elspeth.web.composer.audit import llm_call_audit_envelope
@@ -28,6 +29,10 @@ from elspeth.web.composer.continuation import (
     ToolBatchFrame,
 )
 from elspeth.web.composer.continuation_audit_buffer import RECORDER_CODEC, decode_recorder_snapshot, validate_recorder_projection
+from elspeth.web.composer.continuation_capture_overflow import (
+    ContinuationCaptureOverflowWitness,
+    ContinuationMandatoryCaptureOverflow,
+)
 from elspeth.web.composer.continuation_checkpoint_observation import (
     CheckpointReturnedResponseObservation,
     original_v4_checkpoint_returned_audit_call,
@@ -85,9 +90,13 @@ from elspeth.web.sessions.continuation_selection import load_private_chunks
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
+from elspeth.web.sessions.models import composer_continuation_provider_ordinals_table as ordinals
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as ledger
 from elspeth.web.sessions.time_normalization import restore_utc
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import ColdCheckpointEndConsequenceSource
 
 
 class EndFormatRetryMarker(ContinuationValue):
@@ -131,6 +140,58 @@ class VerifiedEndFormatRetry:
     marker: EndFormatRetryMarker
     owed: VerifiedCheckpointEndOwed
     selected: StoredContinuationSnapshot
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class ColdProjectedEndFormatRetry:
+    source: ColdCheckpointEndConsequenceSource
+    prospective: tuple[ProspectiveContinuationChunk, ...]
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class ColdProjectedEndFormatRetryOverflow:
+    source: ColdCheckpointEndConsequenceSource
+    witness: ContinuationCaptureOverflowWitness
+
+
+_cold_projections: WeakKeyDictionary[ColdProjectedEndFormatRetry, tuple[object, ...]] = WeakKeyDictionary()
+_cold_overflows: WeakKeyDictionary[ColdProjectedEndFormatRetryOverflow, tuple[object, ...]] = WeakKeyDictionary()
+
+
+def require_original_cold_end_format_retry_projection(value: ColdProjectedEndFormatRetry) -> None:
+    from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import require_original_cold_checkpoint_end_source
+
+    original = _cold_projections.get(value) if type(value) is ColdProjectedEndFormatRetry else None
+    if original is None or value.source is not original[0] or value.prospective != original[1]:
+        raise AuditIntegrityError("cold END retry aggregate projection lost its original source")
+    require_original_cold_checkpoint_end_source(value.source)
+
+
+def require_original_cold_end_format_retry_overflow(
+    value: ColdProjectedEndFormatRetryOverflow,
+) -> ContinuationCaptureOverflowWitness:
+    from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import require_original_cold_checkpoint_end_source
+
+    original = _cold_overflows.get(value) if type(value) is ColdProjectedEndFormatRetryOverflow else None
+    if original is None or value.source is not original[0] or value.witness is not original[1]:
+        raise AuditIntegrityError("cold END retry capture overflow lost its original source")
+    require_original_cold_checkpoint_end_source(value.source)
+    return value.witness
+
+
+def issue_cold_end_format_retry_overflow(
+    source: ColdCheckpointEndConsequenceSource, error: AuditIntegrityError
+) -> ColdProjectedEndFormatRetryOverflow:
+    """Bind an actual recorder/evidence capture refusal to its issued cold H."""
+    from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import require_original_cold_checkpoint_end_source
+
+    require_original_cold_checkpoint_end_source(source)
+    cause = error.__cause__ if type(error) is AuditIntegrityError else None
+    if type(cause) is not ContinuationMandatoryCaptureOverflow or cause.witness.codec not in (RECORDER_CODEC, "composer.evidence.v2"):
+        raise AuditIntegrityError("cold END retry has no original mandatory capture refusal") from error
+    value = ColdProjectedEndFormatRetryOverflow(source, cause.witness)
+    _cold_overflows[value] = (source, cause.witness)
+    return value
 
 
 def _retry_recorder(conn: Connection, owed: VerifiedCheckpointEndOwed) -> PrivateChunk:
@@ -213,65 +274,57 @@ def _retry_root(owed: VerifiedCheckpointEndOwed, receipt: str, recorder: Private
     )
 
 
-def retain_end_format_retry_on_connection(
+def reprepare_cold_end_format_retry_prospective_on_connection(
     conn: Connection,
     *,
     service: object,
-    prepared: PreparedCheckpointProvider,
-    owed_admission: CheckpointEndOwedAdmission,
-    returned: CheckpointReturnedResponseObservation,
-) -> VerifiedEndFormatRetry:
-    """Close the original retained complete attempt atomically, without SDK work."""
+    source: ColdCheckpointEndConsequenceSource,
+) -> tuple[ProspectiveContinuationChunk, ...]:
+    """Freshly rebuild all four required bytes without mutating the current H."""
+    from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
+        ColdCheckpointEndConsequenceSource,
+        require_original_cold_checkpoint_end_source,
+    )
+    from elspeth.web.required_work import RequiredWorkBinding
     from elspeth.web.sessions.service import SessionServiceImpl
 
-    if (
-        type(service) is not SessionServiceImpl
-        or not conn.in_transaction()
-        or type(prepared) is not PreparedCheckpointProvider
-        or type(owed_admission) is not CheckpointEndOwedAdmission
-        or type(returned) is not CheckpointReturnedResponseObservation
-        or prepared.retry_ordinal != 0
-        or prepared.composer._require_sessions_service() is not service
-    ):
-        raise AuditIntegrityError("END format retry requires its first original paid attempt")
-    running = prepared.running
+    if type(service) is not SessionServiceImpl or type(source) is not ColdCheckpointEndConsequenceSource or not conn.in_transaction():
+        raise AuditIntegrityError("cold END retry projection lacks its session SQL owner")
+    require_original_cold_checkpoint_end_source(source)
+    work = source.runtime.bindings.required_work
+    if type(work) is not RequiredWorkBinding or work.running is None:
+        raise AuditIntegrityError("cold END retry projection lost its claimed operation")
+    running = work.running
     sid, operation = str(running.claim.session_id), running.claim.operation_id
+    if source.runtime.materialization.service._require_sessions_service() is not service:
+        raise AuditIntegrityError("cold END retry projection changed its original service")
     with service._session_write_lock(conn, sid):
         _require_current_continuation_running(conn, running)
         owed = read_v4_checkpoint_end_owed_on_connection(
             conn,
             session_id=sid,
             operation_id=operation,
-            attempt_id=owed_admission.original.attempt.attempt_id,
-            names=prepared.env_ref_names,
+            attempt_id=source.owed.attempt_id,
+            names=source.runtime.env_ref_names,
         )
+        if owed is None or owed != source.owed or load_snapshot(conn, session_id=sid, operation_id=operation) != owed.selected:
+            raise AuditIntegrityError("cold END retry projection replaced its original current H")
+        content = decode_continuation_response(owed.response).message.content
+        call = decode_retained_physical_audit_call(owed.response)
+        if type(content) is not str or call.call_id != owed.attempt_id or call.messages_hash != owed.request_sha256:
+            raise AuditIntegrityError("cold END retry projection lost its retained original response")
+        verdict = _parse_advisor_checkpoint_guidance(content, phase="end")
         if (
-            owed is None
+            verdict.ok
+            or verdict.failure_class != "malformed"
             or owed.retry_ordinal != 0
-            or owed.selected != owed_admission.owed_selected
-            or load_snapshot(conn, session_id=sid, operation_id=operation) != owed.selected
-            or returned.response != owed.response
-            or returned.attempt != owed_admission.original.attempt
+            or owed.phase_source is None
+            or owed.end_input_ref is None
         ):
-            raise AuditIntegrityError("END format retry replaced its original retained H source")
-        call = original_v4_checkpoint_returned_audit_call(
-            returned,
-            attempt_id=owed.attempt_id,
-            request_sha256=prepared.request_sha256,
-        )
-        if type(returned.message.content) is not str:
-            raise AuditIntegrityError("END format retry requires complete original text")
-        verdict = _parse_advisor_checkpoint_guidance(returned.message.content, phase="end")
-        if verdict.ok or verdict.failure_class != "malformed":
-            raise AuditIntegrityError("END format retry cannot replace a usable or missing provider result")
-        entry = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(call))
-        if entry is None or entry.call_id != owed.attempt_id:
-            raise AuditIntegrityError("END format retry lost its original paid accounting")
-        if owed.phase_source != prepared.prepared_source.source or owed.end_input_ref is None:
-            raise AuditIntegrityError("END format retry lost its original phase/input closure")
+            raise AuditIntegrityError("cold END retry projection cannot reclassify its original response")
         cohort = checkpoint_paid_audit_cohort_for_hold(call, owed.new_hold)
         recorder = _retry_recorder(conn, owed)
-        evidence = _retry_evidence(conn, owed, recorder, names=prepared.env_ref_names)
+        evidence = _retry_evidence(conn, owed, recorder, names=source.runtime.env_ref_names)
         receipt = f"checkpoint-end-format-retry:{owed.attempt_id}"
         marker = EndFormatRetryMarker(
             session_id=sid,
@@ -281,15 +334,183 @@ def retain_end_format_retry_on_connection(
             outer_effect_key=owed.outer_effect_key,
             owed_checkpoint_id=owed.selected.checkpoint_id,
             owed_cursor=owed.selected.cursor,
-            original_phase_checkpoint_id=prepared.prepared_source.source.checkpoint_id,
+            original_phase_checkpoint_id=owed.phase_source.checkpoint_id,
             end_input_ref=owed.end_input_ref,
-            request_sha256=prepared.request_sha256,
+            request_sha256=owed.request_sha256,
             response_chunk_key=private_chunk_key(owed.response),
             receipt_key=receipt,
             recorder=recorder.reference,
             evidence=evidence.reference,
             pass_index=owed.pass_index,
-            end_env_ref_names=tuple(sorted(prepared.env_ref_names)),
+            end_env_ref_names=tuple(sorted(source.runtime.env_ref_names)),
+            first_attempt_schema_valid=verdict.response_schema_valid,
+            private_audit_sha256=cohort.private_sha256,
+        )
+        event = ContinuationEvent("checkpoint", canonical_json(marker.model_dump(mode="json")))
+        append = prepare_snapshot_append(
+            owed.selected,
+            snapshot_json=_retry_root(owed, receipt, recorder.reference, evidence.reference),
+            events=(event,),
+            published_at=database_now(conn),
+        )
+        return (
+            ProspectiveContinuationChunk(private_chunk_key(recorder), recorder.canonical.encode("utf-8"), recorder.reference.codec),
+            ProspectiveContinuationChunk(private_chunk_key(evidence), evidence.canonical.encode("utf-8"), evidence.reference.codec),
+            ProspectiveContinuationChunk(f"event:{owed.selected.cursor + 1}", event.payload_json.encode("utf-8"), "event.v2"),
+            ProspectiveContinuationChunk(f"snapshot:{append.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
+        )
+
+
+def project_cold_end_format_retry_on_connection(
+    conn: Connection, *, service: object, source: ColdCheckpointEndConsequenceSource
+) -> ColdProjectedEndFormatRetry | ColdProjectedEndFormatRetryOverflow:
+    try:
+        prospective = reprepare_cold_end_format_retry_prospective_on_connection(conn, service=service, source=source)
+    except AuditIntegrityError as error:
+        return issue_cold_end_format_retry_overflow(source, error)
+    projected = ColdProjectedEndFormatRetry(source, prospective)
+    _cold_projections[projected] = (source, prospective)
+    return projected
+
+
+def recheck_cold_end_format_retry_capture_overflow_on_connection(
+    conn: Connection, *, service: object, failure: ColdProjectedEndFormatRetryOverflow
+) -> ContinuationCaptureOverflowWitness:
+    witness = require_original_cold_end_format_retry_overflow(failure)
+    try:
+        reprepare_cold_end_format_retry_prospective_on_connection(conn, service=service, source=failure.source)
+    except AuditIntegrityError as error:
+        cause = error.__cause__
+        if type(cause) is ContinuationMandatoryCaptureOverflow and cause.witness == witness:
+            return witness
+        raise AuditIntegrityError("cold END retry capture refusal changed under the current SQL lock") from error
+    raise AuditIntegrityError("cold END retry capture refusal no longer reproduces")
+
+
+def retain_end_format_retry_on_connection(
+    conn: Connection,
+    *,
+    service: object,
+    prepared: PreparedCheckpointProvider | None = None,
+    owed_admission: CheckpointEndOwedAdmission | None = None,
+    returned: CheckpointReturnedResponseObservation | None = None,
+    cold_source: ColdCheckpointEndConsequenceSource | None = None,
+) -> VerifiedEndFormatRetry:
+    """Close one source-proved malformed H atomically, without SDK work."""
+    from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
+        ColdCheckpointEndConsequenceSource,
+        require_original_cold_checkpoint_end_source,
+    )
+    from elspeth.web.required_work import RequiredWorkBinding
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    if type(service) is not SessionServiceImpl or not conn.in_transaction():
+        raise AuditIntegrityError("END format retry requires its original session SQL owner")
+    if cold_source is None:
+        if (
+            type(prepared) is not PreparedCheckpointProvider
+            or type(owed_admission) is not CheckpointEndOwedAdmission
+            or type(returned) is not CheckpointReturnedResponseObservation
+            or prepared.retry_ordinal != 0
+            or prepared.composer._require_sessions_service() is not service
+        ):
+            raise AuditIntegrityError("END format retry requires its first original paid attempt")
+        running = prepared.running
+        names = prepared.env_ref_names
+        attempt_id = owed_admission.original.attempt.attempt_id
+    else:
+        if (
+            prepared is not None
+            or owed_admission is not None
+            or returned is not None
+            or type(cold_source) is not ColdCheckpointEndConsequenceSource
+        ):
+            raise AuditIntegrityError("cold END retry cannot borrow warm physical custody")
+        require_original_cold_checkpoint_end_source(cold_source)
+        work = cold_source.runtime.bindings.required_work
+        if (
+            type(work) is not RequiredWorkBinding
+            or work.running is None
+            or cold_source.runtime.materialization.service._require_sessions_service() is not service
+            or cold_source.runtime.bindings.session_operation_context is not work.running.session_operation_context
+            or cold_source.runtime.source.selected is not cold_source.selected
+            or cold_source.selected.checkpoint_id != cold_source.owed.selected.checkpoint_id
+        ):
+            raise AuditIntegrityError("cold END retry lost its original current H owner")
+        running = work.running
+        names = cold_source.runtime.env_ref_names
+        attempt_id = cold_source.owed.attempt_id
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    with service._session_write_lock(conn, sid):
+        _require_current_continuation_running(conn, running)
+        owed = read_v4_checkpoint_end_owed_on_connection(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            attempt_id=attempt_id,
+            names=names,
+        )
+        if owed is None or owed.retry_ordinal != 0 or load_snapshot(conn, session_id=sid, operation_id=operation) != owed.selected:
+            raise AuditIntegrityError("END format retry replaced its original retained H source")
+        if cold_source is None:
+            if prepared is None or owed_admission is None or returned is None:
+                raise AuditIntegrityError("warm END retry lost its original attempt")
+            if (
+                owed.selected != owed_admission.owed_selected
+                or returned.response != owed.response
+                or returned.attempt != owed_admission.original.attempt
+            ):
+                raise AuditIntegrityError("warm END retry replaced its original returned source")
+            call = original_v4_checkpoint_returned_audit_call(returned, attempt_id=owed.attempt_id, request_sha256=prepared.request_sha256)
+            content = returned.message.content
+            original_phase_checkpoint_id = prepared.prepared_source.source.checkpoint_id
+        else:
+            if (
+                owed != cold_source.owed
+                or owed.selected.checkpoint_id != cold_source.selected.checkpoint_id
+                or decode_continuation_snapshot(owed.selected.payload_json) != cold_source.selected.stack
+            ):
+                raise AuditIntegrityError("cold END retry changed its original H under lock")
+            call = decode_retained_physical_audit_call(owed.response)
+            content = decode_continuation_response(owed.response).message.content
+            if call.call_id != owed.attempt_id or call.messages_hash != owed.request_sha256 or owed.phase_source is None:
+                raise AuditIntegrityError("cold END retry lost its retained physical/request source")
+            original_phase_checkpoint_id = owed.phase_source.checkpoint_id
+        if type(content) is not str:
+            raise AuditIntegrityError("END format retry requires complete original text")
+        verdict = _parse_advisor_checkpoint_guidance(content, phase="end")
+        if verdict.ok or verdict.failure_class != "malformed":
+            raise AuditIntegrityError("END format retry cannot replace a usable or missing provider result")
+        entry = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(call))
+        if entry is None or entry.call_id != owed.attempt_id:
+            raise AuditIntegrityError("END format retry lost its original paid accounting")
+        if (
+            owed.phase_source is None
+            or owed.end_input_ref is None
+            or (prepared is not None and owed.phase_source != prepared.prepared_source.source)
+        ):
+            raise AuditIntegrityError("END format retry lost its original phase/input closure")
+        cohort = checkpoint_paid_audit_cohort_for_hold(call, owed.new_hold)
+        recorder = _retry_recorder(conn, owed)
+        evidence = _retry_evidence(conn, owed, recorder, names=names)
+        receipt = f"checkpoint-end-format-retry:{owed.attempt_id}"
+        marker = EndFormatRetryMarker(
+            session_id=sid,
+            operation_id=operation,
+            attempt_id=owed.attempt_id,
+            effect_key=owed.effect_key,
+            outer_effect_key=owed.outer_effect_key,
+            owed_checkpoint_id=owed.selected.checkpoint_id,
+            owed_cursor=owed.selected.cursor,
+            original_phase_checkpoint_id=original_phase_checkpoint_id,
+            end_input_ref=owed.end_input_ref,
+            request_sha256=owed.request_sha256,
+            response_chunk_key=private_chunk_key(owed.response),
+            receipt_key=receipt,
+            recorder=recorder.reference,
+            evidence=evidence.reference,
+            pass_index=owed.pass_index,
+            end_env_ref_names=tuple(sorted(names)),
             first_attempt_schema_valid=verdict.response_schema_valid,
             private_audit_sha256=cohort.private_sha256,
         )
@@ -321,7 +542,7 @@ def retain_end_format_retry_on_connection(
             owed=owed,
             call=call,
             cohort=cohort,
-            names=prepared.env_ref_names,
+            names=names,
         )
         for chunk in (recorder, evidence):
             put_chunk(
@@ -377,9 +598,14 @@ def retain_end_format_retry_on_connection(
         consume_provider_terminal_hold_after_complete_result(
             conn, source=owed.new_hold, provider_attempt_id=owed.attempt_id, consumed_at=now
         )
-        return read_end_format_retry_on_connection(
-            conn, session_id=sid, operation_id=operation, selected=stored, names=prepared.env_ref_names
-        )
+        return read_end_format_retry_on_connection(conn, session_id=sid, operation_id=operation, selected=stored, names=names)
+
+
+def retain_cold_end_format_retry_on_connection(
+    conn: Connection, *, service: object, source: ColdCheckpointEndConsequenceSource
+) -> VerifiedEndFormatRetry:
+    """Settle a current cold H only after its original source is reissued and reproved."""
+    return retain_end_format_retry_on_connection(conn, service=service, cold_source=source)
 
 
 def read_end_format_retry_on_connection(
@@ -391,14 +617,20 @@ def read_end_format_retry_on_connection(
     names: frozenset[str] | None,
 ) -> VerifiedEndFormatRetry:
     """Cold reproof of the exact complete malformed child and next retry head."""
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
     if contract.version != "composer.continuation.policy.v4" or contract.allowance is None:
         raise AuditIntegrityError("END format retry requires its original bounded V4 contract")
+    # Owner recovery appends only a same-sequence recovered event. Follow that
+    # proved immutable lineage to the original retry marker; the current head
+    # remains the selected head used by the caller and grants no SDK authority.
+    marker_snapshot = semantic_recovery_source(conn, session_id, operation_id, selected).snapshot
     row = conn.execute(
         select(events.c.tag, events.c.payload_chunk_key).where(
             events.c.session_id == session_id,
             events.c.operation_id == operation_id,
-            events.c.sequence == selected.cursor,
+            events.c.sequence == marker_snapshot.cursor,
         )
     ).one_or_none()
     if row is None or row.tag != "checkpoint":
@@ -440,10 +672,10 @@ def read_end_format_retry_on_connection(
             conn,
             session_id=session_id,
             operation_id=operation_id,
-            checkpoint_id=selected.checkpoint_id,
+            checkpoint_id=marker_snapshot.checkpoint_id,
             allowance=owed.new_hold.allowance_bytes,
         )
-        != selected
+        != marker_snapshot
     ):
         raise AuditIntegrityError("END format retry replaced its original retained checkpoint")
     call = decode_retained_physical_audit_call(owed.response)
@@ -489,7 +721,7 @@ def read_end_format_retry_on_connection(
     ):
         raise AuditIntegrityError("END retry lost its complete refreshed evidence graph")
     expected = decode_continuation_snapshot(_retry_root(owed, marker.receipt_key, recorder.reference, evidence.reference))
-    actual = decode_continuation_snapshot(selected.payload_json)
+    actual = decode_continuation_snapshot(marker_snapshot.payload_json)
     if (
         verdict.ok
         or verdict.failure_class != "malformed"
@@ -503,14 +735,14 @@ def read_end_format_retry_on_connection(
         or owed.phase_source.checkpoint_id != marker.original_phase_checkpoint_id
         or owed.end_input_ref != marker.end_input_ref
         or owed.selected.cursor != marker.owed_cursor
-        or selected.cursor != marker.owed_cursor + 1
+        or marker_snapshot.cursor != marker.owed_cursor + 1
         or private_chunk_key(owed.response) != marker.response_chunk_key
         or call.call_id != marker.attempt_id
         or marker.receipt_key != f"checkpoint-end-format-retry:{marker.attempt_id}"
         or child is None
         or child.receipt_key != marker.receipt_key
         or child.result_chunk_key != marker.response_chunk_key
-        or actual != expected.model_copy(update={"cursor": selected.cursor})
+        or actual != expected.model_copy(update={"cursor": marker_snapshot.cursor})
     ):
         raise AuditIntegrityError("END format retry changed its complete paid consequence")
     usage = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(call))
@@ -589,14 +821,17 @@ def read_end_format_retry_phase_on_connection(
     conn: Connection, *, session_id: str, operation_id: str, selected: StoredContinuationSnapshot
 ) -> CheckpointPhaseSource | None:
     """Reprove retry-ready phase DATA; mint no gate, SDK custody or retry permit."""
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
     if contract.version != "composer.continuation.policy.v4" or contract.allowance is None:
         return None
+    marker_snapshot = semantic_recovery_source(conn, session_id, operation_id, selected).snapshot
     row = conn.execute(
         select(events.c.tag, events.c.payload_chunk_key).where(
             events.c.session_id == session_id,
             events.c.operation_id == operation_id,
-            events.c.sequence == selected.cursor,
+            events.c.sequence == marker_snapshot.cursor,
         )
     ).one_or_none()
     if row is None or row.tag != "checkpoint":
@@ -628,3 +863,66 @@ def read_end_format_retry_phase_on_connection(
     else:
         raise AuditIntegrityError("END retry phase changed its original caller frame")
     return CheckpointPhaseSource("end", kind, original, selected, verified.marker.outer_effect_key, (verified.marker.effect_key,))
+
+
+def read_retry_ready_action_source_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str] | None = None,
+) -> VerifiedEndFormatRetry | None:
+    """Source-proved current retry cut for sizing/recovery; grants no paid call."""
+    if load_snapshot(conn, session_id=session_id, operation_id=operation_id) != selected:
+        raise AuditIntegrityError("END retry allowance selected another current SQL head")
+    phase = read_end_format_retry_phase_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=selected)
+    if phase is None:
+        return None
+    if phase.kind != "end_review" or phase.current != selected:
+        raise AuditIntegrityError("END retry allowance has no supported original END Review source")
+    proof = read_end_format_retry_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=selected, names=names)
+    root = decode_continuation_snapshot(selected.payload_json)
+    outer = tuple(item for item in root.effect_frontier if item.effect_id == proof.marker.outer_effect_key)
+    child = tuple(item for item in root.effect_frontier if item.effect_id == proof.marker.effect_key)
+    unresolved = tuple(item.effect_id for item in root.effect_frontier if item.disposition in ("prepared", "dispatched", "unknown"))
+    if (
+        len(root.frames) != 2
+        or type(root.frames[0]) is not ComposeFrame
+        or type(root.frames[1]) is not EndFrame
+        or root.frames[1].phase != "review_needed"
+        or root.pending_owner_results
+        or root.pending_settlement_ids
+        or len(outer) != 1
+        or outer[0].disposition != "dispatched"
+        or outer[0].receipt_id is not None
+        or len(child) != 1
+        or child[0].disposition != "committed"
+        or child[0].receipt_id != proof.marker.receipt_key
+        or unresolved != (proof.marker.outer_effect_key,)
+    ):
+        raise AuditIntegrityError("END retry allowance changed its original incomplete outer phase")
+    parts = proof.marker.effect_key.split(":")
+    suffix = parts[2] if len(parts) == 3 else ""
+    if parts[:2] != ["provider", "1"] or not suffix.isascii() or not suffix.isdecimal() or len(suffix) > 16 or str(int(suffix)) != suffix:
+        raise AuditIntegrityError("END retry allowance lost its canonical family-1 paid child")
+    first_ordinal = int(suffix)
+    next_ordinal = conn.execute(
+        select(ordinals.c.next_ordinal).where(
+            ordinals.c.session_id == session_id,
+            ordinals.c.operation_id == operation_id,
+            ordinals.c.family == 1,
+        )
+    ).scalar_one_or_none()
+    if type(next_ordinal) is not int or first_ordinal >= _CANONICAL_SAFE_INTEGER_MAX or next_ordinal != first_ordinal + 1:
+        raise AuditIntegrityError("END retry already advanced its one physical successor ordinal")
+    successor = conn.execute(
+        select(effects.c.effect_key).where(
+            effects.c.session_id == session_id,
+            effects.c.operation_id == operation_id,
+            effects.c.effect_key == f"provider:1:{next_ordinal}",
+        )
+    ).scalar_one_or_none()
+    if successor is not None:
+        raise AuditIntegrityError("END retry already admitted its one successor paid child")
+    return proof

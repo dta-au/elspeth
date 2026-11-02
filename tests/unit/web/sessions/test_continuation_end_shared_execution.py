@@ -10,15 +10,18 @@ from sqlalchemy import func, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer._compose_loop_carriers import _EndCompletionDisposition
-from elspeth.web.composer.continuation import ComposeFrame, EndFrame
-from elspeth.web.composer.continuation_codec import decode_continuation_response
+from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
+from elspeth.web.composer.continuation_codec import decode_continuation_response, decode_continuation_snapshot
 from elspeth.web.composer.continuation_end_disposition import classify_end_review_result
 from elspeth.web.composer.continuation_end_effects import semantic_end_effect_key
 from elspeth.web.composer.continuation_end_values import continuation_candidate_id, decode_end_candidate
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners, restore_continuation_runtime
 from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.continuation_semantic_advisor_phase import run_continuation_semantic_advisor
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.sessions.continuation_end import EndReviewContinued, EndReviewExecution, execute_continuation_end_review
 from elspeth.web.sessions.continuation_iteration_return import (
@@ -37,13 +40,14 @@ from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
+from tests.unit.web.sessions import test_continuation_semantic_v4_live as semantic_v4_fixture
 from tests.unit.web.sessions.test_continuation_completion_owners import _end_admit
 
 operation_store = semantic_fixture.operation_store
 
 
 @asynccontextmanager
-async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean", timed_read=False):
+async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean", timed_read=False, end_reasoning_bytes=0):
     """Use original SQL/SDK custody; replace only the external model transport."""
     async with semantic_fixture._semantic_case(store, tmp_path, monkeypatch, end_candidate=True, timed_read=timed_read) as case:
         runtime = case["runtime"]
@@ -66,20 +70,38 @@ async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean
             return semantic_fixture._reply(json.dumps(answer))
 
         monkeypatch.setattr(litellm, "acompletion", semantic_completion)
-        issuer, prepared, dispatched = semantic_fixture._begin(store, case)
-        returned = await semantic_fixture._invoke(case, issuer)
+        if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
+            semantic_phases = semantic_v4_fixture._phases(case)
+            # This is the first bound action clock, after fixture-only request
+            # setup and before the actual phase's preparation/guard/quota.
+            action_clock = ContinuationActionClock(runtime.source.policy.actions.advisor)
+            if case["sql_deadline"] is not None:
+                case["sql_deadline"].begin_action(action_clock.policy, started_at=action_clock.started_monotonic)
+            semantic_phases.bind_action_clock(action_clock)
+            result = await run_continuation_semantic_advisor(semantic_phases, original)
+            assert result is None and len(sdk) == 1
+            paid_snapshot = semantic_phases.latest_snapshot
+            assert paid_snapshot is not None
+            advisor = decode_continuation_snapshot(paid_snapshot.payload_json).frames[-1]
+            assert type(advisor) is AdvisorFrame and advisor.phase == "response_retained"
+            assert advisor.provider_effect_key is not None
+            semantic_effect_key = advisor.provider_effect_key
+        else:
+            issuer, prepared, dispatched = semantic_fixture._begin(store, case)
+            returned = await semantic_fixture._invoke(case, issuer)
         with locked_session_transaction(store[0], str(store[4])) as conn:
-            paid = retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=returned, recorder=case["recorder"], issuer=issuer
-            )
-            installed = install_semantic_action_on_connection(
-                conn, case["running"], selected=paid.snapshot, effect_key=prepared.binding.effect_key
-            )
+            if type(runtime.source.policy) is not ContinuationAdmissionPolicyV4:
+                paid = retain_semantic_advisor_outcome_on_connection(
+                    conn, prepared, selected=dispatched, outcome=returned, recorder=case["recorder"], issuer=issuer
+                )
+                paid_snapshot = paid.snapshot
+                semantic_effect_key = prepared.binding.effect_key
+            installed = install_semantic_action_on_connection(conn, case["running"], selected=paid_snapshot, effect_key=semantic_effect_key)
             consumed = consume_semantic_advisor_review_on_connection(
-                conn, case["running"], selected=installed, effect_key=prepared.binding.effect_key
+                conn, case["running"], selected=installed, effect_key=semantic_effect_key
             )
             admitted = require_consumed_semantic_review_on_connection(
-                conn, case["running"], selected=consumed, effect_key=prepared.binding.effect_key
+                conn, case["running"], selected=consumed, effect_key=semantic_effect_key
             )
             before_assistants = tuple(conn.execute(select(messages.c.id).where(messages.c.role == "assistant")))
         service, authority = runtime.materialization.service, runtime.materialization.authority
@@ -89,9 +111,8 @@ async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean
         inventory = await materialize_continuation_env_inventory(
             advisor=service._advisor_checkpoint, authority=authority, selected=selected, required_work=case["work"]
         )
-        # The manual original paid SQL fixture does not run the live semantic
-        # phase's counter handoff. Restore its actual admitted current source;
-        # copying a counter into the old warm owner would hide that boundary.
+        # Restore the actual admitted source after consuming the paid decision;
+        # copying counters into the old warm owner would hide that boundary.
         runtime = await restore_continuation_runtime(
             service=service,
             authority=authority,
@@ -121,7 +142,10 @@ async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean
                     findings="The candidate does not yet meet the request.",
                     publication_verdict="WITHHOLD",
                 )
-            return semantic_fixture._reply(json.dumps(reply))
+            response = semantic_fixture._reply(json.dumps(reply))
+            if end_reasoning_bytes:
+                response.choices[0].message.reasoning_content = "r" * end_reasoning_bytes
+            return response
 
         monkeypatch.setattr(litellm, "acompletion", end_completion)
         passes_before = runtime.live.advisor_checkpoint_passes_used
@@ -129,6 +153,11 @@ async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean
             before_end_sequence = conn.execute(
                 select(func.max(messages.c.sequence_no)).where(messages.c.session_id == str(case["running"].claim.session_id))
             ).scalar_one()
+        if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
+            end_clock = ContinuationActionClock(runtime.source.policy.actions.advisor)
+            if case["sql_deadline"] is not None:
+                case["sql_deadline"].begin_action(end_clock.policy, started_at=end_clock.started_monotonic)
+            phases.bind_action_clock(end_clock)
         execution = await execute_continuation_end_review(phases, selected)
         captured = (
             await capture_continuation_runtime_owners(
@@ -145,7 +174,7 @@ async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean
             "execution": execution,
             "captured": captured,
             "admission": admitted,
-            "semantic_effect_key": prepared.binding.effect_key,
+            "semantic_effect_key": semantic_effect_key,
             "owner_effect_key": semantic_end_effect_key(candidate.response, admitted.action_key),
             "sdk": sdk,
             "passes_before": passes_before,

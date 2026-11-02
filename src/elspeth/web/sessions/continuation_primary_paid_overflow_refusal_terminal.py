@@ -182,7 +182,9 @@ def read_v4_primary_no_sdk_refusal_on_connection(
         operation_epoch=source.session_operation_epoch,
         action_chunk=action_chunk,
     )
-    _incomplete_tail, reserved, combined_hash = primary_terminal_reservation(paid, no_sdk)
+    _incomplete_tail, reserved, combined_hash = primary_terminal_reservation(
+        paid, no_sdk, historical_contract_sha256=source.fallback_contract_sha256
+    )
     projected, projected_events = _shape(
         admitted=admitted,
         receipt_key=data.receipt_key,

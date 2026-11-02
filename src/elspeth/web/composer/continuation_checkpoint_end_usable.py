@@ -66,6 +66,22 @@ async def complete_v4_checkpoint_end_usable_return(
     )
     computation = compute_checkpoint_end_gate(source=physical, returned=returned)
 
+    def project_settled_cost() -> None:
+        """Project the exact committed paid call before another warm action."""
+        budget = phases.provider_owner.cost_budget
+        call = returned.audit_call
+        accountable = call.cost_response_accountable
+        if (
+            budget is None
+            or type(accountable) is not bool
+            or owner.runtime.bindings.provider_owner is not phases.provider_owner
+            or call.call_id != owed.original.attempt.attempt_id
+            or budget.snapshot().physical_calls != len(budget.snapshot().charges) + 1
+            or any(charge.call_id == call.call_id for charge in budget.snapshot().charges)
+        ):
+            raise AuditIntegrityError("END completion lost its original unsettled cost projection")
+        budget.consume_settled(call, response_accountable=accountable)
+
     async def settle_overflow(
         failure: ContinuationCaptureOverflowWitness | ContinuationRetainedCapacityExceeded,
     ) -> EndCheckpointPaidOverflowTerminal:
@@ -124,6 +140,7 @@ async def complete_v4_checkpoint_end_usable_return(
         successor = StoredContinuationSnapshot(
             completed.append.snapshot_json, owed.owed_selected.cursor + len(completed.append.events), completed.append.checkpoint_id
         )
+        project_settled_cost()
         return EndCheckpointRepairContinued(successor)
 
     projected_review = await project_end_complete_review(
@@ -157,4 +174,5 @@ async def complete_v4_checkpoint_end_usable_return(
         )
     except ContinuationRetainedCapacityExceeded as excess:
         return await settle_overflow(excess)
+    project_settled_cost()
     return EndCheckpointCompleteReview(reviewed)

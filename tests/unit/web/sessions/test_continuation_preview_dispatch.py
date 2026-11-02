@@ -1,25 +1,32 @@
 """Actual V4 preview phase, original producer and atomic P4 cold replay."""
 
+import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
 
 import pytest
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY
 from elspeth.web.composer import continuation_preview_dispatch as preview
 from elspeth.web.composer import continuation_runtime
+from elspeth.web.composer import continuation_value_batch_preparation as value_preparation
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+from elspeth.web.composer.continuation_message_family_builders import capture_tool_result_recipe
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.database_clock import database_now
+from elspeth.web.sessions import continuation_value_batch_publication as value_publication
+from elspeth.web.sessions import continuation_value_batch_tail as value_tail
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cut
+from elspeth.web.sessions.continuation_p4 import decode_p4_receipt
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -92,9 +99,65 @@ async def test_actual_preview_phase_issues_once_retains_original_result_and_cold
         actual_bind = preview.bind_issued_preview_dispatch_on_connection
         actual_adopt = preview.adopt_preview_issued_message_source
         actual_register = CurrentContinuationMessageProducers.register_tool_result_message
+        actual_verify = CurrentContinuationMessageProducers.register_issued_preview_result_message
+        actual_lock = preview.locked_session_transaction
+        actual_plan = value_preparation.prepare_issued_preview_batch
+        actual_shape = value_publication.value_batch_publication_shape
+        actual_preview_p4 = value_tail.prepare_issued_preview_p4_result_tail
+        actual_graph_p4 = value_tail.prepare_p4_result_tail
         bound = []
         originals = []
         registrations = []
+        verified = []
+        active_preview_transactions = set()
+        planned = []
+        publication_sources = []
+        nongraph_results = []
+        original_admitted_results = []
+
+        def observed_preview_p4(*, selected, receipt, publication, published_at, env_ref_names):
+            assert publication.issued_preview is not None
+            assert receipt.checkpoint_disposition in ("empty", "no_new_checkpoint")
+            assert receipt.authored_state_hash is None and not receipt.inserted_state_ids
+            arguments = {"selected": selected, "receipt": receipt, "published_at": published_at, "env_ref_names": env_ref_names}
+            with pytest.raises(AuditIntegrityError, match="requires its ordinary successful publication"):
+                actual_graph_p4(**arguments)
+            with pytest.raises(AuditIntegrityError, match="requires its original issued preview publication"):
+                actual_preview_p4(**arguments, publication=replace(publication, issued_preview=None))
+            changed_message = replace(publication.messages[0], content=publication.messages[0].content + " changed")
+            with pytest.raises(AuditIntegrityError, match="publication differs from its original source"):
+                actual_preview_p4(**arguments, publication=replace(publication, messages=(changed_message, *publication.messages[1:])))
+            result = actual_preview_p4(**arguments, publication=publication)
+            assert result.result.historical_effect is None
+            assert result.result.preview_publication is publication
+            nongraph_results.append(result.result)
+            return result
+
+        def observed_shape(batch, *, locked_refusal, env_ref_names, issued_preview=None):
+            assert issued_preview is not None
+            with pytest.raises(AuditIntegrityError, match="one original Compose frame and ready batch"):
+                actual_shape(batch, locked_refusal=locked_refusal, env_ref_names=env_ref_names)
+            with pytest.raises(AuditIntegrityError, match="original complete preparation"):
+                actual_shape(replace(batch), locked_refusal=locked_refusal, env_ref_names=env_ref_names, issued_preview=issued_preview)
+            assert batch.selected.stack.frames[-1].phase == "effect_reconciling"
+            publication_sources.append(batch.selected.checkpoint_id)
+            return actual_shape(batch, locked_refusal=locked_refusal, env_ref_names=env_ref_names, issued_preview=issued_preview)
+
+        @contextmanager
+        def observed_lock(*args, **kwargs):
+            with actual_lock(*args, **kwargs) as conn:
+                thread = threading.get_ident()
+                assert thread not in active_preview_transactions
+                active_preview_transactions.add(thread)
+                try:
+                    yield conn
+                finally:
+                    active_preview_transactions.remove(thread)
+
+        def observed_plan(*args, **kwargs):
+            assert threading.get_ident() not in active_preview_transactions, "preview tail capture crossed its atomic result writer"
+            planned.append(threading.get_ident())
+            return actual_plan(*args, **kwargs)
 
         def observe_bind(conn, issuing, **kwargs):
             prepared = kwargs["prepared"]
@@ -161,15 +224,55 @@ async def test_actual_preview_phase_issues_once_retains_original_result_and_cold
             assert producer.selected is current.source.selected
             assert prepared.runtime.source.selected.stack.cursor + 1 == producer.selected.stack.cursor
             assert len(originals) == 1 and kwargs["result"].result is originals[0]
+            assert kwargs["message"]["content"] is kwargs["serialized"]
             registrations.append(kwargs["message"])
             return actual_register(producer, **kwargs)
+
+        def observed_verify(producer, *, prepared, permit):
+            message = prepared.runtime.live.llm_messages[-1]
+            assert message is registrations[0]
+            serialized = message["content"]
+            assert type(serialized) is str
+            copied = serialized.encode("utf-8").decode("utf-8")
+            assert copied == serialized and copied is not serialized
+            admitted = preview.original_adopted_preview_result(permit, prepared=prepared)
+            original_admitted_results.append(admitted.to_tool_result())
+            arguments = {
+                "response": prepared.runtime.source.selected.stack.frames[-1].response,
+                "completion": prepared.call_model.completion,
+                "tool_index": prepared.call.index,
+                "call": prepared.call.tool_call,
+                "result": admitted,
+            }
+            with pytest.raises(AuditIntegrityError, match="complete original wire or trust partition"):
+                capture_tool_result_recipe(**arguments, serialized=copied, message=message)
+            parts = message[PROMPT_GUARD_CONTENT_PARTS_KEY]
+            assert parts
+            changed = dict(message)
+            changed[PROMPT_GUARD_CONTENT_PARTS_KEY] = (replace(parts[0], text=parts[0].text + " changed"), *parts[1:])
+            with pytest.raises(AuditIntegrityError, match="complete original wire or trust partition"):
+                capture_tool_result_recipe(**arguments, serialized=serialized, message=changed)
+            actual_verify(producer, prepared=prepared, permit=permit)
+            verified.append(message)
 
         monkeypatch.setattr(preview, "execute_tool", observed)
         monkeypatch.setattr(preview, "bind_issued_preview_dispatch_on_connection", observe_bind)
         monkeypatch.setattr(preview, "adopt_preview_issued_message_source", observed_adopt)
         monkeypatch.setattr(CurrentContinuationMessageProducers, "register_tool_result_message", observed_register)
+        monkeypatch.setattr(CurrentContinuationMessageProducers, "register_issued_preview_result_message", observed_verify)
+        monkeypatch.setattr(preview, "locked_session_transaction", observed_lock)
+        monkeypatch.setattr(value_preparation, "prepare_issued_preview_batch", observed_plan)
+        monkeypatch.setattr(value_publication, "value_batch_publication_shape", observed_shape)
+        monkeypatch.setattr(value_tail, "prepare_issued_preview_p4_result_tail", observed_preview_p4)
+        with (
+            observed_lock(store[0], str(store[4])),
+            pytest.raises(AssertionError, match="preview tail capture crossed its atomic result writer"),
+        ):
+            observed_plan()
+        assert not planned and not active_preview_transactions
         await phases._advance(owner)
-        assert len(originals) == len(registrations) == 1 and originals[0].success
+        assert len(originals) == len(registrations) == len(verified) == len(planned) == 1 and originals[0].success
+        assert publication_sources and len(nongraph_results) == 1
         assert originals[0].runtime_preflight is not None
         assert originals[0].runtime_preflight.errors[0].error_code == "empty_pipeline"
         stored = owner.latest_snapshot
@@ -197,7 +300,22 @@ async def test_actual_preview_phase_issues_once_retains_original_result_and_cold
         before = stored_rows(store[0])
         restored, _inventory = await cold.current(selected)
         assert restored.graph.batch is not None
-        assert restored.graph.batch.batch.tool_outcomes[0].response is not None
+        assert restored.graph.batch.batch.tool_outcomes[0].response == original_admitted_results[0]
+        encoded_receipt = restored.graph.batch.batch.p4_receipt_json
+        assert encoded_receipt is not None
+        receipt, outcome = decode_p4_receipt(encoded_receipt, env_ref_names=restored.env_ref_names)
+        assert receipt.checkpoint_disposition in ("empty", "no_new_checkpoint") and outcome.checkpoint is None
+        assert receipt.authored_state_hash is None and not receipt.inserted_state_ids
+        with store[0].connect() as conn:
+            p4 = conn.execute(
+                select(effects).where(
+                    effects.c.session_id == str(store[4]),
+                    effects.c.operation_id == running.claim.operation_id,
+                    effects.c.effect_key == receipt.effect_key,
+                )
+            ).one()
+        assert p4.disposition == "committed" and p4.receipt_key == str(receipt.assistant_id)
+        assert p4.graph_sha256 is None and p4.committed_state_ids_json is None
         assert stored_rows(store[0]) == before and len(sdk) == 1 and len(originals) == 1
 
 

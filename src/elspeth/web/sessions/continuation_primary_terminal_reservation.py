@@ -10,10 +10,11 @@ from elspeth.web.sessions.continuation_primary_paid_incomplete_tail import (
 )
 from elspeth.web.sessions.continuation_primary_paid_overflow_no_sdk import PrimaryNoSdkTailPlan
 from elspeth.web.sessions.continuation_primary_paid_overflow_tail import PrimaryPaidOverflowTailPlan
+from elspeth.web.sessions.continuation_primary_sdk_tail import prepare_primary_sdk_tail_plan
 
 
 def primary_terminal_reservation(
-    paid: PrimaryPaidOverflowTailPlan, no_sdk: PrimaryNoSdkTailPlan
+    paid: PrimaryPaidOverflowTailPlan, no_sdk: PrimaryNoSdkTailPlan, *, historical_contract_sha256: str | None = None
 ) -> tuple[PrimaryPaidIncompleteTailPlan, int, str]:
     """Bind max(overflow, incomplete, no-SDK) to the same original attempt/head.
 
@@ -39,4 +40,21 @@ def primary_terminal_reservation(
             }
         ).encode("utf-8")
     ).hexdigest()
+    if historical_contract_sha256 == contract:
+        # Published v2 holds retain exactly their original three alternatives.
+        return incomplete, reserved, contract
+    sdk = prepare_primary_sdk_tail_plan(identity=paid.identity, admitted=paid.admitted, creator_sequence=paid.creator_sequence)
+    reserved = max(reserved, sdk.reserved_bytes)
+    contract = sha256(
+        canonical_json(
+            {
+                "version": "composer.primary-v4-combined-tail.v3",
+                "previous_contract": contract,
+                "sdk_terminal": sdk.contract_sha256,
+                "reserved_bytes": reserved,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    if historical_contract_sha256 is not None and historical_contract_sha256 != contract:
+        raise AuditIntegrityError("PRIMARY terminal hold has an unsupported original recipe")
     return incomplete, reserved, contract

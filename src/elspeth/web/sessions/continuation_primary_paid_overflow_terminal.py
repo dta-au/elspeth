@@ -226,7 +226,9 @@ def read_v4_primary_paid_overflow_terminal_on_connection(
         operation_epoch=source.session_operation_epoch,
         action_chunk=no_sdk_action_chunk,
     )
-    _incomplete_tail, reserved_bytes, combined_hash = primary_terminal_reservation(paid_plan, no_sdk_plan)
+    _incomplete_tail, reserved_bytes, combined_hash = primary_terminal_reservation(
+        paid_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if source.reserved_bytes != reserved_bytes or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("PRIMARY paid overflow changed its original combined terminal hold")
     batch = build_primary_paid_overflow_tail_batch(paid_plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))

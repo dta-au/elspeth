@@ -218,4 +218,13 @@ async def test_v4_primary_oversized_actual_response_is_one_cold_paid_terminal_wi
         ).all()
     assert cold is not None and cold.receipt == result.receipt and cold.hold_state == "consumed"
     assert len(attempts) == 1 and attempts[0].settled_at is not None and retained.state == "consumed"
-    assert not provider_audits
+    # Guard admission is durably audited before SDK entry even when the paid
+    # result later overflows. Inspect every retained envelope, so any full
+    # provider audit (of any status) still fails this assertion.
+    assert len(provider_audits) == 1
+    guard_envelopes = provider_audits[0].tool_calls
+    assert type(guard_envelopes) is list and len(guard_envelopes) == 1
+    guard = guard_envelopes[0]
+    assert guard["_kind"] == "prompt_guard_audit"
+    assert guard["check"]["operation_id"] == running.session_operation_context.fence.operation_id
+    assert guard["check"]["operation_epoch"] == running.session_operation_context.fence.operation_epoch

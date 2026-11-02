@@ -1424,6 +1424,7 @@ def _selected_segment_action(
     from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
+    from elspeth.web.sessions.continuation_checkpoint_end_retry import read_retry_ready_action_source_on_connection
     from elspeth.web.sessions.continuation_iteration_return import read_iteration_allowance_data_on_connection
     from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
 
@@ -1449,7 +1450,12 @@ def _selected_segment_action(
     private = load_snapshot_private_data_on_connection(
         conn, session_id=parent.session_id, operation_id=parent.operation_id, selected=snapshot
     )
-    return next_continuation_action_policy(selected=SelectedContinuationState(snapshot.checkpoint_id, stack, private), policy=policy)
+    retry_ready = read_retry_ready_action_source_on_connection(
+        conn, session_id=parent.session_id, operation_id=parent.operation_id, selected=snapshot
+    )
+    return next_continuation_action_policy(
+        selected=SelectedContinuationState(snapshot.checkpoint_id, stack, private), policy=policy, retry_ready=retry_ready
+    )
 
 
 def _retained_successor_action(
@@ -1464,6 +1470,7 @@ def _retained_successor_action(
     from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
+    from elspeth.web.sessions.continuation_checkpoint_end_retry import read_retry_ready_action_source_on_connection
     from elspeth.web.sessions.continuation_iteration_return import read_iteration_allowance_data_on_connection
     from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
 
@@ -1482,7 +1489,10 @@ def _retained_successor_action(
         expected = policy.actions.advisor
     elif expected is None:
         private = load_snapshot_private_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=actual)
-        expected = next_continuation_action_policy(selected=SelectedContinuationState(actual.checkpoint_id, stack, private), policy=policy)
+        retry_ready = read_retry_ready_action_source_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=actual)
+        expected = next_continuation_action_policy(
+            selected=SelectedContinuationState(actual.checkpoint_id, stack, private), policy=policy, retry_ready=retry_ready
+        )
     if policy_sha256 is not None and policy_sha256 != stack.policy_hash:
         raise AuditIntegrityError("successor substituted another retained complete policy")
     if next_action_json is not None:

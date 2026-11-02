@@ -1640,10 +1640,33 @@ class AdvisorCheckpointOwner:
         unfenced.
         """
         if checkpoint_phase_owner is not None or checkpoint_end_input is not None:
-            # The explicit V4 caller path remains dormant until its original
-            # prepared-request, raw-result and complete phase joins are ready.
-            # Never silently fall through to the legacy paid retry loop.
-            raise AuditIntegrityError("V4 checkpoint requires its complete physical-result phase owner before dispatch")
+            from elspeth.web.composer.continuation_checkpoint_end_live import run_v4_checkpoint_end_live
+            from elspeth.web.composer.continuation_checkpoint_end_locals import CheckpointEndGateLocals
+            from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
+
+            if type(checkpoint_phase_owner) is not CheckpointPhaseOwner or type(checkpoint_end_input) is not CheckpointEndGateLocals:
+                raise AuditIntegrityError("V4 END checkpoint requires both original phase and gate owners")
+            runtime = checkpoint_phase_owner.runtime
+            if (
+                phase != "end"
+                or state is not runtime.live.state
+                or recorder is not runtime.live.recorder
+                or provider_owner is not runtime.bindings.provider_owner
+                or session_id != runtime.bindings.session_id
+                or session_operation_context is not runtime.bindings.session_operation_context
+                or user_message != runtime.bindings.message
+                or pass_index != checkpoint_end_input.pass_index
+                or advisor_review_state is not checkpoint_end_input.review_state
+                or publication_review is not checkpoint_end_input.publication_review
+                or deadline != runtime.bindings.deadline
+                or continuation_budget is not None
+                or advisor_transcript is not None
+            ):
+                raise AuditIntegrityError("V4 END checkpoint changed its original invocation or gate inputs")
+            await emit_progress(progress, advisor_checkpoint_progress_event(phase))
+            await run_v4_checkpoint_end_live(
+                advisor=self, phase_owner=checkpoint_phase_owner, gate_locals=checkpoint_end_input, deadline=deadline
+            )
 
         provider_attempts = 0
         if continuation_budget is not None:

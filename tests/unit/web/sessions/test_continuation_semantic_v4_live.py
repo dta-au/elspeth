@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from datetime import timedelta
 
@@ -16,6 +17,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import continuation_semantic_advisor as semantic_physical
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.bounded_json import PROVIDER_ARTIFACT_UNAVAILABLE
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_response
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
@@ -25,11 +27,16 @@ from elspeth.web.composer.continuation_semantic_advisor_phase import (
     SemanticAdvisorPaidIncompleteTerminal,
     run_continuation_semantic_advisor,
 )
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.visible_tool_event import visible_response_gap_for_source
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
+from elspeth.web.sessions import continuation_primary as primary_sql
+from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
+from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_cost import _closed_call
 from elspeth.web.sessions.continuation_semantic_advisor import read_semantic_advisor_outcome_on_connection
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_terminal import read_v4_semantic_paid_incomplete_terminal_on_connection
@@ -44,6 +51,8 @@ from elspeth.web.sessions.time_normalization import restore_utc
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, _reply
 from tests.unit.web.sessions import test_continuation_initialization as initialization_fixture
+from tests.unit.web.sessions import test_continuation_primary_v4_live as primary_fixture
+from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST
 from tests.unit.web.sessions.test_continuation_semantic_advisor import _semantic_case
 from tests.unit.web.sessions.test_continuation_semantic_advisor import operation_store as _operation_store
 
@@ -126,6 +135,143 @@ async def test_v4_semantic_success_is_one_original_complete_result_and_consumed_
         assert physical.settled_at is not None and physical.ledger_entry_id == entries[0].entry_id
         assert effect.requested_model == sdk[0]
         assert len(entries) == 1 and entries[0].model == "test/model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("family", "deadline_observation"),
+    (
+        ("primary", "active_quota"),
+        ("primary", "late_quota"),
+        ("primary", "late_action"),
+        ("semantic", "active_quota"),
+        ("semantic", "after_preparation"),
+        ("semantic", "late_quota"),
+        ("semantic", "late_action"),
+    ),
+)
+async def test_v4_original_admission_checks_quota_at_entry_and_after_sql(
+    operation_store, tmp_path, monkeypatch, family, deadline_observation
+):
+    """The real SQL owner checks its original stage twice and rolls back expiry."""
+    timely = deadline_observation in {"active_quota", "after_preparation"}
+    async with AsyncExitStack() as stack:
+        if family == "primary":
+            kwargs, produced, recorder, store = await primary_fixture._v4_primary_input(operation_store, tmp_path, monkeypatch)
+            work = kwargs["required_work"]
+            original_admit = primary_sql.admit_v4_primary_provider_on_connection
+            original_service = SessionServiceImpl.begin_v4_continuation_primary_attempt
+
+            async def invoke():
+                with prompt_guard_user_scope(REQUEST):
+                    return await primary_fixture.run_continuation_primary(
+                        service=kwargs["service"],
+                        authority=kwargs["authority"],
+                        selected=kwargs["selected"],
+                        producers=produced.producers,
+                        messages=list(produced.messages),
+                        tools=[],
+                        recorder=recorder,
+                        drained=primary_fixture.RecorderDrainCursors(),
+                        required_work=work,
+                        provider_owner=primary_fixture.ProviderInvocationOwner(service=store[3], required_work=work),
+                        timeout=5,
+                    )
+
+        else:
+            store = _v4_store(operation_store, monkeypatch)
+            case = await stack.enter_async_context(_semantic_case(store, tmp_path, monkeypatch))
+            work = case["work"]
+            phases = _phases(case)
+            original_admit = semantic_sql.admit_v4_semantic_provider_on_connection
+            original_service = SessionServiceImpl.begin_v4_continuation_semantic_attempt
+
+            async def invoke():
+                return await run_continuation_semantic_advisor(phases, case["runtime"].source.selected)
+
+        clocks = []
+        checks = []
+        outcomes = []
+        sdk = []
+        original_check = ContinuationActionClock.require_active_quota_time
+
+        def check_original_quota(self, *, monotonic_now=None):
+            if not clocks or self is not clocks[0]:
+                return original_check(self, monotonic_now=monotonic_now)
+            assert self._active_stage == "quota" and self._guard_complete
+            assert "preparation" in self._seen
+            checks.append(self)
+            if deadline_observation == "after_preparation":
+                monotonic_now = self.preparation_deadline_monotonic + 0.001
+                assert self._active_stage_deadline_monotonic is not None
+                assert monotonic_now < min(self._active_stage_deadline_monotonic, self.started_monotonic + self.policy.total)
+            elif len(checks) == 2 and not timely:
+                assert self._active_stage_deadline_monotonic is not None
+                if deadline_observation == "late_quota":
+                    monotonic_now = self._active_stage_deadline_monotonic + 0.001
+                    assert monotonic_now < self.started_monotonic + self.policy.total
+                else:
+                    monotonic_now = self.started_monotonic + self.policy.total + 0.001
+            return original_check(self, monotonic_now=monotonic_now)
+
+        def admit_original(conn, service, prepared, *, model, no_sdk_issuer):
+            assert not clocks
+            clocks.append(no_sdk_issuer.clock)
+            return original_admit(conn, service, prepared, model=model, no_sdk_issuer=no_sdk_issuer)
+
+        async def admit_through_original_service(self, *, prepared, requested_model, no_sdk_issuer, required_work):
+            running = prepared.binding.running
+            sid = str(running.claim.session_id)
+            tables = (holds, attempts, usage)
+            with store[0].connect() as conn:
+                before = tuple(tuple(conn.execute(select(table).where(table.c.session_id == sid))) for table in tables)
+            result = await original_service(
+                self, prepared=prepared, requested_model=requested_model, no_sdk_issuer=no_sdk_issuer, required_work=required_work
+            )
+            outcomes.append(result)
+            assert len(checks) == 2 and checks[0] is checks[1] is no_sdk_issuer.clock
+            if timely:
+                assert type(result) is RequiredSQLReturned
+            else:
+                assert type(result) is RequiredSQLRaised and type(result.error) is TimeoutError
+                with store[0].connect() as conn:
+                    assert load_snapshot(conn, session_id=sid, operation_id=running.claim.operation_id) == prepared.snapshot
+                    assert tuple(tuple(conn.execute(select(table).where(table.c.session_id == sid))) for table in tables) == before
+                    effect = conn.execute(
+                        select(effects).where(
+                            effects.c.session_id == sid,
+                            effects.c.operation_id == running.claim.operation_id,
+                            effects.c.effect_key == prepared.binding.effect_key,
+                        )
+                    ).one()
+                assert effect.disposition == "prepared" and effect.provider_attempt_id is None
+                assert not sdk
+            return result
+
+        async def completion(**_kwargs):
+            sdk.append(1)
+            return _reply(json.dumps(_answer(case["request"])) if family == "semantic" else "Original quota-stage PRIMARY reply")
+
+        monkeypatch.setattr(ContinuationActionClock, "require_active_quota_time", check_original_quota)
+        if family == "primary":
+            monkeypatch.setattr(primary_sql, "admit_v4_primary_provider_on_connection", admit_original)
+            monkeypatch.setattr(SessionServiceImpl, "begin_v4_continuation_primary_attempt", admit_through_original_service)
+        else:
+            monkeypatch.setattr(semantic_sql, "admit_v4_semantic_provider_on_connection", admit_original)
+            monkeypatch.setattr(SessionServiceImpl, "begin_v4_continuation_semantic_attempt", admit_through_original_service)
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        if family == "semantic" and not timely:
+            with pytest.raises(TimeoutError, match="continuation quota or original action allowance expired"):
+                await invoke()
+        else:
+            result = await invoke()
+            if family == "primary":
+                assert type(result) is (primary_fixture.PrimaryProviderResult if timely else primary_fixture.PrimaryNoSdkRefusalReceipt)
+            else:
+                assert result is None
+        assert len(outcomes) == 1 and len(checks) == 2
+        assert len(sdk) == (1 if timely else 0)
+        work.coordinator.assert_completed()
 
 
 @pytest.mark.asyncio

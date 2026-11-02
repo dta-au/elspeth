@@ -23,7 +23,7 @@ from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
     ColdCheckpointEndGate,
     require_original_cold_checkpoint_end_gate,
 )
-from elspeth.web.composer.continuation_checkpoint_end_complete_terminal import _original_absent_preflight_is_qualified
+from elspeth.web.composer.continuation_checkpoint_end_complete_terminal import _original_blocked_absent_preflight_is_qualified
 from elspeth.web.composer.continuation_checkpoint_end_input import CheckpointOrdinaryEndCaller
 from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, _capture_owners, _registered_read
 from elspeth.web.composer.continuation_tool_batch import _decode_owned
@@ -110,7 +110,14 @@ async def project_first_cold_end_review(*, gate: ColdCheckpointEndGate) -> ColdP
     no_effectful_recheck = (
         live.state.version == live.initial_version
         and not _state_contains_blob_ref(live.state)
-        and (prior is not None or live.state.validate().is_valid)
+        and (
+            prior is not None
+            or live.state.validate().is_valid
+            or (
+                computation.action == "blocked_or_orphan_terminal"
+                and _original_blocked_absent_preflight_is_qualified(live.state, initial_version=live.initial_version, last_preflight=prior)
+            )
+        )
         and held == prior
         and not interpretation_sites(live.state)
         and not end_input.orphaned_precheck
@@ -151,7 +158,9 @@ async def project_first_cold_end_review(*, gate: ColdCheckpointEndGate) -> ColdP
             or (held is not None and (not held.is_valid or is_pending_interpretation_handoff(held)))
             or (
                 held is None
-                and not _original_absent_preflight_is_qualified(live.state, initial_version=live.initial_version, last_preflight=prior)
+                and not _original_blocked_absent_preflight_is_qualified(
+                    live.state, initial_version=live.initial_version, last_preflight=prior
+                )
             )
         ):
             raise AuditIntegrityError("cold END blocked Review lacks the first qualified terminal branch")

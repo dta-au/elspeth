@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from uuid import uuid4
 
 import litellm
 import pytest
+from pydantic import TypeAdapter
 from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -28,6 +30,7 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
     observe_checkpoint_end_physical_return,
     prepare_checkpoint_end_physical_source,
 )
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, decode_retained_physical_audit_call
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
@@ -35,6 +38,8 @@ from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.provider_cost import CommonProviderCostBudget
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.database_clock import database_now
@@ -42,7 +47,10 @@ from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, load_snapshot, verify_recovery_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import require_end_complete_pass_on_connection
-from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import persist_end_complete_repair_on_connection
+from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import (
+    persist_end_complete_repair_on_connection,
+    prepare_end_complete_repair_batch_on_connection,
+)
 from elspeth.web.sessions.continuation_checkpoint_end_owed import (
     read_v4_checkpoint_end_owed_on_connection,
     retain_v4_checkpoint_end_owed_on_connection,
@@ -58,12 +66,14 @@ from elspeth.web.sessions.continuation_checkpoint_paid_terminal import read_v4_c
 from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
 from elspeth.web.sessions.continuation_end import enter_continuation_end, execute_continuation_end_review
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
-from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
+from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded, admit_retained_payload_chunks
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
+from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
+from tests.helpers.continuation_inventory import inventory_work
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_advisor_checkpoint import _checkpoint_reply
 from tests.unit.web.composer.test_continuation_semantic_advisor import _reply
@@ -72,23 +82,42 @@ from tests.unit.web.coordination import test_composer_operation_authority
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
 from tests.unit.web.sessions import test_continuation_initialization as initialization_fixture
 from tests.unit.web.sessions.test_continuation_primary_result import initialized_primary_input
+from tests.unit.web.sessions.test_continuation_prompt_producers import current_service
 
 operation_store = test_composer_operation_authority.operation_store
 
 
 @pytest.mark.parametrize(
-    ("allowance", "reasoning_bytes", "expect_overflow", "cold_resume", "replacement_audit"),
+    ("allowance", "reasoning_bytes", "expect_overflow", "cold_resume", "replacement_audit", "repeat_recovery", "replacement_overflow"),
     [
-        (16 * 1_048_576, 0, False, False, False),
-        (3_000_000, 700_000, True, False, False),
-        (3_000_000, 700_000, True, True, False),
-        (16 * 1_048_576, 0, False, False, True),
+        (16 * 1_048_576, 0, False, False, False, False, False),
+        (3_000_000, 700_000, True, False, False, False, False),
+        (3_000_000, 700_000, True, True, False, False, False),
+        (16 * 1_048_576, 0, False, False, True, False, False),
+        (16 * 1_048_576, 0, False, False, True, True, False),
+        (3_000_000, 700_000, True, True, True, False, True),
     ],
-    ids=("fitting-complete", "constrained-allowance-rollback", "constrained-cold-overflow", "replacement-audit-source"),
+    ids=(
+        "fitting-complete",
+        "constrained-allowance-rollback",
+        "constrained-cold-overflow",
+        "replacement-audit-source",
+        "replacement-repeated-H",
+        "replacement-cold-overflow",
+    ),
 )
 @pytest.mark.asyncio
 async def test_actual_end_complete_flagged_repair_settles_original_paid_call_once(
-    operation_store, tmp_path, monkeypatch, allowance, reasoning_bytes, expect_overflow, cold_resume, replacement_audit
+    operation_store,
+    tmp_path,
+    monkeypatch,
+    allowance,
+    reasoning_bytes,
+    expect_overflow,
+    cold_resume,
+    replacement_audit,
+    repeat_recovery,
+    replacement_overflow,
 ):
     policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
     assert policy is not None
@@ -308,6 +337,198 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                         incomplete=False,
                     )
                     savepoint.rollback()
+                if repeat_recovery:
+                    current_repository.release(context)
+                    third_store = new_owners(current_store)
+                    third_repository, third_authority, third_sessions = third_store[1:4]
+                    assert third_repository.recover_composer_segment(
+                        session_id=running.claim.session_id,
+                        operation_id=running.claim.operation_id,
+                        expected_generation=claim.ownership_generation,
+                        actor_user_id="alice",
+                        auth_provider_type="local",
+                    )
+                    (third_claim,) = third_authority.claim_segment(limit=1)
+                    third_context = third_repository.start_composer_segment(
+                        third_claim,
+                        owner_instance_id=third_authority._owner_instance_id,
+                        lease_seconds=30,
+                        auth_provider_type="local",
+                    )
+                    assert third_claim.ownership_generation == claim.ownership_generation + 1
+                    with (
+                        locked_session_transaction(store[0], str(store[4])) as conn,
+                        third_sessions._session_write_lock(conn, str(store[4])),
+                    ):
+                        same_h = read_v4_checkpoint_end_owed_on_connection(
+                            conn,
+                            session_id=str(store[4]),
+                            operation_id=running.claim.operation_id,
+                            attempt_id=admission.attempt.attempt_id,
+                            names=prepared.env_ref_names,
+                        )
+                        assert same_h == fresh
+                        assert (
+                            read_current_end_h_recovery_on_connection(conn, selected=same_h.selected, names=prepared.env_ref_names)
+                            == same_h
+                        )
+                        verify_recovery_on_connection(conn, receipt)
+                        second_receipt = replace(
+                            receipt,
+                            previous_generation=claim.ownership_generation,
+                            generation=third_claim.ownership_generation,
+                        )
+                        verify_recovery_on_connection(conn, second_receipt)
+                        second_predecessor = conn.execute(
+                            select(attempts).where(
+                                attempts.c.session_id == str(store[4]),
+                                attempts.c.operation_id == running.claim.operation_id,
+                                attempts.c.sequence == running.claim.segment_sequence,
+                                attempts.c.generation == claim.ownership_generation,
+                            )
+                        ).one()
+                        assert second_predecessor.outcome == "interrupted"
+                        assert second_predecessor.recovered_end_h_checkpoint_id == same_h.selected.checkpoint_id
+                        with pytest.raises(SessionOperationFenceLost):
+                            admit_checkpoint_paid_audit_source_on_connection(
+                                conn,
+                                service=third_sessions,
+                                context=context,
+                                owed=same_h,
+                                call=call,
+                                cohort=cohort,
+                                names=prepared.env_ref_names,
+                            )
+                        third_write = conn.begin_nested()
+                        admit_checkpoint_paid_audit_source_on_connection(
+                            conn,
+                            service=third_sessions,
+                            context=third_context,
+                            owed=same_h,
+                            call=call,
+                            cohort=cohort,
+                            names=prepared.env_ref_names,
+                        )
+                        third_write.rollback()
+                    third_repository.release(third_context)
+                if replacement_overflow:
+                    peer_service, _actors = current_service(current_store)
+                    peer_service._advisor_checkpoint._prompt_guard_mount = PromptGuardMount(
+                        _GuardClient(PromptGuardDecision("allow", "clean"))
+                    )
+                    peer_work = inventory_work(replacement)
+                    peer_owner = ProviderInvocationOwner(service=current_sessions, required_work=peer_work)
+                    peer_lease = await ContinuationLeaseAdoption(
+                        current_repository, context, lease_seconds=30, required_work=peer_work.coordinator
+                    ).join()
+                    try:
+                        peer_phases = ContinuationLivePhases(
+                            service=peer_service,
+                            authority=current_authority,
+                            work=peer_work,
+                            provider_owner=peer_owner,
+                            lease=peer_lease,
+                        )
+                        peer_selected = await load_selected_continuation(
+                            authority=current_authority,
+                            running=replacement,
+                            selected=owed.owed_selected,
+                            required_work=peer_work,
+                        )
+                        cold_source = await read_cold_checkpoint_end_consequence_source(phases=peer_phases, selected=peer_selected)
+                        original_publication = TypeAdapter(AdvisorPublicationReview).validate_json(
+                            cold_source.end_input.publication_review_json
+                        )
+                        original_assistant = json.loads(cold_source.end_input.assistant_message_json)
+                        original_operation = cold_source.owed.new_hold.session_operation_id
+                        current_operation = cold_source.runtime.live.turn_evidence.operation_id
+                        assert current_operation != original_operation
+                        source_publication = cold_source.runtime.live.turn_evidence.review_candidate_for_source_operation(
+                            source_operation_id=original_operation,
+                            candidate=original_assistant["content"] or "",
+                            request=cold_source.runtime.bindings.message,
+                            current_state=cold_source.runtime.live.state,
+                        )
+                        assert source_publication == original_publication
+                        current_publication = cold_source.runtime.live.turn_evidence.review_candidate(
+                            candidate=original_assistant["content"] or "",
+                            request=cold_source.runtime.bindings.message,
+                            current_state=cold_source.runtime.live.state,
+                        )
+                        assert current_publication != original_publication
+                        cold_gate = await compute_first_cold_checkpoint_end_gate(source=cold_source)
+                        cold_projected = await project_first_cold_end_repair(gate=cold_gate)
+                        assert type(cold_projected) is ColdProjectedEndRepair
+                        with locked_session_transaction(store[0], str(store[4])) as conn:
+                            projected_batch = prepare_end_complete_repair_batch_on_connection(
+                                conn,
+                                physical=None,
+                                prepared=None,
+                                owed_admission=None,
+                                owed=cold_source.owed,
+                                selected=cold_source.selected,
+                                returned=None,
+                                projected=cold_projected,
+                                published_at=database_now(conn),
+                            )
+                            with pytest.raises(ContinuationRetainedCapacityExceeded) as measured:
+                                admit_retained_payload_chunks(
+                                    conn,
+                                    session_id=str(store[4]),
+                                    operation_id=running.claim.operation_id,
+                                    prospective=(*projected_batch.prospective, *projected_batch.unpaid_reserve),
+                                    retained_payload_limit_bytes=fresh.new_hold.allowance_bytes,
+                                    consuming_hold=fresh.new_hold,
+                                )
+                        terminal = current_sessions.settle_cold_v4_checkpoint_end_owed_overflow_sync(
+                            cold_source=cold_source,
+                            failure=measured.value,
+                            capacity_projection=cold_projected,
+                        )
+                        assert terminal.receipt.representation == "retained_tail"
+                        assert terminal.receipt.reason == "retained_payload_bytes"
+                        assert terminal.hold_state == "consumed"
+                        with locked_session_transaction(store[0], str(store[4])) as conn:
+                            verify_recovery_on_connection(conn, receipt)
+                            assert (
+                                read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
+                                    conn,
+                                    session_id=running.claim.session_id,
+                                    operation_id=running.claim.operation_id,
+                                    effect_key=fresh.effect_key,
+                                    names=prepared.env_ref_names,
+                                )
+                                == terminal
+                            )
+                            changed_outer = conn.begin_nested()
+                            conn.execute(
+                                update(effects)
+                                .where(
+                                    effects.c.session_id == str(store[4]),
+                                    effects.c.operation_id == running.claim.operation_id,
+                                    effects.c.effect_key == fresh.outer_effect_key,
+                                )
+                                .values(disposition="dispatched")
+                            )
+                            with pytest.raises(AuditIntegrityError, match="complete terminal effect inventory"):
+                                verify_recovery_on_connection(conn, receipt)
+                            changed_outer.rollback()
+                            tampered = conn.begin_nested()
+                            conn.execute(
+                                update(holds)
+                                .where(
+                                    holds.c.session_id == str(store[4]),
+                                    holds.c.operation_id == running.claim.operation_id,
+                                    holds.c.effect_key == fresh.effect_key,
+                                )
+                                .values(state="active", consumed_at=None)
+                            )
+                            with pytest.raises(AuditIntegrityError, match="settled child with unconsumed hold"):
+                                verify_recovery_on_connection(conn, receipt)
+                            tampered.rollback()
+                    finally:
+                        await peer_lease.close()
+                        peer_work.coordinator.assert_completed()
                 retained.append((None, None, owed, prepared, returned, None))
                 raise CapturedBeforeEndConsequences
             selected_owed = await load_selected_continuation(
@@ -359,6 +580,10 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
 
         monkeypatch.setattr(phases.service._advisor_checkpoint, "_run_advisor_checkpoint", intercept_original_end_gate)
         with pytest.raises(CapturedBeforeEndConsequences):
+            end_clock = ContinuationActionClock(entered.source.policy.actions.advisor)
+            if work.coordinator.sql_deadline_owner is not None:
+                work.coordinator.sql_deadline_owner.begin_action(end_clock.policy, started_at=end_clock.started_monotonic)
+            phases.bind_action_clock(end_clock)
             await execute_continuation_end_review(phases, entered.source.selected)
         assert sdk_calls == [1] and len(retained) == 1
         batch, projected, owed, prepared, returned, failure = retained[0]

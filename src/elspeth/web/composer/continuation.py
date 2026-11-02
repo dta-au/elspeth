@@ -104,6 +104,7 @@ class PrivateChunkRef(ContinuationValue):
         "composer.checkpoint-end-input.v1",
         "composer.paid-overflow.v1",
         "composer.paid-incomplete.v1",
+        "composer.sdk-terminal.v1",
         "composer.semantic-frontier.v1",
         "composer.owner-result.v1",
         "composer.bootstrap.v1",
@@ -116,7 +117,15 @@ class PrivateChunkRef(ContinuationValue):
 class EffectFrontierEntry(ContinuationValue):
     effect_id: str
     disposition: Literal[
-        "prepared", "dispatched", "committed", "refused", "unknown", "paid_overflow", "paid_incomplete", "validation_incomplete"
+        "prepared",
+        "dispatched",
+        "committed",
+        "refused",
+        "unknown",
+        "paid_overflow",
+        "paid_incomplete",
+        "validation_incomplete",
+        "sdk_terminal",
     ]
     receipt_id: str | None
 
@@ -262,7 +271,9 @@ class ContinuationFrameStack(ContinuationValue):
     def is_handoff_safe(self) -> bool:
         if self.pending_settlement_ids or self.pending_owner_results:
             return False
-        if any(e.disposition in ("dispatched", "unknown", "paid_overflow", "paid_incomplete") for e in self.effect_frontier):
+        if any(
+            e.disposition in ("dispatched", "unknown", "paid_overflow", "paid_incomplete", "sdk_terminal") for e in self.effect_frontier
+        ):
             return False
         top = self.frames[-1]
         return (
@@ -303,6 +314,11 @@ class ContinuationFrameStack(ContinuationValue):
 
             if type(decode_continuation_policy(self.admission_policy_json, self.policy_hash)) is not ContinuationAdmissionPolicyV4:
                 raise ValueError("paid incomplete provider result requires its original V4 admission")
+        if any(effect.disposition == "sdk_terminal" for effect in self.effect_frontier):
+            from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+
+            if type(decode_continuation_policy(self.admission_policy_json, self.policy_hash)) is not ContinuationAdmissionPolicyV4:
+                raise ValueError("SDK terminal requires its original V4 admission")
         for result in self.pending_owner_results:
             effect = effects.get(result.effect_key)
             if effect is None or effect.disposition != "committed" or effect.receipt_id is None:

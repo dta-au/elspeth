@@ -972,7 +972,7 @@ def admit_v4_semantic_provider_on_connection(
     if type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer or no_sdk_issuer.prepared_candidate is not prepared:
         raise AuditIntegrityError("V4 semantic admission changed its original no-SDK issuer")
     no_sdk_issuer.require_original_clock()
-    no_sdk_issuer.clock.require_preparation_time()
+    no_sdk_issuer.clock.require_active_quota_time()
     binding, selected = prepared.binding, prepared.snapshot
     running = binding.running
     root = _current(conn, running, selected)
@@ -1097,7 +1097,7 @@ def admit_v4_semantic_provider_on_connection(
         )
         if stored != admitted:
             raise AuditIntegrityError("V4 semantic dispatch changed its reserved complete snapshot")
-        no_sdk_issuer.clock.require_preparation_time()
+        no_sdk_issuer.clock.require_active_quota_time()
         no_sdk_issuer.note_dispatched_candidate(stored)
         return V4SemanticProviderAdmission(attempt, stored, hold, tail, incomplete_tail, no_sdk_tail)
 

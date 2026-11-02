@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
     from elspeth.web.sessions.composer_operations import ComposerOperationRunning
     from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation_checkpoint_end_retry import VerifiedEndFormatRetry
     from elspeth.web.sessions.continuation_iteration_return import IterationStageData
 
 
@@ -256,6 +257,7 @@ def validate_continuation_structure_data_on_connection(
             return ambiguous
     if type(top) is EndFrame and ambiguous:
         from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
+        from elspeth.web.sessions.continuation_checkpoint_end_retry import read_retry_ready_action_source_on_connection
 
         held_end = read_current_end_h_recovery_on_connection(conn, selected=stored, names=env_ref_names)
         if held_end is not None:
@@ -266,6 +268,20 @@ def validate_continuation_structure_data_on_connection(
             ):
                 raise AuditIntegrityError("structural END H changed its exact paid pending frontier")
             return ambiguous
+        retry_ready = read_retry_ready_action_source_on_connection(
+            conn,
+            session_id=str(session_id),
+            operation_id=operation_id,
+            selected=stored,
+            names=env_ref_names,
+        )
+        if retry_ready is not None:
+            policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+            next_continuation_action_policy(selected=selected, policy=policy, retry_ready=retry_ready)
+            # One original paid child is complete and its format-retry marker
+            # is current. The outer D remains open by design; the next owner
+            # may restore its original gate, but this read grants no SDK use.
+            return ()
         from elspeth.web.composer.continuation_end_effects import end_effect_key
         from elspeth.web.composer.continuation_end_transitions import END_EFFECT_OWNER
 
@@ -552,6 +568,7 @@ def next_continuation_action_policy(
     *,
     selected: SelectedContinuationState,
     policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+    retry_ready: VerifiedEndFormatRetry | None = None,
 ) -> ContinuationActionPolicy:
     if type(selected) is not SelectedContinuationState or type(policy) not in (
         ContinuationAdmissionPolicy,
@@ -564,9 +581,36 @@ def next_continuation_action_policy(
     root = selected.stack
     if decode_continuation_policy(root.admission_policy_json, root.policy_hash) != policy:
         raise AuditIntegrityError("next allowance changed its retained complete policy")
+    if retry_ready is not None:
+        from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
+        from elspeth.web.sessions.continuation_checkpoint_end_retry import VerifiedEndFormatRetry
+
+        if (
+            type(retry_ready) is not VerifiedEndFormatRetry
+            or type(policy) is not ContinuationAdmissionPolicyV4
+            or retry_ready.selected.checkpoint_id != selected.checkpoint_id
+            or retry_ready.selected.payload_json != encode_continuation_snapshot(root)
+            or retry_ready.marker.operation_id != root.logical.operation_id
+            or retry_ready.marker.session_id != root.logical.session_id
+        ):
+            raise AuditIntegrityError("next END retry allowance lost its exact current V4 source")
     require_resumable_cut(root)
     top = root.frames[-1]
     if type(top) is EndFrame:
+        if retry_ready is not None:
+            if (
+                len(root.frames) != 2
+                or type(root.frames[0]) is not ComposeFrame
+                or top.phase != "review_needed"
+                or root.pending_owner_results
+                or root.pending_settlement_ids
+                or tuple(item.effect_id for item in root.effect_frontier if item.disposition in ("prepared", "dispatched", "unknown"))
+                != (retry_ready.marker.outer_effect_key,)
+                or root.active_action_json is not None
+                or root.active_action_source is not None
+            ):
+                raise AuditIntegrityError("next END retry allowance changed its original review cut")
+            return policy.actions.advisor
         if (
             len(root.frames) != 2
             or type(root.frames[0]) is not ComposeFrame

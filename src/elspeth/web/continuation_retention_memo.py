@@ -30,7 +30,10 @@ from elspeth.contracts.credential_material import (
     find_credential_material,
 )
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_limits import (
+    CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES,
+    CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+)
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation import ContinuationFrameStack, PrivateChunkRef
@@ -206,6 +209,11 @@ class RetentionStageMemo:
             raise AuditIntegrityError("Nested Advisor memo requires one active text-only preparation owner")
         self._legacy_advisor_owner = legacy_advisor_owner
         self._text_parent = text_parent
+        self._shared_text_budget_bytes = (
+            CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES
+            if legacy_advisor_owner is not None
+            else CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        )
         self._lock = Lock()
         self._closed = False
         self._snapshots: dict[tuple[Callable[[str], ContinuationFrameStack], SnapshotDecodeKey], ContinuationFrameStack] = {}
@@ -387,10 +395,10 @@ class RetentionStageMemo:
                 self._canonical_proofs.move_to_end(cache_key)
                 return hit
             self._canonical_text = None
-            while self._canonical_proof_bytes + size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            while self._canonical_proof_bytes + size > self._shared_text_budget_bytes:
                 _, evicted = self._canonical_proofs.popitem(last=False)
                 self._canonical_proof_bytes -= evicted.retained_bytes
-            while self._canonical_proof_bytes + self._recorder_block_hash_bytes + size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            while self._canonical_proof_bytes + self._recorder_block_hash_bytes + size > self._shared_text_budget_bytes:
                 _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                 self._recorder_block_hash_bytes -= evicted_size
             self._canonical_proofs[cache_key] = proof
@@ -421,7 +429,7 @@ class RetentionStageMemo:
                 self._recorder_block_hashes.move_to_end(cache_key)
                 return
             self._canonical_text = None
-            while self._canonical_proof_bytes + self._recorder_block_hash_bytes + size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            while self._canonical_proof_bytes + self._recorder_block_hash_bytes + size > self._shared_text_budget_bytes:
                 if self._recorder_block_hashes:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size

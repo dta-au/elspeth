@@ -59,8 +59,10 @@ from elspeth.web.composer.provider_quota import (
     ProviderInvocationFamily,
     ProviderInvocationOwner,
     V4PaidIncompleteCommitted,
+    V4SdkTerminalCommitted,
 )
 from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness, V4ProviderResultIncomplete
+from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -83,6 +85,7 @@ from elspeth.web.sessions.continuation_primary import (
     V4PrimaryProviderAdmission,
     primary_action_wire_message,
 )
+from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal, VerifiedSdkTerminal
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.service import SessionServiceImpl
 
@@ -550,7 +553,7 @@ async def _run_v4_primary_after_prepared(
     deadline: float,
     env_ref_names: frozenset[str],
     on_sdk_entry: Callable[[], None] | None,
-) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal | PrimaryPaidIncompleteTerminal | PrimaryNoSdkRefusalReceipt:
+) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal | PrimaryPaidIncompleteTerminal | PrimarySdkTerminal | PrimaryNoSdkRefusalReceipt:
     """Keep one pre-SDK H and one in-scope paid observation on the same custody."""
     custody: ProviderCallCustody | None = None
     sessions = service._require_sessions_service()
@@ -619,8 +622,17 @@ async def _run_v4_primary_after_prepared(
                 prepared=prepared, admission=admission, incomplete=incomplete, call=custody.call, required_work=sql
             )
 
+        async def sdk_finalizer(observed: V4SdkFailureObservation, sql: RequiredWorkTicket) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+            admission = custody.continuation_primary_v4_admission
+            if type(admission) is not V4PrimaryProviderAdmission:
+                raise AuditIntegrityError("PRIMARY SDK terminal lost its original admitted source")
+            return await sessions.finalize_v4_continuation_primary_sdk_terminal(
+                prepared=prepared, admission=admission, observation=observed, custody=custody, required_work=sql
+            )
+
         custody.bind_continuation_primary_v4(prepared, finalizer)
         custody.bind_v4_returned_incomplete_finalizer(incomplete_finalizer)
+        custody.bind_v4_sdk_finalizer(sdk_finalizer)
         actual = await service._provider_gateway._call_llm_outcome_with_audit(
             provider_input.evidence.messages,
             provider_input.tools if provider_input.tools is not None else [],
@@ -632,6 +644,11 @@ async def _run_v4_primary_after_prepared(
             prepared_input=provider_input,
             on_sdk_entry=on_sdk_entry,
         )
+    except V4SdkTerminalCommitted as control:
+        if custody is None or custody.v4_sdk_terminal_result is not control.finalization:
+            raise AuditIntegrityError("PRIMARY SDK control changed its original committed custody") from control
+        sdk_finalized = control.finalization
+        return PrimarySdkTerminal(sdk_finalized.verified.receipt, sdk_finalized.verified.terminal, sdk_finalized.deferred_cancellations)
     except V4PaidIncompleteCommitted as control:
         if custody is None:
             raise AuditIntegrityError("V4 PRIMARY incomplete control lost its original custody") from control
@@ -695,6 +712,7 @@ async def run_continuation_primary(
     PrimaryProviderResult
     | PrimaryPaidOverflowTerminal
     | PrimaryPaidIncompleteTerminal
+    | PrimarySdkTerminal
     | PrimaryNoSdkRefusalReceipt
     | V3UnboundedTailRefusal
 ):

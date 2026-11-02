@@ -25,7 +25,10 @@ from elspeth.web.composer.continuation_codec import (
     encode_continuation_snapshot,
     encode_private_chunk,
 )
-from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_limits import (
+    CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES,
+    CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+)
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy
 from elspeth.web.continuation_retention_memo import (
     CanonicalTextEncodingKey,
@@ -175,6 +178,71 @@ def test_canonical_sha_proofs_are_exact_and_share_one_existing_byte_budget() -> 
         memo.canonical_text_proof(second, encode, hashlib.sha256)
         assert calls == ["a", "b", "c", "b"]
     assert memo.cached_entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_advisor_wider_shared_text_pool_keeps_individual_and_default_limits() -> None:
+    clock = _advisor_clock()
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    retained_bound = CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES
+    proof_weight = 250_000 * 2 + 64 + len(str(bound))
+    fits = retained_bound // proof_weight
+    assert fits == 10 and fits * proof_weight <= retained_bound < (fits + 1) * proof_weight
+    keys = [CanonicalTextEncodingKey(chr(ord("a") + index) * 250_000, bound) for index in range(fits + 2)]
+    calls: list[str] = []
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls.append(key.canonical[:1])
+        return key.canonical.encode("utf-8")
+
+    with legacy_advisor_preparation_memo_scope(clock) as parent:
+        for key in keys[:fits]:
+            parent.canonical_text_proof(key, encode, hashlib.sha256)
+        assert len(parent._canonical_proofs) == fits
+        assert parent._canonical_proof_bytes == fits * proof_weight
+        for key in keys[:fits]:
+            parent.canonical_text_proof(key, encode, hashlib.sha256)
+        assert len(calls) == fits
+        parent.canonical_text_proof(keys[fits], encode, hashlib.sha256)
+        assert len(parent._canonical_proofs) == fits
+        assert (encode, hashlib.sha256, keys[0]) not in parent._canonical_proofs
+        parent.canonical_text_proof(keys[fits + 1], encode, hashlib.sha256)
+        assert (encode, hashlib.sha256, keys[1]) not in parent._canonical_proofs
+        assert parent._canonical_proof_bytes <= retained_bound
+        with borrow_legacy_advisor_inflight_memo(parent, clock):
+            child = current_retention_stage_memo()
+            assert child is not None and child is not parent
+            child.canonical_text_proof(keys[0], encode, hashlib.sha256)
+            assert not child._canonical_proofs and len(parent._canonical_proofs) == fits
+        assert not child.active
+    assert parent.cached_entry_count == 0
+
+    with retention_stage_memo_scope() as default:
+        for key in keys[:fits]:
+            default.canonical_text_proof(key, encode, hashlib.sha256)
+        assert len(default._canonical_proofs) == bound // proof_weight == 2
+        assert default._canonical_proof_bytes <= bound
+        assert (encode, hashlib.sha256, keys[0]) not in default._canonical_proofs
+
+    oversized = CanonicalTextEncodingKey("x" * 600_000, bound)
+    block_text = "z" * (bound - 63)
+    block = RecorderBlockHashKey(hashlib.sha256(block_text.encode()).hexdigest(), block_text)
+    oversized_calls: list[str] = []
+
+    def oversized_encode(key: CanonicalTextEncodingKey) -> bytes:
+        oversized_calls.append("proof")
+        return key.canonical.encode("utf-8")
+
+    def verify_block(key: RecorderBlockHashKey) -> None:
+        oversized_calls.append("block")
+        assert hashlib.sha256(key.canonical.encode()).hexdigest() == key.expected_digest
+
+    with legacy_advisor_preparation_memo_scope(_advisor_clock()) as parent:
+        for _ in range(2):
+            parent.canonical_text_proof(oversized, oversized_encode, hashlib.sha256)
+            parent.recorder_block_hash(block, verify_block)
+        assert oversized_calls == ["proof", "block", "proof", "block"]
+        assert not parent._canonical_proofs and not parent._recorder_block_hashes
 
 
 def test_canonical_sha_proof_does_not_cache_oversize_or_foreign_producer() -> None:

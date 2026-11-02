@@ -56,6 +56,13 @@ from elspeth.web.sessions.continuation_checkpoint_end_owed import (
     read_v4_checkpoint_end_owed_on_connection,
 )
 from elspeth.web.sessions.continuation_checkpoint_end_recovery import require_end_h_anchored_generation_chain_on_connection
+from elspeth.web.sessions.continuation_checkpoint_end_retry import (
+    ColdProjectedEndFormatRetry,
+    ColdProjectedEndFormatRetryOverflow,
+    recheck_cold_end_format_retry_capture_overflow_on_connection,
+    reprepare_cold_end_format_retry_prospective_on_connection,
+    require_original_cold_end_format_retry_projection,
+)
 from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
 from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
     admit_checkpoint_paid_audit_source_on_connection,
@@ -254,8 +261,11 @@ def settle_cold_v4_checkpoint_end_owed_overflow_on_connection(
     *,
     service: object,
     cold_source: ColdCheckpointEndConsequenceSource,
-    failure: ContinuationRetainedCapacityExceeded | ColdProjectedEndRepairOverflow | ColdProjectedEndReviewOverflow,
-    capacity_projection: ColdProjectedEndRepair | ColdProjectedEndReview | None = None,
+    failure: ContinuationRetainedCapacityExceeded
+    | ColdProjectedEndRepairOverflow
+    | ColdProjectedEndReviewOverflow
+    | ColdProjectedEndFormatRetryOverflow,
+    capacity_projection: ColdProjectedEndRepair | ColdProjectedEndReview | ColdProjectedEndFormatRetry | None = None,
 ) -> VerifiedCheckpointPaidOverflowTerminal:
     """Consume the same exact overflow batch from a re-read H after owner loss."""
     if not conn.in_transaction() or type(cold_source) is not ColdCheckpointEndConsequenceSource:
@@ -275,8 +285,12 @@ def settle_cold_v4_checkpoint_end_owed_overflow_on_connection(
         if failure.gate.source is not cold_source:
             raise AuditIntegrityError("cold END Review overflow changed its source H")
         witness = require_original_cold_end_review_overflow(failure)
+    elif type(failure) is ColdProjectedEndFormatRetryOverflow:
+        if capacity_projection is not None or failure.source is not cold_source:
+            raise AuditIntegrityError("cold END retry capture overflow changed its source H")
+        witness = recheck_cold_end_format_retry_capture_overflow_on_connection(conn, service=service, failure=failure)
     elif type(failure) is ContinuationRetainedCapacityExceeded:
-        if type(capacity_projection) is not ColdProjectedEndRepair and type(capacity_projection) is not ColdProjectedEndReview:
+        if type(capacity_projection) not in (ColdProjectedEndRepair, ColdProjectedEndReview, ColdProjectedEndFormatRetry):
             raise AuditIntegrityError("cold END aggregate excess lacks its exact admitted projection")
         witness = failure
     else:
@@ -323,6 +337,20 @@ def settle_cold_v4_checkpoint_end_owed_overflow_on_connection(
                 observed_at=database_now(conn),
             )
             prospective = review_batch.prospective
+        elif type(capacity_projection) is ColdProjectedEndFormatRetry:
+            require_original_cold_end_format_retry_projection(capacity_projection)
+            if capacity_projection.source is not cold_source:
+                raise AuditIntegrityError("cold END retry capacity changed its source H")
+            prospective = reprepare_cold_end_format_retry_prospective_on_connection(conn, service=service, source=cold_source)
+            originally_measured = capacity_projection.prospective
+            if (
+                len(prospective) != 4
+                or len(originally_measured) != 4
+                or prospective[:3] != originally_measured[:3]
+                or prospective[3].payload != originally_measured[3].payload
+                or prospective[3].codec != originally_measured[3].codec
+            ):
+                raise AuditIntegrityError("cold END retry capacity changed its exact retained proposal")
         else:
             raise AuditIntegrityError("cold END aggregate excess changed its admitted projection")
         try:

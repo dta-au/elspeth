@@ -15,6 +15,7 @@ from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
     from elspeth.web.composer.provider_quota import ProviderCallCustody
     from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
 
@@ -47,7 +48,7 @@ class CheckpointNoSdkIssuer:
     one permit. SQL still revalidates the current source and attempt under lock.
     """
 
-    def __init__(self, prepared: PreparedCheckpointProvider) -> None:
+    def __init__(self, prepared: PreparedCheckpointProvider, *, clock: ContinuationActionClock) -> None:
         from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkRole
         from elspeth.web.sessions.composer_operations import ComposerOperationRunning
         from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
@@ -65,12 +66,20 @@ class CheckpointNoSdkIssuer:
         ):
             raise AuditIntegrityError("checkpoint no-SDK issuer requires its original prepared operation")
         self.prepared = prepared
+        self.clock = clock
+        self.require_original_clock()
         self._lock = RLock()
         self._custody: ProviderCallCustody | None = None
         self._admission: V4CheckpointProviderAdmission | None = None
         self._observed_model: str | None = None
         self._failure: BaseException | None = None
         self._permit: CheckpointNoSdkRefusalPermit | None = None
+
+    def require_original_clock(self) -> None:
+        from elspeth.web.composer.continuation_checkpoint_end_physical import require_checkpoint_end_prepared_clock
+
+        if require_checkpoint_end_prepared_clock(self.prepared) is not self.clock:
+            raise AuditIntegrityError("checkpoint no-SDK issuer replaced its original driver clock")
 
     def bind_custody(self, custody: ProviderCallCustody) -> None:
         from elspeth.web.composer.provider_quota import ProviderCallCustody

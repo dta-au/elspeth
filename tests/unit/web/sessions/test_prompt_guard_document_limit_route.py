@@ -11,6 +11,7 @@ stands in for the model.
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections import Counter
 from collections.abc import Sequence
@@ -30,7 +31,10 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import continuation_semantic_advisor, continuation_semantic_advisor_phase, prompt_guard
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
-from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_limits import (
+    CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES,
+    CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+)
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, decode_continuation_policy
 from elspeth.web.composer.continuation_progress import decode_continuation_frontier
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
@@ -372,14 +376,20 @@ def _install_advisor_preparation_profile(
         memo.canonical_text_proof(first, encode, sha256)
         memo.canonical_text_proof(CanonicalTextEncodingKey("probe-two", 100), encode, sha256)
         memo.canonical_text_encoding(CanonicalTextEncodingKey("replacement", 100), encode)
-        memo.canonical_text_proof(CanonicalTextEncodingKey("a" * 300_000, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES), encode, sha256)
-        memo.canonical_text_proof(CanonicalTextEncodingKey("b" * 300_000, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES), encode, sha256)
+        proof_weight = 300_000 * 2 + 64 + len(str(CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES))
+        fits = CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES // proof_weight
+        for index in range(fits + 1):
+            memo.canonical_text_proof(
+                CanonicalTextEncodingKey(chr(ord("a") + index) * 300_000, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES),
+                encode,
+                sha256,
+            )
     assert counts[("control", "canonical_text_proof", "hit")] == 1
-    assert counts[("control", "canonical_text_proof", "miss")] == 4
+    assert counts[("control", "canonical_text_proof", "miss")] == 2 + fits + 1
     assert counts[("control", "canonical_text_encoding", "evicted")] == 2
     assert counts[("control", "canonical_text_encoding", "replaced")] == 2
     assert counts[("control", "canonical_text_proof", "budget_evicted")] == 1
-    assert counts[("all", "shared_budget", "highwater_bytes")] <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    assert counts[("all", "shared_budget", "highwater_bytes")] <= CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES
     stage.reset(token)
     target_operation.clear()
     counts.clear()
@@ -397,7 +407,12 @@ async def test_indivisible_history_unit_at_limit_is_inspected_whole_and_one_more
     semantic_scalar_lengths: list[dict[str, int]] = []
     current_session: list[Any] = []
     service_ref: list[Any] = []
-    profile_target, profile_counts, profile_cuts = _install_advisor_preparation_profile(monkeypatch)
+    # The canonical route runs without memo instrumentation. A targeted
+    # diagnostic may opt in with U24_TEST_MEMO_PROFILE=1 for separate evidence.
+    if os.environ.get("U24_TEST_MEMO_PROFILE") == "1":
+        profile_target, profile_counts, profile_cuts = _install_advisor_preparation_profile(monkeypatch)
+    else:
+        profile_target, profile_counts, profile_cuts = [], Counter(), []
     profile_reports: dict[str, dict[str, Any]] = {}
 
     def capture_profile(label: str) -> None:

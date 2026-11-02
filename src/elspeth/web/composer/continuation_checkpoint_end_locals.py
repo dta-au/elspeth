@@ -31,6 +31,7 @@ from elspeth.web.execution.completion_gates import CompletionGateFacts
 from elspeth.web.execution.schemas import ValidationResult
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_checkpoint_end_format_retry import CheckpointEndRetryPublicationSource
     from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
 
 
@@ -153,6 +154,7 @@ class _OriginalEndGateLocals:
     request: str
     publication_binding: str
     dialogue: _BorrowedEndDialogue | None
+    format_retry_publication_source: CheckpointEndRetryPublicationSource | None
 
 
 _issued: WeakKeyDictionary[CheckpointEndGateLocals, _OriginalEndGateLocals] = WeakKeyDictionary()
@@ -168,6 +170,7 @@ def capture_checkpoint_end_gate_locals(
     session_id: str | None,
     request: str,
     dialogue: Sequence[GuardedProviderMessage] | None,
+    format_retry_publication_source: CheckpointEndRetryPublicationSource | None = None,
 ) -> CheckpointEndGateLocals:
     """Issue only at the original gate; check actual runtime values before SDK."""
     from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
@@ -207,7 +210,14 @@ def capture_checkpoint_end_gate_locals(
             raise AuditIntegrityError("source-proof END input changed its terminal-only dialogue or verdict")
     elif dialogue is not None or value.allow_repair_continue or phase_owner.phase_source.kind != "iteration_end":
         raise AuditIntegrityError("iteration END input changed its terminal-only caller")
-    publication = evidence.review_candidate(candidate=value.assistant_message.content or "", request=request, current_state=state)
+    publication = _current_end_publication(
+        evidence=evidence,
+        candidate=value.assistant_message.content or "",
+        request=request,
+        state=state,
+        phase_owner=phase_owner,
+        format_retry_publication_source=format_retry_publication_source,
+    )
     if publication != value.publication_review:
         raise AuditIntegrityError("END gate locals changed the original publication review")
     _issued[value] = _OriginalEndGateLocals(
@@ -219,6 +229,7 @@ def capture_checkpoint_end_gate_locals(
         request,
         publication.binding,
         None if dialogue is None else _BorrowedEndDialogue(dialogue),
+        format_retry_publication_source,
     )
     return value
 
@@ -235,8 +246,47 @@ def require_original_checkpoint_end_gate_locals(value: CheckpointEndGateLocals, 
     require_original_pending_review_observation(
         value.orphan_observation, owner=source.surfacing, state=source.state, session_id=source.session_id
     )
-    publication = source.evidence.review_candidate(
-        candidate=value.assistant_message.content or "", request=source.request, current_state=source.state
+    publication = _current_end_publication(
+        evidence=source.evidence,
+        candidate=value.assistant_message.content or "",
+        request=source.request,
+        state=source.state,
+        phase_owner=phase_owner,
+        format_retry_publication_source=source.format_retry_publication_source,
     )
     if publication != value.publication_review or publication.binding != source.publication_binding:
         raise AuditIntegrityError("END gate publication changed after local capture")
+
+
+def original_end_retry_publication_operation_id(value: CheckpointEndGateLocals, *, phase_owner: CheckpointPhaseOwner) -> str:
+    """Return first-H scope only from an issued retry gate and its actual owner."""
+    require_original_checkpoint_end_gate_locals(value, phase_owner=phase_owner)
+    source = _issued[value]
+    token = source.format_retry_publication_source
+    if token is None:
+        raise AuditIntegrityError("END retry publication lacks its issued original H scope")
+    from elspeth.web.composer.continuation_checkpoint_end_format_retry import require_original_checkpoint_end_retry_publication
+
+    return require_original_checkpoint_end_retry_publication(token, phase_owner=phase_owner)
+
+
+def _current_end_publication(
+    *,
+    evidence: TurnEvidence,
+    candidate: str,
+    request: str,
+    state: CompositionState,
+    phase_owner: CheckpointPhaseOwner,
+    format_retry_publication_source: CheckpointEndRetryPublicationSource | None,
+) -> AdvisorPublicationReview:
+    if format_retry_publication_source is None:
+        return evidence.review_candidate(candidate=candidate, request=request, current_state=state)
+    from elspeth.web.composer.continuation_checkpoint_end_format_retry import require_original_checkpoint_end_retry_publication
+
+    original_operation_id = require_original_checkpoint_end_retry_publication(format_retry_publication_source, phase_owner=phase_owner)
+    return evidence.review_candidate_for_source_operation(
+        source_operation_id=original_operation_id,
+        candidate=candidate,
+        request=request,
+        current_state=state,
+    )

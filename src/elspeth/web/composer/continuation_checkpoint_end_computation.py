@@ -62,6 +62,7 @@ def compute_end_gate(
     max_passes: int,
     allow_repair_continue: bool,
     dialogue_length: int | None,
+    original_source_operation_id: str | None = None,
 ) -> EndGateComputation:
     """Choose the original gate branch without changing any caller or store."""
     candidate = assistant_message.content or ""
@@ -82,12 +83,28 @@ def compute_end_gate(
         if verdict.failure_class == "budget_exhausted"
         else "malformed",
     )
+
+    def publication_source_matches() -> bool:
+        if original_source_operation_id is None:
+            return (
+                turn_evidence.review_candidate(candidate=candidate, request=user_message, current_state=state).binding
+                == publication_review.binding
+            )
+        return (
+            turn_evidence.review_candidate_for_source_operation(
+                source_operation_id=original_source_operation_id,
+                candidate=candidate,
+                request=user_message,
+                current_state=state,
+            )
+            == publication_review
+        )
+
     publication_admitted = (
         verdict.ok
         and verdict.publication_verdict == "ADMIT"
         and verdict.publication_binding == publication_review.binding
-        and turn_evidence.review_candidate(candidate=candidate, request=user_message, current_state=state).binding
-        == publication_review.binding
+        and publication_source_matches()
     )
     terminal_block = (verdict.blocking and publication_admitted) or (
         (verdict.blocking or not publication_admitted)
@@ -151,7 +168,10 @@ def compute_checkpoint_end_gate(
     this function neither requests a second call nor fabricates its verdict.
     """
     from elspeth.web.composer.composition_completion import _FINALIZATION_AUTO_SURFACEABLE_KINDS, _advance_advisor_review_state
-    from elspeth.web.composer.continuation_checkpoint_end_locals import OrdinaryEndCallerLocals
+    from elspeth.web.composer.continuation_checkpoint_end_locals import (
+        OrdinaryEndCallerLocals,
+        original_end_retry_publication_operation_id,
+    )
     from elspeth.web.composer.continuation_checkpoint_end_physical import (
         checkpoint_end_physical_custody,
         require_original_checkpoint_end_physical_source,
@@ -219,6 +239,9 @@ def compute_checkpoint_end_gate(
         max_passes=gate.max_passes,
         allow_repair_continue=gate.allow_repair_continue,
         dialogue_length=len(runtime.live.llm_messages) if type(gate.caller) is OrdinaryEndCallerLocals else None,
+        original_source_operation_id=(
+            original_end_retry_publication_operation_id(gate, phase_owner=source.phase_owner) if retry_ordinal == 1 else None
+        ),
     )
 
 

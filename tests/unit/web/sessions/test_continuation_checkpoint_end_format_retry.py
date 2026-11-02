@@ -19,6 +19,10 @@ from elspeth.web.composer.continuation_checkpoint_end_format_retry import (
     prepare_checkpoint_end_format_retry,
     require_original_checkpoint_end_format_retry,
 )
+from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointRepairContinued
+from elspeth.web.composer.continuation_checkpoint_end_usable import complete_v4_checkpoint_end_usable_return
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
@@ -29,6 +33,7 @@ from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_checkpoint_end_owed import read_v4_checkpoint_end_owed_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_retry import read_end_format_retry_on_connection
+from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
 from elspeth.web.sessions.continuation_end import enter_continuation_end, execute_continuation_end_review
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -185,6 +190,13 @@ async def test_actual_end_format_retry_settles_first_before_exact_second_call(op
                     timeout=None,
                 )
             assert len(sdk_calls) == 1
+            # H0 is settled and the retry-ready marker is verified above.
+            # SDK2 belongs to the next action, with a new original clock.
+            retry_clock = ContinuationActionClock(retry.phase_owner.runtime.source.policy.actions.advisor)
+            retry_deadline = retry.phase_owner.phases.work.coordinator.sql_deadline_owner
+            if retry_deadline is not None:
+                retry_deadline.begin_action(retry_clock.policy, started_at=retry_clock.started_monotonic)
+            retry.phase_owner.phases.bind_action_clock(retry_clock)
             second = await run_v4_checkpoint_end_first_return(
                 advisor=advisor,
                 phase_owner=retry.phase_owner,
@@ -218,10 +230,28 @@ async def test_actual_end_format_retry_settles_first_before_exact_second_call(op
             with pytest.raises(AuditIntegrityError, match="first original complete result"):
                 await prepare_checkpoint_end_format_retry(second)
             assert len(sdk_calls) == 2
+            if not second_malformed:
+                completed = await complete_v4_checkpoint_end_usable_return(
+                    physical=second.physical,
+                    prepared=second.prepared,
+                    owed=second.owed,
+                    returned=second.returned,
+                )
+                assert type(completed) is EndCheckpointRepairContinued
+                with locked_session_transaction(store[0], sid) as conn:
+                    current = load_snapshot(conn, session_id=sid, operation_id=operation)
+                    assert current == completed.completed
+                    durable_cost = read_continuation_cost_snapshot_on_connection(conn, decode_continuation_snapshot(current.payload_json))
+                assert budget.snapshot() == durable_cost
+                assert budget.snapshot().physical_calls == len(budget.snapshot().charges)
             raise CapturedRetryConsequences
 
         monkeypatch.setattr(advisor, "_run_advisor_checkpoint", exercise_original_gate)
         with pytest.raises(CapturedRetryConsequences):
+            end_clock = ContinuationActionClock(entered.source.policy.actions.advisor)
+            if work.coordinator.sql_deadline_owner is not None:
+                work.coordinator.sql_deadline_owner.begin_action(end_clock.policy, started_at=end_clock.started_monotonic)
+            phases.bind_action_clock(end_clock)
             await execute_continuation_end_review(phases, entered.source.selected)
     finally:
         await lease.close()

@@ -460,6 +460,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.protocol import ComposerResult, PipelineCommitIntent
     from elspeth.web.composer.provider_quota import ProviderCallCustody
     from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+    from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -472,6 +473,7 @@ if TYPE_CHECKING:
     )
     from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import EndCompleteRepairBatch
     from elspeth.web.sessions.continuation_checkpoint_end_owed import CheckpointEndOwedAdmission
+    from elspeth.web.sessions.continuation_checkpoint_end_retry import ColdProjectedEndFormatRetry, ColdProjectedEndFormatRetryOverflow
     from elspeth.web.sessions.continuation_checkpoint_paid import (
         CheckpointPreparedSource,
         PreparedCheckpointProvider,
@@ -501,6 +503,7 @@ if TYPE_CHECKING:
     )
     from elspeth.web.sessions.continuation_publication_projection import PipelinePublicationReplayData, PublicationProjectionInput
     from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
+    from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, V4SemanticProviderAdmission
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
     from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
@@ -9000,6 +9003,71 @@ class SessionServiceImpl:
 
         return await run_required_sql_finish_once(required_work, _sync)
 
+    async def finalize_v4_continuation_primary_sdk_terminal(
+        self,
+        *,
+        prepared: PreparedContinuationProvider,
+        admission: V4PrimaryProviderAdmission,
+        observation: V4SdkFailureObservation,
+        custody: ProviderCallCustody,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+        from elspeth.web.composer.provider_sdk_observation import require_original_v4_sdk_failure
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission
+        from elspeth.web.sessions.continuation_primary_sdk_finalization import finalize_v4_primary_sdk_terminal_on_connection
+        from elspeth.web.sessions.continuation_primary_sdk_terminal import read_v4_primary_sdk_terminal_verified_on_connection
+        from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        if type(prepared) is not PreparedContinuationProvider or type(admission) is not V4PrimaryProviderAdmission:
+            _refuse_required_sql(required_work, AuditIntegrityError("PRIMARY SDK finalizer requires original nominal admission"))
+        try:
+            require_original_v4_sdk_failure(observation, custody=custody)
+        except AuditIntegrityError as refused:
+            _refuse_required_sql(required_work, refused)
+        context = prepared.binding.running.session_operation_context
+        _validate_required_sql_ticket(
+            required_work,
+            sources=(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,),
+            session_id=context.fence.session_id,
+            context=context,
+        )
+
+        def _sync() -> VerifiedSdkTerminal:
+            with (
+                self._session_process_locked_begin(context.fence.session_id) as conn,
+                self._session_write_lock(conn, context.fence.session_id),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=context.fence.session_id,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+                written = finalize_v4_primary_sdk_terminal_on_connection(
+                    conn,
+                    session_service=self,
+                    prepared=prepared,
+                    admission=admission,
+                    observation=observation,
+                    custody=custody,
+                    call=custody.call,
+                )
+            with locked_session_transaction(self._engine, str(context.fence.session_id)) as conn:
+                cold = read_v4_primary_sdk_terminal_verified_on_connection(
+                    conn,
+                    session_id=prepared.binding.running.claim.session_id,
+                    operation_id=prepared.binding.running.claim.operation_id,
+                    effect_key=admission.hold.effect_key,
+                )
+            if type(cold) is not VerifiedSdkTerminal or cold != written:
+                raise AuditIntegrityError("PRIMARY SDK terminal lost its exact committed cold result")
+            return cold
+
+        return await run_required_sql_finish_once(required_work, _sync)
+
     async def finalize_v4_continuation_primary_incomplete(
         self,
         *,
@@ -12770,8 +12838,11 @@ class SessionServiceImpl:
         self,
         *,
         cold_source: ColdCheckpointEndConsequenceSource,
-        failure: ContinuationRetainedCapacityExceeded | ColdProjectedEndRepairOverflow | ColdProjectedEndReviewOverflow,
-        capacity_projection: ColdProjectedEndRepair | ColdProjectedEndReview | None = None,
+        failure: ContinuationRetainedCapacityExceeded
+        | ColdProjectedEndRepairOverflow
+        | ColdProjectedEndReviewOverflow
+        | ColdProjectedEndFormatRetryOverflow,
+        capacity_projection: ColdProjectedEndRepair | ColdProjectedEndReview | ColdProjectedEndFormatRetry | None = None,
     ) -> VerifiedCheckpointPaidOverflowTerminal:
         """Close a paid complete END whose projected consequence cannot fit after owner loss."""
         from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (

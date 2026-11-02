@@ -68,6 +68,10 @@ from elspeth.web.sessions.models import composer_continuation_provider_ordinals_
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 
 if TYPE_CHECKING:
+    from weakref import ReferenceType
+
+    from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointEndPhysicalSource
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
     from elspeth.web.sessions.service import SessionServiceImpl
@@ -124,6 +128,8 @@ class PreparedCheckpointProvider:
     requested_model: str
     env_ref_names: frozenset[str]
     publication_binding: str | None
+    clock: ContinuationActionClock = field(repr=False)
+    physical_source: ReferenceType[CheckpointEndPhysicalSource] = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,12 +523,16 @@ def admit_v4_checkpoint_provider_on_connection(
     conn: Connection, service: SessionServiceImpl, prepared: PreparedCheckpointProvider, *, model: str
 ) -> V4CheckpointProviderAdmission:
     """Mint one original physical attempt and exact H before SDK entry."""
+    from elspeth.web.composer.continuation_checkpoint_end_physical import require_checkpoint_end_prepared_clock
+
     if (
         type(prepared) is not PreparedCheckpointProvider
         or prepared.composer._require_sessions_service() is not service
         or model != prepared.requested_model
     ):
         raise AuditIntegrityError("checkpoint admission changed its original provider/service/model")
+    clock = require_checkpoint_end_prepared_clock(prepared)
+    clock.require_active_quota_time()
     running = prepared.running
     _require_current_continuation_running(conn, running)
     source = _require_prepared_checkpoint_source_on_connection(conn, prepared)
@@ -697,6 +707,7 @@ def admit_v4_checkpoint_provider_on_connection(
     )
     if stored != admitted:
         raise AuditIntegrityError("checkpoint admission changed its reserved dispatched root")
+    clock.require_active_quota_time()
     return V4CheckpointProviderAdmission(attempt, source.prepared_selected, stored, hold, tail, terminal_hold, key, source)
 
 

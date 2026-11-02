@@ -206,7 +206,9 @@ def read_v4_primary_paid_incomplete_terminal_on_connection(
         action_chunk=no_sdk_action_chunk,
     )
     overflow_plan = prepare_primary_paid_overflow_tail_plan(identity=identity, admitted=admitted, creator_sequence=source.creator_sequence)
-    incomplete_tail, reserved_bytes, combined_hash = primary_terminal_reservation(overflow_plan, no_sdk_plan)
+    incomplete_tail, reserved_bytes, combined_hash = primary_terminal_reservation(
+        overflow_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if incomplete_tail != paid_plan:
         raise AuditIntegrityError("PRIMARY incomplete terminal changed its original incomplete plan")
     if source.reserved_bytes != reserved_bytes or source.fallback_contract_sha256 != combined_hash:

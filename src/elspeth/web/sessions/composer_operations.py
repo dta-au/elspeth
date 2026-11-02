@@ -137,6 +137,7 @@ type ComposerOperationPublicFailureType = Literal[
     "composer_admission_refused",
     "paid_result_overflow",
     "paid_result_incomplete",
+    "provider_sdk_terminal",
 ]
 COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
     (
@@ -155,6 +156,7 @@ COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
         "composer_admission_refused",
         "paid_result_overflow",
         "paid_result_incomplete",
+        "provider_sdk_terminal",
     )
 )
 

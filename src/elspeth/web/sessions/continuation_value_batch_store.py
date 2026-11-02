@@ -108,7 +108,9 @@ def plan_value_batch_publication_on_connection(
         current_refusal = check_auto_mutation_on_connection(conn, context=context, ceiling=members.mutation_ceiling)
         if locked_refusal is None:
             locked_refusal = current_refusal
-    shape = value_batch_publication_shape(batch, locked_refusal=locked_refusal, env_ref_names=batch.inventory.names)
+    shape = value_batch_publication_shape(
+        batch, locked_refusal=locked_refusal, env_ref_names=batch.inventory.names, issued_preview=issued_preview
+    )
     if issued_preview is not None and shape.state_count != 0:
         raise AuditIntegrityError("issued preview publication cannot retire a review through authored state")
     base = service._reserve_sequence_range(conn, sid, count=shape.message_count)
@@ -124,6 +126,7 @@ def plan_value_batch_publication_on_connection(
         rejection_ids=tuple(uuid4() for _ in range(shape.rejection_count)) if rejection_ids is None else rejection_ids,
         locked_refusal=locked_refusal,
         env_ref_names=batch.inventory.names,
+        issued_preview=issued_preview,
     )
 
 
@@ -142,6 +145,8 @@ def consume_value_batch_publication_on_connection(
 
     if type(publication) is not PreparedValueBatchPublication or commit.running is not running:
         raise AuditIntegrityError("value publication changed its exact P4 SQL owner")
+    if publication.issued_preview is not issued_preview:
+        raise AuditIntegrityError("value publication changed its original issued preview carrier")
     publication.require_original()
     batch, context = publication.batch, running.session_operation_context
     prepared, names = batch.prepared, batch.inventory.names

@@ -40,6 +40,27 @@ async def resume_first_cold_end_repair(*, phases: object, selected: SelectedCont
     if type(sessions) is not SessionServiceImpl:
         raise AuditIntegrityError("cold END resume lost its original sessions SQL owner")
     source = await read_cold_checkpoint_end_consequence_source(phases=phases, selected=selected)
+    if source.owed.retry_ordinal == 0:
+        from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
+        from elspeth.web.composer.continuation_checkpoint_end_dispositions import EndCheckpointPaidOverflowTerminal
+        from elspeth.web.composer.continuation_checkpoint_end_format_retry import (
+            CheckpointEndFormatRetrySource,
+            settle_cold_checkpoint_end_format_retry,
+        )
+        from elspeth.web.composer.continuation_codec import decode_continuation_response
+
+        content = decode_continuation_response(source.owed.response).message.content
+        if type(content) is not str:
+            raise AuditIntegrityError("cold END retry lost its complete original returned text")
+        if not _parse_advisor_checkpoint_guidance(content, phase="end").ok:
+            retry = await settle_cold_checkpoint_end_format_retry(phases=phases, selected=selected)
+            if type(retry) is EndCheckpointPaidOverflowTerminal:
+                phases.latest_snapshot = retry.verified.terminal
+                return retry.verified.terminal
+            if type(retry) is not CheckpointEndFormatRetrySource:
+                raise AuditIntegrityError("cold END retry lost its exact retained next-action source")
+            phases.latest_snapshot = retry.proof.selected
+            return retry.proof.selected
     gate = await compute_first_cold_checkpoint_end_gate(source=source)
 
     async def settle_overflow(
