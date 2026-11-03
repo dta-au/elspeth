@@ -70,6 +70,7 @@ if TYPE_CHECKING:
         VerifiedClassifierPaidOverflowTerminal,
     )
     from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 
 
 @dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
@@ -428,6 +429,8 @@ async def observe_continuation_iteration_classification(
     | VerifiedClassifierPaidOverflowTerminal
     | VerifiedClassifierPaidIncompleteTerminal
     | ClassifierNoSdkRefusalReceipt
+    | SdkTerminalResult
+    | SdkTerminalFailure
 ):
     """Observe the actual classifier; preserve its original thrown outcome."""
     from elspeth.web.sessions.continuation_classifier_primary import (
@@ -491,6 +494,12 @@ async def observe_continuation_iteration_classification(
             classifier_primary_issuer=issuer,
             completion_capture=completion_capture,
         )
+    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
+
+    if isinstance(outcome, (SdkTerminalResult, SdkTerminalFailure)):
+        if type(outcome) not in (SdkTerminalResult, SdkTerminalFailure) or issuer.terminal is not outcome:
+            raise AuditIntegrityError("iteration classifier lost its original SDK terminal issuer")
+        return outcome
     if isinstance(outcome, ClassifierReplyDeadline):
         observation = issuer.require_reply_deadline(outcome)
         observed_deadline = ObservedClassifierReplyDeadline()

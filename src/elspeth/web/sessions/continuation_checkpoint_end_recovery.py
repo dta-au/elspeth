@@ -20,6 +20,7 @@ from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, load_snapshot
 from elspeth.web.sessions.continuation_checkpoint_end_complete_action import (
+    require_original_end_outer_creator_after_complete_repair_on_connection,
     require_original_end_outer_creator_after_paid_overflow_on_connection,
     require_original_end_outer_creator_on_connection,
 )
@@ -303,6 +304,8 @@ def verify_end_h_recovery_receipt_on_connection(conn: Connection, receipt: Compo
         raise AuditIntegrityError("END H recovery substituted another complete paid response")
     if effect.disposition == "paid_overflow":
         require_original_end_outer_creator_after_paid_overflow_on_connection(conn, owed=owed, names=names)
+    elif effect.disposition == "committed":
+        require_original_end_outer_creator_after_complete_repair_on_connection(conn, owed=owed, names=names)
     else:
         require_original_end_outer_creator_on_connection(conn, owed=owed)
     history = conn.execute(

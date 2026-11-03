@@ -26,8 +26,15 @@ from elspeth.web.composer.continuation_title_values import capture_title_provide
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
-from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.composer.provider_quota import (
+    ProviderCallCustody,
+    ProviderInvocationFamily,
+    ProviderInvocationOwner,
+    V4SdkTerminalCommitted,
+)
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
+from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
@@ -41,6 +48,8 @@ from elspeth.web.sessions.continuation import (
     load_snapshot,
     refuse_v3_retained_tail_before_paid,
 )
+from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult, VerifiedSdkTerminal
 from elspeth.web.sessions.continuation_title_provider import (
     CurrentTitleNames,
     CurrentTitleResult,
@@ -226,7 +235,15 @@ async def prepare_current_title_provider(
 
 async def run_prepared_title_provider(
     *, prepared: PreparedTitleProvider, invocation_owner: ProviderInvocationOwner
-) -> TitleAuditSettlementRequest | VerifiedTitlePaidOverflowTerminal | TitlePaidIncompleteResult | TitleNoSdkTerminalResult | None:
+) -> (
+    TitleAuditSettlementRequest
+    | VerifiedTitlePaidOverflowTerminal
+    | TitlePaidIncompleteResult
+    | TitleNoSdkTerminalResult
+    | SdkTerminalResult
+    | SdkTerminalFailure
+    | None
+):
     if type(prepared) is not PreparedTitleProvider or type(invocation_owner) is not ProviderInvocationOwner:
         raise AuditIntegrityError("TITLE execution requires its actual prepared/current invocation owners")
     if invocation_owner.required_work is not prepared.work or invocation_owner.service is not _sessions(prepared.composer):
@@ -296,6 +313,18 @@ async def run_prepared_title_provider(
             )
 
         custody.bind_v4_returned_incomplete_finalizer(finish_returned_incomplete)
+
+        async def finish_sdk(observation: V4SdkFailureObservation, sql: RequiredWorkTicket) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+            owner = prepared.work.coordinator.sql_deadline_owner
+            if owner is not None:
+                owner.begin_settlement()
+            outcome = await _sessions(prepared.composer).finalize_v4_sdk_terminal(
+                observation=observation, custody=custody, required_work=sql
+            )
+            prepared.work.coordinator.validate_provider_settlement_sql_outcome(ticket=sql, actual_outcome=outcome)
+            return outcome
+
+        custody.bind_v4_sdk_finalizer(finish_sdk)
     capture = _AutoTitleCapture() if type(policy) is ContinuationAdmissionPolicyV4 else None
     try:
         await _maybe_auto_title_session_required(
@@ -315,18 +344,29 @@ async def run_prepared_title_provider(
             prepared_input=prepared.provider_input,
             _outcome=capture,
         )
+    except V4SdkTerminalCommitted as control:
+        if custody.v4_sdk_terminal_result is not control.finalization:
+            raise AuditIntegrityError("TITLE SDK result changed original committed custody") from control
+        finalized = control.finalization
+        return SdkTerminalResult(finalized.verified, SdkTerminalFamily.TITLE, finalized.deferred_cancellations)
     except V4ProviderResultIncomplete as incomplete:
         if type(policy) is not ContinuationAdmissionPolicyV4:
             raise
         result = await custody.finalize_v4_returned_incomplete(incomplete)
         return TitlePaidIncompleteResult(result.verified, result.deferred_cancellations)
     except BaseException as original:
+        exceptional = capture_sdk_terminal_failure(original, custody=custody)
+        if exceptional is not None:
+            return exceptional
         if no_sdk_issuer is not None:
             terminal = await _close_v4_title_no_sdk(prepared=prepared, custody=custody, issuer=no_sdk_issuer, error=original)
             if terminal is not None:
                 return terminal
         raise
     if capture is not None and capture.handled_error is not None and no_sdk_issuer is not None:
+        exceptional = capture_sdk_terminal_failure(capture.handled_error, custody=custody)
+        if exceptional is not None:
+            return exceptional
         terminal = await _close_v4_title_no_sdk(prepared=prepared, custody=custody, issuer=no_sdk_issuer, error=capture.handled_error)
         if terminal is not None:
             return terminal

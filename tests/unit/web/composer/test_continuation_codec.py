@@ -118,6 +118,33 @@ def test_private_chunk_stage_reuses_text_bytes_but_rechecks_each_credential_poli
     assert memo.cached_entry_count == 0
 
 
+def test_private_chunk_encoding_proof_reuse_still_rejects_each_changed_reference(monkeypatch):
+    text = canonical_json({"text": "ordinary value"})
+    proof_calls: list[str] = []
+    original_proof = codec._private_chunk_canonical_text_bytes
+
+    def counted_proof(key):
+        proof_calls.append(key.canonical)
+        return original_proof(key)
+
+    monkeypatch.setattr(codec, "_private_chunk_canonical_text_bytes", counted_proof)
+    with retention_stage_memo_scope() as memo:
+        chunk = encode_private_chunk(codec="composer.messages.v1", canonical=text)
+        verify_private_chunk(chunk.reference, text)
+        for changed in (
+            chunk.reference.model_copy(update={"digest": "0" * 64}),
+            chunk.reference.model_copy(update={"byte_length": chunk.reference.byte_length + 1}),
+        ):
+            with pytest.raises(AuditIntegrityError, match="bytes differ from their binding"):
+                verify_private_chunk(changed, text)
+        verify_private_chunk(chunk.reference, text)
+        assert proof_calls == [text]
+    assert not memo.active and memo.cached_entry_count == 0
+    with retention_stage_memo_scope():
+        verify_private_chunk(chunk.reference, text)
+        assert proof_calls == [text, text]
+
+
 def test_private_chunk_stage_keeps_state_guard_outside_text_proof(monkeypatch):
     state_text = canonical_json(_field_mapper_state().to_dict())
     proof_calls: list[str] = []
@@ -207,8 +234,6 @@ def test_stage_reuses_exact_interleaved_chunk_sha_but_rechecks_reference_and_tex
         assert produced == [
             (first_text, None),
             (second_text, None),
-            (first_text, first.reference),
-            (second_text, second.reference),
         ]
         with pytest.raises(AuditIntegrityError, match="bytes differ"):
             verify_private_chunk(first.reference, second_text)
@@ -428,7 +453,7 @@ def test_chunk_canonical_refusal_precedes_binding_refusal_in_a_stage(monkeypatch
     assert hashes == []
 
 
-def test_chunk_reference_fields_are_part_of_the_pure_verification_key(monkeypatch):
+def test_chunk_reference_fields_are_rechecked_after_shared_pure_verification(monkeypatch):
     chunk = encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}')
     original = codec._private_chunk_canonical_text_bytes
     parses = []
@@ -448,7 +473,7 @@ def test_chunk_reference_fields_are_part_of_the_pure_verification_key(monkeypatc
         for reference in (changed_digest, changed_length):
             with pytest.raises(AuditIntegrityError, match="bytes differ"):
                 verify_private_chunk(reference, chunk.canonical)
-    assert parses == [chunk.canonical] * 4
+    assert parses == [chunk.canonical]
 
 
 @pytest.mark.parametrize("update", [{"digest": []}, {"byte_length": []}])

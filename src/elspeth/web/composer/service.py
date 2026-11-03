@@ -48,6 +48,7 @@ if TYPE_CHECKING:
         VerifiedClassifierPaidOverflowTerminal,
     )
     from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
     from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal
     from elspeth.web.sessions.protocol import (
         SessionServiceProtocol,
@@ -1118,6 +1119,8 @@ class ComposerServiceImpl:
         | VerifiedClassifierPaidOverflowTerminal
         | VerifiedClassifierPaidIncompleteTerminal
         | ClassifierNoSdkRefusalReceipt
+        | SdkTerminalResult
+        | SdkTerminalFailure
     ):
         """Phase P5 of the compose loop — anti-anchor + turn accounting.
 
@@ -1463,6 +1466,16 @@ class ComposerServiceImpl:
                                 VerifiedClassifierPaidOverflowTerminal,
                             )
                             from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+                            from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
+
+                            if isinstance(issued, (SdkTerminalResult, SdkTerminalFailure)):
+                                if (
+                                    type(issued) not in (SdkTerminalResult, SdkTerminalFailure)
+                                    or classifier_primary_issuer is None
+                                    or classifier_primary_issuer.terminal is not issued
+                                ):
+                                    raise AuditIntegrityError("classifier SDK result lost its original nominal issuer")
+                                return issued
 
                             if isinstance(
                                 issued,
@@ -1594,6 +1607,16 @@ class ComposerServiceImpl:
                     VerifiedClassifierPaidOverflowTerminal,
                 )
                 from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+                from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
+
+                if isinstance(last_chance_result, (SdkTerminalResult, SdkTerminalFailure)):
+                    if (
+                        type(last_chance_result) not in (SdkTerminalResult, SdkTerminalFailure)
+                        or classifier_primary_issuer is None
+                        or classifier_primary_issuer.terminal is not last_chance_result
+                    ):
+                        raise AuditIntegrityError("classifier SDK result lost its original nominal issuer")
+                    return last_chance_result
 
                 if isinstance(
                     last_chance_result,
@@ -2383,6 +2406,8 @@ class ComposerServiceImpl:
         | VerifiedClassifierPaidOverflowTerminal
         | VerifiedClassifierPaidIncompleteTerminal
         | ClassifierNoSdkRefusalReceipt
+        | SdkTerminalResult
+        | SdkTerminalFailure
     ):
         """Preserve the completion-returning deadline boundary."""
         outcome = await self._call_llm_outcome_before_deadline(
@@ -2404,6 +2429,16 @@ class ComposerServiceImpl:
             VerifiedClassifierPaidOverflowTerminal,
         )
         from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+        from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
+
+        if isinstance(outcome, (SdkTerminalResult, SdkTerminalFailure)):
+            if (
+                type(outcome) not in (SdkTerminalResult, SdkTerminalFailure)
+                or classifier_primary_issuer is None
+                or classifier_primary_issuer.terminal is not outcome
+            ):
+                raise AuditIntegrityError("classifier SDK result lost its original nominal issuer")
+            return outcome
 
         if isinstance(
             outcome, (VerifiedClassifierPaidOverflowTerminal, VerifiedClassifierPaidIncompleteTerminal, ClassifierNoSdkRefusalReceipt)
@@ -2437,6 +2472,8 @@ class ComposerServiceImpl:
         | VerifiedClassifierPaidOverflowTerminal
         | VerifiedClassifierPaidIncompleteTerminal
         | ClassifierNoSdkRefusalReceipt
+        | SdkTerminalResult
+        | SdkTerminalFailure
     ):
         """Call the LLM with a per-call timeout derived from the deadline.
 
@@ -2505,6 +2542,16 @@ class ComposerServiceImpl:
                         VerifiedClassifierPaidOverflowTerminal,
                     )
                     from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+                    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
+
+                    if isinstance(issued, (SdkTerminalResult, SdkTerminalFailure)):
+                        if (
+                            type(issued) not in (SdkTerminalResult, SdkTerminalFailure)
+                            or classifier_primary_issuer is None
+                            or classifier_primary_issuer.terminal is not issued
+                        ):
+                            raise AuditIntegrityError("classifier SDK result lost its original nominal issuer")
+                        return issued
 
                     if isinstance(
                         issued,

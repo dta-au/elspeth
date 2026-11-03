@@ -29,6 +29,7 @@ from elspeth.web.sessions.continuation_paid_overflow import (
 SDK_TERMINAL_RECEIPT_MAX_UTF8_BYTES = 8192
 
 type SdkTerminalObservation = Literal["provider_failure", "provider_timeout", "no_observed_result"]
+type SdkTerminalProducer = Literal["primary", "semantic_advisor", "title", "checkpoint_advisor"]
 
 
 class SdkTerminalReceipt(BaseModel):
@@ -38,7 +39,7 @@ class SdkTerminalReceipt(BaseModel):
 
     schema_version: Literal["composer.sdk-terminal.v1"]
     identity: PaidOverflowIdentity
-    producer: Literal["primary"]
+    producer: SdkTerminalProducer
     outcome: Literal["terminal_sdk_failure"]
     observation: SdkTerminalObservation
     sdk_entered: Literal[True]

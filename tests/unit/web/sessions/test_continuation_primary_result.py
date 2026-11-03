@@ -7,12 +7,13 @@ current message producers, quota, original audit and settlement are real.
 import asyncio
 import json
 from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import litellm
 import pytest
 from litellm import ModelResponse
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
@@ -55,9 +56,11 @@ from elspeth.web.sessions.models import composer_continuation_chunks_table as ch
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
+from elspeth.web.sessions.models import quota_policies_table
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.time_normalization import restore_utc
 from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.continuation_inventory import inventory_advisor, inventory_work
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
@@ -127,17 +130,28 @@ async def primary_input(store, tmp_path, monkeypatch):
 
 
 async def initialized_primary_input(
-    store, tmp_path, monkeypatch, *, settings_overrides=None, base_state_data: CompositionStateData | None = None
+    store,
+    tmp_path,
+    monkeypatch,
+    *,
+    settings_overrides=None,
+    base_state_data: CompositionStateData | None = None,
+    prior_operation_id: str | None = None,
 ):
     """Enter PRIMARY from the actual complete composition initialization owner."""
-    from tests.helpers.fenced_session import seed_token_policies
+    from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, seed_token_policies
     from tests.unit.web.sessions.test_continuation_composition_initialization import construct, ready_case
 
-    if base_state_data is None:
+    if base_state_data is None and prior_operation_id is None:
         running, service, work, ready, title_sdk = await ready_case(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
     else:
         running, service, work, ready, title_sdk = await ready_case(
-            store, tmp_path, monkeypatch, settings_overrides=settings_overrides, base_state_data=base_state_data
+            store,
+            tmp_path,
+            monkeypatch,
+            settings_overrides=settings_overrides,
+            base_state_data=base_state_data,
+            prior_operation_id=prior_operation_id,
         )
     assert not title_sdk
     runtime = await construct(store, running, service, work, ready)
@@ -147,7 +161,55 @@ async def initialized_primary_input(
     assert type(runtime.bindings.provider_owner) is ProviderInvocationOwner
     with store[0].begin() as conn:
         grant_test_pipeline_user(conn, identity_id="alice")
-        seed_token_policies(conn, identity_id="alice")
+        if prior_operation_id is None:
+            seed_token_policies(conn, identity_id="alice")
+        else:
+            # A second actual operation shares its identity/container quotas.
+            # Require the complete original fixture rows; never replace limits
+            # or ignore a duplicate insertion of a foreign/changed policy.
+            policies = conn.execute(
+                select(quota_policies_table).where(
+                    or_(quota_policies_table.c.identity_id == "alice", quota_policies_table.c.identity_id.is_(None))
+                )
+            ).all()
+            assert len(policies) == 2
+            assert {
+                row.policy_id: (
+                    row.identity_id,
+                    row.tokens_per_day,
+                    row.storage_bytes,
+                    row.container_slot,
+                    row.dual_control_above_tokens,
+                    row.set_by_identity_id,
+                    row.set_by_actor,
+                    restore_utc(row.set_at),
+                    row.revoked_at,
+                )
+                for row in policies
+            } == {
+                "quota-identity": (
+                    "alice",
+                    IDENTITY_TOKENS_PER_DAY,
+                    1_000_000,
+                    1,
+                    None,
+                    None,
+                    "operator",
+                    datetime(2026, 9, 1, tzinfo=UTC),
+                    None,
+                ),
+                "quota-container": (
+                    None,
+                    CONTAINER_TOKENS_PER_DAY,
+                    10_000_000,
+                    1,
+                    None,
+                    None,
+                    "config",
+                    datetime(2026, 9, 1, tzinfo=UTC),
+                    None,
+                ),
+            }
     settings, requests = _required_guard_settings(tmp_path, monkeypatch)
     service._provider_gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
     return runtime, work, requests

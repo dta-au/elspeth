@@ -133,21 +133,27 @@ async def ready_case(
     content="Original Café Session Title",
     settings_overrides=None,
     base_state_data: CompositionStateData | None = None,
+    prior_operation_id: str | None = None,
 ):
     if paid:
-        if settings_overrides is not None or base_state_data is not None:
+        if settings_overrides is not None or base_state_data is not None or prior_operation_id is not None:
             raise ValueError("Initial settings overrides are supported only by the unpaid ready fixture")
         running, service, work, settled, original, sdk, calls = await paid_title(store, tmp_path, monkeypatch, content)
         ready = await title_application.apply_current_title_success(service=service, selected=settled.selected, required_work=work)
         assert ready.applied and ready.result == original.result and len(sdk) == len(calls) == 1
         return running, service, work, ready.selected, sdk
-    if base_state_data is None:
+    if base_state_data is None and prior_operation_id is None:
         running, completed, service, _prior, _base = await bootstrap_case(
             store, eligible=False, bound_base=bound_base, settings_overrides=settings_overrides
         )
     else:
         running, completed, service, _prior, _base = await bootstrap_case(
-            store, eligible=False, bound_base=bound_base, settings_overrides=settings_overrides, base_state_data=base_state_data
+            store,
+            eligible=False,
+            bound_base=bound_base,
+            settings_overrides=settings_overrides,
+            base_state_data=base_state_data,
+            prior_operation_id=prior_operation_id,
         )
     work = inventory_work(running)
     ready = await publish(store, running, completed, service, work)

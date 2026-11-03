@@ -17,7 +17,6 @@ from elspeth.web.sessions.continuation_retained_capacity import _require_histori
 from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission, _descriptor_data, _effect_data
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_tail import (
     prepare_semantic_paid_incomplete_tail_plan,
-    semantic_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import prepare_semantic_no_sdk_tail_plan
 from elspeth.web.sessions.continuation_semantic_paid_overflow_tail import prepare_semantic_paid_overflow_tail_plan
@@ -163,7 +162,11 @@ def read_v4_semantic_admission_on_connection(
     incomplete_tail = prepare_semantic_paid_incomplete_tail_plan(
         identity=paid_tail.identity, admitted=candidate, creator_sequence=source.creator_sequence
     )
-    reserved, combined_hash = semantic_combined_terminal_hold_contract(paid_tail, incomplete_tail, no_sdk_tail)
+    from elspeth.web.sessions.continuation_semantic_terminal_reservation import semantic_sdk_terminal_reservation
+
+    reserved, combined_hash = semantic_sdk_terminal_reservation(
+        paid_tail, incomplete_tail, no_sdk_tail, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("V4 semantic cold admission changed its original combined fallback")
     attempt = ProviderAttempt(effect.provider_attempt_id, restore_utc(attempt_row.started_at))

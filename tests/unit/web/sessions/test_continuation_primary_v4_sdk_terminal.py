@@ -12,9 +12,11 @@ from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import provider_gateway
+from elspeth.web.composer.provider_sdk_terminal import require_sdk_terminal_failure
 from elspeth.web.sessions import continuation_primary_sdk_finalization as finalization
+from elspeth.web.sessions import continuation_sdk_finalization as shared_finalization
 from elspeth.web.sessions.continuation_primary_sdk_terminal import read_v4_primary_sdk_terminal_verified_on_connection
-from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal
+from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal, SdkTerminalFailure
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
@@ -87,7 +89,7 @@ async def test_sdk_terminal_failure_after_parent_updates_rolls_back_all_disposit
         raise AuditIntegrityError("injected SDK ledger failure")
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    monkeypatch.setattr(finalization, "settle_provider_attempt_on_connection", fail_settlement)
+    monkeypatch.setattr(shared_finalization, "settle_provider_attempt_on_connection", fail_settlement)
     with pytest.raises(AuditIntegrityError, match="injected SDK ledger failure"):
         await _invoke(kwargs, produced, recorder, store)
     with store[0].connect() as conn:
@@ -158,9 +160,15 @@ async def test_original_sdk_error_survives_audit_failure_while_truthful_terminal
 
     monkeypatch.setattr(litellm, "acompletion", completion)
     monkeypatch.setattr(provider_gateway, "build_llm_call_record", fail_audit)
-    with pytest.raises(BaseExceptionGroup) as caught:
-        await _invoke(kwargs, produced, recorder, store)
-    assert caught.value.exceptions == (sdk_failure, audit_failure)
+    result = await _invoke(kwargs, produced, recorder, store)
+    assert type(result) is SdkTerminalFailure
+    require_sdk_terminal_failure(result)
+    assert isinstance(result.original, BaseExceptionGroup)
+    assert result.original.exceptions == (sdk_failure, audit_failure)
+    with pytest.raises(AuditIntegrityError, match="privately issued"):
+        require_sdk_terminal_failure(replace(result))
+    with pytest.raises(AuditIntegrityError, match="privately issued"):
+        require_sdk_terminal_failure(replace(result, original=AuditIntegrityError("foreign companion")))
     with store[0].connect() as conn:
         effect = conn.execute(select(effects).where(effects.c.session_id == str(store[4]))).one()
         cold = read_v4_primary_sdk_terminal_verified_on_connection(

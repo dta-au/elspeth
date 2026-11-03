@@ -149,9 +149,15 @@ from elspeth.web.sessions.continuation_primary_paid_overflow_terminal import (
     VerifiedPrimaryPaidOverflowTerminal,
     read_v4_primary_paid_overflow_terminal_on_connection,
 )
-from elspeth.web.sessions.continuation_primary_sdk_terminal import read_v4_primary_sdk_terminal_verified_on_connection
 from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
-from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal, VerifiedSdkTerminal
+from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
+from elspeth.web.sessions.continuation_sdk_terminal_cold import read_v4_sdk_terminal_verified_on_connection
+from elspeth.web.sessions.continuation_sdk_terminal_result import (
+    PrimarySdkTerminal,
+    SdkTerminalFailure,
+    SdkTerminalResult,
+    VerifiedSdkTerminal,
+)
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_terminal import read_v4_semantic_paid_incomplete_terminal_on_connection
 from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import (
     VerifiedSemanticPaidOverflowTerminal,
@@ -235,6 +241,8 @@ type _ActionResult = (
     | PrimaryPaidOverflowTerminal
     | PrimaryPaidIncompleteTerminal
     | PrimarySdkTerminal
+    | SdkTerminalResult
+    | SdkTerminalFailure
     | SemanticAdvisorNoSdkTerminal
     | V3UnboundedTailRefusal
     | ToolNoExecutionRefusal
@@ -467,6 +475,91 @@ class _SegmentDriver:
             authority=self.authority, running=self.running, selected=stored, required_work=self.work
         )
         return stored, selected
+
+    async def consume_sdk_terminal(self, result: PrimarySdkTerminal | SdkTerminalResult | SdkTerminalFailure) -> ContinuationSegmentSettled:
+        """Verify a committed SDK outcome before any running-only read."""
+        from elspeth.web.composer.provider_sdk_terminal import require_sdk_terminal_failure
+        from elspeth.web.sessions.composer_async_worker import _StartedSettlement
+
+        original: BaseException | None = None
+        expected: VerifiedSdkTerminal | None = None
+        if type(result) is SdkTerminalFailure:
+            require_sdk_terminal_failure(result)
+            original = result.original
+            expected = result.verified
+            family = result.family
+            names = expected.env_ref_names
+            receipt, snapshot = expected.receipt, expected.terminal
+        elif type(result) is SdkTerminalResult:
+            expected = result.verified
+            family = result.family
+            names = expected.env_ref_names
+            receipt, snapshot = expected.receipt, expected.terminal
+        elif type(result) is PrimarySdkTerminal:
+            family, names = SdkTerminalFamily.PRIMARY, frozenset()
+            receipt, snapshot = result.receipt, result.snapshot
+        else:
+            raise AuditIntegrityError("SDK disposition lost its nominal committed result")
+        if original is not None and not any(error is original for error in self._consumed_native):
+            self._consumed_native.append(original)
+
+        def verify() -> VerifiedSdkTerminal:
+            with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                actual = read_v4_sdk_terminal_verified_on_connection(
+                    conn,
+                    session_id=self.running.claim.session_id,
+                    operation_id=self.running.claim.operation_id,
+                    effect_key=receipt.identity.effect_key,
+                    family=family,
+                    names=names,
+                )
+            context = self.running.session_operation_context
+            if (
+                actual is None
+                or (expected is not None and actual != expected)
+                or actual.receipt != receipt
+                or actual.terminal != snapshot
+                or actual.provider_attempt_id != receipt.identity.attempt_id
+                or actual.hold_state != "consumed"
+                or actual.source.session_id != str(self.running.claim.session_id)
+                or actual.source.operation_id != self.running.claim.operation_id
+                or actual.source.creator_sequence != self.running.claim.segment_sequence
+                or actual.source.creator_generation != self.running.claim.ownership_generation
+                or actual.source.claim_attempt != self.running.claim.attempt
+                or actual.source.session_operation_id != context.fence.operation_id
+                or actual.source.session_operation_epoch != context.fence.operation_epoch
+            ):
+                raise AuditIntegrityError("SDK disposition lost its exact original cold terminal and current owner")
+            return actual
+
+        self.sql_deadline.begin_settlement()
+        try:
+            await _registered(
+                work=self.work,
+                source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                operation=verify,
+                expected=VerifiedSdkTerminal,
+            )
+            terminal = await self.record()
+            if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                snapshot.checkpoint_id,
+                snapshot.cursor,
+            ):
+                raise AuditIntegrityError("SDK disposition lost its actual committed failed parent")
+            await self.worker._verify_terminal_before_release(
+                self.running,
+                self.lease,
+                terminal,
+                _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+            )
+        except BaseException as error:
+            if original is None:
+                raise
+            combined = self.join_failure(error)
+            raise combined from combined.__cause__
+        if original is not None:
+            raise original from original.__cause__
+        return ContinuationSegmentSettled(terminal)
 
     async def settle(
         self,
@@ -923,6 +1016,8 @@ class _SegmentDriver:
                     if isinstance(prepared, V3UnboundedTailRefusal):
                         return prepared
                     title_result = await run_prepared_title_provider(prepared=prepared, invocation_owner=self.provider)
+                    if isinstance(title_result, (SdkTerminalResult, SdkTerminalFailure)):
+                        return title_result
                     if type(title_result) is VerifiedTitlePaidOverflowTerminal:
                         return _TitlePaidTerminalResult(title_result, prepared.names)
                     if type(title_result) is TitlePaidIncompleteResult:
@@ -996,6 +1091,7 @@ class _SegmentDriver:
                     PrimaryPaidOverflowTerminal,
                     PrimaryPaidIncompleteTerminal,
                     PrimarySdkTerminal,
+                    SdkTerminalFailure,
                     V3UnboundedTailRefusal,
                 ),
             ):
@@ -1069,6 +1165,8 @@ class _SegmentDriver:
                                 format_retry=retry,
                             )
                         )
+                    if type(outcome) is SdkTerminalResult or type(outcome) is SdkTerminalFailure:
+                        return outcome
                     if type(outcome) is EndCheckpointCompleteReview:
                         self.phases.latest_snapshot = outcome.review.completed
                         return None
@@ -1493,6 +1591,8 @@ class _SegmentDriver:
                 # The old action is closed. The loop re-reads current ownership
                 # and independently admits the retained SQL refusal tail.
                 continue
+            if isinstance(result, (PrimarySdkTerminal, SdkTerminalResult, SdkTerminalFailure)):
+                return await self.consume_sdk_terminal(result)
             if self.phases.preview_terminal is not None:
                 return await self.consume_preview_terminal()
             if expiry.expired:
@@ -1958,47 +2058,6 @@ class _SegmentDriver:
                         result.verified.terminal.cursor,
                     ):
                         raise AuditIntegrityError("TITLE paid incomplete lost its actual committed failed terminal")
-                    await self.worker._verify_terminal_before_release(
-                        self.running,
-                        self.lease,
-                        terminal,
-                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
-                    )
-                    return ContinuationSegmentSettled(terminal)
-                if type(result) is PrimarySdkTerminal:
-                    primary_sdk_result = result
-
-                    def verify_sdk_terminal(expected_terminal: PrimarySdkTerminal = primary_sdk_result) -> VerifiedSdkTerminal:
-                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
-                            actual = read_v4_primary_sdk_terminal_verified_on_connection(
-                                conn,
-                                session_id=self.running.claim.session_id,
-                                operation_id=self.running.claim.operation_id,
-                                effect_key=expected_terminal.receipt.identity.effect_key,
-                            )
-                        if (
-                            actual is None
-                            or actual.receipt != expected_terminal.receipt
-                            or actual.terminal != expected_terminal.snapshot
-                            or actual.provider_attempt_id != expected_terminal.receipt.identity.attempt_id
-                            or actual.hold_state != "consumed"
-                        ):
-                            raise AuditIntegrityError("PRIMARY SDK outcome lost its exact original cold terminal")
-                        return actual
-
-                    self.sql_deadline.begin_settlement()
-                    await _registered(
-                        work=self.work,
-                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
-                        operation=verify_sdk_terminal,
-                        expected=VerifiedSdkTerminal,
-                    )
-                    terminal = await self.record()
-                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
-                        result.snapshot.checkpoint_id,
-                        result.snapshot.cursor,
-                    ):
-                        raise AuditIntegrityError("PRIMARY SDK outcome lost its actual committed failed terminal")
                     await self.worker._verify_terminal_before_release(
                         self.running,
                         self.lease,

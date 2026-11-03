@@ -117,6 +117,7 @@ from elspeth.web.composer.provider_quota import (
     ProviderInvocationFamily,
     ProviderInvocationOwner,
     V4PaidIncompleteCommitted,
+    V4SdkTerminalCommitted,
     composer_quota_scope,
     provider_call_scope,
     quota_provider_calls,
@@ -1017,32 +1018,40 @@ class AdvisorCheckpointOwner:
                 note_checkpoint_end_physical_failure,
             )
             from elspeth.web.composer.continuation_checkpoint_unbound_finalizer import finalize_checkpoint_end_unbound_refusal
+            from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure, sdk_terminal_failure_scope
 
-            async with provider_call_scope(provider_custody):
-                try:
-                    return await self._call_advisor_with_audit_body(
-                        arguments,
-                        recorder=recorder,
-                        timeout=timeout,
-                        structured_output=structured_output,
-                        on_provider_dispatch=on_provider_dispatch,
-                        provider_custody=provider_custody,
-                        _outcome=_outcome,
-                        checkpoint_end_source=checkpoint_end_source,
-                    )
-                except _CheckpointUnboundRefusalObserved as refusal:
-                    terminal = await finalize_checkpoint_end_unbound_refusal(refusal, source=checkpoint_end_source)
-                    raise _EndCheckpointDispositionControl(terminal) from None
-                except V4PaidIncompleteCommitted:
-                    raise
-                except V4ProviderResultIncomplete as incomplete:
-                    if not provider_custody.has_v4_returned_incomplete_finalizer():
+            try:
+                # The original SDK await may fail while required audit capture
+                # also fails. Keep the complete joined failure inside the SDK
+                # scope, with its original custody available for atomic SQL.
+                async with sdk_terminal_failure_scope(provider_custody), provider_call_scope(provider_custody):
+                    try:
+                        return await self._call_advisor_with_audit_body(
+                            arguments,
+                            recorder=recorder,
+                            timeout=timeout,
+                            structured_output=structured_output,
+                            on_provider_dispatch=on_provider_dispatch,
+                            provider_custody=provider_custody,
+                            _outcome=_outcome,
+                            checkpoint_end_source=checkpoint_end_source,
+                        )
+                    except _CheckpointUnboundRefusalObserved as refusal:
+                        terminal = await finalize_checkpoint_end_unbound_refusal(refusal, source=checkpoint_end_source)
+                        raise _EndCheckpointDispositionControl(terminal) from None
+                    except V4PaidIncompleteCommitted:
                         raise
-                    finalization = await provider_custody.finalize_v4_returned_incomplete(incomplete)
-                    raise V4PaidIncompleteCommitted(finalization) from None
-                except BaseException as original:
+                    except V4ProviderResultIncomplete as incomplete:
+                        if not provider_custody.has_v4_returned_incomplete_finalizer():
+                            raise
+                        finalization = await provider_custody.finalize_v4_returned_incomplete(incomplete)
+                        raise V4PaidIncompleteCommitted(finalization) from None
+            except (_EndCheckpointDispositionControl, V4PaidIncompleteCommitted, V4SdkTerminalCommitted):
+                raise
+            except BaseException as original:
+                if capture_sdk_terminal_failure(original, custody=provider_custody) is None:
                     note_checkpoint_end_physical_failure(checkpoint_end_source, original)
-                    raise
+                raise
         if failure_observation is not None:
             if recorder is not failure_observation.owner.recorder or failure_observation.provider_custody is not None:
                 raise AuditIntegrityError("Advisor failure observation changed its actual invocation owners")

@@ -151,7 +151,6 @@ def read_v4_title_no_sdk_terminal_on_connection(
     from elspeth.web.sessions.continuation_title_no_sdk_tail import build_title_no_sdk_tail_batch, prepare_title_no_sdk_tail_plan
     from elspeth.web.sessions.continuation_title_paid_incomplete_tail import (
         prepare_title_paid_incomplete_tail_plan,
-        title_combined_terminal_hold_contract,
     )
 
     paid_plan = prepare_title_paid_overflow_tail_plan(identity=identity, admitted=admitted, creator_sequence=source.creator_sequence)
@@ -161,7 +160,11 @@ def read_v4_title_no_sdk_terminal_on_connection(
     no_sdk_plan = prepare_title_no_sdk_tail_plan(
         identity=identity, admitted=admitted, creator_sequence=source.creator_sequence, requested_model=effect.requested_model
     )
-    reserved, combined_hash = title_combined_terminal_hold_contract(paid_plan, incomplete_plan, no_sdk_plan)
+    from elspeth.web.sessions.continuation_title_terminal_reservation import title_sdk_terminal_reservation
+
+    reserved, combined_hash = title_sdk_terminal_reservation(
+        paid_plan, incomplete_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("TITLE no-SDK terminal changed its original combined H")
     receipt_json = _bounded_bytes(conn, source, effect.result_chunk_key, "composer.title-no-sdk.v1").decode("utf-8", errors="strict")

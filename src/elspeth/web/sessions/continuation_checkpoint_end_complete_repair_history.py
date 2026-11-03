@@ -6,16 +6,23 @@ import json
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from sqlalchemy import Connection, select
+from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, select
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.advisor_audit import advisor_checkpoint_pass_audit_envelope
 from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance, checkpoint_pass_record
+from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.continuation import ComposeFrame, EndFrame
-from elspeth.web.composer.continuation_codec import decode_continuation_response, decode_continuation_snapshot
+from elspeth.web.composer.continuation_codec import (
+    decode_continuation_response,
+    decode_continuation_snapshot,
+    decode_retained_physical_audit_call,
+)
 from elspeth.web.composer.continuation_evidence import state_from_evidence_json
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_progress import (
     ActionExecutionReceipt,
     continuation_action_key,
@@ -24,6 +31,8 @@ from elspeth.web.composer.continuation_progress import (
     encode_continuation_frontier,
     record_action_receipt,
 )
+from elspeth.web.composer.provider_audit_source import ProviderAuditSource
+from elspeth.web.coordination.quota_authority import _usage_entry_id, token_usage_entry_from_llm_call_envelope
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import PreparedEndCompletePass, require_end_complete_pass_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_withheld import (
@@ -34,11 +43,18 @@ from elspeth.web.sessions.continuation_checkpoint_end_owed import (
     VerifiedCheckpointEndOwed,
     read_v4_checkpoint_end_settled_owed_history_on_connection,
 )
+from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
+    checkpoint_paid_audit_cohort_for_hold,
+    require_checkpoint_paid_private_audit_on_connection,
+)
+from elspeth.web.sessions.continuation_cost import _closed_call
 from elspeth.web.sessions.continuation_retained_capacity import read_bounded_retained_chunk
 from elspeth.web.sessions.continuation_semantic_advisor import _historical_snapshot
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
+from elspeth.web.sessions.models import quota_provider_attempts_table as physical
+from elspeth.web.sessions.models import token_usage_ledger_table as ledger
 from elspeth.web.sessions.time_normalization import restore_utc
 
 
@@ -314,6 +330,105 @@ def _reprove_action(
         raise AuditIntegrityError("historical END repair changed its committed Review action receipt")
 
 
+def _reprove_original_paid_audit(conn: Connection, *, owed: VerifiedCheckpointEndOwed, event: EndCompleteRepairEvent) -> None:
+    """Bind H's complete retained call to its one original quota and audit cohort."""
+    sid = owed.session_id
+    call = decode_retained_physical_audit_call(owed.response)
+    if (
+        call.status is not ComposerLLMCallStatus.SUCCESS
+        or call.call_id != owed.attempt_id
+        or call.messages_hash != owed.request_sha256
+        or call.model_requested != owed.requested_model
+        or call.cost_response_accountable is not True
+        or call.error_class is not None
+        or call.error_message is not None
+    ):
+        raise AuditIntegrityError("historical END repair changed its complete original paid call")
+    cohort = checkpoint_paid_audit_cohort_for_hold(call, owed.new_hold)
+    if event.private_audit_sha256 != cohort.private_sha256:
+        raise AuditIntegrityError("historical END repair changed its original private audit commitment")
+    require_checkpoint_paid_private_audit_on_connection(
+        conn,
+        source=owed.new_hold,
+        attempt_id=owed.attempt_id,
+        private_sha256=cohort.private_sha256,
+        incomplete=False,
+    )
+    usage = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(call))
+    entry_id = _usage_entry_id(session_id=sid, source="composer", run_id=None, call_id=owed.attempt_id)
+    attempt = conn.execute(select(physical).where(physical.c.attempt_id == owed.attempt_id)).one_or_none()
+    entry = conn.execute(select(ledger).where(ledger.c.entry_id == entry_id)).one_or_none()
+    if (
+        usage is None
+        or usage.call_id != owed.attempt_id
+        or usage.recorded_at is None
+        or attempt is None
+        or attempt.session_id != sid
+        or attempt.operation_id != owed.new_hold.session_operation_id
+        or attempt.operation_epoch != owed.new_hold.session_operation_epoch
+        or attempt.settled_at is None
+        or attempt.ledger_entry_id != entry_id
+        or entry is None
+        or entry.session_id != sid
+        or entry.identity_id != attempt.identity_id
+        or entry.source != "composer"
+        or entry.run_id is not None
+        or entry.model != usage.model
+        or entry.prompt_tokens != usage.prompt_tokens
+        or entry.completion_tokens != usage.completion_tokens
+        or entry.cached_prompt_tokens != usage.cached_prompt_tokens
+        or entry.reasoning_tokens != usage.reasoning_tokens
+        or restore_utc(entry.recorded_at) != restore_utc(usage.recorded_at)
+    ):
+        raise AuditIntegrityError("historical END repair lost its exact original quota ledger")
+    recorded = restore_utc(entry.recorded_at)
+    started = restore_utc(attempt.started_at)
+    settled = restore_utc(attempt.settled_at)
+    comparable_recorded = recorded.replace(microsecond=0) if conn.dialect.name == "sqlite" else recorded
+    if conn.dialect.name not in ("sqlite", "postgresql") or started > recorded or settled < comparable_recorded:
+        raise AuditIntegrityError("historical END repair changed its paid time ordering")
+    text = cast(messages.c.tool_calls, Text)
+    actual_length = func.octet_length(text) if conn.dialect.name == "postgresql" else func.length(cast(messages.c.tool_calls, LargeBinary))
+    bounded = case((actual_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, messages.c.tool_calls), else_=None).label("tool_calls")
+    rows = conn.execute(
+        select(
+            messages.c.id,
+            messages.c.session_id,
+            messages.c.role,
+            messages.c.content,
+            messages.c.raw_content,
+            bounded,
+            messages.c.tool_call_id,
+            messages.c.parent_assistant_id,
+            messages.c.composition_state_id,
+            messages.c.writer_principal,
+            actual_length.label("actual_byte_length"),
+        )
+        .where(
+            messages.c.session_id == sid,
+            messages.c.role == "audit",
+            messages.c.content == "Provider call result recorded.",
+            text.like(f"%{owed.attempt_id}%"),
+        )
+        .limit(2)
+    ).all()
+    if (
+        len(rows) != 1
+        or rows[0].session_id != sid
+        or rows[0].tool_calls is None
+        or type(rows[0].actual_byte_length) is not int
+        or not 0 <= rows[0].actual_byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    ):
+        raise AuditIntegrityError("historical END repair lost its one bounded public paid audit")
+    public_call = _closed_call(
+        rows[0],
+        ProviderAuditSource(sid, owed.new_hold.session_operation_id, owed.new_hold.session_operation_epoch),
+        owed.attempt_id,
+    )
+    if llm_call_audit_envelope(public_call) != llm_call_audit_envelope(call):
+        raise AuditIntegrityError("historical END repair changed its original public paid audit")
+
+
 def read_original_end_complete_repair_history_on_connection(
     conn: Connection, *, owed: VerifiedCheckpointEndOwed, names: frozenset[str]
 ) -> VerifiedEndCompleteRepairHistory:
@@ -438,6 +553,7 @@ def read_original_end_complete_repair_history_on_connection(
         raise AuditIntegrityError("historical END repair changed its exact two-effect frontier")
     _reprove_pass_and_withheld(conn, owed=owed, event=event, before=before)
     _reprove_action(conn, owed=owed, event=event, before=before, after=after, successor=successor)
+    _reprove_original_paid_audit(conn, owed=owed, event=event)
     if type(child_receipt) is not str or type(outer_receipt) is not str:
         raise AuditIntegrityError("historical END repair lost its original receipt identifiers")
     return VerifiedEndCompleteRepairHistory(owed, successor, child_receipt, outer_receipt)

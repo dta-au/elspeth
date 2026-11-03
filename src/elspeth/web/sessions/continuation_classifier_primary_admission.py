@@ -34,7 +34,10 @@ from elspeth.web.sessions.continuation_classifier_primary import (
 )
 from elspeth.web.sessions.continuation_classifier_primary_incomplete_tail import prepare_classifier_paid_incomplete_tail_plan
 from elspeth.web.sessions.continuation_classifier_primary_paid_tail import prepare_classifier_paid_overflow_tail_plan
-from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import classifier_terminal_reservation
+from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import (
+    ClassifierTerminalReservation,
+    classifier_sdk_terminal_reservation,
+)
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
 from elspeth.web.sessions.continuation_paid_overflow_quota import preflight_v4_requested_model
 from elspeth.web.sessions.continuation_primary import _input_value
@@ -170,14 +173,7 @@ def admit_v4_classifier_provider_on_connection(
         claim_attempt=running.claim.attempt,
         operation_epoch=fence.operation_epoch,
     )
-    reservation = classifier_terminal_reservation(
-        paid_contract=paid_tail.fallback_contract_sha256,
-        paid_bytes=paid_tail.reserved_bytes,
-        incomplete_contract=incomplete_tail.fallback_contract_sha256,
-        incomplete_bytes=incomplete_tail.reserved_bytes,
-        no_sdk_contract=no_sdk_tail.contract_sha256,
-        no_sdk_bytes=no_sdk_tail.reserved_bytes,
-    )
+    reservation = ClassifierTerminalReservation(*classifier_sdk_terminal_reservation(paid_tail, incomplete_tail, no_sdk_tail))
     hold = ProviderTerminalHoldSource(
         session_id=identity.session_id,
         operation_id=identity.operation_id,
@@ -298,13 +294,10 @@ def read_v4_classifier_admission_on_connection(
         claim_attempt=hold.claim_attempt,
         operation_epoch=hold.session_operation_epoch,
     )
-    reservation = classifier_terminal_reservation(
-        paid_contract=paid_tail.fallback_contract_sha256,
-        paid_bytes=paid_tail.reserved_bytes,
-        incomplete_contract=incomplete_tail.fallback_contract_sha256,
-        incomplete_bytes=incomplete_tail.reserved_bytes,
-        no_sdk_contract=no_sdk_tail.contract_sha256,
-        no_sdk_bytes=no_sdk_tail.reserved_bytes,
+    reservation = ClassifierTerminalReservation(
+        *classifier_sdk_terminal_reservation(
+            paid_tail, incomplete_tail, no_sdk_tail, historical_contract_sha256=hold.fallback_contract_sha256
+        )
     )
     if hold.reserved_bytes != reservation.reserved_bytes or hold.fallback_contract_sha256 != reservation.contract_sha256:
         raise AuditIntegrityError("classifier admission readback changed its original combined H")

@@ -19,6 +19,7 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
     CheckpointEndPhysicalSource,
     checkpoint_end_physical_custody,
     observe_checkpoint_end_physical_return,
+    observe_checkpoint_end_sdk_companion,
     prepare_checkpoint_end_physical_source,
 )
 from elspeth.web.composer.continuation_checkpoint_observation import (
@@ -26,11 +27,14 @@ from elspeth.web.composer.continuation_checkpoint_observation import (
     CheckpointReturnedResponseObservation,
 )
 from elspeth.web.composer.continuation_initialization import _registered
+from elspeth.web.composer.provider_quota import V4SdkTerminalCommitted
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions.continuation_checkpoint_end_owed import CheckpointEndOwedAdmission
 from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
 from elspeth.web.sessions.continuation_checkpoint_paid_terminal import VerifiedCheckpointPaidOverflowTerminal
 from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
+from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 from elspeth.web.sessions.service import SessionServiceImpl
 
 if TYPE_CHECKING:
@@ -61,7 +65,7 @@ async def run_v4_checkpoint_end_first_return(
     provider_owner: ProviderInvocationOwner,
     timeout: float | None,
     format_retry: CheckpointEndFormatRetrySource | None = None,
-) -> V4EndFirstRetained | EndCheckpointPaidOverflowTerminal:
+) -> V4EndFirstRetained | EndCheckpointPaidOverflowTerminal | SdkTerminalResult | SdkTerminalFailure:
     """Use the exact original paid owner, then retain raw complete H once."""
     phases = phase_owner.phases
     running = phases.work.running
@@ -110,16 +114,30 @@ async def run_v4_checkpoint_end_first_return(
             arguments, schema_valid=format_retry.proof.marker.first_attempt_schema_valid is True
         )
     source = await prepare_checkpoint_end_physical_source(phase_owner=phase_owner, gate_locals=gate_locals)
-    await advisor._call_advisor_with_audit(
-        arguments,
-        recorder=recorder,
-        timeout=timeout,
-        structured_output=True,
-        provider_owner=provider_owner,
-        _outcome=source.capture,
-        checkpoint_end_source=source,
-        checkpoint_end_retry=format_retry,
-    )
+    try:
+        await advisor._call_advisor_with_audit(
+            arguments,
+            recorder=recorder,
+            timeout=timeout,
+            structured_output=True,
+            provider_owner=provider_owner,
+            _outcome=source.capture,
+            checkpoint_end_source=source,
+            checkpoint_end_retry=format_retry,
+        )
+    except V4SdkTerminalCommitted as control:
+        custody = checkpoint_end_physical_custody(source)
+        if custody.v4_sdk_terminal_result is not control.finalization:
+            raise AuditIntegrityError("END SDK terminal changed its original committed custody") from control
+        finalized = control.finalization
+        return SdkTerminalResult(finalized.verified, SdkTerminalFamily.CHECKPOINT_END, finalized.deferred_cancellations)
+    except BaseException as failure:
+        exceptional = observe_checkpoint_end_sdk_companion(source, failure)
+        if exceptional is not None:
+            if exceptional.family is not SdkTerminalFamily.CHECKPOINT_END:
+                raise AuditIntegrityError("END SDK companion changed its original family") from failure
+            return exceptional
+        raise
     observed = observe_checkpoint_end_physical_return(source)
     custody = checkpoint_end_physical_custody(source)
     prepared = custody.continuation_checkpoint_v4

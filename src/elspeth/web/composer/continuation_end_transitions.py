@@ -109,6 +109,8 @@ def retain_end_transition(
     candidate: PrivateChunk | None = None,
     captured: CapturedContinuationRuntime | None = None,
 ) -> StoredContinuationSnapshot:
+    from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+
     if transition not in ("end_entered", "recovery_entered", "end_review_dispatched", "end_repair_continued"):
         raise ValueError("END transition has no implemented source owner")
     if (
@@ -125,7 +127,7 @@ def retain_end_transition(
         raise AuditIntegrityError("only END repair continuation retains captured live owners")
     before = selected.stack
     sid, operation_id = before.logical.session_id, before.logical.operation_id
-    with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
+    with retention_stage_memo_scope(), locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
         _require_current_continuation_running(conn, running)
         require_current_env_inventory_on_connection(
             conn, running, inventory=inventory, expected_checkpoint_id=selected.checkpoint_id, expected_cursor=before.cursor

@@ -558,7 +558,9 @@ async def _maybe_auto_title_session_required(
     v4_response_metadata: _AdmittedLLMProviderMetadata | None = None
     durable_audit: _ContinuationTitleAuditKwargs = {}
     try:
-        async with provider_call_scope(provider_custody):
+        from elspeth.web.composer.provider_sdk_terminal import sdk_terminal_failure_scope
+
+        async with sdk_terminal_failure_scope(provider_custody), provider_call_scope(provider_custody):
             try:
                 try:
                     durable_input: _ContinuationTitleGatewayKwargs = {}

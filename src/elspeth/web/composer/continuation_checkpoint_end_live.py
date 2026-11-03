@@ -29,9 +29,11 @@ from elspeth.web.composer.continuation_checkpoint_end_terminal import (
     _EndCheckpointFormatRetryReadyControl,
     _EndCheckpointPaidIncompleteControl,
     _EndCheckpointRepairContinuedControl,
+    _EndCheckpointSdkTerminalControl,
 )
 from elspeth.web.composer.continuation_checkpoint_end_usable import complete_v4_checkpoint_end_usable_return
 from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 
 if TYPE_CHECKING:
     from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
@@ -88,6 +90,8 @@ async def run_v4_checkpoint_end_live(
         except V4PaidIncompleteCommitted as control:
             terminal = observe_checkpoint_end_paid_incomplete_terminal(control, phase_owner=owner, gate_locals=gate)
             raise _EndCheckpointPaidIncompleteControl(terminal) from None
+        if isinstance(returned, (SdkTerminalResult, SdkTerminalFailure)):
+            raise _EndCheckpointSdkTerminalControl(returned)
         if type(returned) is EndCheckpointPaidOverflowTerminal:
             raise _EndCheckpointDispositionControl(returned)
         if type(returned) is not V4EndFirstRetained:

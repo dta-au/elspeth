@@ -133,7 +133,6 @@ from elspeth.web.sessions.continuation_selection import load_private_chunks
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_tail import (
     SemanticPaidIncompleteTailPlan,
     prepare_semantic_paid_incomplete_tail_plan,
-    semantic_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import (
     SemanticNoSdkTailPlan,
@@ -1039,7 +1038,9 @@ def admit_v4_semantic_provider_on_connection(
             creator_sequence=running.claim.segment_sequence,
             creator_generation=running.claim.ownership_generation,
         )
-        reserved_bytes, contract_sha256 = semantic_combined_terminal_hold_contract(tail, incomplete_tail, no_sdk_tail)
+        from elspeth.web.sessions.continuation_semantic_terminal_reservation import semantic_sdk_terminal_reservation
+
+        reserved_bytes, contract_sha256 = semantic_sdk_terminal_reservation(tail, incomplete_tail, no_sdk_tail)
         hold = ProviderTerminalHoldSource(
             session_id=sid,
             operation_id=operation,

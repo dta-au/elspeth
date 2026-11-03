@@ -25,7 +25,6 @@ from elspeth.web.sessions.continuation_semantic_paid_incomplete_audit import req
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_tail import (
     build_semantic_paid_incomplete_tail_batch,
     prepare_semantic_paid_incomplete_tail_plan,
-    semantic_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import prepare_semantic_no_sdk_tail_plan
 from elspeth.web.sessions.continuation_semantic_paid_overflow_tail import prepare_semantic_paid_overflow_tail_plan
@@ -123,7 +122,11 @@ def _read_cold_semantic_paid_incomplete(
         creator_sequence=source.creator_sequence,
         creator_generation=source.creator_generation,
     )
-    reserved, combined_hash = semantic_combined_terminal_hold_contract(paid_plan, incomplete_plan, no_sdk_plan)
+    from elspeth.web.sessions.continuation_semantic_terminal_reservation import semantic_sdk_terminal_reservation
+
+    reserved, combined_hash = semantic_sdk_terminal_reservation(
+        paid_plan, incomplete_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("Semantic paid-incomplete terminal changed original fallback H")
     batch = build_semantic_paid_incomplete_tail_batch(incomplete_plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))

@@ -10,6 +10,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.sessions.composer_operations import ComposerOperationError
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource
+from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
 from elspeth.web.sessions.continuation_sdk_terminal import SdkTerminalReceipt
 
 
@@ -20,6 +21,7 @@ class VerifiedSdkTerminal:
     terminal: StoredContinuationSnapshot
     provider_attempt_id: str
     hold_state: Literal["consumed"]
+    env_ref_names: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if (
@@ -27,6 +29,8 @@ class VerifiedSdkTerminal:
             or type(self.receipt) is not SdkTerminalReceipt
             or type(self.terminal) is not StoredContinuationSnapshot
             or self.hold_state != "consumed"
+            or type(self.env_ref_names) is not frozenset
+            or any(type(name) is not str for name in self.env_ref_names)
             or self.provider_attempt_id != self.receipt.identity.attempt_id
             or self.receipt.identity.session_id != self.source.session_id
             or self.receipt.identity.operation_id != self.source.operation_id
@@ -47,6 +51,33 @@ class VerifiedSdkTerminal:
 class PrimarySdkTerminal:
     receipt: SdkTerminalReceipt
     snapshot: StoredContinuationSnapshot
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class SdkTerminalResult:
+    """Family-tagged projection; the driver must independently cold-read it."""
+
+    verified: VerifiedSdkTerminal
+    family: SdkTerminalFamily
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.verified) is not VerifiedSdkTerminal
+            or type(self.family) is not SdkTerminalFamily
+            or self.verified.receipt.producer != self.family.producer
+        ):
+            raise AuditIntegrityError("SDK projection changed its original terminal family")
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class SdkTerminalFailure:
+    """Exceptional projection; only its private source issuer grants release."""
+
+    verified: VerifiedSdkTerminal
+    family: SdkTerminalFamily
+    original: BaseException = field(repr=False)
     deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
 
 

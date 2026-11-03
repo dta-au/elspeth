@@ -107,7 +107,7 @@ def test_known_charge_and_partial_usage_are_preserved_without_zero_substitution(
         ("sdk_result_observed", 0),
         ("retryable", True),
         ("retryable", 0),
-        ("producer", "checkpoint_advisor"),
+        ("producer", "unknown_provider_family"),
         ("outcome", "terminal_paid_incomplete"),
         ("schema_version", "composer.paid-incomplete.v1"),
     ],

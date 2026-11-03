@@ -21,7 +21,7 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_RESULT_S
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, _effect_snapshot, load_snapshot
 from elspeth.web.sessions.continuation_checkpoint_no_sdk_tail import build_checkpoint_no_sdk_tail_batch
 from elspeth.web.sessions.continuation_checkpoint_paid_terminal import _bounded_bytes, _checkpoint_at, _event_at, _stored_hold_source
-from elspeth.web.sessions.continuation_checkpoint_terminal_hold import prepare_checkpoint_terminal_hold_plan
+from elspeth.web.sessions.continuation_checkpoint_sdk_reservation import prepare_checkpoint_sdk_terminal_hold_plan
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
 from elspeth.web.sessions.continuation_retained_capacity import (
     ProviderTerminalHoldSource,
@@ -275,12 +275,13 @@ def read_v4_checkpoint_no_sdk_terminal_on_connection(
         source_cursor=source.source_cursor,
         source_snapshot_sha256=source.source_snapshot_sha256,
     )
-    combined = prepare_checkpoint_terminal_hold_plan(
+    combined = prepare_checkpoint_sdk_terminal_hold_plan(
         identity=identity,
         admitted=admitted,
         phase=preparation["phase"],
         creator_sequence=source.creator_sequence,
         requested_model=effect.requested_model,
+        historical_contract_sha256=source.fallback_contract_sha256,
     )
     if source.reserved_bytes != combined.reserved_bytes or source.fallback_contract_sha256 != combined.contract_sha256:
         raise AuditIntegrityError("checkpoint no-SDK terminal changed its original combined H")

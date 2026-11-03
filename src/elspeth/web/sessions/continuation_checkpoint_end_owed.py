@@ -50,8 +50,8 @@ from elspeth.web.sessions.continuation_checkpoint_paid_tail import (
     CheckpointPaidOverflowTailPlan,
     prepare_checkpoint_paid_overflow_tail_plan,
 )
-from elspeth.web.sessions.continuation_checkpoint_terminal_hold import (
-    prepare_checkpoint_terminal_hold_plan,
+from elspeth.web.sessions.continuation_checkpoint_sdk_reservation import (
+    prepare_checkpoint_sdk_terminal_hold_plan,
 )
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
 from elspeth.web.sessions.continuation_retained_capacity import (
@@ -636,12 +636,13 @@ def _read_checkpoint_end_owed_on_connection(
         source_cursor=hold.source_cursor,
         source_snapshot_sha256=hold.source_snapshot_sha256,
     )
-    old_plan = prepare_checkpoint_terminal_hold_plan(
+    old_plan = prepare_checkpoint_sdk_terminal_hold_plan(
         identity=identity,
         admitted=original,
         phase="end",
         creator_sequence=hold.creator_sequence,
         requested_model=original_event["requested_model"],
+        historical_contract_sha256=value["old_hold_contract_sha256"],
     )
     if (
         old_plan.contract_sha256 != value["old_hold_contract_sha256"]

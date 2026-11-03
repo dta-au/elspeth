@@ -45,7 +45,10 @@ from elspeth.web.sessions.continuation import (
 from elspeth.web.sessions.continuation_classifier_primary import _chain, _read_source
 from elspeth.web.sessions.continuation_classifier_primary_incomplete_tail import prepare_classifier_paid_incomplete_tail_plan
 from elspeth.web.sessions.continuation_classifier_primary_paid_tail import prepare_classifier_paid_overflow_tail_plan
-from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import classifier_terminal_reservation
+from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import (
+    ClassifierTerminalReservation,
+    classifier_sdk_terminal_reservation,
+)
 from elspeth.web.sessions.continuation_primary_paid_overflow_capacity import (
     V4PrimaryResultBatch,
     admit_v4_primary_result_batch_on_connection,
@@ -463,13 +466,8 @@ def refuse_classifier_no_sdk_on_connection(
         claim_attempt=running.claim.attempt,
         operation_epoch=hold_source.session_operation_epoch,
     )
-    reservation = classifier_terminal_reservation(
-        paid_contract=paid.fallback_contract_sha256,
-        paid_bytes=paid.reserved_bytes,
-        incomplete_contract=incomplete.fallback_contract_sha256,
-        incomplete_bytes=incomplete.reserved_bytes,
-        no_sdk_contract=no_sdk.contract_sha256,
-        no_sdk_bytes=no_sdk.reserved_bytes,
+    reservation = ClassifierTerminalReservation(
+        *classifier_sdk_terminal_reservation(paid, incomplete, no_sdk, historical_contract_sha256=hold_source.fallback_contract_sha256)
     )
     if (
         paid != admission.paid_tail
@@ -701,13 +699,8 @@ def read_classifier_no_sdk_refusal_on_connection(
     incomplete = prepare_classifier_paid_incomplete_tail_plan(
         identity=fence_identity, admitted=admitted, creator_sequence=source.creator_sequence
     )
-    reservation = classifier_terminal_reservation(
-        paid_contract=paid.fallback_contract_sha256,
-        paid_bytes=paid.reserved_bytes,
-        incomplete_contract=incomplete.fallback_contract_sha256,
-        incomplete_bytes=incomplete.reserved_bytes,
-        no_sdk_contract=no_sdk.contract_sha256,
-        no_sdk_bytes=no_sdk.reserved_bytes,
+    reservation = ClassifierTerminalReservation(
+        *classifier_sdk_terminal_reservation(paid, incomplete, no_sdk, historical_contract_sha256=hold_source.fallback_contract_sha256)
     )
     projected, projected_events = _shape(
         admitted,

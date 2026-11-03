@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -14,6 +15,7 @@ from elspeth.web.composer.prompt_guard import build_prompt_guard_mount, prompt_g
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -57,8 +59,32 @@ def _required_guard_settings(tmp_path, monkeypatch):
     return settings, requests
 
 
-def _assert_required_guard_admitted(engine, context, requests, *, role, user_prompt, expected_count=1):
+def _assert_required_guard_admitted(
+    engine, context, requests, *, role, user_prompt, expected_count=1, current_context: SessionOperationContext | None = None
+):
     checks = _checks(engine)
+    if current_context is not None:
+        from elspeth.web.sessions.models import quota_provider_attempts_table, sessions_table
+
+        assert type(current_context) is SessionOperationContext and current_context is context
+        fence = current_context.fence
+        with engine.connect() as connection:
+            attempt = connection.execute(
+                select(quota_provider_attempts_table).where(
+                    quota_provider_attempts_table.c.session_id == fence.session_id,
+                    quota_provider_attempts_table.c.operation_id == fence.operation_id,
+                    quota_provider_attempts_table.c.operation_epoch == fence.operation_epoch,
+                    quota_provider_attempts_table.c.lease_token == fence.lease_token,
+                    quota_provider_attempts_table.c.source == "composer",
+                    quota_provider_attempts_table.c.settled_at.is_(None),
+                    quota_provider_attempts_table.c.ledger_entry_id.is_(None),
+                )
+            ).one()
+            identity_id = connection.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == fence.session_id)).scalar_one()
+        assert attempt.identity_id == identity_id and attempt.run_id is None
+        checks = [
+            check for check in checks if (check["operation_id"], check["operation_epoch"]) == (fence.operation_id, fence.operation_epoch)
+        ]
     assert len(checks) == expected_count
     for check in checks:
         assert check["operation_id"] == context.fence.operation_id

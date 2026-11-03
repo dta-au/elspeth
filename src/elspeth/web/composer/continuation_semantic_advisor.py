@@ -96,8 +96,10 @@ from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
 from elspeth.web.required_work import RequiredWorkTicket
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
     from elspeth.web.sessions.continuation import PreparedContinuationProvider
     from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+    from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
 
@@ -474,6 +476,8 @@ async def run_semantic_advisor(
         [V4ProviderResultIncomplete, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]]
     ]
     | None = None,
+    v4_sdk_finalizer: Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]]
+    | None = None,
 ) -> SemanticAdvisorResult | SemanticV4Finalization:
     """One actual Advisor call; no retry, source retention or action execution."""
     if (
@@ -509,7 +513,7 @@ async def run_semantic_advisor(
         if _outcome is None:
             raise AuditIntegrityError("Semantic original issuer lost its private physical capture")
         no_sdk_issuer.bind_capture(custody, _outcome)
-    if any(value is not None for value in (v4_prepared, v4_env_ref_names, v4_finalizer, v4_incomplete_finalizer)):
+    if any(value is not None for value in (v4_prepared, v4_env_ref_names, v4_finalizer, v4_incomplete_finalizer, v4_sdk_finalizer)):
         from elspeth.web.sessions.continuation import PreparedContinuationProvider
 
         if (
@@ -517,6 +521,7 @@ async def run_semantic_advisor(
             or type(v4_env_ref_names) is not frozenset
             or v4_finalizer is None
             or v4_incomplete_finalizer is None
+            or v4_sdk_finalizer is None
             or no_sdk_issuer is None
             or no_sdk_issuer.prepared_candidate is not v4_prepared
             or _outcome is None
@@ -524,6 +529,7 @@ async def run_semantic_advisor(
             raise AuditIntegrityError("V4 semantic physical call requires original prepared, env and SQL owners")
         custody.bind_continuation_semantic_v4(v4_prepared, v4_finalizer)
         custody.bind_v4_returned_incomplete_finalizer(v4_incomplete_finalizer)
+        custody.bind_v4_sdk_finalizer(v4_sdk_finalizer)
     options = deep_thaw(request.options)
     limit = custody.cost_completion_limit()
     expected_limit = owner._settings.composer_advisor_max_completion_tokens
@@ -554,7 +560,9 @@ async def run_semantic_advisor(
     original_content: str | None = None
     incomplete_return: V4ProviderResultIncomplete | None = None
     call: ComposerLLMCall | None = None
-    async with provider_call_scope(custody):
+    from elspeth.web.composer.provider_sdk_terminal import sdk_terminal_failure_scope
+
+    async with sdk_terminal_failure_scope(custody), provider_call_scope(custody):
         try:
             if no_sdk_issuer is not None:
                 no_sdk_issuer.require_original_clock()

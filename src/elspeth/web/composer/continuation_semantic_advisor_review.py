@@ -32,6 +32,7 @@ from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_end import EndReviewContinued, EndReviewExecution, execute_continuation_end_review
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 from elspeth.web.sessions.continuation_semantic_actions import SemanticActionAdmission, require_consumed_semantic_review_on_connection
 from elspeth.web.sessions.continuation_semantic_review_result import (
     SemanticReviewCommitted,
@@ -107,6 +108,8 @@ async def review_prescribed_continuation_end(
     | EndCheckpointPaidOverflowTerminal
     | EndCheckpointNoSdkTerminal
     | EndCheckpointUnboundRefusalTerminal
+    | SdkTerminalResult
+    | SdkTerminalFailure
     | None
 ):
     """Retain a real END Review result without claiming final publication."""
@@ -154,6 +157,8 @@ async def review_prescribed_continuation_end(
             EndCheckpointPaidOverflowTerminal,
             EndCheckpointNoSdkTerminal,
             EndCheckpointUnboundRefusalTerminal,
+            SdkTerminalResult,
+            SdkTerminalFailure,
         ),
     ):
         return execution

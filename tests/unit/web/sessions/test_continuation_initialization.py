@@ -32,8 +32,8 @@ from elspeth.web.sessions.composer_operations import (
 from elspeth.web.sessions.continuation import ContinuationCASConflict
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from elspeth.web.sessions.models import composition_states_table, sessions_table
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
-from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.titles import format_default_session_title
@@ -65,7 +65,13 @@ def seed_observed_sql_trial_policy(monkeypatch):
 
 
 async def bootstrap_case(
-    store, *, eligible=True, bound_base=False, settings_overrides=None, base_state_data: CompositionStateData | None = None
+    store,
+    *,
+    eligible=True,
+    bound_base=False,
+    settings_overrides=None,
+    base_state_data: CompositionStateData | None = None,
+    prior_operation_id: str | None = None,
 ):
     if base_state_data is not None and type(base_state_data) is not CompositionStateData:
         raise TypeError("bootstrap base requires its original owned composition DTO")
@@ -73,7 +79,42 @@ async def bootstrap_case(
         bound_base = True
     engine, repository, authority, sessions, sid = store
     # An actual settled prior job, read by the real bounded history owner.
-    prior, _ = await operations._settled_failure(store, stop=True)
+    if prior_operation_id is None:
+        prior, _ = await operations._settled_failure(store, stop=True)
+    else:
+        if base_state_data is None:
+            raise ValueError("bootstrap prior reuse requires its actual saved base DTO")
+        prior = authority.get(session_id=sid, operation_id=prior_operation_id)
+        if (
+            prior is None
+            or prior.status != "failed"
+            or prior.failure_code != "request_cancelled"
+            or prior.cancel_requested_at is None
+            or prior.settled_at is None
+        ):
+            raise ValueError("bootstrap prior must be an actual same-session sealed Stop")
+        with engine.connect() as conn:
+            original = conn.execute(
+                select(composition_states_table)
+                .where(composition_states_table.c.session_id == str(sid))
+                .order_by(composition_states_table.c.version.desc())
+                .limit(1)
+            ).one_or_none()
+        if original is None:
+            raise ValueError("bootstrap prior reuse requires its actual saved base state")
+        stored = sessions._row_to_state_record(original)
+        actual_base = CompositionStateData(
+            sources=stored.sources,
+            nodes=stored.nodes,
+            edges=stored.edges,
+            outputs=stored.outputs,
+            metadata_=stored.metadata_,
+            is_valid=stored.is_valid,
+            validation_errors=stored.validation_errors,
+            composer_meta=stored.composer_meta,
+        )
+        if base_state_data != actual_base:
+            raise ValueError("bootstrap base DTO differs from its actual saved state")
     base = None
     if bound_base:
         seed_context = repository.acquire(

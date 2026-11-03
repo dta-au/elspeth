@@ -20,7 +20,7 @@ from elspeth.web.sessions.continuation_paid_overflow import (
     encode_paid_overflow_cost_amount,
 )
 from elspeth.web.sessions.continuation_paid_overflow_quota import AdmittedPaidOverflowRequestedModel, OriginalPaidOverflowPhysicalAttempt
-from elspeth.web.sessions.continuation_sdk_terminal import SdkTerminalReceipt
+from elspeth.web.sessions.continuation_sdk_terminal import SdkTerminalProducer, SdkTerminalReceipt
 
 
 def prepare_sdk_terminal_receipt(
@@ -30,6 +30,7 @@ def prepare_sdk_terminal_receipt(
     identity: PaidOverflowIdentity,
     call: ComposerLLMCall | None,
     observed_at: datetime,
+    producer: SdkTerminalProducer = "primary",
 ) -> SdkTerminalReceipt:
     require_original_v4_sdk_failure(observation, custody=custody)
     if type(identity) is not PaidOverflowIdentity or identity.attempt_id != observation.attempt.attempt_id:
@@ -79,7 +80,7 @@ def prepare_sdk_terminal_receipt(
     return SdkTerminalReceipt(
         schema_version="composer.sdk-terminal.v1",
         identity=identity,
-        producer="primary",
+        producer=producer,
         outcome="terminal_sdk_failure",
         observation=observation.observation,
         sdk_entered=True,
@@ -115,7 +116,7 @@ def prepare_sdk_terminal_quota_entry(
     if (
         physical.attempt_id != identity.attempt_id
         or physical.session_id != identity.session_id
-        or physical.source != "composer"
+        or physical.source != ("auto_title" if receipt.producer == "title" else "composer")
         or physical.run_id is not None
         or physical.operation_id != identity.session_operation_id
         or type(physical.operation_epoch) is not int

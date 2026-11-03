@@ -15,6 +15,8 @@ from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
 )
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_checkpoint_end_retry import VerifiedEndFormatRetry
@@ -106,6 +108,20 @@ class _EndCheckpointFormatRetryReadyControl(Exception):
         self.ready = ready
 
 
+class _EndCheckpointSdkTerminalControl(Exception):
+    """Exit END before parsing, retry, verdict, or publication after SDK closure."""
+
+    def __init__(self, terminal: SdkTerminalResult | SdkTerminalFailure) -> None:
+        if type(terminal) not in (SdkTerminalResult, SdkTerminalFailure) or terminal.family is not SdkTerminalFamily.CHECKPOINT_END:
+            raise AuditIntegrityError("END SDK control requires its original checkpoint terminal")
+        if type(terminal) is SdkTerminalFailure:
+            from elspeth.web.composer.provider_sdk_terminal import require_sdk_terminal_failure
+
+            require_sdk_terminal_failure(terminal)
+        super().__init__("checkpoint_end_sdk_terminal")
+        self.terminal = terminal
+
+
 async def observe_end_checkpoint_terminal[T](
     execution: Awaitable[T],
 ) -> (
@@ -115,6 +131,8 @@ async def observe_end_checkpoint_terminal[T](
     | EndCheckpointCompleteReview
     | EndCheckpointRepairContinued
     | EndCheckpointFormatRetryReady
+    | SdkTerminalResult
+    | SdkTerminalFailure
 ):
     """Stop before the original END caller's effectful continuation tail."""
     try:
@@ -129,3 +147,5 @@ async def observe_end_checkpoint_terminal[T](
         return control.continued
     except _EndCheckpointFormatRetryReadyControl as control:
         return control.ready
+    except _EndCheckpointSdkTerminalControl as control:
+        return control.terminal

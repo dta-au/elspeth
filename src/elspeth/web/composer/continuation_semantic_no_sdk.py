@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     )
     from elspeth.web.composer.provider_quota import ProviderCallCustody, V4ReturnedIncompleteFinalization
     from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+    from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
+    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
     from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission
 
 
@@ -470,6 +472,60 @@ class SemanticAdvisorNoSdkIssuer:
                 raise AuditIntegrityError("V4 semantic paid-incomplete capture lost its original SDK return and audit")
             self._custody.require_v4_result_incomplete(incomplete)
             return original
+
+    def require_original_sdk_custody(
+        self, prepared: PreparedContinuationProvider, observation: V4SdkFailureObservation
+    ) -> ProviderCallCustody:
+        from elspeth.web.composer.provider_sdk_observation import require_original_v4_sdk_failure
+
+        with self._lock:
+            custody = self._custody
+            if self._state != "sdk_entered" or prepared is not self._prepared or custody is None:
+                raise AuditIntegrityError("semantic SDK finalizer lost original live custody")
+            require_original_v4_sdk_failure(observation, custody=custody)
+            if custody.continuation_semantic_v4 is not prepared or observation.attempt.attempt_id != self._attempt_id:
+                raise AuditIntegrityError("semantic SDK finalizer changed original attempt")
+            return custody
+
+    def require_v4_sdk_outcome(
+        self, prepared: PreparedContinuationProvider, outcome: SemanticAdvisorInvocationRaised
+    ) -> SdkTerminalResult | SdkTerminalFailure | None:
+        from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationRaised
+        from elspeth.web.composer.provider_quota import V4SdkTerminalCommitted
+        from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure
+        from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
+        from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalResult
+
+        with self._lock:
+            custody = self._custody
+            if custody is None or (custody.v4_sdk_terminal_failure is None and type(outcome.error) is not V4SdkTerminalCommitted):
+                return None
+            if (
+                self._state != "sdk_entered"
+                or prepared is not self._prepared
+                or type(outcome) is not SemanticAdvisorInvocationRaised
+                or self._capture is None
+                or outcome.observation != self._capture.snapshot()
+                or (self._outcome is not None and outcome is not self._outcome)
+                or self._attempt_id is None
+                or self._dispatched is None
+            ):
+                raise AuditIntegrityError("semantic SDK release lost its original invocation capture")
+            exceptional = capture_sdk_terminal_failure(outcome.error, custody=custody)
+            if exceptional is not None:
+                return exceptional
+            control = outcome.error
+            if type(control) is not V4SdkTerminalCommitted or custody.v4_sdk_terminal_result is not control.finalization:
+                raise AuditIntegrityError("semantic SDK release changed its committed original custody")
+            finalized = control.finalization
+            if (
+                self._outcome is not outcome
+                or finalized.verified.source.effect_key != prepared.binding.effect_key
+                or finalized.verified.provider_attempt_id != self._attempt_id
+                or finalized.verified.terminal.cursor < self._dispatched.cursor + 2
+            ):
+                raise AuditIntegrityError("semantic SDK release changed its original terminal")
+            return SdkTerminalResult(finalized.verified, SdkTerminalFamily.SEMANTIC, finalized.deferred_cancellations)
 
     def require_v4_paid_incomplete_committed(
         self, prepared: PreparedContinuationProvider, outcome: SemanticAdvisorInvocationRaised

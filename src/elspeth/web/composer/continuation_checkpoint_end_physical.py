@@ -36,11 +36,14 @@ from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.provider_quota import ProviderCallCustody, V4PaidIncompleteCommitted
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
+from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
 from elspeth.web.required_work import RequiredWorkRole, RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.continuation_checkpoint_paid import CheckpointPreparedSource, PreparedCheckpointProvider, PreparedCheckpointSource
 from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, VerifiedSdkTerminal
 from elspeth.web.sessions.service import SessionServiceImpl
 
 
@@ -324,6 +327,27 @@ def bind_checkpoint_end_physical_request(
         )
 
     custody.bind_v4_returned_incomplete_finalizer(finalize_incomplete)
+
+    async def finalize_sdk(
+        observation: V4SdkFailureObservation, required_work: RequiredWorkTicket
+    ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+        require_original_checkpoint_end_physical_source(source)
+        if original.custody is not custody or custody.continuation_checkpoint_v4 is not prepared:
+            raise AuditIntegrityError("END SDK finalizer lost its original physical source")
+        admission = custody.continuation_checkpoint_v4_admission
+        if admission is None or custody.attempt is not admission.attempt or observation.attempt is not admission.attempt:
+            raise AuditIntegrityError("END SDK finalizer lost its original admitted paid attempt")
+        sessions = owner.phases.service._sessions_service
+        if type(sessions) is not SessionServiceImpl:
+            raise AuditIntegrityError("END SDK finalizer lost its original SQL owner")
+        deadline_owner = owner.phases.work.coordinator.sql_deadline_owner
+        if deadline_owner is not None:
+            deadline_owner.begin_settlement()
+        outcome = await sessions.finalize_v4_sdk_terminal(observation=observation, custody=custody, required_work=required_work)
+        owner.phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=required_work, actual_outcome=outcome)
+        return outcome
+
+    custody.bind_v4_sdk_finalizer(finalize_sdk)
     clock.finish_preparation()
 
 
@@ -333,6 +357,15 @@ def checkpoint_end_physical_custody(source: CheckpointEndPhysicalSource) -> Prov
     if custody is None:
         raise AuditIntegrityError("END physical source has no original prepared custody")
     return custody
+
+
+def observe_checkpoint_end_sdk_companion(source: CheckpointEndPhysicalSource, failure: BaseException) -> SdkTerminalFailure | None:
+    """Use only this physical source's retained custody for exceptional SDK results."""
+    require_original_checkpoint_end_physical_source(source)
+    custody = _issued[source].custody
+    if custody is None:
+        return None
+    return capture_sdk_terminal_failure(failure, custody=custody)
 
 
 def observe_checkpoint_end_paid_incomplete_terminal(

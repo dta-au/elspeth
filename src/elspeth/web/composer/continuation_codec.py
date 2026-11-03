@@ -204,7 +204,9 @@ def verify_private_chunk(reference: PrivateChunkRef, canonical: str) -> None:
             return
         try:
             proof = memo.canonical_text_proof(
-                CanonicalTextEncodingKey(canonical, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, reference),
+                # This producer proves text and SHA only. Each reference's
+                # current length/digest binding is checked below, even on hits.
+                CanonicalTextEncodingKey(canonical, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES),
                 _private_chunk_canonical_text_bytes,
                 sha256,
             )

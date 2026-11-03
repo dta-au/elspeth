@@ -205,12 +205,18 @@ async def _phase_case(
     before_batch_initialization=None,
     settings_overrides=None,
     base_state_data: CompositionStateData | None = None,
+    prior_operation_id: str | None = None,
 ):
-    if base_state_data is None:
+    if base_state_data is None and prior_operation_id is None:
         runtime, work, requests = await initialized_primary_input(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
     else:
         runtime, work, requests = await initialized_primary_input(
-            store, tmp_path, monkeypatch, settings_overrides=settings_overrides, base_state_data=base_state_data
+            store,
+            tmp_path,
+            monkeypatch,
+            settings_overrides=settings_overrides,
+            base_state_data=base_state_data,
+            prior_operation_id=prior_operation_id,
         )
     service, authority = runtime.materialization.service, store[2]
     running = work.running
@@ -228,7 +234,12 @@ async def _phase_case(
 
         async def completion(**sdk_kwargs):
             _assert_required_guard_admitted(
-                store[0], running.session_operation_context, requests, role="composer", user_prompt=runtime.bindings.message
+                store[0],
+                running.session_operation_context,
+                requests,
+                role="composer",
+                user_prompt=runtime.bindings.message,
+                **({"current_context": running.session_operation_context} if prior_operation_id is not None else {}),
             )
             sdk_calls.append(sdk_kwargs)
             tool_calls = (

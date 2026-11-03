@@ -58,7 +58,7 @@ if TYPE_CHECKING:
         PrimaryProviderResult,
         V4PrimaryProviderAdmission,
     )
-    from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
+    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, VerifiedSdkTerminal
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, V4SemanticProviderAdmission
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
     from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
@@ -259,6 +259,7 @@ class ProviderCallCustody:
         "continuation_title_v4_terminal",
         "v4_returned_incomplete_result",
         "v4_sdk_failure",
+        "v4_sdk_terminal_failure",
         "v4_sdk_terminal_result",
     )
 
@@ -299,6 +300,7 @@ class ProviderCallCustody:
             Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]] | None
         ) = None
         self.v4_sdk_terminal_result: V4SdkFinalization | None = None
+        self.v4_sdk_terminal_failure: SdkTerminalFailure | None = None
         self._admitting = False
         self._admitted_ns = 0
         self._undispatched_recurrence = 0
@@ -1197,9 +1199,25 @@ class ProviderCallCustody:
 
         require_original_v4_sdk_failure(observation, custody=self)
         finalizer = self._v4_sdk_finalizer
-        admission = self.continuation_primary_v4_admission
-        if finalizer is None or admission is None or self.attempt is not admission.attempt or self.v4_sdk_terminal_result is not None:
-            raise AuditIntegrityError("SDK terminal lost its original PRIMARY finalizer")
+        admissions = tuple(
+            item
+            for item in (
+                self.continuation_primary_v4_admission,
+                self.continuation_semantic_v4_admission,
+                self.continuation_classifier_v4_admission,
+                self.continuation_title_v4_admission,
+                self.continuation_checkpoint_v4_admission,
+            )
+            if item is not None
+        )
+        if (
+            finalizer is None
+            or len(admissions) != 1
+            or self.attempt is not admissions[0].attempt
+            or self.v4_sdk_terminal_result is not None
+        ):
+            raise AuditIntegrityError("SDK terminal lost its sole original finalizer")
+        admission = admissions[0]
         sql, projection = self.required_work.reserve_pair(
             RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
         )

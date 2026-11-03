@@ -46,13 +46,20 @@ from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, load_snapshot, verify_recovery_on_connection
+from elspeth.web.sessions.continuation_checkpoint_end_complete_action import (
+    require_original_end_outer_creator_after_complete_repair_on_connection,
+)
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import require_end_complete_pass_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_repair import (
     persist_end_complete_repair_on_connection,
     prepare_end_complete_repair_batch_on_connection,
 )
+from elspeth.web.sessions.continuation_checkpoint_end_complete_repair_history import (
+    read_original_end_complete_repair_history_on_connection,
+)
 from elspeth.web.sessions.continuation_checkpoint_end_owed import (
     read_v4_checkpoint_end_owed_on_connection,
+    read_v4_checkpoint_end_settled_owed_history_on_connection,
     retain_v4_checkpoint_end_owed_on_connection,
 )
 from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
@@ -88,14 +95,24 @@ operation_store = test_composer_operation_authority.operation_store
 
 
 @pytest.mark.parametrize(
-    ("allowance", "reasoning_bytes", "expect_overflow", "cold_resume", "replacement_audit", "repeat_recovery", "replacement_overflow"),
+    (
+        "allowance",
+        "reasoning_bytes",
+        "expect_overflow",
+        "cold_resume",
+        "replacement_audit",
+        "repeat_recovery",
+        "replacement_overflow",
+        "replacement_commit",
+    ),
     [
-        (16 * 1_048_576, 0, False, False, False, False, False),
-        (3_000_000, 700_000, True, False, False, False, False),
-        (3_000_000, 700_000, True, True, False, False, False),
-        (16 * 1_048_576, 0, False, False, True, False, False),
-        (16 * 1_048_576, 0, False, False, True, True, False),
-        (3_000_000, 700_000, True, True, True, False, True),
+        (16 * 1_048_576, 0, False, False, False, False, False, False),
+        (3_000_000, 700_000, True, False, False, False, False, False),
+        (3_000_000, 700_000, True, True, False, False, False, False),
+        (16 * 1_048_576, 0, False, False, True, False, False, False),
+        (16 * 1_048_576, 0, False, False, True, True, False, False),
+        (3_000_000, 700_000, True, True, True, False, True, False),
+        (16 * 1_048_576, 0, False, True, True, False, False, True),
     ],
     ids=(
         "fitting-complete",
@@ -104,6 +121,7 @@ operation_store = test_composer_operation_authority.operation_store
         "replacement-audit-source",
         "replacement-repeated-H",
         "replacement-cold-overflow",
+        "replacement-committed-repair",
     ),
 )
 @pytest.mark.asyncio
@@ -118,6 +136,7 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
     replacement_audit,
     repeat_recovery,
     replacement_overflow,
+    replacement_commit,
 ):
     policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
     assert policy is not None
@@ -529,6 +548,71 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                     finally:
                         await peer_lease.close()
                         peer_work.coordinator.assert_completed()
+                if replacement_commit:
+                    peer_service, _actors = current_service(current_store)
+                    peer_service._advisor_checkpoint._prompt_guard_mount = PromptGuardMount(
+                        _GuardClient(PromptGuardDecision("allow", "clean"))
+                    )
+                    peer_work = inventory_work(replacement)
+                    peer_owner = ProviderInvocationOwner(service=current_sessions, required_work=peer_work)
+                    peer_lease = await ContinuationLeaseAdoption(
+                        current_repository, context, lease_seconds=30, required_work=peer_work.coordinator
+                    ).join()
+                    try:
+                        peer_phases = ContinuationLivePhases(
+                            service=peer_service,
+                            authority=current_authority,
+                            work=peer_work,
+                            provider_owner=peer_owner,
+                            lease=peer_lease,
+                        )
+                        peer_selected = await load_selected_continuation(
+                            authority=current_authority,
+                            running=replacement,
+                            selected=owed.owed_selected,
+                            required_work=peer_work,
+                        )
+                        cold_source = await read_cold_checkpoint_end_consequence_source(phases=peer_phases, selected=peer_selected)
+                        cold_gate = await compute_first_cold_checkpoint_end_gate(source=cold_source)
+                        cold_projected = await project_first_cold_end_repair(gate=cold_gate)
+                        assert type(cold_projected) is ColdProjectedEndRepair
+                        committed = current_sessions.complete_v4_checkpoint_end_cold_repair_sync(projected=cold_projected)
+                        with locked_session_transaction(store[0], str(store[4])) as conn:
+                            verify_recovery_on_connection(conn, receipt)
+                            historical = read_v4_checkpoint_end_settled_owed_history_on_connection(
+                                conn,
+                                session_id=str(store[4]),
+                                operation_id=running.claim.operation_id,
+                                attempt_id=fresh.attempt_id,
+                                owed_checkpoint_id=fresh.selected.checkpoint_id,
+                                names=prepared.env_ref_names,
+                                child_disposition="committed",
+                            )
+                            proven = read_original_end_complete_repair_history_on_connection(
+                                conn, owed=historical, names=prepared.env_ref_names
+                            )
+                            assert proven.successor.checkpoint_id == committed.append.checkpoint_id
+                            assert proven.child_receipt == committed.child_receipt
+                            assert proven.outer_receipt == committed.outer_receipt
+                            assert require_original_end_outer_creator_after_complete_repair_on_connection(
+                                conn, owed=historical, names=prepared.env_ref_names
+                            ) == (running.claim.sequence, running.claim.generation, None)
+                            altered = conn.begin_nested()
+                            conn.execute(
+                                update(effects)
+                                .where(
+                                    effects.c.session_id == str(store[4]),
+                                    effects.c.operation_id == running.claim.operation_id,
+                                    effects.c.effect_key == fresh.outer_effect_key,
+                                )
+                                .values(receipt_key="foreign-repair-receipt")
+                            )
+                            with pytest.raises(AuditIntegrityError):
+                                verify_recovery_on_connection(conn, receipt)
+                            altered.rollback()
+                    finally:
+                        await peer_lease.close()
+                        peer_work.coordinator.assert_completed()
                 retained.append((None, None, owed, prepared, returned, None))
                 raise CapturedBeforeEndConsequences
             selected_owed = await load_selected_continuation(
@@ -647,6 +731,13 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                 assert attempt.settled_at is not None and hold.state == "consumed"
                 assert withheld is not None and withheld.content == "An actual PRIMARY candidate requires END review."
                 assert root.cursor == stored.cursor and not root.pending_settlement_ids
+                proven = read_original_end_complete_repair_history_on_connection(conn, owed=batch.owed, names=prepared.env_ref_names)
+                assert proven.successor == stored
+                assert proven.child_receipt == batch.child_receipt
+                assert proven.outer_receipt == batch.outer_receipt
+                assert require_original_end_outer_creator_after_complete_repair_on_connection(
+                    conn, owed=batch.owed, names=prepared.env_ref_names
+                ) == (running.claim.sequence, running.claim.generation, None)
         if expect_overflow:
             assert type(failure) is ContinuationRetainedCapacityExceeded
             assert failure.observed_bytes > failure.limit_bytes == allowance

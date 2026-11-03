@@ -51,6 +51,7 @@ from elspeth.web.composer.provider_quota import composer_quota_scope
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _TerminateOutcome
@@ -181,6 +182,8 @@ async def review_continuation_end(
     | EndCheckpointPaidOverflowTerminal
     | EndCheckpointNoSdkTerminal
     | EndCheckpointUnboundRefusalTerminal
+    | SdkTerminalResult
+    | SdkTerminalFailure
     | None
 ):
     """Run the shared terminal gates; publish, or return the next turn to the provider."""
@@ -199,6 +202,8 @@ async def review_continuation_end(
             EndCheckpointPaidOverflowTerminal,
             EndCheckpointNoSdkTerminal,
             EndCheckpointUnboundRefusalTerminal,
+            SdkTerminalResult,
+            SdkTerminalFailure,
         ),
     ):
         return execution
@@ -221,6 +226,8 @@ async def execute_continuation_end_review(
     | EndCheckpointPaidOverflowTerminal
     | EndCheckpointNoSdkTerminal
     | EndCheckpointUnboundRefusalTerminal
+    | SdkTerminalResult
+    | SdkTerminalFailure
 ):
     """Execute the one shared review without granting publication authority.
 
@@ -315,6 +322,8 @@ async def execute_continuation_end_review(
             EndCheckpointPaidOverflowTerminal,
             EndCheckpointNoSdkTerminal,
             EndCheckpointUnboundRefusalTerminal,
+            SdkTerminalResult,
+            SdkTerminalFailure,
         ),
     ):
         return terminate

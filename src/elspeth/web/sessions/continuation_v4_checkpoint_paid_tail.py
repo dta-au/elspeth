@@ -29,9 +29,9 @@ from elspeth.web.sessions.continuation_checkpoint_paid_tail import (
     CheckpointPaidOverflowTailPlan,
     build_checkpoint_paid_overflow_tail_batch,
 )
+from elspeth.web.sessions.continuation_checkpoint_sdk_reservation import prepare_checkpoint_sdk_terminal_hold_plan
 from elspeth.web.sessions.continuation_checkpoint_terminal_hold import (
     CheckpointTerminalHoldPlan,
-    prepare_checkpoint_terminal_hold_plan,
 )
 from elspeth.web.sessions.continuation_paid_incomplete import decode_paid_incomplete_receipt
 from elspeth.web.sessions.continuation_paid_overflow import decode_paid_overflow_receipt
@@ -156,12 +156,13 @@ def admit_v4_checkpoint_paid_tail_on_connection(
         or source.reserved_bytes != hold_plan.reserved_bytes
         or source.fallback_contract_sha256 != hold_plan.contract_sha256
         or load_snapshot(conn, session_id=source.session_id, operation_id=source.operation_id) != plan.admitted
-        or prepare_checkpoint_terminal_hold_plan(
+        or prepare_checkpoint_sdk_terminal_hold_plan(
             identity=plan.identity,
             admitted=plan.admitted,
             phase=plan.phase,
             creator_sequence=plan.creator_sequence,
             requested_model=hold_plan.no_sdk.requested_model,
+            historical_contract_sha256=source.fallback_contract_sha256,
         )
         != hold_plan
     ):
@@ -399,12 +400,13 @@ def admit_v4_checkpoint_no_sdk_tail_on_connection(
         or source.reserved_bytes != hold_plan.reserved_bytes
         or source.fallback_contract_sha256 != hold_plan.contract_sha256
         or load_snapshot(conn, session_id=source.session_id, operation_id=source.operation_id) != plan.admitted
-        or prepare_checkpoint_terminal_hold_plan(
+        or prepare_checkpoint_sdk_terminal_hold_plan(
             identity=plan.identity,
             admitted=plan.admitted,
             phase=phase,
             creator_sequence=plan.creator_sequence,
             requested_model=plan.requested_model,
+            historical_contract_sha256=source.fallback_contract_sha256,
         )
         != hold_plan
     ):

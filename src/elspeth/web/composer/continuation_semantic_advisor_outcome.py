@@ -27,8 +27,10 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
     from elspeth.web.composer.continuation_semantic_observation import SemanticProviderResponseObservation
     from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+    from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
     from elspeth.web.sessions.continuation import PreparedContinuationProvider
     from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+    from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
 
@@ -119,6 +121,8 @@ async def observe_semantic_advisor_invocation(
         [V4ProviderResultIncomplete, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]]
     ]
     | None = None,
+    v4_sdk_finalizer: Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]]
+    | None = None,
 ) -> SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised | SemanticAdvisorInvocationV4Finalized:
     """Observe one original throwing invocation, including paid invalid output.
 
@@ -149,6 +153,7 @@ async def observe_semantic_advisor_invocation(
             v4_env_ref_names=v4_env_ref_names,
             v4_finalizer=v4_finalizer,
             v4_incomplete_finalizer=v4_incomplete_finalizer,
+            v4_sdk_finalizer=v4_sdk_finalizer,
         )
     except BaseException as error:
         if capture.original_failure is None:

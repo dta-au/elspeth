@@ -63,6 +63,7 @@ from elspeth.web.composer.provider_quota import (
 )
 from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness, V4ProviderResultIncomplete
 from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
+from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -85,7 +86,7 @@ from elspeth.web.sessions.continuation_primary import (
     V4PrimaryProviderAdmission,
     primary_action_wire_message,
 )
-from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal, VerifiedSdkTerminal
+from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal, SdkTerminalFailure, VerifiedSdkTerminal
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.service import SessionServiceImpl
 
@@ -553,7 +554,14 @@ async def _run_v4_primary_after_prepared(
     deadline: float,
     env_ref_names: frozenset[str],
     on_sdk_entry: Callable[[], None] | None,
-) -> PrimaryProviderResult | PrimaryPaidOverflowTerminal | PrimaryPaidIncompleteTerminal | PrimarySdkTerminal | PrimaryNoSdkRefusalReceipt:
+) -> (
+    PrimaryProviderResult
+    | PrimaryPaidOverflowTerminal
+    | PrimaryPaidIncompleteTerminal
+    | PrimarySdkTerminal
+    | SdkTerminalFailure
+    | PrimaryNoSdkRefusalReceipt
+):
     """Keep one pre-SDK H and one in-scope paid observation on the same custody."""
     custody: ProviderCallCustody | None = None
     sessions = service._require_sessions_service()
@@ -657,6 +665,10 @@ async def _run_v4_primary_after_prepared(
             finalization.verified.receipt, finalization.verified.terminal, finalization.deferred_cancellations
         )
     except BaseException as error:
+        if custody is not None:
+            committed_failure = capture_sdk_terminal_failure(error, custody=custody)
+            if committed_failure is not None:
+                return committed_failure
         failure = _pre_sdk_failure(error, preparing=False)
         if custody is not None and custody.continuation_primary_v4_admission is not None and custody.has_v4_unentered_hold():
             if failure is not None:
@@ -713,6 +725,7 @@ async def run_continuation_primary(
     | PrimaryPaidOverflowTerminal
     | PrimaryPaidIncompleteTerminal
     | PrimarySdkTerminal
+    | SdkTerminalFailure
     | PrimaryNoSdkRefusalReceipt
     | V3UnboundedTailRefusal
 ):

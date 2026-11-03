@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary, ref
 
+from httpx import TimeoutException, TransportError
 from openai import APITimeoutError, OpenAIError
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -60,8 +61,8 @@ def _observe_v4_sdk_await(custody: ProviderCallCustody) -> Iterator[None]:
         raise AuditIntegrityError("V4 SDK observation changed or repeated its original attempt")
     try:
         yield
-    except (OpenAIError, TimeoutError, asyncio.CancelledError) as original:
-        if isinstance(original, (APITimeoutError, TimeoutError)):
+    except (OpenAIError, TransportError, TimeoutError, asyncio.CancelledError) as original:
+        if isinstance(original, (APITimeoutError, TimeoutException, TimeoutError)):
             category: SdkTerminalObservation = "provider_timeout"
         elif isinstance(original, asyncio.CancelledError):
             category = "no_observed_result"

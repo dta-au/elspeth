@@ -19,7 +19,10 @@ from elspeth.web.sessions.continuation_classifier_primary_paid_tail import (
     build_classifier_paid_overflow_tail_batch,
     prepare_classifier_paid_overflow_tail_plan,
 )
-from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import classifier_terminal_reservation
+from elspeth.web.sessions.continuation_classifier_primary_terminal_reservation import (
+    ClassifierTerminalReservation,
+    classifier_sdk_terminal_reservation,
+)
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity, PaidOverflowReceipt, decode_paid_overflow_receipt
 from elspeth.web.sessions.continuation_primary import _input_value
 from elspeth.web.sessions.continuation_primary_paid_overflow_source import require_original_v4_primary_physical_source_on_connection
@@ -160,13 +163,10 @@ def read_v4_classifier_paid_overflow_terminal_on_connection(
         claim_attempt=source.claim_attempt,
         operation_epoch=source.session_operation_epoch,
     )
-    reservation = classifier_terminal_reservation(
-        paid_contract=paid_plan.fallback_contract_sha256,
-        paid_bytes=paid_plan.reserved_bytes,
-        incomplete_contract=incomplete_plan.fallback_contract_sha256,
-        incomplete_bytes=incomplete_plan.reserved_bytes,
-        no_sdk_contract=no_sdk_plan.contract_sha256,
-        no_sdk_bytes=no_sdk_plan.reserved_bytes,
+    reservation = ClassifierTerminalReservation(
+        *classifier_sdk_terminal_reservation(
+            paid_plan, incomplete_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+        )
     )
     if source.reserved_bytes != reservation.reserved_bytes or source.fallback_contract_sha256 != reservation.contract_sha256:
         raise AuditIntegrityError("classifier PRIMARY paid terminal changed original combined H")

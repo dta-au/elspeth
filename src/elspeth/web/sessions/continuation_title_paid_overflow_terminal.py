@@ -36,7 +36,6 @@ from elspeth.web.sessions.continuation_retained_capacity import (
 from elspeth.web.sessions.continuation_title_no_sdk_tail import prepare_title_no_sdk_tail_plan
 from elspeth.web.sessions.continuation_title_paid_incomplete_tail import (
     prepare_title_paid_incomplete_tail_plan,
-    title_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_title_paid_overflow_source import require_original_v4_title_physical_source_on_connection
 from elspeth.web.sessions.continuation_title_paid_overflow_tail import (
@@ -215,7 +214,11 @@ def read_v4_title_paid_overflow_terminal_on_connection(
     no_sdk_plan = prepare_title_no_sdk_tail_plan(
         identity=identity, admitted=admitted, creator_sequence=source.creator_sequence, requested_model=effect.requested_model
     )
-    reserved_bytes, contract_sha256 = title_combined_terminal_hold_contract(plan, incomplete_plan, no_sdk_plan)
+    from elspeth.web.sessions.continuation_title_terminal_reservation import title_sdk_terminal_reservation
+
+    reserved_bytes, contract_sha256 = title_sdk_terminal_reservation(
+        plan, incomplete_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if source.reserved_bytes != reserved_bytes or source.fallback_contract_sha256 != contract_sha256:
         raise AuditIntegrityError("TITLE paid overflow changed its original predispatch terminal hold")
     batch = build_title_paid_overflow_tail_batch(plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))

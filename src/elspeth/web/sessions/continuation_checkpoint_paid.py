@@ -46,9 +46,9 @@ from elspeth.web.sessions.continuation import (
     read_chunk,
 )
 from elspeth.web.sessions.continuation_checkpoint_paid_tail import CheckpointPaidOverflowTailPlan
+from elspeth.web.sessions.continuation_checkpoint_sdk_reservation import prepare_checkpoint_sdk_terminal_hold_plan
 from elspeth.web.sessions.continuation_checkpoint_terminal_hold import (
     CheckpointTerminalHoldPlan,
-    prepare_checkpoint_terminal_hold_plan,
 )
 from elspeth.web.sessions.continuation_paid_overflow import CANONICAL_INTEGER_MAX, PaidOverflowIdentity
 from elspeth.web.sessions.continuation_paid_overflow_quota import preflight_v4_requested_model
@@ -638,7 +638,7 @@ def admit_v4_checkpoint_provider_on_connection(
         source_cursor=source.prepared_selected.cursor,
         source_snapshot_sha256=sha256(source.prepared_selected.payload_json.encode("utf-8")).hexdigest(),
     )
-    terminal_hold = prepare_checkpoint_terminal_hold_plan(
+    terminal_hold = prepare_checkpoint_sdk_terminal_hold_plan(
         identity=identity,
         admitted=admitted,
         phase=source.phase,

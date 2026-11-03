@@ -25,7 +25,6 @@ from elspeth.web.sessions.continuation_retained_capacity import (
 from elspeth.web.sessions.continuation_semantic_advisor import _decode, _descriptor_data, _NoSdk
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_tail import (
     prepare_semantic_paid_incomplete_tail_plan,
-    semantic_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import (
     fixed_v4_semantic_no_sdk_error,
@@ -216,7 +215,11 @@ def read_v4_semantic_no_sdk_terminal_on_connection(
     incomplete_plan = prepare_semantic_paid_incomplete_tail_plan(
         identity=paid_plan.identity, admitted=admitted, creator_sequence=source.creator_sequence
     )
-    reserved, combined_hash = semantic_combined_terminal_hold_contract(paid_plan, incomplete_plan, no_sdk_plan)
+    from elspeth.web.sessions.continuation_semantic_terminal_reservation import semantic_sdk_terminal_reservation
+
+    reserved, combined_hash = semantic_sdk_terminal_reservation(
+        paid_plan, incomplete_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("Semantic no-SDK terminal changed its original combined H")
     tail = reconstruct_semantic_no_sdk_tail_batch(

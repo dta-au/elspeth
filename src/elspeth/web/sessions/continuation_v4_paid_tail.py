@@ -39,7 +39,6 @@ from elspeth.web.sessions.continuation_title_paid_incomplete_tail import (
     TitlePaidIncompleteTailPlan,
     build_title_paid_incomplete_tail_batch,
     prepare_title_paid_incomplete_tail_plan,
-    title_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_title_paid_overflow_tail import (
     TitlePaidOverflowTailBatch,
@@ -150,7 +149,11 @@ def admit_v4_title_paid_tail_on_connection(
         raise AuditIntegrityError("V4 paid terminal tail requires its original root transaction")
     root = decode_continuation_snapshot(plan.admitted.payload_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    reserved_bytes, contract_sha256 = title_combined_terminal_hold_contract(plan, incomplete_plan, no_sdk_plan)
+    from elspeth.web.sessions.continuation_title_terminal_reservation import title_sdk_terminal_reservation
+
+    reserved_bytes, contract_sha256 = title_sdk_terminal_reservation(
+        plan, incomplete_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if (
         type(policy) is not ContinuationAdmissionPolicyV4
         or (source.session_id, source.operation_id) != (plan.identity.session_id, plan.identity.operation_id)
@@ -270,7 +273,11 @@ def admit_v4_title_no_sdk_tail_on_connection(
         raise AuditIntegrityError("V4 TITLE no-SDK tail requires the original root transaction")
     root = decode_continuation_snapshot(plan.admitted.payload_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    reserved_bytes, contract_sha256 = title_combined_terminal_hold_contract(paid_plan, incomplete_plan, plan)
+    from elspeth.web.sessions.continuation_title_terminal_reservation import title_sdk_terminal_reservation
+
+    reserved_bytes, contract_sha256 = title_sdk_terminal_reservation(
+        paid_plan, incomplete_plan, plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if (
         type(policy) is not ContinuationAdmissionPolicyV4
         or (source.session_id, source.operation_id) != (plan.identity.session_id, plan.identity.operation_id)
@@ -396,7 +403,11 @@ def admit_v4_title_paid_incomplete_tail_on_connection(
         raise AuditIntegrityError("V4 TITLE paid-incomplete tail requires its original root transaction")
     root = decode_continuation_snapshot(plan.admitted.payload_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    reserved, contract = title_combined_terminal_hold_contract(paid_plan, plan, no_sdk_plan)
+    from elspeth.web.sessions.continuation_title_terminal_reservation import title_sdk_terminal_reservation
+
+    reserved, contract = title_sdk_terminal_reservation(
+        paid_plan, plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if (
         type(policy) is not ContinuationAdmissionPolicyV4
         or (source.session_id, source.operation_id) != (plan.identity.session_id, plan.identity.operation_id)

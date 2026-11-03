@@ -58,7 +58,6 @@ from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
     V4PaidIncompleteCommitted,
-    V4SdkTerminalCommitted,
     provider_call_scope,
     quota_provider_calls,
     required_provider_audit_scope,
@@ -66,8 +65,6 @@ from elspeth.web.composer.provider_quota import (
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.provider_sdk_observation import (
     _observe_v4_sdk_await,
-    current_v4_sdk_failure,
-    failure_contains_original_sdk_observation,
 )
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.request_limits import DEFAULT_MAX_PREPARED_REQUEST_BYTES
@@ -1756,23 +1753,10 @@ class ProviderGateway:
                 finalization = await provider_custody.finalize_v4_returned_incomplete(incomplete)
                 raise V4PaidIncompleteCommitted(finalization) from None
             except BaseException as failure:
-                observed = current_v4_sdk_failure(provider_custody)
-                if (
-                    observed is None
-                    or not provider_custody.has_v4_sdk_finalizer()
-                    or not failure_contains_original_sdk_observation(failure, observed)
-                ):
-                    raise
-                direct = failure is observed.original or (type(failure) is TimeoutError and failure.__cause__ is observed.original)
-                finalized = await provider_custody.finalize_v4_sdk_failure(
-                    observed, preserve_sdk_cancellation=isinstance(failure, asyncio.CancelledError)
-                )
-                control = V4SdkTerminalCommitted(finalized)
-                if not direct:
-                    # The terminal closes the original physical attempt, but
-                    # an owned audit/other companion remains an actual error.
-                    raise failure from control
-                raise control from failure
+                from elspeth.web.composer.provider_sdk_terminal import finalize_sdk_failure_exception
+
+                await finalize_sdk_failure_exception(provider_custody, failure)
+                raise
             if provider_custody.continuation_primary_v4 is not None:
                 await provider_custody.finalize_continuation_primary_v4(outcome)
             elif provider_custody.continuation_classifier_v4 is not None:

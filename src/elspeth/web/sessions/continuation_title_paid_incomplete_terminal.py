@@ -26,7 +26,6 @@ from elspeth.web.sessions.continuation_title_no_sdk_tail import prepare_title_no
 from elspeth.web.sessions.continuation_title_paid_incomplete_tail import (
     build_title_paid_incomplete_tail_batch,
     prepare_title_paid_incomplete_tail_plan,
-    title_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_title_paid_overflow_source import require_original_v4_title_physical_source_on_connection
 from elspeth.web.sessions.continuation_title_paid_overflow_tail import prepare_title_paid_overflow_tail_plan
@@ -122,7 +121,11 @@ def _read_cold_title_paid_incomplete(
     no_sdk_plan = prepare_title_no_sdk_tail_plan(
         identity=identity, admitted=admitted, creator_sequence=source.creator_sequence, requested_model=effect.requested_model
     )
-    reserved, contract = title_combined_terminal_hold_contract(paid_plan, incomplete_plan, no_sdk_plan)
+    from elspeth.web.sessions.continuation_title_terminal_reservation import title_sdk_terminal_reservation
+
+    reserved, contract = title_sdk_terminal_reservation(
+        paid_plan, incomplete_plan, no_sdk_plan, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != contract:
         raise AuditIntegrityError("TITLE paid incomplete changed original three-tail H")
     batch = build_title_paid_incomplete_tail_batch(incomplete_plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at))

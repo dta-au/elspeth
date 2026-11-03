@@ -83,7 +83,6 @@ from elspeth.web.sessions.continuation_title_no_sdk_tail import TitleNoSdkTailPl
 from elspeth.web.sessions.continuation_title_paid_incomplete_tail import (
     TitlePaidIncompleteTailPlan,
     prepare_title_paid_incomplete_tail_plan,
-    title_combined_terminal_hold_contract,
 )
 from elspeth.web.sessions.continuation_title_paid_overflow_tail import (
     TitlePaidOverflowTailPlan,
@@ -740,7 +739,7 @@ def title_source_chain_data_on_connection(
                     and parent.phase == "settled"
                     and parent.settled_by == "owner_terminal"
                     and parent.request_json is None
-                    and effect.disposition in ("paid_overflow", "paid_incomplete", "refused")
+                    and effect.disposition in ("paid_overflow", "paid_incomplete", "refused", "sdk_terminal")
                     and before_frame.request_json == original_request_json
                 )
             else:
@@ -1495,7 +1494,9 @@ def admit_v4_title_provider_on_connection(
         creator_sequence=running.claim.segment_sequence,
         requested_model=requested_model.value,
     )
-    reserved_bytes, fallback_contract_sha256 = title_combined_terminal_hold_contract(tail, incomplete_tail, no_sdk_tail)
+    from elspeth.web.sessions.continuation_title_terminal_reservation import title_sdk_terminal_reservation
+
+    reserved_bytes, fallback_contract_sha256 = title_sdk_terminal_reservation(tail, incomplete_tail, no_sdk_tail)
     hold = ProviderTerminalHoldSource(
         session_id=sid,
         operation_id=operation,
@@ -1673,7 +1674,11 @@ def read_v4_title_admission_on_connection(conn: Connection, *, prepared: Prepare
     no_sdk_tail = prepare_title_no_sdk_tail_plan(
         identity=identity, admitted=current, creator_sequence=source.creator_sequence, requested_model=requested_model
     )
-    reserved_bytes, contract_sha256 = title_combined_terminal_hold_contract(tail, incomplete_tail, no_sdk_tail)
+    from elspeth.web.sessions.continuation_title_terminal_reservation import title_sdk_terminal_reservation
+
+    reserved_bytes, contract_sha256 = title_sdk_terminal_reservation(
+        tail, incomplete_tail, no_sdk_tail, historical_contract_sha256=source.fallback_contract_sha256
+    )
     if source.reserved_bytes != reserved_bytes or source.fallback_contract_sha256 != contract_sha256:
         raise AuditIntegrityError("V4 TITLE admission replay lost its original three-tail contract")
     attempt = ProviderAttempt(effect.provider_attempt_id, restore_utc(physical_row.started_at))

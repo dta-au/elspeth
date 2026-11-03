@@ -52,6 +52,7 @@ from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
 from elspeth.web.continuation_retention_memo import legacy_advisor_preparation_memo_scope
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
@@ -63,6 +64,7 @@ from elspeth.web.sessions.continuation import (
     refuse_v3_retained_tail_before_paid,
 )
 from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult, VerifiedSdkTerminal
 from elspeth.web.sessions.continuation_semantic_advisor import (
     SemanticAdvisorProviderResult,
     _semantic_checkpoint_kind_data,
@@ -275,7 +277,15 @@ async def run_prescribed_semantic_read(phases: ContinuationLivePhases, selected:
 
 async def run_continuation_semantic_advisor(
     phases: ContinuationLivePhases, selected: SelectedContinuationState
-) -> SemanticAdvisorNoSdkTerminal | SemanticAdvisorPaidTerminal | SemanticAdvisorPaidIncompleteTerminal | V3UnboundedTailRefusal | None:
+) -> (
+    SemanticAdvisorNoSdkTerminal
+    | SemanticAdvisorPaidTerminal
+    | SemanticAdvisorPaidIncompleteTerminal
+    | SdkTerminalResult
+    | SdkTerminalFailure
+    | V3UnboundedTailRefusal
+    | None
+):
     """Execute one real action; retain paid output before a new SQL action.
 
     Stop/expiry may finish an original physical outcome, but cannot install a
@@ -344,7 +354,14 @@ async def _run_semantic_advisor_preparation(
     running: ComposerOperationRunning,
     policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
     clock: ContinuationActionClock,
-) -> SemanticAdvisorNoSdkTerminal | SemanticAdvisorPaidTerminal | SemanticAdvisorPaidIncompleteTerminal | None:
+) -> (
+    SemanticAdvisorNoSdkTerminal
+    | SemanticAdvisorPaidTerminal
+    | SemanticAdvisorPaidIncompleteTerminal
+    | SdkTerminalResult
+    | SdkTerminalFailure
+    | None
+):
     runtime, inventory = await phases.current(selected)
     current = await _registered(
         work=phases.work,
@@ -450,6 +467,17 @@ async def _run_semantic_advisor_preparation(
             phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
             return outcome
 
+        async def finalize_sdk(
+            observation: V4SdkFailureObservation, ticket: RequiredWorkTicket
+        ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+            deadline_owner = phases.work.coordinator.sql_deadline_owner
+            if deadline_owner is not None:
+                deadline_owner.begin_settlement()
+            custody = issuer.require_original_sdk_custody(prepared, observation)
+            outcome = await session_service.finalize_v4_sdk_terminal(observation=observation, custody=custody, required_work=ticket)
+            phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
+            return outcome
+
         observed_v4: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationV4Finalized | SemanticAdvisorInvocationRaised | None = (
             None
         )
@@ -467,6 +495,7 @@ async def _run_semantic_advisor_preparation(
                 v4_env_ref_names=runtime.env_ref_names,
                 v4_finalizer=finalize_paid,
                 v4_incomplete_finalizer=finalize_incomplete,
+                v4_sdk_finalizer=finalize_sdk,
             )
             if type(observed_v4) is SemanticAdvisorInvocationV4Finalized:
                 paid_finalization = observed_v4.finalization
@@ -486,6 +515,9 @@ async def _run_semantic_advisor_preparation(
                 return None
             if type(observed_v4) is not SemanticAdvisorInvocationRaised:
                 raise AuditIntegrityError("V4 semantic Advisor lost its original physical observation")
+            sdk_terminal = issuer.require_v4_sdk_outcome(prepared, observed_v4)
+            if sdk_terminal is not None:
+                return sdk_terminal
             if type(observed_v4.error) is V4PaidIncompleteCommitted:
                 finalized_incomplete = issuer.require_v4_paid_incomplete_committed(prepared, observed_v4)
                 return SemanticAdvisorPaidIncompleteTerminal(finalized_incomplete.verified, finalized_incomplete.deferred_cancellations)

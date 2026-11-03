@@ -67,6 +67,7 @@ from elspeth.web.sessions.continuation_iteration_return import (
     retain_iteration_prepared,
     retain_iteration_returned,
 )
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
@@ -126,6 +127,8 @@ async def advance_continuation_iteration(
     | VerifiedClassifierPaidOverflowTerminal
     | VerifiedClassifierPaidIncompleteTerminal
     | ClassifierNoSdkRefusalReceipt
+    | SdkTerminalResult
+    | SdkTerminalFailure
     | EndCheckpointPaidIncompleteTerminal
     | EndCheckpointPaidOverflowTerminal
     | EndCheckpointNoSdkTerminal
@@ -312,6 +315,8 @@ async def advance_continuation_iteration(
         | VerifiedClassifierPaidOverflowTerminal
         | VerifiedClassifierPaidIncompleteTerminal
         | ClassifierNoSdkRefusalReceipt
+        | SdkTerminalResult
+        | SdkTerminalFailure
         | EndCheckpointPaidIncompleteTerminal
         | EndCheckpointPaidOverflowTerminal
         | EndCheckpointNoSdkTerminal
@@ -370,6 +375,10 @@ async def advance_continuation_iteration(
     if isinstance(
         observed, (VerifiedClassifierPaidOverflowTerminal, VerifiedClassifierPaidIncompleteTerminal, ClassifierNoSdkRefusalReceipt)
     ):
+        return observed
+    if isinstance(observed, (SdkTerminalResult, SdkTerminalFailure)):
+        if type(observed) not in (SdkTerminalResult, SdkTerminalFailure):
+            raise AuditIntegrityError("iteration SDK result requires its original nominal terminal")
         return observed
     if isinstance(observed, ObservedClassifierReplyDeadline):
         return observed

@@ -108,6 +108,8 @@ from elspeth.web.sessions.continuation_primary import (
     allocate_primary_effect_on_connection,
 )
 from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource
+from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult, VerifiedSdkTerminal
 from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -1037,7 +1039,12 @@ class ClassifierPrimaryIssuer:
         self._failure: BaseException | None = None
         self._result: ClassifierPrimaryResult | None = None
         self._terminal: (
-            VerifiedClassifierPaidOverflowTerminal | VerifiedClassifierPaidIncompleteTerminal | ClassifierNoSdkRefusalReceipt | None
+            VerifiedClassifierPaidOverflowTerminal
+            | VerifiedClassifierPaidIncompleteTerminal
+            | ClassifierNoSdkRefusalReceipt
+            | SdkTerminalResult
+            | SdkTerminalFailure
+            | None
         ) = None
         self._reply_deadline: float | None = None
         self._reply_deadline_observation: ClassifierReplyDeadline | None = None
@@ -1131,7 +1138,14 @@ class ClassifierPrimaryIssuer:
     @property
     def terminal(
         self,
-    ) -> VerifiedClassifierPaidOverflowTerminal | VerifiedClassifierPaidIncompleteTerminal | ClassifierNoSdkRefusalReceipt | None:
+    ) -> (
+        VerifiedClassifierPaidOverflowTerminal
+        | VerifiedClassifierPaidIncompleteTerminal
+        | ClassifierNoSdkRefusalReceipt
+        | SdkTerminalResult
+        | SdkTerminalFailure
+        | None
+    ):
         return self._terminal
 
     @property
@@ -1210,6 +1224,8 @@ class ClassifierPrimaryIssuer:
         | VerifiedClassifierPaidOverflowTerminal
         | VerifiedClassifierPaidIncompleteTerminal
         | ClassifierNoSdkRefusalReceipt
+        | SdkTerminalResult
+        | SdkTerminalFailure
     ):
         if self._reply_deadline_observation is not None:
             raise AuditIntegrityError("classifier reply deadline permanently closed its original dispatch")
@@ -1239,6 +1255,8 @@ class ClassifierPrimaryIssuer:
         | VerifiedClassifierPaidOverflowTerminal
         | VerifiedClassifierPaidIncompleteTerminal
         | ClassifierNoSdkRefusalReceipt
+        | SdkTerminalResult
+        | SdkTerminalFailure
     ):
         policy = decode_continuation_policy(self.selected.stack.admission_policy_json, self.selected.stack.policy_hash)
         if type(policy) is ContinuationAdmissionPolicyV3:
@@ -1422,10 +1440,14 @@ class ClassifierPrimaryIssuer:
         | VerifiedClassifierPaidOverflowTerminal
         | VerifiedClassifierPaidIncompleteTerminal
         | ClassifierNoSdkRefusalReceipt
+        | SdkTerminalResult
+        | SdkTerminalFailure
     ):
         from elspeth.web.composer.continuation_primary import _pre_sdk_failure
-        from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
+        from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted, V4SdkTerminalCommitted
         from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+        from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
+        from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure
         from elspeth.web.sessions.service import SessionServiceImpl
 
         sessions = self.service._require_sessions_service()
@@ -1481,6 +1503,18 @@ class ClassifierPrimaryIssuer:
 
         custody.bind_v4_returned_incomplete_finalizer(incomplete_finalizer)
 
+        async def sdk_finalizer(
+            observation: V4SdkFailureObservation, sql: RequiredWorkTicket
+        ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+            deadline_owner = self.work.coordinator.sql_deadline_owner
+            if deadline_owner is not None:
+                deadline_owner.begin_settlement()
+            result = await sessions.finalize_v4_sdk_terminal(observation=observation, custody=custody, required_work=sql)
+            self.work.coordinator.validate_provider_settlement_sql_outcome(ticket=sql, actual_outcome=result)
+            return result
+
+        custody.bind_v4_sdk_finalizer(sdk_finalizer)
+
         def entered() -> None:
             self._sdk_entered = True
 
@@ -1502,6 +1536,13 @@ class ClassifierPrimaryIssuer:
                 prepared_input=prepared_input,
                 on_sdk_entry=entered,
             )
+        except V4SdkTerminalCommitted as control:
+            if custody.v4_sdk_terminal_result is not control.finalization:
+                raise AuditIntegrityError("classifier SDK result changed original committed custody") from control
+            finalized = control.finalization
+            sdk_terminal = SdkTerminalResult(finalized.verified, SdkTerminalFamily.CLASSIFIER, finalized.deferred_cancellations)
+            self._terminal = sdk_terminal
+            return sdk_terminal
         except V4PaidIncompleteCommitted as control:
             committed = custody.require_v4_paid_incomplete_committed(control)
             admission = custody.continuation_classifier_v4_admission
@@ -1517,6 +1558,10 @@ class ClassifierPrimaryIssuer:
             self._terminal = terminal
             return terminal
         except BaseException as error:
+            exceptional = capture_sdk_terminal_failure(error, custody=custody)
+            if exceptional is not None:
+                self._terminal = exceptional
+                return exceptional
             failure = _pre_sdk_failure(error, preparing=False)
             admission = custody.continuation_classifier_v4_admission
             if type(admission) is V4ClassifierProviderAdmission and custody.has_v4_unentered_hold() and failure is not None:

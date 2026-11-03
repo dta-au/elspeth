@@ -27,6 +27,10 @@ from elspeth.web.composer.continuation_progress import (
 )
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import _require_current_continuation_running, retain_action_execution_receipt_on_connection
+from elspeth.web.sessions.continuation_checkpoint_end_complete_repair_history import (
+    VerifiedEndCompleteRepairHistory,
+    read_original_end_complete_repair_history_on_connection,
+)
 from elspeth.web.sessions.continuation_checkpoint_end_owed import VerifiedCheckpointEndOwed
 from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
 from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
@@ -58,7 +62,15 @@ def require_original_end_outer_creator_on_connection(
     conn: Connection, *, owed: VerifiedCheckpointEndOwed
 ) -> tuple[int, int, SemanticActionAdmission | None]:
     """Bind the historical D effect/creator separately from the current writer."""
-    return _require_original_end_outer_creator_on_connection(conn, owed=owed, terminal=None, terminal_names=None)
+    return _require_original_end_outer_creator_on_connection(conn, owed=owed, terminal=None, terminal_names=None, committed_repair=None)
+
+
+def require_original_end_outer_creator_after_complete_repair_on_connection(
+    conn: Connection, *, owed: VerifiedCheckpointEndOwed, names: frozenset[str]
+) -> tuple[int, int, SemanticActionAdmission | None]:
+    """Admit historical committed D only after its complete durable repair."""
+    history = read_original_end_complete_repair_history_on_connection(conn, owed=owed, names=names)
+    return _require_original_end_outer_creator_on_connection(conn, owed=owed, terminal=None, terminal_names=None, committed_repair=history)
 
 
 def require_original_end_outer_creator_after_paid_overflow_on_connection(
@@ -82,7 +94,9 @@ def require_original_end_outer_creator_after_paid_overflow_on_connection(
         or terminal.receipt.representation != "retained_tail"
     ):
         raise AuditIntegrityError("END outer creator lacks its exact paid-overflow terminal")
-    return _require_original_end_outer_creator_on_connection(conn, owed=owed, terminal=terminal, terminal_names=names)
+    return _require_original_end_outer_creator_on_connection(
+        conn, owed=owed, terminal=terminal, terminal_names=names, committed_repair=None
+    )
 
 
 def _require_original_end_outer_creator_on_connection(
@@ -91,9 +105,20 @@ def _require_original_end_outer_creator_on_connection(
     owed: VerifiedCheckpointEndOwed,
     terminal: VerifiedCheckpointPaidOverflowTerminal | None,
     terminal_names: frozenset[str] | None,
+    committed_repair: VerifiedEndCompleteRepairHistory | None,
 ) -> tuple[int, int, SemanticActionAdmission | None]:
     """Reprove immutable D lineage and its exact live or terminal SQL effect."""
-    if type(owed) is not VerifiedCheckpointEndOwed or owed.phase_source is None or owed.prepared_selected is None or owed.end_input is None:
+    if (
+        type(owed) is not VerifiedCheckpointEndOwed
+        or owed.phase_source is None
+        or owed.prepared_selected is None
+        or owed.end_input is None
+        or (
+            committed_repair is not None
+            and (type(committed_repair) is not VerifiedEndCompleteRepairHistory or committed_repair.owed != owed)
+        )
+        or (terminal is not None and committed_repair is not None)
+    ):
         raise AuditIntegrityError("END outer creator lacks its original semantic dispatch D")
     sid, operation = owed.session_id, owed.operation_id
     original_owed = owed.retry_history.owed if owed.retry_history is not None else owed
@@ -188,14 +213,25 @@ def _require_original_end_outer_creator_on_connection(
         )
     ).one_or_none()
     expected_input = stable_hash({"schema": "composer.end-review.v1", "candidate": end.candidate.digest})
+    expected_receipt: str | None = None
+    expected_result_chunk_key: str | None = None
+    if committed_repair is not None:
+        repaired = decode_continuation_snapshot(committed_repair.successor.payload_json)
+        if len(repaired.frames) != 1 or type(repaired.frames[0]) is not ComposeFrame:
+            raise AuditIntegrityError("END outer creator lost its original committed repair frame")
+        iteration = repaired.frames[0].iteration
+        expected_receipt = f"repair:{iteration.digest}"
+        expected_result_chunk_key = f"value:{iteration.codec}:{iteration.digest}"
+        if committed_repair.outer_receipt != expected_receipt:
+            raise AuditIntegrityError("END outer creator changed its original committed repair receipt")
     if (
         effect is None
         or effect.owner != "composer_end"
-        or effect.disposition != ("unknown" if terminal is not None else "dispatched")
+        or effect.disposition != ("unknown" if terminal is not None else "committed" if committed_repair is not None else "dispatched")
         or effect.input_sha256 != expected_input
         or effect.action_json != original.active_action_json
-        or effect.receipt_key is not None
-        or effect.result_chunk_key is not None
+        or effect.receipt_key != expected_receipt
+        or effect.result_chunk_key != expected_result_chunk_key
         or effect.provider_attempt_id is not None
     ):
         raise AuditIntegrityError("END outer creator lost its original dispatched effect")

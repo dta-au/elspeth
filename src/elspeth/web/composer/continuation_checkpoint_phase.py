@@ -10,6 +10,7 @@ from elspeth.web.composer.continuation_env_inventory import CurrentContinuationE
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime, _registered_read
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
@@ -74,7 +75,7 @@ async def prepare_checkpoint_phase_owner(
         raise AuditIntegrityError("checkpoint phase preparation lost its current runtime owner")
 
     def read() -> CheckpointPhaseOwner:
-        with locked_session_transaction(phases.authority._engine, str(running.claim.session_id)) as conn:
+        with retention_stage_memo_scope(), locked_session_transaction(phases.authority._engine, str(running.claim.session_id)) as conn:
             _require_current_continuation_running(conn, running)
             stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
             if stored.checkpoint_id != selected.checkpoint_id or stored.cursor != selected.stack.cursor:

@@ -46,6 +46,7 @@ async def _v4_tool_case(
     primary_preparation_probe_15s=False,
     retained_payload_bytes=16 * 1_048_576,
     base_state_data: CompositionStateData | None = None,
+    prior_operation_id: str | None = None,
 ):
     from tests.helpers.continuation_policy import classifier_15s_probe_settings
 
@@ -91,7 +92,7 @@ async def _v4_tool_case(
                 ),
             },
         )
-        if base_state_data is None
+        if base_state_data is None and prior_operation_id is None
         else phase_fixture._phase_case(
             current_store,
             tmp_path,
@@ -107,6 +108,7 @@ async def _v4_tool_case(
                 ),
             },
             base_state_data=base_state_data,
+            prior_operation_id=prior_operation_id,
         )
     )
     async with base_case as (owner, running, primary, sdk):

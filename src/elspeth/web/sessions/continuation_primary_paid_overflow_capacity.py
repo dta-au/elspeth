@@ -23,6 +23,7 @@ from elspeth.web.sessions.continuation_retained_capacity import (
     _require_hold_fields,
     admit_retained_payload_chunks,
 )
+from elspeth.web.sessions.continuation_sdk_tail import SdkTailBatch, SdkTailPlan, require_sdk_tail_batch
 
 _SCOPE_KEY = "elspeth.v4_primary_result_tail"
 
@@ -44,11 +45,66 @@ class V4PrimaryResultBatch:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class V4SdkResultBatch:
+    source: ProviderTerminalHoldSource
+    plan: SdkTailPlan
+    tail: SdkTailBatch
+
+    @property
+    def admitted(self) -> StoredContinuationSnapshot:
+        return self.plan.admitted
+
+    @property
+    def result_chunks(self) -> tuple[ProspectiveContinuationChunk, ...]:
+        return (self.tail.prospective[0],)
+
+    @property
+    def append(self) -> PreparedContinuationAppend:
+        return self.tail.append
+
+    @property
+    def prospective(self) -> tuple[ProspectiveContinuationChunk, ...]:
+        return self.tail.prospective
+
+    @property
+    def final(self) -> StoredContinuationSnapshot:
+        return StoredContinuationSnapshot(
+            self.append.snapshot_json, self.append.expected_cursor + len(self.append.events), self.append.checkpoint_id
+        )
+
+
+@contextmanager
+def admit_v4_sdk_result_batch_on_connection(conn: Connection, *, batch: V4SdkResultBatch) -> Iterator[None]:
+    if type(batch) is not V4SdkResultBatch:
+        raise AuditIntegrityError("SDK result requires its nominal exact batch")
+    require_sdk_tail_batch(batch.plan, batch.tail)
+    source, identity = batch.source, batch.plan.identity
+    if (
+        source.session_id != identity.session_id
+        or source.operation_id != identity.operation_id
+        or source.effect_key != identity.effect_key
+        or source.policy_sha256 != identity.policy_sha256
+        or source.session_operation_id != identity.session_operation_id
+        or source.session_operation_epoch != identity.session_operation_epoch
+        or source.creator_generation != identity.ownership_generation
+        or source.creator_sequence != batch.plan.creator_sequence
+        or source.lease_sha256 != identity.lease_sha256
+        or source.source_checkpoint_id != identity.source_checkpoint_id
+        or source.source_cursor != identity.source_cursor
+        or source.source_snapshot_sha256 != identity.source_snapshot_sha256
+        or source.reserved_bytes < batch.plan.reserved_bytes
+    ):
+        raise AuditIntegrityError("SDK result lost its original hold identity and reserved capacity")
+    with _admit_result_batch(conn, batch=batch):
+        yield
+
+
 @dataclass(slots=True)
 class _PrimaryScope:
     connection: Connection
     transaction: RootTransaction
-    batch: V4PrimaryResultBatch
+    batch: V4PrimaryResultBatch | V4SdkResultBatch
     stage: int = 0
 
 
@@ -114,8 +170,18 @@ def record_primary_hold_consumed(conn: Connection, *, session_id: str, operation
 @contextmanager
 def admit_v4_primary_result_batch_on_connection(conn: Connection, *, batch: V4PrimaryResultBatch) -> Iterator[None]:
     """Preflight one complete or terminal batch, then enforce every writer prefix."""
-    if type(batch) is not V4PrimaryResultBatch or _SCOPE_KEY in conn.info:
+    if type(batch) is not V4PrimaryResultBatch:
         raise AuditIntegrityError("V4 PRIMARY result needs its sole nominal batch")
+    if not batch.result_chunks or len(batch.append.events) not in (1, 2):
+        raise AuditIntegrityError("V4 PRIMARY result lacks its closed complete or terminal shape")
+    with _admit_result_batch(conn, batch=batch):
+        yield
+
+
+@contextmanager
+def _admit_result_batch(conn: Connection, *, batch: V4PrimaryResultBatch | V4SdkResultBatch) -> Iterator[None]:
+    if type(batch) not in (V4PrimaryResultBatch, V4SdkResultBatch) or _SCOPE_KEY in conn.info:
+        raise AuditIntegrityError("V4 result needs its sole nominal batch scope")
     transaction = conn.get_transaction()
     if type(transaction) is not RootTransaction or not transaction.is_active:
         raise AuditIntegrityError("V4 PRIMARY result needs its original root transaction")
@@ -127,8 +193,6 @@ def admit_v4_primary_result_batch_on_connection(conn: Connection, *, batch: V4Pr
     if hold.state != "active" or hold.provider_attempt_id is None:
         raise AuditIntegrityError("V4 PRIMARY result lost its active original paid hold")
     batch.append.require_original()
-    if not batch.result_chunks or len(batch.append.events) not in (1, 2):
-        raise AuditIntegrityError("V4 PRIMARY result lacks its closed complete or terminal shape")
     expected = (
         *batch.result_chunks,
         *(

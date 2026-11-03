@@ -9012,21 +9012,40 @@ class SessionServiceImpl:
         custody: ProviderCallCustody,
         required_work: RequiredWorkTicket,
     ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
-        from elspeth.web.composer.provider_sdk_observation import require_original_v4_sdk_failure
         from elspeth.web.sessions.continuation import PreparedContinuationProvider
         from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission
+
+        if (
+            type(prepared) is not PreparedContinuationProvider
+            or type(admission) is not V4PrimaryProviderAdmission
+            or custody.continuation_primary_v4 is not prepared
+            or custody.continuation_primary_v4_admission is not admission
+        ):
+            _refuse_required_sql(required_work, AuditIntegrityError("PRIMARY SDK finalizer changed original nominal admission"))
+        return await self.finalize_v4_sdk_terminal(observation=observation, custody=custody, required_work=required_work)
+
+    async def finalize_v4_sdk_terminal(
+        self,
+        *,
+        observation: V4SdkFailureObservation,
+        custody: ProviderCallCustody,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+        from elspeth.web.composer.provider_sdk_observation import require_original_v4_sdk_failure
         from elspeth.web.sessions.continuation_primary_sdk_finalization import finalize_v4_primary_sdk_terminal_on_connection
-        from elspeth.web.sessions.continuation_primary_sdk_terminal import read_v4_primary_sdk_terminal_verified_on_connection
+        from elspeth.web.sessions.continuation_sdk_dispatch import sdk_terminal_family_for_custody
+        from elspeth.web.sessions.continuation_sdk_finalization import finalize_v4_sdk_terminal_on_connection
+        from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
+        from elspeth.web.sessions.continuation_sdk_terminal_cold import read_v4_sdk_terminal_verified_on_connection
         from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
         from elspeth.web.sessions.locking import locked_session_transaction
 
-        if type(prepared) is not PreparedContinuationProvider or type(admission) is not V4PrimaryProviderAdmission:
-            _refuse_required_sql(required_work, AuditIntegrityError("PRIMARY SDK finalizer requires original nominal admission"))
         try:
             require_original_v4_sdk_failure(observation, custody=custody)
+            family = sdk_terminal_family_for_custody(custody)
         except AuditIntegrityError as refused:
             _refuse_required_sql(required_work, refused)
-        context = prepared.binding.running.session_operation_context
+        context = custody.context
         _validate_required_sql_ticket(
             required_work,
             sources=(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,),
@@ -9046,24 +9065,32 @@ class SessionServiceImpl:
                     audit_only=True,
                 ),
             ):
-                written = finalize_v4_primary_sdk_terminal_on_connection(
-                    conn,
-                    session_service=self,
-                    prepared=prepared,
-                    admission=admission,
-                    observation=observation,
-                    custody=custody,
-                    call=custody.call,
-                )
+                if family is SdkTerminalFamily.PRIMARY:
+                    prepared, admission = custody.continuation_primary_v4, custody.continuation_primary_v4_admission
+                    if prepared is None or admission is None:
+                        raise AuditIntegrityError("PRIMARY SDK source disappeared before required SQL")
+                    written = finalize_v4_primary_sdk_terminal_on_connection(
+                        conn,
+                        session_service=self,
+                        prepared=prepared,
+                        admission=admission,
+                        observation=observation,
+                        custody=custody,
+                        call=custody.call,
+                    )
+                else:
+                    written = finalize_v4_sdk_terminal_on_connection(conn, observation=observation, custody=custody)
             with locked_session_transaction(self._engine, str(context.fence.session_id)) as conn:
-                cold = read_v4_primary_sdk_terminal_verified_on_connection(
+                cold = read_v4_sdk_terminal_verified_on_connection(
                     conn,
-                    session_id=prepared.binding.running.claim.session_id,
-                    operation_id=prepared.binding.running.claim.operation_id,
-                    effect_key=admission.hold.effect_key,
+                    session_id=UUID(written.source.session_id),
+                    operation_id=written.source.operation_id,
+                    effect_key=written.source.effect_key,
+                    family=family,
+                    names=written.env_ref_names,
                 )
             if type(cold) is not VerifiedSdkTerminal or cold != written:
-                raise AuditIntegrityError("PRIMARY SDK terminal lost its exact committed cold result")
+                raise AuditIntegrityError("SDK terminal lost its exact committed cold result")
             return cold
 
         return await run_required_sql_finish_once(required_work, _sync)
@@ -12549,6 +12576,7 @@ class SessionServiceImpl:
         Detached runtime restore occurs after this committed cut and before the
         separate physical admission. This method cannot mint a quota attempt.
         """
+        from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
         from elspeth.web.sessions.continuation_checkpoint_paid import (
             PreparedCheckpointSource,
             prepare_v4_checkpoint_source_on_connection,
@@ -12558,6 +12586,7 @@ class SessionServiceImpl:
             raise AuditIntegrityError("checkpoint source preparation requires its original nominal producer")
         context = prepared.running.session_operation_context
         with (
+            retention_stage_memo_scope(),
             self._session_process_locked_begin(context.fence.session_id) as conn,
             self._session_write_lock(conn, context.fence.session_id),
         ):
