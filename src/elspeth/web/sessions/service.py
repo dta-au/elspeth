@@ -12576,7 +12576,7 @@ class SessionServiceImpl:
         Detached runtime restore occurs after this committed cut and before the
         separate physical admission. This method cannot mint a quota attempt.
         """
-        from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+        from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope
         from elspeth.web.sessions.continuation_checkpoint_paid import (
             PreparedCheckpointSource,
             prepare_v4_checkpoint_source_on_connection,
@@ -12586,7 +12586,7 @@ class SessionServiceImpl:
             raise AuditIntegrityError("checkpoint source preparation requires its original nominal producer")
         context = prepared.running.session_operation_context
         with (
-            retention_stage_memo_scope(),
+            borrow_v4_preparation_memo_scope(),
             self._session_process_locked_begin(context.fence.session_id) as conn,
             self._session_write_lock(conn, context.fence.session_id),
         ):

@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import replace
+from itertools import permutations
 from typing import cast
 
 import pytest
@@ -32,6 +33,7 @@ from elspeth.web.composer.continuation_limits import (
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy
 from elspeth.web.continuation_retention_memo import (
     CanonicalTextEncodingKey,
+    CanonicalTextVerificationKey,
     CredentialInputToken,
     CredentialPolicyKey,
     CredentialScanKey,
@@ -43,12 +45,16 @@ from elspeth.web.continuation_retention_memo import (
     SnapshotDecodeKey,
     StateCredentialStepKey,
     borrow_legacy_advisor_inflight_memo,
+    borrow_v4_preparation_memo_scope,
     current_legacy_advisor_preparation_memo,
     current_retention_stage_memo,
+    current_v4_preparation_memo,
     finish_legacy_advisor_preparation_memo,
+    finish_v4_preparation_memo,
     legacy_advisor_preparation_memo_scope,
     prepare_retention_sql_callable,
     retention_stage_memo_scope,
+    v4_preparation_memo_scope,
 )
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.sessions import service
@@ -843,3 +849,322 @@ async def test_legacy_advisor_text_identity_nested_borrow_and_late_close() -> No
             assert child.active and child.cached_entry_count == 0
         assert memo.cached_entry_count == 0 and current_retention_stage_memo() is None
     assert not memo.active and not child.active
+
+
+@pytest.mark.asyncio
+async def test_v4_preparation_sql_cuts_share_only_canonical_and_block_proofs() -> None:
+    clock = _advisor_clock()
+    calls = {"text": 0, "block": 0, "encoding": 0, "request": 0, "snapshot": 0, "chunk": 0, "scan": 0, "state": 0}
+    worker_only = ContextVar("v4-preparation-cut", default="fresh")
+    text = '{"whole":"input"}'
+    key = CanonicalTextEncodingKey(text, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    block = RecorderBlockHashKey(hashlib.sha256(text.encode()).hexdigest(), text)
+    request = RecorderRequestTextKey(text, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    snapshot_key = _snapshot_key()
+    chunk = encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}')
+    chunk_key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    scan_key = _scan_key()
+    state_key = StateCredentialStepKey(scan_key)
+    children: list[RetentionStageMemo] = []
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls["text"] += 1
+        return key.canonical.encode()
+
+    def encode_locally(key: CanonicalTextEncodingKey) -> bytes:
+        calls["encoding"] += 1
+        return key.canonical.encode()
+
+    def verify_block(key: RecorderBlockHashKey) -> None:
+        calls["block"] += 1
+        assert hashlib.sha256(key.canonical.encode()).hexdigest() == key.expected_digest
+
+    def prepare_request(_key: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        calls["request"] += 1
+        return RecorderRequestTextProof("{}", ())
+
+    def decode(_encoded: str) -> ContinuationFrameStack:
+        calls["snapshot"] += 1
+        return initial_stack()
+
+    def verify_chunk(_canonical: str) -> None:
+        calls["chunk"] += 1
+
+    def scan(key: CredentialScanKey) -> CredentialMaterialFinding | None:
+        calls["scan"] += 1
+        return _scan(key)
+
+    def scan_state(key: StateCredentialStepKey) -> CredentialMaterialFinding | None:
+        calls["state"] += 1
+        return _scan(key.scan)
+
+    with v4_preparation_memo_scope(clock) as parent:
+
+        def sql_cut() -> int:
+            assert worker_only.get() == "fresh"
+            assert current_v4_preparation_memo(clock) is parent
+            worker_only.set("inside-original-worker")
+            with borrow_v4_preparation_memo_scope(clock) as child:
+                assert child is current_retention_stage_memo() and child is not parent
+                assert current_v4_preparation_memo(clock) is parent
+                children.append(child)
+                for _repeat in range(2):
+                    child.canonical_text_proof(key, encode, hashlib.sha256)
+                    child.recorder_block_hash(block, verify_block)
+                    child.canonical_text_encoding(key, encode_locally)
+                    child.recorder_request_text(request, prepare_request)
+                    child.snapshot(snapshot_key, decode)
+                    child.private_chunk(chunk_key, verify_chunk)
+                    child.credential(scan_key, scan)
+                    child.state_credentials(state_key, scan_state)
+                assert parent.cached_entry_count == 2
+            assert not child.active and child.cached_entry_count == 0
+            return len(children)
+
+        for ordinal in range(1, 4):
+            outcome = await async_workers.run_required_sql_finish_once(publication_ticket(), sql_cut)
+            assert isinstance(outcome, RequiredSQLReturned) and outcome.value == ordinal
+        assert calls == {"text": 1, "block": 1, "encoding": 3, "request": 3, "snapshot": 3, "chunk": 3, "scan": 3, "state": 3}
+        assert len({id(child) for child in children}) == 3
+        assert parent._shared_text_budget_bytes == CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        with v4_preparation_memo_scope(clock) as nested:
+            assert nested is parent
+        assert parent.active
+        clock.finish_preparation()
+        finish_v4_preparation_memo(clock)
+        assert not parent.active and parent.cached_entry_count == 0
+        with pytest.raises(AuditIntegrityError, match="reopen"), v4_preparation_memo_scope(clock):
+            pass
+    assert current_retention_stage_memo() is None
+    with pytest.raises(AuditIntegrityError, match="reopen"), v4_preparation_memo_scope(clock):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_v4_preparation_text_pressure_keeps_original_one_mib_combined_budget() -> None:
+    calls: list[str] = []
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls.append(key.canonical[:1])
+        return key.canonical.encode()
+
+    def verify_block(key: RecorderBlockHashKey) -> None:
+        calls.append("block")
+        assert hashlib.sha256(key.canonical.encode()).hexdigest() == key.expected_digest
+
+    first = CanonicalTextEncodingKey("a" * 300_000, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    second = CanonicalTextEncodingKey("b" * 300_000, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    block_text = "c" * 500_000
+    block = RecorderBlockHashKey(hashlib.sha256(block_text.encode()).hexdigest(), block_text)
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        with borrow_v4_preparation_memo_scope() as child:
+            child.canonical_text_proof(first, encode, hashlib.sha256)
+            child.canonical_text_proof(second, encode, hashlib.sha256)
+            assert parent.cached_entry_count == 1
+            child.recorder_block_hash(block, verify_block)
+            assert parent.cached_entry_count == 1
+            child.canonical_text_proof(second, encode, hashlib.sha256)
+            assert parent.cached_entry_count == 1
+            child.canonical_text_proof(second, encode, hashlib.sha256)
+            assert parent._canonical_proof_bytes + parent._recorder_block_hash_bytes <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        assert calls == ["a", "b", "block", "b"]
+
+
+@pytest.mark.asyncio
+async def test_v4_preparation_clock_error_and_late_publication_do_not_reopen_parent() -> None:
+    clock, foreign = _advisor_clock(), _advisor_clock()
+    original = RuntimeError("original V4 preparation error")
+    entered, release = threading.Event(), threading.Event()
+
+    def delayed(key: CanonicalTextEncodingKey) -> bytes:
+        entered.set()
+        assert release.wait(5)
+        return key.canonical.encode()
+
+    with pytest.raises(RuntimeError) as raised, v4_preparation_memo_scope(clock) as parent:
+        with pytest.raises(AuditIntegrityError, match="original action clock"), v4_preparation_memo_scope(foreign):
+            pass
+        with pytest.raises(AuditIntegrityError, match="original action clock"), borrow_v4_preparation_memo_scope(foreign):
+            pass
+        with borrow_v4_preparation_memo_scope(clock) as child:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(child.canonical_text_proof, CanonicalTextEncodingKey("late", 100), delayed, hashlib.sha256)
+                assert entered.wait(5)
+                finish_v4_preparation_memo(clock)
+                release.set()
+                assert future.result(timeout=5).encoded == b"late"
+            assert not parent.active and parent.cached_entry_count == 0
+            assert child.cached_entry_count == 0
+        raise original
+    assert raised.value is original and current_retention_stage_memo() is None
+    assert not child.active
+    with v4_preparation_memo_scope(_advisor_clock()) as following:
+        assert following is not parent and following.cached_entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_v4_preparation_original_error_closes_creator_and_complete_keys_remain_distinct() -> None:
+    clock = _advisor_clock()
+    original = RuntimeError("original preparation failed before finishing")
+    calls: list[tuple[str, str, int, object]] = []
+    reference = encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}').reference
+    first = CanonicalTextEncodingKey("whole", 100)
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls.append(("original", key.canonical, key.max_utf8_bytes, key.reference))
+        return key.canonical.encode()
+
+    def replacement(key: CanonicalTextEncodingKey) -> bytes:
+        calls.append(("replacement", key.canonical, key.max_utf8_bytes, key.reference))
+        return key.canonical.encode()
+
+    with pytest.raises(RuntimeError) as raised, v4_preparation_memo_scope(clock) as parent:
+        for key, producer in (
+            (first, encode),
+            (replace(first, canonical="changed"), encode),
+            (replace(first, max_utf8_bytes=101), encode),
+            (replace(first, reference=reference), encode),
+            (first, replacement),
+        ):
+            with borrow_v4_preparation_memo_scope(clock) as child:
+                child.canonical_text_proof(key, producer, hashlib.sha256)
+                child.canonical_text_proof(key, producer, hashlib.sha256)
+        assert calls == [
+            ("original", "whole", 100, None),
+            ("original", "changed", 100, None),
+            ("original", "whole", 101, None),
+            ("original", "whole", 100, reference),
+            ("replacement", "whole", 100, None),
+        ]
+        raise original
+    assert raised.value is original and not parent.active and parent.cached_entry_count == 0
+    assert not child.active and current_retention_stage_memo() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", tuple(permutations(("full", "canonical", "block"))))
+async def test_v4_three_text_families_enforce_combined_budget_in_every_insertion_order(order: tuple[str, ...]) -> None:
+    calls = {"full": 0, "canonical": 0, "block": 0}
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    full = CanonicalTextEncodingKey("f" * 200_000, bound)
+    canonical = CanonicalTextVerificationKey("c" * 400_000, bound)
+    block_text = "b" * 400_000
+    block = RecorderBlockHashKey(hashlib.sha256(block_text.encode()).hexdigest(), block_text)
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls["full"] += 1
+        return key.canonical.encode()
+
+    def verify(_text: str) -> None:
+        calls["canonical"] += 1
+
+    def verify_block(key: RecorderBlockHashKey) -> None:
+        calls["block"] += 1
+        assert hashlib.sha256(key.canonical.encode()).hexdigest() == key.expected_digest
+
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for family in order:
+            with borrow_v4_preparation_memo_scope() as child:
+                if family == "full":
+                    child.canonical_text_proof(full, encode, hashlib.sha256)
+                elif family == "canonical":
+                    child.canonical_text_verification(canonical, verify)
+                else:
+                    child.recorder_block_hash(block, verify_block)
+            assert parent._canonical_proof_bytes + parent._canonical_verification_bytes + parent._recorder_block_hash_bytes <= bound
+        assert calls == {"full": 1, "canonical": 1, "block": 1} and parent.cached_entry_count == 2
+        # Existing full/block insertion preferences survive the new family;
+        # the canonical insertion evicts the old full proof when it needs room.
+        evicted = "full" if order[-1] == "canonical" else "canonical"
+        with borrow_v4_preparation_memo_scope() as child:
+            if evicted == "full":
+                child.canonical_text_proof(full, encode, hashlib.sha256)
+            else:
+                child.canonical_text_verification(canonical, verify)
+        assert calls[evicted] == 2
+        assert parent._canonical_proof_bytes + parent._canonical_verification_bytes + parent._recorder_block_hash_bytes <= bound
+    assert parent.cached_entry_count == 0 and parent._canonical_verification_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_v4_canonical_only_lru_uses_actual_utf8_and_complete_producer_text_bound_keys() -> None:
+    calls: list[str] = []
+
+    def verify(text: str) -> None:
+        calls.append(text[:1])
+
+    def replacement(text: str) -> None:
+        calls.append("replacement:" + text[:1])
+
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    first, second, third = (CanonicalTextVerificationKey(char * 350_000, bound) for char in "abc")
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for key in (first, second, first, third, first, second):
+            with borrow_v4_preparation_memo_scope() as child:
+                child.canonical_text_verification(key, verify)
+        assert calls == ["a", "b", "c", "b"]
+        assert parent.cached_entry_count == 2
+        parent.canonical_text_verification(CanonicalTextVerificationKey("😀" * 20, 100), verify)
+        assert parent._canonical_verifications[(verify, CanonicalTextVerificationKey("😀" * 20, 100))] == 83
+        parent.canonical_text_verification(CanonicalTextVerificationKey("😀" * 20, 101), verify)
+        parent.canonical_text_verification(CanonicalTextVerificationKey("😀" * 20, 100), replacement)
+        assert calls[-3:] == ["😀", "😀", "replacement:😀"]
+
+
+@pytest.mark.asyncio
+async def test_v4_canonical_only_oversize_failure_and_late_completion_never_publish() -> None:
+    calls: list[str] = []
+    original = AuditIntegrityError("original canonical refusal")
+
+    def verify(text: str) -> None:
+        calls.append(text[:1])
+
+    def fails(_text: str) -> None:
+        raise original
+
+    def foreign(_text: str) -> None:
+        return cast(None, [])
+
+    entered, release = threading.Event(), threading.Event()
+
+    def delayed(_text: str) -> None:
+        entered.set()
+        assert release.wait(5)
+
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for key in (
+            CanonicalTextVerificationKey("large" * 250_000, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES),
+            CanonicalTextVerificationKey("small", 2),
+        ):
+            for _ in range(2):
+                parent.canonical_text_verification(key, verify)
+        assert calls == ["l", "l", "s", "s"] and parent.cached_entry_count == 0
+        with pytest.raises(AuditIntegrityError) as raised:
+            parent.canonical_text_verification(CanonicalTextVerificationKey("bad", 1), fails)
+        assert raised.value is original
+        with pytest.raises(TypeError, match="no mutable value"):
+            parent.canonical_text_verification(CanonicalTextVerificationKey("foreign", 100), foreign)
+        assert parent.cached_entry_count == 0
+        with borrow_v4_preparation_memo_scope() as child, ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(child.canonical_text_verification, CanonicalTextVerificationKey("late", 100), delayed)
+            assert entered.wait(5)
+            parent.close()
+            release.set()
+            assert future.result(timeout=5) is None
+        assert parent.cached_entry_count == 0 and parent._canonical_verification_bytes == 0
+        parent.canonical_text_verification(CanonicalTextVerificationKey("closed", 100), verify)
+        assert parent.cached_entry_count == 0 and parent._canonical_verification_bytes == 0
+
+
+def test_canonical_encoding_replacement_clears_canonical_only_family() -> None:
+    def verify(_text: str) -> None:
+        pass
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        return key.canonical.encode()
+
+    with retention_stage_memo_scope() as memo:
+        memo.canonical_text_verification(CanonicalTextVerificationKey("first", 100), verify)
+        assert memo.cached_entry_count == 1
+        memo.canonical_text_encoding(CanonicalTextEncodingKey("replacement", 100), encode)
+        assert memo.cached_entry_count == 1 and memo._canonical_verification_bytes == 0

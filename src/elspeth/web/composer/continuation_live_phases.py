@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_preview_observation import PreviewSourceData
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.state import CompositionState
+    from elspeth.web.sessions.continuation_classifier_prephysical_failure import ClassifierPrephysicalFailure
     from elspeth.web.sessions.continuation_preview_result import PreviewValidationIncompleteTerminal
 
 
@@ -141,6 +142,7 @@ class ContinuationLivePhases:
     # P4 publication and the batch entry state, for the post-batch owner.
     finished_batch: tuple[_DispatchOutcome, _PersistOutcome | ColdPostBatchPersistData, CompositionState] | None = None
     action_clock: ContinuationActionClock | None = None
+    classifier_prephysical_failure: ClassifierPrephysicalFailure | None = None
 
     def bind_action_clock(self, clock: ContinuationActionClock) -> None:
         """Bind the driver's original action clock, without starting a new one."""

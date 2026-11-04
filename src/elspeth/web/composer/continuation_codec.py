@@ -39,9 +39,11 @@ from elspeth.web.composer.continuation_capture_overflow import (
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.continuation_retention_memo import (
     CanonicalTextEncodingKey,
+    CanonicalTextVerificationKey,
     PrivateChunkVerificationKey,
     SnapshotDecodeKey,
     current_retention_stage_memo,
+    current_v4_preparation_memo,
 )
 
 _TRUSTED_PRIVATE_CHUNK_SHA256 = sha256
@@ -197,7 +199,13 @@ def verify_private_chunk(reference: PrivateChunkRef, canonical: str) -> None:
             # A replaced crypto producer cannot reuse a digest. A valid large
             # chunk cannot fit the bounded full proof, so preserve the old
             # canonical-only memo while computing its binding SHA fresh.
-            memo.private_chunk(PrivateChunkVerificationKey(reference, canonical), _verify_private_chunk_canonical)
+            if current_v4_preparation_memo() is not None:
+                memo.canonical_text_verification(
+                    CanonicalTextVerificationKey(canonical, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES),
+                    _verify_private_chunk_canonical,
+                )
+            else:
+                memo.private_chunk(PrivateChunkVerificationKey(reference, canonical), _verify_private_chunk_canonical)
             encoded = canonical.encode("utf-8")
             if len(encoded) != reference.byte_length or sha256(encoded).hexdigest() != reference.digest:
                 raise AuditIntegrityError("private chunk bytes differ from their binding")

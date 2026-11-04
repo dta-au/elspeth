@@ -235,6 +235,38 @@ async def execute_continuation_end_review(
     a later whole-request Stop can authorize publication. The ordinary END owner
     publishes the same result through ``review_continuation_end``.
     """
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+    from elspeth.web.continuation_retention_memo import v4_preparation_memo_scope
+
+    policy = (
+        phases.runtime.source.policy
+        if phases.runtime is not None
+        else decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+    )
+    if type(policy) is ContinuationAdmissionPolicyV4:
+        clock = phases.action_clock
+        if clock is None:
+            raise AuditIntegrityError("V4 END preparation lost its original driver action clock")
+        with v4_preparation_memo_scope(clock):
+            return await _execute_continuation_end_review(phases, selected)
+    return await _execute_continuation_end_review(phases, selected)
+
+
+async def _execute_continuation_end_review(
+    phases: ContinuationLivePhases, selected: SelectedContinuationState
+) -> (
+    EndReviewExecution
+    | EndReviewContinued
+    | EndCheckpointCompleteReview
+    | EndCheckpointRepairContinued
+    | EndCheckpointFormatRetryReady
+    | EndCheckpointPaidIncompleteTerminal
+    | EndCheckpointPaidOverflowTerminal
+    | EndCheckpointNoSdkTerminal
+    | EndCheckpointUnboundRefusalTerminal
+    | SdkTerminalResult
+    | SdkTerminalFailure
+):
     top = selected.stack.frames[-1]
     if type(top) is not EndFrame or top.phase != "review_needed":
         raise AuditIntegrityError("END review has no landed owner for this END phase")

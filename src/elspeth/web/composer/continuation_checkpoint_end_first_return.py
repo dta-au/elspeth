@@ -28,6 +28,7 @@ from elspeth.web.composer.continuation_checkpoint_observation import (
 )
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.provider_quota import V4SdkTerminalCommitted
+from elspeth.web.continuation_retention_memo import v4_preparation_memo_scope
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions.continuation_checkpoint_end_owed import CheckpointEndOwedAdmission
 from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
@@ -67,6 +68,31 @@ async def run_v4_checkpoint_end_first_return(
     format_retry: CheckpointEndFormatRetrySource | None = None,
 ) -> V4EndFirstRetained | EndCheckpointPaidOverflowTerminal | SdkTerminalResult | SdkTerminalFailure:
     """Use the exact original paid owner, then retain raw complete H once."""
+    clock = phase_owner.phases.action_clock
+    if clock is None:
+        raise AuditIntegrityError("END first call lost its original preparation clock")
+    with v4_preparation_memo_scope(clock):
+        return await _run_v4_checkpoint_end_first_return(
+            advisor=advisor,
+            phase_owner=phase_owner,
+            gate_locals=gate_locals,
+            recorder=recorder,
+            provider_owner=provider_owner,
+            timeout=timeout,
+            format_retry=format_retry,
+        )
+
+
+async def _run_v4_checkpoint_end_first_return(
+    *,
+    advisor: AdvisorCheckpointOwner,
+    phase_owner: CheckpointPhaseOwner,
+    gate_locals: CheckpointEndGateLocals,
+    recorder: BufferingRecorder,
+    provider_owner: ProviderInvocationOwner,
+    timeout: float | None,
+    format_retry: CheckpointEndFormatRetrySource | None,
+) -> V4EndFirstRetained | EndCheckpointPaidOverflowTerminal | SdkTerminalResult | SdkTerminalFailure:
     phases = phase_owner.phases
     running = phases.work.running
     sessions = phases.service._sessions_service

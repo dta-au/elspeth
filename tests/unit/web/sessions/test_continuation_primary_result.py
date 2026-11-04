@@ -32,6 +32,7 @@ from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
 from elspeth.web.composer.continuation_p4_application_restore import apply_selected_p4_to_cold_evidence
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_primary import read_continuation_primary, run_continuation_primary
+from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalReason
 from elspeth.web.composer.continuation_prompt_producers import load_current_message_producers
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash, continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
@@ -40,6 +41,7 @@ from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonP
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.sessions import continuation_primary as primary_sql
 from elspeth.web.sessions.composer_operations import ComposerOperationFenceLost, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
@@ -710,7 +712,10 @@ async def test_primary_current_reader_refuses_one_corrupted_source_after_actual_
 async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_preparation_positive(operation_store, tmp_path, monkeypatch):
     original = ProviderGateway.prepare_continuation_primary
     original_outcome = ProviderGateway._call_llm_outcome_with_audit
+    original_refuse = PrimaryNoSdkIssuer.reserve_refusal
     prepared = []
+    originals = []
+    permits = []
 
     def observe(self, messages, tools, *, user_prompt=None, cost_budget=None):
         actual = original(self, messages, tools, user_prompt=user_prompt, cost_budget=cost_budget)
@@ -720,13 +725,24 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
     async def changed(self, *args, **kwargs):
         assert self._settings.composer_seed != 404
         self._settings = self._settings.model_copy(update={"composer_seed": 404})
-        return await original_outcome(self, *args, **kwargs)
+        try:
+            return await original_outcome(self, *args, **kwargs)
+        except AuditIntegrityError as original_failure:
+            originals.append(original_failure)
+            raise
+
+    def refuse(issuer, *, reason, original_failure):
+        assert reason is PrimaryNoSdkRefusalReason.INTEGRITY_REFUSED
+        assert len(originals) == 1 and original_failure is originals[0]
+        permit = original_refuse(issuer, reason=reason, original_failure=original_failure)
+        permits.append(permit)
+        return permit
 
     monkeypatch.setattr(ProviderGateway, "prepare_continuation_primary", observe)
     monkeypatch.setattr(ProviderGateway, "_call_llm_outcome_with_audit", changed)
+    monkeypatch.setattr(PrimaryNoSdkIssuer, "reserve_refusal", refuse)
     # The mismatch is an actual original boundary failure, with no SDK audit
     # invented for an unentered physical call. Its durable intent stays finite.
-    failure = AuditIntegrityError
     kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
     running = kwargs["inventory"].running
     sdk = []
@@ -738,8 +754,8 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
     monkeypatch.setattr(litellm, "acompletion", unexpected)
     work = kwargs["required_work"]
     try:
-        with prompt_guard_user_scope(REQUEST), pytest.raises(failure, match="actual prepared continuation input"):
-            await run_continuation_primary(
+        with prompt_guard_user_scope(REQUEST):
+            refused = await run_continuation_primary(
                 service=kwargs["service"],
                 authority=kwargs["authority"],
                 selected=kwargs["selected"],
@@ -753,10 +769,27 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
                 timeout=5,
             )
         assert len(prepared) == 1 and sdk == [] and recorder.llm_calls == ()
+        assert len(originals) == len(permits) == 1
+        assert "actual prepared continuation input" in str(originals[0])
+        assert permits[0].original_failure is originals[0]
+        assert permits[0].prepared.binding.input_sha256 == prepared[0].input_sha256
+        assert continuation_provider_input_hash(prepared[0].kwargs) == prepared[0].input_sha256
+        assert prepared[0].kwargs.get("seed") != 404
+        assert type(refused) is primary_sql.PrimaryNoSdkRefusalReceipt
+        assert refused.terminal.status == "failed" and refused.terminal.failure_code == "http_error"
+        assert refused.effect_key == permits[0].prepared.binding.effect_key
         with operation_store[0].connect() as conn:
             assert conn.execute(select(physical)).all() == []
             assert conn.execute(select(usage)).all() == []
-            assert conn.execute(select(effects.c.disposition)).scalar_one() == "dispatched"
+            effect = conn.execute(select(effects)).one()
+            assert effect.disposition == "refused" and effect.provider_attempt_id is None
+            assert effect.input_sha256 == prepared[0].input_sha256
+            assert effect.result_chunk_key == refused.result_chunk_key and effect.receipt_key == refused.receipt_key
+            cold = primary_sql.read_primary_no_sdk_refusal_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, effect_key=refused.effect_key
+            )
+        assert type(cold) is primary_sql.PrimaryNoSdkRefusalReceipt and cold == refused
+        assert len(prepared) == len(originals) == len(permits) == 1 and sdk == [] and recorder.llm_calls == ()
         work.coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)

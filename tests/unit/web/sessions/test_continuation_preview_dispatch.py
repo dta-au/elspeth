@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY
 from elspeth.web import async_workers
 from elspeth.web.composer import continuation_composition_initialization as composition_initialization
@@ -724,8 +725,10 @@ async def test_actual_nonempty_preview_preserves_provider_authored_base_and_cold
             before_rows = conn.execute(select(states).where(states.c.session_id == str(store[4]))).all()
         actual_preflight = ComposerPreflight.cached_runtime_preflight
         actual_tool = preview.execute_tool
+        actual_tail = value_preparation.prepare_issued_preview_batch
         preflights = []
         originals = []
+        adopted_preflights = []
 
         async def observe_preflight(preflight, state, **kwargs):
             result = await actual_preflight(preflight, state, **kwargs)
@@ -744,12 +747,23 @@ async def test_actual_nonempty_preview_preserves_provider_authored_base_and_cold
             originals.append(result)
             return result
 
+        def observe_tail(*args, **kwargs):
+            prepared = kwargs["prepared"]
+            assert len(originals) == 1
+            verdict = originals[0].runtime_preflight
+            assert verdict is not None and prepared.runtime.live.last_runtime_preflight is verdict
+            assert prepared.context.runtime_preflight_cache is prepared.runtime.live.runtime_preflight_cache
+            adopted_preflights.append(verdict)
+            return actual_tail(*args, **kwargs)
+
         monkeypatch.setattr(ComposerPreflight, "cached_runtime_preflight", observe_preflight)
         monkeypatch.setattr(preview, "execute_tool", observe_tool)
+        monkeypatch.setattr(value_preparation, "prepare_issued_preview_batch", observe_tail)
         await phases._advance(owner)
         assert len(originals) == 1 and originals[0].success
         verdict = originals[0].runtime_preflight
         assert verdict is not None and any(verdict is result for result in preflights)
+        assert len(adopted_preflights) == 1 and adopted_preflights[0] is verdict
         assert all(error.error_code != "empty_pipeline" for error in verdict.errors)
         assert any(check.name == RUNTIME_CHECK_PLUGIN_INSTANTIATION for check in verdict.checks)
         assert originals[0].updated_state.to_dict() == before_state
@@ -779,7 +793,16 @@ async def test_actual_nonempty_preview_preserves_provider_authored_base_and_cold
         assert restored.live.state.to_dict() == before_state and restored.graph.batch is not None
         result = restored.graph.batch.batch.tool_outcomes[0].response
         assert result == original_admitted and result.runtime_preflight == verdict
-        assert restored.live.last_runtime_preflight == verdict
+        # Cold caches retain original DATA, never a current validation grant.
+        history = restored.live.continuation_cache_history
+        assert history is not None and history.last_preflight_json == canonical_json(verdict.model_dump(mode="json"))
+        assert history.last_preflight_identity is not None and history.needs_current_preflight is True
+        assert (history.capture_creators[-1].operation_id, history.capture_creators[-1].operation_epoch) == (
+            current_context.fence.operation_id,
+            current_context.fence.operation_epoch,
+        )
+        assert restored.live.last_runtime_preflight is None and restored.live.runtime_preflight_cache == {}
+        assert restored.live.discovery_cache == {}
         assert stored_rows(store[0]) == before_cold and len(originals) == 1 and len(sdk) == len(author_sdk) == 1
         assert guard_checks(store[0]) == all_guards
         assert not output_path.exists()

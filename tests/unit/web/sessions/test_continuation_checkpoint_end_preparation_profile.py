@@ -18,6 +18,7 @@ from sqlalchemy.exc import DBAPIError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
+from elspeth.web.continuation_retention_memo import RetentionStageMemo, current_v4_preparation_memo
 from elspeth.web.required_executor import RequiredInvocationWitness
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -77,6 +78,24 @@ async def test_actual_end_review_preparation_profile(operation_store, tmp_path, 
     assert cpu_mode in {"0", "1"} and (cpu_mode == "0" or mode == "1")
     cpu_selection = os.environ.get(CPU_SELECTION_FLAG, "all_workers")
     profile = EndPreparationProfile(enabled=mode == "1", cpu_profile=cpu_mode == "1", cpu_selection=cpu_selection)
+    parents = {}
+    proof_children = {}
+    original_proof = RetentionStageMemo.canonical_text_proof
+
+    def observe_text_proof(memo, key, producer, digest_producer):
+        parent = current_v4_preparation_memo()
+        proof = original_proof(memo, key, producer, digest_producer)
+        if parent is not None:
+            parents[id(parent)] = parent
+            if memo is not parent:
+                # Keep the immutable proof alive so object-id reuse after an
+                # eviction cannot manufacture a cross-child hit in this probe.
+                entry = proof_children.setdefault(id(proof), (proof, set()))
+                entry[1].add(id(memo))
+        return proof
+
+    if mode == "1":
+        monkeypatch.setattr(RetentionStageMemo, "canonical_text_proof", observe_text_proof)
     try:
         with profile.install(monkeypatch, operation_store[0]):
             await original_review.test_actual_v4_paid_end_review_retains_blocked_action_without_early_publication(
@@ -92,6 +111,14 @@ async def test_actual_end_review_preparation_profile(operation_store, tmp_path, 
         # original production timeout, cancellation or other test exception.
         failure = profile.flush(output)
         record_property("end_profile_write_error", None if failure is None else type(failure).__name__)
+        record_property(
+            "end_preparation_text_parent",
+            {
+                "parents": len(parents),
+                "cross_child_proofs": sum(len(children) > 1 for _proof, children in proof_children.values()),
+                "parents_closed_empty": all(not parent.active and parent.cached_entry_count == 0 for parent in parents.values()),
+            },
+        )
 
 
 @pytest.mark.parametrize("enabled", (False, True), ids=("off", "on"))

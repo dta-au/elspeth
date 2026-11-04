@@ -11751,7 +11751,7 @@ class _ProbeSeamProof:
         return True
 
 
-# Whole-production binding for the six reviewed DATA consumers. Kept outside
+# Whole-production binding for the reviewed DATA consumers. Kept outside
 # production source so its own value is not part of the digest. Source edits,
 # additions and omissions withdraw admission; this grants no writer authority.
 _CONTINUATION_DATA_READ_SOURCE_SHA256 = "08851526ed9ccfb527a9d62473084150cbc773d42edb50350ed7d903e397afa9"
@@ -11762,6 +11762,7 @@ _CONTINUATION_DATA_READERS = frozenset(
         "ComposerAsyncOperationAuthority.read_continuation_tool_failure",
         "ComposerAsyncOperationAuthority.read_continuation_owed_batch_runtime",
         "ComposerAsyncOperationAuthority.read_continuation_owed_tool_runtime",
+        "ComposerAsyncOperationAuthority.read_continuation_control_intent",
         "ComposerAsyncOperationAuthority.read_continuation_phase_primary",
     }
 )

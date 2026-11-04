@@ -7,16 +7,22 @@ from pathlib import Path
 
 import pytest
 from fastapi import Request
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.exceptions import HTTPException
 from structlog.testing import capture_logs
 
 from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.credential_material import scrub_credential_material
+from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
-from elspeth.web.composer.protocol import ComposerMutationAuthorityRevoked
+from elspeth.web.composer.protocol import (
+    ComposerConvergenceError,
+    ComposerMutationAuthorityRevoked,
+    ComposerPluginCrashError,
+    ComposerRuntimePreflightError,
+)
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.required_executor import RequiredGenerationUnavailable
@@ -111,6 +117,112 @@ def test_nonretryable_permission_failure_is_safe_diagnostic() -> None:
     assert projected.failure_code == "operation_failed"
     assert projected.diagnostic_id is not None
     assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("budget", "reason", "cause"),
+    [
+        ("composition", "convergence_composition_budget", "The LLM kept making tool calls without producing a final response."),
+        ("discovery", "convergence_discovery_budget", "The LLM kept making tool calls without producing a final response."),
+        ("timeout", "convergence_wall_clock_timeout", "The request ran out of time before the turn could be completed."),
+    ],
+)
+def test_nominal_convergence_projects_only_closed_safe_facts(budget, reason, cause) -> None:
+    original = ComposerConvergenceError(3, budget_exhausted=budget)
+    original.args = ("PRIVATE altered exception text",)
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.http_status == 422 and projected.failure_code == "http_error"
+    assert projected.error_type == "convergence" and projected.diagnostic_id is None
+    assert projected.body == {
+        "detail": {
+            "error_type": "convergence",
+            "detail": f"Composer did not converge within 3 turns (budget exhausted: {budget}). {cause}",
+            "turns_used": 3,
+            "budget_exhausted": budget,
+            "reason": reason,
+            "recovery_text": {
+                "composition": "Split the request into smaller turns, or ask an operator to raise the mutation-turn budget.",
+                "discovery": "Narrow the schema or catalog exploration, or ask an operator to raise the discovery-turn budget.",
+                "timeout": "Retry once the provider responds faster, or ask an operator to raise the composer wall-clock budget.",
+            }[budget],
+        }
+    }
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("foreign_budget", ["PRIVATE invalid budget", object()], ids=["foreign-string", "foreign-object"])
+def test_nominal_convergence_with_invalid_budget_does_not_publish_private_args(foreign_budget: object) -> None:
+    original = ComposerConvergenceError(3)
+    original.__dict__["budget_exhausted"] = foreign_budget
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.failure_code == "operation_failed"
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+def test_nominal_convergence_rejects_foreign_string_subclass_before_interpolation() -> None:
+    class ForeignBudget(str):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __str__(self) -> str:
+            return "PRIVATE foreign subclass interpolation"
+
+        __hash__ = str.__hash__
+
+    original = ComposerConvergenceError(3)
+    original.__dict__["budget_exhausted"] = ForeignBudget("timeout")
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.failure_code == "operation_failed"
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("kind", ["plugin", "preflight"])
+def test_nominal_plugin_and_preflight_project_fixed_safe_distinct_details(kind: str) -> None:
+    original = RuntimeError("PRIVATE native plugin URL and secret")
+    unverified_state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    failure = (
+        ComposerPluginCrashError(original, partial_state=unverified_state)
+        if kind == "plugin"
+        else ComposerRuntimePreflightError(original_exc=original, partial_state=unverified_state)
+    )
+    projected = project_composer_operation_error(failure, request_id="nominal-request")
+    assert projected.http_status == 500 and projected.failure_code == "http_error"
+    assert projected.error_type == "composer_plugin_error" and projected.diagnostic_id is None
+    detail = projected.body["detail"]
+    assert isinstance(detail, dict) and detail["error_type"] == "composer_plugin_error"
+    assert ("runtime preflight" in detail["detail"]) == (kind == "preflight")
+    assert "failed_turn" not in detail and "partial_state" not in detail
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("wrapper", [RuntimeError, TimeoutError])
+def test_unowned_nominal_cause_cannot_promote_generic_failure(wrapper) -> None:
+    nominal = ComposerConvergenceError(2)
+    original = wrapper("PRIVATE unowned wrapper")
+    original.__cause__ = nominal
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.failure_code == "operation_failed" and projected.error_type == "operation_failed"
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("primary", [AuditIntegrityError("PRIVATE audit"), OperationalError("PRIVATE SQL", {}, RuntimeError())])
+def test_integrity_and_storage_outrank_nominal_failure(primary: BaseException) -> None:
+    original = ExceptionGroup("PRIVATE grouped error", [ComposerConvergenceError(2), primary])
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.error_type == ("audit_integrity_error" if isinstance(primary, AuditIntegrityError) else "database_unavailable")
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("other", [RuntimeError("PRIVATE ordinary"), ComposerPluginCrashError(RuntimeError("PRIVATE plugin"))])
+def test_multiple_ordinary_leaves_and_owned_settlement_stay_generic(other: Exception) -> None:
+    nominal = ComposerConvergenceError(2)
+    grouped = ExceptionGroup("PRIVATE grouped error", [nominal, other])
+    owned = ComposerOwnedSettlementFailure()
+    owned.__cause__ = nominal
+    for original in (grouped, owned, SQLAlchemyError("PRIVATE SQL")):
+        projected = project_composer_operation_error(original, request_id="nominal-request")
+        assert projected.failure_code == "operation_failed" and projected.error_type == "operation_failed"
+        assert "PRIVATE" not in projected.model_dump_json()
 
 
 def test_failure_projection_does_not_log_before_atomic_terminal_audit() -> None:
@@ -441,9 +553,17 @@ async def test_actual_manual_executor_failure_keeps_original_custody_and_safe_pr
     from tests.unit.web.sessions.test_pipeline_rejection_callers import mounted_app, originals
     from tests.unit.web.sessions.test_pipeline_rejection_required import prepared_rejection
 
-    _engine, repository, _authority, _service, sid = operation_store
+    _engine, repository, authority, service, sid = operation_store
     expected, running = await prepared_rejection(operation_store)
+    cancelled = authority.request_cancel(session_id=sid, operation_id=running.claim.operation_id)
+    assert cancelled is not None and cancelled.cancel_requested_at is not None
+    terminal = authority.settle_continuation_owner(running, outcome=request_cancelled_error(request_id=cancelled.request_id))
+    assert terminal.status == "failed" and terminal.failure_code == "request_cancelled"
     repository.release(running.session_operation_context)
+    retained = await service.get_authoritative_pipeline_proposal(session_id=sid, proposal_id=expected.authority.row.id)
+    assert retained.row.id == expected.authority.row.id
+    assert retained.proposal.draft_hash == expected.authority.proposal.draft_hash
+    assert retained.row.status == "pending"
     app = mounted_app(operation_store, tmp_path)
     body = PipelineCommitError("controlled candidate validation failure", code="VALIDATION_FAILED")
     original = executor_type("PRIVATE executor input")
@@ -498,7 +618,9 @@ async def test_actual_manual_executor_failure_keeps_original_custody_and_safe_pr
                 json={"draft_hash": expected.authority.proposal.draft_hash},
                 headers={"X-Request-ID": "f1-manual-correlation"},
             )
-    assert len(reached) == len(captured) == 1 and not pending_admission
+    assert len(reached) == len(captured) == 1 and not pending_admission, (
+        f"HTTP status={response.status_code}, body={scrub_credential_material(response.json())}"
+    )
     observation = captured[0]
     assert observation.selected_original is original
     assert observation.lease.closed

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from uuid import uuid4
 
 import litellm
 import pytest
@@ -74,6 +75,7 @@ async def _v4_tool_case(
         # supplies its real policy/snapshot factory, never a retained rewrite.
         monkeypatch.setattr(bootstrap_fixture, "current_service", configured_service)
     current_store = (store[0], store[1], authority, store[3], store[4])
+    tool_call_id = "original_v4_tool" if prior_operation_id is None else f"original_v4_tool:{uuid4()}"
     if arguments is None:
         arguments = {"patch": {"name": "V4 original model metadata"}} if tool == "set_metadata" else {}
     base_case = (
@@ -81,7 +83,7 @@ async def _v4_tool_case(
             current_store,
             tmp_path,
             monkeypatch,
-            tool_call=("original_v4_tool", tool, arguments),
+            tool_call=(tool_call_id, tool, arguments),
             following_tool_call=following_tool_call,
             settings_overrides={
                 "composer_continuation_max_retained_payload_bytes": policy.max_retained_payload_bytes,
@@ -97,7 +99,7 @@ async def _v4_tool_case(
             current_store,
             tmp_path,
             monkeypatch,
-            tool_call=("original_v4_tool", tool, arguments),
+            tool_call=(tool_call_id, tool, arguments),
             following_tool_call=following_tool_call,
             settings_overrides={
                 "composer_continuation_max_retained_payload_bytes": policy.max_retained_payload_bytes,
@@ -113,6 +115,7 @@ async def _v4_tool_case(
     )
     async with base_case as (owner, running, primary, sdk):
         assert len(sdk) == 1 and primary.outcome.completion.tool_batch.calls[0].function.name == tool
+        assert primary.outcome.completion.tool_batch.calls[0].id == tool_call_id
         assert owner.runtime is not None
         if available_plugins is not None:
             snapshot = owner.runtime.bindings.plugin_snapshot

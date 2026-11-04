@@ -19,7 +19,13 @@ from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlemen
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
-from elspeth.web.composer.protocol import ComposerContextUnsupported, ComposerMutationAuthorityRevoked
+from elspeth.web.composer.protocol import (
+    ComposerContextUnsupported,
+    ComposerConvergenceError,
+    ComposerMutationAuthorityRevoked,
+    ComposerPluginCrashError,
+    ComposerRuntimePreflightError,
+)
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
@@ -334,6 +340,65 @@ def project_composer_operation_error(
                 "request_id": request_id,
             },
             "secret_decryption_failed",
+        )
+    if type(leaf) is ComposerConvergenceError:
+        budget_value: object = leaf.budget_exhausted
+        if (
+            type(leaf.max_turns) is not int
+            or leaf.max_turns < 0
+            or type(budget_value) is not str
+            or budget_value
+            not in (
+                "composition",
+                "discovery",
+                "timeout",
+            )
+        ):
+            return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
+        from elspeth.web.composer.progress import convergence_progress_event
+
+        progress = convergence_progress_event(budget_exhausted=leaf.budget_exhausted)
+        cause = (
+            "The request ran out of time before the turn could be completed."
+            if leaf.budget_exhausted == "timeout"
+            else "The LLM kept making tool calls without producing a final response."
+        )
+        convergence_detail = f"Composer did not converge within {leaf.max_turns} turns (budget exhausted: {leaf.budget_exhausted}). {cause}"
+        return _http_error(
+            422,
+            {
+                "detail": {
+                    "error_type": "convergence",
+                    "detail": convergence_detail,
+                    "turns_used": leaf.max_turns,
+                    "budget_exhausted": leaf.budget_exhausted,
+                    "reason": progress.reason,
+                    "recovery_text": progress.likely_next,
+                }
+            },
+            "convergence",
+        )
+    if type(leaf) is ComposerPluginCrashError:
+        return _http_error(
+            500,
+            {
+                "detail": {
+                    "error_type": "composer_plugin_error",
+                    "detail": "A composer plugin crashed during a composer tool call. This is not a user-retryable error.",
+                }
+            },
+            "composer_plugin_error",
+        )
+    if type(leaf) is ComposerRuntimePreflightError:
+        return _http_error(
+            500,
+            {
+                "detail": {
+                    "error_type": "composer_plugin_error",
+                    "detail": "A composer plugin crashed during runtime preflight. This is not a user-retryable error.",
+                }
+            },
+            "composer_plugin_error",
         )
     if isinstance(leaf, HTTPException):
         try:

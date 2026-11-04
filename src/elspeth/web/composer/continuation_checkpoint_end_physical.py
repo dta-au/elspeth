@@ -348,7 +348,12 @@ def bind_checkpoint_end_physical_request(
         return outcome
 
     custody.bind_v4_sdk_finalizer(finalize_sdk)
-    clock.finish_preparation()
+    from elspeth.web.continuation_retention_memo import finish_v4_preparation_memo
+
+    try:
+        clock.finish_preparation()
+    finally:
+        finish_v4_preparation_memo(clock)
 
 
 def checkpoint_end_physical_custody(source: CheckpointEndPhysicalSource) -> ProviderCallCustody:

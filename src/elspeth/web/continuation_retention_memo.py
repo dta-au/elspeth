@@ -59,6 +59,12 @@ class CanonicalTextEncodingKey:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalTextVerificationKey:
+    canonical: str
+    cache_bound_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalTextProof:
     encoded: bytes
     digest: str
@@ -187,12 +193,14 @@ class RetentionStageMemo:
     """
 
     _legacy_advisor_owner: ContinuationActionClock | None
+    _v4_preparation_owner: ContinuationActionClock | None
     _text_parent: RetentionStageMemo | None
 
     def __init__(
         self,
         *,
         legacy_advisor_owner: ContinuationActionClock | None = None,
+        v4_preparation_owner: ContinuationActionClock | None = None,
         text_parent: RetentionStageMemo | None = None,
     ) -> None:
         if legacy_advisor_owner is not None:
@@ -200,14 +208,21 @@ class RetentionStageMemo:
 
             if type(legacy_advisor_owner) is not ContinuationActionClock:
                 raise TypeError("Legacy Advisor memo requires its exact action clock")
+        if v4_preparation_owner is not None:
+            from elspeth.web.composer.continuation_clock import ContinuationActionClock
+
+            if type(v4_preparation_owner) is not ContinuationActionClock or legacy_advisor_owner is not None:
+                raise TypeError("V4 preparation memo requires its exact distinct action clock")
         if text_parent is not None and (
             type(text_parent) is not RetentionStageMemo
-            or text_parent._legacy_advisor_owner is None
+            or (text_parent._legacy_advisor_owner is None and text_parent._v4_preparation_owner is None)
             or not text_parent.active
             or legacy_advisor_owner is not None
+            or v4_preparation_owner is not None
         ):
             raise AuditIntegrityError("Nested Advisor memo requires one active text-only preparation owner")
         self._legacy_advisor_owner = legacy_advisor_owner
+        self._v4_preparation_owner = v4_preparation_owner
         self._text_parent = text_parent
         self._shared_text_budget_bytes = (
             CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES
@@ -224,6 +239,8 @@ class RetentionStageMemo:
             CanonicalTextProof,
         ] = OrderedDict()
         self._canonical_proof_bytes = 0
+        self._canonical_verifications: OrderedDict[tuple[Callable[[str], None], CanonicalTextVerificationKey], int] = OrderedDict()
+        self._canonical_verification_bytes = 0
         self._recorder_block_hashes: OrderedDict[tuple[Callable[[RecorderBlockHashKey], object], RecorderBlockHashKey], int] = OrderedDict()
         self._recorder_block_hash_bytes = 0
         self._recorder_request: (
@@ -253,6 +270,7 @@ class RetentionStageMemo:
                 + len(self._states)
                 + int(self._canonical_text is not None)
                 + len(self._canonical_proofs)
+                + len(self._canonical_verifications)
                 + len(self._recorder_block_hashes)
                 + int(self._recorder_request is not None)
             )
@@ -265,6 +283,8 @@ class RetentionStageMemo:
             self._canonical_text = None
             self._canonical_proofs.clear()
             self._canonical_proof_bytes = 0
+            self._canonical_verifications.clear()
+            self._canonical_verification_bytes = 0
             self._recorder_block_hashes.clear()
             self._recorder_block_hash_bytes = 0
             self._recorder_request = None
@@ -288,7 +308,7 @@ class RetentionStageMemo:
         if type(key) is not SnapshotDecodeKey:
             raise TypeError("Snapshot memo requires its exact key")
         _require_function_producer(producer)
-        if self._legacy_advisor_owner is not None:
+        if self._legacy_advisor_owner is not None or self._v4_preparation_owner is not None:
             return _snapshot_value(key, producer)
         return self._lookup(self._snapshots, (producer, key), lambda: _snapshot_value(key, producer))
 
@@ -296,7 +316,7 @@ class RetentionStageMemo:
         if type(key) is not PrivateChunkVerificationKey:
             raise TypeError("Chunk memo requires its exact key")
         _require_function_producer(producer)
-        if self._legacy_advisor_owner is not None:
+        if self._legacy_advisor_owner is not None or self._v4_preparation_owner is not None:
             return _chunk_value(key, producer)
         self._lookup(self._chunks, (producer, key), lambda: _chunk_value(key, producer))
 
@@ -304,7 +324,7 @@ class RetentionStageMemo:
         """Retain only one immutable exact-text proof, never its parsed graph."""
         with self._lock:
             parent = self._text_parent if not self._closed else None
-        if parent is not None:
+        if parent is not None and parent._legacy_advisor_owner is not None:
             return parent.canonical_text_encoding(key, producer)
         if (
             type(key) is not CanonicalTextEncodingKey
@@ -322,12 +342,14 @@ class RetentionStageMemo:
         if type(value) is not bytes or len(value) > key.max_utf8_bytes or value != key.canonical.encode("utf-8"):
             raise TypeError("Canonical text memo requires exact immutable bytes")
         with self._lock:
-            if not self._closed and len(value) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            if not self._closed and self._v4_preparation_owner is None and len(value) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
                 entry = self._canonical_text
                 if entry is not None and entry[0] is producer and entry[1] == key:
                     return entry[2]
                 self._canonical_proofs.clear()
                 self._canonical_proof_bytes = 0
+                self._canonical_verifications.clear()
+                self._canonical_verification_bytes = 0
                 self._recorder_block_hashes.clear()
                 self._recorder_block_hash_bytes = 0
                 self._canonical_text = (producer, key, value)
@@ -398,12 +420,68 @@ class RetentionStageMemo:
             while self._canonical_proof_bytes + size > self._shared_text_budget_bytes:
                 _, evicted = self._canonical_proofs.popitem(last=False)
                 self._canonical_proof_bytes -= evicted.retained_bytes
-            while self._canonical_proof_bytes + self._recorder_block_hash_bytes + size > self._shared_text_budget_bytes:
-                _, evicted_size = self._recorder_block_hashes.popitem(last=False)
-                self._recorder_block_hash_bytes -= evicted_size
+            while (
+                self._canonical_proof_bytes + self._canonical_verification_bytes + self._recorder_block_hash_bytes + size
+                > self._shared_text_budget_bytes
+            ):
+                if self._canonical_verifications:
+                    _, evicted_size = self._canonical_verifications.popitem(last=False)
+                    self._canonical_verification_bytes -= evicted_size
+                else:
+                    _, evicted_size = self._recorder_block_hashes.popitem(last=False)
+                    self._recorder_block_hash_bytes -= evicted_size
             self._canonical_proofs[cache_key] = proof
             self._canonical_proof_bytes += size
         return proof
+
+    def canonical_text_verification(self, key: CanonicalTextVerificationKey, producer: Callable[[str], None]) -> None:
+        """Retain canonical-text success only; reference binding stays with the caller."""
+        if (
+            type(key) is not CanonicalTextVerificationKey
+            or type(key.canonical) is not str
+            or type(key.cache_bound_bytes) is not int
+            or key.cache_bound_bytes < 1
+        ):
+            raise TypeError("Canonical verification memo requires its exact bounded text key")
+        _require_function_producer(producer)
+        with self._lock:
+            parent = self._text_parent if not self._closed else None
+        if parent is not None:
+            return parent.canonical_text_verification(key, producer)
+        cache_key = (producer, key)
+        with self._lock:
+            if not self._closed and cache_key in self._canonical_verifications:
+                self._canonical_verifications.move_to_end(cache_key)
+                return
+        result_producer: Callable[[str], object] = producer
+        if result_producer(key.canonical) is not None:
+            raise TypeError("Canonical verification producer must return no mutable value")
+        # The bound decides retention only, after the original proof succeeds.
+        # Measure actual text, never a possibly corrupt reference byte length.
+        text_bytes = utf8_size(key.canonical)
+        size = text_bytes + len(str(key.cache_bound_bytes))
+        with self._lock:
+            if self._closed or text_bytes > key.cache_bound_bytes or size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+                return
+            if cache_key in self._canonical_verifications:
+                self._canonical_verifications.move_to_end(cache_key)
+                return
+            self._canonical_text = None
+            while (
+                self._canonical_proof_bytes + self._canonical_verification_bytes + self._recorder_block_hash_bytes + size
+                > self._shared_text_budget_bytes
+            ):
+                if self._canonical_verifications:
+                    _, evicted_size = self._canonical_verifications.popitem(last=False)
+                    self._canonical_verification_bytes -= evicted_size
+                elif self._canonical_proofs:
+                    _, evicted_proof = self._canonical_proofs.popitem(last=False)
+                    self._canonical_proof_bytes -= evicted_proof.retained_bytes
+                else:
+                    _, evicted_size = self._recorder_block_hashes.popitem(last=False)
+                    self._recorder_block_hash_bytes -= evicted_size
+            self._canonical_verifications[cache_key] = size
+            self._canonical_verification_bytes += size
 
     def recorder_block_hash(self, key: RecorderBlockHashKey, producer: Callable[[RecorderBlockHashKey], object]) -> None:
         """Retain one exact immutable block address proof; callers still parse/store fresh."""
@@ -429,10 +507,16 @@ class RetentionStageMemo:
                 self._recorder_block_hashes.move_to_end(cache_key)
                 return
             self._canonical_text = None
-            while self._canonical_proof_bytes + self._recorder_block_hash_bytes + size > self._shared_text_budget_bytes:
+            while (
+                self._canonical_proof_bytes + self._canonical_verification_bytes + self._recorder_block_hash_bytes + size
+                > self._shared_text_budget_bytes
+            ):
                 if self._recorder_block_hashes:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
+                elif self._canonical_verifications:
+                    _, evicted_size = self._canonical_verifications.popitem(last=False)
+                    self._canonical_verification_bytes -= evicted_size
                 else:
                     _, evicted_proof = self._canonical_proofs.popitem(last=False)
                     self._canonical_proof_bytes -= evicted_proof.retained_bytes
@@ -445,7 +529,7 @@ class RetentionStageMemo:
         """Retain one immutable prepared-request projection under its complete byte budget."""
         with self._lock:
             parent = self._text_parent if not self._closed else None
-        if parent is not None:
+        if parent is not None and parent._legacy_advisor_owner is not None:
             return parent.recorder_request_text(key, producer)
         if (
             type(key) is not RecorderRequestTextKey
@@ -479,7 +563,7 @@ class RetentionStageMemo:
             if remaining < 0:
                 return value
         with self._lock:
-            if not self._closed:
+            if not self._closed and self._v4_preparation_owner is None:
                 entry = self._recorder_request
                 if entry is not None and entry[0] is producer and entry[1] == key:
                     return entry[2]
@@ -492,7 +576,7 @@ class RetentionStageMemo:
         if type(key) is not CredentialScanKey:
             raise TypeError("Credential memo requires its exact key")
         _require_function_producer(producer)
-        if self._legacy_advisor_owner is not None:
+        if self._legacy_advisor_owner is not None or self._v4_preparation_owner is not None:
             return _finding_value(producer(key))
         return self._lookup(self._credentials, (producer, key), lambda: _finding_value(producer(key)))
 
@@ -502,7 +586,7 @@ class RetentionStageMemo:
         if type(key) is not StateCredentialStepKey:
             raise TypeError("State memo requires its exact key")
         _require_function_producer(producer)
-        if self._legacy_advisor_owner is not None:
+        if self._legacy_advisor_owner is not None or self._v4_preparation_owner is not None:
             return _finding_value(producer(key))
         return self._lookup(self._states, (producer, key), lambda: _finding_value(producer(key)))
 
@@ -524,6 +608,67 @@ def retention_stage_memo_scope() -> Iterator[RetentionStageMemo]:
     finally:
         memo.close()
         _RETENTION_STAGE_MEMO.reset(token)
+
+
+def current_v4_preparation_memo(clock: ContinuationActionClock | None = None) -> RetentionStageMemo | None:
+    """Resolve only the original V4 text parent, including inside a fresh child."""
+    memo = current_retention_stage_memo()
+    if memo is not None and memo._text_parent is not None:
+        memo = memo._text_parent
+    if memo is None or memo._v4_preparation_owner is None or not memo.active:
+        return None
+    if clock is not None and memo._v4_preparation_owner is not clock:
+        raise AuditIntegrityError("V4 preparation changed its original action clock")
+    return memo
+
+
+@contextmanager
+def v4_preparation_memo_scope(clock: ContinuationActionClock) -> Iterator[RetentionStageMemo]:
+    """The creator owns closure; matching nested END calls borrow its text only."""
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
+
+    if type(clock) is not ContinuationActionClock:
+        raise TypeError("V4 preparation memo requires its exact action clock")
+    ambient = _RETENTION_STAGE_MEMO.get()
+    if (ambient is not None and ambient._v4_preparation_owner is not None and not ambient.active) or clock._seen:
+        raise AuditIntegrityError("V4 preparation cannot reopen its completed original scope")
+    existing = current_v4_preparation_memo(clock)
+    if existing is not None:
+        yield existing
+        return
+    if current_retention_stage_memo() is not None:
+        raise AuditIntegrityError("V4 preparation cannot borrow an unrelated memo")
+    memo = RetentionStageMemo(v4_preparation_owner=clock)
+    token = _RETENTION_STAGE_MEMO.set(memo)
+    try:
+        yield memo
+    finally:
+        memo.close()
+        _RETENTION_STAGE_MEMO.reset(token)
+
+
+@contextmanager
+def borrow_v4_preparation_memo_scope(clock: ContinuationActionClock | None = None) -> Iterator[RetentionStageMemo]:
+    """Fresh SQL-local families share only canonical proof and block hash text."""
+    parent = current_v4_preparation_memo(clock)
+    if parent is None:
+        with retention_stage_memo_scope() as memo:
+            yield memo
+        return
+    child = RetentionStageMemo(text_parent=parent)
+    token = _RETENTION_STAGE_MEMO.set(child)
+    try:
+        yield child
+    finally:
+        child.close()
+        _RETENTION_STAGE_MEMO.reset(token)
+
+
+def finish_v4_preparation_memo(clock: ContinuationActionClock) -> None:
+    """Seal the V4 text parent at the original preparation clock cut."""
+    memo = current_v4_preparation_memo(clock)
+    if memo is not None:
+        memo.close()
 
 
 @contextmanager

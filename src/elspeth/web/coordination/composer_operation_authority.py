@@ -39,6 +39,7 @@ from elspeth.web.composer.continuation_policy import (
 )
 from elspeth.web.continuation_retention_memo import (
     RetentionStageMemo,
+    borrow_v4_preparation_memo_scope,
     current_retention_stage_memo,
     retention_stage_memo_scope,
 )
@@ -1053,7 +1054,7 @@ class ComposerAsyncOperationAuthority:
             or current_retention_stage_memo() is not retention_memo
         ):
             raise AuditIntegrityError("runtime read requires its exact active retention memo")
-        memo_scope = retention_stage_memo_scope() if retention_memo is None else nullcontext(retention_memo)
+        memo_scope = borrow_v4_preparation_memo_scope() if retention_memo is None else nullcontext(retention_memo)
         with session_data_read_transaction(self._engine, str(running.claim.session_id)) as conn, memo_scope:
             if type(selected) is SelectedContinuationState and selected.stack.frames and type(selected.stack.frames[-1]) is AdvisorFrame:
                 from elspeth.web.sessions.continuation_semantic_advisor import read_semantic_advisor_runtime_source_on_connection

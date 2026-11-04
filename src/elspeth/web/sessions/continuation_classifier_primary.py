@@ -129,6 +129,131 @@ if TYPE_CHECKING:
 type ClassifierPrimaryBranch = Literal["staged_review", "composition_last_chance"]
 
 
+@dataclass(frozen=True, slots=True)
+class ClassifierPrephysicalSource:
+    """Reproved historical DATA; no provider or terminal permission."""
+
+    selected: SelectedContinuationState
+    effect_key: str
+    creator_sequence: int
+    creator_generation: int
+    claim_attempt: int
+    physical_operation_id: str
+    physical_operation_epoch: int
+    env_ref_names: frozenset[str]
+
+
+def read_classifier_prephysical_source_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, checkpoint_id: str
+) -> ClassifierPrephysicalSource:
+    """Prove a logical classifier source with no physical or orphan owner.
+
+    A failed parent may have changed exactly its logical advance to unknown.
+    This is a terminal DATA facet; the ordinary business-stage reader stays
+    strict and cannot use this observation to dispatch.
+    """
+    from elspeth.contracts.json_parser import parse_json_strict
+    from elspeth.web.sessions.continuation_iteration_return import _stage_source_record, read_original_classifier_stage_on_connection
+    from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
+    from elspeth.web.sessions.models import composer_async_operations_table as jobs
+    from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
+    from elspeth.web.sessions.models import composer_segment_attempts_table as history
+    from elspeth.web.sessions.models import quota_provider_attempts_table as physical
+
+    sid = str(session_id)
+    row = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid, checkpoints.c.operation_id == operation_id, checkpoints.c.checkpoint_id == checkpoint_id
+        )
+    ).one()
+    stored = _historical(conn, sid, operation_id, row.cursor)
+    stage = read_original_classifier_stage_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=stored)
+    source_record = _stage_source_record(conn, stored, sid, operation_id)
+    if source_record is None:
+        raise AuditIntegrityError("prephysical classifier lost its complete original stage record")
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one()
+    root = decode_continuation_snapshot(stored.payload_json)
+    unresolved = tuple(item.effect_id for item in root.effect_frontier if item.disposition in ("prepared", "dispatched", "unknown"))
+    if unresolved != (stage.owner_effect_key,):
+        raise AuditIntegrityError("prephysical classifier cannot conceal another unresolved effect")
+    if parent.status not in ("running", "failed"):
+        raise AuditIntegrityError("prephysical classifier has no live or failed parent")
+    final = parent.status == "failed"
+    actual = tuple(conn.execute(select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation_id)))
+    expected = {
+        (item.effect_id, "unknown" if final and item.effect_id == stage.owner_effect_key else item.disposition, item.receipt_id)
+        for item in root.effect_frontier
+    }
+    if {(item.effect_key, item.disposition, item.receipt_key) for item in actual} != expected:
+        raise AuditIntegrityError("prephysical classifier changed its complete actual effects inventory")
+    creator = conn.execute(
+        select(history).where(
+            history.c.session_id == sid,
+            history.c.operation_id == operation_id,
+            history.c.sequence == stage.creator_sequence,
+            history.c.generation == stage.creator_generation,
+        )
+    ).one()
+    if (
+        conn.execute(
+            select(chunks.c.chunk_key).where(
+                chunks.c.session_id == sid, chunks.c.operation_id == operation_id, chunks.c.chunk_key == _stage_key(stage.owner_effect_key)
+            )
+        ).first()
+        is not None
+    ):
+        raise AuditIntegrityError("prephysical classifier already has its physical stage anchor")
+    providers = {item.effect_key: item for item in actual if item.owner == "provider"}
+    for item in conn.execute(select(chunks).where(chunks.c.session_id == sid, chunks.c.operation_id == operation_id)):
+        if item.chunk_key.startswith("classifier-primary-source:"):
+            source = _read_source(conn, session_id, operation_id, item.chunk_key.removeprefix("classifier-primary-source:"))
+            if source.stage_effect_key == stage.owner_effect_key or source.source_checkpoint_id == checkpoint_id:
+                raise AuditIntegrityError("prephysical classifier already has an original physical source")
+            if source.effect_key not in providers or providers[source.effect_key].disposition != "committed":
+                raise AuditIntegrityError("prephysical classifier contains an orphan physical source")
+        elif item.chunk_key.startswith("classifier-primary-stage:"):
+            encoded = item.payload.decode("utf-8", errors="strict")
+            value, error = parse_json_strict(encoded)
+            if error is not None or type(value) is not dict or type(value.get("effect_key")) is not str:
+                raise AuditIntegrityError("prephysical classifier contains a malformed stage anchor")
+            linked = value["effect_key"]
+            prior = _read_source(conn, session_id, operation_id, linked)
+            if encoded != _event(prior) or linked not in providers or providers[linked].disposition != "committed":
+                raise AuditIntegrityError("prephysical classifier contains an orphan stage anchor")
+    known = {item.provider_attempt_id for item in providers.values()}
+    if None in known or any(item.disposition != "committed" for item in providers.values()):
+        raise AuditIntegrityError("prephysical classifier contains an unclosed original provider")
+    for attempt in conn.execute(
+        select(physical).where(physical.c.session_id == sid, physical.c.operation_id == creator.session_operation_id)
+    ):
+        if attempt.attempt_id not in known or attempt.settled_at is None or attempt.ledger_entry_id is None:
+            raise AuditIntegrityError("prephysical classifier contains an orphan or unclosed physical attempt")
+    for hold in conn.execute(select(holds).where(holds.c.session_id == sid, holds.c.operation_id == operation_id)):
+        if (
+            hold.effect_key not in providers
+            or hold.state != "consumed"
+            or hold.provider_attempt_id != providers[hold.effect_key].provider_attempt_id
+        ):
+            raise AuditIntegrityError("prephysical classifier contains an orphan or active terminal hold")
+    # Reprove all original paid ledger/source links, not merely membership.
+    read_continuation_cost_snapshot_on_connection(conn, root)
+    selected = SelectedContinuationState(
+        stored.checkpoint_id,
+        root,
+        load_snapshot_private_data_on_connection(conn, session_id=sid, operation_id=operation_id, selected=stored),
+    )
+    return ClassifierPrephysicalSource(
+        selected,
+        stage.owner_effect_key,
+        stage.creator_sequence,
+        stage.creator_generation,
+        creator.claim_attempt,
+        creator.session_operation_id,
+        creator.session_operation_epoch,
+        frozenset(source_record[0].env_ref_names),
+    )
+
+
 class _Source(ContinuationValue):
     schema_version: Literal["composer.classifier-primary-source.v1"] = "composer.classifier-primary-source.v1"
     session_id: UUID
@@ -1151,6 +1276,25 @@ class ClassifierPrimaryIssuer:
     @property
     def sdk_entered(self) -> bool:
         return self._sdk_entered
+
+    def require_original_prephysical_failure(self, original: BaseException) -> TimeoutError:
+        """Identify the actual completed invocation, never authorize a terminal."""
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        failure = self._failure
+        if (
+            type(original) is not ComposerConvergenceError
+            or original.budget_exhausted != "timeout"
+            or type(failure) is not TimeoutError
+            or original.__context__ is not failure
+            or not self._started
+            or self._sdk_entered
+            or self._result is not None
+            or self._terminal is not None
+            or self._reply_deadline_observation is not None
+        ):
+            raise AuditIntegrityError("classifier failure has no original completed prephysical invocation")
+        return failure
 
     async def _sql[T](self, operation: Callable[[Connection], T]) -> T:
         def transaction() -> T:

@@ -51,7 +51,7 @@ from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.tool_batch import ToolBatchContext, ToolBatchCustody, ToolBatchProvenance
-from elspeth.web.continuation_retention_memo import RetentionStageMemo, retention_stage_memo_scope
+from elspeth.web.continuation_retention_memo import RetentionStageMemo, borrow_v4_preparation_memo_scope, retention_stage_memo_scope
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
@@ -1013,7 +1013,7 @@ async def capture_continuation_runtime_owners(
     def capture() -> CapturedContinuationRuntime:
         # One actual physical invocation owns this pure cache. Each facade
         # call still opens and proves its own current SQL DATA transaction.
-        with retention_stage_memo_scope() as memo:
+        with borrow_v4_preparation_memo_scope() as memo:
             return capture_scoped(memo)
 
     result = await _registered_read(work, CapturedContinuationRuntime, capture)
