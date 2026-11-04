@@ -464,36 +464,48 @@ async def observe_continuation_iteration_classification(
     )
     issuer.bind_reply_deadline(deadline)
     completion_capture = _ClassifyEndInvocationCapture()
-    with composer_quota_scope(service._require_sessions_service(), context), prompt_guard_user_scope(bindings.message):
-        outcome = await service._classify_and_budget_turn(
-            dispatch=dispatch,
-            turn_evidence=live.turn_evidence,
-            session_operation_context=context,
-            persist=persist,
-            llm_messages=live.llm_messages,
-            tools=live.tools,
-            recorder=live.recorder,
-            anti_anchor=live.anti_anchor,
-            progress=bindings.progress,
-            message=bindings.message,
-            initial_version=live.initial_version,
-            deadline=deadline,
-            runtime_preflight_cache=live.runtime_preflight_cache,
-            session_scope=bindings.session_scope,
-            session_id=bindings.session_id,
-            user_id=bindings.user_id,
-            mutation_success_seen=live.mutation_success_seen,
-            repair_turns_used=live.repair_turns_used,
-            composition_turns_used=live.composition_turns_used,
-            discovery_turns_used=live.discovery_turns_used,
-            advisor_checkpoint_passes_used=live.advisor_checkpoint_passes_used,
-            plugin_snapshot=bindings.plugin_snapshot,
-            advisor_review_state=live.advisor_review_state,
-            completion_gates=bindings.completion_gates,
-            provider_owner=bindings.provider_owner,
-            classifier_primary_issuer=issuer,
-            completion_capture=completion_capture,
-        )
+    from elspeth.web.composer.protocol import ComposerConvergenceError
+
+    try:
+        with composer_quota_scope(service._require_sessions_service(), context), prompt_guard_user_scope(bindings.message):
+            outcome = await service._classify_and_budget_turn(
+                dispatch=dispatch,
+                turn_evidence=live.turn_evidence,
+                session_operation_context=context,
+                persist=persist,
+                llm_messages=live.llm_messages,
+                tools=live.tools,
+                recorder=live.recorder,
+                anti_anchor=live.anti_anchor,
+                progress=bindings.progress,
+                message=bindings.message,
+                initial_version=live.initial_version,
+                deadline=deadline,
+                runtime_preflight_cache=live.runtime_preflight_cache,
+                session_scope=bindings.session_scope,
+                session_id=bindings.session_id,
+                user_id=bindings.user_id,
+                mutation_success_seen=live.mutation_success_seen,
+                repair_turns_used=live.repair_turns_used,
+                composition_turns_used=live.composition_turns_used,
+                discovery_turns_used=live.discovery_turns_used,
+                advisor_checkpoint_passes_used=live.advisor_checkpoint_passes_used,
+                plugin_snapshot=bindings.plugin_snapshot,
+                advisor_review_state=live.advisor_review_state,
+                completion_gates=bindings.completion_gates,
+                provider_owner=bindings.provider_owner,
+                classifier_primary_issuer=issuer,
+                completion_capture=completion_capture,
+            )
+    except ComposerConvergenceError as original:
+        if issuer.original_prephysical_failure(original) is not None:
+            from elspeth.web.sessions.continuation_classifier_prephysical_failure import observe_classifier_prephysical_failure
+
+            try:
+                observe_classifier_prephysical_failure(phases, runtime, issuer, original)
+            except BaseException as observation_failure:
+                raise BaseExceptionGroup("classifier original failure and observation", [original, observation_failure]) from None
+        raise
     from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 
     if isinstance(outcome, (SdkTerminalResult, SdkTerminalFailure)):

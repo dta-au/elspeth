@@ -170,6 +170,8 @@ def require_checkpoint_end_prepared_clock(prepared: PreparedCheckpointProvider) 
     source = prepared.physical_source()
     if source is None:
         raise AuditIntegrityError("END timing lost its original live physical source")
+    if not isinstance(source, CheckpointEndPhysicalSource) or type(source) is not CheckpointEndPhysicalSource:
+        raise AuditIntegrityError("END timing requires its original END physical source")
     require_original_checkpoint_end_physical_source(source)
     original = _issued[source]
     phases = source.phase_owner.phases

@@ -485,7 +485,10 @@ async def try_admit_preview_tool(
     from elspeth.web.sessions.continuation import StoredContinuationSnapshot
     from elspeth.web.sessions.continuation_preview_result import (
         OversizedPreviewReturn,
+        PreviewTailExcess,
         PreviewValidationIncompleteTerminal,
+        observe_preview_tail_excess,
+        retain_preview_tail_incomplete_on_connection,
         retain_preview_validation_incomplete_on_connection,
     )
     from elspeth.web.sessions.continuation_value_batch_tail import retain_value_batch_tail_on_connection
@@ -625,18 +628,22 @@ async def try_admit_preview_tool(
                 # Capture retains its original fence/message reproofs, which
                 # open their own transactions. Complete that DATA planning in
                 # this same owned result job before the atomic result writer.
-                batch = (
-                    prepare_issued_preview_batch(
-                        owner,
-                        prepared=prepared,
-                        produced=actual,
-                        runtime=current,
-                        selected=current_selected,
-                        inventory=current_inventory,
-                    )
-                    if type(actual.returned) is CompletePreviewReturn
-                    else None
-                )
+                batch = None
+                tail_excess = None
+                if type(actual.returned) is CompletePreviewReturn:
+                    try:
+                        batch = prepare_issued_preview_batch(
+                            owner,
+                            prepared=prepared,
+                            produced=actual,
+                            runtime=current,
+                            selected=current_selected,
+                            inventory=current_inventory,
+                        )
+                    except BaseException as original:
+                        tail_excess = observe_preview_tail_excess(actual.returned, original)
+                        if tail_excess is None:
+                            raise
                 with (
                     locked_session_transaction(owner.authority._engine, source.session_id) as conn,
                     sessions._session_write_lock(conn, source.session_id),
@@ -647,11 +654,33 @@ async def try_admit_preview_tool(
                         )
                         value: StoredContinuationSnapshot | PreviewValidationIncompleteTerminal = terminal
                     else:
-                        if batch is None:
+                        if type(actual.returned) is not CompletePreviewReturn:
+                            raise AuditIntegrityError("preview disposition changed its original complete return")
+                        if tail_excess is None and batch is None:
                             raise AuditIntegrityError("preview disposition lost its complete original tail preparation")
-                        value = retain_value_batch_tail_on_connection(
-                            conn, inventory.running, service=sessions, batch=batch, published_at=datetime.now(UTC), issued_preview=actual
-                        ).snapshot
+                        if tail_excess is None:
+                            if batch is None:
+                                raise AuditIntegrityError("preview complete tail lost its actual prepared source")
+                            try:
+                                value = retain_value_batch_tail_on_connection(
+                                    conn,
+                                    inventory.running,
+                                    service=sessions,
+                                    batch=batch,
+                                    published_at=datetime.now(UTC),
+                                    issued_preview=actual,
+                                ).snapshot
+                            except PreviewTailExcess as original_excess:
+                                tail_excess = original_excess
+                        if tail_excess is not None:
+                            value = retain_preview_tail_incomplete_on_connection(
+                                conn,
+                                inventory.running,
+                                returned=actual.returned,
+                                excess=tail_excess,
+                                env_ref_names=inventory.names,
+                                recorded_at=datetime.now(UTC),
+                            )
                 # Preserve the actual committing return before bridge delivery.
                 if type(value) is PreviewValidationIncompleteTerminal:
                     owner.preview_terminal = value

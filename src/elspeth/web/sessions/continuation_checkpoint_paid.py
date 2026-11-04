@@ -45,6 +45,11 @@ from elspeth.web.sessions.continuation import (
     put_chunk,
     read_chunk,
 )
+from elspeth.web.sessions.continuation_checkpoint_early_source import (
+    CapturedCheckpointEarlyInput,
+    early_source_event_fields,
+    require_early_input_on_connection,
+)
 from elspeth.web.sessions.continuation_checkpoint_paid_tail import CheckpointPaidOverflowTailPlan
 from elspeth.web.sessions.continuation_checkpoint_sdk_reservation import prepare_checkpoint_sdk_terminal_hold_plan
 from elspeth.web.sessions.continuation_checkpoint_terminal_hold import (
@@ -70,6 +75,7 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as physica
 if TYPE_CHECKING:
     from weakref import ReferenceType
 
+    from elspeth.web.composer.continuation_checkpoint_early_physical import CheckpointEarlyPhysicalSource
     from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointEndPhysicalSource
     from elspeth.web.composer.continuation_clock import ContinuationActionClock
     from elspeth.web.composer.service import ComposerServiceImpl
@@ -102,6 +108,7 @@ class PreparedCheckpointSource:
     composer: ComposerServiceImpl = field(repr=False)
     authority: ComposerAsyncOperationAuthority = field(repr=False)
     end_input: CapturedCheckpointEndInput | None = field(default=None, repr=False)
+    early_input: CapturedCheckpointEarlyInput | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +121,7 @@ class CheckpointPreparedSource:
     pass_index: int
     end_input_ref: PrivateChunkRef | None
     end_env_ref_names: tuple[str, ...]
+    early_input_ref: PrivateChunkRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +137,7 @@ class PreparedCheckpointProvider:
     env_ref_names: frozenset[str]
     publication_binding: str | None
     clock: ContinuationActionClock = field(repr=False)
-    physical_source: ReferenceType[CheckpointEndPhysicalSource] = field(repr=False)
+    physical_source: ReferenceType[CheckpointEndPhysicalSource | CheckpointEarlyPhysicalSource] = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +193,11 @@ def _initial_phase_source(
     retry_phase = read_end_format_retry_phase_on_connection(conn, session_id=sid, operation_id=operation_id, selected=selected)
     if retry_phase is not None:
         return retry_phase
+    from elspeth.web.sessions.continuation_checkpoint_early_retry import read_early_format_retry_phase_on_connection
+
+    early_retry = read_early_format_retry_phase_on_connection(conn, session_id=sid, operation_id=operation_id, selected=selected)
+    if early_retry is not None:
+        return early_retry
     top = root.frames[-1]
     if type(top) is ToolBatchFrame:
         stage = read_iteration_stage_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=selected)
@@ -294,6 +307,8 @@ def prepare_v4_checkpoint_source_on_connection(
     end_input = None
     end_env_ref_names: tuple[str, ...] = ()
     if phase.phase == "end":
+        if prepared.early_input is not None:
+            raise AuditIntegrityError("END checkpoint cannot borrow an EARLY request input")
         if type(prepared.end_input) is not CapturedCheckpointEndInput:
             raise AuditIntegrityError("END checkpoint preparation lacks its original complete gate input")
         end_input, gate = require_original_checkpoint_end_snapshot(
@@ -308,6 +323,20 @@ def prepare_v4_checkpoint_source_on_connection(
             raise AuditIntegrityError("END checkpoint preparation changed its one original format retry")
     elif prepared.end_input is not None:
         raise AuditIntegrityError("EARLY checkpoint cannot borrow END gate input")
+    early_input = prepared.early_input
+    if early_input is not None:
+        from elspeth.web.composer.continuation_checkpoint_early_physical import require_original_checkpoint_early_input
+
+        require_original_checkpoint_early_input(early_input, captured=prepared.captured_before)
+        if (
+            phase.phase != "early"
+            or phase.kind != "iteration_early"
+            or prepared.pass_index != 0
+            or early_input.snapshot.original_checkpoint_id != source.checkpoint_id
+            or early_input.snapshot.original_cursor != source.cursor
+            or early_input.snapshot.outer_effect_key != phase.outer_effect_key
+        ):
+            raise AuditIntegrityError("EARLY checkpoint preparation changed its original request source")
     before = selected.stack
     captured = prepared.captured_before
     if (
@@ -339,6 +368,15 @@ def prepare_v4_checkpoint_source_on_connection(
             payload=end_input.canonical.encode("utf-8"),
             codec=end_input.reference.codec,
         )
+    if early_input is not None:
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=private_chunk_key(early_input.chunk),
+            payload=early_input.chunk.canonical.encode("utf-8"),
+            codec=early_input.chunk.reference.codec,
+        )
     captured_root_sha256 = sha256(
         encode_continuation_snapshot(captured.stack.model_copy(update={"cursor": source.cursor + 1})).encode("utf-8")
     ).hexdigest()
@@ -347,7 +385,7 @@ def prepare_v4_checkpoint_source_on_connection(
         canonical_json(
             {
                 "owner": "composer_checkpoint_source",
-                "version": 1,
+                **early_source_event_fields(early_input.chunk.reference if early_input is not None else None),
                 "stage": "source_prepared",
                 "phase": phase.phase,
                 "kind": phase.kind,
@@ -392,6 +430,7 @@ def prepare_v4_checkpoint_source_on_connection(
         prepared.pass_index,
         end_input.reference if end_input is not None else None,
         end_env_ref_names,
+        early_input.chunk.reference if early_input is not None else None,
     )
 
 
@@ -440,7 +479,7 @@ def _require_prepared_checkpoint_source_on_connection(conn: Connection, prepared
     expected = canonical_json(
         {
             "owner": "composer_checkpoint_source",
-            "version": 1,
+            **early_source_event_fields(source.early_input_ref),
             "stage": "source_prepared",
             "phase": source.phase,
             "kind": source.kind,
@@ -515,6 +554,27 @@ def _require_prepared_checkpoint_source_on_connection(conn: Connection, prepared
             )
         ):
             raise AuditIntegrityError("END checkpoint input changed its original gate source")
+    if source.early_input_ref is not None:
+        contract = load_continuation_read_contract(conn, session_id=sid, operation_id=operation)
+        if type(contract.allowance) is not int or source.phase != "early" or source.pass_index != 0:
+            raise AuditIntegrityError("EARLY checkpoint input lost its bounded original phase")
+        early_data = require_early_input_on_connection(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            reference=source.early_input_ref,
+            allowance=contract.allowance,
+            origin=source.source,
+            prepared=source.prepared_selected,
+            outer_effect_key=source.outer_effect_key,
+        )
+        if (
+            early_data.messages_sha256 != prepared.request_sha256
+            or early_data.requested_model != prepared.requested_model
+            or early_data.env_ref_names != tuple(sorted(prepared.env_ref_names))
+            or early_data.retry_ordinal != prepared.retry_ordinal
+        ):
+            raise AuditIntegrityError("EARLY physical admission substituted its request or environment inventory")
     _effect_inventory(conn, sid, operation, source.prepared_selected)
     return source
 
@@ -523,7 +583,7 @@ def admit_v4_checkpoint_provider_on_connection(
     conn: Connection, service: SessionServiceImpl, prepared: PreparedCheckpointProvider, *, model: str
 ) -> V4CheckpointProviderAdmission:
     """Mint one original physical attempt and exact H before SDK entry."""
-    from elspeth.web.composer.continuation_checkpoint_end_physical import require_checkpoint_end_prepared_clock
+    from elspeth.web.composer.continuation_checkpoint_prepared_clock import require_checkpoint_prepared_clock
 
     if (
         type(prepared) is not PreparedCheckpointProvider
@@ -531,7 +591,7 @@ def admit_v4_checkpoint_provider_on_connection(
         or model != prepared.requested_model
     ):
         raise AuditIntegrityError("checkpoint admission changed its original provider/service/model")
-    clock = require_checkpoint_end_prepared_clock(prepared)
+    clock = require_checkpoint_prepared_clock(prepared)
     clock.require_active_quota_time()
     running = prepared.running
     _require_current_continuation_running(conn, running)
@@ -597,7 +657,7 @@ def admit_v4_checkpoint_provider_on_connection(
         canonical_json(
             {
                 "owner": "composer_checkpoint_paid",
-                "version": 1,
+                **early_source_event_fields(source.early_input_ref),
                 "stage": "dispatched",
                 "phase": source.phase,
                 "kind": source.kind,
@@ -790,8 +850,9 @@ def require_current_checkpoint_dispatched_on_connection(
             "end_input_sha256",
             "end_env_ref_names",
         }
+        | ({"early_input_chunk_key", "early_input_sha256"} if source.early_input_ref is not None else set())
         or payload["owner"] != "composer_checkpoint_paid"
-        or payload["version"] != 1
+        or payload["version"] != (2 if source.early_input_ref is not None else 1)
         or payload["stage"] != "dispatched"
         or payload["phase"] != source.phase
         or payload["kind"] != source.kind
@@ -808,6 +869,7 @@ def require_current_checkpoint_dispatched_on_connection(
         != (f"value:{source.end_input_ref.codec}:{source.end_input_ref.digest}" if source.end_input_ref is not None else None)
         or payload["end_input_sha256"] != (source.end_input_ref.digest if source.end_input_ref is not None else None)
         or payload["end_env_ref_names"] != list(source.end_env_ref_names)
+        or any(payload[key] != value for key, value in early_source_event_fields(source.early_input_ref).items())
         or text != canonical_json(payload)
     ):
         raise AuditIntegrityError("checkpoint pending read changed its original dispatch event")

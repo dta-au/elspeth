@@ -33,6 +33,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_limits import (
     CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES,
     CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+    CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES,
 )
 
 if TYPE_CHECKING:
@@ -227,7 +228,11 @@ class RetentionStageMemo:
         self._shared_text_budget_bytes = (
             CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES
             if legacy_advisor_owner is not None
-            else CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+            else (
+                CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES
+                if v4_preparation_owner is not None
+                else CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+            )
         )
         self._lock = Lock()
         self._closed = False

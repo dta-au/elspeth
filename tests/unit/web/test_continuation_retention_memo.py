@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from elspeth.contracts.credential_material import CredentialMaterialFinding, CredentialTraversalPolicy, find_credential_material
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web import async_workers
+from elspeth.web import continuation_retention_memo as memo_module
 from elspeth.web.composer import prompt_guard
 from elspeth.web.composer.continuation import ContinuationFrameStack, InitializeFrame
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
@@ -29,6 +30,7 @@ from elspeth.web.composer.continuation_codec import (
 from elspeth.web.composer.continuation_limits import (
     CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES,
     CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+    CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES,
 )
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy
 from elspeth.web.continuation_retention_memo import (
@@ -926,7 +928,7 @@ async def test_v4_preparation_sql_cuts_share_only_canonical_and_block_proofs() -
             assert isinstance(outcome, RequiredSQLReturned) and outcome.value == ordinal
         assert calls == {"text": 1, "block": 1, "encoding": 3, "request": 3, "snapshot": 3, "chunk": 3, "scan": 3, "state": 3}
         assert len({id(child) for child in children}) == 3
-        assert parent._shared_text_budget_bytes == CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        assert parent._shared_text_budget_bytes == CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES == 5_242_880
         with v4_preparation_memo_scope(clock) as nested:
             assert nested is parent
         assert parent.active
@@ -941,7 +943,10 @@ async def test_v4_preparation_sql_cuts_share_only_canonical_and_block_proofs() -
 
 
 @pytest.mark.asyncio
-async def test_v4_preparation_text_pressure_keeps_original_one_mib_combined_budget() -> None:
+@pytest.mark.parametrize("budget_mib", (1, 5))
+async def test_v4_preparation_text_pressure_respects_selected_transient_budget(monkeypatch: pytest.MonkeyPatch, budget_mib: int) -> None:
+    budget_bytes = budget_mib * 1_048_576
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", budget_bytes)
     calls: list[str] = []
 
     def encode(key: CanonicalTextEncodingKey) -> bytes:
@@ -960,14 +965,14 @@ async def test_v4_preparation_text_pressure_keeps_original_one_mib_combined_budg
         with borrow_v4_preparation_memo_scope() as child:
             child.canonical_text_proof(first, encode, hashlib.sha256)
             child.canonical_text_proof(second, encode, hashlib.sha256)
-            assert parent.cached_entry_count == 1
+            assert parent.cached_entry_count == (1 if budget_mib == 1 else 2)
             child.recorder_block_hash(block, verify_block)
-            assert parent.cached_entry_count == 1
+            assert parent.cached_entry_count == (1 if budget_mib == 1 else 3)
             child.canonical_text_proof(second, encode, hashlib.sha256)
-            assert parent.cached_entry_count == 1
+            assert parent.cached_entry_count == (1 if budget_mib == 1 else 3)
             child.canonical_text_proof(second, encode, hashlib.sha256)
-            assert parent._canonical_proof_bytes + parent._recorder_block_hash_bytes <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
-        assert calls == ["a", "b", "block", "b"]
+            assert parent._canonical_proof_bytes + parent._recorder_block_hash_bytes <= budget_bytes
+        assert calls == (["a", "b", "block", "b"] if budget_mib == 1 else ["a", "b", "block"])
 
 
 @pytest.mark.asyncio
@@ -1043,7 +1048,12 @@ async def test_v4_preparation_original_error_closes_creator_and_complete_keys_re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("order", tuple(permutations(("full", "canonical", "block"))))
-async def test_v4_three_text_families_enforce_combined_budget_in_every_insertion_order(order: tuple[str, ...]) -> None:
+@pytest.mark.parametrize("budget_mib", (1, 5))
+async def test_v4_three_text_families_enforce_combined_budget_in_every_insertion_order(
+    monkeypatch: pytest.MonkeyPatch, order: tuple[str, ...], budget_mib: int
+) -> None:
+    budget_bytes = budget_mib * 1_048_576
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", budget_bytes)
     calls = {"full": 0, "canonical": 0, "block": 0}
     bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
     full = CanonicalTextEncodingKey("f" * 200_000, bound)
@@ -1071,23 +1081,27 @@ async def test_v4_three_text_families_enforce_combined_budget_in_every_insertion
                     child.canonical_text_verification(canonical, verify)
                 else:
                     child.recorder_block_hash(block, verify_block)
-            assert parent._canonical_proof_bytes + parent._canonical_verification_bytes + parent._recorder_block_hash_bytes <= bound
-        assert calls == {"full": 1, "canonical": 1, "block": 1} and parent.cached_entry_count == 2
-        # Existing full/block insertion preferences survive the new family;
-        # the canonical insertion evicts the old full proof when it needs room.
-        evicted = "full" if order[-1] == "canonical" else "canonical"
+            assert parent._canonical_proof_bytes + parent._canonical_verification_bytes + parent._recorder_block_hash_bytes <= budget_bytes
+        assert calls == {"full": 1, "canonical": 1, "block": 1} and parent.cached_entry_count == (2 if budget_mib == 1 else 3)
+        # The 1 MiB case proves existing eviction preferences; 5 MiB retains
+        # the same complete entries and must hit on the selected revisit.
+        revisited = "full" if order[-1] == "canonical" else "canonical"
         with borrow_v4_preparation_memo_scope() as child:
-            if evicted == "full":
+            if revisited == "full":
                 child.canonical_text_proof(full, encode, hashlib.sha256)
             else:
                 child.canonical_text_verification(canonical, verify)
-        assert calls[evicted] == 2
-        assert parent._canonical_proof_bytes + parent._canonical_verification_bytes + parent._recorder_block_hash_bytes <= bound
+        assert calls[revisited] == (2 if budget_mib == 1 else 1)
+        assert parent._canonical_proof_bytes + parent._canonical_verification_bytes + parent._recorder_block_hash_bytes <= budget_bytes
     assert parent.cached_entry_count == 0 and parent._canonical_verification_bytes == 0
 
 
 @pytest.mark.asyncio
-async def test_v4_canonical_only_lru_uses_actual_utf8_and_complete_producer_text_bound_keys() -> None:
+@pytest.mark.parametrize("budget_mib", (1, 5))
+async def test_v4_canonical_only_lru_uses_actual_utf8_and_complete_producer_text_bound_keys(
+    monkeypatch: pytest.MonkeyPatch, budget_mib: int
+) -> None:
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", budget_mib * 1_048_576)
     calls: list[str] = []
 
     def verify(text: str) -> None:
@@ -1102,8 +1116,8 @@ async def test_v4_canonical_only_lru_uses_actual_utf8_and_complete_producer_text
         for key in (first, second, first, third, first, second):
             with borrow_v4_preparation_memo_scope() as child:
                 child.canonical_text_verification(key, verify)
-        assert calls == ["a", "b", "c", "b"]
-        assert parent.cached_entry_count == 2
+        assert calls == (["a", "b", "c", "b"] if budget_mib == 1 else ["a", "b", "c"])
+        assert parent.cached_entry_count == (2 if budget_mib == 1 else 3)
         parent.canonical_text_verification(CanonicalTextVerificationKey("😀" * 20, 100), verify)
         assert parent._canonical_verifications[(verify, CanonicalTextVerificationKey("😀" * 20, 100))] == 83
         parent.canonical_text_verification(CanonicalTextVerificationKey("😀" * 20, 101), verify)

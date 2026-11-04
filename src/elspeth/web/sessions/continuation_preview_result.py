@@ -19,14 +19,14 @@ from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
 
 import rfc8785
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from sqlalchemy import Connection, insert, select, update
 from sqlalchemy.engine import RootTransaction
 
 from elspeth.contracts.bounded_serialization import BoundedCanonicalSize, bounded_canonical_json_size, utf8_size
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
-from elspeth.web.composer.continuation import ContinuationFrameStack, EffectFrontierEntry, ToolBatchFrame
+from elspeth.web.composer.continuation import ContinuationFrameStack, EffectFrontierEntry, PrivateChunkRef, ToolBatchFrame
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     decode_continuation_snapshot,
@@ -38,13 +38,14 @@ from elspeth.web.composer.continuation_preview_observation import (
     OriginalPreviewObservation,
     PreviewObservationData,
     PreviewSourceData,
+    decode_preview_data,
     encode_preview_data,
     measure_preview_data,
     observe_original_preview_result,
     require_original_preview_observation,
     require_preview_source_matches,
 )
-from elspeth.web.composer.continuation_tool_batch import prepare_tool_result_value
+from elspeth.web.composer.continuation_tool_batch import decode_tool_result_value, prepare_tool_result_value
 from elspeth.web.composer.continuation_value_batch_preparation import PreparedValueBatchCall
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
@@ -95,6 +96,33 @@ class ValidationIncompleteReceipt(BaseModel):
     returned_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}\+00:00$")
 
 
+class PreviewTailIncompleteReceipt(BaseModel):
+    """A complete raw return whose mandatory consequence cannot be retained."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    schema_version: Literal["composer.preview-incomplete.v2"] = "composer.preview-incomplete.v2"
+    source: PreviewSourceData
+    outcome: Literal["validation_incomplete"] = "validation_incomplete"
+    reason: Literal["complete_preview_tail_exceeds_limit"] = "complete_preview_tail_exceeds_limit"
+    surface: Literal["private_chunk", "evidence_pair", "retained_history"]
+    limit: int = Field(gt=0)
+    # A saturated lower bound is sufficient to prove excess and has a bound
+    # derived from the admitted limit before the original producer starts.
+    observed_at_least: int = Field(gt=0)
+    measurement: Literal["lower_bound"] = "lower_bound"
+    original_result: PrivateChunkRef | None = None
+    additional_provider_calls: Literal[0] = 0
+    additional_provider_cost_usd: Literal["0"] = "0"
+    missing_result_used: Literal[False] = False
+    automatic_retry_allowed: Literal[False] = False
+    returned_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    returned_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}\+00:00$")
+
+
+type PreviewIncompleteReceipt = ValidationIncompleteReceipt | PreviewTailIncompleteReceipt
+_INCOMPLETE_RECEIPT = TypeAdapter[PreviewIncompleteReceipt](PreviewIncompleteReceipt)
+
+
 @dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
 class CompletePreviewReturn:
     original: OriginalPreviewObservation
@@ -113,6 +141,95 @@ class OversizedPreviewReturn:
 
 type PreviewReturned = CompletePreviewReturn | OversizedPreviewReturn
 _RETURNS: WeakKeyDictionary[PreviewReturned, tuple[str, str]] = WeakKeyDictionary()
+
+
+class PreviewTailExcess(Exception):
+    """The original pre-consume planning error, bound to its original return."""
+
+    def __init__(self, returned: CompletePreviewReturn, original: BaseException, receipt: PreviewTailIncompleteReceipt) -> None:
+        super().__init__("complete original preview tail exceeds its retention allowance")
+        self.returned = returned
+        self.original = original
+        self.receipt = receipt
+
+
+_TAIL_EXCESSES: WeakKeyDictionary[PreviewTailExcess, tuple[CompletePreviewReturn, BaseException, str]] = WeakKeyDictionary()
+
+
+def observe_preview_tail_excess(returned: CompletePreviewReturn, original: BaseException) -> PreviewTailExcess | None:
+    """Observe only native size refusal at an actual unconsumed planner call.
+
+    This is not a writer capability: current issued source, hold, actor and
+    inventory must all be re-proved on the terminal writer's connection.
+    """
+    from elspeth.web.composer.continuation_capture_overflow import ContinuationMandatoryCaptureOverflow
+    from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
+
+    if type(returned) is not CompletePreviewReturn:
+        raise AuditIntegrityError("preview tail excess requires its complete original return")
+    require_issued_preview_return(returned)
+    surface: Literal["private_chunk", "evidence_pair", "retained_history"]
+    if type(original) is ContinuationRetainedCapacityExceeded:
+        surface, limit = "retained_history", original.limit_bytes
+        if original.observed_bytes <= limit:
+            raise AuditIntegrityError("preview aggregate excess changed its native measurement")
+    else:
+        cause = original.__cause__
+        if type(cause) is not ContinuationMandatoryCaptureOverflow:
+            return None
+        witness = cause.witness
+        if witness.unit not in ("private_chunk", "evidence_pair") or witness.observed_bytes <= witness.limit_bytes:
+            raise AuditIntegrityError("preview mandatory excess changed its native measurement")
+        surface, limit = witness.unit, witness.limit_bytes
+        if limit != CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            raise AuditIntegrityError("preview mandatory excess changed the unchanged document bound")
+    receipt = PreviewTailIncompleteReceipt(
+        source=returned.original.source,
+        surface=surface,
+        limit=limit,
+        observed_at_least=limit + 1,
+        returned_sha256=_RETURNS[returned][0],
+        returned_at=datetime.now(UTC).isoformat(timespec="microseconds"),
+    )
+    observed = PreviewTailExcess(returned, original, receipt)
+    _TAIL_EXCESSES[observed] = (returned, original, canonical_json(receipt.model_dump(mode="json")))
+    return observed
+
+
+def require_original_preview_tail_excess(observed: PreviewTailExcess, returned: CompletePreviewReturn) -> None:
+    from elspeth.web.composer.continuation_capture_overflow import ContinuationMandatoryCaptureOverflow
+    from elspeth.web.sessions.continuation_retained_capacity import ContinuationRetainedCapacityExceeded
+
+    if type(observed) is not PreviewTailExcess or type(returned) is not CompletePreviewReturn:
+        raise AuditIntegrityError("preview tail excess lacks its actual original identity")
+    issued = _TAIL_EXCESSES.get(observed)
+    if (
+        issued is None
+        or issued[0] is not returned
+        or observed.returned is not returned
+        or observed.original is not issued[1]
+        or canonical_json(observed.receipt.model_dump(mode="json")) != issued[2]
+        or observed.receipt.source != returned.original.source
+        or observed.receipt.observed_at_least != observed.receipt.limit + 1
+    ):
+        raise AuditIntegrityError("preview tail excess changed its original source or measurement")
+    if type(observed.original) is ContinuationRetainedCapacityExceeded:
+        if (
+            observed.receipt.surface != "retained_history"
+            or observed.original.limit_bytes != observed.receipt.limit
+            or observed.original.observed_bytes <= observed.original.limit_bytes
+        ):
+            raise AuditIntegrityError("preview tail excess changed its actual aggregate measurement")
+    else:
+        cause = observed.original.__cause__
+        if (
+            type(cause) is not ContinuationMandatoryCaptureOverflow
+            or cause.witness.unit != observed.receipt.surface
+            or cause.witness.limit_bytes != observed.receipt.limit
+            or cause.witness.observed_bytes <= cause.witness.limit_bytes
+        ):
+            raise AuditIntegrityError("preview tail excess changed its actual mandatory measurement")
+    require_issued_preview_return(returned)
 
 
 class _HashSink(BytesIO):
@@ -292,7 +409,7 @@ class PreviewTerminalHoldContract(BaseModel):
     """Source-bound fixed fallback DATA; no provider hold or physical attempt."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    schema_version: Literal["composer.preview-hold.v1"] = "composer.preview-hold.v1"
+    schema_version: Literal["composer.preview-hold.v1", "composer.preview-hold.v2"] = "composer.preview-hold.v2"
     source: PreviewSourceData
     diagnostic_id: str = Field(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
     document_bytes: tuple[int, ...]
@@ -381,7 +498,7 @@ def _effect_key(source: PreviewSourceData) -> str:
     return f"tool:{source.response.digest}:{source.tool_index}"
 
 
-def _incomplete_event(receipt: ValidationIncompleteReceipt, chunk: PrivateChunk) -> str:
+def _incomplete_event(receipt: PreviewIncompleteReceipt, chunk: PrivateChunk) -> str:
     return canonical_json(
         {
             "owner": "composer_preview",
@@ -413,7 +530,7 @@ def _incomplete_root(root: ContinuationFrameStack, *, source: PreviewSourceData,
     )
 
 
-def _fallback_documents(root: ContinuationFrameStack, *, source: PreviewSourceData) -> tuple[str, ...]:
+def _fallback_documents_v1(root: ContinuationFrameStack, *, source: PreviewSourceData) -> tuple[str, ...]:
     """Closed maximum of the actual five payload documents in this tail.
 
     Zero hex is capacity DATA only. No planning value is a returned-result
@@ -448,6 +565,55 @@ def _fallback_documents(root: ContinuationFrameStack, *, source: PreviewSourceDa
         settled,
         encode_continuation_snapshot(final),
     )
+
+
+def _receipt_documents(root: ContinuationFrameStack, receipt: PreviewIncompleteReceipt, failure: str) -> tuple[str, ...]:
+    canonical = canonical_json(receipt.model_dump(mode="json"))
+    codec = "composer.preview-incomplete.v2" if type(receipt) is PreviewTailIncompleteReceipt else "composer.preview-incomplete.v1"
+    chunk = encode_private_chunk(codec=codec, canonical=canonical)
+    source = receipt.source
+    first = _incomplete_root(root, source=source, receipt_id=f"validation-incomplete:{chunk.reference.digest}", cursor=root.cursor + 1)
+    final = first.model_copy(update={"cursor": first.cursor + 1})
+    return (
+        canonical,
+        _incomplete_event(receipt, chunk),
+        encode_continuation_snapshot(first),
+        canonical_json(
+            {"version": 1, "sequence": source.sequence, "generation": source.generation, "status": "failed", "failure_code": failure}
+        ),
+        encode_continuation_snapshot(final),
+    )
+
+
+def _fallback_documents(
+    root: ContinuationFrameStack,
+    *,
+    source: PreviewSourceData,
+    version: Literal["composer.preview-hold.v1", "composer.preview-hold.v2"] = "composer.preview-hold.v1",
+) -> tuple[str, ...]:
+    original = _fallback_documents_v1(root, source=source)
+    if version == "composer.preview-hold.v1":
+        return original
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    if type(policy) is not ContinuationAdmissionPolicyV4:
+        raise AuditIntegrityError("preview tail fallback requires its immutable V4 allowance")
+    bound = max(CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, policy.max_retained_payload_bytes)
+    candidate = PreviewTailIncompleteReceipt(
+        source=source,
+        surface="retained_history",
+        limit=bound,
+        observed_at_least=bound + 1,
+        original_result=PrivateChunkRef(
+            codec="composer.preview-observation.v1", digest="0" * 64, byte_length=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        ),
+        returned_sha256="0" * 64,
+        returned_at="9999-12-31T23:59:59.999999+00:00",
+    )
+    failure = max(COMPOSER_OPERATION_FAILURE_CODES, key=lambda item: len(canonical_json(item).encode("utf-8")))
+    extended = _receipt_documents(root, candidate, failure)
+    return tuple(max(pair, key=lambda text: len(text.encode("utf-8"))) for pair in zip(original, extended, strict=True))
 
 
 def _require_original_preview_source_on_connection(conn: Connection, *, source: PreviewSourceData, env_ref_names: frozenset[str]) -> None:
@@ -559,7 +725,7 @@ def reserve_preview_terminal_hold_on_connection(
         or read_contract.allowance <= 0
     ):
         raise AuditIntegrityError("preview reservation requires its actual immutable V4 policy")
-    documents = _fallback_documents(root, source=source)
+    documents = _fallback_documents(root, source=source, version="composer.preview-hold.v2")
     sizes = tuple(len(document.encode("utf-8")) for document in documents)
     if any(size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES for size in sizes):
         raise AuditIntegrityError("preview has no complete bounded unpaid terminal fallback")
@@ -663,7 +829,7 @@ def read_preview_terminal_hold_on_connection(
     ):
         raise AuditIntegrityError("preview hold differs from original immutable admission")
     _require_original_preview_source_on_connection(conn, source=source, env_ref_names=env_ref_names)
-    documents = _fallback_documents(_issued_root_on_connection(conn, source), source=source)
+    documents = _fallback_documents(_issued_root_on_connection(conn, source), source=source, version=contract.schema_version)
     sizes = tuple(len(document.encode("utf-8")) for document in documents)
     if (
         sizes != contract.document_bytes
@@ -699,7 +865,8 @@ def live_preview_terminal_hold_bytes_on_connection(
         contract = PreviewTerminalHoldContract.model_validate_json(row.source_json, strict=True)
         source = contract.source
         sizes = tuple(
-            len(document.encode("utf-8")) for document in _fallback_documents(_issued_root_on_connection(conn, source), source=source)
+            len(document.encode("utf-8"))
+            for document in _fallback_documents(_issued_root_on_connection(conn, source), source=source, version=contract.schema_version)
         )
         if (
             (source.session_id, source.operation_id, _effect_key(source)) != (session_id, operation_id, row.effect_key)
@@ -779,7 +946,7 @@ def consume_preview_terminal_hold_on_connection(
 @dataclass(frozen=True, slots=True)
 class PreviewValidationIncompleteTerminal:
     snapshot: StoredContinuationSnapshot
-    receipt: ValidationIncompleteReceipt
+    receipt: PreviewIncompleteReceipt
     error: ComposerOperationError
     env_ref_names: frozenset[str]
 
@@ -798,13 +965,74 @@ def retain_preview_validation_incomplete_on_connection(
         )
 
 
+def retain_preview_tail_incomplete_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    returned: CompletePreviewReturn,
+    excess: PreviewTailExcess,
+    env_ref_names: frozenset[str],
+    recorded_at: datetime,
+) -> PreviewValidationIncompleteTerminal:
+    require_original_preview_tail_excess(excess, returned)
+    with preview_returned_credit_scope(conn, running, returned=returned, env_ref_names=env_ref_names):
+        return _retain_preview_validation_incomplete_on_connection(
+            conn, running, returned=returned, env_ref_names=env_ref_names, recorded_at=recorded_at, tail=excess
+        )
+
+
+def _retainable_tail_original(
+    conn: Connection,
+    *,
+    root: ContinuationFrameStack,
+    returned: CompletePreviewReturn,
+    receipt: PreviewTailIncompleteReceipt,
+    failure: str,
+) -> tuple[PreviewTailIncompleteReceipt, PrivateChunk | None]:
+    from elspeth.web.sessions.continuation_retained_capacity import (
+        ContinuationRetainedCapacityExceeded,
+        ProspectiveContinuationChunk,
+        admit_retained_payload_chunks,
+        load_continuation_read_contract,
+    )
+
+    source = receipt.source
+    candidate = receipt.model_copy(update={"original_result": returned.chunk.reference})
+    documents = _receipt_documents(root, candidate, failure)
+    # Sizing keys are unique prospective DATA, never published identities.
+    # They prevent fictional deduplication of actual mandatory terminal bytes.
+    prospective = tuple(
+        ProspectiveContinuationChunk(f"preview-terminal-plan:{uuid4()}", text.encode("utf-8"), "event.v2") for text in documents
+    )
+    contract = load_continuation_read_contract(conn, session_id=source.session_id, operation_id=source.operation_id)
+    if contract.allowance is None:
+        raise AuditIntegrityError("preview optional original lost its immutable retained limit")
+    try:
+        admit_retained_payload_chunks(
+            conn,
+            session_id=source.session_id,
+            operation_id=source.operation_id,
+            prospective=(
+                *prospective,
+                ProspectiveContinuationChunk(
+                    private_chunk_key(returned.chunk), returned.chunk.canonical.encode("utf-8"), returned.chunk.reference.codec
+                ),
+            ),
+            retained_payload_limit_bytes=contract.allowance,
+        )
+    except ContinuationRetainedCapacityExceeded:
+        return receipt, None
+    return candidate, returned.chunk
+
+
 def _retain_preview_validation_incomplete_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
     *,
-    returned: OversizedPreviewReturn,
+    returned: OversizedPreviewReturn | CompletePreviewReturn,
     env_ref_names: frozenset[str],
     recorded_at: datetime,
+    tail: PreviewTailExcess | None = None,
 ) -> PreviewValidationIncompleteTerminal:
     """Commit the original measured missing output and terminal atomically.
 
@@ -813,11 +1041,19 @@ def _retain_preview_validation_incomplete_on_connection(
     """
     from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 
-    if type(returned) is not OversizedPreviewReturn:
-        raise AuditIntegrityError("preview incomplete requires its actual oversized original return")
+    receipt: PreviewIncompleteReceipt
+    if type(returned) is CompletePreviewReturn:
+        if tail is None:
+            raise AuditIntegrityError("complete preview requires its original unconsumed tail excess")
+        require_original_preview_tail_excess(tail, returned)
+        receipt = tail.receipt
+    elif type(returned) is OversizedPreviewReturn and tail is None:
+        receipt = returned.receipt
+    else:
+        raise AuditIntegrityError("preview incomplete requires its actual original size refusal")
     require_issued_preview_return(returned)
     _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
-    source = returned.source
+    source = preview_return_fields(returned)[0]
     if (source.session_id, source.operation_id, source.sequence, source.generation, source.claim_attempt) != (
         str(running.claim.session_id),
         running.claim.operation_id,
@@ -837,12 +1073,15 @@ def _retain_preview_validation_incomplete_on_connection(
         effect_key=_effect_key(source),
         env_ref_names=env_ref_names,
     )
-    receipt = returned.receipt
-    canonical = canonical_json(receipt.model_dump(mode="json"))
-    chunk = encode_private_chunk(codec="composer.preview-incomplete.v1", canonical=canonical, env_ref_names=env_ref_names)
-    receipt_id = f"validation-incomplete:{chunk.reference.digest}"
-    first = _incomplete_root(root, source=source, receipt_id=receipt_id, cursor=root.cursor + 1)
-    final = first.model_copy(update={"cursor": first.cursor + 1})
+    if tail is not None and contract.schema_version != "composer.preview-hold.v2":
+        raise AuditIntegrityError("preview tail excess cannot spend a legacy raw-result hold")
+    if type(receipt) is PreviewTailIncompleteReceipt:
+        from elspeth.web.sessions.continuation_retained_capacity import load_continuation_read_contract
+
+        read_contract = load_continuation_read_contract(conn, session_id=source.session_id, operation_id=source.operation_id)
+        expected_limit = read_contract.allowance if receipt.surface == "retained_history" else CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        if receipt.limit != expected_limit or receipt.observed_at_least != receipt.limit + 1:
+            raise AuditIntegrityError("preview tail excess changed its actual immutable retention limit")
     parent = conn.execute(select(jobs).where(jobs.c.session_id == source.session_id, jobs.c.operation_id == source.operation_id)).one()
     # Durable Stop keeps its public priority; the observed incomplete tool
     # effect/receipt remains truthful and is never replayed.
@@ -853,30 +1092,41 @@ def _retain_preview_validation_incomplete_on_connection(
             http_status=422,
             failure_code="operation_failed",
             error_type="validation_incomplete",
-            body={"error_type": "validation_incomplete", "reason": "oversized_preview_result"},
+            body={
+                "error_type": "validation_incomplete",
+                "reason": "preview_tail_capacity_exceeded" if tail is not None else "oversized_preview_result",
+            },
             diagnostic_id=contract.diagnostic_id,
         )
     )
-    actual_documents = (
-        canonical,
-        _incomplete_event(receipt, chunk),
-        encode_continuation_snapshot(first),
-        canonical_json(
-            {
-                "version": 1,
-                "sequence": source.sequence,
-                "generation": source.generation,
-                "status": "failed",
-                "failure_code": error.failure_code,
-            }
-        ),
-        encode_continuation_snapshot(final),
+    retained_original: PrivateChunk | None = None
+    if type(returned) is CompletePreviewReturn and type(receipt) is PreviewTailIncompleteReceipt:
+        receipt, retained_original = _retainable_tail_original(
+            conn, root=root, returned=returned, receipt=receipt, failure=error.failure_code
+        )
+    canonical = canonical_json(receipt.model_dump(mode="json"))
+    codec: Literal["composer.preview-incomplete.v1", "composer.preview-incomplete.v2"] = (
+        "composer.preview-incomplete.v2" if type(receipt) is PreviewTailIncompleteReceipt else "composer.preview-incomplete.v1"
     )
+    chunk = encode_private_chunk(codec=codec, canonical=canonical, env_ref_names=env_ref_names)
+    receipt_id = f"validation-incomplete:{chunk.reference.digest}"
+    first = _incomplete_root(root, source=source, receipt_id=receipt_id, cursor=root.cursor + 1)
+    final = first.model_copy(update={"cursor": first.cursor + 1})
+    actual_documents = _receipt_documents(root, receipt, error.failure_code)
     sizes = tuple(len(document.encode("utf-8")) for document in actual_documents)
     if len(sizes) != len(contract.document_bytes) or any(
         actual > allowed for actual, allowed in zip(sizes, contract.document_bytes, strict=True)
     ):
         raise AuditIntegrityError("preview incomplete exceeded its original complete reserved fallback")
+    if retained_original is not None:
+        put_chunk(
+            conn,
+            session_id=source.session_id,
+            operation_id=source.operation_id,
+            key=private_chunk_key(retained_original),
+            payload=retained_original.canonical.encode("utf-8"),
+            codec=retained_original.reference.codec,
+        )
     put_chunk(
         conn,
         session_id=source.session_id,
@@ -1045,8 +1295,34 @@ def read_preview_validation_incomplete_on_connection(
     encoded = read_chunk(conn, session_id=session_id, operation_id=operation_id, key=effect.result_chunk_key).decode(
         "utf-8", errors="strict"
     )
-    receipt = ValidationIncompleteReceipt.model_validate_json(encoded, strict=True)
-    chunk = encode_private_chunk(codec="composer.preview-incomplete.v1", canonical=encoded, env_ref_names=env_ref_names)
+    receipt = _INCOMPLETE_RECEIPT.validate_json(encoded, strict=True)
+    codec: Literal["composer.preview-incomplete.v1", "composer.preview-incomplete.v2"] = (
+        "composer.preview-incomplete.v2" if type(receipt) is PreviewTailIncompleteReceipt else "composer.preview-incomplete.v1"
+    )
+    chunk = encode_private_chunk(codec=codec, canonical=encoded, env_ref_names=env_ref_names)
+    if type(receipt) is PreviewTailIncompleteReceipt:
+        from elspeth.web.sessions.continuation_retained_capacity import load_continuation_read_contract
+
+        read_contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
+        expected_limit = read_contract.allowance if receipt.surface == "retained_history" else CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        if (
+            contract.schema_version != "composer.preview-hold.v2"
+            or receipt.limit != expected_limit
+            or receipt.observed_at_least != receipt.limit + 1
+        ):
+            raise AuditIntegrityError("preview tail receipt changed its original limit or complete-return branch")
+        if receipt.original_result is not None:
+            reference = receipt.original_result
+            if reference.codec != "composer.preview-observation.v1":
+                raise AuditIntegrityError("preview tail retained another original result codec")
+            original = read_chunk(
+                conn, session_id=session_id, operation_id=operation_id, key=f"value:{reference.codec}:{reference.digest}"
+            ).decode("utf-8", errors="strict")
+            data = decode_preview_data(PrivateChunk(reference, original), expected_source=source, env_ref_names=env_ref_names)
+            original_result = decode_tool_result_value(data.result, env_ref_names=env_ref_names)
+            tolerant = ValidationResult.model_validate_json(data.tolerant_json, strict=True) if data.tolerant_json is not None else None
+            if _returned_hash(source, original_result, tolerant) != receipt.returned_sha256:
+                raise AuditIntegrityError("preview tail retained original differs from its returned-result fingerprint")
     if (
         receipt.source != source
         or canonical_json(receipt.model_dump(mode="json")) != encoded
@@ -1066,7 +1342,10 @@ def read_preview_validation_incomplete_on_connection(
             http_status=422,
             failure_code="operation_failed",
             error_type="validation_incomplete",
-            body={"error_type": "validation_incomplete", "reason": "oversized_preview_result"},
+            body={
+                "error_type": "validation_incomplete",
+                "reason": "preview_tail_capacity_exceeded" if type(receipt) is PreviewTailIncompleteReceipt else "oversized_preview_result",
+            },
             diagnostic_id=contract.diagnostic_id,
         )
     )

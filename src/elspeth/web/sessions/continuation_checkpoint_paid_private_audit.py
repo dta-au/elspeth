@@ -79,6 +79,10 @@ def admit_checkpoint_paid_audit_source_on_connection(
     names: frozenset[str],
 ) -> AdmittedCheckpointAuditSource:
     """Bind one deep current H and original call before any consequence writes."""
+    from elspeth.web.sessions.continuation_checkpoint_early_return import (
+        VerifiedEarlyCompleteReturn,
+        read_early_complete_return_on_connection,
+    )
     from elspeth.web.sessions.continuation_checkpoint_end_owed import VerifiedCheckpointEndOwed, read_v4_checkpoint_end_owed_on_connection
     from elspeth.web.sessions.service import SessionServiceImpl
 
@@ -86,7 +90,8 @@ def admit_checkpoint_paid_audit_source_on_connection(
         type(service) is not SessionServiceImpl
         or type(context) is not SessionOperationContext
         or context.operation_kind is not SessionOperationKind.COMPOSE
-        or type(owed) is not VerifiedCheckpointEndOwed
+        or not isinstance(owed, (VerifiedCheckpointEndOwed, VerifiedEarlyCompleteReturn))
+        or type(owed) not in (VerifiedCheckpointEndOwed, VerifiedEarlyCompleteReturn)
         or type(call) is not ComposerLLMCall
         or type(cohort) is not CheckpointPaidAuditCohort
         or type(names) is not frozenset
@@ -96,13 +101,23 @@ def admit_checkpoint_paid_audit_source_on_connection(
         raise AuditIntegrityError("checkpoint paid audit lacks its actual current and original owners")
     service._assert_session_write_lock_held(conn, owed.session_id, caller="checkpoint_paid_audit_admission")
     service._require_session_write_authority_on_connection(conn, context, session_id=owed.session_id)
-    fresh = read_v4_checkpoint_end_owed_on_connection(
-        conn,
-        session_id=owed.session_id,
-        operation_id=owed.operation_id,
-        attempt_id=owed.attempt_id,
-        names=names,
-    )
+    fresh: VerifiedCheckpointEndOwed | VerifiedEarlyCompleteReturn | None
+    if isinstance(owed, VerifiedEarlyCompleteReturn):
+        fresh = read_early_complete_return_on_connection(
+            conn,
+            session_id=owed.session_id,
+            operation_id=owed.operation_id,
+            selected=owed.selected,
+            names=names,
+        )
+    else:
+        fresh = read_v4_checkpoint_end_owed_on_connection(
+            conn,
+            session_id=owed.session_id,
+            operation_id=owed.operation_id,
+            attempt_id=owed.attempt_id,
+            names=names,
+        )
     if (
         fresh != owed
         or decode_retained_physical_audit_call(owed.response) != call

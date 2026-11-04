@@ -6,7 +6,7 @@ import asyncio
 import errno
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
@@ -90,6 +90,47 @@ def worker_lost_error(*, request_id: str | None) -> ComposerOperationError:
             "request_id": request_id,
         },
         diagnostic_id=None,
+    )
+
+
+def project_convergence_failure_data(
+    *,
+    max_turns: int,
+    budget_exhausted: Literal["composition", "discovery", "timeout"],
+    request_id: str | None,
+    diagnostic_id: str | None,
+) -> ComposerOperationError:
+    """Project only closed convergence facts, including on cold DATA readback."""
+    budget_value: object = budget_exhausted
+    if (
+        type(max_turns) is not int
+        or max_turns < 0
+        or type(budget_value) is not str
+        or budget_value not in ("composition", "discovery", "timeout")
+    ):
+        return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
+    from elspeth.web.composer.progress import convergence_progress_event
+
+    progress = convergence_progress_event(budget_exhausted=budget_exhausted)
+    cause = (
+        "The request ran out of time before the turn could be completed."
+        if budget_exhausted == "timeout"
+        else "The LLM kept making tool calls without producing a final response."
+    )
+    convergence_detail = f"Composer did not converge within {max_turns} turns (budget exhausted: {budget_exhausted}). {cause}"
+    return _http_error(
+        422,
+        {
+            "detail": {
+                "error_type": "convergence",
+                "detail": convergence_detail,
+                "turns_used": max_turns,
+                "budget_exhausted": budget_exhausted,
+                "reason": progress.reason,
+                "recovery_text": progress.likely_next,
+            }
+        },
+        "convergence",
     )
 
 
@@ -342,41 +383,11 @@ def project_composer_operation_error(
             "secret_decryption_failed",
         )
     if type(leaf) is ComposerConvergenceError:
-        budget_value: object = leaf.budget_exhausted
-        if (
-            type(leaf.max_turns) is not int
-            or leaf.max_turns < 0
-            or type(budget_value) is not str
-            or budget_value
-            not in (
-                "composition",
-                "discovery",
-                "timeout",
-            )
-        ):
-            return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
-        from elspeth.web.composer.progress import convergence_progress_event
-
-        progress = convergence_progress_event(budget_exhausted=leaf.budget_exhausted)
-        cause = (
-            "The request ran out of time before the turn could be completed."
-            if leaf.budget_exhausted == "timeout"
-            else "The LLM kept making tool calls without producing a final response."
-        )
-        convergence_detail = f"Composer did not converge within {leaf.max_turns} turns (budget exhausted: {leaf.budget_exhausted}). {cause}"
-        return _http_error(
-            422,
-            {
-                "detail": {
-                    "error_type": "convergence",
-                    "detail": convergence_detail,
-                    "turns_used": leaf.max_turns,
-                    "budget_exhausted": leaf.budget_exhausted,
-                    "reason": progress.reason,
-                    "recovery_text": progress.likely_next,
-                }
-            },
-            "convergence",
+        return project_convergence_failure_data(
+            max_turns=leaf.max_turns,
+            budget_exhausted=leaf.budget_exhausted,
+            request_id=request_id,
+            diagnostic_id=diagnostic_id,
         )
     if type(leaf) is ComposerPluginCrashError:
         return _http_error(

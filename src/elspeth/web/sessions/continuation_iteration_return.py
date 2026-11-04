@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     )
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from elspeth.web.sessions.continuation_checkpoint_early_return import EarlyCheckpointChildCommitted
     from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result
 
 type IterationStoredStage = Literal[
@@ -84,7 +85,7 @@ type IterationStoredStage = Literal[
     "reply_refusal_dispatched",
     "returned",
 ]
-type IterationStage = IterationStoredStage | Literal["publication_ready"]
+type IterationStage = IterationStoredStage | Literal["publication_ready", "early_retry_ready"]
 
 
 class _StageRecord(BaseModel):
@@ -400,6 +401,24 @@ def _stage_source_record(
         ).one_or_none()
         if event is None:
             return None
+        if event.tag == "checkpoint":
+            from elspeth.contracts.json_parser import parse_json_strict
+
+            text = read_chunk(conn, session_id=sid, operation_id=operation, key=event.payload_chunk_key).decode("utf-8", errors="strict")
+            payload, error = parse_json_strict(text)
+            if error is not None or type(payload) is not dict:
+                raise AuditIntegrityError("EARLY child bridge lost its closed checkpoint event")
+            if payload.get("owner") == "composer_checkpoint_early_child":
+                from elspeth.web.sessions.continuation_checkpoint_early_return import read_original_early_child_source_on_connection
+
+                if crossed:
+                    raise AuditIntegrityError("EARLY paid child cannot become an unpaid handoff source")
+                child = read_original_early_child_source_on_connection(conn, session_id=sid, operation_id=operation, selected=selected)
+                original = child.original_stage
+                found = _stage_record(conn, original, sid, operation)
+                if found is None or found[0].stage != "early_dispatched":
+                    raise AuditIntegrityError("EARLY complete child lost its exact original dispatched source")
+                return found[0], found[1], original
         if event.tag == "response_retained":
             from elspeth.contracts.json_parser import parse_json_strict
             from elspeth.web.sessions.continuation_classifier_primary import read_original_classifier_primary_on_connection
@@ -866,6 +885,24 @@ def read_iteration_stage_data_on_connection(
     expected = {(item.effect_id, item.disposition, item.receipt_id) for item in root.effect_frontier}
     if actual != expected:
         raise AuditIntegrityError("iteration stage lost its complete physical effects inventory")
+    from elspeth.web.sessions.continuation_checkpoint_early_retry import read_early_format_retry_on_connection
+
+    retry = read_early_format_retry_on_connection(conn, session_id=sid, operation_id=operation, selected=current)
+    if retry is not None:
+        early_record = _stage_record(conn, retry.child.original_stage, sid, operation)
+        if early_record is None or early_record[0].stage != "early_dispatched":
+            raise AuditIntegrityError("EARLY retry allowance lost its original dispatched stage")
+        _prove_record(conn, retry.child.original_stage, early_record[0], early_record[1])
+        return IterationStageData(
+            "early_retry_ready",
+            current,
+            _historical(conn, sid, operation, checkpoint_id=early_record[0].source_checkpoint_id),
+            main,
+            retry.marker.outer_effect_key,
+            True,
+            early_record[0].creator_sequence,
+            early_record[0].creator_generation,
+        )
     value = _stage_source_record(conn, current, sid, operation)
     if value is None:
         existing = conn.execute(
@@ -1495,6 +1532,82 @@ def retain_iteration_early_completed(
             }
         )
         return _retain(conn, running, selected, inventory, record, captured)
+
+
+def retain_iteration_early_paid_completed_on_connection(
+    conn: Connection,
+    *,
+    running: ComposerOperationRunning,
+    selected: StoredContinuationSnapshot,
+    inventory: CurrentContinuationEnvInventory,
+    captured: CapturedContinuationRuntime,
+    original_stage: StoredContinuationSnapshot,
+    completion_proof: EarlyCheckpointChildCommitted,
+) -> StoredContinuationSnapshot:
+    """Finish the exact complete C as K/R in its original settlement transaction."""
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+    from elspeth.web.sessions.continuation_checkpoint_early_retry import retain_early_format_retry_on_connection
+    from elspeth.web.sessions.continuation_checkpoint_early_return import (
+        EarlyCheckpointChildCommitted,
+        read_original_early_child_source_on_connection,
+    )
+    from elspeth.web.sessions.continuation_selection import load_private_chunks
+
+    if (
+        not conn.in_transaction()
+        or type(completion_proof) is not EarlyCheckpointChildCommitted
+        or type(captured) is not CapturedContinuationRuntime
+        or completion_proof.captured is not captured
+        or completion_proof.selected != selected
+        or completion_proof.original_stage != original_stage
+    ):
+        raise AuditIntegrityError("EARLY paid completion lost its original complete child projection")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    _require_current_continuation_running(conn, running)
+    if load_snapshot(conn, session_id=sid, operation_id=operation) != selected:
+        raise AuditIntegrityError("EARLY paid completion changed its actual current child head")
+    child = read_original_early_child_source_on_connection(conn, session_id=sid, operation_id=operation, selected=selected)
+    root = decode_continuation_snapshot(selected.payload_json)
+    if (
+        child.original_stage != original_stage
+        or child.owed != completion_proof.owed
+        or child.response != completion_proof.response
+        or child.retry_pending != completion_proof.retry_pending
+        or child.accounting != completion_proof.accounting
+        or child.names != inventory.names
+        or root.frames != captured.stack.frames
+        or root.pending_settlement_ids
+        or root.pending_owner_results
+    ):
+        raise AuditIntegrityError("EARLY paid completion changed its cold-reproved original consequence")
+    if child.retry_pending:
+        return retain_early_format_retry_on_connection(
+            conn,
+            running=running,
+            selected=selected,
+            inventory=inventory,
+            completion_proof=completion_proof,
+        )
+    previous = _stage_record(conn, original_stage, sid, operation)
+    if previous is None or previous[0].stage != "early_dispatched":
+        raise AuditIntegrityError("EARLY paid completion lost its original dispatched outer stage")
+    _prove_record(conn, original_stage, previous[0], previous[1])
+    current = SelectedContinuationState(
+        selected.checkpoint_id,
+        root,
+        load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root),
+    )
+    compose, batch = applied_batch_cut(root.frames)
+    record = previous[0].model_copy(
+        update={
+            "before_checkpoint_id": selected.checkpoint_id,
+            "before_cursor": selected.cursor,
+            "stage": "classify_ready",
+            "compose": compose,
+            "batch": batch,
+        }
+    )
+    return _retain(conn, running, current, inventory, record, captured)
 
 
 def retain_iteration_pending_end(

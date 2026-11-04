@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import sys
 from dataclasses import dataclass, replace
 from datetime import datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NoReturn
 from uuid import UUID, uuid4
 from weakref import ReferenceType, WeakKeyDictionary, ref
 
@@ -18,11 +19,11 @@ from elspeth.contracts.composer_audit import PrivateFailureFacts
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.async_workers import run_required_sql_finish_once
-from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts, private_operation_failure_draft
 from elspeth.web.composer.continuation import ContinuationValue
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
+from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence, diagnostic_evidence_identity
 from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
@@ -35,7 +36,8 @@ from elspeth.web.coordination.composer_operation_authority import (
 from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource, RequiredWorkSubphase
-from elspeth.web.sessions.composer_operation_errors import operation_failure_diagnostic_id, project_composer_operation_error
+from elspeth.web.sessions._persist_payload import AuditMessageDraft
+from elspeth.web.sessions.composer_operation_errors import operation_failure_diagnostic_id
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRecord, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     StoredContinuationSnapshot,
@@ -81,6 +83,7 @@ class _NativeFailure:
     work_identity: int
     lease_identity: int
     clock_identity: int
+    sql_clock_identity: int
     selected_identity: int
     snapshot_json: str
     private_chunks: tuple[tuple[str, str, str], ...]
@@ -107,6 +110,7 @@ def observe_classifier_prephysical_failure(
     issuer.require_original_prephysical_failure(original)
     running = phases.work.running
     clock = phases.action_clock
+    timing = phases.work.coordinator.sql_deadline_owner
     if (
         running is None
         or clock is None
@@ -119,8 +123,12 @@ def observe_classifier_prephysical_failure(
         or runtime.materialization.inventory is not issuer.inventory
         or type(runtime.source.policy) is not ContinuationAdmissionPolicyV4
         or phases.classifier_prephysical_failure is not None
+        or timing is None
+        or timing.running is not running
+        or original.failed_turn != runtime.live.failed_turn
     ):
         raise AuditIntegrityError("classifier failure changed its original invocation owners")
+    timing.require_action_clock(clock)
     marker = ClassifierPrephysicalFailure()
     selected = runtime.source.selected
     _NATIVE[marker] = _NativeFailure(
@@ -133,6 +141,7 @@ def observe_classifier_prephysical_failure(
         id(phases.work),
         id(phases.lease),
         id(clock),
+        id(timing),
         id(selected),
         encode_continuation_snapshot(selected.stack),
         tuple((part.reference.codec, part.reference.digest, part.canonical) for part in selected.chunks),
@@ -164,6 +173,7 @@ def _require_native(
         raise AuditIntegrityError("classifier failure requires its original issued custody")
     original, issuer = saved.original(), saved.issuer()
     runtime, clock = phases.runtime, phases.action_clock
+    timing = work.coordinator.sql_deadline_owner
     if (
         original is None
         or issuer is None
@@ -187,8 +197,10 @@ def _require_native(
         or issuer.work is not work
         or issuer.clock is not clock
         or phases.lease.context is not running.session_operation_context
-        or phases.cancellation_requested.is_set()
         or phases.lease.closed
+        or timing is None
+        or id(timing) != saved.sql_clock_identity
+        or timing.running is not running
         or clock.started_monotonic != saved.clock_started
         or canonical_json(clock.policy.model_dump(mode="json")) != saved.clock_policy_json
         or encode_continuation_snapshot(runtime.source.selected.stack) != saved.snapshot_json
@@ -197,8 +209,12 @@ def _require_native(
         or capture_failure_facts(original) != saved.facts
         or original.max_turns != saved.max_turns
         or canonical_json(runtime.live.state.to_dict()) != saved.state_json
+        or original.failed_turn != runtime.live.failed_turn
+        or (None if original.partial_state is None else canonical_json(original.partial_state.to_dict()))
+        != (saved.state_json if runtime.live.state.version > saved.initial_version else None)
     ):
         raise AuditIntegrityError("classifier failure substituted its original source, actor or native outcome")
+    timing.require_action_clock(clock)
     issuer.require_original_prephysical_failure(original)
     return saved, original
 
@@ -218,6 +234,12 @@ def _require_joined_body(work: RequiredWorkBinding, original: ComposerConvergenc
             continue
         with coordinator._lock, ticket._lock:
             actual = ticket._finish_once_handoff
+            if ticket._submission_unknown:
+                raise AuditIntegrityError("classifier failure cannot close an unknown SQL submission")
+            if actual is None and ticket._complete and ticket._no_submission and ticket._future is None and not ticket._submission_unknown:
+                coordinator._registered(ticket, ticket.key.source)
+                # A registered, completed no-submission branch owns no SQL.
+                continue
             if not isinstance(actual, (RequiredSQLRaised, RequiredSQLReturned)) or type(actual) not in (
                 RequiredSQLRaised,
                 RequiredSQLReturned,
@@ -266,6 +288,7 @@ class VerifiedClassifierPrephysicalTerminal:
     original_source: StoredContinuationSnapshot
     effect_key: str
     private_message_id: UUID
+    descriptor_json: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +296,7 @@ class CommittedClassifierPrephysicalFailure:
     verified: VerifiedClassifierPrephysicalTerminal
     original: ComposerConvergenceError
     deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
+    original_errors: tuple[BaseException, ...] = ()
 
     @property
     def terminal(self) -> ComposerOperationRecord:
@@ -285,42 +309,52 @@ def _key(operation_id: str) -> str:
 
 def _recovery_outcome(
     conn: Connection,
-    service: SessionServiceImpl,
     source: ClassifierPrephysicalSource,
-    original: ComposerConvergenceError,
+    *,
+    max_turns: int,
     state_json: str,
     initial_version: int,
     request_id: str | None,
+    diagnostic_id: str | None,
 ) -> ComposerOperationError:
+    """Reconstruct failed response DATA from the original durable source only."""
     from elspeth.web.composer.continuation_evidence import state_from_evidence_json
+    from elspeth.web.composer.continuation_iteration import decode_continuation_iteration, iteration_values
+    from elspeth.web.sessions.composer_operation_errors import project_convergence_failure_data
     from elspeth.web.sessions.routes._helpers import _state_from_record, _state_response
+    from elspeth.web.sessions.state_decoder import state_record_from_row
 
-    failure = project_composer_operation_error(
-        original,
-        request_id=request_id,
-        diagnostic_id=operation_failure_diagnostic_id(
-            session_id=str(source.selected.stack.logical.session_id), operation_id=source.selected.stack.logical.operation_id
-        ),
+    compose, _batch = applied_batch_cut(source.selected.stack.frames)
+    state_chunk = next(part for part in source.selected.chunks if part.reference == compose.state)
+    expected_state = state_from_evidence_json(state_chunk.canonical)
+    if initial_version != compose.initial_version or canonical_json(expected_state.to_dict()) != state_json:
+        raise AuditIntegrityError("classifier failure changed its original captured recovery state")
+    if max_turns != compose.composition_slice + compose.discovery_slice + 1:
+        raise AuditIntegrityError("classifier failure changed its original charged turn count")
+    failure = project_convergence_failure_data(
+        max_turns=max_turns, budget_exhausted="timeout", request_id=request_id, diagnostic_id=diagnostic_id
     )
     detail = failure.body.get("detail")
     if failure.error_type != "convergence" or type(detail) is not dict:
         raise AuditIntegrityError("classifier failure has no nominal convergence projection")
     public: dict[str, JsonValue] = dict(detail)
-    compose, _batch = applied_batch_cut(source.selected.stack.frames)
-    head = conn.execute(
-        select(states).where(states.c.session_id == source.selected.stack.logical.session_id).order_by(states.c.version.desc()).limit(1)
-    ).one_or_none()
     if compose.current_state_id is not None:
-        if head is None or head.id != compose.current_state_id:
-            raise AuditIntegrityError("classifier recovery lost its actual durable head")
-        record = service._row_to_state_record(head)
+        row = conn.execute(
+            select(states).where(states.c.session_id == source.selected.stack.logical.session_id, states.c.id == compose.current_state_id)
+        ).one_or_none()
+        if row is None:
+            raise AuditIntegrityError("classifier recovery lost its original durable state")
+        record = state_record_from_row(row)
         if canonical_json(_state_from_record(record).to_dict()) != state_json:
             raise AuditIntegrityError("classifier recovery state differs from its actual captured graph")
         if record.version > initial_version:
             public["partial_state"] = _state_response(record).model_dump(mode="json")
-    elif head is not None or state_from_evidence_json(state_json).version > initial_version:
+    elif expected_state.version > initial_version:
         raise AuditIntegrityError("classifier recovery claimed an absent durable state")
-    failed = original.failed_turn
+    iteration = next(part for part in source.selected.chunks if part.reference == compose.iteration)
+    failed = iteration_values(
+        decode_continuation_iteration(iteration, env_ref_names=source.env_ref_names), env_ref_names=source.env_ref_names
+    ).failed_turn
     if failed is not None:
         assistant = conn.execute(
             select(messages).where(
@@ -340,7 +374,7 @@ def _recovery_outcome(
                 select(messages).where(
                     messages.c.session_id == source.selected.stack.logical.session_id,
                     messages.c.role == "tool",
-                    messages.c.parent_message_id == assistant.id,
+                    messages.c.parent_assistant_id == assistant.id,
                 )
             )
         )
@@ -357,6 +391,46 @@ def _recovery_outcome(
     return failure.model_copy(update={"body": {"detail": public}})
 
 
+def _failure_draft(record: _Descriptor, *, request_id: str | None) -> AuditMessageDraft:
+    """Bind original facts and invocation DATA in the existing private envelope."""
+    correlation = "operation:" + record.operation_id
+    evidence = build_private_tool_evidence(
+        session_id=str(record.session_id),
+        operation_id=record.physical_operation_id,
+        operation_epoch=record.physical_operation_epoch,
+        evidence_id=diagnostic_evidence_identity("operation-failure", correlation),
+        tool_call_id=correlation,
+        tool_name="composer_failure",
+        status="operation_failure",
+        arguments_canonical=canonical_json(
+            {
+                "durable_operation_id": record.operation_id,
+                "request_id": request_id,
+                "diagnostic_id": record.outcome.diagnostic_id,
+                "failure_code": record.outcome.failure_code,
+                "correlation_kind": "internal_operation",
+                "classifier_prephysical": {
+                    "source_checkpoint_id": record.source_checkpoint_id,
+                    "source_sha256": record.source_sha256,
+                    "effect_key": record.effect_key,
+                    "max_turns": record.max_turns,
+                    "clock_policy_json": record.clock_policy_json,
+                    "clock_started": record.clock_started,
+                    "state_sha256": sha256(record.state_json.encode()).hexdigest(),
+                    "initial_version": record.initial_version,
+                },
+            }
+        ),
+        result_canonical=PrivateFailureFacts(record.private_facts).canonical,
+    )
+    return AuditMessageDraft(
+        role="audit",
+        content="Private credential-filtered operation failure facts",
+        tool_calls=(evidence.to_envelope(),),
+        inherit_composition_state=False,
+    )
+
+
 def read_classifier_prephysical_terminal_on_connection(
     conn: Connection, *, session_id: UUID, operation_id: str
 ) -> VerifiedClassifierPrephysicalTerminal | None:
@@ -368,7 +442,7 @@ def read_classifier_prephysical_terminal_on_connection(
     ).one_or_none()
     if row is None:
         return None
-    raw = row.payload.decode("utf-8", errors="strict")
+    raw = read_chunk(conn, session_id=str(session_id), operation_id=operation_id, key=_key(operation_id)).decode("utf-8", errors="strict")
     record = _Descriptor.model_validate_json(raw, strict=True)
     if (
         row.codec != record.schema_version
@@ -407,14 +481,46 @@ def read_classifier_prephysical_terminal_on_connection(
     if parent is None:
         raise AuditIntegrityError("classifier failure lost its failed parent")
     terminal = _record_from_row(parent)
+    from elspeth.web.composer.continuation_policy import decode_continuation_policy
+
+    policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+    if (
+        type(policy) is not ContinuationAdmissionPolicyV4
+        or record.clock_policy_json != canonical_json(policy.actions.primary.model_dump(mode="json"))
+        or not math.isfinite(record.clock_started)
+    ):
+        raise AuditIntegrityError("classifier failure changed its original action policy")
+    projected = _recovery_outcome(
+        conn,
+        source,
+        max_turns=record.max_turns,
+        state_json=record.state_json,
+        initial_version=record.initial_version,
+        request_id=parent.request_id,
+        diagnostic_id=operation_failure_diagnostic_id(session_id=str(session_id), operation_id=operation_id),
+    )
+    if _select_failure_on_connection(parent, projected, authoritative_failure=False) != record.outcome:
+        raise AuditIntegrityError("classifier failure changed its original semantic projection")
+    draft = _failure_draft(record, request_id=parent.request_id)
+    if record.audit_content != draft.content or record.audit_json != canonical_json(draft.tool_calls):
+        raise AuditIntegrityError("classifier failure changed its original private facts or observation")
     current = load_snapshot(conn, session_id=str(session_id), operation_id=operation_id)
     if (
         terminal.status != "failed"
         or terminal.result_json != canonical_json(record.outcome.model_dump(mode="json"))
         or terminal.failure_code != record.outcome.failure_code
+        or parent.result_sha256 != sha256(canonical_json(record.outcome.model_dump(mode="json")).encode()).hexdigest()
         or (current.checkpoint_id, current.cursor, current.payload_json)
         != (record.terminal_checkpoint_id, record.terminal_cursor, record.terminal_snapshot_json)
         or (terminal.checkpoint_id, terminal.journal_cursor) != (current.checkpoint_id, current.cursor)
+        or (
+            terminal.current_segment_sequence,
+            terminal.ownership_generation,
+            terminal.attempt,
+            terminal.session_operation_id,
+            terminal.session_operation_epoch,
+        )
+        != (record.sequence, record.generation, record.claim_attempt, record.physical_operation_id, record.physical_operation_epoch)
     ):
         raise AuditIntegrityError("classifier failure changed its complete terminal identity")
     before, after = selected.stack, decode_continuation_snapshot(current.payload_json)
@@ -436,7 +542,22 @@ def read_classifier_prephysical_terminal_on_connection(
         observed_events.append(
             (item.tag, read_chunk(conn, session_id=str(session_id), operation_id=operation_id, key=item.payload_chunk_key).decode())
         )
-    if tuple(observed_events) != record.terminal_events or tuple(tag for tag, _payload in observed_events) != ("effect_unknown", "settled"):
+    expected_events = (
+        ("effect_unknown", canonical_json({"version": 1, "effect_key": record.effect_key})),
+        (
+            "settled",
+            canonical_json(
+                {
+                    "version": 1,
+                    "sequence": record.sequence,
+                    "generation": record.generation,
+                    "status": "failed",
+                    "failure_code": record.outcome.failure_code,
+                }
+            ),
+        ),
+    )
+    if tuple(observed_events) != record.terminal_events or record.terminal_events != expected_events:
         raise AuditIntegrityError("classifier failure changed its original terminal journal")
     message = conn.execute(
         select(messages).where(messages.c.session_id == str(session_id), messages.c.id == str(record.message_id))
@@ -446,6 +567,9 @@ def read_classifier_prephysical_terminal_on_connection(
         or message.role != "audit"
         or message.writer_principal != "compose_loop"
         or message.content != record.audit_content
+        or message.tool_call_id is not None
+        or message.parent_assistant_id is not None
+        or message.composition_state_id is not None
         or canonical_json(message.tool_calls) != record.audit_json
         or restore_utc(message.created_at) != restore_utc(record.published_at)
     ):
@@ -453,8 +577,37 @@ def read_classifier_prephysical_terminal_on_connection(
     if terminal.settled_at is None or restore_utc(terminal.settled_at) != restore_utc(record.published_at):
         raise AuditIntegrityError("classifier failure changed its committed publication time")
     return VerifiedClassifierPrephysicalTerminal(
-        terminal, StoredContinuationSnapshot(source_json, before.cursor, selected.checkpoint_id), source.effect_key, record.message_id
+        terminal, StoredContinuationSnapshot(source_json, before.cursor, selected.checkpoint_id), source.effect_key, record.message_id, raw
     )
+
+
+def _require_candidate(verified: VerifiedClassifierPrephysicalTerminal, candidate: _Descriptor) -> None:
+    if type(verified) is not VerifiedClassifierPrephysicalTerminal or verified.descriptor_json != canonical_json(
+        candidate.model_dump(mode="json")
+    ):
+        raise AuditIntegrityError("classifier failure readback belongs to another prepared terminal candidate")
+
+
+def _originals(*errors: BaseException) -> tuple[BaseException, ...]:
+    result: list[BaseException] = []
+
+    def append(error: BaseException) -> None:
+        if isinstance(error, BaseExceptionGroup):
+            for child in error.exceptions:
+                append(child)
+        elif all(error is not previous for previous in result):
+            result.append(error)
+
+    for error in errors:
+        append(error)
+    return tuple(result)
+
+
+def _raise_originals(*errors: BaseException) -> NoReturn:
+    originals = _originals(*errors)
+    if len(originals) == 1:
+        raise originals[0]
+    raise BaseExceptionGroup("classifier original required outcomes", list(originals))
 
 
 async def fail_classifier_prephysical_operation(
@@ -471,8 +624,12 @@ async def fail_classifier_prephysical_operation(
     saved, original = _require_native(custody, phases, running, work)
     _require_joined_body(work, original)
     timing = work.coordinator.sql_deadline_owner
-    if timing is None or timing.running is not running or timing.drain_signal.started_at is not None:
+    if timing is None or timing.running is not running:
         raise AuditIntegrityError("classifier failure lost its original bounded settlement owner")
+    if timing.drain_signal.started_at is not None:
+        from elspeth.web.sessions.composer_operations import COMPOSER_SHUTDOWN
+
+        raise asyncio.CancelledError(COMPOSER_SHUTDOWN)
     timing.begin_settlement()
     candidate: _Descriptor | None = None
 
@@ -480,6 +637,10 @@ async def fail_classifier_prephysical_operation(
         nonlocal candidate
         with locked_session_transaction(service._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
             _require_native(custody, phases, running, work)
+            if timing.drain_signal.started_at is not None:
+                from elspeth.web.sessions.composer_operations import COMPOSER_SHUTDOWN
+
+                raise asyncio.CancelledError(COMPOSER_SHUTDOWN)
             _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
             current = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
             runtime = phases.runtime
@@ -509,7 +670,25 @@ async def fail_classifier_prephysical_operation(
             parent = _read(conn, running.claim.session_id, running.claim.operation_id)
             if parent is None:
                 raise AuditIntegrityError("classifier failure lost its original parent")
-            failure = _recovery_outcome(conn, service, source, original, saved.state_json, saved.initial_version, parent.request_id)
+            if phases.cancellation_requested.is_set() and parent.cancel_requested_at is None:
+                raise AuditIntegrityError("classifier failure cannot consume an undelivered cancellation")
+            compose, _batch = applied_batch_cut(source.selected.stack.frames)
+            head_id = conn.execute(
+                select(states.c.id).where(states.c.session_id == str(running.claim.session_id)).order_by(states.c.version.desc()).limit(1)
+            ).scalar_one_or_none()
+            if head_id != compose.current_state_id:
+                raise AuditIntegrityError("classifier failure changed its actual durable recovery head")
+            failure = _recovery_outcome(
+                conn,
+                source,
+                max_turns=saved.max_turns,
+                state_json=saved.state_json,
+                initial_version=saved.initial_version,
+                request_id=parent.request_id,
+                diagnostic_id=operation_failure_diagnostic_id(
+                    session_id=str(running.claim.session_id), operation_id=running.claim.operation_id
+                ),
+            )
             failure = _select_failure_on_connection(parent, failure, authoritative_failure=False)
             segment = conn.execute(
                 select(segments).where(
@@ -537,12 +716,6 @@ async def fail_classifier_prephysical_operation(
                 settled_by="owner_terminal",
                 attempt_outcome="settled",
             )
-            draft = private_operation_failure_draft(
-                ComposerOperationFailureFacts(
-                    running.claim.operation_id, parent.request_id, running.session_operation_context, saved.facts
-                ),
-                failure=failure,
-            )
             candidate = _Descriptor(
                 session_id=running.claim.session_id,
                 operation_id=running.claim.operation_id,
@@ -564,14 +737,16 @@ async def fail_classifier_prephysical_operation(
                 initial_version=saved.initial_version,
                 outcome=failure,
                 message_id=uuid4(),
-                audit_json=canonical_json(draft.tool_calls),
-                audit_content=draft.content,
+                audit_json="",
+                audit_content="",
                 terminal_checkpoint_id=prepared.append.checkpoint_id,
                 terminal_cursor=current.cursor + len(prepared.append.events),
                 terminal_snapshot_json=prepared.append.snapshot_json,
                 terminal_events=tuple((event.tag, event.payload_json) for event in prepared.append.events),
                 published_at=prepared.published_at,
             )
+            draft = _failure_draft(candidate, request_id=parent.request_id)
+            candidate = candidate.model_copy(update={"audit_json": canonical_json(draft.tool_calls), "audit_content": draft.content})
             encoded = canonical_json(candidate.model_dump(mode="json"))
             require_no_credential_material(
                 encoded, surface="classifier_prephysical_failure", env_ref_names=source.env_ref_names, max_string_bytes=1_048_576
@@ -604,15 +779,24 @@ async def fail_classifier_prephysical_operation(
             )
             if verified is None or verified.terminal != terminal:
                 raise AuditIntegrityError("classifier failure writer lost its exact terminal bundle")
+            _require_candidate(verified, candidate)
         return verified
 
     sql = work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)
-    outcome = await run_required_sql_finish_once(sql, write)
-    work.coordinator.validate_terminal_failure_sql_outcome(ticket=sql, actual_outcome=outcome, expected_sql_attempt_ordinal=0)
+    try:
+        outcome = await run_required_sql_finish_once(sql, write)
+        work.coordinator.validate_terminal_failure_sql_outcome(ticket=sql, actual_outcome=outcome, expected_sql_attempt_ordinal=0)
+    except BaseException as failure:
+        _raise_originals(original, failure)
     if type(outcome) is RequiredSQLReturned:
+        if candidate is None:
+            raise AuditIntegrityError("classifier failure returned without its original prepared candidate")
+        _require_candidate(outcome.value, candidate)
         return CommittedClassifierPrephysicalFailure(outcome.value, original, outcome.deferred_cancellations)
     if type(outcome) is not RequiredSQLRaised:
         raise AuditIntegrityError("classifier failed terminal lost its original SQL handoff")
+    errors: list[BaseException] = [outcome.error]
+    cancellations = list(outcome.deferred_cancellations)
     if candidate is not None:
 
         def read() -> VerifiedClassifierPrephysicalTerminal | None:
@@ -627,15 +811,31 @@ async def fail_classifier_prephysical_operation(
             transition_ordinal=0,
             semantic_ordinal=0,
         )
-        observed = await run_required_sql_finish_once(read_sql, read)
-        work.coordinator.validate_joined_lifecycle_sql_outcome(
-            ticket=read_sql, expected_source=RequiredWorkSource.TERMINAL_WRITER_READ_SQL, actual_outcome=observed
-        )
-        if type(observed) is RequiredSQLReturned and observed.value is not None:
-            projection.begin_projection()
-            projection.complete_owned()
-            # A real postcommit SQL failure stays native, even after readback.
-            raise BaseExceptionGroup("classifier failed terminal committed with original SQL failure", [original, outcome.error])
-        projection.complete_owned(observed.error if type(observed) is RequiredSQLRaised else outcome.error)
-    failure = ComposerTerminalSQLCompletionUnknown("classifier failed terminal has no exact committed readback")
-    raise failure from BaseExceptionGroup("classifier original and terminal SQL failure", [original, outcome.error])
+        try:
+            observed = await run_required_sql_finish_once(read_sql, read)
+            cancellations.extend(item for item in observed.deferred_cancellations if all(item is not earlier for earlier in cancellations))
+            work.coordinator.validate_joined_lifecycle_sql_outcome(
+                ticket=read_sql, expected_source=RequiredWorkSource.TERMINAL_WRITER_READ_SQL, actual_outcome=observed
+            )
+            if type(observed) is RequiredSQLRaised:
+                errors.append(observed.error)
+                projection.complete_owned(observed.error)
+            elif type(observed) is RequiredSQLReturned:
+                projection.begin_projection()
+                if observed.value is not None:
+                    _require_candidate(observed.value, candidate)
+                    projection.complete_owned()
+                    return CommittedClassifierPrephysicalFailure(observed.value, original, tuple(cancellations), _originals(*errors))
+                projection.complete_owned()
+            else:
+                raise AuditIntegrityError("classifier failure readback lost its original SQL carrier")
+        except BaseException as error:
+            errors.append(error)
+            if not projection.complete:
+                try:
+                    projection.complete_owned(error)
+                except BaseException as cleanup:
+                    errors.append(cleanup)
+    if candidate is not None:
+        errors.append(ComposerTerminalSQLCompletionUnknown("classifier failed terminal has no exact committed readback"))
+    _raise_originals(original, *errors, *cancellations)

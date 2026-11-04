@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from types import CodeType
 
@@ -17,12 +19,19 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web import continuation_retention_memo as memo_module
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
-from elspeth.web.continuation_retention_memo import RetentionStageMemo, current_v4_preparation_memo
+from elspeth.web.continuation_retention_memo import (
+    CanonicalTextEncodingKey,
+    CanonicalTextVerificationKey,
+    RecorderBlockHashKey,
+    retention_stage_memo_scope,
+    v4_preparation_memo_scope,
+)
 from elspeth.web.required_executor import RequiredInvocationWitness
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.service import SessionServiceImpl
-from tests.helpers.continuation_end_profile import EndPreparationProfile
+from tests.helpers.continuation_end_profile import EndPreparationProfile, EndTextMemoObservation
 from tests.helpers.continuation_policy import minimal_continuation_policy
 from tests.unit.web.sessions import test_continuation_checkpoint_end_complete_review as original_review
 
@@ -32,6 +41,7 @@ PROFILE_FLAG = "ELSPETH_TEST_END_PREPARATION_PROFILE"
 PROFILE_PATH = "ELSPETH_TEST_END_PREPARATION_PROFILE_PATH"
 CPU_PROFILE_FLAG = "ELSPETH_TEST_END_PREPARATION_CPROFILE"
 CPU_SELECTION_FLAG = "ELSPETH_TEST_END_PREPARATION_CPROFILE_SELECTION"
+TEXT_MEMO_BUDGET_FLAG = "ELSPETH_TEST_END_PREPARATION_TEXT_MEMO_MIB"
 CPU_MONITOR_EVENTS = (
     sys.monitoring.events.PY_START,
     sys.monitoring.events.PY_RESUME,
@@ -78,26 +88,18 @@ async def test_actual_end_review_preparation_profile(operation_store, tmp_path, 
     assert cpu_mode in {"0", "1"} and (cpu_mode == "0" or mode == "1")
     cpu_selection = os.environ.get(CPU_SELECTION_FLAG, "all_workers")
     profile = EndPreparationProfile(enabled=mode == "1", cpu_profile=cpu_mode == "1", cpu_selection=cpu_selection)
-    parents = {}
-    proof_children = {}
-    original_proof = RetentionStageMemo.canonical_text_proof
-
-    def observe_text_proof(memo, key, producer, digest_producer):
-        parent = current_v4_preparation_memo()
-        proof = original_proof(memo, key, producer, digest_producer)
-        if parent is not None:
-            parents[id(parent)] = parent
-            if memo is not parent:
-                # Keep the immutable proof alive so object-id reuse after an
-                # eviction cannot manufacture a cross-child hit in this probe.
-                entry = proof_children.setdefault(id(proof), (proof, set()))
-                entry[1].add(id(memo))
-        return proof
-
-    if mode == "1":
-        monkeypatch.setattr(RetentionStageMemo, "canonical_text_proof", observe_text_proof)
+    default_budget_mib = memo_module.CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES // 1_048_576
+    budget_mib = os.environ.get(TEXT_MEMO_BUDGET_FLAG, str(default_budget_mib))
+    assert budget_mib in {"1", "5"}
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", int(budget_mib) * 1_048_576)
+    record_property("end_preparation_text_memo_budget_mib", int(budget_mib))
+    profile.text_memo_budget_bytes = int(budget_mib) * 1_048_576
+    profile.text_memo = EndTextMemoObservation() if mode == "1" else None
     try:
-        with profile.install(monkeypatch, operation_store[0]):
+        with (
+            profile.install(monkeypatch, operation_store[0]),
+            profile.text_memo.install(monkeypatch) if profile.text_memo is not None else nullcontext(),
+        ):
             await original_review.test_actual_v4_paid_end_review_retains_blocked_action_without_early_publication(
                 operation_store, tmp_path, monkeypatch
             )
@@ -111,14 +113,80 @@ async def test_actual_end_review_preparation_profile(operation_store, tmp_path, 
         # original production timeout, cancellation or other test exception.
         failure = profile.flush(output)
         record_property("end_profile_write_error", None if failure is None else type(failure).__name__)
-        record_property(
-            "end_preparation_text_parent",
-            {
-                "parents": len(parents),
-                "cross_child_proofs": sum(len(children) > 1 for _proof, children in proof_children.values()),
-                "parents_closed_empty": all(not parent.active and parent.cached_entry_count == 0 for parent in parents.values()),
-            },
-        )
+        record_property("end_preparation_text_memo", None if profile.text_memo is None else profile.text_memo.snapshot())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget_mib", (1, 5))
+async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_ordinary_negative(monkeypatch, budget_mib):
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", budget_mib * 1_048_576)
+    observer = EndTextMemoObservation()
+    calls = []
+    original_error = RuntimeError("original canonical producer failure")
+    first = CanonicalTextVerificationKey("sensitive-observer-control" + "a" * 600_000, 1_048_576)
+    second = CanonicalTextVerificationKey("b" * 600_000, 1_048_576)
+
+    def verify(text):
+        calls.append(len(text))
+
+    def fails(_text):
+        raise original_error
+
+    def encode(key):
+        return key.canonical.encode()
+
+    def block(_key):
+        pass
+
+    with observer.install(monkeypatch):
+        with retention_stage_memo_scope() as ordinary:
+            ordinary.canonical_text_verification(first, verify)
+        assert observer.snapshot()["families"]["canonical"]["requests"] == 0
+        clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+        with v4_preparation_memo_scope(clock) as parent:
+            for key in (first, second, first):
+                parent.canonical_text_verification(key, verify)
+            full_key = CanonicalTextEncodingKey("full", 100)
+            block_key = RecorderBlockHashKey("0" * 64, "block")
+            for _ in range(2):
+                parent.canonical_text_proof(full_key, encode, hashlib.sha256)
+                parent.recorder_block_hash(block_key, block)
+            with pytest.raises(RuntimeError) as raised:
+                parent.canonical_text_verification(CanonicalTextVerificationKey("fails", 100), fails)
+            assert raised.value is original_error
+        parent.canonical_text_verification(first, verify)  # Closed work recomputes without publication.
+    snapshot = observer.snapshot()
+    canonical = snapshot["families"]["canonical"]
+    assert canonical["requests"] == 5 and canonical["errors"] == 1 and canonical["unretained"] == 1
+    assert canonical["hits"] == (0 if budget_mib == 1 else 1)
+    assert canonical["evictions"] == (2 if budget_mib == 1 else 0)
+    assert canonical["recomputations"] == (2 if budget_mib == 1 else 1)
+    assert len(calls) == (5 if budget_mib == 1 else 4)
+    assert all(snapshot["families"][family]["hits"] == 1 for family in ("full", "block"))
+    assert snapshot["parents"] == [{"budget": budget_mib * 1_048_576, "closed_empty": True}]
+    assert snapshot["observer_errors"] == snapshot["overlapping_calls"] == snapshot["budget_violations"] == 0
+    assert snapshot["peak_retained_bytes"] <= budget_mib * 1_048_576 and snapshot["observer_ns"] > 0
+    assert snapshot["observed_key_weight_estimate"] > 1_048_576
+    assert "sensitive-observer-control" not in json.dumps(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_text_memo_observer_censors_working_set_after_fingerprint_capacity(monkeypatch):
+    observer = EndTextMemoObservation(max_fingerprints=1)
+
+    def verify(_text):
+        pass
+
+    with observer.install(monkeypatch):
+        clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+        with v4_preparation_memo_scope(clock) as parent:
+            for text_value in ("first", "second", "first"):
+                parent.canonical_text_verification(CanonicalTextVerificationKey(text_value, 100), verify)
+    snapshot = observer.snapshot()
+    assert snapshot["fingerprints"] == snapshot["fingerprint_capacity"] == 1
+    assert snapshot["fingerprint_drops"] == 2 and snapshot["observed_key_weight_estimate"] is None
+    assert snapshot["families"]["canonical"]["hits"] == 1
+    assert snapshot["observer_errors"] == snapshot["budget_violations"] == 0
 
 
 @pytest.mark.parametrize("enabled", (False, True), ids=("off", "on"))

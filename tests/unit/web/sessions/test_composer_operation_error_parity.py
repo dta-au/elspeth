@@ -26,7 +26,11 @@ from elspeth.web.composer.protocol import (
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.required_executor import RequiredGenerationUnavailable
-from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error, request_cancelled_error
+from elspeth.web.sessions.composer_operation_errors import (
+    project_composer_operation_error,
+    project_convergence_failure_data,
+    request_cancelled_error,
+)
 from elspeth.web.sessions.protocol import StaleComposeStateError
 
 pytest_plugins = ("tests.unit.web.coordination.test_composer_operation_authority",)
@@ -131,6 +135,10 @@ def test_nominal_convergence_projects_only_closed_safe_facts(budget, reason, cau
     original = ComposerConvergenceError(3, budget_exhausted=budget)
     original.args = ("PRIVATE altered exception text",)
     projected = project_composer_operation_error(original, request_id="nominal-request")
+    from_data = project_convergence_failure_data(
+        max_turns=3, budget_exhausted=budget, request_id="nominal-request", diagnostic_id="private-diagnostic"
+    )
+    assert from_data == projected
     assert projected.http_status == 422 and projected.failure_code == "http_error"
     assert projected.error_type == "convergence" and projected.diagnostic_id is None
     assert projected.body == {
@@ -147,6 +155,22 @@ def test_nominal_convergence_projects_only_closed_safe_facts(budget, reason, cau
             }[budget],
         }
     }
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("turns", "budget"),
+    [(-1, "composition"), (True, "composition"), ("3", "composition"), (3, "PRIVATE invalid budget"), (3, object())],
+    ids=["negative-turns", "bool-turns", "string-turns", "foreign-budget", "foreign-object"],
+)
+def test_convergence_data_projection_rejects_malformed_cold_facts(turns: object, budget: object) -> None:
+    projected = project_convergence_failure_data(
+        max_turns=turns,
+        budget_exhausted=budget,
+        request_id="nominal-request",
+        diagnostic_id="11111111-1111-4111-8111-111111111111",
+    )
+    assert projected.failure_code == "operation_failed" and projected.diagnostic_id == "11111111-1111-4111-8111-111111111111"
     assert "PRIVATE" not in projected.model_dump_json()
 
 

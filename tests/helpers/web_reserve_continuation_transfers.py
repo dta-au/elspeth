@@ -4151,7 +4151,6 @@ def closed_source_record_transfers(units):
         ),
         (
             EVIDENCE_GRAPH,
-            SEMANTIC_SOURCE,
             "_finish_current_evidence",
             "RestoredTurnEvidence(owner, messages, recorder, drained, graph.selected, snapshot.application_entry, graph.selected_audit, graph.selected_dialect)",
         ),

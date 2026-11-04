@@ -8,6 +8,7 @@ is admitted before the first tool effect or public row is inserted.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -72,6 +73,13 @@ def _prefix(append: PreparedContinuationAppend, chunks: tuple[PrivateChunk, ...]
     )
 
 
+@dataclass(slots=True)
+class _PreviewTailPlanning:
+    # Observation only: no admission can be gained by this field. The actual
+    # complete-tail scope independently grants and tracks every consumption.
+    consumption_started: bool = False
+
+
 def retain_value_batch_tail_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
@@ -91,13 +99,37 @@ def retain_value_batch_tail_on_connection(
             conn, running, service=service, batch=batch, published_at=published_at, issued_preview=None
         )
     from elspeth.web.composer.continuation_value_batch_preparation import require_prepared_issued_preview_batch
-    from elspeth.web.sessions.continuation_preview_result import preview_returned_credit_scope
+    from elspeth.web.sessions.continuation_preview_result import (
+        CompletePreviewReturn,
+        observe_preview_tail_excess,
+        preview_returned_credit_scope,
+    )
 
     require_prepared_issued_preview_batch(batch, issued_preview)
-    with preview_returned_credit_scope(conn, running, returned=issued_preview.returned, env_ref_names=batch.inventory.names):
-        return _retain_value_batch_tail_on_connection(
-            conn, running, service=service, batch=batch, published_at=published_at, issued_preview=issued_preview
-        )
+    progress = _PreviewTailPlanning()
+    try:
+        with preview_returned_credit_scope(conn, running, returned=issued_preview.returned, env_ref_names=batch.inventory.names):
+            return _retain_value_batch_tail_on_connection(
+                conn,
+                running,
+                service=service,
+                batch=batch,
+                published_at=published_at,
+                issued_preview=issued_preview,
+                preview_progress=progress,
+            )
+    except BaseException as original:
+        transaction = conn.get_transaction()
+        if (
+            not progress.consumption_started
+            and transaction is not None
+            and transaction.is_active
+            and type(issued_preview.returned) is CompletePreviewReturn
+        ):
+            observed = observe_preview_tail_excess(issued_preview.returned, original)
+            if observed is not None:
+                raise observed from original
+        raise
 
 
 def _retain_value_batch_tail_on_connection(
@@ -108,6 +140,7 @@ def _retain_value_batch_tail_on_connection(
     batch: PreparedValueBatch,
     published_at: datetime,
     issued_preview: RequiredPreviewProduced | None,
+    preview_progress: _PreviewTailPlanning | None = None,
 ) -> StoredP4Application:
     from elspeth.web.composer.continuation_value_batch_preparation import require_prepared_value_batch
 
@@ -198,6 +231,8 @@ def _retain_value_batch_tail_on_connection(
         _prefix(application.append, application.chunks),
     )
     with admit_prepared_complete_tail_on_connection(conn, original=original, prefixes=prefixes):
+        if preview_progress is not None:
+            preview_progress.consumption_started = True
         consume_value_batch_transitions_on_connection(conn, running, plan=transitions, env_ref_names=names, issued_preview=issued_preview)
         commit = prepare_p4_on_connection(
             conn,

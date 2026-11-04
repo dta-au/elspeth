@@ -76,9 +76,9 @@ class CheckpointNoSdkIssuer:
         self._permit: CheckpointNoSdkRefusalPermit | None = None
 
     def require_original_clock(self) -> None:
-        from elspeth.web.composer.continuation_checkpoint_end_physical import require_checkpoint_end_prepared_clock
+        from elspeth.web.composer.continuation_checkpoint_prepared_clock import require_checkpoint_prepared_clock
 
-        if require_checkpoint_end_prepared_clock(self.prepared) is not self.clock:
+        if require_checkpoint_prepared_clock(self.prepared) is not self.clock:
             raise AuditIntegrityError("checkpoint no-SDK issuer replaced its original driver clock")
 
     def bind_custody(self, custody: ProviderCallCustody) -> None:

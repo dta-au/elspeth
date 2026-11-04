@@ -9,7 +9,11 @@ from sqlalchemy import Connection, Row, select
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation_checkpoint_end_physical import checkpoint_end_physical_custody, require_checkpoint_end_prepared_clock
+from elspeth.web.composer.continuation_checkpoint_end_physical import (
+    CheckpointEndPhysicalSource,
+    checkpoint_end_physical_custody,
+    require_checkpoint_end_prepared_clock,
+)
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation, require_original_v4_sdk_failure
@@ -128,9 +132,10 @@ def require_checkpoint_sdk_source_on_connection(
         raise AuditIntegrityError("SDK END requires its original nominal prepared request/admission")
     require_checkpoint_end_prepared_clock(prepared)
     physical_source = prepared.physical_source()
+    if not isinstance(physical_source, CheckpointEndPhysicalSource) or type(physical_source) is not CheckpointEndPhysicalSource:
+        raise AuditIntegrityError("SDK checkpoint requires its installed original END source")
     if (
-        physical_source is None
-        or checkpoint_end_physical_custody(physical_source) is not custody
+        checkpoint_end_physical_custody(physical_source) is not custody
         or prepared.prepared_source.phase != "end"
         or admission.original_source is not prepared.prepared_source
         or custody.attempt is not admission.attempt

@@ -113,7 +113,7 @@ async def _retain(
     transition: EndTransition,
     candidate: PrivateChunk | None = None,
     captured: CapturedContinuationRuntime | None = None,
-) -> SelectedContinuationState:
+) -> _CurrentPhaseRead:
     runtime = phases.runtime
     if runtime is None or runtime.source.selected is not selected:
         raise AuditIntegrityError("END transition lost its actual current runtime selection")
@@ -137,8 +137,7 @@ async def _retain(
         expected=StoredContinuationSnapshot,
     )
     following = await load_selected_continuation(authority=phases.authority, running=running, selected=stored, required_work=phases.work)
-    await phases.current(following)
-    return following
+    return await phases._current_phase_read(following)
 
 
 async def enter_continuation_end(
@@ -271,8 +270,9 @@ async def _execute_continuation_end_review(
     if type(top) is not EndFrame or top.phase != "review_needed":
         raise AuditIntegrityError("END review has no landed owner for this END phase")
     await _primary(phases, selected)
-    current = await _retain(phases, selected, "end_review_dispatched")
-    runtime, result = await _primary(phases, current)
+    phase_read = await _retain(phases, selected, "end_review_dispatched")
+    current = phase_read.selected
+    runtime, result = await _primary(phases, current, phase_read=phase_read)
     service = phases.service
     live, bindings = runtime.live, runtime.bindings
     completion = result.outcome.completion
@@ -414,8 +414,9 @@ async def continue_end_after_terminal_review(
                     live.pending_advisor_elision_indices.append(superseded_reply_index)
         live.turn_evidence.transcript.observe_messages(live.llm_messages)
         captured = await capture_continuation_runtime_owners(runtime, selected=current, inventory=runtime.materialization.inventory)
-        following = await _retain(phases, current, "end_repair_continued", captured=captured)
-        following_runtime = phases.runtime
+        phase_read = await _retain(phases, current, "end_repair_continued", captured=captured)
+        following = phase_read.selected
+        following_runtime = phases._require_phase_read(following, phase_read).runtime
         if following_runtime is None or following_runtime.source.selected is not following:
             raise AuditIntegrityError("continued END review lost its actual retained runtime")
         return EndReviewContinued(current=following, runtime=following_runtime)

@@ -1,5 +1,7 @@
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import pytest
 
@@ -7,8 +9,16 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web import async_workers, credential_guard
 from elspeth.web.composer import continuation_codec as codec
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import encode_private_chunk, verify_private_chunk
-from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+from elspeth.web.composer.continuation_policy import ContinuationActionPolicy
+from elspeth.web.continuation_retention_memo import (
+    borrow_legacy_advisor_inflight_memo,
+    borrow_v4_preparation_memo_scope,
+    legacy_advisor_preparation_memo_scope,
+    retention_stage_memo_scope,
+    v4_preparation_memo_scope,
+)
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.required_sql_outcomes import RequiredSQLReturned
 from tests.unit.web.composer.test_continuation_frames import initial_stack
@@ -499,3 +509,136 @@ def test_missing_nominal_chunk_field_keeps_canonical_refusal():
     reference = codec.PrivateChunkRef.model_construct(codec="composer.messages.v1", byte_length=13)
     with retention_stage_memo_scope(), pytest.raises(AuditIntegrityError, match="canonical strict JSON"):
         verify_private_chunk(reference, '{"safe": true}')
+
+
+def _canonical_only_clock():
+    return ContinuationActionClock(ContinuationActionPolicy(preparation=10, guard=1, quota=1, physical=1, retention=1))
+
+
+@pytest.mark.asyncio
+async def test_v4_large_canonical_only_proof_crosses_real_sql_children_and_rechecks_binding(monkeypatch):
+    canonical = canonical_json({"text": "x" * 600_000})
+    chunk = encode_private_chunk(codec="composer.messages.v1", canonical=canonical)
+    original = codec._verify_private_chunk_canonical
+    canonical_calls = []
+
+    def verify(text):
+        canonical_calls.append(text)
+        return original(text)
+
+    monkeypatch.setattr(codec, "_verify_private_chunk_canonical", verify)
+    with v4_preparation_memo_scope(_canonical_only_clock()) as parent:
+
+        def cut():
+            with borrow_v4_preparation_memo_scope():
+                verify_private_chunk(chunk.reference, canonical)
+            return True
+
+        for _ in range(2):
+            outcome = await async_workers.run_required_sql_finish_once(publication_ticket(), cut)
+            assert isinstance(outcome, RequiredSQLReturned) and outcome.value is True
+        assert canonical_calls == [canonical]
+        assert len(parent._canonical_verifications) == 1 and not parent._canonical_proofs
+        for reference in (
+            chunk.reference.model_copy(update={"digest": "0" * 64}),
+            chunk.reference.model_copy(update={"byte_length": chunk.reference.byte_length + 1}),
+        ):
+            with borrow_v4_preparation_memo_scope(), pytest.raises(AuditIntegrityError, match="bytes differ"):
+                verify_private_chunk(reference, canonical)
+        assert canonical_calls == [canonical]
+        with borrow_v4_preparation_memo_scope(), pytest.raises(AuditIntegrityError, match="bytes differ"):
+            verify_private_chunk(chunk.reference, canonical.replace("x", "y"))
+        assert len(canonical_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_v4_warm_canonical_only_proof_keeps_foreign_sha_fresh_and_producer_change_cold(monkeypatch):
+    canonical = canonical_json({"text": "x" * 600_000})
+    chunk = encode_private_chunk(codec="composer.messages.v1", canonical=canonical)
+    original = codec._verify_private_chunk_canonical
+    canonical_calls = []
+    hashes = []
+
+    def first(text):
+        canonical_calls.append("first")
+        return original(text)
+
+    def replacement(text):
+        canonical_calls.append("replacement")
+        return original(text)
+
+    def digest(encoded):
+        hashes.append(len(encoded))
+        return hashlib.sha256(encoded if len(hashes) == 1 else b"changed crypto result")
+
+    monkeypatch.setattr(codec, "_verify_private_chunk_canonical", first)
+    with v4_preparation_memo_scope(_canonical_only_clock()):
+        with borrow_v4_preparation_memo_scope():
+            verify_private_chunk(chunk.reference, canonical)
+        monkeypatch.setattr(codec, "sha256", digest)
+        with borrow_v4_preparation_memo_scope():
+            verify_private_chunk(chunk.reference, canonical)
+        with borrow_v4_preparation_memo_scope(), pytest.raises(AuditIntegrityError, match="bytes differ"):
+            verify_private_chunk(chunk.reference, canonical)
+        assert canonical_calls == ["first"] and hashes == [chunk.reference.byte_length] * 2
+        monkeypatch.setattr(codec, "sha256", hashlib.sha256)
+        monkeypatch.setattr(codec, "_verify_private_chunk_canonical", replacement)
+        with borrow_v4_preparation_memo_scope():
+            verify_private_chunk(chunk.reference, canonical)
+        assert canonical_calls == ["first", "replacement"]
+
+
+@pytest.mark.asyncio
+async def test_v4_canonical_only_oversize_recomputes_and_malformed_refusal_precedes_hash(monkeypatch):
+    canonical = canonical_json({"text": "x" * (codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES + 1)})
+    encoded = canonical.encode()
+    reference = codec.PrivateChunkRef(codec="composer.messages.v1", digest=hashlib.sha256(encoded).hexdigest(), byte_length=len(encoded))
+    original = codec._verify_private_chunk_canonical
+    calls = []
+    hashes = []
+
+    def verify(text):
+        calls.append(len(text))
+        return original(text)
+
+    def digest(data):
+        hashes.append(len(data))
+        return hashlib.sha256(data)
+
+    monkeypatch.setattr(codec, "_verify_private_chunk_canonical", verify)
+    monkeypatch.setattr(codec, "sha256", digest)
+    with v4_preparation_memo_scope(_canonical_only_clock()) as parent:
+        for _ in range(2):
+            with borrow_v4_preparation_memo_scope():
+                verify_private_chunk(reference, canonical)
+        assert calls == [len(canonical)] * 2 and hashes == [len(encoded)] * 2
+        assert parent.cached_entry_count == 0
+        corrupt = reference.model_copy(update={"digest": "0" * 64})
+        for malformed in ('{"text": "x"}', canonical.replace(":", ": ", 1)):
+            with borrow_v4_preparation_memo_scope(), pytest.raises(AuditIntegrityError, match="canonical strict JSON"):
+                verify_private_chunk(corrupt, malformed)
+        assert hashes == [len(encoded)] * 2 and parent.cached_entry_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", (False, True), ids=("ordinary", "legacy"))
+async def test_large_canonical_fallback_keeps_ordinary_and_legacy_proofs_child_local(monkeypatch, legacy):
+    canonical = canonical_json({"text": "x" * 600_000})
+    chunk = encode_private_chunk(codec="composer.messages.v1", canonical=canonical)
+    original = codec._verify_private_chunk_canonical
+    calls = []
+
+    def verify(text):
+        calls.append(len(text))
+        return original(text)
+
+    monkeypatch.setattr(codec, "_verify_private_chunk_canonical", verify)
+    clock = _canonical_only_clock()
+    with legacy_advisor_preparation_memo_scope(clock) if legacy else nullcontext(None) as parent:
+        for _ in range(2):
+            with borrow_legacy_advisor_inflight_memo(parent, clock) if legacy else retention_stage_memo_scope():
+                verify_private_chunk(chunk.reference, canonical)
+                verify_private_chunk(chunk.reference, canonical)
+        assert calls == [len(canonical)] * 2
+        if parent is not None:
+            assert not parent._canonical_verifications and parent.cached_entry_count == 0

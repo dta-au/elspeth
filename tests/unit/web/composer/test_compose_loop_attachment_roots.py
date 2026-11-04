@@ -364,9 +364,6 @@ def _emit_worker_custody_snapshot(app: FastAPI, *, phase: str) -> None:
         "loop_done": worker._loop_task.done() if worker._loop_task is not None else None,
         "loop_cancelled": worker._loop_task.cancelled() if worker._loop_task is not None else None,
         "coordinators": [_coordinator_custody_facts(owner) for owner in worker._required_coordinators.values()],
-        "recovery_coordinators": [
-            _coordinator_custody_facts(owner) for owners in worker._recovery_coordinators.values() for owner in owners
-        ],
     }
     print("U13_REQUIRED_WORK_SNAPSHOT " + json.dumps(snapshot, sort_keys=True), flush=True)
 

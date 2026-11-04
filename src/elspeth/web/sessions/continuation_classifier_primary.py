@@ -186,6 +186,20 @@ def read_classifier_prephysical_source_on_connection(
     }
     if {(item.effect_key, item.disposition, item.receipt_key) for item in actual} != expected:
         raise AuditIntegrityError("prephysical classifier changed its complete actual effects inventory")
+    logical = next(item for item in actual if item.effect_key == stage.owner_effect_key)
+    if (
+        logical.receipt_key is not None
+        or logical.result_chunk_key is not None
+        or logical.provider_attempt_id is not None
+        or logical.physical_sequence is not None
+        or logical.physical_generation is not None
+        or logical.requested_model is not None
+        or logical.response_finished_at is not None
+        or logical.action_json is not None
+        or logical.graph_sha256 is not None
+        or logical.committed_state_ids_json is not None
+    ):
+        raise AuditIntegrityError("prephysical classifier changed its closed logical effect shape")
     creator = conn.execute(
         select(history).where(
             history.c.session_id == sid,
@@ -212,7 +226,9 @@ def read_classifier_prephysical_source_on_connection(
             if source.effect_key not in providers or providers[source.effect_key].disposition != "committed":
                 raise AuditIntegrityError("prephysical classifier contains an orphan physical source")
         elif item.chunk_key.startswith("classifier-primary-stage:"):
-            encoded = item.payload.decode("utf-8", errors="strict")
+            if item.codec != "composer.classifier-primary-stage.v1":
+                raise AuditIntegrityError("prephysical classifier changed its stage anchor codec")
+            encoded = read_chunk(conn, session_id=sid, operation_id=operation_id, key=item.chunk_key).decode("utf-8", errors="strict")
             value, error = parse_json_strict(encoded)
             if error is not None or type(value) is not dict or type(value.get("effect_key")) is not str:
                 raise AuditIntegrityError("prephysical classifier contains a malformed stage anchor")
@@ -223,9 +239,12 @@ def read_classifier_prephysical_source_on_connection(
     known = {item.provider_attempt_id for item in providers.values()}
     if None in known or any(item.disposition != "committed" for item in providers.values()):
         raise AuditIntegrityError("prephysical classifier contains an unclosed original provider")
-    for attempt in conn.execute(
-        select(physical).where(physical.c.session_id == sid, physical.c.operation_id == creator.session_operation_id)
-    ):
+    physical_creators = tuple(
+        conn.execute(
+            select(history.c.session_operation_id).where(history.c.session_id == sid, history.c.operation_id == operation_id)
+        ).scalars()
+    )
+    for attempt in conn.execute(select(physical).where(physical.c.session_id == sid, physical.c.operation_id.in_(physical_creators))):
         if attempt.attempt_id not in known or attempt.settled_at is None or attempt.ledger_entry_id is None:
             raise AuditIntegrityError("prephysical classifier contains an orphan or unclosed physical attempt")
     for hold in conn.execute(select(holds).where(holds.c.session_id == sid, holds.c.operation_id == operation_id)):
@@ -1277,8 +1296,8 @@ class ClassifierPrimaryIssuer:
     def sdk_entered(self) -> bool:
         return self._sdk_entered
 
-    def require_original_prephysical_failure(self, original: BaseException) -> TimeoutError:
-        """Identify the actual completed invocation, never authorize a terminal."""
+    def original_prephysical_failure(self, original: BaseException) -> TimeoutError | None:
+        """Observe an actual completed invocation; this grants no terminal."""
         from elspeth.web.composer.protocol import ComposerConvergenceError
 
         failure = self._failure
@@ -1293,6 +1312,12 @@ class ClassifierPrimaryIssuer:
             or self._terminal is not None
             or self._reply_deadline_observation is not None
         ):
+            return None
+        return failure
+
+    def require_original_prephysical_failure(self, original: BaseException) -> TimeoutError:
+        failure = self.original_prephysical_failure(original)
+        if failure is None:
             raise AuditIntegrityError("classifier failure has no original completed prephysical invocation")
         return failure
 

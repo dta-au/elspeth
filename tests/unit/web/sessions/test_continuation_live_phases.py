@@ -194,6 +194,71 @@ async def test_post_batch_transition_returns_its_one_actual_current_phase_read(o
     owner.work.coordinator.assert_completed()
 
 
+@pytest.mark.asyncio
+async def test_end_dispatch_hands_its_fresh_postwrite_phase_read_to_immediate_primary(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.sessions import continuation_end as end_owner
+    from tests.unit.web.sessions.test_continuation_end_shared_execution import actual_shared_end_case
+
+    class EndHandoffObserved(Exception):
+        pass
+
+    actual_read = ContinuationLivePhases._current_phase_read
+    actual_primary = end_owner._primary
+    reads = []
+    handoffs = []
+
+    def dispatched_end(selected):
+        top = selected.stack.frames[-1]
+        return type(top) is end_owner.EndFrame and any(
+            item.effect_id.startswith("end:") and item.disposition == "dispatched" for item in selected.stack.effect_frontier
+        )
+
+    async def read(owner, selected):
+        phase_read = await actual_read(owner, selected)
+        if dispatched_end(selected):
+            reads.append(phase_read)
+        return phase_read
+
+    async def primary(owner, selected, *, phase_read=None):
+        if dispatched_end(selected):
+            assert type(phase_read) is _CurrentPhaseRead
+            assert owner._require_phase_read(selected, phase_read) is phase_read
+            for altered in (
+                replace(phase_read, selected=replace(selected)),
+                replace(phase_read, runtime=replace(phase_read.runtime)),
+                replace(phase_read, lease=None),
+            ):
+                with pytest.raises(AuditIntegrityError, match="handoff"):
+                    await actual_primary(owner, selected, phase_read=altered)
+        result = await actual_primary(owner, selected, phase_read=phase_read)
+        if dispatched_end(selected):
+            handoffs.append((owner, selected, phase_read, result))
+            raise EndHandoffObserved
+        return result
+
+    monkeypatch.setattr(ContinuationLivePhases, "_current_phase_read", read)
+    monkeypatch.setattr(end_owner, "_primary", primary)
+    with pytest.raises(EndHandoffObserved):
+        async with actual_shared_end_case(operation_store, tmp_path, monkeypatch):
+            raise AssertionError("END source was captured before its original dispatch")
+
+    assert len(handoffs) == 1
+    owner, selected, cohort, (runtime, _result) = handoffs[0]
+    (effect,) = tuple(
+        item for item in selected.stack.effect_frontier if item.effect_id.startswith("end:") and item.disposition == "dispatched"
+    )
+    with operation_store[0].connect() as conn:
+        committed = conn.execute(select(effects).where(effects.c.effect_key == effect.effect_id)).one()
+    assert committed.disposition == "dispatched" and committed.receipt_key is None
+    assert len(reads) == 1 and cohort is reads[0]
+    assert type(cohort) is _CurrentPhaseRead and cohort.selected is selected
+    assert cohort.runtime is runtime and owner.runtime is runtime
+    assert cohort.inventory is runtime.materialization.inventory and cohort.lease is owner.lease
+    assert owner.lease.closed
+    with pytest.raises(AuditIntegrityError, match="handoff"):
+        owner._require_phase_read(selected, cohort)
+
+
 @asynccontextmanager
 async def _phase_case(
     store,

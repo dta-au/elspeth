@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -39,6 +39,9 @@ from elspeth.web.required_executor import RequiredInvocationWitness
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions import continuation_composition_initialization as composition_initialization_sql
+from elspeth.web.sessions import continuation_prepared_tail as prepared_tail
+from elspeth.web.sessions import continuation_preview_result as preview_result
+from elspeth.web.sessions import continuation_retained_capacity as retained_capacity
 from elspeth.web.sessions import continuation_value_batch_publication as value_publication
 from elspeth.web.sessions import continuation_value_batch_tail as value_tail
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
@@ -47,8 +50,10 @@ from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cu
 from elspeth.web.sessions.continuation_p4 import decode_p4_receipt
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import composer_continuation_chunks_table as retained_chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as provider_holds
 from elspeth.web.sessions.models import composer_segment_attempts_table as segment_attempts
 from elspeth.web.sessions.models import composer_validation_terminal_holds_table as holds
 from elspeth.web.sessions.models import composition_states_table as states
@@ -729,6 +734,7 @@ async def test_actual_nonempty_preview_preserves_provider_authored_base_and_cold
         preflights = []
         originals = []
         adopted_preflights = []
+        capacity_records = []
 
         async def observe_preflight(preflight, state, **kwargs):
             result = await actual_preflight(preflight, state, **kwargs)
@@ -756,10 +762,75 @@ async def test_actual_nonempty_preview_preserves_provider_authored_base_and_cold
             adopted_preflights.append(verdict)
             return actual_tail(*args, **kwargs)
 
+        def measure_capacity(original, kind):
+            @wraps(original)
+            def measured(conn, *, session_id, operation_id, prospective, retained_payload_limit_bytes, **kwargs):
+                if (session_id, operation_id) == (str(store[4]), running.claim.operation_id):
+                    assert conn.dialect.name == "sqlite"
+                    stored = conn.execute(
+                        select(retained_chunks.c.chunk_key, func.length(retained_chunks.c.payload)).where(
+                            retained_chunks.c.session_id == session_id, retained_chunks.c.operation_id == operation_id
+                        )
+                    ).all()
+                    existing = {row[0] for row in stored}
+                    candidates = {}
+                    for candidate in prospective:
+                        assert candidate.key not in candidates or candidates[candidate.key] == candidate
+                        candidates[candidate.key] = candidate
+                    held = 0
+                    for table in (holds, provider_holds):
+                        held += conn.execute(
+                            select(func.coalesce(func.sum(table.c.reserved_bytes), 0)).where(
+                                table.c.session_id == session_id, table.c.operation_id == operation_id, table.c.state == "active"
+                            )
+                        ).scalar_one()
+                    used = sum(row[1] for row in stored)
+                    added = sum(len(candidate.payload) for key, candidate in candidates.items() if key not in existing)
+                    credit = preview_result.preview_returned_credit_on_connection(conn, session_id=session_id, operation_id=operation_id)
+                    new_hold = kwargs.get("_new_hold_bytes", 0)
+                    capacity_records.append(
+                        {
+                            "kind": kind,
+                            "used": used,
+                            "live_holds": held,
+                            "source_credit": credit,
+                            "new_hold": new_hold,
+                            "added": added,
+                            "observed_bytes": used + held - credit + new_hold + added,
+                            "limit_bytes": retained_payload_limit_bytes,
+                        }
+                    )
+                return original(
+                    conn,
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    prospective=prospective,
+                    retained_payload_limit_bytes=retained_payload_limit_bytes,
+                    **kwargs,
+                )
+
+            return measured
+
         monkeypatch.setattr(ComposerPreflight, "cached_runtime_preflight", observe_preflight)
         monkeypatch.setattr(preview, "execute_tool", observe_tool)
         monkeypatch.setattr(value_preparation, "prepare_issued_preview_batch", observe_tail)
-        await phases._advance(owner)
+        with monkeypatch.context() as capacity_patch:
+            capacity_patch.setattr(
+                retained_capacity,
+                "admit_retained_payload_chunks",
+                measure_capacity(retained_capacity.admit_retained_payload_chunks, "preview_issue_or_write"),
+            )
+            capacity_patch.setattr(
+                prepared_tail,
+                "admit_retained_payload_chunks",
+                measure_capacity(prepared_tail.admit_retained_payload_chunks, "complete_tail_prefix"),
+            )
+            try:
+                await phases._advance(owner)
+            finally:
+                record_property("preview_actual_tail_capacity", json.dumps(capacity_records, sort_keys=True))
+        assert any(row["new_hold"] > 0 for row in capacity_records)
+        assert any(row["kind"] == "complete_tail_prefix" for row in capacity_records)
         assert len(originals) == 1 and originals[0].success
         verdict = originals[0].runtime_preflight
         assert verdict is not None and any(verdict is result for result in preflights)

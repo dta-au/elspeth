@@ -34,6 +34,7 @@ from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED, ComposerOperationCancelledDuringTurn
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
+from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration
 from elspeth.web.sessions.continuation_primary import allocate_primary_effect_on_connection, prepare_primary_provider_on_connection
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -50,6 +51,7 @@ from tests.unit.web.sessions import test_continuation_live_phases as live_fixtur
 from tests.unit.web.sessions.test_continuation_iteration_stages import _applied_case
 from tests.unit.web.sessions.test_continuation_iteration_stages import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
+from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver
 
 operation_store = _operation_store
 
@@ -105,8 +107,19 @@ async def _classifier_case(store, tmp_path, monkeypatch):
         return actual_work(running, sql_deadline_owner=owner)
 
     monkeypatch.setattr(initialization, "inventory_work", timed_work)
-    async with _applied_case(store, tmp_path, monkeypatch) as (phases, running, selected, inventory, captured, prior_sdk):
-        ready = stages.retain_iteration_prepared(phases.authority, running, selected=selected, inventory=inventory, captured=captured)
+    async with _applied_case(store, tmp_path, monkeypatch) as (phases, running, selected, _inventory, _captured, prior_sdk):
+        timing = phases.work.coordinator.sql_deadline_owner
+        assert type(timing) is ContinuationSQLDeadlineOwner
+        # A cold applied-P4 runtime still carries the prepublication Compose
+        # fields. Run the actual shared fold before retaining classify_ready;
+        # a raw capture alone does not prove its assistant/failed-turn facts.
+        driver = _actual_failure_driver(store, phases, running, drain_signal=timing.drain_signal)
+        assert await advance_continuation_iteration(phases, driver.services, selected) is None
+        ready = phases.authority.load_continuation_snapshot(running)
+        with store[0].connect() as conn:
+            prepared_stage = stages.read_iteration_stage_on_connection(conn, running, selected=ready)
+        assert prepared_stage is not None and prepared_stage.stage == "classify_ready"
+        assert ready.cursor == selected.stack.cursor + 1
         ready_selected = await load_selected_continuation(
             authority=phases.authority, running=running, selected=ready, required_work=phases.work
         )

@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -15,8 +16,172 @@ from hashlib import sha256
 from pathlib import Path
 from types import MethodType
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from sqlalchemy import Engine, event
+
+
+class EndTextMemoObservation:
+    """Bounded test-only cache accounting; no payloads or producer replacements.
+
+    Fingerprints use Python's cached text/key hash and producer identities.
+    Collisions can overcount recomputations or undercount distinct text weight;
+    these observations never authorize cache hits or product behavior.
+    """
+
+    families = ("full", "canonical", "block")
+
+    def __init__(self, *, max_fingerprints: int = 1024) -> None:
+        self.max_fingerprints = max_fingerprints
+        self._lock = threading.Lock()
+        self._parents = WeakKeyDictionary()
+        self._parent_states = {}
+        self._fingerprints = OrderedDict()
+        self._active = {}
+        self.fingerprint_drops = 0
+        self.observer_errors = 0
+        self.overlapping_calls = 0
+        self.budget_violations = 0
+        self.observer_ns = 0
+        self.peak_retained_bytes = 0
+        self.counts = {
+            family: {
+                "requests": 0,
+                "hits": 0,
+                "misses": 0,
+                "errors": 0,
+                "admissions": 0,
+                "evictions": 0,
+                "evicted_bytes": 0,
+                "recomputations": 0,
+                "unretained": 0,
+            }
+            for family in self.families
+        }
+
+    def _state(self, memo, family, cache_key):
+        with memo._lock:
+            entries = (memo._canonical_proofs, memo._canonical_verifications, memo._recorder_block_hashes)
+            weights = (memo._canonical_proof_bytes, memo._canonical_verification_bytes, memo._recorder_block_hash_bytes)
+            selected = entries[self.families.index(family)]
+            hit = cache_key in selected
+            value = selected[cache_key] if hit else None
+            weight = value.retained_bytes if hit and family == "full" else (value if hit else 0)
+            return hit, weight, tuple(len(items) for items in entries), weights, memo._shared_text_budget_bytes, not memo._closed
+
+    def _observe(self, memo, family, key, producer, digest_producer, operation):
+        if memo._v4_preparation_owner is None:
+            return operation()
+        before_ns = time.monotonic_ns()
+        cache_key = (producer, digest_producer, key) if family == "full" else (producer, key)
+        try:
+            before = self._state(memo, family, cache_key)
+            fingerprint = (family, id(producer), id(digest_producer), hash(key))
+            with self._lock:
+                ordinal = self._parents.get(memo)
+                if ordinal is None:
+                    if len(self._parent_states) >= 32:
+                        raise ValueError("text observer parent capacity exceeded")
+                    ordinal = len(self._parent_states) + 1
+                    self._parents[memo] = ordinal
+                    self._parent_states[ordinal] = {"budget": before[4], "closed_empty": False}
+                fingerprint = (ordinal, *fingerprint)
+                self.overlapping_calls += self._active.get(ordinal, 0) > 0
+                self._active[ordinal] = self._active.get(ordinal, 0) + 1
+                self.counts[family]["requests"] += 1
+                self.counts[family]["hits" if before[0] else "misses"] += 1
+                self.observer_ns += time.monotonic_ns() - before_ns
+        except Exception:
+            with self._lock:
+                self.observer_errors += 1
+            return operation()
+        success = False
+        try:
+            result = operation()
+            success = True
+            return result
+        finally:
+            after_ns = time.monotonic_ns()
+            try:
+                after = self._state(memo, family, cache_key)
+                with self._lock:
+                    self._active[ordinal] -= 1
+                    self.counts[family]["errors"] += not success
+                    self.peak_retained_bytes = max(self.peak_retained_bytes, sum(before[3]), sum(after[3]))
+                    self.budget_violations += sum(after[3]) > after[4]
+                    if success:
+                        admitted = not before[0] and after[0]
+                        self.counts[family]["admissions"] += admitted
+                        self.counts[family]["unretained"] += not after[0]
+                        seen = fingerprint in self._fingerprints
+                        self.counts[family]["recomputations"] += not before[0] and seen
+                        self._fingerprints[fingerprint] = max(self._fingerprints.get(fingerprint, 0), after[1])
+                        self._fingerprints.move_to_end(fingerprint)
+                        if len(self._fingerprints) > self.max_fingerprints:
+                            self._fingerprints.popitem(last=False)
+                            self.fingerprint_drops += 1
+                        if after[5]:
+                            for index, evicted_family in enumerate(self.families):
+                                added = admitted and family == evicted_family
+                                self.counts[evicted_family]["evictions"] += max(0, before[2][index] + added - after[2][index])
+                                self.counts[evicted_family]["evicted_bytes"] += max(
+                                    0, before[3][index] + (after[1] if added else 0) - after[3][index]
+                                )
+            except Exception:
+                with self._lock:
+                    self.observer_errors += 1
+            finally:
+                with self._lock:
+                    self.observer_ns += time.monotonic_ns() - after_ns
+
+    @contextmanager
+    def install(self, monkeypatch):
+        from elspeth.web.continuation_retention_memo import RetentionStageMemo
+
+        original_full = RetentionStageMemo.canonical_text_proof
+        original_canonical = RetentionStageMemo.canonical_text_verification
+        original_block = RetentionStageMemo.recorder_block_hash
+        original_close = RetentionStageMemo.close
+
+        def full(memo, key, producer, digest_producer):
+            return self._observe(memo, "full", key, producer, digest_producer, lambda: original_full(memo, key, producer, digest_producer))
+
+        def canonical(memo, key, producer):
+            return self._observe(memo, "canonical", key, producer, None, lambda: original_canonical(memo, key, producer))
+
+        def block(memo, key, producer):
+            return self._observe(memo, "block", key, producer, None, lambda: original_block(memo, key, producer))
+
+        def close(memo):
+            original_close(memo)
+            with self._lock:
+                ordinal = self._parents.get(memo)
+                if ordinal is not None:
+                    self._parent_states[ordinal]["closed_empty"] = not memo.active and memo.cached_entry_count == 0
+
+        with monkeypatch.context() as patch:
+            patch.setattr(RetentionStageMemo, "canonical_text_proof", full)
+            patch.setattr(RetentionStageMemo, "canonical_text_verification", canonical)
+            patch.setattr(RetentionStageMemo, "recorder_block_hash", block)
+            patch.setattr(RetentionStageMemo, "close", close)
+            yield self
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "families": {family: dict(counts) for family, counts in self.counts.items()},
+                "parents": [dict(state) for state in self._parent_states.values()],
+                "peak_retained_bytes": self.peak_retained_bytes,
+                "observed_key_weight_estimate": None if self.fingerprint_drops else sum(self._fingerprints.values()),
+                "fingerprints": len(self._fingerprints),
+                "fingerprint_capacity": self.max_fingerprints,
+                "fingerprint_drops": self.fingerprint_drops,
+                "observer_errors": self.observer_errors,
+                "overlapping_calls": self.overlapping_calls,
+                "budget_violations": self.budget_violations,
+                "observer_ns": self.observer_ns,
+                "scope": "retained-key weight estimate uses Python hashes; collisions and dropped fingerprints limit identity claims; overlapping calls invalidate eviction attribution",
+            }
 
 
 class EndPreparationProfile:
@@ -41,6 +206,8 @@ class EndPreparationProfile:
         self._end_exits: dict[int, dict[str, Any]] = {}
         self._cpu_profiles: list[tuple[dict[str, Any], Any]] = []
         self.installed = False
+        self.text_memo: EndTextMemoObservation | None = None
+        self.text_memo_budget_bytes: int | None = None
 
     def begin(self, label: str, *, kind: str = "call", **facts: Any) -> dict[str, Any]:
         wall = time.monotonic_ns()
@@ -596,6 +763,8 @@ class EndPreparationProfile:
                 "pending_sql_contexts": len(self._sql),
                 "cpu_scope": "native thread CPU; async intervals include other event-loop activity; worker body includes gate wait",
                 "wall_scope": "inclusive intervals; do not sum nested or overlapping spans",
+                "text_memo": None if self.text_memo is None else self.text_memo.snapshot(),
+                "text_memo_budget_bytes": self.text_memo_budget_bytes,
             }
 
     def flush(self, path: Path) -> OSError | None:

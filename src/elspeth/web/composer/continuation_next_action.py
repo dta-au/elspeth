@@ -553,7 +553,7 @@ def iteration_stage_action_policy(
         return policy.actions.session_sql
     if type(stage) is not IterationStageData or stage.current != selected:
         raise AuditIntegrityError("iteration allowance changed its exact original stage source")
-    if stage.stage in ("early_ready", "returned"):
+    if stage.stage in ("early_ready", "early_retry_ready", "returned"):
         return policy.actions.advisor
     if stage.stage == "end_ready":
         return policy.actions.advisor

@@ -16,6 +16,7 @@ from elspeth.web.composer.continuation_checkpoint_end_input import decode_checkp
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, _effect_snapshot
+from elspeth.web.sessions.continuation_checkpoint_early_source import CheckpointEarlyInput, require_early_input_on_connection
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
 from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource, read_bounded_retained_chunk
 from elspeth.web.sessions.continuation_selection import load_private_chunks
@@ -37,6 +38,8 @@ class CheckpointProviderSourceData:
     end_input_ref: PrivateChunkRef | None
     env_ref_names: frozenset[str]
     requested_model: str
+    early_input_ref: PrivateChunkRef | None = None
+    early_input: CheckpointEarlyInput | None = None
 
 
 def _bounded_bytes(conn: Connection, source: ProviderTerminalHoldSource, key: str, codec: str) -> bytes:
@@ -106,6 +109,7 @@ def read_checkpoint_provider_source_on_connection(
         raise AuditIntegrityError("checkpoint paid overflow changed its prepared source snapshot")
     preparation_tag, preparation_text = _event_at(conn, source, prepared.cursor)
     preparation, error = parse_json_strict(preparation_text)
+    new_early = error is None and type(preparation) is dict and preparation.get("version") == 2 and preparation.get("phase") == "early"
     if (
         preparation_tag != "checkpoint"
         or error is not None
@@ -128,8 +132,9 @@ def read_checkpoint_provider_source_on_connection(
             "end_env_ref_names",
             "captured_root_sha256",
         }
+        | ({"early_input_chunk_key", "early_input_sha256"} if new_early else set())
         or preparation["owner"] != "composer_checkpoint_source"
-        or preparation["version"] != 1
+        or preparation["version"] != (2 if new_early else 1)
         or preparation["stage"] != "source_prepared"
         or preparation["phase"] not in ("early", "end")
         or preparation["kind"] not in ("iteration_early", "iteration_end", "end_review")
@@ -162,6 +167,30 @@ def read_checkpoint_provider_source_on_connection(
     ):
         raise AuditIntegrityError("checkpoint paid overflow lost its original unpaid outer phase")
     end_retry_ordinal: int | None = None
+    early_input_ref: PrivateChunkRef | None = None
+    early_input: CheckpointEarlyInput | None = None
+    if new_early:
+        early_key, early_digest = preparation["early_input_chunk_key"], preparation["early_input_sha256"]
+        if (
+            type(early_key) is not str
+            or type(early_digest) is not str
+            or early_key != f"value:composer.checkpoint-early-input.v1:{early_digest}"
+        ):
+            raise AuditIntegrityError("EARLY source changed its original request reference")
+        early_bytes = _bounded_bytes(conn, source, early_key, "composer.checkpoint-early-input.v1")
+        early_input_ref = PrivateChunkRef(codec="composer.checkpoint-early-input.v1", digest=early_digest, byte_length=len(early_bytes))
+        early_input = require_early_input_on_connection(
+            conn,
+            session_id=sid,
+            operation_id=operation_id,
+            reference=early_input_ref,
+            allowance=source.allowance_bytes,
+            origin=origin,
+            prepared=prepared,
+            outer_effect_key=preparation["outer_effect_key"],
+        )
+        if names is not None and names != frozenset(early_input.env_ref_names):
+            raise AuditIntegrityError("EARLY source changed its original guard environment inventory")
     if preparation["phase"] == "end":
         if names != frozenset(preparation["end_env_ref_names"]):
             raise AuditIntegrityError("checkpoint paid overflow changed current END guard inventory")
@@ -230,8 +259,9 @@ def read_checkpoint_provider_source_on_connection(
             "end_input_sha256",
             "end_env_ref_names",
         }
+        | ({"early_input_chunk_key", "early_input_sha256"} if new_early else set())
         or dispatch["owner"] != "composer_checkpoint_paid"
-        or dispatch["version"] != 1
+        or dispatch["version"] != (2 if new_early else 1)
         or dispatch["stage"] != "dispatched"
         or dispatch["phase"] != preparation["phase"]
         or dispatch["kind"] != preparation["kind"]
@@ -249,6 +279,16 @@ def read_checkpoint_provider_source_on_connection(
         or dispatch["end_input_sha256"] != preparation["end_input_sha256"]
         or dispatch["end_env_ref_names"] != preparation["end_env_ref_names"]
         or (preparation["phase"] == "end" and dispatch["retry_ordinal"] != end_retry_ordinal)
+        or (
+            early_input is not None
+            and (
+                dispatch["early_input_chunk_key"] != preparation["early_input_chunk_key"]
+                or dispatch["early_input_sha256"] != preparation["early_input_sha256"]
+                or dispatch["request_sha256"] != early_input.messages_sha256
+                or dispatch["requested_model"] != early_input.requested_model
+                or dispatch["retry_ordinal"] != early_input.retry_ordinal
+            )
+        )
         or dispatch_text != canonical_json(dispatch)
     ):
         raise AuditIntegrityError("checkpoint paid overflow changed its original dispatch event")
@@ -277,7 +317,7 @@ def read_checkpoint_provider_source_on_connection(
         source_cursor=source.source_cursor,
         source_snapshot_sha256=source.source_snapshot_sha256,
     )
-    return CheckpointProviderSourceData(
+    result = CheckpointProviderSourceData(
         origin,
         prepared,
         admitted,
@@ -288,6 +328,13 @@ def read_checkpoint_provider_source_on_connection(
         preparation["pass_index"],
         dispatch["retry_ordinal"],
         end_input_ref,
-        frozenset(preparation["end_env_ref_names"]),
+        frozenset(early_input.env_ref_names) if early_input is not None else frozenset(preparation["end_env_ref_names"]),
         effect.requested_model,
+        early_input_ref,
+        early_input,
     )
+    if early_input is not None:
+        from elspeth.web.sessions.continuation_checkpoint_early_source import resolve_early_original_stage_on_connection
+
+        resolve_early_original_stage_on_connection(conn, source=result, names=result.env_ref_names)
+    return result
