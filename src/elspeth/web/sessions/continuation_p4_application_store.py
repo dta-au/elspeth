@@ -40,7 +40,7 @@ from elspeth.web.composer.continuation_evidence_application_values import P4Effe
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_owed_evidence import read_owed_p4_evidence_on_connection
 from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk, encode_p4_pending_batch_chunk
-from elspeth.web.composer.continuation_prepared_p4 import decode_prepared_p4, prepared_p4_members
+from elspeth.web.composer.continuation_prepared_p4 import _decode_prepared_p4_with_members
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.sessions._persist_payload import AuditOutcome
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
@@ -331,11 +331,11 @@ def require_p4_application_journal_data_on_connection(
         pending = decode_p4_pending_batch_chunk(pending_chunk, env_ref_names=env_ref_names)
         if pending.batch.p4_input_json != prepared_chunk.canonical:
             raise AuditIntegrityError("application journal changed its actual complete prepared input")
-        prepared = decode_prepared_p4(prepared_chunk.canonical, env_ref_names=env_ref_names)
+        prepared, prepared_members = _decode_prepared_p4_with_members(prepared_chunk.canonical, env_ref_names=env_ref_names)
         if (
             prepared.session_id != sid
             or prepared.creator_operation_id != record.creator_operation_id
-            or prepared_p4_members(prepared, env_ref_names=env_ref_names).mutation_ceiling != selected.stack.mutation_ceiling.materialize()
+            or prepared_members.mutation_ceiling != selected.stack.mutation_ceiling.materialize()
         ):
             raise AuditIntegrityError("application journal changed original input/session/ceiling")
         receipt, outcome = decode_p4_receipt(result_chunk.canonical, env_ref_names=env_ref_names)

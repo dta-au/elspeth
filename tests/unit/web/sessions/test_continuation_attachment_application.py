@@ -268,7 +268,7 @@ async def application_case(
                     },
                 }
             ],
-            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)

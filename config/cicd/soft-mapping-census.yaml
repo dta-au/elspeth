@@ -813,6 +813,8 @@ files:
     dict[str, object]: 2
   src/elspeth/web/composer/continuation_dispatch_audit.py:
     Mapping[str, Any]: 1
+  src/elspeth/web/composer/continuation_evidence.py:
+    Mapping[str, Any]: 1
   src/elspeth/web/composer/continuation_evidence_graph.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 4
@@ -1138,10 +1140,10 @@ files:
     Mapping[str, Any]: 16
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 803
+  Mapping[str, Any]: 804
   Mapping[str, object]: 327
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1188
   dict[str, object]: 408
-  soft: 2734
+  soft: 2735

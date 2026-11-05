@@ -161,6 +161,83 @@ def test_complete_graph_values_aliases_pending_and_private_recorder_roundtrip():
     assert encode_turn_evidence(snapshot(owner, restored.messages, restored.recorder, logical)) == chunk
 
 
+@pytest.mark.parametrize("mandatory", (False, True), ids=("ordinary-no-prior", "mandatory"))
+def test_fresh_capture_keeps_first_admitted_graph_and_original_capture_order(monkeypatch, mandatory):
+    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
+    from elspeth.web.composer.continuation_application_graph import capture_application_recorder_source, encode_application_graph
+    from elspeth.web.composer.continuation_batch_data import RestoredBatchData
+    from tests.unit.web.composer.test_continuation_batch_data import actual_cut
+
+    owner, messages, recorder, logical, _policy = rich_evidence()
+    batch, accumulator, calls = actual_cut()
+    data = RestoredBatchData(batch, accumulator, calls)
+    original_fields = evidence_codec.require_evidence_fields_admission
+    original_semantics = evidence_codec._require_evidence_field_semantics
+    original_transcript = AdvisorTranscriptOwner.snapshot_for_continuation
+    field_inputs, graphs, order = [], [], []
+
+    def admit_fields(value, **kwargs):
+        field_inputs.append(value)
+        return original_fields(value, **kwargs)
+
+    def admit_semantics(value, **kwargs):
+        order.append("fields")
+        graph = original_semantics(value, **kwargs)
+        graphs.append(graph)
+        return graph
+
+    def transcript(self, *args, **kwargs):
+        if self is owner.transcript:
+            order.append("transcript")
+        return original_transcript(self, *args, **kwargs)
+
+    with monkeypatch.context() as observed:
+        observed.setattr(evidence_codec, "require_evidence_fields_admission", admit_fields)
+        observed.setattr(evidence_codec, "_require_evidence_field_semantics", admit_semantics)
+        observed.setattr(AdvisorTranscriptOwner, "snapshot_for_continuation", transcript)
+        fresh = capture_turn_evidence(
+            owner,
+            messages,
+            logical=logical,
+            recorder=recorder,
+            drained=RecorderDrainCursors(),
+            env_ref_names=frozenset(),
+            data=data,
+            mandatory_retention=mandatory,
+        )
+        assert order == (["fields", "transcript"] if mandatory else ["transcript", "fields"])
+        assert len(field_inputs) == len(graphs) == 1
+        first_graph = graphs[0]
+        assert first_graph is not None and fresh.graph is first_graph
+        assert first_graph.selected.batch is not data.batch
+        # Calibrate the observers with the public complete-source admission;
+        # this separate boundary must still perform its own full field pass.
+        public = admit_turn_evidence(
+            fresh.snapshot,
+            env_ref_names=frozenset(),
+            source_chunks=fresh.dependency_chunks,
+            mandatory_retention=mandatory,
+        )
+        assert len(field_inputs) == len(graphs) == 2 and field_inputs[-1] is fresh.snapshot
+        assert public.graph is graphs[-1] and public.graph is not first_graph
+
+    assert fresh.snapshot == public.snapshot and fresh.source_chunk == public.source_chunk
+    assert fresh.dependency_chunks == public.dependency_chunks
+    assert fresh.snapshot.application_entry is None
+    assert fresh._graph_lock is not public._graph_lock
+    source = capture_application_recorder_source(first_graph.recorder, env_ref_names=frozenset())
+    original_graph_json = encode_application_graph(first_graph, env_ref_names=frozenset(), recorder_source=source)
+    assert encode_application_graph(public.graph, env_ref_names=frozenset(), recorder_source=source) == original_graph_json
+    copied = fresh.copy_graph()
+    assert copied is not None and copied is not first_graph and copied.selected.batch is not first_graph.selected.batch
+    assert copied.selected.batch.decoded_args_by_call_id["call-1"] is copied.selected.batch.decoded_args_by_call_id["call-2"]
+    assert copied.selected.batch.decoded_args_by_call_id is not first_graph.selected.batch.decoded_args_by_call_id
+    assert encode_application_graph(copied, env_ref_names=frozenset(), recorder_source=source) == original_graph_json
+    assert fresh.take_graph() is first_graph and public.graph is graphs[-1]
+    with pytest.raises(AuditIntegrityError, match="admitted graph cannot be transferred twice"):
+        fresh.take_graph()
+
+
 def test_native_evidence_projections_keep_public_bytes_and_recheck_changed_source(monkeypatch):
     owner, messages, recorder, logical, _ = rich_evidence()
     messages.append({"role": "user", "content": 'Retain "quotes", \\ slash,\n\t café 😀', "retained_numbers": {"tiny": 1e-7}})

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from _thread import LockType
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from threading import Lock
-from typing import TYPE_CHECKING, Annotated, Literal, Never, SupportsIndex
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Never, SupportsIndex
 from uuid import UUID
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
@@ -31,7 +32,10 @@ from elspeth.web.credential_guard import require_no_credential_material, require
 from elspeth.web.sessions.continuation import HistoricalEffectLocator
 
 if TYPE_CHECKING:
+    from elspeth.contracts.bounded_serialization import BoundedCanonicalSize
+    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
     from elspeth.web.composer.continuation_application_graph import ApplicationGraph, ApplicationRecorderSource
+    from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 
 
 class RetainedBlobPage(ContinuationValue):
@@ -515,6 +519,61 @@ def admit_turn_evidence(
     return AdmittedTurnEvidence(snapshot, env_ref_names=env_ref_names, mandatory_retention=mandatory_retention, source_chunks=source_chunks)
 
 
+def _capture_fresh_turn_evidence(
+    fields: TurnEvidenceFields,
+    *,
+    transcript_owner: AdvisorTranscriptOwner,
+    messages: Sequence[Mapping[str, Any]],
+    materialization: CurrentContinuationMessageProducers | None,
+    recorder_source: ApplicationRecorderSource,
+    sources: P4ApplicationSources,
+    env_ref_names: frozenset[str],
+    mandatory_retention: bool,
+    prior_application_entry: PortableP4ApplicationEntry | None,
+) -> AdmittedTurnEvidence:
+    """Keep the first field graph local through fresh transcript finalization."""
+    from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
+    from elspeth.web.composer.continuation_application_graph import require_application_recorder_capacity
+    from elspeth.web.composer.continuation_message_shelf import require_message_shelf_integrity
+    from elspeth.web.composer.continuation_retention import retained_model_json_view
+
+    recorder_chunk = recorder_source.chunk
+    graph = require_evidence_fields_admission(
+        fields, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk, recorder_source=recorder_source
+    )
+    if prior_application_entry is not None and (
+        fields.application_entry is None
+        or fields.application_entry.applications[: len(prior_application_entry.applications)] != prior_application_entry.applications
+    ):
+        raise AuditIntegrityError("runtime capture lost selected actual application history")
+    transcript_snapshot = transcript_owner.snapshot_for_continuation(
+        messages, materialization=materialization, mandatory_retention=mandatory_retention
+    )
+    snapshot = TurnEvidenceSnapshot(**fields.__dict__, transcript=transcript_snapshot)
+    if mandatory_retention:
+        require_message_shelf_integrity(transcript_snapshot, env_ref_names=env_ref_names)
+        require_application_recorder_capacity(recorder_source)
+    measured = bounded_canonical_json_size(retained_model_json_view(snapshot), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    chunk = _encode_admitted_turn_evidence_snapshot(
+        snapshot,
+        measured=measured,
+        recorder_chunk=recorder_chunk,
+        env_ref_names=env_ref_names,
+        mandatory_retention=mandatory_retention,
+    )
+    # No mutable graph or partially initialized owner escapes this sequence.
+    admitted = object.__new__(AdmittedTurnEvidence)
+    object.__setattr__(admitted, "snapshot", snapshot)
+    object.__setattr__(admitted, "_graph", graph)
+    object.__setattr__(admitted, "_graph_lock", Lock())
+    object.__setattr__(admitted, "_graph_taken", False)
+    object.__setattr__(admitted, "env_ref_names", env_ref_names)
+    object.__setattr__(admitted, "source_chunk", chunk)
+    object.__setattr__(admitted, "sources", sources)
+    object.__setattr__(admitted, "recorder_chunk", recorder_chunk)
+    return admitted
+
+
 def require_admitted_turn_evidence(evidence: AdmittedTurnEvidence, *, env_ref_names: frozenset[str]) -> AdmittedTurnEvidence:
     if type(evidence) is not AdmittedTurnEvidence:
         raise TypeError("evidence reuse requires its actual source-admitted owner")
@@ -648,15 +707,36 @@ def _encode_turn_evidence_source(
     if type(snapshot) is not TurnEvidenceSnapshot:
         raise TypeError("evidence requires its owned closed snapshot")
     from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
+    from elspeth.web.composer.continuation_retention import retained_model_json_view
+
+    measured = bounded_canonical_json_size(retained_model_json_view(snapshot), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    graph = require_evidence_fields_admission(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+    chunk = _encode_admitted_turn_evidence_snapshot(
+        snapshot,
+        measured=measured,
+        recorder_chunk=recorder_chunk,
+        env_ref_names=env_ref_names,
+        mandatory_retention=mandatory_retention,
+    )
+    return chunk, graph
+
+
+def _encode_admitted_turn_evidence_snapshot(
+    snapshot: TurnEvidenceSnapshot,
+    *,
+    measured: BoundedCanonicalSize,
+    recorder_chunk: PrivateChunk,
+    env_ref_names: frozenset[str],
+    mandatory_retention: bool,
+) -> PrivateChunk:
+    """Finish the original full encoding after field/graph admission."""
+    from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
     from elspeth.web.composer.continuation_capture_overflow import require_capture_retention_capacity
+    from elspeth.web.composer.continuation_message_shelf import require_message_shelf_integrity
     from elspeth.web.composer.continuation_retention import (
         bind_retained_json_encoding,
         retained_model_json_view,
     )
-
-    measured = bounded_canonical_json_size(retained_model_json_view(snapshot), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
-    graph = require_evidence_fields_admission(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
-    from elspeth.web.composer.continuation_message_shelf import require_message_shelf_integrity
 
     require_message_shelf_integrity(snapshot.transcript, env_ref_names=env_ref_names)
     if mandatory_retention:
@@ -688,7 +768,7 @@ def _encode_turn_evidence_source(
         canonical=encoded,
         env_ref_names=env_ref_names,
     )
-    return chunk, graph
+    return chunk
 
 
 def _require_evidence_pair_capacity(*, evidence_bytes: int, recorder_chunk: PrivateChunk, mandatory_retention: bool) -> None:
