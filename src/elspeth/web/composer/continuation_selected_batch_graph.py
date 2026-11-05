@@ -28,7 +28,6 @@ def require_selected_active_batch_graph(
         return
     if type(selected) is not SelectedContinuationState:
         raise TypeError("selected graph requires its actual selected DATA owner")
-    selected.__post_init__()
     frames = tuple(frame for frame in selected.stack.frames if type(frame) is ToolBatchFrame)
     if len(frames) != 1 or selected.stack.frames[-1] is not frames[0]:
         raise AuditIntegrityError("active evidence graph lost its selected issued batch")

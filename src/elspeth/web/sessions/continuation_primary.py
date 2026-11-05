@@ -2020,7 +2020,6 @@ def _require_selected_primary_source(
 ) -> None:
     if type(selected) is not SelectedContinuationState:
         raise AuditIntegrityError("primary source read requires its actual complete nominal selection")
-    selected.__post_init__()
     expected = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
     actual = load_selected_private_chunks_on_connection(conn, running, expected)
     if actual != selected.chunks:

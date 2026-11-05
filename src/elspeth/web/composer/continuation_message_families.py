@@ -594,7 +594,6 @@ def _require_completed_tool_source_on_connection(
         historical = SelectedContinuationState(
             refusal_checkpoint.checkpoint_id, root, load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root)
         )
-        historical.__post_init__()
         original = require_admitted_turn_evidence(
             read_selected_turn_evidence_graph_on_connection(conn, running, selected=historical, names=names), env_ref_names=names
         )
@@ -663,7 +662,6 @@ def _require_completed_tool_source_on_connection(
     historical = SelectedContinuationState(
         checkpoint.checkpoint_id, root, load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root)
     )
-    historical.__post_init__()
     original = require_admitted_turn_evidence(
         read_selected_turn_evidence_graph_on_connection(conn, running, selected=historical, names=names), env_ref_names=names
     )

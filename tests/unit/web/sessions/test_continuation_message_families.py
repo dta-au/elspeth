@@ -425,6 +425,7 @@ async def test_completed_recipe_admits_original_issue_once_and_separate_completi
     from elspeth.web.composer import continuation_phase_transitions as transitions
     from elspeth.web.composer.continuation_message_family_builders import family_message_wire
     from elspeth.web.composer.continuation_message_family_recipes import ToolResultMessageRecipe
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from tests.unit.web.sessions import test_continuation_live_phases as phases
 
     async with phases._phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
@@ -438,7 +439,13 @@ async def test_completed_recipe_admits_original_issue_once_and_separate_completi
         )
         original_issue = transitions.read_tool_issue_data_on_connection
         original_evidence = evidence_reader.read_selected_turn_evidence_graph_data_on_connection
+        original_constructor = SelectedContinuationState.__post_init__
         attempts, issues, evidence_proofs = [], [], []
+        constructors, historical_owners = [], []
+
+        def validate_selection(self):
+            constructors.append(self)
+            original_constructor(self)
 
         def read_issue(conn, **values):
             assert conn.in_transaction()
@@ -452,10 +459,16 @@ async def test_completed_recipe_admits_original_issue_once_and_separate_completi
             result = original_evidence(conn, *args, **values)
             selected = values["selected"]
             evidence_proofs.append((conn, selected.checkpoint_id, selected.stack.cursor, len(issues)))
+            if selected is not runtime.source.selected:
+                historical_owners.append(selected)
             return result
 
+        monkeypatch.setattr(SelectedContinuationState, "__post_init__", validate_selection)
         monkeypatch.setattr(transitions, "read_tool_issue_data_on_connection", read_issue)
         monkeypatch.setattr(evidence_reader, "read_selected_turn_evidence_graph_data_on_connection", read_evidence)
+        calibrated = replace(runtime.source.selected)
+        assert calibrated == runtime.source.selected and calibrated is not runtime.source.selected
+        assert len(constructors) == 1 and constructors[0] is calibrated
         before = stored_rows(operation_store[0])
         restored = await asyncio.to_thread(current.restore_messages, ((recipe, wire),))
         assert len(restored) == 1 and family_message_wire(restored[0]) == wire
@@ -473,6 +486,8 @@ async def test_completed_recipe_admits_original_issue_once_and_separate_completi
             if actual is conn and cursor == issue.cursor + 1 and returned_issues == 1
         ]
         assert len(issued) == len(completed) == 1 and issued[0][0] != completed[0][0]
+        assert historical_owners
+        assert all(sum(actual is selected for actual in constructors) == 1 for selected in historical_owners)
         assert conn.closed and stored_rows(operation_store[0]) == before and len(sdk) == 1
         assert runtime.materialization.capture_message(message) == (wire, recipe)
         owner.work.coordinator.assert_completed()

@@ -90,7 +90,6 @@ def read_runtime_source_on_connection(
         or inventory.running is not running
     ):
         raise AuditIntegrityError("runtime read requires its actual current and selected owners")
-    selected.__post_init__()
     if (selected.stack.logical.session_id, selected.stack.logical.operation_id) != (
         str(running.claim.session_id),
         running.claim.operation_id,

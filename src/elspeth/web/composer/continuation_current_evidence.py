@@ -53,7 +53,6 @@ def _assemble_current_message_evidence(
     ):
         raise AuditIntegrityError("current evidence crossed its actual selected message producers")
     _require_current_reader_service(service, authority)
-    selected.__post_init__()
     if materialization.finish_read is not None:
         materialization.finish_read.require_selection(selected, inventory)
     running = inventory.running
