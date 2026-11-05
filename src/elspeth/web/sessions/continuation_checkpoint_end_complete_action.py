@@ -185,13 +185,16 @@ def _require_original_end_outer_creator_on_connection(
         ):
             raise AuditIntegrityError("END outer creator changed its original paid PRIMARY identity")
     else:
+        semantic_source = original.active_action_source
+        if semantic_source is None:
+            raise AuditIntegrityError("END outer creator changed its original paid semantic Review")
         if terminal is None:
             admission = read_original_dispatched_semantic_review_on_connection(
                 conn,
                 session_id=UUID(sid),
                 operation_id=operation,
                 dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
-                semantic_effect_key=owed.outer_effect_key,
+                semantic_effect_key=semantic_source.effect_key,
             )
         else:
             if terminal_names is None:
@@ -201,7 +204,7 @@ def _require_original_end_outer_creator_on_connection(
                 session_id=UUID(sid),
                 operation_id=operation,
                 dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
-                semantic_effect_key=owed.outer_effect_key,
+                semantic_effect_key=semantic_source.effect_key,
                 names=terminal_names,
                 terminal=terminal,
             )

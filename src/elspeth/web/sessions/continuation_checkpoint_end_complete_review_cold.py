@@ -14,7 +14,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.advisor_audit import AdvisorCheckpointPassRecord, advisor_checkpoint_pass_audit_envelope
 from elspeth.web.composer.audit import llm_call_audit_envelope
-from elspeth.web.composer.continuation import ComposeFrame, EndFrame, PrivateChunkRef
+from elspeth.web.composer.continuation import ComposeFrame, EffectFrontierEntry, EndFrame, PrivateChunkRef
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     decode_continuation_snapshot,
@@ -27,7 +27,7 @@ from elspeth.web.composer.continuation_end_values import decode_end_candidate, e
 from elspeth.web.composer.continuation_progress import ActionExecutionReceipt, record_action_receipt
 from elspeth.web.coordination.quota_authority import _usage_entry_id, token_usage_entry_from_llm_call_envelope
 from elspeth.web.credential_guard import require_no_credential_material
-from elspeth.web.sessions.continuation import _effect_snapshot, read_chunk
+from elspeth.web.sessions.continuation import read_chunk
 from elspeth.web.sessions.continuation_checkpoint_end_owed import read_v4_checkpoint_end_settled_owed_history_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import require_checkpoint_paid_private_audit_on_connection
 from elspeth.web.sessions.continuation_retained_capacity import (
@@ -371,11 +371,17 @@ def read_original_v4_end_complete_review_on_connection(
         key=f"value:{after_receipt.reference.codec}:{after_receipt.reference.digest}",
     ) != after_receipt.canonical.encode("utf-8"):
         raise AuditIntegrityError("paid END Review changed its committed action receipt")
-    child_advanced = _effect_snapshot(
-        owed.payload_json, effect_key=commit.physical_effect_key, disposition="committed", receipt_id=child.receipt_key
+    frontier = tuple(
+        EffectFrontierEntry(
+            effect_id=item.effect_id,
+            disposition="committed",
+            receipt_id=child.receipt_key if item.effect_id == commit.physical_effect_key else review_effect_key,
+        )
+        if item.effect_id in (commit.physical_effect_key, review_effect_key)
+        else item
+        for item in owed_root.effect_frontier
     )
-    outer_advanced = _effect_snapshot(child_advanced, effect_key=review_effect_key, disposition="committed", receipt_id=review_effect_key)
-    advanced = decode_continuation_snapshot(outer_advanced).model_copy(update={"pending_settlement_ids": ()})
+    advanced = owed_root.model_copy(update={"effect_frontier": frontier, "pending_settlement_ids": ()})
     end = advanced.frames[-1]
     completed_root = decode_continuation_snapshot(completed.payload_json)
     if type(end) is not EndFrame or len(completed_root.frames) != 2:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from sqlalchemy import select, update
 
@@ -82,18 +84,43 @@ async def test_actual_paid_semantic_review_end_overflow_retains_historical_dispa
                 conn, owed=owed, names=names
             )
             assert admission is not None and admission.owner_effect_key == terminal.outer_effect_key
+            assert admission.paid.source.effect_key == case["semantic_effect_key"]
+            assert admission.paid.source.effect_key not in (terminal.outer_effect_key, terminal.source.effect_key)
             assert (
                 read_original_dispatched_semantic_review_after_end_overflow_on_connection(
                     conn,
                     session_id=session_id,
                     operation_id=operation_id,
                     dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
-                    semantic_effect_key=terminal.outer_effect_key,
+                    semantic_effect_key=case["semantic_effect_key"],
                     names=names,
                     terminal=terminal,
                 )
                 == admission
             )
+            for substituted_key in (terminal.outer_effect_key, terminal.source.effect_key):
+                with pytest.raises(AuditIntegrityError, match="Semantic SQL substituted its selected provider locator"):
+                    read_original_dispatched_semantic_review_after_end_overflow_on_connection(
+                        conn,
+                        session_id=session_id,
+                        operation_id=operation_id,
+                        dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
+                        semantic_effect_key=substituted_key,
+                        names=names,
+                        terminal=terminal,
+                    )
+            # An altered terminal must fail its independent cold equality check;
+            # this does not pretend to reach the later admitted-owner comparison.
+            with pytest.raises(AuditIntegrityError, match="exact paid-overflow terminal"):
+                read_original_dispatched_semantic_review_after_end_overflow_on_connection(
+                    conn,
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
+                    semantic_effect_key=case["semantic_effect_key"],
+                    names=names,
+                    terminal=replace(terminal, outer_effect_key=case["semantic_effect_key"]),
+                )
             corrupted = conn.begin_nested()
             conn.execute(
                 update(effects)
@@ -110,7 +137,7 @@ async def test_actual_paid_semantic_review_end_overflow_retains_historical_dispa
                     session_id=session_id,
                     operation_id=operation_id,
                     dispatch_checkpoint_id=owed.phase_source.checkpoint_id,
-                    semantic_effect_key=terminal.outer_effect_key,
+                    semantic_effect_key=case["semantic_effect_key"],
                     names=names,
                     terminal=terminal,
                 )

@@ -94,6 +94,200 @@ from tests.unit.web.sessions.test_continuation_prompt_producers import current_s
 operation_store = test_composer_operation_authority.operation_store
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", (False, True), ids=("original-owner", "replacement-owner"))
+async def test_actual_semantic_review_repair_preserves_paid_lineage_without_another_sdk_call(
+    operation_store, tmp_path, monkeypatch, recover
+):
+    from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointRepairContinued
+    from elspeth.web.sessions import continuation_checkpoint_end_complete_repair as repair_store
+    from elspeth.web.sessions.continuation_semantic_actions import read_original_dispatched_semantic_review_on_connection
+    from tests.unit.web.sessions import test_continuation_end_shared_execution as shared_fixture
+    from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
+
+    policy = continuation_policy_v4_from_settings(
+        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
+    )
+    assert policy is not None
+    authority = ComposerAsyncOperationAuthority(
+        operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
+    )
+    store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
+    monkeypatch.setattr(initialization_fixture, "minimal_continuation_policy", lambda: policy)
+    flagged = shared_fixture._end_admit()
+    flagged.update(verdict="FLAGGED", findings="The source still needs one requested field.", publication_verdict="WITHHOLD")
+    monkeypatch.setattr(shared_fixture, "_end_admit", lambda: flagged)
+    actual_execute = shared_fixture.execute_continuation_end_review
+    actual_persist = repair_store.persist_end_complete_repair_on_connection
+    original_batches, end_requests, assistants_before = [], [], []
+    interrupted = RuntimeError("original semantic Review repair consequence rolled back")
+
+    async def observe_end(phases, selected):
+        actual_sdk = litellm.acompletion
+        with store[0].connect() as conn:
+            assistants_before.extend(conn.execute(select(messages.c.id).where(messages.c.role == "assistant")).scalars())
+
+        async def complete(**options):
+            end_requests.append(options)
+            return await actual_sdk(**options)
+
+        monkeypatch.setattr(litellm, "acompletion", complete)
+        return await actual_execute(phases, selected)
+
+    def persist(conn, **arguments):
+        # Run the complete original SQL body. Recovery loses this transaction
+        # before commit, retaining the actual paid H rather than a patched row.
+        batch = actual_persist(conn, **arguments)
+        original_batches.append((batch, arguments))
+        if recover:
+            raise interrupted
+        return batch
+
+    monkeypatch.setattr(shared_fixture, "execute_continuation_end_review", observe_end)
+    monkeypatch.setattr(repair_store, "persist_end_complete_repair_on_connection", persist)
+    if recover:
+        with pytest.raises(RuntimeError) as failure:
+            async with shared_fixture.actual_shared_end_case(store, tmp_path, monkeypatch, timed_read=True):
+                pytest.fail("rolled-back semantic Review repair unexpectedly completed")
+        assert failure.value is interrupted
+    else:
+        async with shared_fixture.actual_shared_end_case(store, tmp_path, monkeypatch, timed_read=True) as case:
+            assert type(case["execution"]) is EndCheckpointRepairContinued
+            assert tuple(name for name, _ in case["sdk"]) == ("semantic", "end")
+            assert case["admission"].paid.source.effect_key == case["semantic_effect_key"]
+    assert len(original_batches) == len(end_requests) == 1
+    batch, original_arguments = original_batches[0]
+    running = original_arguments["prepared"].running
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    names = original_arguments["prepared"].env_ref_names
+    original = decode_continuation_snapshot(batch.owed.phase_source.payload_json)
+    source = original.active_action_source
+    assert source is not None and original.active_action_json is not None
+    assert source.effect_key not in (batch.owed.outer_effect_key, batch.owed.effect_key)
+    with locked_session_transaction(store[0], sid) as conn:
+        physical_ids = tuple(conn.execute(select(physical.c.attempt_id).where(physical.c.session_id == sid)).scalars())
+        current = load_snapshot(conn, session_id=sid, operation_id=operation)
+        if recover:
+            assert current == batch.owed.selected
+            assert decode_continuation_snapshot(current.payload_json).pending_settlement_ids == (batch.owed.attempt_id,)
+            held = conn.execute(select(holds).where(holds.c.provider_attempt_id == batch.owed.attempt_id)).one()
+            attempt = conn.execute(select(physical).where(physical.c.attempt_id == batch.owed.attempt_id)).one()
+            assert held.state == "active" and attempt.settled_at is None
+
+    if recover:
+        monkeypatch.setattr(repair_store, "persist_end_complete_repair_on_connection", actual_persist)
+        current_store = new_owners(store)
+        repository, current_authority, sessions = current_store[1:4]
+        assert repository.recover_composer_segment(
+            session_id=running.claim.session_id,
+            operation_id=operation,
+            expected_generation=running.claim.ownership_generation,
+            actor_user_id="alice",
+            auth_provider_type="local",
+        )
+        (claim,) = current_authority.claim_segment(limit=1)
+        context = repository.start_composer_segment(
+            claim, owner_instance_id=current_authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"
+        )
+        replacement = ComposerOperationRunning(claim=claim, session_operation_context=context)
+        assert replacement.claim.ownership_generation == running.claim.ownership_generation + 1
+        work = inventory_work(replacement)
+        provider = ProviderInvocationOwner(service=sessions, required_work=work)
+        lease = await ContinuationLeaseAdoption(repository, context, lease_seconds=30, required_work=work.coordinator).join()
+
+        async def no_repeated_sdk(**_options):
+            pytest.fail("cold semantic Review repair repeated the paid provider call")
+
+        monkeypatch.setattr(litellm, "acompletion", no_repeated_sdk)
+        try:
+            with locked_session_transaction(store[0], sid) as conn:
+                fresh = read_v4_checkpoint_end_owed_on_connection(
+                    conn, session_id=sid, operation_id=operation, attempt_id=batch.owed.attempt_id, names=names
+                )
+                assert fresh is not None and fresh.selected == current
+                assert read_current_end_h_recovery_on_connection(conn, selected=fresh.selected, names=names) == fresh
+            service, _actors = current_service(current_store)
+            phases = ContinuationLivePhases(service, current_authority, work, provider, lease)
+            selected = await load_selected_continuation(
+                authority=current_authority, running=replacement, selected=fresh.selected, required_work=work
+            )
+            cold = await read_cold_checkpoint_end_consequence_source(phases=phases, selected=selected)
+            gate = await compute_first_cold_checkpoint_end_gate(source=cold)
+            projected = await project_first_cold_end_repair(gate=gate)
+            assert type(projected) is ColdProjectedEndRepair
+            batch = sessions.complete_v4_checkpoint_end_cold_repair_sync(projected=projected)
+        finally:
+            await lease.close()
+            work.coordinator.assert_completed()
+
+    before_reads = stored_rows(store[0])
+    with locked_session_transaction(store[0], sid) as conn:
+        current = load_snapshot(conn, session_id=sid, operation_id=operation)
+        root = decode_continuation_snapshot(current.payload_json)
+        assert current.checkpoint_id == batch.append.checkpoint_id
+        assert type(root.frames[0]) is ComposeFrame and root.frames[0].phase == "action_ready"
+        assert not root.pending_settlement_ids
+        assert tuple(conn.execute(select(physical.c.attempt_id).where(physical.c.session_id == sid)).scalars()) == physical_ids
+        attempt = conn.execute(select(physical).where(physical.c.attempt_id == batch.owed.attempt_id)).one()
+        held = conn.execute(select(holds).where(holds.c.provider_attempt_id == batch.owed.attempt_id)).one()
+        assert attempt.settled_at is not None and held.state == "consumed"
+        assert tuple(conn.execute(select(messages.c.id).where(messages.c.role == "assistant")).scalars()) == tuple(assistants_before)
+        for _ in range(2):
+            historical = read_v4_checkpoint_end_settled_owed_history_on_connection(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                attempt_id=batch.owed.attempt_id,
+                owed_checkpoint_id=batch.owed.selected.checkpoint_id,
+                names=names,
+                child_disposition="committed",
+            )
+            proven = read_original_end_complete_repair_history_on_connection(conn, owed=historical, names=names)
+            assert proven.successor == current and proven.child_receipt == batch.child_receipt
+            assert proven.outer_receipt == batch.outer_receipt
+            sequence, generation, admission = require_original_end_outer_creator_after_complete_repair_on_connection(
+                conn, owed=historical, names=names
+            )
+            assert (sequence, generation) == (running.claim.segment_sequence, running.claim.ownership_generation)
+            assert admission is not None and admission.paid.source == source
+            assert admission.owner_effect_key == historical.outer_effect_key
+            assert (
+                read_original_dispatched_semantic_review_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=operation,
+                    dispatch_checkpoint_id=historical.phase_source.checkpoint_id,
+                    semantic_effect_key=source.effect_key,
+                )
+                == admission
+            )
+        # Real alternate effect keys and the original P checkpoint are DATA
+        # opponents; original retained rows and warm issuers stay untouched.
+        for substituted in (historical.outer_effect_key, historical.effect_key, original.frames[0].provider_effect_key):
+            assert substituted is not None and substituted != source.effect_key
+            with pytest.raises(AuditIntegrityError, match="Semantic SQL substituted its selected provider locator"):
+                read_original_dispatched_semantic_review_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=operation,
+                    dispatch_checkpoint_id=historical.phase_source.checkpoint_id,
+                    semantic_effect_key=substituted,
+                )
+        with pytest.raises(AuditIntegrityError):
+            read_original_dispatched_semantic_review_on_connection(
+                conn,
+                session_id=running.claim.session_id,
+                operation_id=operation,
+                dispatch_checkpoint_id=historical.prepared_selected.checkpoint_id,
+                semantic_effect_key=source.effect_key,
+            )
+        with pytest.raises(AuditIntegrityError):
+            require_original_end_outer_creator_after_complete_repair_on_connection(
+                conn, owed=replace(historical, outer_effect_key=source.effect_key), names=names
+            )
+    assert stored_rows(store[0]) == before_reads and len(end_requests) == 1
+
+
 @pytest.mark.parametrize(
     (
         "allowance",
@@ -596,7 +790,7 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                             assert proven.outer_receipt == committed.outer_receipt
                             assert require_original_end_outer_creator_after_complete_repair_on_connection(
                                 conn, owed=historical, names=prepared.env_ref_names
-                            ) == (running.claim.sequence, running.claim.generation, None)
+                            ) == (running.claim.segment_sequence, running.claim.ownership_generation, None)
                             altered = conn.begin_nested()
                             conn.execute(
                                 update(effects)
@@ -737,7 +931,7 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                 assert proven.outer_receipt == batch.outer_receipt
                 assert require_original_end_outer_creator_after_complete_repair_on_connection(
                     conn, owed=batch.owed, names=prepared.env_ref_names
-                ) == (running.claim.sequence, running.claim.generation, None)
+                ) == (running.claim.segment_sequence, running.claim.ownership_generation, None)
         if expect_overflow:
             assert type(failure) is ContinuationRetainedCapacityExceeded
             assert failure.observed_bytes > failure.limit_bytes == allowance

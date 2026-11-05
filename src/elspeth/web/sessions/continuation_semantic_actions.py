@@ -1022,7 +1022,6 @@ def read_original_dispatched_semantic_review_after_end_overflow_on_connection(
         or terminal.source.operation_id != operation_id
         or terminal.phase != "end"
         or terminal.hold_state != "consumed"
-        or terminal.outer_effect_key != semantic_effect_key
         or terminal.receipt.representation != "retained_tail"
         or read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
             conn,
@@ -1035,7 +1034,7 @@ def read_original_dispatched_semantic_review_after_end_overflow_on_connection(
     ):
         raise AuditIntegrityError("semantic END historical Review lacks its exact paid-overflow terminal")
     selected = _historical_snapshot(conn, str(session_id), operation_id, checkpoint_id=dispatch_checkpoint_id)
-    return _reprove_dispatched_review(
+    admission = _reprove_dispatched_review(
         conn,
         session_id,
         operation_id,
@@ -1044,6 +1043,9 @@ def read_original_dispatched_semantic_review_after_end_overflow_on_connection(
         current_running=None,
         paid_overflow_terminal=terminal,
     )
+    if terminal.outer_effect_key != admission.owner_effect_key:
+        raise AuditIntegrityError("semantic END historical Review lacks its exact paid-overflow terminal")
+    return admission
 
 
 def _reprove_dispatched_review(

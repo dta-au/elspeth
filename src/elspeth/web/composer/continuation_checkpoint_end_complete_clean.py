@@ -30,6 +30,7 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
     require_checkpoint_end_detached_source,
 )
 from elspeth.web.composer.continuation_checkpoint_observation import CheckpointReturnedResponseObservation
+from elspeth.web.composer.no_tool_policy import state_is_structurally_empty
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 from elspeth.web.interpretation_state import interpretation_sites
@@ -69,7 +70,7 @@ async def project_end_complete_clean(
     no_recompute = (
         live.state.version == gate.initial_version
         and not _state_contains_blob_ref(live.state)
-        and (prior is not None or live.state.validate().is_valid)
+        and (prior is not None or live.state.validate().is_valid or (prior is None and state_is_structurally_empty(live.state)))
         and gate.runtime_preflight == prior
     )
     graph_blocked = (

@@ -224,12 +224,15 @@ def prepare_end_complete_review_on_connection(
     if quota_entry is None or quota_entry.call_id != owed.attempt_id:
         raise AuditIntegrityError("END complete Review lost original provider accounting")
     paid_audit = checkpoint_paid_audit_cohort_for_hold(original_call, owed.new_hold)
+    semantic_source = before.active_action_source
+    if semantic_source is None:
+        raise AuditIntegrityError("END complete Review lost its original paid semantic action")
     admission = read_original_dispatched_semantic_review_on_connection(
         conn,
         session_id=running.claim.session_id,
         operation_id=operation,
         dispatch_checkpoint_id=dispatch_checkpoint_id,
-        semantic_effect_key=owed.outer_effect_key,
+        semantic_effect_key=semantic_source.effect_key,
     )
     candidate, owner_key = admission.review_candidate, admission.owner_effect_key
     if (

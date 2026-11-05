@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha256
 from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, select
@@ -231,11 +232,11 @@ def require_end_complete_repair_postwrite_on_connection(
     if (
         physical_row is None
         or physical_row.session_id != sid
-        # The quota attempt belongs to the enclosing fenced session operation;
-        # `operation` above is the distinct Continuation journal identity.
-        or physical_row.operation_id != running.session_operation_context.fence.operation_id
-        or physical_row.operation_epoch != running.session_operation_context.fence.operation_epoch
-        or physical_row.lease_token != running.session_operation_context.fence.lease_token
+        # The paid attempt retains its original creator identity even when a
+        # replacement running owner writes this consequence under its own fence.
+        or physical_row.operation_id != batch.owed.new_hold.session_operation_id
+        or physical_row.operation_epoch != batch.owed.new_hold.session_operation_epoch
+        or sha256(physical_row.lease_token.encode("utf-8")).hexdigest() != batch.owed.new_hold.lease_sha256
         or physical_row.settled_at is None
         or physical_row.ledger_entry_id != entry_id
         or entry is None

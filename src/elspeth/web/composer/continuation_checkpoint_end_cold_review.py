@@ -113,6 +113,7 @@ async def project_first_cold_end_review(*, gate: ColdCheckpointEndGate) -> ColdP
         and (
             prior is not None
             or live.state.validate().is_valid
+            or (prior is None and state_is_structurally_empty(live.state))
             or (
                 computation.action == "blocked_or_orphan_terminal"
                 and _original_blocked_absent_preflight_is_qualified(live.state, initial_version=live.initial_version, last_preflight=prior)
