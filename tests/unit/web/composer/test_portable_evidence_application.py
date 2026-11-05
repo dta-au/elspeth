@@ -435,6 +435,101 @@ async def portable_input(store, tmp_path, monkeypatch, *, kind="graph", share_au
 
 
 @pytest.mark.asyncio
+async def test_portable_projection_carries_actual_input_members_without_repeated_direct_admission(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer import continuation_prepared_p4 as prepared_values
+
+    async with portable_input(operation_store, tmp_path, monkeypatch) as (_running, args, values, _audit, _messages):
+        names = values["env_ref_names"]
+        actual_members = prepared_values._decoded_prepared_p4_members
+        actual_decode = application_data._decode_prepared_p4_with_members
+        actual_pending = application_data._pending_chunk
+        actual_input = application_data._require_input
+        actual_project = application_data._project
+        actual_cohort = application_data._project_recorder_cohort
+        assert actual_cohort is live_application._project_recorder_cohort
+        attempts, decoded, pending_counts, inputs, projected, cohorts = [], [], [], [], [], []
+
+        def admit(value, *, env_ref_names):
+            attempts.append(value)
+            return actual_members(value, env_ref_names=env_ref_names)
+
+        def decode(*args, **kwargs):
+            pair = actual_decode(*args, **kwargs)
+            decoded.append(pair)
+            return pair
+
+        def pending(*args, **kwargs):
+            start = len(attempts)
+            result = actual_pending(*args, **kwargs)
+            pending_counts.append(len(attempts) - start)
+            return result
+
+        def require_input(logical, response_chunk, pending_batch_chunk, graph, result, *, env_ref_names):
+            start, pending_start, decoded_start = len(attempts), len(pending_counts), len(decoded)
+            members = actual_input(logical, response_chunk, pending_batch_chunk, graph, result, env_ref_names=env_ref_names)
+            # Count the actual nested pending codec separately. Receipt/result
+            # admission outside this interval is also legitimate independent work.
+            assert len(attempts) - start - sum(pending_counts[pending_start:]) == 1
+            assert len(decoded) == decoded_start + 1 and members is decoded[-1][1]
+            inputs.append((graph, decoded[-1][0], members))
+            return members
+
+        def project(graph, result, *, members, env_ref_names):
+            start = len(attempts)
+            assert graph is inputs[-1][0] and members is inputs[-1][2]
+            projected_value = actual_project(graph, result, members=members, env_ref_names=env_ref_names)
+            assert len(attempts) == start
+            projected.append((graph, members, projected_value))
+            return projected_value
+
+        def cohort(before, members, result):
+            assert before is inputs[-1][0].recorder and members is inputs[-1][2]
+            after = actual_cohort(before, members, result)
+            cohorts.append((before, members, after))
+            return after
+
+        monkeypatch.setattr(prepared_values, "_decoded_prepared_p4_members", admit)
+        monkeypatch.setattr(application_data, "_decode_prepared_p4_with_members", decode)
+        monkeypatch.setattr(application_data, "_pending_chunk", pending)
+        monkeypatch.setattr(application_data, "_require_input", require_input)
+        monkeypatch.setattr(application_data, "_project", project)
+        monkeypatch.setattr(application_data, "_project_recorder_cohort", cohort)
+        original_effects = args["evidence"].effects
+        bundle = build_portable_p4_application(**values)
+        assert inputs and len(inputs) == len(projected) == len(cohorts)
+        assert sum(pending_counts) > 0 and len(attempts) > len(inputs)
+        assert bundle.entry.applications[-1].result == values["result_chunk"].reference
+        assert args["evidence"].effects is original_effects and args["evidence"]._historical_p4_applications == {}
+        for (graph, _prepared, members), (same_graph, same_members, projection), (before, cohort_members, _after) in zip(
+            inputs, projected, cohorts, strict=True
+        ):
+            assert same_graph is graph and same_members is cohort_members is members
+            assert before is graph.recorder
+            after = projection[1]
+            assert all(left is right for left, right in zip(before.invocations, after.invocations, strict=True))
+            assert all(left is right for left, right in zip(before.private_authorings, after.private_authorings, strict=True))
+            assert all(left is right for left, right in zip(before.visible_tool_events, after.visible_tool_events, strict=True))
+
+        # Calibrate zero member work in the pure projection and real admission
+        # in the standalone path that accepts separately supplied prepared DATA.
+        graph, prepared, members = inputs[0]
+        before = graph.recorder
+        start = len(attempts)
+        pure = live_application._project_recorder_cohort(before, members, values["result"])
+        assert len(attempts) == start and pure == cohorts[0][2]
+        standalone = live_application._project_recorder(before, prepared, values["result"], env_ref_names=names)
+        assert len(attempts) == start + 1 and standalone == pure
+        malformed = prepared.model_copy(update={"redacted_calls_json": "{}"})
+        with pytest.raises(AuditIntegrityError, match="retained P4 calls are not their object array"):
+            live_application._project_recorder(before, malformed, values["result"], env_ref_names=names)
+        assert len(attempts) == start + 2
+        invalid_recorder = replace(before, drained=replace(before.drained, invocations=len(before.invocations) + 1))
+        with pytest.raises(AuditIntegrityError, match="buffer drain cursor exceeds its retained channel"):
+            live_application._project_recorder(invalid_recorder, malformed, values["result"], env_ref_names=names)
+        assert len(attempts) == start + 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ("graph", "nongraph", "revoked", "crash", "unavailable"))
 async def test_complete_portable_projection_retains_real_outcome_all_channels_and_shared_graph(
     operation_store, monkeypatch, kind, tmp_path

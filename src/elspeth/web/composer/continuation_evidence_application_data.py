@@ -48,9 +48,14 @@ from elspeth.web.composer.continuation_evidence_application_values import (
     PortableP4ApplicationEntry,
     PortableP4ApplicationRecord,
 )
-from elspeth.web.composer.continuation_p4_application import HistoricalP4Application, _project_effects, _project_recorder
+from elspeth.web.composer.continuation_p4_application import HistoricalP4Application, _project_effects, _project_recorder_cohort
 from elspeth.web.composer.continuation_p4_batch import encode_p4_pending_batch_chunk
-from elspeth.web.composer.continuation_prepared_p4 import decode_prepared_p4, p4_semantic_input
+from elspeth.web.composer.continuation_prepared_p4 import (
+    PreparedP4Members,
+    _decode_prepared_p4_with_members,
+    _prepared_p4_semantic_input,
+    decode_prepared_p4,
+)
 from elspeth.web.composer.continuation_tool_batch import _read_json_value
 from elspeth.web.composer.turn_effects import PersistedTurnEffects, TurnEvidence, authored_state_hash
 from elspeth.web.credential_guard import require_no_credential_material
@@ -168,13 +173,17 @@ def _recorder_aliases(before: RecorderSnapshot, after: RecorderSnapshot) -> None
 
 
 def _project(
-    graph: ApplicationGraph, result: ReadmittedP4Result | PreparedP4ResultData, *, env_ref_names: frozenset[str]
+    graph: ApplicationGraph,
+    result: ReadmittedP4Result | PreparedP4ResultData,
+    *,
+    members: PreparedP4Members,
+    env_ref_names: frozenset[str],
 ) -> tuple[PersistedTurnEffects, RecorderSnapshot, Verification]:
     batch = graph.selected.batch
     if batch.p4_input_json is None:
         raise AuditIntegrityError("portable application lost its complete original P4 input")
-    prepared = decode_prepared_p4(batch.p4_input_json, env_ref_names=env_ref_names)
-    after_recorder = _project_recorder(graph.recorder, prepared, result, env_ref_names=env_ref_names)
+    graph.recorder.validate_links_and_cursors()
+    after_recorder = _project_recorder_cohort(graph.recorder, members, result)
     failures: list[str] = []
     after_effects, original_failure = _project_effects(
         graph.effects, result, graph.selected, env_ref_names=env_ref_names, failure_codes=failures
@@ -293,7 +302,7 @@ def _require_input(
     result: ReadmittedP4Result | PreparedP4ResultData,
     *,
     env_ref_names: frozenset[str],
-) -> None:
+) -> PreparedP4Members:
     if type(logical) is not LogicalRequestBinding or graph.selected.batch.phase != "p4_pending":
         raise AuditIntegrityError("portable application requires its actual pending logical cut")
     response = decode_continuation_response(response_chunk)
@@ -306,12 +315,12 @@ def _require_input(
     prepared_json = receipt.prepared_p4_json
     if prepared_json is None:
         raise AuditIntegrityError("portable application lost its complete original P4 input")
-    prepared = decode_prepared_p4(prepared_json, env_ref_names=env_ref_names)
+    prepared, members = _decode_prepared_p4_with_members(prepared_json, env_ref_names=env_ref_names)
     from elspeth.contracts.hashing import stable_hash
 
     if (
         prepared.session_id != logical.session_id
-        or stable_hash(_read_json_value(p4_semantic_input(prepared, env_ref_names=env_ref_names))) != receipt.input_sha256
+        or stable_hash(_read_json_value(_prepared_p4_semantic_input(prepared))) != receipt.input_sha256
     ):
         raise AuditIntegrityError("portable application changed its semantic input/session")
     if (
@@ -320,6 +329,7 @@ def _require_input(
         or graph.effects.latest_authored_state_hash != authored_state_hash(data.batch.entry_state)
     ):
         raise AuditIntegrityError("portable application changed previously accepted history")
+    return members
 
 
 def require_evidence_application_links(
@@ -467,12 +477,12 @@ def _build_portable_p4_application(
     graph = admitted.graph
     if graph is None:
         raise AuditIntegrityError("portable application requires the producer-captured joint identity graph")
-    _require_input(logical, response_chunk, pending_batch_chunk, graph, result, env_ref_names=env_ref_names)
+    members = _require_input(logical, response_chunk, pending_batch_chunk, graph, result, env_ref_names=env_ref_names)
     previous = snapshot.application_entry
     records = () if previous is None else previous.applications
     if any(item.effect_key == result.receipt.effect_key for item in records):
         raise AuditIntegrityError("portable application effect already belongs to applied history")
-    effects, recorder, code = _project(graph, result, env_ref_names=env_ref_names)
+    effects, recorder, code = _project(graph, result, members=members, env_ref_names=env_ref_names)
     cut = ApplicationGraphCut(graph.selected, graph.effects, effects, graph.recorder, recorder)
     complete = replace(
         graph.selected.batch,
@@ -660,14 +670,14 @@ def _require_p4_application_source(
     before = ApplicationGraph(cut.data, cut.effects_before, cut.recorder_before, graph.cuts[:index])
     response = sources.chunk(record.response)
     pending = sources.chunk(record.pending_batch)
-    _require_input(entry.logical, response, pending, before, result, env_ref_names=env_ref_names)
+    members = _require_input(entry.logical, response, pending, before, result, env_ref_names=env_ref_names)
     prepared_json = result.receipt.prepared_p4_json
     if prepared_json is None:
         raise AuditIntegrityError("portable application lost its complete original P4 input")
     prepared = encode_private_chunk(codec="composer.prepared-p4.v1", canonical=prepared_json, env_ref_names=env_ref_names)
     if record.prepared_input != prepared.reference or sources.chunk(record.prepared_input).canonical != prepared.canonical:
         raise AuditIntegrityError("portable journal changed its complete prepared input locator")
-    expected_effects, expected_recorder, code = _project(before, result, env_ref_names=env_ref_names)
+    expected_effects, expected_recorder, code = _project(before, result, members=members, env_ref_names=env_ref_names)
     if (
         record.verification != code
         or retained_effects(cut.effects_after) != retained_effects(expected_effects)

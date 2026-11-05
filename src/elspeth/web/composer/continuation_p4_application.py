@@ -24,7 +24,7 @@ from elspeth.web.composer.continuation_env_inventory import CurrentContinuationE
 from elspeth.web.composer.continuation_owed_p4 import _require_current_read_owners, require_selected_owed_p4_inventory
 from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk, encode_p4_pending_batch_chunk
 from elspeth.web.composer.continuation_p4_outcome import historical_checkpoint_record
-from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value, decode_prepared_p4, prepared_p4_members
+from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Members, PreparedP4Value, decode_prepared_p4, prepared_p4_members
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.composer.turn_effects import (
@@ -138,6 +138,13 @@ def _project_recorder(
 ) -> RecorderSnapshot:
     before.validate_links_and_cursors()
     members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
+    return _project_recorder_cohort(before, members, result)
+
+
+def _project_recorder_cohort(
+    before: RecorderSnapshot, members: PreparedP4Members, result: ReadmittedP4Result | PreparedP4ResultData
+) -> RecorderSnapshot:
+    """Project admitted member DATA after the caller's recorder link check."""
     cursor = before.drained
     count = len(members.invocations)
     if (

@@ -4,7 +4,8 @@ Mode zero observes only inclusive clock-to-preparation-finish time. Mode one
 adds selected inclusive spans, native thread CPU, SQL and the already calibrated
 original-witness observer, plus four-family memo statistics. Mode two records
 the same spans without the memo observer. A separate CPU opt-in, available
-in either span mode, captures the first current-evidence memo scope. No mode
+in either span mode, captures the first current-evidence memo scope or every
+original required worker. No mode
 replaces submitted callables, adjusts a deadline, consumes a clock stage,
 caches a result or records private payloads.
 """
@@ -29,13 +30,20 @@ CPU_PROFILE_FLAG = "ELSPETH_TEST_EARLY_PREPARATION_CPU"
 
 
 class EarlyPreparationProfile:
-    def __init__(self, *, enabled: bool, cpu_profile: bool = False, observe_memo: bool = True) -> None:
+    def __init__(
+        self, *, enabled: bool, cpu_profile: bool = False, observe_memo: bool = True, cpu_selection: str = "current_evidence"
+    ) -> None:
+        if cpu_selection not in {"current_evidence", "all_workers"}:
+            raise ValueError("EARLY CPU selection must be current_evidence or all_workers")
         if cpu_profile and not enabled:
             raise ValueError("EARLY CPU capture requires selected-span observations")
         self.enabled = enabled
         self.cpu_profile = cpu_profile
+        self.cpu_selection = cpu_selection
         self.spans = EndPreparationProfile(
-            enabled=enabled, cpu_profile=cpu_profile, cpu_selection="selected_scope" if cpu_profile else "all_workers"
+            enabled=enabled,
+            cpu_profile=cpu_profile,
+            cpu_selection="selected_scope" if cpu_profile and cpu_selection == "current_evidence" else "all_workers",
         )
         self.clocks: list[dict[str, Any]] = []
         self.spans.clocks = self.clocks
@@ -238,7 +246,7 @@ class EarlyPreparationProfile:
                                 preparation_entry=name == "bind_checkpoint_early_physical_request",
                             ),
                         )
-                    if self.cpu_profile:
+                    if self.cpu_profile and self.cpu_selection == "current_evidence":
                         patch.setattr(
                             current_evidence,
                             "borrow_v4_preparation_memo_scope",
@@ -324,14 +332,20 @@ class EarlyPreparationProfile:
                     issue.replace("original END", "original EARLY").replace("END-entry-exit", "EARLY-entry-exit")
                     for issue in result["cpu_capture_issues"]
                 ]
-                scope = self._cpu_selected_scope
                 clock = None if self._cpu_target_clock is None else self._by_clock.get(self._cpu_target_clock)
-                partial = scope is not None and (
-                    "end_ns" not in scope or scope.get("error") is not None or clock is None or not clock["finish_attempts"]
-                )
-                if scope is None:
-                    issues.append("CPU capture did not reach the original current-evidence memo scope")
-                elif partial:
+                if self.cpu_selection == "current_evidence":
+                    scope = self._cpu_selected_scope
+                    partial = scope is not None and (
+                        "end_ns" not in scope or scope.get("error") is not None or clock is None or not clock["finish_attempts"]
+                    )
+                    if scope is None:
+                        issues.append("CPU capture did not reach the original current-evidence memo scope")
+                else:
+                    partial = clock is None or not clock["finish_attempts"]
+                    captured = [profile["worker_id"] for profile in result["cpu_profiles"]]
+                    if len(captured) != len(set(captured)) or set(captured) != set(result["cpu_expected_workers"]):
+                        issues.append("CPU capture does not match every original EARLY worker exactly once")
+                if partial:
                     issues.append("CPU capture contains only a partial original EARLY preparation workload")
                 if result["incomplete_spans"] or result["unpaired_submissions"]:
                     issues.append("CPU capture has unfinished original worker observations")
@@ -339,8 +353,13 @@ class EarlyPreparationProfile:
                     cpu_capture_issues=issues,
                     cpu_capture_valid=not issues,
                     cpu_capture_status="partial_invalid" if partial else "invalid" if issues else "captured_preparation",
-                    cpu_scope="native thread CPU in first original current-evidence memo scope; queue and gate excluded; "
-                    "cProfile overhead included; no unprofiled wall-speed claim",
+                    cpu_scope=(
+                        "native thread CPU in first original current-evidence memo scope; queue and gate excluded; "
+                        "cProfile overhead included; no unprofiled wall-speed claim"
+                        if self.cpu_selection == "current_evidence"
+                        else "native thread CPU in every original required worker; gate included, queue excluded; "
+                        "event-loop frames not profiled; cProfile overhead included; no unprofiled wall-speed claim"
+                    ),
                 )
         return result
 
@@ -363,7 +382,7 @@ def early_preparation_profile(monkeypatch, engine, *, output_key):
         return
     assert mode in {"0", "1", "2"}
     cpu_mode = os.environ.get(CPU_PROFILE_FLAG)
-    assert cpu_mode in {None, "current_evidence"}, "EARLY CPU target must be current_evidence"
+    assert cpu_mode in {None, "current_evidence", "all_workers"}, "EARLY CPU target must be current_evidence or all_workers"
     assert cpu_mode is None or mode in {"1", "2"}, "EARLY CPU capture requires selected-span mode"
     root = Path(__file__).resolve().parents[2]
     directory = Path(os.environ.get(PROFILE_DIRECTORY, ".claude/lanes/early-preparation-profile"))
@@ -371,7 +390,12 @@ def early_preparation_profile(monkeypatch, engine, *, output_key):
         directory = root / directory
     directory = directory.resolve()
     assert directory.is_relative_to(root), "EARLY diagnostic output must remain inside this project"
-    profile = EarlyPreparationProfile(enabled=mode in {"1", "2"}, cpu_profile=cpu_mode == "current_evidence", observe_memo=mode == "1")
+    profile = EarlyPreparationProfile(
+        enabled=mode in {"1", "2"},
+        cpu_profile=cpu_mode is not None,
+        observe_memo=mode == "1",
+        cpu_selection=cpu_mode or "current_evidence",
+    )
     try:
         with profile.install(monkeypatch, engine):
             yield profile

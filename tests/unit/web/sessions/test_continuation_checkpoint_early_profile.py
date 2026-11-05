@@ -439,9 +439,13 @@ def test_early_cpu_profile_is_disabled_by_default_and_does_not_replace_evidence_
 
 
 @pytest.mark.asyncio
-async def test_early_cpu_profile_selects_one_original_scope_across_real_context_reset_workers(monkeypatch):
-    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True)
-    original_callable = evidence_bridge._restore_current_message_evidence
+@pytest.mark.parametrize("cpu_selection", ("current_evidence", "all_workers"))
+async def test_early_cpu_profile_selects_original_work_across_real_context_reset_workers(monkeypatch, cpu_selection):
+    profile = EarlyPreparationProfile(
+        enabled=True, cpu_profile=True, cpu_selection=cpu_selection, observe_memo=cpu_selection == "current_evidence"
+    )
+    original_callable = evidence_bridge._assemble_runtime_message_evidence
+    original_scope = evidence_bridge.borrow_v4_preparation_memo_scope
     actual_submit = ThreadPoolExecutor.submit
     marker = object()
     submissions, calls, verified_text = [], [], []
@@ -476,7 +480,9 @@ async def test_early_cpu_profile_selects_one_original_scope_across_real_context_
         with monkeypatch.context() as patch:
             patch.setattr(ThreadPoolExecutor, "submit", observed_submit)
             with profile.install(patch, engine), ThreadPoolExecutor(max_workers=1) as executor:
-                assert evidence_bridge._restore_current_message_evidence is original_callable
+                assert evidence_bridge._assemble_runtime_message_evidence is original_callable
+                if cpu_selection == "all_workers":
+                    assert evidence_bridge.borrow_v4_preparation_memo_scope is original_scope
                 clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
                 deadlines = clock.deadline, clock.preparation_deadline_monotonic
                 with v4_preparation_memo_scope(clock) as parent:
@@ -496,27 +502,111 @@ async def test_early_cpu_profile_selects_one_original_scope_across_real_context_
                     finish_v4_preparation_memo(clock)
                 assert executor.submit(sys.getprofile).result(timeout=5) is None
                 assert (clock.deadline, clock.preparation_deadline_monotonic) == deadlines and clock._seen == {"preparation"}
-        assert evidence_bridge._restore_current_message_evidence is original_callable
+        assert evidence_bridge._assemble_runtime_message_evidence is original_callable
         assert submissions[0][0] is first_bound and submissions[0][1][0] is adapter
         assert submissions[1][0] is second_bound and submissions[1][1][0] is adapter
         assert first.snapshot().callable_finished and second.snapshot().callable_finished and len(calls) == 4
         snapshot = profile.snapshot()
         assert snapshot["cpu_capture_valid"] is True and snapshot["cpu_capture_status"] == "captured_preparation"
-        assert snapshot["cpu_target_clocks"] == [id(clock)] and len(snapshot["cpu_profiles"]) == 1
+        assert snapshot["cpu_target_clocks"] == [id(clock)]
+        assert len(snapshot["cpu_profiles"]) == (1 if cpu_selection == "current_evidence" else 2)
         captured = snapshot["cpu_profiles"][0]
         assert captured["clock"] == id(clock) and captured["witness"] == first.identity
-        assert captured["within_preparation_window"] is True and "original current-evidence memo scope" in captured["scope"]
+        assert captured["within_preparation_window"] is True
         assert captured["timer"] == "time.thread_time_ns" and captured["timeunit"] == 1e-9
-        assert captured["selected_method"] == {
-            "module": original_callable.__module__,
-            "qualname": original_callable.__qualname__,
-            "file": original_callable.__code__.co_filename,
-            "line": original_callable.__code__.co_firstlineno,
-        }
+        if cpu_selection == "current_evidence":
+            assert "original current-evidence memo scope" in captured["scope"]
+            assert captured["selected_method"] == {
+                "module": original_callable.__module__,
+                "qualname": original_callable.__qualname__,
+                "file": original_callable.__code__.co_filename,
+                "line": original_callable.__code__.co_firstlineno,
+            }
+            assert snapshot["text_memo"]["families"]["canonical"]["requests"] == 4
+            assert snapshot["text_memo"]["families"]["canonical"]["hits"] == 3
+            assert snapshot["text_memo"]["observer_errors"] == 0
+        else:
+            assert snapshot["mode"] == "spans_only" and snapshot["text_memo"] is None
+            assert snapshot["cpu_selection"] == "all_workers"
+            assert {item["witness"] for item in snapshot["cpu_profiles"]} == {first.identity, second.identity}
+            assert snapshot["cpu_expected_workers"] == [item["worker_id"] for item in snapshot["cpu_profiles"]]
+            for item in snapshot["cpu_profiles"]:
+                assert item["selected_method"] is None and "original worker including gate" in item["scope"]
+                assert item["within_preparation_window"]
+                assert "controlled_body" in {entry["function"] for entry in item["entries"]}
+            missing_worker = profile.spans._cpu_profiles.pop()[0]["id"]
+            incomplete = profile.snapshot()
+            assert incomplete["cpu_capture_valid"] is False
+            assert incomplete["cpu_missing_workers"] == [missing_worker]
         assert "controlled_body" in {entry["function"] for entry in captured["entries"]}
-        assert snapshot["text_memo"]["families"]["canonical"]["requests"] == 4
-        assert snapshot["text_memo"]["families"]["canonical"]["hits"] == 3 and verified_text == ["{}"]
-        assert snapshot["text_memo"]["observer_errors"] == 0
+        assert verified_text == ["{}"]
+        assert not snapshot["errors"] and not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
+        assert sys.getprofile() is previous_hook and sys.monitoring.get_tool(tool) is None
+        assert sys.monitoring.get_events(tool) == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("unowned", "foreign_clock", "after_finish", "aborted_gate"))
+async def test_early_all_worker_cpu_preserves_selection_and_aborted_gate(monkeypatch, kind):
+    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True, cpu_selection="all_workers", observe_memo=False)
+    marker = object()
+    calls = []
+    previous_hook = sys.getprofile()
+    tool = sys.monitoring.PROFILER_ID
+    assert sys.monitoring.get_tool(tool) is None
+
+    def target_body():
+        calls.append("target")
+        return marker
+
+    def other_body():
+        calls.append("other")
+        return marker
+
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            deadlines = clock.deadline, clock.preparation_deadline_monotonic
+            with profile.spans.span("calibration.all_workers"):
+                first = RequiredInvocationWitness(1)
+                future = executor.submit(first.invoke, target_body)
+                first.arm()
+                assert future.result(timeout=5) is marker
+            if kind == "after_finish":
+                clock.finish_preparation()
+            elif kind == "foreign_clock":
+                foreign = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            if kind == "unowned":
+                assert executor.submit(other_body).result(timeout=5) is marker
+            else:
+                second = RequiredInvocationWitness(1)
+                other = executor.submit(second.invoke, other_body)
+                if kind == "aborted_gate":
+                    second.abort()
+                    with pytest.raises(RequiredInvocationAborted):
+                        other.result(timeout=5)
+                    assert second.snapshot().valid_aborted_exit
+                else:
+                    second.arm()
+                    assert other.result(timeout=5) is marker
+            if kind == "foreign_clock":
+                foreign.finish_preparation()
+            if kind != "after_finish":
+                clock.finish_preparation()
+            assert (clock.deadline, clock.preparation_deadline_monotonic) == deadlines
+            assert clock._seen == {"preparation"}
+        snapshot = profile.snapshot()
+        assert snapshot["cpu_capture_valid"] and snapshot["cpu_missing_workers"] == []
+        assert snapshot["cpu_target_clocks"] == [id(clock)]
+        assert snapshot["mode"] == "spans_only" and snapshot["text_memo"] is None
+        assert len(snapshot["cpu_profiles"]) == (2 if kind == "aborted_gate" else 1)
+        assert snapshot["cpu_profiles"][0]["parent_context"] == ["calibration.all_workers"]
+        assert calls == (["target"] if kind == "aborted_gate" else ["target", "other"])
+        assert "target_body" in {entry["function"] for entry in snapshot["cpu_profiles"][0]["entries"]}
+        assert all("other_body" not in {entry["function"] for entry in item["entries"]} for item in snapshot["cpu_profiles"])
         assert not snapshot["errors"] and not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
         assert sys.getprofile() is previous_hook and sys.monitoring.get_tool(tool) is None
         assert sys.monitoring.get_events(tool) == 0
