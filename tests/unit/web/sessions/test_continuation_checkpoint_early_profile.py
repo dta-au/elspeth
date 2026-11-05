@@ -1142,3 +1142,102 @@ async def test_early_cpu_profile_actual_finish_or_closed_creator_blocks_later_sc
                 assert not snapshot["errors"] and not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
     finally:
         engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ("first_only", "exception", "foreign_clock", "unowned", "no_parent", "after_finish", "existing_hook"))
+async def test_message_inputs_cpu_selects_one_actual_worker_call_and_restores_hooks(monkeypatch, case):
+    from contextlib import nullcontext
+
+    from elspeth.web.composer import continuation_prompt_producers as producers
+
+    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True, cpu_selection="message_inputs", observe_memo=False)
+    marker = object()
+    failure = RuntimeError("controlled message inputs failure")
+    calls = []
+    before = sys.getprofile()
+    tool = sys.monitoring.PROFILER_ID
+    assert sys.monitoring.get_tool(tool) is None
+
+    def existing_hook(_frame, _event, _argument):
+        return None
+
+    def target():
+        calls.append(threading.get_native_id())
+        assert sum(range(100)) == 4950
+        if case == "exception":
+            raise failure
+        return marker
+
+    def earlier_work():
+        return sum(range(10))
+
+    def later_work():
+        return sum(range(20))
+
+    def callback():
+        assert profile.spans._clock.get() == (id(clock) if case == "no_parent" else None)
+        earlier_work()
+        assert producers._inputs_from_current_evidence_on_connection() is marker
+        later_work()
+        assert producers._inputs_from_current_evidence_on_connection() is marker
+        return marker
+
+    engine = create_session_engine("sqlite://")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(producers, "_inputs_from_current_evidence_on_connection", target)
+            with profile.install(patch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+                clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+                selected_clock = (
+                    ContinuationActionClock(minimal_continuation_policy().actions.advisor) if case == "foreign_clock" else clock
+                )
+                with nullcontext() if case == "no_parent" else v4_preparation_memo_scope(selected_clock):
+                    adapter = prepare_retention_sql_callable(callback)
+                    if case == "after_finish":
+                        clock.finish_preparation()
+                        finish_v4_preparation_memo(clock)
+                    if case == "existing_hook":
+                        executor.submit(sys.setprofile, existing_hook).result(timeout=5)
+                    witness = RequiredInvocationWitness(1)
+                    if case == "unowned":
+                        future = executor.submit(adapter)
+                    else:
+                        future = executor.submit(witness.invoke, adapter)
+                        witness.arm()
+                    if case == "exception":
+                        with pytest.raises(RuntimeError) as raised:
+                            future.result(timeout=5)
+                        assert raised.value is failure
+                    else:
+                        assert future.result(timeout=5) is marker
+                    assert executor.submit(sys.getprofile).result(timeout=5) is (existing_hook if case == "existing_hook" else None)
+                    if case == "existing_hook":
+                        executor.submit(sys.setprofile, None).result(timeout=5)
+                    if case != "after_finish":
+                        clock.finish_preparation()
+                    if selected_clock is not clock:
+                        selected_clock.finish_preparation()
+                    finish_v4_preparation_memo(selected_clock)
+            assert producers._inputs_from_current_evidence_on_connection is target
+        result = profile.snapshot()
+        assert result["text_memo"] is None
+        assert not result["incomplete_spans"] and not result["unpaired_submissions"]
+        assert len(calls) == (1 if case == "exception" else 2)
+        assert result["cpu_capture_valid"] is (case == "first_only")
+        if case in {"first_only", "exception"}:
+            assert len(result["cpu_profiles"]) == 1
+            captured = result["cpu_profiles"][0]
+            assert captured["witness"] == witness.identity and captured["clock"] == id(clock)
+            assert captured["selected_method"]["qualname"] == target.__qualname__
+            entries = captured["entries"]
+            assert sum(entry["total_calls"] for entry in entries if entry["function"] == "target") == 1
+            assert not {"earlier_work", "later_work"}.intersection(entry["function"] for entry in entries)
+            assert captured["within_preparation_window"]
+            assert result["cpu_capture_status"] == ("partial_invalid" if case == "exception" else "captured_preparation")
+        else:
+            assert result["cpu_profiles"] == []
+        assert sys.getprofile() is before and sys.monitoring.get_tool(tool) is None
+        assert sys.monitoring.get_events(tool) == 0
+    finally:
+        engine.dispose()

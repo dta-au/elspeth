@@ -6,6 +6,7 @@ ordinary evidence reader retains its full current admission and journal check.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError, dataclass
 from typing import TYPE_CHECKING, Any, Self
 
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_batch_data import RestoredBatchData
     from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, TurnEvidenceSnapshot
     from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+    from elspeth.web.composer.continuation_phase_transitions import ToolIssueSource
     from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.tools._common import ToolResult
@@ -453,10 +455,7 @@ def _sources_from_admitted_evidence_on_connection(
             if retain_response(recipe.response) != actual:
                 raise AuditIntegrityError("native recipe changed its actual committed paid response source")
             checked_native.add(recipe.response)
-    result_sources = _admit_selected_tool_result_recipes_on_connection(
-        conn, running, selected=selected, admitted=admitted, names=inventory.names
-    )
-    feedback_sources = _admit_selected_tool_feedback_recipes_on_connection(
+    result_sources, feedback_sources = _admit_selected_tool_recipes_on_connection(
         conn, running, selected=selected, admitted=admitted, names=inventory.names
     )
     from elspeth.web.composer.continuation_control_transitions import control_result_message_on_connection
@@ -491,6 +490,7 @@ def _require_completed_tool_source_on_connection(
     admitted: AdmittedTurnEvidence,
     recipe: ToolResultMessageRecipe | ToolFeedbackMessageRecipe,
     names: frozenset[str],
+    read_issues: Callable[[], dict[tuple[str, int], tuple[ToolIssueSource, ...]]],
 ) -> _CompletedToolSource:
     """Prove a committed producer source, never bless the selected shelf text."""
     from elspeth.contracts.hashing import canonical_json
@@ -499,9 +499,7 @@ def _require_completed_tool_source_on_connection(
     from elspeth.web.composer.continuation_evidence import require_admitted_turn_evidence
     from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
     from elspeth.web.composer.continuation_phase_transitions import (
-        read_tool_effect_sources_on_connection,
         require_same_sequence_issue_history_on_connection,
-        validate_tool_effects_on_connection,
     )
     from elspeth.web.composer.tools._common import ToolResult
     from elspeth.web.sessions.continuation_selection import load_private_chunks
@@ -575,7 +573,7 @@ def _require_completed_tool_source_on_connection(
             recipe.tool_call_id,
         ) or refusal.cursor > selected.stack.cursor:
             raise AuditIntegrityError("argument feedback changed its original refused source selector")
-        validate_tool_effects_on_connection(conn, running, selected=selected, env_ref_names=names)
+        read_issues()
         completed = decode_coupled_batch_chunk(_actual_chunk(conn, running, refusal.result), env_ref_names=names)
         if completed.calls != data.calls or completed.batch.tool_outcomes != data.batch.tool_outcomes[: recipe.tool_index + 1]:
             raise AuditIntegrityError("argument feedback changed its actual original refused outcome")
@@ -600,8 +598,7 @@ def _require_completed_tool_source_on_connection(
         return _CompletedToolSource(data, original)
     # The complete effects read already admits each issue's historical source.
     # Reuse its actual issue DATA before checking this recipe's completion.
-    issues = read_tool_effect_sources_on_connection(conn, running, selected=selected, env_ref_names=names)
-    matching_issues = tuple(issue for issue in issues if f"tool:{issue.response.digest}:{issue.tool_index}" == key)
+    matching_issues = read_issues().get((recipe.response.digest, recipe.tool_index), ())
     if len(matching_issues) != 1:
         raise AuditIntegrityError("tool result source lost its actual immutable issue")
     issue = matching_issues[0]
@@ -676,13 +673,14 @@ def _require_tool_result_source_on_connection(
     admitted: AdmittedTurnEvidence,
     recipe: ToolResultMessageRecipe,
     names: frozenset[str],
+    read_issues: Callable[[], dict[tuple[str, int], tuple[ToolIssueSource, ...]]],
 ) -> _ToolResultFamilySource:
     from elspeth.web.composer.tools._common import ToolResult
 
     if type(recipe) is not ToolResultMessageRecipe:
         raise AuditIntegrityError("tool result source replaced its closed selector")
     completed = _require_completed_tool_source_on_connection(
-        conn, running, selected=selected, admitted=admitted, recipe=recipe, names=names
+        conn, running, selected=selected, admitted=admitted, recipe=recipe, names=names, read_issues=read_issues
     )
     data = completed.data
     call, outcome = data.calls[recipe.tool_index], data.batch.tool_outcomes[recipe.tool_index]
@@ -707,11 +705,12 @@ def _require_tool_feedback_source_on_connection(
     recipe: ToolFeedbackMessageRecipe,
     names: frozenset[str],
     text: str,
+    read_issues: Callable[[], dict[tuple[str, int], tuple[ToolIssueSource, ...]]],
 ) -> _ToolFeedbackFamilySource:
     if type(recipe) is not ToolFeedbackMessageRecipe:
         raise AuditIntegrityError("feedback source replaced its closed selector")
     completed = _require_completed_tool_source_on_connection(
-        conn, running, selected=selected, admitted=admitted, recipe=recipe, names=names
+        conn, running, selected=selected, admitted=admitted, recipe=recipe, names=names, read_issues=read_issues
     )
     data = completed.data
     graph = admitted.graph
@@ -765,6 +764,38 @@ def _require_tool_feedback_source_on_connection(
     return _ToolFeedbackFamilySource(recipe, call, outcome, invocation, message)
 
 
+def _admit_selected_tool_recipes_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    admitted: AdmittedTurnEvidence,
+    names: frozenset[str],
+) -> tuple[tuple[_ToolResultFamilySource, ...], tuple[_ToolFeedbackFamilySource, ...]]:
+    """Share one lazy complete effect proof within this actual SQL read only."""
+    from elspeth.web.composer.continuation_phase_transitions import read_tool_effect_sources_on_connection
+
+    issues_by_selector: dict[tuple[str, int], tuple[ToolIssueSource, ...]] | None = None
+
+    def read_issues() -> dict[tuple[str, int], tuple[ToolIssueSource, ...]]:
+        nonlocal issues_by_selector
+        if issues_by_selector is None:
+            issues = read_tool_effect_sources_on_connection(conn, running, selected=selected, env_ref_names=names)
+            grouped: dict[tuple[str, int], list[ToolIssueSource]] = {}
+            for issue in issues:
+                grouped.setdefault((issue.response.digest, issue.tool_index), []).append(issue)
+            issues_by_selector = {selector: tuple(matches) for selector, matches in grouped.items()}
+        return issues_by_selector
+
+    results = _admit_selected_tool_result_recipes_on_connection(
+        conn, running, selected=selected, admitted=admitted, names=names, read_issues=read_issues
+    )
+    feedback = _admit_selected_tool_feedback_recipes_on_connection(
+        conn, running, selected=selected, admitted=admitted, names=names, read_issues=read_issues
+    )
+    return results, feedback
+
+
 def _admit_selected_tool_feedback_recipes_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
@@ -772,6 +803,7 @@ def _admit_selected_tool_feedback_recipes_on_connection(
     selected: SelectedContinuationState,
     admitted: AdmittedTurnEvidence,
     names: frozenset[str],
+    read_issues: Callable[[], dict[tuple[str, int], tuple[ToolIssueSource, ...]]],
 ) -> tuple[_ToolFeedbackFamilySource, ...]:
     """Fresh selected source proof, also used by current input admission.
 
@@ -789,7 +821,7 @@ def _admit_selected_tool_feedback_recipes_on_connection(
     for recipe, text in zip(transcript.producer_recipes, transcript.messages_json, strict=True):
         if type(recipe) is ToolFeedbackMessageRecipe:
             source = _require_tool_feedback_source_on_connection(
-                conn, running, selected=selected, admitted=admitted, recipe=recipe, names=names, text=text
+                conn, running, selected=selected, admitted=admitted, recipe=recipe, names=names, text=text, read_issues=read_issues
             )
             if family_message_wire(source.message) != text:
                 raise AuditIntegrityError("feedback differs from complete original selected wire/body hash")
@@ -804,6 +836,7 @@ def _admit_selected_tool_result_recipes_on_connection(
     selected: SelectedContinuationState,
     admitted: AdmittedTurnEvidence,
     names: frozenset[str],
+    read_issues: Callable[[], dict[tuple[str, int], tuple[ToolIssueSource, ...]]],
 ) -> tuple[_ToolResultFamilySource, ...]:
     """Validate new recipe bodies after the caller's fresh current SQL read.
 
@@ -821,7 +854,9 @@ def _admit_selected_tool_result_recipes_on_connection(
     for recipe, text in zip(transcript.producer_recipes, transcript.messages_json, strict=True):
         if type(recipe) is not ToolResultMessageRecipe:
             continue
-        source = _require_tool_result_source_on_connection(conn, running, selected=selected, admitted=admitted, recipe=recipe, names=names)
+        source = _require_tool_result_source_on_connection(
+            conn, running, selected=selected, admitted=admitted, recipe=recipe, names=names, read_issues=read_issues
+        )
         if family_message_wire(source.message) != text:
             raise AuditIntegrityError("tool result producer differs from complete original selected wire/body hash")
         result.append(source)

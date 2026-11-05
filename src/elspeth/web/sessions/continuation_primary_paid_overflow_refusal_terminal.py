@@ -85,6 +85,8 @@ def read_v4_primary_no_sdk_refusal_on_connection(
     admitted = StoredContinuationSnapshot(admitted_text, admitted_row.cursor, admitted_row.checkpoint_id)
     admitted_root = decode_continuation_snapshot(admitted_text)
     admitted_frame = _primary_frame(admitted_root)
+    admitted_effects = tuple(entry for entry in admitted_root.effect_frontier if entry.effect_id == effect_key)
+    terminal_effects = tuple(entry for entry in terminal_root.effect_frontier if entry.effect_id == effect_key)
     if (
         terminal_root.logical != admitted_root.logical
         or terminal_root.policy_hash != source.policy_sha256
@@ -104,18 +106,18 @@ def read_v4_primary_no_sdk_refusal_on_connection(
         or admitted_frame.provider_effect_key != effect_key
         or admitted_frame.provider_input_sha256 != source.source_input_sha256
         or admitted_frame.phase != "awaiting_response"
-        or len(admitted_root.effect_frontier) != 1
+        or len(admitted_effects) != 1
         or (
-            admitted_root.effect_frontier[0].effect_id,
-            admitted_root.effect_frontier[0].disposition,
-            admitted_root.effect_frontier[0].receipt_id,
+            admitted_effects[0].effect_id,
+            admitted_effects[0].disposition,
+            admitted_effects[0].receipt_id,
         )
         != (effect_key, "dispatched", None)
-        or len(terminal_root.effect_frontier) != 1
+        or len(terminal_effects) != 1
         or (
-            terminal_root.effect_frontier[0].effect_id,
-            terminal_root.effect_frontier[0].disposition,
-            terminal_root.effect_frontier[0].receipt_id,
+            terminal_effects[0].effect_id,
+            terminal_effects[0].disposition,
+            terminal_effects[0].receipt_id,
         )
         != (effect_key, "refused", effect.receipt_key)
         or _bounded_bytes(conn, source, terminal_row.snapshot_chunk_key, "snapshot.v2") != terminal.payload_json.encode("utf-8")

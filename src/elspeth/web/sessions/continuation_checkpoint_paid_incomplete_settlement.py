@@ -85,7 +85,7 @@ def settle_v4_checkpoint_returned_incomplete_on_connection(
     ):
         raise AuditIntegrityError("checkpoint incomplete lost its original malformed physical audit")
     running = prepared.running
-    selected = require_current_checkpoint_dispatched_on_connection(conn, running, admission)
+    selected = require_current_checkpoint_dispatched_on_connection(conn, running, admission, allow_cancel=True, allow_expired_segment=True)
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     source = admission.hold
     identity = admission.paid_tail.identity

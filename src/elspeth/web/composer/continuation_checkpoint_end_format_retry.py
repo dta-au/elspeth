@@ -7,9 +7,9 @@ neither a decoded receipt nor an SDK failure grants another paid call.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from pydantic import TypeAdapter
 
@@ -72,20 +72,31 @@ class CheckpointEndFormatRetrySource:
     proof: VerifiedEndFormatRetry
     phase_owner: CheckpointPhaseOwner
     gate_locals: CheckpointEndGateLocals
+    _issued_record: _OriginalRetrySource | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
 class CheckpointEndRetryPublicationSource:
     proof: VerifiedEndFormatRetry
     phase_owner: CheckpointPhaseOwner
+    _issued_record: _OriginalRetryPublication | None = field(default=None, init=False, repr=False, compare=False)
 
 
-_issued: WeakKeyDictionary[CheckpointEndFormatRetrySource, tuple[VerifiedEndFormatRetry, CheckpointPhaseOwner, CheckpointEndGateLocals]] = (
-    WeakKeyDictionary()
-)
-_issued_publications: WeakKeyDictionary[CheckpointEndRetryPublicationSource, tuple[VerifiedEndFormatRetry, CheckpointPhaseOwner]] = (
-    WeakKeyDictionary()
-)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _OriginalRetrySource:
+    proof: VerifiedEndFormatRetry
+    phase_owner: CheckpointPhaseOwner
+    gate_locals: CheckpointEndGateLocals
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _OriginalRetryPublication:
+    proof: VerifiedEndFormatRetry
+    phase_owner: CheckpointPhaseOwner
+
+
+_issued: WeakKeyDictionary[CheckpointEndFormatRetrySource, ReferenceType[_OriginalRetrySource]] = WeakKeyDictionary()
+_issued_publications: WeakKeyDictionary[CheckpointEndRetryPublicationSource, ReferenceType[_OriginalRetryPublication]] = WeakKeyDictionary()
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,9 +113,14 @@ _DIAGNOSTICS = TypeAdapter(tuple[EndProofDiagnostic, ...])
 
 
 def require_original_checkpoint_end_format_retry(source: CheckpointEndFormatRetrySource) -> None:
-    original = _issued.get(source) if type(source) is CheckpointEndFormatRetrySource else None
-    if original is None or any(
-        actual is not expected for actual, expected in zip((source.proof, source.phase_owner, source.gate_locals), original, strict=True)
+    registered = _issued.get(source) if type(source) is CheckpointEndFormatRetrySource else None
+    original = None if registered is None else registered()
+    if (
+        original is None
+        or original is not source._issued_record
+        or source.proof is not original.proof
+        or source.phase_owner is not original.phase_owner
+        or source.gate_locals is not original.gate_locals
     ):
         raise AuditIntegrityError("END format retry requires its original SQL and gate source")
     owner, proof = source.phase_owner, source.proof
@@ -122,8 +138,15 @@ def require_original_checkpoint_end_format_retry(source: CheckpointEndFormatRetr
 def require_original_checkpoint_end_retry_publication(
     source: CheckpointEndRetryPublicationSource, *, phase_owner: CheckpointPhaseOwner
 ) -> str:
-    original = _issued_publications.get(source) if type(source) is CheckpointEndRetryPublicationSource else None
-    if original is None or source.proof is not original[0] or source.phase_owner is not original[1] or phase_owner is not original[1]:
+    registered = _issued_publications.get(source) if type(source) is CheckpointEndRetryPublicationSource else None
+    original = None if registered is None else registered()
+    if (
+        original is None
+        or original is not source._issued_record
+        or source.proof is not original.proof
+        or source.phase_owner is not original.phase_owner
+        or phase_owner is not original.phase_owner
+    ):
         raise AuditIntegrityError("END retry publication lacks its original issued SQL and phase owner")
     proof = source.proof
     owed = proof.owed
@@ -146,7 +169,9 @@ def require_original_checkpoint_end_retry_publication(
 
 def _issue_retry_publication_source(proof: VerifiedEndFormatRetry, owner: CheckpointPhaseOwner) -> CheckpointEndRetryPublicationSource:
     value = CheckpointEndRetryPublicationSource(proof, owner)
-    _issued_publications[value] = (proof, owner)
+    original = _OriginalRetryPublication(proof, owner)
+    object.__setattr__(value, "_issued_record", original)
+    _issued_publications[value] = ref(original)
     require_original_checkpoint_end_retry_publication(value, phase_owner=owner)
     return value
 
@@ -283,7 +308,9 @@ async def restore_checkpoint_end_format_retry_source(
         format_retry_publication_source=_issue_retry_publication_source(proof, owner),
     )
     issued = CheckpointEndFormatRetrySource(proof, owner, gate)
-    _issued[issued] = (proof, owner, gate)
+    original = _OriginalRetrySource(proof, owner, gate)
+    object.__setattr__(issued, "_issued_record", original)
+    _issued[issued] = ref(original)
     require_original_checkpoint_end_format_retry(issued)
     return issued
 
@@ -480,6 +507,8 @@ async def prepare_checkpoint_end_format_retry(
         format_retry_publication_source=_issue_retry_publication_source(proof, owner),
     )
     source = CheckpointEndFormatRetrySource(proof, owner, gate)
-    _issued[source] = (proof, owner, gate)
+    original = _OriginalRetrySource(proof, owner, gate)
+    object.__setattr__(source, "_issued_record", original)
+    _issued[source] = ref(original)
     require_original_checkpoint_end_format_retry(source)
     return source

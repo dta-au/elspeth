@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Literal
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
@@ -79,6 +79,7 @@ class CheckpointReturnedResponseObservation:
     audit_call: ComposerLLMCall
     response: PrivateChunk
     tool_batch: _AdmittedToolBatch = field(default_factory=lambda: _AdmittedToolBatch((), frozenset()))
+    _issued_record: _OriginalV4CheckpointReturn | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,12 +107,13 @@ class CheckpointIncompleteResponseObservation:
     retryable: Literal[False]
     cost: PaidOverflowCost
     usage: CheckpointOverflowUsageObservation
+    _issued_record: _OriginalV4CheckpointReturn | None = field(default=None, init=False, repr=False, compare=False)
 
 
 type CheckpointProviderResponseObservation = CheckpointCompleteResponseObservation | CheckpointIncompleteResponseObservation
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _OriginalV4CheckpointReturn:
     custody: ProviderCallCustody
     witness: V4ProviderResultCompleteness
@@ -122,8 +124,22 @@ class _OriginalV4CheckpointReturn:
 
 
 _v4_returns: WeakKeyDictionary[
-    CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation, _OriginalV4CheckpointReturn
+    CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation, ReferenceType[_OriginalV4CheckpointReturn]
 ] = WeakKeyDictionary()
+
+
+def _original_return(
+    result: CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation,
+) -> _OriginalV4CheckpointReturn:
+    reference = (
+        _v4_returns.get(result)
+        if type(result) in (CheckpointReturnedResponseObservation, CheckpointIncompleteResponseObservation)
+        else None
+    )
+    source = None if reference is None else reference()
+    if source is None or source is not result._issued_record:
+        raise AuditIntegrityError("V4 checkpoint result lacks its original physical return producer")
+    return source
 
 
 def _cost(call: ComposerLLMCall) -> PaidOverflowCost:
@@ -341,7 +357,7 @@ def observe_v4_checkpoint_returned_response(
     )
     if observation.audit_call.messages_hash != custody.continuation_checkpoint_v4_admission.hold.source_input_sha256:
         raise AuditIntegrityError("V4 checkpoint result changed its original admitted request")
-    _v4_returns[result] = _OriginalV4CheckpointReturn(
+    source = _OriginalV4CheckpointReturn(
         custody,
         witness,
         observation,
@@ -349,6 +365,8 @@ def observe_v4_checkpoint_returned_response(
         observation.audit_call.messages_hash,
         result.response.reference.digest if type(result) is CheckpointReturnedResponseObservation else None,
     )
+    object.__setattr__(result, "_issued_record", source)
+    _v4_returns[result] = ref(source)
     return result
 
 
@@ -359,12 +377,8 @@ def require_original_v4_checkpoint_returned_response(
     request_sha256: str,
 ) -> None:
     """Require the original raw SDK-result producer before SQL can mark completeness."""
-    source = (
-        _v4_returns.get(result)
-        if type(result) in (CheckpointReturnedResponseObservation, CheckpointIncompleteResponseObservation)
-        else None
-    )
-    if source is None or source.attempt_id != attempt_id or source.request_sha256 != request_sha256:
+    source = _original_return(result)
+    if source.attempt_id != attempt_id or source.request_sha256 != request_sha256:
         raise AuditIntegrityError("V4 checkpoint result lacks its original physical return producer")
     source.custody.require_v4_result_completeness(source.witness)
     if type(result) is CheckpointReturnedResponseObservation:
@@ -398,7 +412,7 @@ def original_v4_checkpoint_returned_audit_call(
     original call remains available only through the live SDK-return issuer.
     """
     require_original_v4_checkpoint_returned_response(result, attempt_id=attempt_id, request_sha256=request_sha256)
-    source = _v4_returns[result]
+    source = _original_return(result)
     call = source.original.audit_call
     message = source.original.message
     metadata = source.original.provider_metadata

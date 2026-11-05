@@ -37,6 +37,7 @@ from elspeth.web.composer.continuation_caches import (
     encode_continuation_caches,
     restore_continuation_caches,
 )
+from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness, ContinuationMandatoryCaptureOverflow
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_mandatory_private_chunk, encode_private_chunk, verify_private_chunk
 from elspeth.web.composer.continuation_current_evidence import _assemble_runtime_turn_evidence
 from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
@@ -51,6 +52,7 @@ from elspeth.web.composer.continuation_prompt_producers import (
     current_message_producers_from_runtime_source,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
@@ -99,6 +101,58 @@ class CapturedContinuationRuntime:
     selected: SelectedContinuationState
     stack: ContinuationFrameStack
     chunks: tuple[PrivateChunk, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeCapture:
+    captured: CapturedContinuationRuntime | None
+    overflow: ContinuationCaptureOverflowWitness | None
+
+
+def _capture_runtime_between_reads[Proof](
+    *,
+    read_source: Callable[[], Proof],
+    capture: Callable[[], CapturedContinuationRuntime],
+    changed_source_message: str,
+) -> _RuntimeCapture:
+    """Read callbacks close their transactions before the effectful capture.
+
+    Run inside the caller's registered worker. A mandatory size refusal still
+    owes the final source proof; unrelated capture errors retain their order.
+    """
+    before = read_source()
+    try:
+        captured = capture()
+    except (ComposerContextUnsupported, AuditIntegrityError) as error:
+        cause = error.__cause__
+        if type(cause) is not ContinuationMandatoryCaptureOverflow:
+            raise
+        try:
+            after = read_source()
+            if after != before:
+                raise AuditIntegrityError(changed_source_message)
+        except BaseException as failure:
+            raise BaseExceptionGroup("Runtime capture refusal and final source proof", [error, failure]) from None
+        return _RuntimeCapture(None, cause.witness)
+    after = read_source()
+    if after != before:
+        raise AuditIntegrityError(changed_source_message)
+    return _RuntimeCapture(captured, None)
+
+
+async def _registered_runtime_capture[Proof](
+    work: RequiredWorkBinding,
+    *,
+    read_source: Callable[[], Proof],
+    capture: Callable[[], CapturedContinuationRuntime],
+    changed_source_message: str,
+) -> _RuntimeCapture:
+    """Keep the complete read/capture/read operation in its original SQL scope."""
+
+    def operation() -> _RuntimeCapture:
+        return _capture_runtime_between_reads(read_source=read_source, capture=capture, changed_source_message=changed_source_message)
+
+    return await _registered_read(work, _RuntimeCapture, operation)
 
 
 @dataclass(frozen=True, slots=True, repr=False)

@@ -10,15 +10,14 @@ from dataclasses import dataclass, replace
 from weakref import WeakKeyDictionary
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness, ContinuationMandatoryCaptureOverflow
+from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness
 from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
     ColdCheckpointEndConsequenceSource,
     ColdCheckpointEndGate,
     require_original_cold_checkpoint_end_gate,
 )
 from elspeth.web.composer.continuation_checkpoint_end_computation import EndGateComputation
-from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, _capture_owners, _registered_read
-from elspeth.web.composer.protocol import ComposerContextUnsupported
+from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, _capture_owners, _registered_runtime_capture
 from elspeth.web.required_work import RequiredWorkBinding
 from elspeth.web.sessions.continuation_checkpoint_end_complete_withheld import (
     PreparedEndRepairWithheldReply,
@@ -126,23 +125,20 @@ async def project_first_cold_end_repair(*, gate: ColdCheckpointEndGate) -> ColdP
                 raise AuditIntegrityError("cold END repair changed its original H during projection")
             return owed
 
-    before = await _registered_read(work, VerifiedCheckpointEndOwed, read_h)
     capture_source = replace(runtime.source, selected=selected)
-    try:
-        captured = _capture_owners(runtime, source=capture_source, inventory=inventory)
-    except (ComposerContextUnsupported, AuditIntegrityError) as error:
-        witness = error.__cause__
-        if type(witness) is not ContinuationMandatoryCaptureOverflow:
-            raise
-        after = await _registered_read(work, VerifiedCheckpointEndOwed, read_h)
-        if after != before:
-            raise AuditIntegrityError("cold END repair changed H across mandatory size capture") from error
-        projected_overflow = ColdProjectedEndRepairOverflow(source, gate, witness.witness)
-        _overflows[projected_overflow] = (source, gate, witness.witness)
+    capture = await _registered_runtime_capture(
+        work,
+        read_source=read_h,
+        capture=lambda: _capture_owners(runtime, source=capture_source, inventory=inventory),
+        changed_source_message="cold END repair changed H across complete capture",
+    )
+    if capture.overflow is not None:
+        projected_overflow = ColdProjectedEndRepairOverflow(source, gate, capture.overflow)
+        _overflows[projected_overflow] = (source, gate, capture.overflow)
         return projected_overflow
-    after = await _registered_read(work, VerifiedCheckpointEndOwed, read_h)
-    if after != before:
-        raise AuditIntegrityError("cold END repair changed H across complete capture")
+    captured = capture.captured
+    if captured is None:
+        raise AuditIntegrityError("cold END repair lost captured DATA without a size witness")
     projected = ColdProjectedEndRepair(source, gate, captured, withheld)
     _issued[projected] = (source, gate, captured, withheld)
     return projected

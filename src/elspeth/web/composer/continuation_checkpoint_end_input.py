@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Annotated, Literal
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
@@ -252,9 +252,10 @@ def decode_checkpoint_end_input(chunk: PrivateChunk, *, env_ref_names: frozenset
 @dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
 class CapturedCheckpointEndInput:
     chunk: PrivateChunk
+    _issued_record: _OriginalEndInput | None = field(default=None, init=False, repr=False, compare=False)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _OriginalEndInput:
     phase_source: CheckpointPhaseSource
     runtime: RestoredContinuationRuntime
@@ -262,7 +263,15 @@ class _OriginalEndInput:
     chunk: PrivateChunk
 
 
-_issued: WeakKeyDictionary[CapturedCheckpointEndInput, _OriginalEndInput] = WeakKeyDictionary()
+_issued: WeakKeyDictionary[CapturedCheckpointEndInput, ReferenceType[_OriginalEndInput]] = WeakKeyDictionary()
+
+
+def _original_input(result: CapturedCheckpointEndInput) -> _OriginalEndInput:
+    reference = _issued.get(result) if type(result) is CapturedCheckpointEndInput else None
+    source = None if reference is None else reference()
+    if source is None or source is not result._issued_record:
+        raise AuditIntegrityError("END input requires its original pre-call capture producer")
+    return source
 
 
 def capture_checkpoint_end_input(
@@ -414,15 +423,17 @@ def capture_checkpoint_end_input(
             raise AuditIntegrityError("END gate input changed its exact superseded reply")
     chunk = encode_checkpoint_end_input(snapshot, env_ref_names=runtime.env_ref_names)
     result = CapturedCheckpointEndInput(chunk)
-    _issued[result] = _OriginalEndInput(phase_source, runtime, captured, chunk)
+    original = _OriginalEndInput(phase_source, runtime, captured, chunk)
+    object.__setattr__(result, "_issued_record", original)
+    _issued[result] = ref(original)
     return result
 
 
 def require_original_checkpoint_end_input(
     result: CapturedCheckpointEndInput, *, phase_source: CheckpointPhaseSource, captured: CapturedContinuationRuntime
 ) -> PrivateChunk:
-    source = _issued.get(result) if type(result) is CapturedCheckpointEndInput else None
-    if source is None or source.phase_source != phase_source or source.captured is not captured or source.chunk is not result.chunk:
+    source = _original_input(result)
+    if source.phase_source != phase_source or source.captured is not captured or source.chunk is not result.chunk:
         raise AuditIntegrityError("END input requires its original pre-call capture producer")
     decode_checkpoint_end_input(result.chunk, env_ref_names=source.runtime.env_ref_names)
     return result.chunk
@@ -432,7 +443,7 @@ def require_original_checkpoint_end_snapshot(
     result: CapturedCheckpointEndInput, *, phase_source: CheckpointPhaseSource, captured: CapturedContinuationRuntime
 ) -> tuple[PrivateChunk, CheckpointEndInputSnapshot]:
     chunk = require_original_checkpoint_end_input(result, phase_source=phase_source, captured=captured)
-    source = _issued[result]
+    source = _original_input(result)
     return chunk, decode_checkpoint_end_input(chunk, env_ref_names=source.runtime.env_ref_names)
 
 
@@ -440,4 +451,4 @@ def require_original_checkpoint_end_env_names(
     result: CapturedCheckpointEndInput, *, phase_source: CheckpointPhaseSource, captured: CapturedContinuationRuntime
 ) -> frozenset[str]:
     require_original_checkpoint_end_input(result, phase_source=phase_source, captured=captured)
-    return _issued[result].runtime.env_ref_names
+    return _original_input(result).runtime.env_ref_names

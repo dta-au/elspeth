@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal
+from weakref import ref
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
@@ -222,7 +223,7 @@ def observe_v4_early_checkpoint_returned_response(
         result = CheckpointReturnedResponseObservation(
             "early", attempt, observation.message, metadata, call, response, observation.tool_batch
         )
-    _v4_returns[result] = _OriginalV4CheckpointReturn(
+    source = _OriginalV4CheckpointReturn(
         custody,
         witness,
         observation,
@@ -230,4 +231,6 @@ def observe_v4_early_checkpoint_returned_response(
         call.messages_hash,
         result.response.reference.digest if type(result) is CheckpointReturnedResponseObservation else None,
     )
+    object.__setattr__(result, "_issued_record", source)
+    _v4_returns[result] = ref(source)
     return result

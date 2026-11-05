@@ -129,6 +129,16 @@ def read_tool_issue_data_on_connection(
     conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, env_ref_names: frozenset[str]
 ) -> ToolIssueSource:
     """Immutable issue DATA after the caller's exact SQL ownership proof."""
+    issue, _encoded, _prepared = _read_tool_issue_with_prepared_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, effect_key=effect_key, env_ref_names=env_ref_names
+    )
+    return issue
+
+
+def _read_tool_issue_with_prepared_data_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, env_ref_names: frozenset[str]
+) -> tuple[ToolIssueSource, str, RestoredPreparedBatchData]:
+    """Keep the actual decoded prepared DATA private to this source read."""
     sid, operation = str(session_id), operation_id
     effect = conn.execute(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == effect_key)
@@ -242,7 +252,7 @@ def read_tool_issue_data_on_connection(
         or (call.original_creator_id, call.original_creator_epoch) != (issue.creator_operation_id, issue.creator_operation_epoch)
     ):
         raise AuditIntegrityError("tool issue changed its source-authored call/argument identity")
-    return issue
+    return issue, encoded, data
 
 
 def validate_tool_effects_on_connection(
@@ -334,7 +344,7 @@ def _read_tool_effects_data_on_connection(
             ):
                 raise AuditIntegrityError("value preparation refusal changed its selected original frontier")
             continue
-        issue = read_tool_issue_data_on_connection(
+        issue, issued_raw, issued_prepared = _read_tool_issue_with_prepared_data_on_connection(
             conn, session_id=session_id, operation_id=operation_id, effect_key=effect.effect_key, env_ref_names=env_ref_names
         )
         issues.append(issue)
@@ -361,7 +371,7 @@ def _read_tool_effects_data_on_connection(
         prepared_raw = read_chunk(
             conn, session_id=sid, operation_id=operation, key=f"value:{issue.prepared.codec}:{issue.prepared.digest}"
         ).decode("utf-8", errors="strict")
-        prepared = decode_prepared_batch_data(prepared_raw, env_ref_names=env_ref_names)
+        prepared = issued_prepared if prepared_raw == issued_raw else decode_prepared_batch_data(prepared_raw, env_ref_names=env_ref_names)
         if (
             completed.calls != prepared.calls
             or completed.batch.next_tool_index != issue.tool_index + 1

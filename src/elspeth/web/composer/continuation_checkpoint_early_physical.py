@@ -41,6 +41,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _DispatchOutcome, _PersistOutcome
+    from elspeth.web.composer.continuation_checkpoint_early_adoption import _SettledEarly
     from elspeth.web.composer.continuation_checkpoint_observation import (
         CheckpointIncompleteResponseObservation,
         CheckpointReturnedResponseObservation,
@@ -62,9 +63,11 @@ class CheckpointEarlyPhysicalSource:
     captured: CapturedContinuationRuntime = field(repr=False)
     clock: ContinuationActionClock = field(repr=False)
     capture: _AdvisorInvocationCapture = field(repr=False)
+    _issued_record: _OriginalEarlySource | None = field(default=None, init=False, repr=False, compare=False)
+    _settled_record: _SettledEarly | None = field(default=None, init=False, repr=False, compare=False)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, weakref_slot=True)
 class _OriginalEarlySource:
     phase_owner: CheckpointPhaseOwner
     dispatch: _DispatchOutcome
@@ -84,7 +87,15 @@ class _OriginalEarlySource:
     detached_capture: CapturedContinuationRuntime | None = None
 
 
-_issued: WeakKeyDictionary[CheckpointEarlyPhysicalSource, _OriginalEarlySource] = WeakKeyDictionary()
+_issued: WeakKeyDictionary[CheckpointEarlyPhysicalSource, ReferenceType[_OriginalEarlySource]] = WeakKeyDictionary()
+
+
+def _original_source(source: CheckpointEarlyPhysicalSource) -> _OriginalEarlySource:
+    reference = _issued.get(source) if type(source) is CheckpointEarlyPhysicalSource else None
+    original = None if reference is None else reference()
+    if original is None or original is not source._issued_record:
+        raise AuditIntegrityError("EARLY physical request lost its original issued observation")
+    return original
 
 
 @asynccontextmanager
@@ -139,8 +150,8 @@ def require_original_checkpoint_early_physical_source(source: CheckpointEarlyPhy
     from elspeth.web.composer.continuation_semantic_advisor_return import _live_source
     from elspeth.web.composer.no_tool_policy import state_is_structurally_empty
 
-    original = _issued.get(source) if type(source) is CheckpointEarlyPhysicalSource else None
-    if original is None or any(
+    original = _original_source(source)
+    if any(
         actual is not expected
         for actual, expected in (
             (source.phase_owner, original.phase_owner),
@@ -239,7 +250,9 @@ async def prepare_checkpoint_early_physical_source(
     captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=runtime.materialization.inventory)
     capture = _AdvisorInvocationCapture()
     source = CheckpointEarlyPhysicalSource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture)
-    _issued[source] = _OriginalEarlySource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture, retry=retry)
+    original = _OriginalEarlySource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture, retry=retry)
+    object.__setattr__(source, "_issued_record", original)
+    _issued[source] = ref(original)
     require_original_checkpoint_early_physical_source(source)
     return source
 
@@ -251,7 +264,7 @@ def require_checkpoint_early_prepared_clock(prepared: PreparedCheckpointProvider
     if not isinstance(source, CheckpointEarlyPhysicalSource):
         raise AuditIntegrityError("EARLY timing lost its original live source")
     require_original_checkpoint_early_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     owner = source.phase_owner
     if (
         original.prepared is not prepared
@@ -283,7 +296,7 @@ async def bind_checkpoint_early_physical_request(
     from elspeth.web.composer.provider_gateway import _apply_openrouter_usage_accounting
 
     require_original_checkpoint_early_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     owner = source.phase_owner
     running = owner.phases.work.running
     if (
@@ -409,7 +422,7 @@ def require_original_checkpoint_early_input(
     if not isinstance(source, CheckpointEarlyPhysicalSource):
         raise AuditIntegrityError("EARLY preparation lost its original live source")
     require_original_checkpoint_early_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     if original.early_input is not value or source.captured is not captured or original.prepared_input is None:
         raise AuditIntegrityError("EARLY preparation replaced its original prepared request")
     supplied = original.prepared_input
@@ -426,7 +439,7 @@ def require_original_checkpoint_early_input(
 
 def checkpoint_early_physical_custody(source: CheckpointEarlyPhysicalSource) -> ProviderCallCustody:
     require_original_checkpoint_early_physical_source(source)
-    custody = _issued[source].custody
+    custody = _original_source(source).custody
     if custody is None:
         raise AuditIntegrityError("EARLY physical source has no original bound custody")
     return custody
@@ -434,7 +447,7 @@ def checkpoint_early_physical_custody(source: CheckpointEarlyPhysicalSource) -> 
 
 def checkpoint_early_format_retry(source: CheckpointEarlyPhysicalSource) -> VerifiedEarlyFormatRetry | None:
     require_original_checkpoint_early_physical_source(source)
-    return _issued[source].retry
+    return _original_source(source).retry
 
 
 def require_checkpoint_early_detached_source(
@@ -443,10 +456,23 @@ def require_checkpoint_early_detached_source(
     detached: RestoredContinuationRuntime,
     original: RestoredContinuationRuntime,
 ) -> None:
+    """Validate the complete original graph in the caller's registered worker."""
     from elspeth.web.composer.continuation_checkpoint_end_detached import require_detached_end_capture
 
+    expected = _require_checkpoint_early_detached_owners(source, detached=detached, original=original)
+    require_detached_end_capture(detached, expected=expected, phase_owner=source.phase_owner)
+
+
+def _require_checkpoint_early_detached_owners(
+    source: CheckpointEarlyPhysicalSource,
+    *,
+    detached: RestoredContinuationRuntime,
+    original: RestoredContinuationRuntime,
+) -> CapturedContinuationRuntime:
+    from elspeth.web.composer.continuation_checkpoint_end_detached import require_detached_end_owners
+
     require_original_checkpoint_early_physical_source(source)
-    issued = _issued[source]
+    issued = _original_source(source)
     if (
         issued.detached is not detached
         or source.phase_owner.runtime is not original
@@ -455,28 +481,31 @@ def require_checkpoint_early_detached_source(
         or detached.source.selected.checkpoint_id != issued.prepared.prepared_source.prepared_selected.checkpoint_id
     ):
         raise AuditIntegrityError("EARLY projection replaced its original independent pre-call graph")
-    require_detached_end_capture(detached, expected=issued.detached_capture, phase_owner=source.phase_owner)
+    require_detached_end_owners(detached, original)
+    return issued.detached_capture
 
 
 def checkpoint_early_detached_runtime(source: CheckpointEarlyPhysicalSource) -> RestoredContinuationRuntime:
     require_original_checkpoint_early_physical_source(source)
-    detached = _issued[source].detached
+    detached = _original_source(source).detached
     if detached is None:
         raise AuditIntegrityError("EARLY physical source has no original retained detached graph")
-    require_checkpoint_early_detached_source(source, detached=detached, original=source.phase_owner.runtime)
+    # Only hand off the exact original owners here. The projector performs the
+    # full capture/compare immediately before applying its result in one worker.
+    _require_checkpoint_early_detached_owners(source, detached=detached, original=source.phase_owner.runtime)
     return detached
 
 
 def note_checkpoint_early_physical_failure(source: CheckpointEarlyPhysicalSource, error: BaseException) -> None:
     require_original_checkpoint_early_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     if original.issuer is not None and original.custody is not None:
         original.issuer.note_original_failure(original.custody, error)
 
 
 def checkpoint_early_physical_no_sdk_issuer(source: CheckpointEarlyPhysicalSource) -> CheckpointNoSdkIssuer:
     require_original_checkpoint_early_physical_source(source)
-    issuer = _issued[source].issuer
+    issuer = _original_source(source).issuer
     if issuer is None:
         raise AuditIntegrityError("EARLY physical source has no original no-SDK issuer")
     return issuer
@@ -509,7 +538,7 @@ def observe_checkpoint_early_sdk_companion(
     from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure
 
     require_original_checkpoint_early_physical_source(source)
-    custody = _issued[source].custody
+    custody = _original_source(source).custody
     return None if custody is None else capture_sdk_terminal_failure(failure, custody=custody)
 
 
@@ -530,7 +559,7 @@ def _bind_early_finalizers(
     def require_admission() -> None:
         require_original_checkpoint_early_physical_source(source)
         if (
-            _issued[source].custody is not custody
+            _original_source(source).custody is not custody
             or custody.continuation_checkpoint_v4 is not prepared
             or custody.continuation_checkpoint_v4_admission is None
             or source.phase_owner.phases.service._sessions_service is not sessions

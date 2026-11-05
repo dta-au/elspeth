@@ -7,9 +7,9 @@ or changes the live checkpoint caller's recorder/transcript.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -36,7 +36,9 @@ from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
     RestoredContinuationRuntime,
     _capture_owners,
+    _capture_runtime_between_reads,
     _registered_read,
+    _RuntimeCapture,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.protocol import ComposerContextUnsupported
@@ -44,6 +46,7 @@ from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.required_work import RequiredWorkBinding
+from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.locking import locked_session_transaction
 
 if TYPE_CHECKING:
@@ -70,9 +73,10 @@ class ProjectedEarlyCheckpoint:
     injection: str | None
     retry_pending: bool
     accounting: CheckpointPassAccounting
+    _issued_record: _ProjectionSource | None = field(default=None, init=False, repr=False, compare=False)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _ProjectionSource:
     prepared: PreparedCheckpointProvider
     admission: V4CheckpointProviderAdmission
@@ -99,12 +103,11 @@ class _ProjectionOverflowSource:
 
 
 @dataclass(frozen=True, slots=True)
-class _ProjectionCapture:
-    captured: CapturedContinuationRuntime | None
-    overflow: ContinuationCaptureOverflowWitness | None
+class _EarlyProjectionResult:
+    value: ProjectedEarlyCheckpoint | ProjectedEarlyCheckpointOverflow
 
 
-_issued: WeakKeyDictionary[ProjectedEarlyCheckpoint, _ProjectionSource] = WeakKeyDictionary()
+_issued: WeakKeyDictionary[ProjectedEarlyCheckpoint, ReferenceType[_ProjectionSource]] = WeakKeyDictionary()
 _overflows: WeakKeyDictionary[ProjectedEarlyCheckpointOverflow, _ProjectionOverflowSource] = WeakKeyDictionary()
 
 
@@ -202,7 +205,7 @@ def _require_detached_source(detached: RestoredContinuationRuntime, original: Re
         raise AuditIntegrityError("checkpoint projection reused an original mutable batch owner")
 
 
-async def _capture_dispatched_projection(
+def _capture_dispatched_projection(
     *,
     prepared: PreparedCheckpointProvider,
     admission: V4CheckpointProviderAdmission,
@@ -210,7 +213,7 @@ async def _capture_dispatched_projection(
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
     runtime_work: RequiredWorkBinding,
-) -> _ProjectionCapture:
+) -> _RuntimeCapture:
     from elspeth.web.sessions.continuation_checkpoint_paid import require_current_checkpoint_dispatched_on_connection
 
     before = detached.source.selected.stack
@@ -238,30 +241,29 @@ async def _capture_dispatched_projection(
     ):
         raise AuditIntegrityError("checkpoint projection replaced its exact pre-call graph at dispatch")
 
-    def capture() -> _ProjectionCapture:
+    def read_dispatched() -> StoredContinuationSnapshot:
         with locked_session_transaction(prepared.authority._engine, str(prepared.running.claim.session_id)) as conn:
             if require_current_checkpoint_dispatched_on_connection(conn, prepared.running, admission) != admission.selected:
                 raise AuditIntegrityError("checkpoint projection lost its actual pending source")
-            # Ordinary runtime reads correctly refuse unresolved quota attempts.
-            # Only the exact original held attempt may bind its already decoded
-            # pre-call DATA to the current dispatch frontier for this capture.
-            source = replace(detached.source, selected=selected)
-            try:
-                result = _ProjectionCapture(_capture_owners(detached, source=source, inventory=inventory), None)
-            except (ComposerContextUnsupported, AuditIntegrityError) as error:
-                cause = error.__cause__
-                if type(cause) is not ContinuationMandatoryCaptureOverflow:
-                    raise
-                _require_capture_witness(cause.witness)
-                # This is only a size witness. Authority comes from the exact
-                # original source/call checks and held-attempt proof around the
-                # actual capture, never from arbitrary encoder exceptions.
-                result = _ProjectionCapture(None, cause.witness)
-            if require_current_checkpoint_dispatched_on_connection(conn, prepared.running, admission) != admission.selected:
-                raise AuditIntegrityError("checkpoint projection changed its pending source while capturing")
-            return result
+            return admission.selected
 
-    return await _registered_read(prepared.work, _ProjectionCapture, capture)
+    def capture() -> CapturedContinuationRuntime:
+        # Only the original held attempt may bind the decoded pre-call DATA to
+        # dispatch. No outer writer survives the capture's own live-fence CAS.
+        source = replace(detached.source, selected=selected)
+        try:
+            return _capture_owners(detached, source=source, inventory=inventory)
+        except (ComposerContextUnsupported, AuditIntegrityError) as error:
+            cause = error.__cause__
+            if type(cause) is ContinuationMandatoryCaptureOverflow:
+                _require_capture_witness(cause.witness)
+            raise
+
+    return _capture_runtime_between_reads(
+        read_source=read_dispatched,
+        capture=capture,
+        changed_source_message="checkpoint projection changed its pending source while capturing",
+    )
 
 
 async def project_early_checkpoint_result(
@@ -276,6 +278,41 @@ async def project_early_checkpoint_result(
     returned: CheckpointReturnedResponseObservation,
     accounting: CheckpointPassAccounting,
     physical_source: CheckpointEarlyPhysicalSource | None = None,
+) -> ProjectedEarlyCheckpoint | ProjectedEarlyCheckpointOverflow:
+    """Validate, apply and capture the exact original result in one worker."""
+
+    def project() -> _EarlyProjectionResult:
+        return _EarlyProjectionResult(
+            _project_early_checkpoint_result(
+                prepared=prepared,
+                admission=admission,
+                detached=detached,
+                original=original,
+                selected=selected,
+                inventory=inventory,
+                custody=custody,
+                returned=returned,
+                accounting=accounting,
+                physical_source=physical_source,
+            )
+        )
+
+    result = await _registered_read(prepared.work, _EarlyProjectionResult, project)
+    return result.value
+
+
+def _project_early_checkpoint_result(
+    *,
+    prepared: PreparedCheckpointProvider,
+    admission: V4CheckpointProviderAdmission,
+    detached: RestoredContinuationRuntime,
+    original: RestoredContinuationRuntime,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    custody: ProviderCallCustody,
+    returned: CheckpointReturnedResponseObservation,
+    accounting: CheckpointPassAccounting,
+    physical_source: CheckpointEarlyPhysicalSource | None,
 ) -> ProjectedEarlyCheckpoint | ProjectedEarlyCheckpointOverflow:
     """Measure the original call and exact EARLY consequence on an isolated graph.
 
@@ -361,7 +398,7 @@ async def project_early_checkpoint_result(
     runtime_work = original.bindings.required_work if physical_source is not None else prepared.work
     if type(runtime_work) is not RequiredWorkBinding:
         raise AuditIntegrityError("EARLY projection lost its original runtime work owner")
-    capture = await _capture_dispatched_projection(
+    capture = _capture_dispatched_projection(
         prepared=prepared,
         admission=admission,
         detached=detached,
@@ -378,9 +415,11 @@ async def project_early_checkpoint_result(
         raise AuditIntegrityError("checkpoint capture lost its complete DATA without an original size observation")
     observed_accounting = replace(accounting, first_attempt_schema_valid=first_valid, first_attempt_accepted=first_accepted)
     projected = ProjectedEarlyCheckpoint(captured, verdict, pass_record, injection, retry_pending, observed_accounting)
-    _issued[projected] = _ProjectionSource(
+    issued_record = _ProjectionSource(
         prepared, admission, returned, captured, verdict, pass_record, injection, retry_pending, observed_accounting
     )
+    object.__setattr__(projected, "_issued_record", issued_record)
+    _issued[projected] = ref(issued_record)
     return projected
 
 
@@ -392,9 +431,11 @@ def require_original_early_checkpoint_projection(
     returned: CheckpointReturnedResponseObservation,
 ) -> CapturedContinuationRuntime:
     """Reprove live producer custody before the SQL owner admits any batch."""
-    source = _issued.get(projected) if type(projected) is ProjectedEarlyCheckpoint else None
+    registered = _issued.get(projected) if type(projected) is ProjectedEarlyCheckpoint else None
+    source = None if registered is None else registered()
     if (
         source is None
+        or source is not projected._issued_record
         or source.prepared is not prepared
         or source.admission is not admission
         or source.returned is not returned

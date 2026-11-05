@@ -437,7 +437,7 @@ async def test_completed_recipe_admits_original_issue_once_and_separate_completi
         current = CurrentContinuationMessageFamilies(
             owner.service, owner.authority, runtime.source.selected, runtime.materialization.inventory
         )
-        original_issue = transitions.read_tool_issue_data_on_connection
+        original_issue = transitions._read_tool_issue_with_prepared_data_on_connection
         original_evidence = evidence_reader.read_selected_turn_evidence_graph_data_on_connection
         original_constructor = SelectedContinuationState.__post_init__
         attempts, issues, evidence_proofs = [], [], []
@@ -451,8 +451,9 @@ async def test_completed_recipe_admits_original_issue_once_and_separate_completi
             assert conn.in_transaction()
             attempts.append((conn, values["effect_key"]))
             result = original_issue(conn, **values)
-            assert type(result) is transitions.ToolIssueSource
-            issues.append((conn, values["effect_key"], result))
+            issue, _encoded, _prepared = result
+            assert type(issue) is transitions.ToolIssueSource
+            issues.append((conn, values["effect_key"], issue))
             return result
 
         def read_evidence(conn, *args, **values):
@@ -464,7 +465,7 @@ async def test_completed_recipe_admits_original_issue_once_and_separate_completi
             return result
 
         monkeypatch.setattr(SelectedContinuationState, "__post_init__", validate_selection)
-        monkeypatch.setattr(transitions, "read_tool_issue_data_on_connection", read_issue)
+        monkeypatch.setattr(transitions, "_read_tool_issue_with_prepared_data_on_connection", read_issue)
         monkeypatch.setattr(evidence_reader, "read_selected_turn_evidence_graph_data_on_connection", read_evidence)
         calibrated = replace(runtime.source.selected)
         assert calibrated == runtime.source.selected and calibrated is not runtime.source.selected

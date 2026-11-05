@@ -4,8 +4,8 @@ Mode zero observes only inclusive clock-to-preparation-finish time. Mode one
 adds selected inclusive spans, native thread CPU, SQL and the already calibrated
 original-witness observer, plus six-family memo statistics. Mode two records
 the same spans without the memo observer. A separate CPU opt-in, available
-in either span mode, captures the first current-evidence memo scope or every
-original required worker. No mode
+in either span mode, captures the first current-evidence memo scope, the first
+message-inputs call, or every original required worker. No mode
 replaces submitted callables, adjusts a deadline, consumes a clock stage,
 caches a result or records private payloads.
 """
@@ -47,8 +47,8 @@ class EarlyPreparationProfile:
         cpu_selection: str = "current_evidence",
         observe_process_cpu: bool = False,
     ) -> None:
-        if cpu_selection not in {"current_evidence", "all_workers"}:
-            raise ValueError("EARLY CPU selection must be current_evidence or all_workers")
+        if cpu_selection not in {"current_evidence", "message_inputs", "all_workers"}:
+            raise ValueError("EARLY CPU selection must be current_evidence, message_inputs or all_workers")
         if cpu_profile and not enabled:
             raise ValueError("EARLY CPU capture requires selected-span observations")
         self.enabled = enabled
@@ -58,7 +58,7 @@ class EarlyPreparationProfile:
         self.spans = EndPreparationProfile(
             enabled=enabled,
             cpu_profile=cpu_profile,
-            cpu_selection="selected_scope" if cpu_profile and cpu_selection == "current_evidence" else "all_workers",
+            cpu_selection="selected_scope" if cpu_profile and cpu_selection != "all_workers" else "all_workers",
         )
         self.clocks: list[dict[str, Any]] = []
         self.spans.clocks = self.clocks
@@ -124,7 +124,7 @@ class EarlyPreparationProfile:
 
         return call
 
-    def _current_evidence_scope(self, original_scope, original_method):
+    def _current_evidence_scope(self, original_scope, original_method, *, message_inputs=False):
         @contextmanager
         @wraps(original_scope)
         def selected(*args, **kwargs):
@@ -152,13 +152,14 @@ class EarlyPreparationProfile:
                         "file": original_method.__code__.co_filename,
                         "line": original_method.__code__.co_firstlineno,
                     }
-                    worker["cprofile_scope"] = "original_current_evidence_scope"
+                    worker["cprofile_scope"] = "original_selected_method_body" if message_inputs else "original_current_evidence_scope"
                     worker["cprofile_memo_parent"] = id(parent)
             if not eligible:
                 with original_scope(*args, **kwargs) as memo:
                     yield memo
                 return
-            with self.spans.span("cprofile.current_evidence_memo_scope") as scope:
+            label = "cprofile.message_inputs" if message_inputs else "cprofile.current_evidence_memo_scope"
+            with self.spans.span(label) as scope:
                 with self._lock:
                     worker["cprofile_method_span"] = scope["id"]
                     self._cpu_selected_scope = scope
@@ -166,6 +167,16 @@ class EarlyPreparationProfile:
                     yield memo
 
         return selected
+
+    def _message_inputs(self, original):
+        selected_scope = self._current_evidence_scope(nullcontext, original, message_inputs=True)
+
+        @wraps(original)
+        def call(*args, **kwargs):
+            with selected_scope():
+                return original(*args, **kwargs)
+
+        return call
 
     @contextmanager
     def install(self, monkeypatch, engine):
@@ -318,6 +329,8 @@ class EarlyPreparationProfile:
                             "selection.private_closure",
                         ),
                     ):
+                        if self.cpu_profile and self.cpu_selection == "message_inputs" and label == "runtime.message_inputs":
+                            original = self._message_inputs(original)
                         patch.setattr(owner, name, self._sync(label, original))
                     patch.setattr(
                         advisor, "prepare_provider_input", self._sync("advisor.prepare_provider_input", advisor.prepare_provider_input)
@@ -357,13 +370,20 @@ class EarlyPreparationProfile:
                     for issue in result["cpu_capture_issues"]
                 ]
                 clock = None if self._cpu_target_clock is None else self._by_clock.get(self._cpu_target_clock)
-                if self.cpu_selection == "current_evidence":
+                if self.cpu_selection != "all_workers":
                     scope = self._cpu_selected_scope
                     partial = scope is not None and (
                         "end_ns" not in scope or scope.get("error") is not None or clock is None or not clock["finish_attempts"]
                     )
                     if scope is None:
-                        issues.append("CPU capture did not reach the original current-evidence memo scope")
+                        target = "message-inputs call" if self.cpu_selection == "message_inputs" else "current-evidence memo scope"
+                        issues.append(f"CPU capture did not reach the original {target}")
+                    if self.cpu_selection == "message_inputs" and scope is not None:
+                        matches = [item for item in result["cpu_profiles"] if item["selected_method_span"] == scope["id"]]
+                        if len(result["cpu_profiles"]) != 1 or len(matches) != 1:
+                            issues.append("CPU capture does not match the first message-inputs call exactly once")
+                        elif scope["clock"] != matches[0]["clock"] or scope["worker"] != matches[0]["worker_id"]:
+                            issues.append("CPU message-inputs scope lost its original clock/worker pairing")
                 else:
                     partial = clock is None or not clock["finish_attempts"]
                     captured = [profile["worker_id"] for profile in result["cpu_profiles"]]
@@ -378,13 +398,18 @@ class EarlyPreparationProfile:
                     cpu_capture_valid=not issues,
                     cpu_capture_status="partial_invalid" if partial else "invalid" if issues else "captured_preparation",
                     cpu_scope=(
-                        "native thread CPU in first original current-evidence memo scope; queue and gate excluded; "
+                        "native thread CPU in first original message-inputs call; queue, gate and earlier work excluded; "
+                        "event-loop frames not profiled; cProfile overhead included; no unprofiled wall-speed claim"
+                        if self.cpu_selection == "message_inputs"
+                        else "native thread CPU in first original current-evidence memo scope; queue and gate excluded; "
                         "cProfile overhead included; no unprofiled wall-speed claim"
                         if self.cpu_selection == "current_evidence"
                         else "native thread CPU in every original required worker; gate included, queue excluded; "
                         "event-loop frames not profiled; cProfile overhead included; no unprofiled wall-speed claim"
                     ),
                 )
+                if self.cpu_selection == "message_inputs":
+                    result["cpu_selection"] = "message_inputs"
         return result
 
     def flush(self, path: Path):
@@ -406,7 +431,7 @@ def early_preparation_profile(monkeypatch, engine, *, output_key):
         return
     assert mode in {"0", "1", "2"}
     cpu_mode = os.environ.get(CPU_PROFILE_FLAG)
-    assert cpu_mode in {None, "current_evidence", "all_workers"}, "EARLY CPU target must be current_evidence or all_workers"
+    assert cpu_mode in {None, "current_evidence", "message_inputs", "all_workers"}, "unknown EARLY CPU target"
     assert cpu_mode is None or mode in {"1", "2"}, "EARLY CPU capture requires selected-span mode"
     root = Path(__file__).resolve().parents[2]
     directory = Path(os.environ.get(PROFILE_DIRECTORY, ".claude/lanes/early-preparation-profile"))

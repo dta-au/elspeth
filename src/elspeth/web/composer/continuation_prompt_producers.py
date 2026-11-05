@@ -283,14 +283,10 @@ def _inputs_from_current_evidence_on_connection(
     require_original_bootstrap_transcript_on_connection(conn, bootstrap)
     iteration = decode_continuation_iteration(selected_chunk(frame.iteration), env_ref_names=inventory.names)
     from elspeth.web.composer.continuation_message_families import (
-        _admit_selected_tool_feedback_recipes_on_connection,
-        _admit_selected_tool_result_recipes_on_connection,
+        _admit_selected_tool_recipes_on_connection,
     )
 
-    _admit_selected_tool_result_recipes_on_connection(conn, inventory.running, selected=selected, admitted=admitted, names=inventory.names)
-    _admit_selected_tool_feedback_recipes_on_connection(
-        conn, inventory.running, selected=selected, admitted=admitted, names=inventory.names
-    )
+    _admit_selected_tool_recipes_on_connection(conn, inventory.running, selected=selected, admitted=admitted, names=inventory.names)
     return _CurrentProducerInputs(
         bootstrap, values, iteration.producer_inputs, encode_message_shelf(snapshot.transcript).canonical, admitted
     )

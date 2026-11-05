@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import Connection, Row, insert, select, update
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
 from elspeth.contracts.json_parser import parse_json_strict
@@ -422,6 +423,13 @@ def stored_primary_input_data_on_connection(
 
 
 def _original_wire(value: RetainedPrimaryInput) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    messages, tools, _context = _original_wire_with_context(value)
+    return messages, tools
+
+
+def _original_wire_with_context(
+    value: RetainedPrimaryInput,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], PrivateProviderContext]:
     """Actual immutable SDK input for auditing an already committed result.
 
     Preparation, dispatch intent and publication separately bind this input to
@@ -443,9 +451,10 @@ def _original_wire(value: RetainedPrimaryInput) -> tuple[list[dict[str, Any]], l
     ):
         raise AuditIntegrityError("primary original input lost its complete retained SDK wire")
     original_tools = tools if tools is not None else []
-    if capture_provider_context(messages=messages, tools=original_tools or None).disposition != "retained":
+    context = capture_provider_context(messages=messages, tools=original_tools or None)
+    if context.disposition != "retained":
         raise AuditIntegrityError("primary original input is not its safely retained complete source")
-    return messages, original_tools
+    return messages, original_tools, context
 
 
 def allocate_primary_effect_on_connection(
@@ -1727,14 +1736,14 @@ def _physical_source_data(conn: Connection, session_id: UUID, operation_id: str,
     if type(call) is not ComposerLLMCall or call.call_id is None:
         raise AuditIntegrityError("primary result requires the actual original physical audit")
     source = _stored_descriptor_data(conn, session_id, operation_id, effect)
-    wire, tools = _original_wire(source)
+    wire, tools, context = _original_wire_with_context(source)
     if (
         call.model_requested != source.model
         or call.temperature != source.temperature
         or call.seed != source.seed
         or call.messages_hash != stable_hash(wire)
         or call.tools_spec_hash != (stable_hash(tools) if tools else None)
-        or call.private_request != capture_provider_context(messages=wire, tools=tools or None)
+        or call.private_request != context
     ):
         raise AuditIntegrityError("primary physical audit differs from its complete actual prepared input source")
     creator = conn.execute(

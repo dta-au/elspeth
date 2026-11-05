@@ -367,7 +367,7 @@ async def test_copied_advisor_feedback_reuses_admission_and_keeps_source_owners_
         assert type(recipe) is ToolFeedbackMessageRecipe and recipe.source == "advisor_success"
         actual_current = evidence_reader.read_turn_evidence_on_connection
         assert producers.read_turn_evidence_on_connection is actual_current
-        actual_issue = transitions.read_tool_issue_data_on_connection
+        actual_issue = transitions._read_tool_issue_with_prepared_data_on_connection
         actual_historical = evidence_reader.read_selected_turn_evidence_graph_data_on_connection
         actual_private = families.CurrentContinuationMessageFamilies._assemble_admitted_cohort
         actual_runtime = owner.authority.read_continuation_runtime
@@ -383,7 +383,8 @@ async def test_copied_advisor_feedback_reuses_admission_and_keeps_source_owners_
             result = actual_issue(conn, **values)
             if phase == "private":
                 assert conn.in_transaction()
-                issues.append((conn, values["effect_key"], result))
+                issued, _encoded, _prepared = result
+                issues.append((conn, values["effect_key"], issued))
             return result
 
         def read_historical(conn, *args, **values):
@@ -414,7 +415,7 @@ async def test_copied_advisor_feedback_reuses_admission_and_keeps_source_owners_
 
         monkeypatch.setattr(evidence_reader, "read_turn_evidence_on_connection", current)
         monkeypatch.setattr(producers, "read_turn_evidence_on_connection", current)
-        monkeypatch.setattr(transitions, "read_tool_issue_data_on_connection", issue)
+        monkeypatch.setattr(transitions, "_read_tool_issue_with_prepared_data_on_connection", issue)
         monkeypatch.setattr(evidence_reader, "read_selected_turn_evidence_graph_data_on_connection", read_historical)
         monkeypatch.setattr(families.CurrentContinuationMessageFamilies, "_assemble_admitted_cohort", private)
         monkeypatch.setattr(owner.authority, "read_continuation_runtime", read_runtime)

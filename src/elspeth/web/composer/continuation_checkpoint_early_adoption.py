@@ -11,7 +11,7 @@ import asyncio
 import time
 from dataclasses import dataclass, replace
 from functools import partial
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
@@ -38,7 +38,7 @@ from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, Ret
 from elspeth.web.sessions.locking import locked_session_transaction
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _SettledEarly:
     advanced: EarlyCheckpointAdvanced
     returned: CheckpointReturnedResponseObservation
@@ -46,7 +46,7 @@ class _SettledEarly:
     runtime: RestoredContinuationRuntime
 
 
-_settled: WeakKeyDictionary[CheckpointEarlyPhysicalSource, _SettledEarly] = WeakKeyDictionary()
+_settled: WeakKeyDictionary[CheckpointEarlyPhysicalSource, ReferenceType[_SettledEarly]] = WeakKeyDictionary()
 
 
 def project_committed_early_cost(
@@ -110,7 +110,9 @@ def project_committed_early_cost(
     ):
         raise AuditIntegrityError("EARLY completion lost its original unsettled cost projection")
     budget.consume_settled(call, response_accountable=accountable)
-    _settled[source] = _SettledEarly(advanced, returned, primary, runtime)
+    settled = _SettledEarly(advanced, returned, primary, runtime)
+    object.__setattr__(source, "_settled_record", settled)
+    _settled[source] = ref(settled)
 
 
 async def adopt_committed_early(
@@ -127,13 +129,15 @@ async def adopt_committed_early(
     """
     _require_return(source, returned)
     prepared, _admission = _admitted(source)
-    settled = _settled.get(source)
+    reference = _settled.get(source)
+    settled = None if reference is None else reference()
     phases = source.phase_owner.phases
     old = source.phase_owner.runtime
     clock = source.clock
     sql_owner = phases.work.coordinator.sql_deadline_owner
     if (
         settled is None
+        or settled is not source._settled_record
         or settled.advanced is not advanced
         or settled.returned is not returned
         or settled.runtime is not old
@@ -265,4 +269,5 @@ async def adopt_committed_early(
     phases.runtime = restored
     phases.finished_batch = finished.dispatch, finished.persist, finished.pre_batch_state
     del _settled[source]
+    object.__setattr__(source, "_settled_record", None)
     return restored

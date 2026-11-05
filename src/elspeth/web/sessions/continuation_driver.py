@@ -9,12 +9,16 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Coroutine
+from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from elspeth.contracts.errors import AuditIntegrityError
+import structlog
+
+from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.web.composer.advisor_output import ReadContinuationAction
 from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame, InitializeFrame
 from elspeth.web.composer.continuation_action_fit_yield import ActionFitSuccessorPlan, plan_action_fit_successor
@@ -88,6 +92,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationFenceLost,
     ComposerOperationRecord,
     ComposerOperationRunning,
+    ComposerRequiredRecoveryFailure,
 )
 from elspeth.web.sessions.continuation import (
     ComposerSegmentRecoveryReceipt,
@@ -189,6 +194,184 @@ from elspeth.web.sessions.schemas import SendMessageRequest
 if TYPE_CHECKING:
     from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
     from elspeth.web.sessions.continuation_tool_failure import CommittedContinuationFailure
+
+
+slog = structlog.get_logger(__name__)
+_CODE_ROOT = Path(__file__).parent.parent.parent
+
+
+def _log_continuation_failure(
+    event: str,
+    *,
+    operation_id: str,
+    stage: str,
+    error: BaseException,
+    audit_unavailable: bool = False,
+    failure_type: str | None = None,
+) -> None:
+    """Diagnose code faults without reading exception text, arguments or locals.
+
+    This is an operational debugging record, not the durable operation outcome.
+    Even diagnostic-sink failure must leave original native/paid custody intact.
+    """
+    try:
+        nodes: list[tuple[str, str | None, int | None]] = []
+        classes: list[type[BaseException]] = []
+        edges: list[tuple[int, int, str]] = []
+        seen: dict[int, int] = {}
+        truncated: set[str] = set()
+
+        def visit(current: BaseException, depth: int) -> int:
+            identity = id(current)
+            if identity in seen:
+                return seen[identity]
+            index = len(nodes)
+            seen[identity] = index
+            location: str | None = None
+            line: int | None = None
+            frame = current.__traceback__
+            for _ in range(64):
+                if frame is None:
+                    break
+                # Only installed package code is eligible. An external SDK's
+                # dynamically supplied filename is not diagnostic content.
+                filename = frame.tb_frame.f_code.co_filename
+                if len(filename) > 1024:
+                    truncated.add("location_limit")
+                else:
+                    try:
+                        relative = Path(filename).relative_to(_CODE_ROOT)
+                    except ValueError:
+                        pass
+                    else:
+                        if ".." not in relative.parts:
+                            candidate = "elspeth/" + relative.as_posix()
+                            if len(candidate) <= 256:
+                                location, line = candidate, frame.tb_lineno
+                            else:
+                                truncated.add("location_limit")
+                frame = frame.tb_next
+            if frame is not None:
+                truncated.add("frame_limit")
+            class_name = type(current).__name__
+            if len(class_name) > 128:
+                truncated.add("class_name_limit")
+            nodes.append((class_name[:128], location, line))
+            classes.append(type(current))
+            candidates: list[tuple[str, BaseException]] = []
+            if current.__cause__ is not None:
+                candidates.append(("cause", current.__cause__))
+            if current.__context__ is not None:
+                candidates.append(("context", current.__context__))
+            if isinstance(current, BaseExceptionGroup):
+                candidates.extend(("group_member", member) for member in current.exceptions[:8])
+                if len(current.exceptions) > 8:
+                    truncated.add("group_member_limit")
+            for relation, child in candidates:
+                if len(edges) == 16:
+                    truncated.add("edge_limit")
+                    break
+                child_index = seen.get(id(child))
+                if child_index is None:
+                    if depth == 4:
+                        truncated.add("depth_limit")
+                        continue
+                    if len(nodes) == 8:
+                        truncated.add("node_limit")
+                        continue
+                    # Reserve the edge before recursion so descendants cannot
+                    # consume its slot and exceed the fixed edge allowance.
+                    edge_index = len(edges)
+                    edges.append((index, len(nodes), relation))
+                    child_index = visit(child, depth + 1)
+                    edges[edge_index] = (index, child_index, relation)
+                else:
+                    edges.append((index, child_index, relation))
+            return index
+
+        visit(error, 0)
+        from elspeth.web.composer.provider_cost import CommonProviderCostRefused
+
+        # Classify only the bounded captured graph. Incidental context/cause
+        # metadata does not turn a timeout/refusal into a programming fault.
+        operative = {0}
+        for _ in nodes:
+            operative.update(target for source, target, relation in edges if source in operative and relation == "group_member")
+        companions = {
+            index
+            for index in operative
+            if issubclass(classes[index], (asyncio.CancelledError, ComposerOwnedSettlementFailure, ComposerRequiredRecoveryFailure))
+        }
+        for _ in nodes:
+            companions.update(
+                target for source, target, relation in edges if source in companions and relation in ("cause", "group_member")
+            )
+        kinds: set[str] = set()
+        for index in operative:
+            cls = classes[index]
+            if issubclass(cls, BaseExceptionGroup):
+                continue
+            if issubclass(cls, AuditIntegrityError) or cls in (
+                RuntimeError,
+                LookupError,
+                AssertionError,
+                TypeError,
+                AttributeError,
+                NameError,
+                ArithmeticError,
+                KeyError,
+                IndexError,
+                ZeroDivisionError,
+                NotImplementedError,
+                UnboundLocalError,
+            ):
+                kinds.add("unexpected")
+            elif issubclass(
+                cls,
+                (
+                    asyncio.CancelledError,
+                    TimeoutError,
+                    CommonProviderCostRefused,
+                    ComposerOperationCancelledDuringTurn,
+                    SessionOperationFenceLost,
+                    ComposerOperationFenceLost,
+                ),
+            ):
+                kinds.add("expected")
+            else:
+                kinds.add("unknown")
+        if any(issubclass(classes[index], AuditIntegrityError) for index in companions):
+            kinds.add("unexpected")
+        omitted = bool(truncated & {"node_limit", "depth_limit", "edge_limit", "group_member_limit"})
+        if "unexpected" in kinds:
+            classification = "unexpected"
+        elif omitted:
+            classification = "unknown"
+        elif kinds == {"expected"}:
+            classification = "expected"
+        elif failure_type in ("audit_integrity_error", "operation_failed"):
+            # This value is the already computed real settlement outcome,
+            # never a second projection/flattening of the original exception.
+            classification = "unexpected"
+        else:
+            classification = "unknown"
+        emit = slog.error if audit_unavailable and classification == "unexpected" else slog.debug
+        emit(
+            event,
+            operation_id=operation_id,
+            stage=stage,
+            fault_nodes=tuple(nodes),
+            fault_edges=tuple(edges),
+            diagnostic_truncation=tuple(sorted(truncated)),
+            fault_classification=classification,
+        )
+    except BaseException:
+        # Static acknowledgement on the retained original, never a replacement
+        # exception or another potentially failing diagnostic sink.
+        # Malformed foreign __notes__ can reject even this fixed note. Neither
+        # acknowledgement failure nor sink failure owns the original error.
+        with suppress(BaseException):
+            BaseException.add_note(error, "Continuation structural diagnostic emission unavailable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,6 +559,7 @@ class _SegmentDriver:
         self._committed_failure: CommittedContinuationFailure | None = None
         self._committed_classifier_prephysical: CommittedClassifierPrephysicalFailure | None = None
         self._action_ordinal = 0
+        self._diagnostic_stage = "initialization"
         self.progress_owner: ContinuationProgressOwner | None = None
         self._progress_cleanup_failures: list[BaseException] = []
         self._iteration_stage: IterationStageData | None = None
@@ -774,6 +958,17 @@ class _SegmentDriver:
             expected=ComposerOperationRecord,
         )
         await self.worker._verify_terminal_before_release(self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal))
+        if original is not None and expired_failure is None and failure.error_type in ("audit_integrity_error", "operation_failed"):
+            # The durable outcome has priority, but this generic pre-owner
+            # branch has no tool/classifier original-facts receipt to retain.
+            _log_continuation_failure(
+                "composer_operation.stage_failure",
+                operation_id=self.running.claim.operation_id,
+                stage=self._diagnostic_stage,
+                error=original,
+                audit_unavailable=True,
+                failure_type=failure.error_type,
+            )
         return ContinuationSegmentSettled(terminal)
 
     async def settle_expired(self, original: BaseException | None, *, timeout_seconds: float) -> ContinuationSegmentSettled:
@@ -1554,6 +1749,7 @@ class _SegmentDriver:
             if self._worker_is_draining():
                 return await self.dispose()
             action_clock = ContinuationActionClock(action)
+            self._diagnostic_stage = selected.stack.frames[-1].frame_kind
             self._action_clock = action_clock
             self.sql_deadline.begin_action(action, started_at=action_clock.started_monotonic)
             self.phases.bind_action_clock(action_clock)
@@ -1607,6 +1803,12 @@ class _SegmentDriver:
                         raise BaseExceptionGroup("Watcher allocation and close failed", [watch_setup, close_error]) from None
                     raise
             except BaseException as setup_error:
+                _log_continuation_failure(
+                    "composer_operation.stage_failure",
+                    operation_id=self.running.claim.operation_id,
+                    stage=self._diagnostic_stage,
+                    error=setup_error,
+                )
                 cleanup_errors: list[BaseException] = []
                 if expiry is not None and expiry.timer is not None:
                     try:
@@ -1648,15 +1850,34 @@ class _SegmentDriver:
                 combined = self.join_failure(setup_error, *cleanup_errors)
                 if combined is setup_error:
                     raise
+                for cleanup in cleanup_errors:
+                    _log_continuation_failure(
+                        "composer_operation.cleanup_failure",
+                        operation_id=self.running.claim.operation_id,
+                        stage=self._diagnostic_stage,
+                        error=cleanup,
+                    )
                 raise combined from combined.__cause__
             original: BaseException | None = None
             try:
                 result = await self.lease.join_continuation_stage(stage_owner)
             except (SessionOperationFenceLost, ComposerOperationFenceLost) as error:
                 original = error
+                _log_continuation_failure(
+                    "composer_operation.stage_failure",
+                    operation_id=self.running.claim.operation_id,
+                    stage=self._diagnostic_stage,
+                    error=error,
+                )
                 raise
             except BaseException as error:
                 original = error
+                _log_continuation_failure(
+                    "composer_operation.stage_failure",
+                    operation_id=self.running.claim.operation_id,
+                    stage=self._diagnostic_stage,
+                    error=error,
+                )
                 if not any(error is item for item in self._consumed_native):
                     self._consumed_native.append(error)
                 result = None
@@ -1664,6 +1885,13 @@ class _SegmentDriver:
                 action_failures = expiry.close(original)
                 failures = (*action_failures, *await _finish_operation_watcher(watch, observation))
                 if failures:
+                    for failure in failures:
+                        _log_continuation_failure(
+                            "composer_operation.cleanup_failure",
+                            operation_id=self.running.claim.operation_id,
+                            stage=self._diagnostic_stage,
+                            error=failure,
+                        )
                     raise BaseExceptionGroup(
                         "Continuation stage observation failed", ([original] if original is not None else []) + list(failures)
                     )
@@ -2325,6 +2553,13 @@ async def run_continuation_segment(
             original = driver.join_failure(failure)
         elif adoption_failure is not None:
             original = combine_failure_objects(adoption_failure, failure)
+        _log_continuation_failure(
+            "composer_operation.segment_failure",
+            operation_id=running.claim.operation_id,
+            stage=driver._diagnostic_stage if driver is not None else "adoption",
+            error=original,
+            audit_unavailable=True,
+        )
         if original is failure:
             raise
         raise original from original.__cause__
@@ -2342,6 +2577,14 @@ async def run_continuation_segment(
         except BaseException as cleanup:
             cleanup_errors.append(cleanup)
         if cleanup_errors:
+            for cleanup_error in cleanup_errors:
+                _log_continuation_failure(
+                    "composer_operation.cleanup_failure",
+                    operation_id=running.claim.operation_id,
+                    stage=driver._diagnostic_stage if driver is not None else "adoption",
+                    error=cleanup_error,
+                    audit_unavailable=True,
+                )
             cleanup_failure = cleanup_errors[0]
             additional = (*cleanup_errors[1:], *((original,) if original is not None else ()))
             if driver is not None:

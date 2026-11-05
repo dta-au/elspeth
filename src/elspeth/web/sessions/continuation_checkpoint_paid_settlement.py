@@ -279,7 +279,7 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
         observation, attempt_id=admission.attempt.attempt_id, request_sha256=prepared.request_sha256
     )
     running = prepared.running
-    selected = require_current_checkpoint_dispatched_on_connection(conn, running, admission)
+    selected = require_current_checkpoint_dispatched_on_connection(conn, running, admission, allow_cancel=True, allow_expired_segment=True)
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     source = admission.hold
     identity = admission.paid_tail.identity

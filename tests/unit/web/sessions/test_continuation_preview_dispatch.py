@@ -51,7 +51,7 @@ from elspeth.web.sessions import continuation_value_batch_tail as value_tail
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cut
-from elspeth.web.sessions.continuation_p4 import decode_p4_receipt
+from elspeth.web.sessions.continuation_p4 import decode_p4_receipt, require_prepared_nongraph_p4_result
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
@@ -400,7 +400,11 @@ async def test_actual_preview_phase_issues_once_retains_original_result_and_cold
                 actual_preview_p4(**arguments, publication=replace(publication, messages=(changed_message, *publication.messages[1:])))
             result = actual_preview_p4(**arguments, publication=publication)
             assert result.result.historical_effect is None
-            assert result.result.preview_publication is publication
+            assert result.result.publication is publication
+            with pytest.raises(AuditIntegrityError, match="original Compose frame and ready batch"):
+                require_prepared_nongraph_p4_result(
+                    replace(result.result, publication=replace(publication, issued_preview=None)), env_ref_names=env_ref_names
+                )
             nongraph_results.append(result.result)
             return result
 

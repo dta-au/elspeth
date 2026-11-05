@@ -6,8 +6,8 @@ writer must reprove the same owed physical source and every finalizer effect.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from weakref import WeakKeyDictionary
+from dataclasses import dataclass, field, replace
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -40,9 +40,10 @@ class ProjectedEndCompleteTerminal:
     result: ComposerResult
     withheld_candidate: str | None
     superseded_reply_index: int | None
+    _issued_record: _TerminalSource | None = field(default=None, init=False, repr=False, compare=False)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _TerminalSource:
     physical: CheckpointEndPhysicalSource
     returned: CheckpointReturnedResponseObservation
@@ -55,7 +56,7 @@ class _TerminalSource:
     superseded_reply_index: int | None
 
 
-_issued: WeakKeyDictionary[ProjectedEndCompleteTerminal, _TerminalSource] = WeakKeyDictionary()
+_issued: WeakKeyDictionary[ProjectedEndCompleteTerminal, ReferenceType[_TerminalSource]] = WeakKeyDictionary()
 
 
 def _original_absent_preflight_is_qualified(state: CompositionState, *, initial_version: int, last_preflight: object) -> bool:
@@ -196,7 +197,7 @@ def project_end_complete_terminal(
     ):
         raise AuditIntegrityError("END terminal lost its complete original blocked result")
     projected = ProjectedEndCompleteTerminal(computation, result, withheld, index)
-    _issued[projected] = _TerminalSource(
+    original = _TerminalSource(
         physical,
         returned,
         computation,
@@ -207,6 +208,8 @@ def project_end_complete_terminal(
         withheld,
         index,
     )
+    object.__setattr__(projected, "_issued_record", original)
+    _issued[projected] = ref(original)
     return projected
 
 
@@ -217,9 +220,11 @@ def require_original_end_complete_terminal(
     returned: CheckpointReturnedResponseObservation,
 ) -> None:
     """Reject a substituted blocked result or borrowed physical source."""
-    original = _issued.get(projected) if type(projected) is ProjectedEndCompleteTerminal else None
+    registered = _issued.get(projected) if type(projected) is ProjectedEndCompleteTerminal else None
+    original = None if registered is None else registered()
     if (
         original is None
+        or original is not projected._issued_record
         or original.physical is not physical
         or original.returned is not returned
         or original.computation is not projected.computation

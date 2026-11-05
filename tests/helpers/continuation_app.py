@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -266,7 +266,10 @@ class ScriptedSDK:
     ``("primary", (content, tool_calls))`` serves the composer model with the
     full palette; the payload may also be a callable taking the app, for tool
     calls that need the app's planner dialect. ``("end", verdict)`` serves the
-    END Advisor review. ``("semantic", response_factory)`` serves the actual
+    END Advisor review; a string payload supplies deliberately malformed text.
+    ``("early", verdict)`` serves the EARLY checkpoint. A checkpoint payload
+    callable receives actual SDK kwargs, allowing reached-cut assertions before
+    an externally malformed reply. ``("semantic", response_factory)`` serves the actual
     semantic Advisor request; its callable receives the real SDK kwargs.
     ``("raise", exception)`` raises the original exception
     object at the SDK boundary, whatever the request.
@@ -294,10 +297,21 @@ class ScriptedSDK:
             assert kwargs["model"] == ADVISOR_MODEL and "tools" not in kwargs
             response = payload(kwargs) if callable(payload) else payload
             return sdk_reply(json.dumps(response), model=ADVISOR_MODEL)
-        assert role == "end" and kwargs["model"] == ADVISOR_MODEL and "response_format" in kwargs, role
+        assert role in ("early", "end") and kwargs["model"] == ADVISOR_MODEL and "response_format" in kwargs, role
+        if callable(payload):
+            payload = payload(kwargs)
         return ModelResponse(
             model=ADVISOR_MODEL,
-            choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(payload), "tool_calls": None}}],
+            choices=[
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": payload if type(payload) is str else json.dumps(payload),
+                        "tool_calls": None,
+                    },
+                }
+            ],
             usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
         )
 
@@ -308,6 +322,45 @@ class ScriptedSDK:
 
 def install_sdk(monkeypatch: pytest.MonkeyPatch, sdk: Callable[..., Any]) -> None:
     monkeypatch.setattr(litellm, "acompletion", sdk)
+
+
+@dataclass(slots=True)
+class SupportedPathObservation:
+    """Actual driver cuts and watcher identities, never a replacement scheduler."""
+
+    events: list[dict[str, Any]] = field(default_factory=list)
+    watched_tasks: set[int] = field(default_factory=set)
+
+    def require_driver_stages(self) -> None:
+        entries = [event for event in self.events if event["boundary"] == "advance" and event["event"] == "entry"]
+        assert entries
+        assert all(event["clock_bound"] and event["sql_owner_bound"] and event["task_id"] in self.watched_tasks for event in entries)
+
+
+@contextmanager
+def observe_supported_path(
+    monkeypatch: pytest.MonkeyPatch, *, operation_id: str, session_id: UUID, artifact: Path
+) -> Iterator[SupportedPathObservation]:
+    """Write complete bounded metadata even when a predecessor/assertion fails."""
+    from elspeth.web.sessions.continuation_driver import _SegmentDriver
+
+    observed = SupportedPathObservation()
+    original_watch = _SegmentDriver.watch_stage
+
+    async def watch(driver: _SegmentDriver, stage: Any, reader: Any) -> None:
+        if driver.running.claim.operation_id == operation_id and driver.running.claim.session_id == session_id:
+            observed.watched_tasks.add(id(stage))
+        return await original_watch(driver, stage, reader)
+
+    with monkeypatch.context() as scoped:
+        observed.events = observe_original_driver_failures(scoped, operation_id, session_id=session_id)
+        scoped.setattr(_SegmentDriver, "watch_stage", watch)
+        try:
+            yield observed
+        finally:
+            artifact.write_text(
+                json.dumps({"events": observed.events, "watched_tasks": sorted(observed.watched_tasks)}, indent=2), encoding="utf-8"
+            )
 
 
 def observe_original_driver_failures(monkeypatch: pytest.MonkeyPatch, operation_id: str, *, session_id: UUID) -> list[dict[str, Any]]:
@@ -392,6 +445,8 @@ def observe_original_driver_failures(monkeypatch: pytest.MonkeyPatch, operation_
                     "action_kind": action_kind(driver, bound_clock),
                     "driver_id": id(driver),
                     "task_id": None if task is None else id(task),
+                    "clock_bound": bound_clock is not None and driver.phases.action_clock is bound_clock,
+                    "sql_owner_bound": driver.work.coordinator.sql_deadline_owner is driver.sql_deadline,
                     "perf_counter": started,
                 }
             )

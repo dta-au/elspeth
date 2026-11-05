@@ -72,8 +72,18 @@ def require_detached_end_owners(detached: RestoredContinuationRuntime, original:
 def require_detached_end_capture(
     detached: RestoredContinuationRuntime, *, expected: CapturedContinuationRuntime, phase_owner: CheckpointPhaseOwner
 ) -> None:
+    """Effectful synchronous validation; callers must own a registered worker.
+
+    Capture reacquires policy and the live operation fence through SQL. The
+    immediate comparison below consumes that actual DATA without another read.
+    """
     require_detached_end_owners(detached, phase_owner.runtime)
     observed = _capture_owners(detached, source=detached.source, inventory=detached.materialization.inventory)
+    require_detached_capture_matches(observed, expected=expected)
+
+
+def require_detached_capture_matches(observed: CapturedContinuationRuntime, *, expected: CapturedContinuationRuntime) -> None:
+    """Compare the actual capture DATA; this function opens no authority scope."""
     if observed.stack != expected.stack or sorted(
         (chunk.reference.codec, chunk.reference.digest, chunk.canonical) for chunk in observed.chunks
     ) != sorted((chunk.reference.codec, chunk.reference.digest, chunk.canonical) for chunk in expected.chunks):

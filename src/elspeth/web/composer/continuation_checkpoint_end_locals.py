@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, TypedDict
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
@@ -99,6 +99,7 @@ class CheckpointEndGateLocals:
     persisted_assistant_message_id: str | None
     persisted_assistant_content: str | None
     persisted_tool_call_turn: bool
+    _issued_record: _OriginalEndGateLocals | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +145,7 @@ class _BorrowedEndDialogue:
             raise AuditIntegrityError("END gate dialogue or its owned provenance changed after local capture")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _OriginalEndGateLocals:
     phase_owner: CheckpointPhaseOwner
     state: CompositionState
@@ -157,7 +158,15 @@ class _OriginalEndGateLocals:
     format_retry_publication_source: CheckpointEndRetryPublicationSource | None
 
 
-_issued: WeakKeyDictionary[CheckpointEndGateLocals, _OriginalEndGateLocals] = WeakKeyDictionary()
+_issued: WeakKeyDictionary[CheckpointEndGateLocals, ReferenceType[_OriginalEndGateLocals]] = WeakKeyDictionary()
+
+
+def _original_gate_locals(value: CheckpointEndGateLocals) -> _OriginalEndGateLocals:
+    reference = _issued.get(value) if type(value) is CheckpointEndGateLocals else None
+    source = None if reference is None else reference()
+    if source is None or source is not value._issued_record:
+        raise AuditIntegrityError("END gate input requires its original caller-local capture")
+    return source
 
 
 def capture_checkpoint_end_gate_locals(
@@ -220,7 +229,7 @@ def capture_checkpoint_end_gate_locals(
     )
     if publication != value.publication_review:
         raise AuditIntegrityError("END gate locals changed the original publication review")
-    _issued[value] = _OriginalEndGateLocals(
+    original = _OriginalEndGateLocals(
         phase_owner,
         state,
         evidence,
@@ -231,13 +240,15 @@ def capture_checkpoint_end_gate_locals(
         None if dialogue is None else _BorrowedEndDialogue(dialogue),
         format_retry_publication_source,
     )
+    object.__setattr__(value, "_issued_record", original)
+    _issued[value] = ref(original)
     return value
 
 
 def require_original_checkpoint_end_gate_locals(value: CheckpointEndGateLocals, *, phase_owner: CheckpointPhaseOwner) -> None:
     """Reprove original warm production; a decoded/copied value is not issued."""
-    source = _issued.get(value) if type(value) is CheckpointEndGateLocals else None
-    if source is None or source.phase_owner is not phase_owner:
+    source = _original_gate_locals(value)
+    if source.phase_owner is not phase_owner:
         raise AuditIntegrityError("END gate input requires its original caller-local capture")
     if stable_hash(source.state.to_dict()) != value.orphan_observation.state_sha256:
         raise AuditIntegrityError("END gate state changed after local capture")
@@ -261,7 +272,7 @@ def require_original_checkpoint_end_gate_locals(value: CheckpointEndGateLocals, 
 def original_end_retry_publication_operation_id(value: CheckpointEndGateLocals, *, phase_owner: CheckpointPhaseOwner) -> str:
     """Return first-H scope only from an issued retry gate and its actual owner."""
     require_original_checkpoint_end_gate_locals(value, phase_owner=phase_owner)
-    source = _issued[value]
+    source = _original_gate_locals(value)
     token = source.format_retry_publication_source
     if token is None:
         raise AuditIntegrityError("END retry publication lacks its issued original H scope")

@@ -6,8 +6,8 @@ until the SQL Review consequence admits and consumes every retained effect.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from weakref import WeakKeyDictionary
+from dataclasses import dataclass, field, replace
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -30,6 +30,7 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
     require_checkpoint_end_detached_source,
 )
 from elspeth.web.composer.continuation_checkpoint_observation import CheckpointReturnedResponseObservation
+from elspeth.web.composer.continuation_runtime import _registered_read
 from elspeth.web.composer.no_tool_policy import state_is_structurally_empty
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.execution.completion_gates import completion_gate_fingerprint
@@ -42,9 +43,10 @@ class ProjectedEndCompleteClean:
     result: ComposerResult
     disposition: _EndCompletionDisposition
     superseded_reply_index: int | None
+    _issued_record: _Original | None = field(default=None, init=False, repr=False, compare=False)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _Original:
     physical: CheckpointEndPhysicalSource
     returned: CheckpointReturnedResponseObservation
@@ -55,14 +57,19 @@ class _Original:
     preflight_json: str | None
 
 
-_issued: WeakKeyDictionary[ProjectedEndCompleteClean, _Original] = WeakKeyDictionary()
+_issued: WeakKeyDictionary[ProjectedEndCompleteClean, ReferenceType[_Original]] = WeakKeyDictionary()
 
 
 async def project_end_complete_clean(
     *, physical: CheckpointEndPhysicalSource, returned: CheckpointReturnedResponseObservation, computation: EndGateComputation
 ) -> ProjectedEndCompleteClean:
     """Run the original pure no-site tail with its preflight reuse proved first."""
-    require_checkpoint_end_detached_source(physical)
+
+    def validate_detached() -> CheckpointEndPhysicalSource:
+        require_checkpoint_end_detached_source(physical)
+        return physical
+
+    await _registered_read(physical.phase_owner.phases.work, CheckpointEndPhysicalSource, validate_detached)
     require_original_checkpoint_end_computation(computation, source=physical, returned=returned)
     gate, owner, live = physical.gate_locals, physical.phase_owner, physical.detached.live
     bindings = physical.detached.bindings
@@ -144,7 +151,7 @@ async def project_end_complete_clean(
     if result.pipeline_commit_intent is not None or result.graph_recovery_intent is not None or result.recovery_audit_drafts:
         raise AuditIntegrityError("END clean projection unexpectedly requested a graph write")
     projected = ProjectedEndCompleteClean(computation, result, disposition, index)
-    _issued[projected] = _Original(
+    original = _Original(
         physical,
         returned,
         computation,
@@ -153,15 +160,19 @@ async def project_end_complete_clean(
         canonical_json(result.state.to_dict()),
         None if result.runtime_preflight is None else result.runtime_preflight.model_dump_json(),
     )
+    object.__setattr__(projected, "_issued_record", original)
+    _issued[projected] = ref(original)
     return projected
 
 
 def require_original_end_complete_clean(
     projected: ProjectedEndCompleteClean, *, physical: CheckpointEndPhysicalSource, returned: CheckpointReturnedResponseObservation
 ) -> None:
-    original = _issued.get(projected) if type(projected) is ProjectedEndCompleteClean else None
+    registered = _issued.get(projected) if type(projected) is ProjectedEndCompleteClean else None
+    original = None if registered is None else registered()
     if (
         original is None
+        or original is not projected._issued_record
         or original.physical is not physical
         or original.returned is not returned
         or original.computation is not projected.computation

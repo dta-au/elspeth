@@ -6,11 +6,11 @@ neither settles the paid attempt nor changes live Composer state or SQL.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from weakref import WeakKeyDictionary
+from dataclasses import dataclass, field, replace
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness, ContinuationMandatoryCaptureOverflow
+from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness
 from elspeth.web.composer.continuation_checkpoint_end_computation import (
     EndGateComputation,
     require_original_checkpoint_end_computation,
@@ -27,9 +27,13 @@ from elspeth.web.composer.continuation_checkpoint_observation import (
 )
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
-from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, _capture_owners, _registered_read
+from elspeth.web.composer.continuation_runtime import (
+    CapturedContinuationRuntime,
+    _capture_owners,
+    _registered_read,
+    _registered_runtime_capture,
+)
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
-from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.sessions.continuation_checkpoint_end_complete_withheld import (
     PreparedEndRepairWithheldReply,
     prepare_end_repair_withheld_reply,
@@ -50,14 +54,16 @@ class ProjectedEndCompleteRepair:
     captured: CapturedContinuationRuntime
     computation: EndGateComputation
     withheld: PreparedEndRepairWithheldReply | None
+    _issued_record: _RepairProjectionSource | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
 class ProjectedEndCompleteRepairOverflow:
     witness: ContinuationCaptureOverflowWitness
+    _issued_record: _RepairProjectionSource | None = field(default=None, init=False, repr=False, compare=False)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class _RepairProjectionSource:
     physical: CheckpointEndPhysicalSource
     prepared: PreparedCheckpointProvider
@@ -70,14 +76,8 @@ class _RepairProjectionSource:
     overflow: ContinuationCaptureOverflowWitness | None
 
 
-@dataclass(frozen=True, slots=True)
-class _CaptureResult:
-    captured: CapturedContinuationRuntime | None
-    overflow: ContinuationCaptureOverflowWitness | None
-
-
-_issued: WeakKeyDictionary[ProjectedEndCompleteRepair, _RepairProjectionSource] = WeakKeyDictionary()
-_overflows: WeakKeyDictionary[ProjectedEndCompleteRepairOverflow, _RepairProjectionSource] = WeakKeyDictionary()
+_issued: WeakKeyDictionary[ProjectedEndCompleteRepair, ReferenceType[_RepairProjectionSource]] = WeakKeyDictionary()
+_overflows: WeakKeyDictionary[ProjectedEndCompleteRepairOverflow, ReferenceType[_RepairProjectionSource]] = WeakKeyDictionary()
 
 
 def _require_original_sources(
@@ -88,7 +88,7 @@ def _require_original_sources(
     selected: SelectedContinuationState,
     returned: CheckpointReturnedResponseObservation,
     computation: EndGateComputation,
-) -> None:
+) -> CheckpointEndPhysicalSource:
     require_checkpoint_end_detached_source(physical)
     require_original_checkpoint_end_computation(computation, source=physical, returned=returned)
     if (
@@ -110,6 +110,7 @@ def _require_original_sources(
     original_v4_checkpoint_returned_audit_call(
         returned, attempt_id=owed.original.attempt.attempt_id, request_sha256=prepared.request_sha256
     )
+    return physical
 
 
 async def project_end_complete_repair(
@@ -122,9 +123,13 @@ async def project_end_complete_repair(
     computation: EndGateComputation,
 ) -> ProjectedEndCompleteRepair | ProjectedEndCompleteRepairOverflow:
     """Capture the exact repair successor against the rebound owed head."""
-    _require_original_sources(
-        physical=physical, prepared=prepared, owed=owed, selected=selected, returned=returned, computation=computation
-    )
+
+    def validate_sources() -> CheckpointEndPhysicalSource:
+        return _require_original_sources(
+            physical=physical, prepared=prepared, owed=owed, selected=selected, returned=returned, computation=computation
+        )
+
+    await _registered_read(prepared.work, CheckpointEndPhysicalSource, validate_sources)
     detached = physical.detached
     live = detached.live
     owner = physical.phase_owner
@@ -173,35 +178,26 @@ async def project_end_complete_repair(
                 raise AuditIntegrityError("END repair projection lost its rebound owed head")
             return cold
 
-    # Runtime capture proves its composition scope through the session authority,
-    # which takes its own SQLite transaction. Holding the outer writer while it
-    # does so deadlocks; bracket capture with two exact cold observations. The consequence writer
-    # repeats this check under its own lock before it changes any row.
-    cold = await _registered_read(prepared.work, VerifiedCheckpointEndOwed, read_cold_owed)
     source = replace(detached.source, selected=selected)
-    try:
-        captured = _capture_owners(detached, source=source, inventory=inventory)
-    except (ComposerContextUnsupported, AuditIntegrityError) as error:
-        witness = error.__cause__
-        if type(witness) is not ContinuationMandatoryCaptureOverflow:
-            raise
-        result = _CaptureResult(None, witness.witness)
-    else:
-        result = _CaptureResult(captured, None)
-    again = await _registered_read(prepared.work, VerifiedCheckpointEndOwed, read_cold_owed)
-    if again != cold:
-        raise AuditIntegrityError("END repair projection changed its owed head during capture")
+    result = await _registered_runtime_capture(
+        prepared.work,
+        read_source=read_cold_owed,
+        capture=lambda: _capture_owners(detached, source=source, inventory=inventory),
+        changed_source_message="END repair projection changed its owed head during capture",
+    )
     original = _RepairProjectionSource(
         physical, prepared, owed, selected, returned, computation, result.captured, withheld, result.overflow
     )
     if result.overflow is not None:
         overflow = ProjectedEndCompleteRepairOverflow(result.overflow)
-        _overflows[overflow] = original
+        object.__setattr__(overflow, "_issued_record", original)
+        _overflows[overflow] = ref(original)
         return overflow
     if result.captured is None:
         raise AuditIntegrityError("END repair projection lost complete DATA without an original size observation")
     projected = ProjectedEndCompleteRepair(result.captured, computation, withheld)
-    _issued[projected] = original
+    object.__setattr__(projected, "_issued_record", original)
+    _issued[projected] = ref(original)
     return projected
 
 
@@ -214,9 +210,11 @@ def require_original_end_complete_repair(
     selected: SelectedContinuationState,
     returned: CheckpointReturnedResponseObservation,
 ) -> None:
-    source = _issued.get(projected) if type(projected) is ProjectedEndCompleteRepair else None
+    registered = _issued.get(projected) if type(projected) is ProjectedEndCompleteRepair else None
+    source = None if registered is None else registered()
     if (
         source is None
+        or source is not projected._issued_record
         or source.physical is not physical
         or source.prepared is not prepared
         or source.owed is not owed
@@ -245,9 +243,11 @@ def require_original_end_complete_repair_overflow(
     selected: SelectedContinuationState,
     returned: CheckpointReturnedResponseObservation,
 ) -> ContinuationCaptureOverflowWitness:
-    source = _overflows.get(overflow) if type(overflow) is ProjectedEndCompleteRepairOverflow else None
+    registered = _overflows.get(overflow) if type(overflow) is ProjectedEndCompleteRepairOverflow else None
+    source = None if registered is None else registered()
     if (
         source is None
+        or source is not overflow._issued_record
         or source.physical is not physical
         or source.prepared is not prepared
         or source.owed is not owed

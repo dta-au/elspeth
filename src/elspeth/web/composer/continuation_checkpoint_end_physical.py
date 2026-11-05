@@ -57,9 +57,10 @@ class CheckpointEndPhysicalSource:
     capture: _AdvisorInvocationCapture = field(repr=False)
     detached: RestoredContinuationRuntime = field(repr=False)
     clock: ContinuationActionClock = field(repr=False)
+    _issued_record: _OriginalPhysicalSource | None = field(default=None, init=False, repr=False, compare=False)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, weakref_slot=True)
 class _OriginalPhysicalSource:
     phase_owner: CheckpointPhaseOwner
     gate_locals: CheckpointEndGateLocals
@@ -77,9 +78,17 @@ class _OriginalPhysicalSource:
     unbound_failure: ReferenceType[ComposerContextUnsupported] | None = None
 
 
-_issued: WeakKeyDictionary[CheckpointEndPhysicalSource, _OriginalPhysicalSource] = WeakKeyDictionary()
+_issued: WeakKeyDictionary[CheckpointEndPhysicalSource, ReferenceType[_OriginalPhysicalSource]] = WeakKeyDictionary()
 _gate_sources: WeakKeyDictionary[CheckpointEndGateLocals, ReferenceType[CheckpointEndPhysicalSource]] = WeakKeyDictionary()
 _UNBOUND_REFUSAL_ISSUER = object()
+
+
+def _original_source(source: CheckpointEndPhysicalSource) -> _OriginalPhysicalSource:
+    reference = _issued.get(source) if type(source) is CheckpointEndPhysicalSource else None
+    original = None if reference is None else reference()
+    if original is None or original is not source._issued_record:
+        raise AuditIntegrityError("END physical invocation lost its original source producer")
+    return original
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
@@ -105,7 +114,7 @@ def observe_checkpoint_end_unbound_refusal(
 ) -> CheckpointUnboundRefusalPermit:
     """Issue only at the original request-preparation refusal, before binding."""
     require_original_checkpoint_end_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     if (
         type(failure) is not ComposerContextUnsupported
         or failure.reason != "prepared_request_bytes"
@@ -125,7 +134,7 @@ def require_original_checkpoint_unbound_refusal(permit: CheckpointUnboundRefusal
     if type(permit) is not CheckpointUnboundRefusalPermit:
         raise AuditIntegrityError("Checkpoint unbound refusal requires its original nominal permit")
     require_original_checkpoint_end_physical_source(permit.source)
-    original = _issued[permit.source]
+    original = _original_source(permit.source)
     if (
         original.unbound_refusal is None
         or original.unbound_refusal() is not permit
@@ -140,8 +149,8 @@ def require_original_checkpoint_unbound_refusal(permit: CheckpointUnboundRefusal
 
 
 def require_original_checkpoint_end_physical_source(source: CheckpointEndPhysicalSource) -> None:
-    original = _issued.get(source) if type(source) is CheckpointEndPhysicalSource else None
-    if original is None or any(
+    original = _original_source(source)
+    if any(
         actual is not expected
         for actual, expected in (
             (source.phase_owner, original.phase_owner),
@@ -173,7 +182,7 @@ def require_checkpoint_end_prepared_clock(prepared: PreparedCheckpointProvider) 
     if not isinstance(source, CheckpointEndPhysicalSource) or type(source) is not CheckpointEndPhysicalSource:
         raise AuditIntegrityError("END timing requires its original END physical source")
     require_original_checkpoint_end_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     phases = source.phase_owner.phases
     clock = original.clock
     if (
@@ -201,7 +210,7 @@ def require_checkpoint_end_detached_source(source: CheckpointEndPhysicalSource) 
     from elspeth.web.composer.continuation_checkpoint_end_detached import require_detached_end_capture
 
     require_original_checkpoint_end_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     if source.detached.source.selected.checkpoint_id != source.prepared.prepared_selected.checkpoint_id:
         raise AuditIntegrityError("END detached source changed its pre-admission selected head")
     require_detached_end_capture(source.detached, expected=original.detached_capture, phase_owner=source.phase_owner)
@@ -257,9 +266,9 @@ async def prepare_checkpoint_end_physical_source(
     detached, detached_capture = await restore_prepared_end_runtime(phase_owner=phase_owner, prepared=prepared, captured=captured)
     capture = _AdvisorInvocationCapture()
     source = CheckpointEndPhysicalSource(phase_owner, gate_locals, captured, end_input, prepared, capture, detached, clock)
-    _issued[source] = _OriginalPhysicalSource(
-        phase_owner, gate_locals, captured, end_input, prepared, capture, detached, detached_capture, clock
-    )
+    original = _OriginalPhysicalSource(phase_owner, gate_locals, captured, end_input, prepared, capture, detached, detached_capture, clock)
+    object.__setattr__(source, "_issued_record", original)
+    _issued[source] = ref(original)
     _gate_sources[gate_locals] = ref(source)
     require_original_checkpoint_end_physical_source(source)
     return source
@@ -270,7 +279,7 @@ def bind_checkpoint_end_physical_request(
 ) -> None:
     """Bind actual prepared request bytes/model to the original unentered SDK."""
     require_original_checkpoint_end_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     owner = source.phase_owner
     running = owner.phases.work.running
     if (
@@ -360,7 +369,7 @@ def bind_checkpoint_end_physical_request(
 
 def checkpoint_end_physical_custody(source: CheckpointEndPhysicalSource) -> ProviderCallCustody:
     require_original_checkpoint_end_physical_source(source)
-    custody = _issued[source].custody
+    custody = _original_source(source).custody
     if custody is None:
         raise AuditIntegrityError("END physical source has no original prepared custody")
     return custody
@@ -369,7 +378,7 @@ def checkpoint_end_physical_custody(source: CheckpointEndPhysicalSource) -> Prov
 def observe_checkpoint_end_sdk_companion(source: CheckpointEndPhysicalSource, failure: BaseException) -> SdkTerminalFailure | None:
     """Use only this physical source's retained custody for exceptional SDK results."""
     require_original_checkpoint_end_physical_source(source)
-    custody = _issued[source].custody
+    custody = _original_source(source).custody
     if custody is None:
         return None
     return capture_sdk_terminal_failure(failure, custody=custody)
@@ -391,14 +400,14 @@ def observe_checkpoint_end_paid_incomplete_terminal(
 def note_checkpoint_end_physical_failure(source: CheckpointEndPhysicalSource, error: BaseException) -> None:
     """Keep the original failure available to the separately admitted no-SDK owner."""
     require_original_checkpoint_end_physical_source(source)
-    original = _issued[source]
+    original = _original_source(source)
     if original.issuer is not None and original.custody is not None:
         original.issuer.note_original_failure(original.custody, error)
 
 
 def checkpoint_end_physical_no_sdk_issuer(source: CheckpointEndPhysicalSource) -> CheckpointNoSdkIssuer:
     require_original_checkpoint_end_physical_source(source)
-    issuer = _issued[source].issuer
+    issuer = _original_source(source).issuer
     if issuer is None:
         raise AuditIntegrityError("END physical source has no original no-SDK issuer")
     return issuer

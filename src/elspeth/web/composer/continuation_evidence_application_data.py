@@ -67,7 +67,7 @@ from elspeth.web.sessions.continuation_p4 import (
     ReadmittedP4Result,
     _decode_p4_receipt_with_prepared,
     decode_p4_receipt,
-    require_prepared_issued_preview_p4_result,
+    require_prepared_nongraph_p4_result,
 )
 
 Verification = Literal["verified", "not_applicable", "authored_state_mismatch", "checkpoint_decode_or_compare_failed"]
@@ -245,8 +245,8 @@ def _checked_prepared_result(
         or result_chunk.reference.codec != "composer.owner-result.v1"
     ):
         raise TypeError("prepared application requires its separate prospective result DATA")
-    if result.preview_publication is not None:
-        require_prepared_issued_preview_p4_result(result, env_ref_names=env_ref_names)
+    if result.publication is not None:
+        require_prepared_nongraph_p4_result(result, env_ref_names=env_ref_names)
         _checked_result_values(result_chunk, result, producer, env_ref_names=env_ref_names)
         return
     if type(result.historical_effect) is not HistoricalEffectLocator:

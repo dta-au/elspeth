@@ -17,7 +17,7 @@ from elspeth.web.composer.composition_completion import (
     _TerminalNoToolAdvisorGateOutcome,
     _with_advisor_gate_decision,
 )
-from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness, ContinuationMandatoryCaptureOverflow
+from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness
 from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
     ColdCheckpointEndConsequenceSource,
     ColdCheckpointEndGate,
@@ -25,10 +25,9 @@ from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
 )
 from elspeth.web.composer.continuation_checkpoint_end_complete_terminal import _original_blocked_absent_preflight_is_qualified
 from elspeth.web.composer.continuation_checkpoint_end_input import CheckpointOrdinaryEndCaller
-from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, _capture_owners, _registered_read
+from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, _capture_owners, _registered_runtime_capture
 from elspeth.web.composer.continuation_tool_batch import _decode_owned
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff, state_is_structurally_empty
-from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.execution.completion_gates import CompletionGateFacts, completion_gate_fingerprint
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import interpretation_sites
@@ -257,23 +256,20 @@ async def project_first_cold_end_review(*, gate: ColdCheckpointEndGate) -> ColdP
                 raise AuditIntegrityError("cold END Review changed H during projection")
             return owed
 
-    before = await _registered_read(work, VerifiedCheckpointEndOwed, read_h)
     capture_source = replace(runtime.source, selected=source.selected)
-    try:
-        captured = _capture_owners(runtime, source=capture_source, inventory=runtime.materialization.inventory)
-    except (ComposerContextUnsupported, AuditIntegrityError) as error:
-        witness = error.__cause__
-        if type(witness) is not ContinuationMandatoryCaptureOverflow:
-            raise
-        after = await _registered_read(work, VerifiedCheckpointEndOwed, read_h)
-        if after != before:
-            raise AuditIntegrityError("cold END Review changed H across overflow capture") from error
-        overflow = ColdProjectedEndReviewOverflow(gate, witness.witness)
-        _overflows[overflow] = (gate, witness.witness)
+    capture = await _registered_runtime_capture(
+        work,
+        read_source=read_h,
+        capture=lambda: _capture_owners(runtime, source=capture_source, inventory=runtime.materialization.inventory),
+        changed_source_message="cold END Review changed H across complete capture",
+    )
+    if capture.overflow is not None:
+        overflow = ColdProjectedEndReviewOverflow(gate, capture.overflow)
+        _overflows[overflow] = (gate, capture.overflow)
         return overflow
-    after = await _registered_read(work, VerifiedCheckpointEndOwed, read_h)
-    if after != before:
-        raise AuditIntegrityError("cold END Review changed H across complete capture")
+    captured = capture.captured
+    if captured is None:
+        raise AuditIntegrityError("cold END Review lost captured DATA without a size witness")
     execution = EndReviewExecution(source.selected, runtime, result, computation.publication_review.binding, disposition)
     projected = ColdProjectedEndReview(gate, execution, captured, withheld)
     _issued[projected] = (gate, execution, captured, withheld)
