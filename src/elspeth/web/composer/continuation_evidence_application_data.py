@@ -48,6 +48,7 @@ from elspeth.web.composer.continuation_evidence_application_values import (
     PortableP4ApplicationEntry,
     PortableP4ApplicationRecord,
 )
+from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot
 from elspeth.web.composer.continuation_p4_application import HistoricalP4Application, _project_effects, _project_recorder_cohort
 from elspeth.web.composer.continuation_p4_batch import encode_p4_pending_batch_chunk
 from elspeth.web.composer.continuation_p4_outcome import RetainedAuditOutcome
@@ -354,6 +355,19 @@ def append_primary_call_to_evidence(
     recorder: RecorderSnapshot,
     env_ref_names: frozenset[str],
 ) -> AdmittedTurnEvidence:
+    """Preserve the existing PRIMARY entry while sharing recorder graph append."""
+    return append_call_to_evidence(evidence, call=call, recorder=recorder, env_ref_names=env_ref_names)
+
+
+def append_call_to_evidence(
+    evidence: AdmittedTurnEvidence,
+    *,
+    call: ComposerLLMCall,
+    recorder: RecorderSnapshot,
+    env_ref_names: frozenset[str],
+    transcript: MessageShelfSnapshot | None = None,
+    mandatory_retention: bool = False,
+) -> AdmittedTurnEvidence:
     """Extend the actual shared recorder graph without replacing any prior cut.
 
     Current SQL/physical admission belongs to the publication owner. This pure
@@ -365,7 +379,7 @@ def append_primary_call_to_evidence(
     admitted = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
     snapshot = admitted.snapshot
     if type(call) is not ComposerLLMCall or type(recorder) is not RecorderSnapshot:
-        raise TypeError("primary evidence extension requires its complete actual nominal sources")
+        raise TypeError("evidence extension requires its complete actual nominal sources")
     before = decode_recorder_snapshot(admitted.recorder_chunk)
     if (
         call.call_id is None
@@ -374,11 +388,13 @@ def append_primary_call_to_evidence(
         or recorder.llm_calls[-1] is not call
         or any(item.call_id == call.call_id for item in before.llm_calls)
     ):
-        raise AuditIntegrityError("primary evidence extension changed its exact original recorder prefix")
+        raise AuditIntegrityError("evidence extension changed its exact original recorder prefix")
     graph = admitted.graph
     recorder_source = capture_application_recorder_source(recorder, env_ref_names=env_ref_names)
     audit = recorder_source.chunk
-    updated = snapshot.model_copy(update={"recorder": audit.reference})
+    updated = snapshot.model_copy(
+        update={"recorder": audit.reference, "transcript": snapshot.transcript if transcript is None else transcript}
+    )
     if graph is not None:
         # The SQL snapshot and live recorder were independently decoded. Reuse
         # the actual graph's prefix objects so cut/batch/event aliases remain
@@ -386,7 +402,7 @@ def append_primary_call_to_evidence(
         extended = replace(graph.recorder, llm_calls=(*graph.recorder.llm_calls, call))
         _require_recorder_extension(graph.recorder, extended)
         if encode_recorder_snapshot(extended) != audit:
-            raise AuditIntegrityError("primary evidence extension differs from its complete actual recorder")
+            raise AuditIntegrityError("evidence extension differs from its complete actual recorder")
         changed_graph = replace(graph, recorder=extended)
         graph_json = encode_application_graph(changed_graph, env_ref_names=env_ref_names, recorder_source=recorder_source)
         if snapshot.application_entry is not None:
@@ -394,7 +410,12 @@ def append_primary_call_to_evidence(
             updated = updated.model_copy(update={"application_entry": entry})
         else:
             updated = updated.model_copy(update={"joint_graph_json": graph_json})
-    return admit_turn_evidence(updated, env_ref_names=env_ref_names, source_chunks=(audit, *admitted.sources.chunks))
+    return admit_turn_evidence(
+        updated,
+        env_ref_names=env_ref_names,
+        mandatory_retention=mandatory_retention,
+        source_chunks=(audit, *admitted.sources.chunks),
+    )
 
 
 def build_portable_p4_application(
@@ -1046,6 +1067,22 @@ def require_selected_applied_batch_chunk(chunk: PrivateChunk, *, evidence: Admit
         or snapshot.application_entry.graph_json != chunk.canonical
     ):
         raise AuditIntegrityError("selected applied batch changed its complete shared evidence graph")
+
+
+def refresh_selected_applied_batch_chunk(
+    chunk: PrivateChunk,
+    *,
+    previous: AdmittedTurnEvidence,
+    updated: AdmittedTurnEvidence,
+    env_ref_names: frozenset[str],
+) -> PrivateChunk:
+    """Keep the applied batch's separate chunk on its refreshed evidence graph."""
+    require_selected_applied_batch_chunk(chunk, evidence=previous, env_ref_names=env_ref_names)
+    admitted = require_admitted_turn_evidence(updated, env_ref_names=env_ref_names)
+    before, after = previous.snapshot.application_entry, admitted.snapshot.application_entry
+    if before is None or after is None or after.model_copy(update={"graph_json": before.graph_json}) != before:
+        raise AuditIntegrityError("applied batch refresh replaced its original application history")
+    return encode_private_chunk(codec="composer.applied-p4-batch.v2", canonical=after.graph_json, env_ref_names=env_ref_names)
 
 
 def _require_initial_frontier(effects: PersistedTurnEffects, logical: LogicalRequestBinding) -> None:

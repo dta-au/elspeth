@@ -1671,3 +1671,120 @@ async def test_evidence_reference_close_during_borrowed_miss_cannot_publish() ->
         assert future.result(timeout=5) == (key.reference,)
         assert parent.cached_entry_count == child.cached_entry_count == 0
         assert parent._evidence_reference_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_semantic_inflight_none_borrows_v4_text_but_keeps_fresh_local_proofs() -> None:
+    clock = _advisor_clock()
+    key = _evidence_key()
+    changed_reference = replace(key, reference=key.reference.model_copy(update={"digest": "1" * 64}))
+    changed_text = replace(key, canonical='{"changed":true}')
+    calls: list[str] = []
+    local_calls: list[str] = []
+    children: list[RetentionStageMemo] = []
+
+    def references(text: str) -> tuple[PrivateChunkRef, ...]:
+        calls.append(text)
+        return (key.reference,)
+
+    def verify_local(text: str) -> None:
+        local_calls.append(text)
+
+    with v4_preparation_memo_scope(clock) as parent:
+
+        def actual_cut() -> int:
+            assert current_v4_preparation_memo(clock) is parent
+            with borrow_legacy_advisor_inflight_memo(None, None):
+                child = current_retention_stage_memo()
+                assert child is not None and child is not parent
+                assert current_v4_preparation_memo(clock) is parent
+                children.append(child)
+                for candidate in (key, key, changed_reference, changed_text):
+                    assert child.evidence_references(candidate, references) == (key.reference,)
+                child.private_chunk(key, verify_local)
+                child.private_chunk(key, verify_local)
+            assert not child.active and child.cached_entry_count == 0
+            return len(children)
+
+        for expected in (1, 2):
+            outcome = await async_workers.run_required_sql_finish_once(publication_ticket(), actual_cut)
+            assert isinstance(outcome, RequiredSQLReturned) and outcome.value == expected
+        assert children[0] is not children[1]
+        assert calls == [key.canonical, key.canonical, changed_text.canonical]
+        assert local_calls == [key.canonical, key.canonical]
+        assert parent.cached_entry_count == 3
+    assert not parent.active and parent.cached_entry_count == 0
+    with borrow_legacy_advisor_inflight_memo(None, None):
+        ordinary = current_retention_stage_memo()
+        assert ordinary is not None and current_v4_preparation_memo() is None
+        ordinary.evidence_references(key, references)
+        ordinary.evidence_references(key, references)
+        assert ordinary.cached_entry_count == 0
+    assert not ordinary.active and len(calls) == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_kind", ("success", "timeout", "failure", "cancel"))
+async def test_semantic_inflight_v4_parent_closure_preserves_original_outcome(exit_kind: str) -> None:
+    clock = _advisor_clock()
+    marker = asyncio.CancelledError("original cancellation") if exit_kind == "cancel" else RuntimeError("original failure")
+    observed: BaseException | None = None
+    try:
+        with v4_preparation_memo_scope(clock) as parent, borrow_legacy_advisor_inflight_memo(None, None):
+            child = current_retention_stage_memo()
+            assert child is not None and current_v4_preparation_memo(clock) is parent
+            child.canonical_text_proof(CanonicalTextEncodingKey("{}", 100), _semantic_text_bytes, hashlib.sha256)
+            assert parent.cached_entry_count == 1
+            if exit_kind in {"failure", "cancel"}:
+                raise marker
+            if exit_kind == "timeout":
+                clock.preparation_deadline_monotonic = clock.started_monotonic - 1
+            try:
+                clock.finish_preparation()
+            finally:
+                finish_v4_preparation_memo(clock)
+            assert not parent.active and parent.cached_entry_count == 0
+    except BaseException as error:
+        observed = error
+    if exit_kind == "success":
+        assert observed is None and clock._seen == {"preparation"}
+    elif exit_kind == "timeout":
+        assert type(observed) is TimeoutError and clock._seen == set()
+    else:
+        assert observed is marker and clock._seen == set()
+    assert not parent.active and not child.active
+    assert parent.cached_entry_count == child.cached_entry_count == 0
+    assert current_retention_stage_memo() is None
+    with v4_preparation_memo_scope(_advisor_clock()) as following:
+        assert following is not parent and following.cached_entry_count == 0
+
+
+def _semantic_text_bytes(key: CanonicalTextEncodingKey) -> bytes:
+    return key.canonical.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_semantic_inflight_v4_late_result_cannot_repopulate_finished_parent() -> None:
+    entered, release = threading.Event(), threading.Event()
+    clock = _advisor_clock()
+    key = _evidence_key()
+
+    def delayed(_text: str) -> tuple[PrivateChunkRef, ...]:
+        entered.set()
+        assert release.wait(5)
+        return (key.reference,)
+
+    with v4_preparation_memo_scope(clock) as parent:
+        with borrow_legacy_advisor_inflight_memo(None, None), ThreadPoolExecutor(max_workers=1) as executor:
+            child = current_retention_stage_memo()
+            assert child is not None
+            future = executor.submit(child.evidence_references, key, delayed)
+            try:
+                assert entered.wait(5)
+                clock.finish_preparation()
+                finish_v4_preparation_memo(clock)
+            finally:
+                release.set()
+            assert future.result(timeout=5) == (key.reference,)
+            assert not parent.active and parent.cached_entry_count == child.cached_entry_count == 0
+        assert not child.active

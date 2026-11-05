@@ -676,7 +676,8 @@ def _expected_child_frames(
 ) -> tuple[ComposeFrame, ToolBatchFrame, tuple[PrivateChunk, ...]]:
     from elspeth.web.composer.advisor_checkpoint import early_checkpoint_injection
     from elspeth.web.composer.continuation_audit_buffer import RECORDER_CODEC, decode_recorder_snapshot, validate_recorder_projection
-    from elspeth.web.composer.continuation_evidence import admit_turn_evidence, decode_turn_evidence, encode_turn_evidence
+    from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence
+    from elspeth.web.composer.continuation_evidence_application_data import append_call_to_evidence, refresh_selected_applied_batch_chunk
     from elspeth.web.composer.continuation_message_shelf import decode_message_shelf, encode_message_shelf
     from elspeth.web.sessions.continuation_selection import load_private_chunks
 
@@ -694,7 +695,8 @@ def _expected_child_frames(
     previous_recorder = decode_recorder_snapshot(_held_chunk(conn, owed, frame.audit_buffer))
     if any(call.call_id == owed.attempt_id for call in previous_recorder.llm_calls):
         raise AuditIntegrityError("EARLY consequence duplicated its original returned physical audit")
-    canonical, _restored = validate_recorder_projection(replace(previous_recorder, llm_calls=(*previous_recorder.llm_calls, owed.call)))
+    extended_recorder = replace(previous_recorder, llm_calls=(*previous_recorder.llm_calls, owed.call))
+    canonical, _restored = validate_recorder_projection(extended_recorder)
     recorder = encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical, env_ref_names=owed.source.env_ref_names)
     previous_shelf = decode_message_shelf(_held_chunk(conn, owed, frame.transcript))
     shelf = _expected_shelf(previous_shelf, injection)
@@ -708,13 +710,26 @@ def _expected_child_frames(
     previous_evidence = decode_turn_evidence(
         _held_chunk(conn, owed, frame.evidence), env_ref_names=owed.source.env_ref_names, source_chunks=chunks
     )
-    refreshed = admit_turn_evidence(
-        previous_evidence.snapshot.model_copy(update={"recorder": recorder.reference, "transcript": shelf}),
+    refreshed = append_call_to_evidence(
+        previous_evidence,
+        call=owed.call,
+        recorder=extended_recorder,
         env_ref_names=owed.source.env_ref_names,
-        source_chunks=(*chunks, recorder),
+        transcript=shelf,
         mandatory_retention=True,
     )
+    if refreshed.recorder_chunk != recorder:
+        raise AuditIntegrityError("EARLY evidence append changed its exact paid recorder")
     evidence = encode_turn_evidence(refreshed, env_ref_names=owed.source.env_ref_names, mandatory_retention=True)
+    if batch.phase != "result_retained":
+        raise AuditIntegrityError("EARLY consequence changed its original applied batch phase")
+    applied = refresh_selected_applied_batch_chunk(
+        _held_chunk(conn, owed, batch.accumulator),
+        previous=previous_evidence,
+        updated=refreshed,
+        env_ref_names=owed.source.env_ref_names,
+    )
+    expected_batch = batch.model_copy(update={"accumulator": applied.reference})
     expected = frame.model_copy(
         update={
             "messages": messages.reference,
@@ -724,7 +739,7 @@ def _expected_child_frames(
             "advisor_repair_context_introduced": frame.advisor_repair_context_introduced or injection is not None,
         }
     )
-    return expected, batch, (recorder, transcript, messages, evidence)
+    return expected, expected_batch, (recorder, transcript, messages, evidence, applied)
 
 
 def _child_event(
@@ -811,7 +826,10 @@ def read_original_early_child_source_on_connection(
         expected_reprompt_sent = retry.marker.format_reprompt_required
         expected_first_schema = retry.marker.first_attempt_schema_valid
         expected_first_accepted = retry.child.accounting.first_attempt_accepted
-    expected_frame, batch, _expected_chunks = _expected_child_frames(conn, owed, retry_pending=marker.retry_pending)
+    expected_frame, batch, expected_chunks = _expected_child_frames(conn, owed, retry_pending=marker.retry_pending)
+    for chunk in expected_chunks:
+        if _held_chunk(conn, owed, chunk.reference) != chunk:
+            raise AuditIntegrityError("EARLY child changed its complete refreshed private closure")
     root = decode_continuation_snapshot(owed.selected.payload_json)
     frontier = tuple(
         item.model_copy(update={"disposition": "committed", "receipt_id": marker.receipt_key})

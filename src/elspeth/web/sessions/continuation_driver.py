@@ -22,6 +22,12 @@ from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlemen
 from elspeth.web.composer.advisor_output import ReadContinuationAction
 from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame, InitializeFrame
 from elspeth.web.composer.continuation_action_fit_yield import ActionFitSuccessorPlan, plan_action_fit_successor
+from elspeth.web.composer.continuation_checkpoint_early_live import (
+    EarlyCheckpointNoSdkTerminal,
+    EarlyCheckpointOwedOverflowTerminal,
+    EarlyCheckpointPaidIncompleteTerminal,
+    EarlyCheckpointPaidOverflowTerminal,
+)
 from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
     EndCheckpointNoSdkTerminal,
     EndCheckpointPaidOverflowTerminal,
@@ -102,6 +108,9 @@ from elspeth.web.sessions.continuation import (
     V3UnboundedTailRefusal,
     _require_current_continuation_running,
     read_v3_retained_tail_refusal_on_connection,
+)
+from elspeth.web.sessions.continuation_checkpoint_early_owed_overflow import (
+    read_v4_checkpoint_early_owed_overflow_terminal_on_connection,
 )
 from elspeth.web.sessions.continuation_checkpoint_end_retry import (
     VerifiedEndFormatRetry,
@@ -422,6 +431,10 @@ type _ActionResult = (
     | _TitleNoSdkResult
     | SemanticAdvisorPaidTerminal
     | SemanticAdvisorPaidIncompleteTerminal
+    | EarlyCheckpointPaidIncompleteTerminal
+    | EarlyCheckpointPaidOverflowTerminal
+    | EarlyCheckpointOwedOverflowTerminal
+    | EarlyCheckpointNoSdkTerminal
     | EndCheckpointPaidIncompleteTerminal
     | EndCheckpointPaidOverflowTerminal
     | EndCheckpointNoSdkTerminal
@@ -2036,6 +2049,142 @@ class _SegmentDriver:
                     terminal = await self.record()
                     if terminal.status != "failed" or terminal != result.terminal:
                         raise AuditIntegrityError("Classifier no-SDK refusal lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is EarlyCheckpointPaidOverflowTerminal or type(result) is EarlyCheckpointOwedOverflowTerminal:
+                    early_overflow_result = result
+
+                    def verify_early_paid_overflow(
+                        expected_terminal: EarlyCheckpointPaidOverflowTerminal = early_overflow_result,
+                        expected_names: frozenset[str] = names,
+                    ) -> VerifiedCheckpointPaidOverflowTerminal:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            if type(expected_terminal) is EarlyCheckpointOwedOverflowTerminal:
+                                actual = read_v4_checkpoint_early_owed_overflow_terminal_on_connection(
+                                    conn,
+                                    session_id=self.running.claim.session_id,
+                                    operation_id=self.running.claim.operation_id,
+                                    effect_key=expected_terminal.verified.source.effect_key,
+                                    names=expected_names,
+                                )
+                            else:
+                                actual = read_v4_checkpoint_paid_overflow_terminal_on_connection(
+                                    conn,
+                                    session_id=self.running.claim.session_id,
+                                    operation_id=self.running.claim.operation_id,
+                                    effect_key=expected_terminal.verified.source.effect_key,
+                                    names=expected_names,
+                                )
+                        if (
+                            actual is None
+                            or actual != expected_terminal.verified
+                            or actual.phase != "early"
+                            or actual.hold_state != "consumed"
+                        ):
+                            raise AuditIntegrityError("EARLY paid overflow lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_early_paid_overflow,
+                        expected=VerifiedCheckpointPaidOverflowTerminal,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.verified.terminal.checkpoint_id,
+                        result.verified.terminal.cursor,
+                    ):
+                        raise AuditIntegrityError("EARLY paid overflow lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is EarlyCheckpointNoSdkTerminal:
+                    early_no_sdk_result = result
+
+                    def verify_early_no_sdk(
+                        expected_terminal: EarlyCheckpointNoSdkTerminal = early_no_sdk_result,
+                        expected_names: frozenset[str] = names,
+                    ) -> VerifiedCheckpointNoSdkTerminal:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_v4_checkpoint_no_sdk_terminal_on_connection(
+                                conn,
+                                session_id=self.running.claim.session_id,
+                                operation_id=self.running.claim.operation_id,
+                                effect_key=expected_terminal.verified.source.effect_key,
+                                names=expected_names,
+                            )
+                        if (
+                            actual is None
+                            or actual != expected_terminal.verified
+                            or actual.phase != "early"
+                            or actual.hold_state != "consumed"
+                        ):
+                            raise AuditIntegrityError("EARLY no-SDK refusal lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_early_no_sdk,
+                        expected=VerifiedCheckpointNoSdkTerminal,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.verified.terminal.checkpoint_id,
+                        result.verified.terminal.cursor,
+                    ):
+                        raise AuditIntegrityError("EARLY no-SDK refusal lost its actual committed failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
+                if type(result) is EarlyCheckpointPaidIncompleteTerminal:
+                    early_incomplete_result = result
+
+                    def verify_early_paid_incomplete(
+                        expected_terminal: EarlyCheckpointPaidIncompleteTerminal = early_incomplete_result,
+                        expected_names: frozenset[str] = names,
+                    ) -> VerifiedPaidIncompleteTerminal:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual = read_v4_checkpoint_paid_incomplete_verified_on_connection(
+                                conn,
+                                session_id=self.running.claim.session_id,
+                                operation_id=self.running.claim.operation_id,
+                                effect_key=expected_terminal.verified.receipt.identity.effect_key,
+                                names=expected_names,
+                            )
+                        if actual is None or actual != expected_terminal.verified or actual.hold_state != "consumed":
+                            raise AuditIntegrityError("EARLY paid incomplete lost its exact original cold terminal")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_early_paid_incomplete,
+                        expected=VerifiedPaidIncompleteTerminal,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
+                        result.verified.terminal.checkpoint_id,
+                        result.verified.terminal.cursor,
+                    ):
+                        raise AuditIntegrityError("EARLY paid incomplete lost its actual committed failed terminal")
                     await self.worker._verify_terminal_before_release(
                         self.running,
                         self.lease,

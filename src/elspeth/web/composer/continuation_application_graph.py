@@ -11,9 +11,9 @@ from __future__ import annotations
 from copy import copy
 from dataclasses import dataclass, replace
 from hashlib import sha256
-from typing import Any
+from typing import Any, cast
 
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 
 from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateFailureFacts
@@ -21,6 +21,8 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ToolContractDi
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.json_parser import parse_json_strict
+from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.web.composer.audit import PrivatePlannerCandidate
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation import PrivateChunkRef
@@ -38,6 +40,7 @@ from elspeth.web.composer.continuation_batch_data import RestoredBatchData
 from elspeth.web.composer.continuation_codec import PrivateChunk, owned_json, verify_private_chunk
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.turn_effects import PersistedBatchEffects, PersistedTurnEffects, authored_state_hash
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
@@ -62,6 +65,125 @@ class ApplicationGraph:
     cuts: tuple[ApplicationGraphCut, ...]
     selected_audit: PortableDispatchAudit | None = None
     selected_dialect: ToolContractDialect | None = None
+
+
+def _render_json_value(encoded: str) -> JsonValue:
+    value, error = parse_json_strict(encoded)
+    if error is not None or canonical_json(value) != encoded:
+        raise AuditIntegrityError("Application rendering lost its original canonical JSON")
+    return cast(JsonValue, value)
+
+
+def _render_json_parts(
+    encoded: str, partitions: dict[JsonPath, tuple[PromptGuardContentPart, ...]] | None = None
+) -> tuple[PromptGuardContentPart, ...]:
+    return json_content_parts(
+        encoded, ensure_ascii=False, separators=(",", ":"), encoder=canonical_json, decoder=_render_json_value, string_parts=partitions
+    )
+
+
+def _p4_input_parts(encoded: str) -> tuple[PromptGuardContentPart, ...]:
+    value = _render_json_value(encoded)
+    if type(value) is not dict or value["schema_version"] != "composer.prepared-p4.v1":
+        raise AuditIntegrityError("Application rendering changed its declared prepared P4 codec")
+    partitions: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {}
+    # These are serialized members emitted by PreparedP4Value's owner, not
+    # arbitrary strings selected because their contents resemble JSON.
+    for name in (
+        "redacted_calls_json",
+        "redacted_rows_json",
+        "revoked_rows_json",
+        "mutation_ceiling_json",
+        "authority_revocation_json",
+        "private_tool_evidence_json",
+        "private_tool_failures_json",
+        "rejection_records_json",
+        "withheld_replies_json",
+        "source_audit_json",
+    ):
+        text = value[name]
+        if text is None:
+            continue
+        if type(text) is not str:
+            raise AuditIntegrityError("Application rendering changed a prepared P4 JSON member")
+        nested: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {}
+        if name in ("redacted_rows_json", "revoked_rows_json"):
+            rows = _render_json_value(text)
+            if type(rows) is not list:
+                raise AuditIntegrityError("Application rendering lost its declared P4 row sequence")
+            for index, row in enumerate(rows):
+                if type(row) is not dict:
+                    raise AuditIntegrityError("Application rendering lost its declared P4 row")
+                for member in ("state_payload_json", "visible_event_json"):
+                    child = row[member]
+                    if child is not None:
+                        if type(child) is not str:
+                            raise AuditIntegrityError("Application rendering changed a P4 row JSON member")
+                        nested[(index, member)] = _render_json_parts(child)
+        partitions[(name,)] = _render_json_parts(text, nested)
+    return _render_json_parts(encoded, partitions)
+
+
+def _p4_receipt_parts(encoded: str) -> tuple[PromptGuardContentPart, ...]:
+    value = _render_json_value(encoded)
+    if type(value) is not dict or value["schema_version"] != "composer.persisted-turn.v2":
+        raise AuditIntegrityError("Application rendering changed its declared P4 receipt codec")
+    partitions: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {}
+    prepared, audit = value["prepared_p4_json"], value["audit_outcome_json"]
+    if prepared is not None:
+        if type(prepared) is not str:
+            raise AuditIntegrityError("Application rendering changed its receipt's prepared P4 input")
+        partitions[("prepared_p4_json",)] = _p4_input_parts(prepared)
+    if audit is not None:
+        if type(audit) is not str:
+            raise AuditIntegrityError("Application rendering changed its receipt's audit outcome")
+        partitions[("audit_outcome_json",)] = _render_json_parts(audit)
+    return _render_json_parts(encoded, partitions)
+
+
+def application_graph_content_parts(encoded: str) -> tuple[PromptGuardContentPart, ...]:
+    """Render already admitted graph DATA without losing owned JSON boundaries.
+
+    This grants no graph, source or reference authority. Only codec-declared
+    string wrappers are expanded; original user/provider scalars stay atomic.
+    Every unit stays untrusted and recombines into the exact original wire.
+    """
+    value = _render_json_value(encoded)
+    if type(value) is not dict or value["schema_version"] not in (
+        "composer.evidence-batch-graph.v2",
+        "composer.prepared-evidence-batch-graph.v2",
+    ):
+        raise AuditIntegrityError("Application rendering requires its declared graph codec")
+    nodes = value["nodes"]
+    if type(nodes) is not list:
+        raise AuditIntegrityError("Application rendering lost its declared graph nodes")
+    partitions: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {}
+    for index, node in enumerate(nodes):
+        if type(node) is not dict:
+            raise AuditIntegrityError("Application rendering lost its declared graph node")
+        kind, body = node["kind"], node["value"]
+        if kind in ("state", "validation", "portable_dispatch_audit"):
+            if type(body) is not str:
+                raise AuditIntegrityError("Application rendering changed a declared JSON node")
+            partitions[("nodes", index, "value")] = _render_json_parts(body)
+        elif kind == "ContinuationBatchState":
+            if type(body) is not list:
+                raise AuditIntegrityError("Application rendering lost its declared batch members")
+            for member_index, member in enumerate(body):
+                if type(member) is not list or len(member) != 2:
+                    raise AuditIntegrityError("Application rendering changed a declared batch member")
+                name, scalar = member
+                if name not in ("p4_receipt_json", "p4_input_json"):
+                    continue
+                if type(scalar) is not dict or set(scalar) != {"scalar"}:
+                    raise AuditIntegrityError("Application rendering changed a declared batch JSON scalar")
+                text = scalar["scalar"]
+                if text is not None:
+                    if type(text) is not str:
+                        raise AuditIntegrityError("Application rendering lost a declared batch JSON text")
+                    parts = _p4_receipt_parts(text) if name == "p4_receipt_json" else _p4_input_parts(text)
+                    partitions[("nodes", index, "value", member_index, 1, "scalar")] = parts
+    return _render_json_parts(encoded, partitions)
 
 
 @dataclass(frozen=True, slots=True, init=False, eq=False)

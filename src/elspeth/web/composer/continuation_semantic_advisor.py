@@ -28,6 +28,7 @@ from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
     PROMPT_GUARD_TRUST_KEY,
+    PromptGuardContentPart,
     PromptGuardTextMessage,
     PromptGuardTrust,
 )
@@ -51,6 +52,7 @@ from elspeth.web.composer.continuation_advisor import (
     decode_continuation_advisor_invocation,
     encode_continuation_advisor_invocation,
 )
+from elspeth.web.composer.continuation_application_graph import application_graph_content_parts
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     encode_continuation_text_response,
@@ -59,6 +61,7 @@ from elspeth.web.composer.continuation_codec import (
     verify_private_chunk,
 )
 from elspeth.web.composer.continuation_end_values import decode_end_candidate
+from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
 from elspeth.web.composer.continuation_iteration import encode_continuation_iteration, iteration_values
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
 from elspeth.web.composer.continuation_progress import ContinuationFrontier
@@ -73,7 +76,7 @@ from elspeth.web.composer.continuation_semantic_observation import (
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls, build_llm_call_record
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput, prepare_provider_input
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
-from elspeth.web.composer.prompt_guard_rendering import json_content_parts
+from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import (
@@ -90,7 +93,7 @@ from elspeth.web.composer.provider_quota import (
 )
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.state import CompositionState
-from elspeth.web.continuation_retention_memo import finish_legacy_advisor_preparation_memo
+from elspeth.web.continuation_retention_memo import finish_legacy_advisor_preparation_memo, finish_v4_preparation_memo
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
 from elspeth.web.required_work import RequiredWorkTicket
@@ -217,6 +220,28 @@ def semantic_retained_json(value: str) -> JsonValue:
     if error is not None or type(parsed) is not dict or canonical_json(parsed) != value:
         raise AuditIntegrityError("Semantic retained result lost its complete canonical DATA")
     return parsed
+
+
+def _semantic_retained_content_parts(
+    retained: str, *, frontier_canonical: str, evidence: TurnEvidenceSnapshot
+) -> tuple[PromptGuardContentPart, ...]:
+    """Carry declared source JSON boundaries through the unchanged document."""
+    if type(evidence) is not TurnEvidenceSnapshot:
+        raise TypeError("Semantic source rendering requires its actual evidence snapshot")
+
+    def parts(text: str) -> tuple[PromptGuardContentPart, ...]:
+        return json_content_parts(text, ensure_ascii=False, separators=(",", ":"), encoder=canonical_json)
+
+    partitions: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {
+        ("frontier",): parts(frontier_canonical),
+        ("evidence", "effects", "initial_state_json"): parts(evidence.effects.initial_state_json),
+        ("evidence", "effects", "latest_verified_state_json"): parts(evidence.effects.latest_verified_state_json),
+    }
+    if evidence.joint_graph_json is not None:
+        partitions[("evidence", "joint_graph_json")] = application_graph_content_parts(evidence.joint_graph_json)
+    if evidence.application_entry is not None:
+        partitions[("evidence", "application_entry", "graph_json")] = application_graph_content_parts(evidence.application_entry.graph_json)
+    return json_content_parts(retained, ensure_ascii=False, separators=(",", ":"), string_parts=partitions, encoder=canonical_json)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,13 +374,20 @@ def prepare_semantic_advisor_request(
         raise AuditIntegrityError("Semantic Advisor requires its complete originating user request")
     # Reject changed immutable DATA before current-source materialization can
     # perform its real fenced reads. Valid input still receives every check.
-    transcript_owner, _shelf = AdvisorTranscriptOwner.for_continuation(
+    history = AdvisorTranscriptOwner._continuation_history(
         resolved.evidence.transcript,
         session_id=resolved.evidence.session_id,
         actor_user_id=resolved.evidence.actor_user_id,
         request_id=resolved.evidence.request_id,
         request=user_message,
-        materialization=runtime.materialization,
+    )
+    from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
+
+    if type(runtime.materialization) is not CurrentContinuationMessageProducers:
+        raise AuditIntegrityError("transcript restore requires its actual current producer owner")
+    shelf = runtime.materialization._restore_shelf_for_semantic_request(resolved.evidence.transcript)
+    transcript_owner, _shelf = AdvisorTranscriptOwner._from_continuation_shelf(
+        resolved.evidence.transcript, request=user_message, history=history, shelf=shelf
     )
     transcript = transcript_owner.snapshot()
     review = iteration_values(resolved.iteration, env_ref_names=env_ref_names).advisor_review
@@ -373,7 +405,6 @@ def prepare_semantic_advisor_request(
     arguments["problem_summary"] = _SEMANTIC_INSTRUCTIONS
     context = advisor_context.build_advisor_user_message(arguments)
     frontier_canonical = encode_frontier_chunk(frontier).canonical
-    frontier_parts = json_content_parts(frontier_canonical, ensure_ascii=False, separators=(",", ":"), encoder=canonical_json)
     retained_values: dict[str, JsonValue] = {
         "source": source.model_dump(mode="json"),
         "frontier": frontier_canonical,
@@ -408,12 +439,8 @@ def prepare_semantic_advisor_request(
         {
             "role": "user",
             "content": retained,
-            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
-                retained,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                string_parts={("frontier",): frontier_parts},
-                encoder=canonical_json,
+            PROMPT_GUARD_CONTENT_PARTS_KEY: _semantic_retained_content_parts(
+                retained, frontier_canonical=frontier_canonical, evidence=resolved.evidence
             ),
         },
     ]
@@ -570,6 +597,7 @@ async def run_semantic_advisor(
                     no_sdk_issuer.clock.finish_preparation()
                 finally:
                     finish_legacy_advisor_preparation_memo(no_sdk_issuer.clock)
+                    finish_v4_preparation_memo(no_sdk_issuer.clock)
             response = await asyncio.wait_for(
                 provider_gateway._litellm_acompletion(
                     provider_custody=custody,

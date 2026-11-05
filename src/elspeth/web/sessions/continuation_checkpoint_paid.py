@@ -47,6 +47,7 @@ from elspeth.web.sessions.continuation import (
 )
 from elspeth.web.sessions.continuation_checkpoint_early_source import (
     CapturedCheckpointEarlyInput,
+    CheckpointEarlyInput,
     early_source_event_fields,
     require_early_input_on_connection,
 )
@@ -67,6 +68,7 @@ from elspeth.web.sessions.continuation_retained_capacity import (
     reserve_provider_terminal_hold,
 )
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 from elspeth.web.sessions.models import composer_continuation_provider_ordinals_table as ordinals
@@ -458,9 +460,40 @@ def _require_prepared_checkpoint_source_on_connection(conn: Connection, prepared
         or (prepared.publication_binding is not None and not is_lower_sha256_hex(prepared.publication_binding))
     ):
         raise AuditIntegrityError("checkpoint physical admission lost its nominal original preparation")
-    source = prepared.prepared_source
-    running = prepared.running
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    early_data = require_prepared_checkpoint_source_data_on_connection(
+        conn,
+        source=prepared.prepared_source,
+        session_id=prepared.running.claim.session_id,
+        operation_id=prepared.running.claim.operation_id,
+        sequence=prepared.running.claim.segment_sequence,
+        generation=prepared.running.claim.ownership_generation,
+        retry_ordinal=prepared.retry_ordinal,
+    )
+    if early_data is not None and (
+        early_data.messages_sha256 != prepared.request_sha256
+        or early_data.requested_model != prepared.requested_model
+        or early_data.env_ref_names != tuple(sorted(prepared.env_ref_names))
+        or early_data.retry_ordinal != prepared.retry_ordinal
+    ):
+        raise AuditIntegrityError("EARLY physical admission substituted its request or environment inventory")
+    _effect_inventory(
+        conn, str(prepared.running.claim.session_id), prepared.running.claim.operation_id, prepared.prepared_source.prepared_selected
+    )
+    return prepared.prepared_source
+
+
+def require_prepared_checkpoint_source_data_on_connection(
+    conn: Connection,
+    *,
+    source: CheckpointPreparedSource,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int,
+    generation: int,
+    retry_ordinal: int,
+) -> CheckpointEarlyInput | None:
+    """Prove retained preparation DATA without minting physical work/custody."""
+    sid, operation = str(session_id), operation_id
     if load_snapshot(conn, session_id=sid, operation_id=operation) != source.prepared_selected:
         raise AuditIntegrityError("checkpoint physical admission replaced its prepared current head")
     row = conn.execute(
@@ -487,8 +520,8 @@ def _require_prepared_checkpoint_source_on_connection(conn: Connection, prepared
             "outer_effect_key": source.outer_effect_key,
             "source_checkpoint_id": source.source.checkpoint_id,
             "source_cursor": source.source.cursor,
-            "creator_sequence": running.claim.segment_sequence,
-            "creator_generation": running.claim.ownership_generation,
+            "creator_sequence": sequence,
+            "creator_generation": generation,
             "end_input_chunk_key": f"value:{source.end_input_ref.codec}:{source.end_input_ref.digest}"
             if source.end_input_ref is not None
             else None,
@@ -542,7 +575,7 @@ def _require_prepared_checkpoint_source_on_connection(conn: Connection, prepared
             or input_data.original_cursor != source.source.cursor
             or input_data.outer_effect_key != source.outer_effect_key
             or input_data.pass_index != source.pass_index
-            or input_data.retry_ordinal != prepared.retry_ordinal
+            or input_data.retry_ordinal != retry_ordinal
             or input_data.captured_runtime_sha256
             != stable_hash(root.model_copy(update={"cursor": source.source.cursor}).model_dump(mode="json"))
             or input_data.runtime_chunks
@@ -554,6 +587,7 @@ def _require_prepared_checkpoint_source_on_connection(conn: Connection, prepared
             )
         ):
             raise AuditIntegrityError("END checkpoint input changed its original gate source")
+    early_data = None
     if source.early_input_ref is not None:
         contract = load_continuation_read_contract(conn, session_id=sid, operation_id=operation)
         if type(contract.allowance) is not int or source.phase != "early" or source.pass_index != 0:
@@ -568,14 +602,118 @@ def _require_prepared_checkpoint_source_on_connection(conn: Connection, prepared
             prepared=source.prepared_selected,
             outer_effect_key=source.outer_effect_key,
         )
-        if (
-            early_data.messages_sha256 != prepared.request_sha256
-            or early_data.requested_model != prepared.requested_model
-            or early_data.env_ref_names != tuple(sorted(prepared.env_ref_names))
-            or early_data.retry_ordinal != prepared.retry_ordinal
-        ):
-            raise AuditIntegrityError("EARLY physical admission substituted its request or environment inventory")
-    _effect_inventory(conn, sid, operation, source.prepared_selected)
+    return early_data
+
+
+def read_unpaid_early_prepared_source_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: StoredContinuationSnapshot,
+    sequence: int,
+    generation: int,
+    env_ref_names: frozenset[str],
+) -> CheckpointPreparedSource | None:
+    """Read the actual EARLY prepared-event bridge without provider authority."""
+    sid = str(session_id)
+    if load_snapshot(conn, session_id=sid, operation_id=operation_id) != selected:
+        raise AuditIntegrityError("unpaid EARLY preparation changed its current selected head")
+    tag, text = _event_text(conn, sid, operation_id, selected.cursor)
+    event, error = parse_json_strict(text)
+    if (
+        tag != "checkpoint"
+        or error is not None
+        or type(event) is not dict
+        or event.get("owner") != "composer_checkpoint_source"
+        or event.get("stage") != "source_prepared"
+        or event.get("phase") != "early"
+    ):
+        return None
+    if (
+        set(event)
+        != {
+            "owner",
+            "version",
+            "stage",
+            "phase",
+            "kind",
+            "pass_index",
+            "outer_effect_key",
+            "source_checkpoint_id",
+            "source_cursor",
+            "creator_sequence",
+            "creator_generation",
+            "end_input_chunk_key",
+            "end_input_sha256",
+            "end_env_ref_names",
+            "captured_root_sha256",
+            "early_input_chunk_key",
+            "early_input_sha256",
+        }
+        or event["version"] != 2
+        or event["kind"] != "iteration_early"
+        or type(event["source_checkpoint_id"]) is not str
+        or type(event["source_cursor"]) is not int
+        or type(event["outer_effect_key"]) is not str
+        or type(event["early_input_sha256"]) is not str
+        or not is_lower_sha256_hex(event["early_input_sha256"])
+        or event["early_input_chunk_key"] != f"value:composer.checkpoint-early-input.v1:{event['early_input_sha256']}"
+    ):
+        raise AuditIntegrityError("unpaid EARLY lost its complete prepared-source event")
+    original_row = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation_id,
+            checkpoints.c.checkpoint_id == event["source_checkpoint_id"],
+        )
+    ).one_or_none()
+    if original_row is None or original_row.cursor != event["source_cursor"]:
+        raise AuditIntegrityError("unpaid EARLY preparation lost its actual original checkpoint")
+    origin = StoredContinuationSnapshot(
+        read_chunk(conn, session_id=sid, operation_id=operation_id, key=original_row.snapshot_chunk_key).decode("utf-8", errors="strict"),
+        original_row.cursor,
+        original_row.checkpoint_id,
+    )
+    chunk = conn.execute(
+        select(chunks.c.codec, chunks.c.byte_length).where(
+            chunks.c.session_id == sid,
+            chunks.c.operation_id == operation_id,
+            chunks.c.chunk_key == event["early_input_chunk_key"],
+        )
+    ).one_or_none()
+    if chunk is None or chunk.codec != "composer.checkpoint-early-input.v1":
+        raise AuditIntegrityError("unpaid EARLY preparation lost its retained original input")
+    reference = PrivateChunkRef(
+        codec="composer.checkpoint-early-input.v1", digest=event["early_input_sha256"], byte_length=chunk.byte_length
+    )
+    source = CheckpointPreparedSource(origin, selected, "early", "iteration_early", event["outer_effect_key"], 0, None, (), reference)
+    phase = _initial_phase_source(conn, session_id=session_id, operation_id=operation_id, selected=origin)
+    if (
+        phase is None
+        or phase.phase != "early"
+        or phase.kind != "iteration_early"
+        or phase.current != origin
+        or phase.outer_effect_key != source.outer_effect_key
+        or len(phase.completed_children) not in (0, 1)
+    ):
+        raise AuditIntegrityError("unpaid EARLY preparation lost its original stage or exact retry child")
+    early_data = require_prepared_checkpoint_source_data_on_connection(
+        conn,
+        source=source,
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        generation=generation,
+        retry_ordinal=len(phase.completed_children),
+    )
+    if (
+        early_data is None
+        or early_data.env_ref_names != tuple(sorted(env_ref_names))
+        or early_data.retry_ordinal != len(phase.completed_children)
+    ):
+        raise AuditIntegrityError("unpaid EARLY preparation changed its actual environment or retry lineage")
+    _effect_inventory(conn, sid, operation_id, selected)
     return source
 
 

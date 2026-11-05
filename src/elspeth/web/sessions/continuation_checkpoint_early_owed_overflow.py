@@ -92,7 +92,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.time_normalization import restore_utc
 
 if TYPE_CHECKING:
-    from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveAdvanced, EarlyCheckpointPaidOverflowTerminal
+    from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveAdvanced, EarlyCheckpointOwedOverflowTerminal
     from elspeth.web.composer.continuation_checkpoint_early_physical import CheckpointEarlyPhysicalSource
 
 
@@ -707,9 +707,9 @@ async def complete_early_checkpoint_or_overflow(
     owed: EarlyCompleteReturnAdmission,
     returned: CheckpointReturnedResponseObservation,
     projected: ProjectedEarlyCheckpoint,
-) -> EarlyCheckpointLiveAdvanced | EarlyCheckpointPaidOverflowTerminal:
+) -> EarlyCheckpointLiveAdvanced | EarlyCheckpointOwedOverflowTerminal:
     """Keep original finish-once result and cancellation identities together."""
-    from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveAdvanced, EarlyCheckpointPaidOverflowTerminal
+    from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveAdvanced, EarlyCheckpointOwedOverflowTerminal
     from elspeth.web.composer.continuation_checkpoint_early_physical import (
         CheckpointEarlyPhysicalSource,
         require_original_checkpoint_early_physical_source,
@@ -852,7 +852,7 @@ async def complete_early_checkpoint_or_overflow(
     if actual is None:
         raise AuditIntegrityError("EARLY completion produced no committed source")
     if type(actual.result) is VerifiedCheckpointPaidOverflowTerminal:
-        return EarlyCheckpointPaidOverflowTerminal(actual.result, tuple(deferred))
+        return EarlyCheckpointOwedOverflowTerminal(actual.result, tuple(deferred))
     if type(actual.result) is not EarlyCheckpointAdvanced:
         raise AuditIntegrityError("EARLY completion crossed its original result alternatives")
     if deferred:

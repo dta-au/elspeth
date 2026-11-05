@@ -8,6 +8,8 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.composer import continuation_evidence as evidence_codec
 from elspeth.web.composer.continuation_checkpoint_early_observation import observe_v4_early_checkpoint_returned_response
 from elspeth.web.composer.continuation_checkpoint_early_physical import (
     checkpoint_early_detached_runtime,
@@ -22,6 +24,7 @@ from elspeth.web.composer.continuation_checkpoint_projection import (
 )
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
 from elspeth.web.sessions.continuation_checkpoint_early_projected_overflow import settle_early_projected_overflow_sync
 from elspeth.web.sessions.continuation_checkpoint_paid_terminal import read_v4_checkpoint_paid_overflow_terminal_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -40,30 +43,104 @@ operation_store = _operation_store
 _CLEAN = json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "Coherent.", "note": None})
 
 
+def _reasoning_details(*, early):
+    # Supported provider artifacts whose individual strings survive both the
+    # generic credential traversal and the smaller diagnostic artifact bound.
+    count, size, character = (6, 49_000, "e") if early else (7, 50_000, "r")
+    return [{"type": "reasoning.text", "text": character * size} for _ in range(count)]
+
+
+def _install_primary_response_profile(monkeypatch, *, oversized):
+    original_response = phase_fixture.ModelResponse
+
+    def primary_response(**kwargs):
+        if oversized:
+            kwargs["choices"][0]["message"]["content"] = "p" * 260_000
+            kwargs["choices"][0]["message"]["reasoning_details"] = _reasoning_details(early=False)
+        return original_response(**kwargs)
+
+    monkeypatch.setattr(phase_fixture, "ModelResponse", primary_response)
+
+
+def _early_response_profile(*, oversized):
+    response = _reply(_CLEAN)
+    if oversized:
+        response.choices[0].message.reasoning_details = _reasoning_details(early=True)
+    return response
+
+
+def _assert_fitting_primary_profile(runtime, *, oversized):
+    # Measure the already admitted original chunks, without another capture or
+    # replacement clock. The complete prefix must fit before the paid EARLY call.
+    evidence = runtime.source.admitted_evidence
+    lengths = tuple(len(chunk.canonical.encode("utf-8")) for chunk in (evidence.source_chunk, evidence.recorder_chunk))
+    assert lengths == (evidence.source_chunk.reference.byte_length, evidence.recorder_chunk.reference.byte_length)
+    assert 0 < sum(lengths) <= 1_048_576, lengths
+    if oversized:
+        calls = json.loads(evidence.recorder_chunk.canonical)["snapshot"]["llm_calls"]
+        originals = [call for call in calls if call["reasoning_details"] == _reasoning_details(early=False)]
+        assert len(originals) == 1 and originals[0]["status"] == "success"
+
+
+def _assert_complete_early_profile(returned, *, oversized):
+    assert type(returned) is CheckpointReturnedResponseObservation
+    assert type(returned.provider_metadata.v4_completeness) is V4ProviderResultCompleteness
+    response_bytes = len(returned.response.canonical.encode("utf-8"))
+    assert response_bytes == returned.response.reference.byte_length
+    assert 0 < response_bytes <= 1_048_576, response_bytes
+    assert returned.audit_call.status.value == "success"
+    if oversized:
+        expected = _reasoning_details(early=True)
+        assert deep_thaw(returned.provider_metadata.reasoning_details) == expected
+        assert deep_thaw(returned.audit_call.reasoning_details) == expected
+
+
+def _observe_original_pair_capacity(monkeypatch):
+    original = evidence_codec._require_evidence_pair_capacity
+    overflows = []
+
+    def observe(*, evidence_bytes, recorder_chunk, mandatory_retention):
+        recorder_bytes = len(recorder_chunk.canonical.encode("utf-8"))
+        assert recorder_bytes == recorder_chunk.reference.byte_length
+        if mandatory_retention and evidence_bytes + recorder_bytes > 1_048_576:
+            # The producer admits its exact evidence-document size before this
+            # call, but serializes only AFTER the genuine pair guard succeeds.
+            # Keep that refusal; do not manufacture a replacement encoding.
+            assert 0 < evidence_bytes <= 1_048_576, evidence_bytes
+            assert 0 < recorder_bytes <= 1_048_576, recorder_bytes
+            overflows.append((evidence_bytes, recorder_bytes))
+        return original(evidence_bytes=evidence_bytes, recorder_chunk=recorder_chunk, mandatory_retention=mandatory_retention)
+
+    monkeypatch.setattr(evidence_codec, "_require_evidence_pair_capacity", observe)
+    return overflows
+
+
+def _assert_pre_h_projection_overflow(projected, pair_overflows):
+    assert type(projected) is ProjectedEarlyCheckpointOverflow
+    # This is the original projection capture witness, before H/settlement,
+    # never the independent 16 MiB retained-tail aggregate admission.
+    witness = projected.witness
+    assert witness.unit == "evidence_pair" and witness.codec == "composer.evidence.v2"
+    assert witness.limit_bytes == 1_048_576
+    assert witness.size_is_exact
+    assert len(pair_overflows) == 1, pair_overflows
+    assert witness.observed_bytes == sum(pair_overflows[0]) > witness.limit_bytes, witness
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("oversized", (False, True), ids=("fitting-capture-is-not-overflow", "original-capture-overflow"))
 async def test_original_early_projection_overflow_closes_d_without_retry(operation_store, tmp_path, monkeypatch, oversized):
     # These are external provider bytes, before PRIMARY admission. Each physical
     # response fits separately; their complete recorder plus transcript pair does
     # not fit after EARLY. No encoder, size gate, clock or witness is replaced.
-    original_response = phase_fixture.ModelResponse
-
-    def primary_response(**kwargs):
-        if oversized:
-            kwargs["choices"][0]["message"]["content"] = "p" * 260_000
-            kwargs["choices"][0]["message"]["reasoning_content"] = "r" * 350_000
-        return original_response(**kwargs)
-
-    monkeypatch.setattr(phase_fixture, "ModelResponse", primary_response)
+    _install_primary_response_profile(monkeypatch, oversized=oversized)
     async with _early_case(operation_store, tmp_path, monkeypatch) as (_store, owner, _running, selected, primary_sdk):
+        _assert_fitting_primary_profile(owner.runtime, oversized=oversized)
         sdk = []
 
         async def completion(**_kwargs):
             sdk.append(1)
-            response = _reply(_CLEAN)
-            if oversized:
-                response.choices[0].message.reasoning_content = "e" * 490_000
-            return response
+            return _early_response_profile(oversized=oversized)
 
         monkeypatch.setattr(litellm, "acompletion", completion)
         async with _early_attempt(owner, selected) as source:
@@ -80,35 +157,45 @@ async def test_original_early_projection_overflow_closes_d_without_retry(operati
                 context=runtime.bindings.session_operation_context,
                 env_ref_names=runtime.env_ref_names,
             )
-            assert type(returned) is CheckpointReturnedResponseObservation
+            _assert_complete_early_profile(returned, oversized=oversized)
             current = await load_selected_continuation(
                 authority=phases.authority, running=prepared.running, selected=admission.selected, required_work=phases.work
             )
             inventory = await materialize_continuation_env_inventory(
                 advisor=phases.service._advisor_checkpoint, authority=phases.authority, selected=current, required_work=phases.work
             )
-            projected = await project_early_checkpoint_result(
-                prepared=prepared,
-                admission=admission,
-                detached=checkpoint_early_detached_runtime(source),
-                original=runtime,
-                selected=current,
-                inventory=inventory,
-                custody=custody,
-                returned=returned,
-                accounting=CheckpointPassAccounting(0, 1, None, None, False),
-                physical_source=source,
-            )
+            with monkeypatch.context() as projection_patch:
+                pair_overflows = _observe_original_pair_capacity(projection_patch)
+                try:
+                    projected = await project_early_checkpoint_result(
+                        prepared=prepared,
+                        admission=admission,
+                        detached=checkpoint_early_detached_runtime(source),
+                        original=runtime,
+                        selected=current,
+                        inventory=inventory,
+                        custody=custody,
+                        returned=returned,
+                        accounting=CheckpointPassAccounting(0, 1, None, None, False),
+                        physical_source=source,
+                    )
+                except BaseExceptionGroup:
+                    # WP2 adds a genuine final-source refusal after capture.
+                    # Require the pair cut even when no projection is returned,
+                    # then preserve that original group and its native children.
+                    assert len(pair_overflows) == 1, pair_overflows
+                    raise
             service = prepared.composer._require_sessions_service()
             args = {"service": service, "prepared": prepared, "admission": admission, "returned": returned, "projected": projected}
             before = stored_rows(service._engine)
             if not oversized:
                 assert type(projected) is ProjectedEarlyCheckpoint
+                assert pair_overflows == []
                 with pytest.raises(AuditIntegrityError):
                     settle_early_projected_overflow_sync(**args)
                 assert stored_rows(service._engine) == before
                 return
-            assert type(projected) is ProjectedEarlyCheckpointOverflow
+            _assert_pre_h_projection_overflow(projected, pair_overflows)
             # Constructor copies and even the genuine value-only witness carry
             # no paid authority. Original return/source/ref substitutions fail.
             for changes in (

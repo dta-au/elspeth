@@ -1,8 +1,7 @@
-"""Dormant one-action EARLY caller and original complete-return handoff.
+"""One-action EARLY caller and original complete-return handoff.
 
-The driver still owns caller selection, committed graph/cost adoption and a
-separate retry action. Pending overflow values are deliberately not terminals:
-their source-owned SQL fallbacks must be joined before this caller is enabled.
+The driver owns caller selection, committed graph adoption and a separate retry
+action. Source-owned SQL completion projects paid cost before graph adoption.
 """
 
 from __future__ import annotations
@@ -41,11 +40,8 @@ from elspeth.web.composer.continuation_checkpoint_projection import (
     ProjectedEarlyCheckpoint,
     ProjectedEarlyCheckpointOverflow,
     project_early_checkpoint_result,
-    require_original_early_checkpoint_overflow,
-    require_original_early_checkpoint_projection,
 )
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
-from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emit_progress
 from elspeth.web.composer.prompt_guard import PromptGuardRefused, prompt_guard_user_scope
@@ -59,7 +55,6 @@ from elspeth.web.sessions.continuation_checkpoint_early_retry import VerifiedEar
 from elspeth.web.sessions.continuation_checkpoint_early_return import EarlyCompleteReturnAdmission
 from elspeth.web.sessions.continuation_checkpoint_early_sql import (
     EarlyCheckpointAdvanced,
-    complete_early_checkpoint_sync,
     retain_early_complete_return_sync,
 )
 from elspeth.web.sessions.continuation_checkpoint_no_sdk_terminal import (
@@ -161,43 +156,6 @@ class EarlyCheckpointLiveAdvanced:
 
 
 @dataclass(frozen=True, slots=True)
-class EarlyCheckpointProjectionOverflowPending:
-    """Original D overflow awaiting its source-owned SQL fallback, not terminal."""
-
-    source: CheckpointEarlyPhysicalSource
-    returned: CheckpointReturnedResponseObservation
-    projected: ProjectedEarlyCheckpointOverflow
-
-    def __post_init__(self) -> None:
-        _require_return(self.source, self.returned)
-        prepared, admission = _admitted(self.source)
-        require_original_early_checkpoint_overflow(self.projected, prepared=prepared, admission=admission, returned=self.returned)
-
-
-@dataclass(frozen=True, slots=True)
-class EarlyCheckpointOwedOverflowPending:
-    """Original current H survives C/K/R rollback; no D fallback may consume it."""
-
-    source: CheckpointEarlyPhysicalSource
-    owed: EarlyCompleteReturnAdmission
-    returned: CheckpointReturnedResponseObservation
-    projected: ProjectedEarlyCheckpoint
-    overflow: ContinuationRetainedCapacityExceeded
-
-    def __post_init__(self) -> None:
-        _require_return(self.source, self.returned)
-        prepared, admission = _admitted(self.source)
-        if (
-            type(self.owed) is not EarlyCompleteReturnAdmission
-            or self.owed.original is not admission
-            or self.owed.response is not self.returned.response
-            or type(self.overflow) is not ContinuationRetainedCapacityExceeded
-        ):
-            raise AuditIntegrityError("EARLY owed overflow changed its original complete return or capacity refusal")
-        require_original_early_checkpoint_projection(self.projected, prepared=prepared, admission=admission, returned=self.returned)
-
-
-@dataclass(frozen=True, slots=True)
 class EarlyCheckpointPaidOverflowTerminal:
     verified: VerifiedCheckpointPaidOverflowTerminal
     deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
@@ -210,6 +168,11 @@ class EarlyCheckpointPaidOverflowTerminal:
             or self.verified.hold_state != "consumed"
         ):
             raise AuditIntegrityError("EARLY overflow requires its original settled checkpoint terminal")
+
+
+@dataclass(frozen=True, slots=True)
+class EarlyCheckpointOwedOverflowTerminal(EarlyCheckpointPaidOverflowTerminal):
+    """Post-H overflow; the driver must use the owed-result cold proof."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,17 +216,13 @@ class EarlyCheckpointPaidIncompleteTerminal:
 
 type EarlyCheckpointLiveTerminal = (
     EarlyCheckpointPaidOverflowTerminal
+    | EarlyCheckpointOwedOverflowTerminal
     | EarlyCheckpointNoSdkTerminal
     | EarlyCheckpointPaidIncompleteTerminal
     | SdkTerminalResult
     | SdkTerminalFailure
 )
-type EarlyCheckpointLiveOutcome = (
-    EarlyCheckpointLiveAdvanced
-    | EarlyCheckpointProjectionOverflowPending
-    | EarlyCheckpointOwedOverflowPending
-    | EarlyCheckpointLiveTerminal
-)
+type EarlyCheckpointLiveOutcome = EarlyCheckpointLiveAdvanced | EarlyCheckpointLiveTerminal
 
 
 def _begin_settlement(source: CheckpointEarlyPhysicalSource) -> None:
@@ -274,10 +233,10 @@ def _begin_settlement(source: CheckpointEarlyPhysicalSource) -> None:
     owner.begin_settlement()
 
 
-async def _terminal_sql[T](
+async def _delivered_sql[T](
     source: CheckpointEarlyPhysicalSource, *, operation: Callable[[], T], expected: type[T]
-) -> tuple[T, tuple[asyncio.CancelledError, ...]]:
-    """Return committed terminal DATA before surfacing deferred cancellation."""
+) -> RequiredSQLReturned[T] | RequiredSQLRaised:
+    """Keep the original SQL result and cancellation until its owner disposes it."""
     work = source.phase_owner.phases.work
     _begin_settlement(source)
     sql, projection = work.reserve_pair(RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION)
@@ -291,9 +250,7 @@ async def _terminal_sql[T](
         raise
     if type(outcome) is RequiredSQLRaised:
         projection.complete_without_submission()
-        if outcome.deferred_cancellations:
-            raise BaseExceptionGroup("EARLY terminal SQL and deferred cancellation", [outcome.error, *outcome.deferred_cancellations])
-        raise outcome.error
+        return outcome
     if type(outcome) is not RequiredSQLReturned:
         projection.complete_without_submission()
         raise AuditIntegrityError("EARLY terminal lost its original registered SQL outcome")
@@ -305,6 +262,18 @@ async def _terminal_sql[T](
         projection.complete_owned(error)
         raise
     projection.complete_owned()
+    return outcome
+
+
+async def _terminal_sql[T](
+    source: CheckpointEarlyPhysicalSource, *, operation: Callable[[], T], expected: type[T]
+) -> tuple[T, tuple[asyncio.CancelledError, ...]]:
+    """Return committed terminal DATA before surfacing deferred cancellation."""
+    outcome = await _delivered_sql(source, operation=operation, expected=expected)
+    if isinstance(outcome, RequiredSQLRaised):
+        if outcome.deferred_cancellations:
+            raise BaseExceptionGroup("EARLY terminal SQL and deferred cancellation", [outcome.error, *outcome.deferred_cancellations])
+        raise outcome.error
     return outcome.value, outcome.deferred_cancellations
 
 
@@ -446,13 +415,14 @@ async def _call_early(source: CheckpointEarlyPhysicalSource) -> CheckpointReturn
 
 async def complete_v4_checkpoint_early_return(
     source: CheckpointEarlyPhysicalSource, *, returned: CheckpointReturnedResponseObservation
-) -> (
-    EarlyCheckpointLiveAdvanced
-    | EarlyCheckpointProjectionOverflowPending
-    | EarlyCheckpointOwedOverflowPending
-    | EarlyCheckpointPaidOverflowTerminal
-):
+) -> EarlyCheckpointLiveAdvanced | EarlyCheckpointPaidOverflowTerminal:
     """Project current D, then retain H and atomically complete C/K or C/R."""
+    from elspeth.web.sessions.continuation_checkpoint_early_owed_overflow import (
+        EarlyCheckpointCompletionDeliveryError,
+        complete_early_checkpoint_or_overflow,
+    )
+    from elspeth.web.sessions.continuation_checkpoint_early_projected_overflow import settle_early_projected_overflow_sync
+
     _require_return(source, returned)
     prepared, admission = _admitted(source)
     phases, runtime = source.phase_owner.phases, source.phase_owner.runtime
@@ -490,33 +460,78 @@ async def complete_v4_checkpoint_early_return(
     if isinstance(projected, ProjectedEarlyCheckpointOverflow):
         if type(projected) is not ProjectedEarlyCheckpointOverflow:
             raise AuditIntegrityError("EARLY live call received a foreign projection overflow")
-        return EarlyCheckpointProjectionOverflowPending(source, returned, projected)
+        verified, deferred = await _terminal_sql(
+            source,
+            operation=partial(
+                settle_early_projected_overflow_sync,
+                service=_sessions(prepared),
+                prepared=prepared,
+                admission=admission,
+                returned=returned,
+                projected=projected,
+            ),
+            expected=VerifiedCheckpointPaidOverflowTerminal,
+        )
+        return EarlyCheckpointPaidOverflowTerminal(verified, deferred)
     if type(projected) is not ProjectedEarlyCheckpoint:
         raise AuditIntegrityError("EARLY live call lost its original detached complete projection")
     sessions = _sessions(prepared)
+    retained = await _delivered_sql(
+        source,
+        operation=partial(retain_early_complete_return_sync, service=sessions, prepared=prepared, admission=admission, returned=returned),
+        expected=EarlyCompleteReturnAdmission,
+    )
+    deferred = retained.deferred_cancellations
+    if isinstance(retained, RequiredSQLRaised):
+        if isinstance(retained.error, ContinuationRetainedCapacityExceeded):
+            try:
+                overflow = await _returned_overflow(source, returned, overflow=retained.error)
+            except BaseException as failure:
+                if deferred:
+                    raise BaseExceptionGroup("EARLY H overflow settlement and cancellation", [failure, *deferred]) from None
+                raise
+            return EarlyCheckpointPaidOverflowTerminal(overflow.verified, (*deferred, *overflow.deferred_cancellations))
+        if deferred:
+            raise BaseExceptionGroup("EARLY H retention and cancellation", [retained.error, *deferred])
+        raise retained.error
+    owed = retained.value
     try:
-        owed = await _registered(
-            work=phases.work,
-            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-            operation=partial(
-                retain_early_complete_return_sync, service=sessions, prepared=prepared, admission=admission, returned=returned
-            ),
-            expected=EarlyCompleteReturnAdmission,
+        completed = await complete_early_checkpoint_or_overflow(
+            service=sessions, prepared=prepared, owed=owed, returned=returned, projected=projected
         )
-    except ContinuationRetainedCapacityExceeded as excess:
-        return await _returned_overflow(source, returned, overflow=excess)
-    try:
-        advanced = await _registered(
-            work=phases.work,
-            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-            operation=partial(
-                complete_early_checkpoint_sync, service=sessions, prepared=prepared, owed=owed, returned=returned, projected=projected
-            ),
-            expected=EarlyCheckpointAdvanced,
-        )
-    except ContinuationRetainedCapacityExceeded as excess:
-        return EarlyCheckpointOwedOverflowPending(source, owed, returned, projected, excess)
-    return EarlyCheckpointLiveAdvanced(source, advanced, returned)
+    except EarlyCheckpointCompletionDeliveryError as delivery:
+        originals = delivery.original_group.exceptions
+        if all(isinstance(error, asyncio.CancelledError) for error in originals):
+            # Completion has proved/projected its committed head and cost onto
+            # the original phase owner. Dispatch the original cancellation via
+            # dispose; its cause must not contain the same exception recursively.
+            first = originals[0]
+            others = [error for error in (*originals[1:], *deferred) if error is not first]
+            if others:
+                if first.__cause__ is not None:
+                    others.insert(0, first.__cause__)
+                raise first from BaseExceptionGroup("EARLY other completion cancellations", others)
+            raise first from first.__cause__
+        if deferred:
+            raise BaseExceptionGroup("EARLY completion and retained-return cancellation", [delivery, *deferred]) from None
+        raise
+    except BaseException as failure:
+        if deferred:
+            raise BaseExceptionGroup("EARLY completion and retained-return cancellation", [failure, *deferred]) from None
+        raise
+    if type(completed) is EarlyCheckpointOwedOverflowTerminal:
+        return EarlyCheckpointOwedOverflowTerminal(completed.verified, (*deferred, *completed.deferred_cancellations))
+    if deferred:
+        # H and its paid completion are delivered before cancellation. The
+        # committed head/cost are already projected; business adoption is skipped.
+        first = deferred[0]
+        others = [error for error in deferred[1:] if error is not first]
+        if others:
+            if first.__cause__ is not None:
+                others.insert(0, first.__cause__)
+            raise first from BaseExceptionGroup("EARLY other retained-return cancellations", others)
+        raise first
+    return completed
 
 
 async def run_v4_checkpoint_early_live(

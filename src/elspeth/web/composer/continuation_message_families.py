@@ -79,6 +79,14 @@ class _BatchFamilySource:
 
 
 @dataclass(frozen=True, slots=True)
+class _FamilySourceInputs:
+    evidence: TurnEvidenceSnapshot
+    recorder: RecorderSnapshot
+    responses: tuple[PrivateChunk, ...]
+    batches: tuple[_BatchFamilySource, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _MessageFamilySources:
     evidence: TurnEvidenceSnapshot
     recorder: RecorderSnapshot
@@ -347,6 +355,24 @@ def _sources_from_admitted_evidence_on_connection(
     finish_read: ContinuationFinishRead | None = None,
 ) -> _MessageFamilySources:
     """Read family relationships using the caller's actual admitted evidence."""
+    inputs = _family_source_inputs_on_connection(conn, selected=selected, inventory=inventory, admitted=admitted, finish_read=finish_read)
+    result_sources, feedback_sources = _admit_selected_tool_recipes_on_connection(
+        conn, inventory.running, selected=selected, admitted=admitted, names=inventory.names
+    )
+    return _finish_family_sources_on_connection(
+        conn, selected=selected, inventory=inventory, inputs=inputs, result_sources=result_sources, feedback_sources=feedback_sources
+    )
+
+
+def _family_source_inputs_on_connection(
+    conn: Connection,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    admitted: AdmittedTurnEvidence,
+    finish_read: ContinuationFinishRead | None = None,
+) -> _FamilySourceInputs:
+    """The actual family SQL relationships preceding tool recipe admission."""
     from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
     from elspeth.web.composer.continuation_batch_data import (
         RestoredBatchData,
@@ -455,14 +481,23 @@ def _sources_from_admitted_evidence_on_connection(
             if retain_response(recipe.response) != actual:
                 raise AuditIntegrityError("native recipe changed its actual committed paid response source")
             checked_native.add(recipe.response)
-    result_sources, feedback_sources = _admit_selected_tool_recipes_on_connection(
-        conn, running, selected=selected, admitted=admitted, names=inventory.names
-    )
+    return _FamilySourceInputs(evidence, recorder, tuple(responses), tuple(batches))
+
+
+def _finish_family_sources_on_connection(
+    conn: Connection,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    inputs: _FamilySourceInputs,
+    result_sources: tuple[_ToolResultFamilySource, ...],
+    feedback_sources: tuple[_ToolFeedbackFamilySource, ...],
+) -> _MessageFamilySources:
     from elspeth.web.composer.continuation_control_transitions import control_result_message_on_connection
 
     control_results = tuple(
-        (recipe, family_message_wire(control_result_message_on_connection(conn, running, selected=selected, recipe=recipe)))
-        for recipe in evidence.transcript.producer_recipes or ()
+        (recipe, family_message_wire(control_result_message_on_connection(conn, inventory.running, selected=selected, recipe=recipe)))
+        for recipe in inputs.evidence.transcript.producer_recipes or ()
         if type(recipe) is ControlResultMessageRecipe
     )
     from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
@@ -471,10 +506,10 @@ def _sources_from_admitted_evidence_on_connection(
     # immutable source and recorder proofs above. Policy alone grants no custody.
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
     return _MessageFamilySources(
-        evidence,
-        recorder,
-        tuple(responses),
-        tuple(batches),
+        inputs.evidence,
+        inputs.recorder,
+        inputs.responses,
+        inputs.batches,
         result_sources,
         feedback_sources,
         control_results,
@@ -1260,6 +1295,39 @@ class CurrentContinuationMessageFamilies:
                         raise AuditIntegrityError("feedback source changed during current reconstruction")
                     _require_response_audit_source(after, _response(after, recipe.response))
             return cohort
+
+    def _assemble_paired_cohort_on_connection(
+        self,
+        conn: Connection,
+        requests: _FamilyRequests,
+        *,
+        admitted: AdmittedTurnEvidence,
+        result_sources: tuple[_ToolResultFamilySource, ...],
+        feedback_sources: tuple[_ToolFeedbackFamilySource, ...],
+    ) -> _RestoredFamilyCohort:
+        """Use actual recipe DATA from this transaction's complete input read."""
+        if self.finish_read is not None or any(type(recipe) is FailureSchemaMessageRecipe for recipe, _text in requests):
+            raise AuditIntegrityError("paired family assembly requires ordinary current inputs without policy callbacks")
+        if not requests:
+            return _RestoredFamilyCohort((), (), ())
+        inputs = _family_source_inputs_on_connection(conn, selected=self.selected, inventory=self.inventory, admitted=admitted)
+        sources = _finish_family_sources_on_connection(
+            conn,
+            selected=self.selected,
+            inventory=self.inventory,
+            inputs=inputs,
+            result_sources=result_sources,
+            feedback_sources=feedback_sources,
+        )
+        cohort = _assemble_family_cohort(sources, requests, catalogs={})
+        require_current_env_inventory_on_connection(
+            conn,
+            self.inventory.running,
+            inventory=self.inventory,
+            expected_checkpoint_id=self.selected.checkpoint_id,
+            expected_cursor=self.selected.stack.cursor,
+        )
+        return cohort
 
     def _assemble_admitted_cohort(self, requests: _FamilyRequests, *, admitted: AdmittedTurnEvidence) -> _RestoredFamilyCohort:
         """Build private DATA for a caller that owes the complete final source read."""

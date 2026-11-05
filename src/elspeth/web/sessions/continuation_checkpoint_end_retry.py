@@ -15,6 +15,7 @@ from weakref import WeakKeyDictionary
 from pydantic import ValidationError, model_validator
 from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, select, update
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX, canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
@@ -28,7 +29,12 @@ from elspeth.web.composer.continuation import (
     PrivateChunkRef,
     ToolBatchFrame,
 )
-from elspeth.web.composer.continuation_audit_buffer import RECORDER_CODEC, decode_recorder_snapshot, validate_recorder_projection
+from elspeth.web.composer.continuation_audit_buffer import (
+    RECORDER_CODEC,
+    RecorderSnapshot,
+    decode_recorder_snapshot,
+    validate_recorder_projection,
+)
 from elspeth.web.composer.continuation_capture_overflow import (
     ContinuationCaptureOverflowWitness,
     ContinuationMandatoryCaptureOverflow,
@@ -45,7 +51,7 @@ from elspeth.web.composer.continuation_codec import (
     encode_continuation_snapshot,
     encode_private_chunk,
 )
-from elspeth.web.composer.continuation_evidence import admit_turn_evidence, decode_turn_evidence, encode_turn_evidence
+from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.coordination.database_clock import database_now
@@ -194,7 +200,7 @@ def issue_cold_end_format_retry_overflow(
     return value
 
 
-def _retry_recorder(conn: Connection, owed: VerifiedCheckpointEndOwed) -> PrivateChunk:
+def _retry_recorder(conn: Connection, owed: VerifiedCheckpointEndOwed, *, call: ComposerLLMCall) -> tuple[PrivateChunk, RecorderSnapshot]:
     root = decode_continuation_snapshot(owed.selected.payload_json)
     compose = root.frames[0]
     if type(compose) is not ComposeFrame:
@@ -209,16 +215,24 @@ def _retry_recorder(conn: Connection, owed: VerifiedCheckpointEndOwed) -> Privat
     if stored is None or stored.codec != compose.audit_buffer.codec:
         raise AuditIntegrityError("END retry lost its bounded original recorder")
     previous = decode_recorder_snapshot(PrivateChunk(compose.audit_buffer, stored.payload.decode("utf-8", errors="strict")))
-    call = decode_retained_physical_audit_call(owed.response)
     if call.call_id != owed.attempt_id or any(item.call_id == call.call_id for item in previous.llm_calls):
         raise AuditIntegrityError("END retry duplicated or replaced its original paid audit")
     # Earlier physical audits retain their original drain semantics. The
     # finalizer independently reproves and deduplicates checkpointed calls.
-    canonical, _restored = validate_recorder_projection(replace(previous, llm_calls=(*previous.llm_calls, call)))
-    return encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)
+    extended = replace(previous, llm_calls=(*previous.llm_calls, call))
+    canonical, _restored = validate_recorder_projection(extended)
+    return encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical), extended
 
 
-def _retry_evidence(conn: Connection, owed: VerifiedCheckpointEndOwed, recorder: PrivateChunk, *, names: frozenset[str]) -> PrivateChunk:
+def _retry_evidence(
+    conn: Connection,
+    owed: VerifiedCheckpointEndOwed,
+    recorder: PrivateChunk,
+    *,
+    call: ComposerLLMCall,
+    extended: RecorderSnapshot,
+    names: frozenset[str],
+) -> tuple[PrivateChunk, tuple[PrivateChunk, ...]]:
     """Freshly admit the unchanged evidence graph with its exact paid recorder.
 
     Both private references change together. This is a DATA projection from
@@ -235,16 +249,40 @@ def _retry_evidence(conn: Connection, owed: VerifiedCheckpointEndOwed, recorder:
     original = decode_turn_evidence(originals[0], env_ref_names=names, source_chunks=chunks)
     if original.snapshot.recorder != compose.audit_buffer:
         raise AuditIntegrityError("END retry evidence changed its original recorder identity")
-    refreshed = admit_turn_evidence(
-        original.snapshot.model_copy(update={"recorder": recorder.reference}),
+    from elspeth.web.composer.continuation_evidence_application_data import append_call_to_evidence, refresh_selected_applied_batch_chunk
+
+    refreshed = append_call_to_evidence(
+        original,
+        call=call,
+        recorder=extended,
         env_ref_names=names,
         mandatory_retention=True,
-        source_chunks=(*chunks, recorder),
     )
-    return encode_turn_evidence(refreshed, env_ref_names=names, mandatory_retention=True)
+    if call.call_id != owed.attempt_id or refreshed.recorder_chunk != recorder:
+        raise AuditIntegrityError("END retry evidence changed its exact paid recorder")
+    batches = tuple(frame for frame in root.frames if type(frame) is ToolBatchFrame)
+    if len(batches) > 1:
+        raise AuditIntegrityError("END retry evidence has more than its original batch")
+    applied: tuple[PrivateChunk, ...] = ()
+    if batches and batches[0].accumulator.codec == "composer.applied-p4-batch.v2":
+        batch = batches[0]
+        if batch.phase != "result_retained":
+            raise AuditIntegrityError("END retry changed its original applied batch phase")
+        originals = tuple(chunk for chunk in chunks if chunk.reference == batch.accumulator)
+        if len(originals) != 1:
+            raise AuditIntegrityError("END retry lost its complete original applied batch")
+        applied = (refresh_selected_applied_batch_chunk(originals[0], previous=original, updated=refreshed, env_ref_names=names),)
+    return encode_turn_evidence(refreshed, env_ref_names=names, mandatory_retention=True), applied
 
 
-def _retry_root(owed: VerifiedCheckpointEndOwed, receipt: str, recorder: PrivateChunkRef, evidence: PrivateChunkRef) -> str:
+def _retry_root(
+    owed: VerifiedCheckpointEndOwed,
+    receipt: str,
+    recorder: PrivateChunkRef,
+    evidence: PrivateChunkRef,
+    *,
+    applied: tuple[PrivateChunk, ...],
+) -> str:
     root = decode_continuation_snapshot(owed.selected.payload_json)
     children = tuple(item for item in root.effect_frontier if item.effect_id == owed.effect_key)
     if (
@@ -258,10 +296,29 @@ def _retry_root(owed: VerifiedCheckpointEndOwed, receipt: str, recorder: Private
         or root.pending_owner_results
     ):
         raise AuditIntegrityError("END format retry lost its exact outstanding physical child")
+    frames = list(root.frames)
+    frames[0] = root.frames[0].model_copy(update={"audit_buffer": recorder, "evidence": evidence})
+    indexes = tuple(index for index, frame in enumerate(frames) if type(frame) is ToolBatchFrame)
+    if len(indexes) > 1 or len(applied) > 1:
+        raise AuditIntegrityError("END retry changed its exact applied batch closure")
+    if indexes:
+        batch = frames[indexes[0]]
+        if type(batch) is not ToolBatchFrame:
+            raise AuditIntegrityError("END retry lost its original batch frame")
+        if batch.accumulator.codec == "composer.applied-p4-batch.v2":
+            if batch.phase != "result_retained" or len(applied) != 1:
+                raise AuditIntegrityError("END retry lost its refreshed applied batch chunk")
+            if applied[0].reference.codec != "composer.applied-p4-batch.v2":
+                raise AuditIntegrityError("END retry substituted its applied batch codec")
+            frames[indexes[0]] = batch.model_copy(update={"accumulator": applied[0].reference})
+        elif applied:
+            raise AuditIntegrityError("END retry invented an applied batch source")
+    elif applied:
+        raise AuditIntegrityError("END retry invented an applied batch source")
     return encode_continuation_snapshot(
         root.model_copy(
             update={
-                "frames": (root.frames[0].model_copy(update={"audit_buffer": recorder, "evidence": evidence}), *root.frames[1:]),
+                "frames": tuple(frames),
                 "effect_frontier": tuple(
                     EffectFrontierEntry(effect_id=item.effect_id, disposition="committed", receipt_id=receipt)
                     if item.effect_id == owed.effect_key
@@ -280,7 +337,7 @@ def reprepare_cold_end_format_retry_prospective_on_connection(
     service: object,
     source: ColdCheckpointEndConsequenceSource,
 ) -> tuple[ProspectiveContinuationChunk, ...]:
-    """Freshly rebuild all four required bytes without mutating the current H."""
+    """Rebuild the complete required private closure without mutating current H."""
     from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
         ColdCheckpointEndConsequenceSource,
         require_original_cold_checkpoint_end_source,
@@ -323,8 +380,8 @@ def reprepare_cold_end_format_retry_prospective_on_connection(
         ):
             raise AuditIntegrityError("cold END retry projection cannot reclassify its original response")
         cohort = checkpoint_paid_audit_cohort_for_hold(call, owed.new_hold)
-        recorder = _retry_recorder(conn, owed)
-        evidence = _retry_evidence(conn, owed, recorder, names=source.runtime.env_ref_names)
+        recorder, extended = _retry_recorder(conn, owed, call=call)
+        evidence, applied = _retry_evidence(conn, owed, recorder, call=call, extended=extended, names=source.runtime.env_ref_names)
         receipt = f"checkpoint-end-format-retry:{owed.attempt_id}"
         marker = EndFormatRetryMarker(
             session_id=sid,
@@ -349,13 +406,17 @@ def reprepare_cold_end_format_retry_prospective_on_connection(
         event = ContinuationEvent("checkpoint", canonical_json(marker.model_dump(mode="json")))
         append = prepare_snapshot_append(
             owed.selected,
-            snapshot_json=_retry_root(owed, receipt, recorder.reference, evidence.reference),
+            snapshot_json=_retry_root(owed, receipt, recorder.reference, evidence.reference, applied=applied),
             events=(event,),
             published_at=database_now(conn),
         )
         return (
             ProspectiveContinuationChunk(private_chunk_key(recorder), recorder.canonical.encode("utf-8"), recorder.reference.codec),
             ProspectiveContinuationChunk(private_chunk_key(evidence), evidence.canonical.encode("utf-8"), evidence.reference.codec),
+            *(
+                ProspectiveContinuationChunk(private_chunk_key(chunk), chunk.canonical.encode("utf-8"), chunk.reference.codec)
+                for chunk in applied
+            ),
             ProspectiveContinuationChunk(f"event:{owed.selected.cursor + 1}", event.payload_json.encode("utf-8"), "event.v2"),
             ProspectiveContinuationChunk(f"snapshot:{append.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
         )
@@ -491,8 +552,8 @@ def retain_end_format_retry_on_connection(
         ):
             raise AuditIntegrityError("END format retry lost its original phase/input closure")
         cohort = checkpoint_paid_audit_cohort_for_hold(call, owed.new_hold)
-        recorder = _retry_recorder(conn, owed)
-        evidence = _retry_evidence(conn, owed, recorder, names=names)
+        recorder, extended = _retry_recorder(conn, owed, call=call)
+        evidence, applied = _retry_evidence(conn, owed, recorder, call=call, extended=extended, names=names)
         receipt = f"checkpoint-end-format-retry:{owed.attempt_id}"
         marker = EndFormatRetryMarker(
             session_id=sid,
@@ -518,7 +579,7 @@ def retain_end_format_retry_on_connection(
         now = database_now(conn)
         append = prepare_snapshot_append(
             owed.selected,
-            snapshot_json=_retry_root(owed, receipt, recorder.reference, evidence.reference),
+            snapshot_json=_retry_root(owed, receipt, recorder.reference, evidence.reference, applied=applied),
             events=(event,),
             published_at=now,
         )
@@ -531,6 +592,10 @@ def retain_end_format_retry_on_connection(
             prospective=(
                 ProspectiveContinuationChunk(private_chunk_key(recorder), recorder.canonical.encode("utf-8"), recorder.reference.codec),
                 ProspectiveContinuationChunk(private_chunk_key(evidence), evidence.canonical.encode("utf-8"), evidence.reference.codec),
+                *(
+                    ProspectiveContinuationChunk(private_chunk_key(chunk), chunk.canonical.encode("utf-8"), chunk.reference.codec)
+                    for chunk in applied
+                ),
                 ProspectiveContinuationChunk(f"event:{owed.selected.cursor + 1}", event.payload_json.encode("utf-8"), "event.v2"),
                 ProspectiveContinuationChunk(f"snapshot:{append.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
             ),
@@ -544,7 +609,7 @@ def retain_end_format_retry_on_connection(
             cohort=cohort,
             names=names,
         )
-        for chunk in (recorder, evidence):
+        for chunk in (recorder, evidence, *applied):
             put_chunk(
                 conn,
                 session_id=sid,
@@ -690,8 +755,8 @@ def read_end_format_retry_on_connection(
             effects.c.effect_key == marker.effect_key,
         )
     ).one_or_none()
-    recorder = _retry_recorder(conn, owed)
-    evidence = _retry_evidence(conn, owed, recorder, names=original_names)
+    recorder, extended = _retry_recorder(conn, owed, call=call)
+    evidence, applied = _retry_evidence(conn, owed, recorder, call=call, extended=extended, names=original_names)
     stored_recorder = read_bounded_retained_chunk(
         conn,
         session_id=session_id,
@@ -720,7 +785,13 @@ def read_end_format_retry_on_connection(
         or stored_evidence.payload != evidence.canonical.encode("utf-8")
     ):
         raise AuditIntegrityError("END retry lost its complete refreshed evidence graph")
-    expected = decode_continuation_snapshot(_retry_root(owed, marker.receipt_key, recorder.reference, evidence.reference))
+    for chunk in applied:
+        stored = read_bounded_retained_chunk(
+            conn, session_id=session_id, operation_id=operation_id, key=private_chunk_key(chunk), allowance=contract.allowance
+        )
+        if stored is None or stored.codec != chunk.reference.codec or stored.payload != chunk.canonical.encode("utf-8"):
+            raise AuditIntegrityError("END retry lost its complete refreshed applied batch")
+    expected = decode_continuation_snapshot(_retry_root(owed, marker.receipt_key, recorder.reference, evidence.reference, applied=applied))
     actual = decode_continuation_snapshot(marker_snapshot.payload_json)
     if (
         verdict.ok

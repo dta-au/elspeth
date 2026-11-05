@@ -836,7 +836,7 @@ files:
     dict[str, Any]: 4
   src/elspeth/web/composer/continuation_prompt_producers.py:
     Mapping[str, Any]: 11
-    dict[str, Any]: 40
+    dict[str, Any]: 41
     dict[str, object]: 4
   src/elspeth/web/composer/continuation_provider_input.py:
     Mapping[str, Any]: 2
@@ -1144,6 +1144,6 @@ totals:
   Mapping[str, object]: 327
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1190
+  dict[str, Any]: 1191
   dict[str, object]: 408
-  soft: 2737
+  soft: 2738

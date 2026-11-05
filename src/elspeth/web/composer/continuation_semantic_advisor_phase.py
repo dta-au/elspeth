@@ -35,14 +35,14 @@ from elspeth.web.composer.continuation_policy import (
 )
 from elspeth.web.composer.continuation_progress import decode_prescribed_continuation_action
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
-from elspeth.web.composer.continuation_semantic_advisor import SemanticAdvisorRetainedInputs, prepare_semantic_advisor_request
+from elspeth.web.composer.continuation_semantic_advisor import PreparedSemanticAdvisorRequest, prepare_semantic_advisor_request
 from elspeth.web.composer.continuation_semantic_advisor_outcome import (
     SemanticAdvisorInvocationRaised,
     SemanticAdvisorInvocationReturned,
     SemanticAdvisorInvocationV4Finalized,
     observe_semantic_advisor_invocation,
 )
-from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
+from elspeth.web.composer.continuation_semantic_invocation import SemanticAdvisorInvocationData, make_semantic_advisor_invocation
 from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer, SemanticAdvisorNoSdkRefusalReason
 from elspeth.web.composer.continuation_semantic_observation import SemanticProviderResponseObservation
 from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
@@ -53,7 +53,7 @@ from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
-from elspeth.web.continuation_retention_memo import legacy_advisor_preparation_memo_scope
+from elspeth.web.continuation_retention_memo import legacy_advisor_preparation_memo_scope, v4_preparation_memo_scope
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.composer_operations import ComposerOperationRecord, ComposerOperationRunning
@@ -105,6 +105,12 @@ class SemanticAdvisorPaidTerminal:
 class SemanticAdvisorPaidIncompleteTerminal:
     verified: VerifiedPaidIncompleteTerminal
     deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticRequestPreparation:
+    invocation: SemanticAdvisorInvocationData
+    request: PreparedSemanticAdvisorRequest
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,7 +346,8 @@ async def run_continuation_semantic_advisor(
     if type(clock) is not ContinuationActionClock or clock.policy != policy.actions.advisor:
         raise AuditIntegrityError("Semantic live action changed its original Advisor allowance")
     if type(policy) is ContinuationAdmissionPolicyV4:
-        return await _run_semantic_advisor_preparation(phases, selected, running=running, policy=policy, clock=clock)
+        with v4_preparation_memo_scope(clock):
+            return await _run_semantic_advisor_preparation(phases, selected, running=running, policy=policy, clock=clock)
     if type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2):
         raise AuditIntegrityError("Semantic Advisor lost its original admitted policy")
     with legacy_advisor_preparation_memo_scope(clock):
@@ -376,29 +383,37 @@ async def _run_semantic_advisor_preparation(
             authority=phases.authority, running=running, selected=current, required_work=phases.work
         )
         runtime, inventory = await phases.current(selected)
-    raw = capture_semantic_advisor_source(runtime)
-    invocation = make_semantic_advisor_invocation(raw)
-    stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
-    retained_inputs = await _registered(
+
+    def build_request() -> _SemanticRequestPreparation:
+        raw = capture_semantic_advisor_source(runtime)
+        invocation = make_semantic_advisor_invocation(raw)
+        stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
+        retained_inputs = _transaction(
+            phases, lambda conn: read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=stored)
+        )
+        # The retained-input transaction is closed before policy callbacks,
+        # transcript acquisition and initial content-scope CAS open their own.
+        request = prepare_semantic_advisor_request(
+            owner=phases.service._advisor_checkpoint,
+            provider_owner=phases.provider_owner,
+            source=invocation.invocation,
+            frontier=invocation.frontier,
+            state=runtime.live.state,
+            content_scope=ComposerContentScope(UUID(selected.stack.logical.session_id), composition_content_hash(runtime.live.state)),
+            user_message=runtime.bindings.message,
+            runtime=runtime,
+            env_ref_names=runtime.env_ref_names,
+            retained_inputs=retained_inputs,
+        )
+        return _SemanticRequestPreparation(invocation, request)
+
+    preparation = await _registered(
         work=phases.work,
         source=RequiredWorkSource.CONTINUATION_READ_SQL,
-        operation=lambda: _transaction(
-            phases, lambda conn: read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=stored)
-        ),
-        expected=SemanticAdvisorRetainedInputs,
+        operation=build_request,
+        expected=_SemanticRequestPreparation,
     )
-    request = prepare_semantic_advisor_request(
-        owner=phases.service._advisor_checkpoint,
-        provider_owner=phases.provider_owner,
-        source=invocation.invocation,
-        frontier=invocation.frontier,
-        state=runtime.live.state,
-        content_scope=ComposerContentScope(UUID(selected.stack.logical.session_id), composition_content_hash(runtime.live.state)),
-        user_message=runtime.bindings.message,
-        runtime=runtime,
-        env_ref_names=runtime.env_ref_names,
-        retained_inputs=retained_inputs,
-    )
+    invocation, request = preparation.invocation, preparation.request
     issuer = SemanticAdvisorNoSdkIssuer(
         running=running,
         work=phases.work,

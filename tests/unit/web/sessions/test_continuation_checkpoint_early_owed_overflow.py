@@ -14,6 +14,7 @@ from sqlalchemy import func, select, update
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointOwedOverflowTerminal
 from elspeth.web.composer.continuation_checkpoint_early_observation import observe_v4_early_checkpoint_returned_response
 from elspeth.web.composer.continuation_checkpoint_early_physical import (
     checkpoint_early_detached_runtime,
@@ -565,6 +566,7 @@ async def test_actual_finish_once_deferred_cancellation_keeps_original_terminal(
                 await asyncio.gather(task, return_exceptions=True)
         assert sdk == [1]
         if failure_boundary == "none":
+            assert type(result) is EarlyCheckpointOwedOverflowTerminal
             assert type(result.verified) is VerifiedCheckpointPaidOverflowTerminal
             assert len(result.deferred_cancellations) == 1
             deferred = result.deferred_cancellations[0]

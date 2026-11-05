@@ -464,20 +464,56 @@ def _semantic_preparation_window(snapshot, target_clock):
     """Qualify native observations without treating post-finish work as preparation."""
     issues = list(snapshot["errors"])
     clocks = [row for row in snapshot["clocks"] if row["identity"] == target_clock]
-    if len(clocks) != 1 or len(clocks[0]["finish_attempts"]) != 1:
-        return {"valid": False, "issues": [*issues, "semantic target needs one original clock and finish attempt"]}
+    # A real driver constructs many short-lived clocks. Their object ids may
+    # repeat; the selected constructor row, not an id alone, identifies ours.
+    index = snapshot.get("target_clock_index")
+    if index is not None:
+        clocks = [row for ordinal, row in enumerate(snapshot["clocks"]) if ordinal == index and row["identity"] == target_clock]
+    if len(clocks) != 1:
+        return {"valid": False, "issues": [*issues, "semantic target needs one original constructed clock"]}
     clock = clocks[0]
-    finish = clock["finish_attempts"][0]
+    refusals = snapshot.get("refused_preparation_guards", [])
+    endpoints = [*clock["finish_attempts"], *refusals]
+    if len(endpoints) != 1:
+        return {"valid": False, "issues": [*issues, "semantic target needs one original finish or refused guard endpoint"]}
+    finish = endpoints[0]
+    refused = bool(refusals)
+    endpoint_worker = finish.get("worker") if refused else None
     start, end = clock["start_ns"], finish["entry_ns"]
-    if end < start or not finish["same_thread"]:
+    if end < start or (not refused and not finish["same_thread"]):
         issues.append("semantic clock has an invalid interval or changed finish thread")
+    if refused and (
+        finish["clock"] != target_clock
+        or finish["error"] != "TimeoutError"
+        or finish["seen"]
+        or finish["same_thread"] != (finish["thread"] == clock["thread"])
+    ):
+        issues.append("semantic refusal did not belong to the original unfinished preparation")
     if snapshot["incomplete_spans"] or snapshot["unpaired_submissions"] or snapshot["pending_sql_contexts"]:
         issues.append("semantic observations have unfinished spans, workers or SQL")
     if snapshot["cpu_profile_enabled"] or snapshot["cpu_profiles"] or snapshot["text_memo"] is not None:
         issues.append("semantic observation must exclude CPU profiling and memo probes")
     records = snapshot["records"]
     by_id = {row["id"]: row for row in records}
-    selected = [row for row in records if row["clock"] == target_clock]
+    if refused and snapshot["enabled"] and not finish["same_thread"]:
+        worker = by_id.get(endpoint_worker)
+        if (
+            worker is None
+            or worker["kind"] != "worker"
+            or worker["clock"] != target_clock
+            or worker["thread"] != finish["thread"]
+            or not start <= worker["start_ns"] <= end <= finish["end_ns"] <= worker.get("end_ns", -1)
+        ):
+            issues.append("semantic refused guard lost its original completed native worker")
+    next_constructor = min(
+        (row["start_ns"] for row in snapshot["clocks"] if row["identity"] == target_clock and row["start_ns"] > start),
+        default=None,
+    )
+    selected = [
+        row
+        for row in records
+        if row["clock"] == target_clock and row["start_ns"] >= start and (next_constructor is None or row["start_ns"] < next_constructor)
+    ]
     submissions = [row for row in selected if row["kind"] == "submission" and start <= row["start_ns"] <= end]
     for submission in submissions:
         if submission.get("submission_failed"):
@@ -488,7 +524,10 @@ def _semantic_preparation_window(snapshot, target_clock):
             or worker["clock"] != target_clock
             or worker["kind"] != "worker"
             or worker.get("submission") != submission["id"]
-            or not start <= worker["start_ns"] <= worker.get("end_ns", end + 1) <= end
+            or not start <= worker["start_ns"] <= end
+            or "end_ns" not in worker
+            or worker["end_ns"] < worker["start_ns"]
+            or (worker["end_ns"] > end and worker["id"] != endpoint_worker)
         ):
             issues.append("semantic preparation submission lost its complete original worker window")
     contained = [row["id"] for row in selected if start <= row["start_ns"] <= row.get("end_ns", end + 1) <= end]
@@ -500,6 +539,10 @@ def _semantic_preparation_window(snapshot, target_clock):
         "valid": not issues,
         "issues": issues,
         "clock": target_clock,
+        "endpoint_kind": "refused_guard" if refused else "finish_preparation",
+        "endpoint_worker": endpoint_worker,
+        "endpoint_entry_ns": end,
+        "endpoint_exit_ns": finish["end_ns"],
         "start_ns": start,
         "finish_entry_ns": end,
         "finish_exit_ns": finish["end_ns"],
@@ -516,31 +559,85 @@ def _semantic_preparation_window(snapshot, target_clock):
 
 
 class SemanticPreparationProfile(EarlyPreparationProfile):
-    """Spans-only adapter around the actual shared fixture's initial semantic clock."""
+    """Observe one original semantic clock from a fixture or supported driver."""
 
     def __init__(self, *, enabled: bool) -> None:
         super().__init__(enabled=enabled, cpu_profile=False, observe_memo=False, observe_process_cpu=True)
         self.target_clock: int | None = None
+        self.target_clock_index: int | None = None
+        self.driver_operation: tuple[str, object] | None = None
+        self.driver_selection: dict[str, Any] | None = None
+        self.refused_preparation_guards: list[dict[str, Any]] = []
+        self._finishing_clocks: set[int] = set()
 
     def select_clock(self, clock: ContinuationActionClock) -> None:
-        if type(clock) is not ContinuationActionClock or id(clock) not in self._by_clock or self.target_clock is not None:
+        if (
+            type(clock) is not ContinuationActionClock
+            or id(clock) not in self._by_clock
+            or self.target_clock is not None
+            or clock._seen
+            or self._by_clock[id(clock)]["finish_attempts"]
+        ):
             raise ValueError("semantic observation requires its one original constructed clock")
         self.target_clock = id(clock)
+        self.target_clock_index = next(index for index, row in enumerate(self.clocks) if row is self._by_clock[id(clock)])
+        with self.spans._lock:
+            self.spans._closed_clocks.pop(id(clock), None)
+
+    def bind_driver_operation(self, *, operation_id, session_id) -> None:
+        if self.driver_operation is not None or self.target_clock is not None:
+            raise ValueError("semantic observation already has an original target")
+        self.driver_operation = operation_id, session_id
+
+    def _select_driver_clock(self, *, clock, bound_clock, advisor_policy, operation_id, session_id, cursor, frame_kind, phase):
+        if (
+            self.driver_operation != (operation_id, session_id)
+            or self.target_clock is not None
+            or type(clock) is not ContinuationActionClock
+            or clock is not bound_clock
+            # The phase redecodes the retained policy; the original driver
+            # clock keeps its original owner's equal policy instance.
+            or clock.policy != advisor_policy
+            or (frame_kind, phase) != ("compose", "action_ready")
+        ):
+            return
+        if id(clock) not in self._by_clock or clock._seen or self._by_clock[id(clock)]["finish_attempts"]:
+            self.spans.errors.append("semantic driver target lacks its original unfinished constructor observation")
+            return
+        self.select_clock(clock)
+        self.driver_selection = {
+            "operation_id": operation_id,
+            "session_id": str(session_id),
+            "cursor": cursor,
+            "frame_kind": frame_kind,
+            "phase": phase,
+            "clock": id(clock),
+            "thread": threading.get_native_id(),
+        }
 
     def _active(self):
         with self.spans._lock:
             worker = self.spans._workers.get(threading.get_native_id())
             identity = self.spans._clock.get() if worker is None else worker["clock"]
-        return identity == self.target_clock and self.target_clock is not None and super()._active()
+        return (
+            identity == self.target_clock
+            and self.target_clock_index is not None
+            and self._by_clock.get(identity) is self.clocks[self.target_clock_index]
+            and not self.refused_preparation_guards
+            and super()._active()
+        )
 
     @contextmanager
     def install(self, monkeypatch, engine):
         # Import the same bindings in inclusive-only and selected-span modes,
         # before the actual clock. None is a hash/render/memo dependency.
+        from elspeth.web.composer import continuation_prompt_producers as producers
         from elspeth.web.composer import continuation_runtime as runtime
         from elspeth.web.composer import continuation_semantic_advisor as semantic
         from elspeth.web.composer import continuation_semantic_advisor_phase as phase
+        from elspeth.web.composer.continuation import ComposeFrame
         from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+        from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
         from elspeth.web.sessions import continuation_semantic_advisor as sql_semantic
 
         synchronous = (
@@ -553,6 +650,19 @@ class SemanticPreparationProfile(EarlyPreparationProfile):
             (sql_semantic, "read_runtime_source_on_connection", sql_semantic.read_runtime_source_on_connection),
             (semantic, "prepare_provider_input", semantic.prepare_provider_input),
             (semantic.PreparedSemanticAdvisorRequest, "verify", semantic.PreparedSemanticAdvisorRequest.verify),
+            (CurrentContinuationMessageProducers, "restore_shelf", CurrentContinuationMessageProducers.restore_shelf),
+            (
+                CurrentContinuationMessageProducers,
+                "_restore_shelf_for_semantic_request",
+                CurrentContinuationMessageProducers._restore_shelf_for_semantic_request,
+            ),
+            (
+                CurrentContinuationMessageProducers,
+                "_require_current_with_tool_sources_on_connection",
+                CurrentContinuationMessageProducers._require_current_with_tool_sources_on_connection,
+            ),
+            (CurrentContinuationMessageProducers, "_require_current", CurrentContinuationMessageProducers._require_current),
+            (producers, "_inputs_with_tool_sources_on_connection", producers._inputs_with_tool_sources_on_connection),
         )
         asynchronous = (
             (ContinuationLivePhases, "current", ContinuationLivePhases.current),
@@ -562,28 +672,109 @@ class SemanticPreparationProfile(EarlyPreparationProfile):
             (semantic, "run_semantic_advisor", semantic.run_semantic_advisor),
         )
         with super().install(monkeypatch, engine), monkeypatch.context() as patch:
+            original_guard = ContinuationActionClock.require_preparation_time
+            original_finish = ContinuationActionClock.finish_preparation
+
+            @wraps(original_finish)
+            def finish(clock):
+                self._finishing_clocks.add(id(clock))
+                try:
+                    return original_finish(clock)
+                finally:
+                    self._finishing_clocks.discard(id(clock))
+
+            @wraps(original_guard)
+            def guard(clock, *, monotonic_now=None):
+                selected = (
+                    id(clock) == self.target_clock
+                    and self.target_clock_index is not None
+                    and self._by_clock.get(id(clock)) is self.clocks[self.target_clock_index]
+                    and not self.clocks[self.target_clock_index]["finish_attempts"]
+                    and not self.refused_preparation_guards
+                    and id(clock) not in self._finishing_clocks
+                )
+                if not selected:
+                    return original_guard(clock, monotonic_now=monotonic_now)
+                entered, cpu_entry = time.monotonic_ns(), _cpu_sample()
+                try:
+                    return original_guard(clock, monotonic_now=monotonic_now)
+                except BaseException as original:
+                    ended = time.monotonic_ns()
+                    with self.spans._lock, self._lock:
+                        row = self._by_clock[id(clock)]
+                        worker = self.spans._workers.get(threading.get_native_id())
+                        same_thread = row["thread"] == threading.get_native_id()
+                        endpoint = {
+                            "clock": id(clock),
+                            "entry_ns": entered,
+                            "end_ns": ended,
+                            "elapsed_to_entry_ns": entered - row["start_ns"],
+                            "elapsed_to_exit_ns": ended - row["start_ns"],
+                            "error": type(original).__name__,
+                            "same_thread": same_thread,
+                            "thread": threading.get_native_id(),
+                            "worker": None if worker is None else worker["id"],
+                            "seen": sorted(clock._seen),
+                            "cpu_samples_entry": cpu_entry,
+                            "entry_process_cpu_ns": cpu_entry["process_ns"] - row["cpu_samples_start"]["process_ns"],
+                        }
+                        if same_thread:
+                            endpoint["entry_thread_cpu_ns"] = cpu_entry["thread_ns"] - row["cpu_samples_start"]["thread_ns"]
+                        if worker is not None:
+                            endpoint["worker_cpu_to_entry_ns"] = cpu_entry["thread_ns"] - worker["thread_cpu_start_ns"]
+                        self.refused_preparation_guards.append(endpoint)
+                        self.spans._closed_clocks.setdefault(id(clock), ended)
+                    raise
+
+            patch.setattr(ContinuationActionClock, "finish_preparation", finish)
+            patch.setattr(ContinuationActionClock, "require_preparation_time", guard)
             if self.enabled:
                 for owner, name, original in synchronous:
                     patch.setattr(owner, name, self._sync(f"{owner.__name__}.{name}", original))
                 for owner, name, original in asynchronous:
                     patch.setattr(owner, name, self._async(f"{owner.__name__}.{name}", original))
+            if self.driver_operation is not None:
+                original_preparation = phase._run_semantic_advisor_preparation
+
+                @wraps(original_preparation)
+                async def preparation(phases, selected, *, running, policy, clock):
+                    frame = selected.stack.frames[-1]
+                    if self.target_clock is None and type(frame) is ComposeFrame:
+                        self._select_driver_clock(
+                            clock=clock,
+                            bound_clock=phases.action_clock,
+                            advisor_policy=policy.actions.advisor,
+                            operation_id=running.claim.operation_id,
+                            session_id=running.claim.session_id,
+                            cursor=selected.stack.cursor,
+                            frame_kind=frame.frame_kind,
+                            phase=frame.phase,
+                        )
+                    return await original_preparation(phases, selected, running=running, policy=policy, clock=clock)
+
+                patch.setattr(phase, "_run_semantic_advisor_preparation", preparation)
             yield self
 
     def snapshot(self):
         result = super().snapshot()
         result.update(
+            target_clock_index=self.target_clock_index,
+            driver_selection=self.driver_selection,
+            refused_preparation_guards=[dict(row) for row in self.refused_preparation_guards],
+        )
+        result.update(
             observer="original_initial_semantic_preparation",
             process_id=os.getpid(),
             preparation=_semantic_preparation_window(result, self.target_clock),
-            process_cpu_scope="all threads in this process between the recorded post-constructor and finish-entry CPU samples",
+            process_cpu_scope="all threads in this process between post-constructor and original endpoint-entry CPU samples",
             thread_cpu_scope="event-loop thread only; async intervals include other activity; native workers are recorded separately",
-            wall_scope="original clock anchor to forwarded finish entry/exit; inclusive spans may overlap and must not be summed",
+            wall_scope="original clock anchor to forwarded finish/refused-guard entry/exit; inclusive spans overlap and must not be summed",
         )
         return result
 
 
 @contextmanager
-def semantic_preparation_profile(monkeypatch, engine, *, output_key):
+def semantic_preparation_profile(monkeypatch, engine, *, output_key, driver_operation=None):
     mode = os.environ.get(SEMANTIC_PROFILE_FLAG)
     if mode is None:
         yield None
@@ -596,6 +787,9 @@ def semantic_preparation_profile(monkeypatch, engine, *, output_key):
     directory = directory.resolve()
     assert directory.is_relative_to(root), "semantic diagnostic output must remain inside this project"
     profile = SemanticPreparationProfile(enabled=mode == "2")
+    if driver_operation is not None:
+        operation_id, session_id = driver_operation
+        profile.bind_driver_operation(operation_id=operation_id, session_id=session_id)
     try:
         with profile.install(monkeypatch, engine):
             yield profile

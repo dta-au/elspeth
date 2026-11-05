@@ -61,6 +61,7 @@ from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveTerminal
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
     from elspeth.web.sessions.continuation_classifier_primary import (
         ClassifierPrimaryIssuer,
@@ -356,6 +357,28 @@ def _require_current_capture(
         or captured.selected is not selected
     ):
         raise AuditIntegrityError("iteration observation changed its original selected capture")
+
+
+async def observe_continuation_iteration_early_v4(
+    phases: ContinuationLivePhases,
+    runtime: RestoredContinuationRuntime,
+    *,
+    selected: SelectedContinuationState,
+    dispatch: _DispatchOutcome,
+    persist: _PersistOutcome | ColdPostBatchPersistData,
+    pre_batch_state: CompositionState,
+) -> EarlyCheckpointLiveTerminal | None:
+    """Join original V4 paid completion and adoption before the next action."""
+    from elspeth.web.composer.continuation_checkpoint_early_adoption import adopt_committed_early
+    from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveAdvanced, run_v4_checkpoint_early_live
+
+    result = await run_v4_checkpoint_early_live(
+        phases, runtime, selected=selected, dispatch=dispatch, persist=persist, pre_batch_state=pre_batch_state
+    )
+    if isinstance(result, EarlyCheckpointLiveAdvanced):
+        await adopt_committed_early(result.source, advanced=result.advanced, returned=result.returned)
+        return None
+    return result
 
 
 async def observe_continuation_iteration_early(

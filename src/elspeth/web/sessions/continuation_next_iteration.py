@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Literal
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer._compose_loop_carriers import _ClassifyOutcome
+from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveTerminal
 from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
     EndCheckpointNoSdkTerminal,
     EndCheckpointPaidOverflowTerminal,
@@ -34,6 +35,7 @@ from elspeth.web.composer.continuation_classifier_owned_source import ClassifyRe
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_iteration_transitions import IterationTransition, applied_batch_cut, retain_iteration_transition
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.continuation_semantic_advisor_return import (
@@ -46,6 +48,7 @@ from elspeth.web.composer.continuation_semantic_advisor_return import (
     observe_continuation_classifier_reply_refusal,
     observe_continuation_iteration_classification,
     observe_continuation_iteration_early,
+    observe_continuation_iteration_early_v4,
     refresh_original_classification_source,
 )
 from elspeth.web.required_work import RequiredWorkSource
@@ -123,6 +126,7 @@ async def advance_continuation_iteration(
     iteration_stage: IterationStageData | None = None,
 ) -> (
     ComposerOperationRecord
+    | EarlyCheckpointLiveTerminal
     | ObservedClassifierReplyDeadline
     | VerifiedClassifierPaidOverflowTerminal
     | VerifiedClassifierPaidIncompleteTerminal
@@ -220,8 +224,14 @@ async def advance_continuation_iteration(
             )
         )
         return None
-    if iteration_stage.stage not in ("early_ready", "classify_ready", "end_ready", "reply_refusal_ready"):
+    if iteration_stage.stage not in ("early_ready", "early_retry_ready", "classify_ready", "end_ready", "reply_refusal_ready"):
         raise AuditIntegrityError("post-batch paid stage cannot replay a dispatched or completed owner")
+    if iteration_stage.stage == "early_retry_ready":
+        # The retry marker is already the independently fitted current action;
+        # the original outer EARLY owner must not be dispatched a second time.
+        return await observe_continuation_iteration_early_v4(
+            phases, runtime, selected=selected, dispatch=dispatch, persist=persist, pre_batch_state=pre_batch_state
+        )
     stage: Literal["early", "classify", "end", "reply_refusal"] = (
         "early"
         if iteration_stage.stage == "early_ready"
@@ -285,6 +295,10 @@ async def advance_continuation_iteration(
         runtime, _inventory = await phases.current(current)
     live = runtime.live
     if stage == "early":
+        if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
+            return await observe_continuation_iteration_early_v4(
+                phases, runtime, selected=current, dispatch=dispatch, persist=persist, pre_batch_state=pre_batch_state
+            )
         observed_early, captured = await observe_continuation_iteration_early(
             phases, runtime, selected=current, dispatch=dispatch, persist=persist, pre_batch_state=pre_batch_state
         )

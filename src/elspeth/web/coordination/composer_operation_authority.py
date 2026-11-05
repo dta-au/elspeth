@@ -768,7 +768,10 @@ class ComposerAsyncOperationAuthority:
         if type(running) is not ComposerOperationRunning:
             raise TypeError("continuation terminal requires its actual running owner")
         with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
-            from elspeth.web.composer.continuation_next_action import validate_continuation_structure_on_connection
+            from elspeth.web.composer.continuation_next_action import (
+                unpaid_early_outer_on_connection,
+                validate_continuation_structure_on_connection,
+            )
             from elspeth.web.composer.continuation_selection import SelectedContinuationState
             from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection, terminal_service_failure
             from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
@@ -812,11 +815,24 @@ class ComposerAsyncOperationAuthority:
                 parent = _read(conn, running.claim.session_id, running.claim.operation_id)
                 if parent is None:
                     raise AuditIntegrityError("continuation disposition lost its logical request")
-                outcome = (
-                    request_cancelled_error(request_id=parent.request_id)
-                    if parent.cancel_requested_at is not None
-                    else worker_lost_error(request_id=parent.request_id)
-                )
+                if parent.cancel_requested_at is not None:
+                    outcome = request_cancelled_error(request_id=parent.request_id)
+                elif (
+                    unpaid_early_outer_on_connection(
+                        conn,
+                        session_id=running.claim.session_id,
+                        operation_id=running.claim.operation_id,
+                        sequence=running.claim.segment_sequence,
+                        generation=running.claim.ownership_generation,
+                        selected=selected,
+                        env_ref_names=env_ref_names,
+                    )
+                    is None
+                ):
+                    outcome = worker_lost_error(request_id=parent.request_id)
+                # Exact unpaid EARLY keeps the actual original failure. Its
+                # outer effect stays ambiguous and ordinary settlement records
+                # unknown; this never invents a paid or no-SDK result.
             return settle_composer_operation_on_connection(conn, running, outcome=outcome)
 
     def classify_continuation_owner(

@@ -58,7 +58,7 @@ from elspeth.web.composer.continuation_codec import (
     verify_private_chunk,
 )
 from elspeth.web.composer.continuation_end_values import EndContinuationCandidate, decode_end_candidate, encode_end_candidate
-from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
+from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence, state_from_evidence_json
 from elspeth.web.composer.continuation_evidence_application_data import append_primary_call_to_evidence
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
@@ -785,6 +785,12 @@ def prepare_semantic_advisor_on_connection(
     retained_inputs = _retained_inputs_data(
         conn, str(running.claim.session_id), running.claim.operation_id, root, checkpoint_id=stored.checkpoint_id, cursor=stored.cursor
     )
+    evidence_document = _SemanticEvidenceDocument(
+        source=resolved.admitted_evidence.source_chunk,
+        source_chunks=resolved.selected.chunks,
+        env_ref_names=resolved.admitted_evidence.env_ref_names,
+        projection_json=canonical_json(resolved.evidence.model_dump(mode="json", by_alias=True, exclude={"transcript"})),
+    )
     _require_retained_input_document(
         conn,
         str(running.claim.session_id),
@@ -793,6 +799,7 @@ def prepare_semantic_advisor_on_connection(
         _decode(_PhysicalInput, physical_json),
         retained_inputs,
         env_ref_names=invocation.source.env_ref_names,
+        evidence_document=evidence_document,
     )
     descriptor = _Input(
         raw_source_body_json=invocation.source.source_body_json,
@@ -3414,6 +3421,21 @@ def read_semantic_advisor_retained_inputs_on_connection(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _SemanticEvidenceDocument:
+    """Immutable projection from this preparation transaction's full proof.
+
+    This carries no admitted graph or current authority. Its consumer still
+    reads the actual evidence and complete private closure before equality
+    permits reuse; cold callers retain their original decoder.
+    """
+
+    source: PrivateChunk
+    source_chunks: tuple[PrivateChunk, ...]
+    env_ref_names: frozenset[str]
+    projection_json: str
+
+
 def _require_retained_input_document(
     conn: Connection,
     sid: str,
@@ -3423,6 +3445,7 @@ def _require_retained_input_document(
     retained: SemanticAdvisorRetainedInputs,
     *,
     env_ref_names: frozenset[str],
+    evidence_document: _SemanticEvidenceDocument | None = None,
 ) -> None:
     if len(physical.messages) != 3 or physical.messages[-1].get("role") != "user":
         raise AuditIntegrityError("Semantic physical input lost its original complete source document")
@@ -3433,11 +3456,24 @@ def _require_retained_input_document(
     if error is not None or type(document) is not dict or canonical_json(document) != text:
         raise AuditIntegrityError("Semantic physical input substituted its canonical invocation/source document")
     parent = _parent(root)
-    expected_evidence = decode_turn_evidence(
-        _ref(conn, sid, operation, parent.evidence),
-        env_ref_names=env_ref_names,
-        source_chunks=load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root),
-    ).snapshot.model_dump(mode="json", by_alias=True, exclude={"transcript"})
+    evidence_chunk = _ref(conn, sid, operation, parent.evidence)
+    source_chunks = load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root)
+    if evidence_document is not None and type(evidence_document) is not _SemanticEvidenceDocument:
+        raise AuditIntegrityError("Semantic document lost its original immutable source projection")
+    if (
+        evidence_document is not None
+        and evidence_document.source == evidence_chunk
+        and evidence_document.source_chunks == source_chunks
+        and evidence_document.env_ref_names == env_ref_names
+    ):
+        projected, projection_error = parse_json_strict(evidence_document.projection_json)
+        if projection_error is not None or type(projected) is not dict or canonical_json(projected) != evidence_document.projection_json:
+            raise AuditIntegrityError("Semantic document changed its canonical source projection")
+        expected_evidence = projected
+    else:
+        expected_evidence = decode_turn_evidence(
+            evidence_chunk, env_ref_names=env_ref_names, source_chunks=source_chunks
+        ).snapshot.model_dump(mode="json", by_alias=True, exclude={"transcript"})
     expected_document: dict[str, JsonValue] = {
         "source": physical.source.model_dump(mode="json"),
         "frontier": _ref(conn, sid, operation, root.semantic_frontier).canonical if root.semantic_frontier is not None else None,
@@ -4098,9 +4134,14 @@ def select_semantic_advisor_current_graph_on_connection(
 ) -> StoredContinuationSnapshot:
     """Select only the actual retained authored graph's semantic projection.
 
-    Every obligation, source evidence, pending review and action receipt keeps
-    its original value. This authors no graph and declares no timer/note progress.
+    An unchanged projection checks its actual current inventory and two strict
+    source chunks, without replaying unrelated history. A real frontier append
+    retains full source admission before mutation/capacity checks. Local source
+    decoding precedes that history proof; all failures still precede writes.
+    This authors no graph and declares no timer/note progress.
     """
+    if type(selected) is not SelectedContinuationState or type(inventory) is not CurrentContinuationEnvInventory:
+        raise AuditIntegrityError("Semantic graph selection requires its actual selected source/inventory")
     stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
     root = _current(conn, running, stored)
     parent = _parent(root)
@@ -4114,13 +4155,16 @@ def select_semantic_advisor_current_graph_on_connection(
         or any(item.disposition in ("prepared", "dispatched", "unknown") for item in root.effect_frontier)
     ):
         raise AuditIntegrityError("Semantic graph selection requires its quiescent unprescribed original Compose source")
-    read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+    require_current_env_inventory_on_connection(
+        conn, running, inventory=inventory, expected_checkpoint_id=selected.checkpoint_id, expected_cursor=selected.stack.cursor
+    )
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     state = state_from_evidence_json(_ref(conn, sid, operation, parent.state).canonical)
     previous = decode_frontier_chunk(_ref(conn, sid, operation, root.semantic_frontier))
     changed = encode_frontier_chunk(replace(previous, graph_hash=authored_state_hash(state)))
     if changed.reference == root.semantic_frontier:
         return stored
+    read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
     with conn.begin_nested():
         put_chunk(
             conn,

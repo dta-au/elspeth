@@ -45,6 +45,120 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_iteration_return import IterationStageData
 
 
+def unpaid_early_outer_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    generation: int | None,
+    selected: SelectedContinuationState,
+    env_ref_names: frozenset[str],
+) -> str | None:
+    """Read the exact prebind EARLY outer after full structural admission.
+
+    This is SQL DATA, not a caller clearance. Both callers use the same locked
+    transaction as complete structural proof; paid children keep their owners.
+    A prepared-source bridge is proved by its exact retained event and input.
+    """
+    from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
+    from elspeth.web.sessions.continuation import _has_active_terminal_hold, load_snapshot
+    from elspeth.web.sessions.continuation_checkpoint_paid import read_unpaid_early_prepared_source_on_connection
+    from elspeth.web.sessions.continuation_iteration_return import read_iteration_stage_data_on_connection
+    from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+    from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+    from elspeth.web.sessions.models import quota_provider_attempts_table as physical
+    from elspeth.web.sessions.models import token_usage_ledger_table as ledger
+
+    root = selected.stack
+    top = root.frames[-1]
+    if (
+        type(top) is not ToolBatchFrame
+        or top.phase != "result_retained"
+        or top.accumulator.codec != "composer.applied-p4-batch.v2"
+        or type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is not ContinuationAdmissionPolicyV4
+    ):
+        return None
+    candidate = f"advance-early:{top.response.digest}"
+    if tuple(item.effect_id for item in root.effect_frontier if item.disposition in ("prepared", "dispatched", "unknown")) != (candidate,):
+        return None
+    stored = load_snapshot(conn, session_id=str(session_id), operation_id=operation_id)
+    if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(root):
+        raise AuditIntegrityError("unpaid EARLY changed its actual selected parent")
+    if sequence is None or generation is None:
+        return None
+    prepared = read_unpaid_early_prepared_source_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        selected=stored,
+        sequence=sequence,
+        generation=generation,
+        env_ref_names=env_ref_names,
+    )
+    origin = stored if prepared is None else prepared.source
+    stage = read_iteration_stage_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=origin)
+    if stage is None or stage.stage not in ("early_dispatched", "early_retry_ready"):
+        return None
+    key = stage.early_effect_key
+    if (
+        not stage.early_required
+        or (stage.creator_sequence, stage.creator_generation) != (sequence, generation)
+        or root.pending_owner_results
+        or root.pending_settlement_ids
+        or key != candidate
+        or _has_active_terminal_hold(conn, session_id=str(session_id), operation_id=operation_id)
+    ):
+        raise AuditIntegrityError("unpaid EARLY lost its original sole outer and empty paid custody")
+    current_effects = conn.execute(
+        select(effects).where(effects.c.session_id == str(session_id), effects.c.operation_id == operation_id)
+    ).all()
+    outer = tuple(row for row in current_effects if row.effect_key == key)
+    if len(outer) != 1 or outer[0].disposition != "dispatched" or outer[0].receipt_key is not None or outer[0].result_chunk_key is not None:
+        raise AuditIntegrityError("unpaid EARLY changed its original dispatched outer")
+    # Previous PRIMARY calls are real paid work. Bind the complete physical
+    # inventory to the logical operation's original fences and settled effects;
+    # an orphan attempt cannot disappear merely because it lacks an effect link.
+    actual = conn.execute(
+        select(
+            physical,
+            attempts.c.sequence.label("attempt_sequence"),
+            attempts.c.generation.label("attempt_generation"),
+            attempts.c.session_operation_epoch.label("attempt_epoch"),
+            attempts.c.session_operation_lease_token.label("attempt_lease"),
+            ledger.c.entry_id.label("usage_entry"),
+            ledger.c.identity_id.label("usage_identity"),
+            ledger.c.session_id.label("usage_session"),
+            ledger.c.source.label("usage_source"),
+            ledger.c.run_id.label("usage_run"),
+        )
+        .outerjoin(ledger, ledger.c.entry_id == physical.c.ledger_entry_id)
+        .join(
+            attempts,
+            (attempts.c.session_id == physical.c.session_id) & (attempts.c.session_operation_id == physical.c.operation_id),
+        )
+        .where(attempts.c.session_id == str(session_id), attempts.c.operation_id == operation_id)
+    ).all()
+    bound = tuple(row for row in current_effects if row.provider_attempt_id is not None)
+    by_attempt = {row.provider_attempt_id: row for row in bound}
+    if {row.attempt_id for row in actual} != set(by_attempt) or len(actual) != len(bound) or len(by_attempt) != len(bound):
+        raise AuditIntegrityError("unpaid EARLY lost its complete prior physical inventory")
+    for attempt in actual:
+        linked = by_attempt[attempt.attempt_id]
+        if (
+            linked.disposition not in ("committed", "refused")
+            or (linked.physical_sequence, linked.physical_generation) != (attempt.attempt_sequence, attempt.attempt_generation)
+            or attempt.operation_epoch != attempt.attempt_epoch
+            or attempt.lease_token != attempt.attempt_lease
+            or attempt.settled_at is None
+            or attempt.usage_entry is None
+            or (attempt.usage_identity, attempt.usage_session, attempt.usage_source, attempt.usage_run)
+            != (attempt.identity_id, attempt.session_id, attempt.source, attempt.run_id)
+        ):
+            raise AuditIntegrityError("unpaid EARLY contains an unsettled or foreign prior physical call")
+    return key
+
+
 def validate_continuation_structure_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
@@ -326,6 +440,17 @@ def validate_continuation_structure_data_on_connection(
         and ambiguous
         and not tool_unresolved
     ):
+        early = unpaid_early_outer_on_connection(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            sequence=sequence,
+            generation=generation,
+            selected=selected,
+            env_ref_names=env_ref_names,
+        )
+        if early is not None:
+            return (early,)
         from elspeth.web.composer.continuation_iteration_transitions import (
             ITERATION_EFFECT_OWNER,
             advance_effect_key,

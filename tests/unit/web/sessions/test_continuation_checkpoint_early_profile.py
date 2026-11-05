@@ -47,17 +47,20 @@ async def test_semantic_profile_absent_flag_keeps_original_clock_and_aliases(mon
 
     monkeypatch.delenv(SEMANTIC_PROFILE_FLAG, raising=False)
     original_clock = ContinuationActionClock.__init__
+    original_guard = ContinuationActionClock.require_preparation_time
     original_request = phase.prepare_semantic_advisor_request
     engine = create_session_engine("sqlite://")
     try:
         with semantic_preparation_profile(monkeypatch, engine, output_key="disabled-semantic-control") as profile:
             assert profile is None
             assert ContinuationActionClock.__init__ is original_clock
+            assert ContinuationActionClock.require_preparation_time is original_guard
             assert phase.prepare_semantic_advisor_request is original_request
             clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
             clock.finish_preparation()
             assert clock._seen == {"preparation"}
         assert ContinuationActionClock.__init__ is original_clock
+        assert ContinuationActionClock.require_preparation_time is original_guard
         assert phase.prepare_semantic_advisor_request is original_request
     finally:
         engine.dispose()
@@ -154,6 +157,9 @@ async def test_semantic_profile_observes_original_clock_cpu_async_aliases_and_on
             )
             assert not active["preparation"]["valid"]  # No actual finish yet.
             clock.finish_preparation()
+            with pytest.raises(TimeoutError):
+                clock.require_preparation_time(monotonic_now=clock.preparation_deadline_monotonic + 0.001)
+            assert profile.refused_preparation_guards == []
             assert observed() is marker and await awaited() is marker
             other = ContinuationActionClock(clock.policy)
             assert observed() is marker and await awaited() is marker
@@ -262,6 +268,209 @@ async def test_semantic_profile_pairs_real_context_reset_workers_sql_and_rejects
                 mutant["incomplete_spans"].append(worker["id"])
             assert not _semantic_preparation_window(mutant, id(clock))["valid"], fault
         assert _semantic_preparation_window(snapshot, id(clock))["valid"]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", (False, True), ids=("inclusive-only", "selected-spans"))
+async def test_semantic_driver_selection_requires_original_operation_action_and_bound_clock(monkeypatch, enabled):
+    profile = SemanticPreparationProfile(enabled=enabled)
+    profile.bind_driver_operation(operation_id="original-operation", session_id="original-session")
+    policy = minimal_continuation_policy()
+    decoded = type(policy).model_validate_json(policy.model_dump_json())
+    assert decoded.actions.advisor == policy.actions.advisor and decoded.actions.advisor is not policy.actions.advisor
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine):
+            clock = ContinuationActionClock(policy.actions.advisor)
+            other = ContinuationActionClock(policy.actions.advisor)
+            arguments = {
+                "clock": clock,
+                "bound_clock": clock,
+                "advisor_policy": decoded.actions.advisor,
+                "operation_id": "original-operation",
+                "session_id": "original-session",
+                "cursor": 15,
+                "frame_kind": "compose",
+                "phase": "action_ready",
+            }
+            for name, wrong in (
+                ("operation_id", "other-operation"),
+                ("session_id", "other-session"),
+                ("bound_clock", other),
+                ("advisor_policy", policy.actions.primary),
+                ("frame_kind", "tool_batch"),
+                ("phase", "response_retained"),
+            ):
+                profile._select_driver_clock(**{**arguments, name: wrong})
+                assert profile.target_clock is None and profile.driver_selection is None
+            profile._select_driver_clock(**arguments)
+            assert profile.target_clock == id(clock) and profile.target_clock_index == 0
+            assert profile.driver_selection["cursor"] == 15 and profile.driver_selection["clock"] == id(clock)
+            profile._select_driver_clock(**{**arguments, "clock": other, "bound_clock": other})
+            assert profile.target_clock == id(clock)
+            with pytest.raises(TimeoutError):
+                other.require_preparation_time(monotonic_now=other.preparation_deadline_monotonic + 0.001)
+            assert profile.refused_preparation_guards == []
+            clock.finish_preparation()
+        snapshot = profile.snapshot()
+        assert snapshot["preparation"]["valid"] and snapshot["preparation"]["endpoint_kind"] == "finish_preparation"
+        # Simulate metadata from a collected predecessor clock whose id was
+        # reused. Selection must still bind the exact original constructor row.
+        reused = deepcopy(snapshot)
+        reused["clocks"].append(deepcopy(reused["clocks"][0]))
+        assert _semantic_preparation_window(reused, id(clock))["valid"]
+        reused["target_clock_index"] = 1
+        assert not _semantic_preparation_window(reused, id(clock))["valid"]
+        assert clock._seen == {"preparation"} and other._seen == set()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", (False, True), ids=("inclusive-only", "selected-spans"))
+@pytest.mark.parametrize("native_worker", (False, True), ids=("loop-guard", "native-guard"))
+async def test_semantic_profile_preserves_first_original_refusal_and_complete_worker_unwind(monkeypatch, enabled, native_worker):
+    profile = SemanticPreparationProfile(enabled=enabled)
+    engine = create_session_engine("sqlite://")
+    actual_guard = ContinuationActionClock.require_preparation_time
+    originals = []
+
+    def original_guard(clock, *, monotonic_now=None):
+        try:
+            return actual_guard(clock, monotonic_now=monotonic_now)
+        except BaseException as original:
+            originals.append(original)
+            raise
+
+    monkeypatch.setattr(ContinuationActionClock, "require_preparation_time", original_guard)
+    try:
+        with profile.install(monkeypatch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            profile.select_clock(clock)
+            deadlines = clock.deadline, clock.preparation_deadline_monotonic
+            clock.require_preparation_time()
+            assert profile.refused_preparation_guards == []
+
+            def refuse():
+                # Supply an observation to the actual guard; do not replace
+                # the clock, advance its state or change either deadline.
+                clock.require_preparation_time(monotonic_now=clock.preparation_deadline_monotonic + 0.001)
+
+            if native_worker:
+                with v4_preparation_memo_scope(clock):
+                    adapter = prepare_retention_sql_callable(refuse)
+                    witness = RequiredInvocationWitness(1)
+                    future = executor.submit(witness.invoke, adapter)
+                    witness.arm()
+                    with pytest.raises(TimeoutError) as raised:
+                        future.result(timeout=5)
+                assert witness.snapshot().callable_finished
+            else:
+                with pytest.raises(TimeoutError) as raised:
+                    refuse()
+            assert raised.value is originals[0]
+            # A later refused observation cannot replace the first endpoint.
+            with pytest.raises(TimeoutError):
+                refuse()
+            assert len(profile.refused_preparation_guards) == 1
+            assert clock._seen == set() and (clock.deadline, clock.preparation_deadline_monotonic) == deadlines
+        snapshot = profile.snapshot()
+        endpoint = snapshot["refused_preparation_guards"][0]
+        window = snapshot["preparation"]
+        assert window["valid"] and window["endpoint_kind"] == "refused_guard"
+        assert endpoint["same_thread"] is (not native_worker)
+        assert endpoint["entry_process_cpu_ns"] >= 0
+        assert ("entry_thread_cpu_ns" in endpoint) is (not native_worker)
+        assert snapshot["clocks"][0]["finish_attempts"] == []
+        assert not snapshot["errors"] and not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
+        if native_worker and enabled:
+            worker = next(row for row in snapshot["records"] if row["id"] == endpoint["worker"])
+            assert worker["start_ns"] <= endpoint["entry_ns"] <= endpoint["end_ns"] <= worker["end_ns"]
+            assert endpoint["worker_cpu_to_entry_ns"] >= 0 and worker["id"] in window["crossing_record_ids"]
+            for fault in ("missing_worker", "wrong_clock", "wrong_thread", "unrelated_worker", "unfinished_worker"):
+                mutant = deepcopy(snapshot)
+                actual = next(row for row in mutant["records"] if row["id"] == endpoint["worker"])
+                if fault == "missing_worker":
+                    mutant["records"].remove(actual)
+                elif fault == "wrong_clock":
+                    actual["clock"] = -1
+                elif fault == "wrong_thread":
+                    actual["thread"] = -1
+                elif fault == "unrelated_worker":
+                    mutant["refused_preparation_guards"][0]["worker"] = -1
+                else:
+                    actual.pop("end_ns")
+                    mutant["incomplete_spans"].append(actual["id"])
+                assert not _semantic_preparation_window(mutant, id(clock))["valid"], fault
+        else:
+            assert endpoint["worker"] is None
+        for fault in ("missing_endpoint", "wrong_clock", "already_prepared", "wrong_error", "later_finish"):
+            mutant = deepcopy(snapshot)
+            if fault == "missing_endpoint":
+                mutant["refused_preparation_guards"].clear()
+            elif fault == "wrong_clock":
+                mutant["refused_preparation_guards"][0]["clock"] = -1
+            elif fault == "already_prepared":
+                mutant["refused_preparation_guards"][0]["seen"] = ["preparation"]
+            elif fault == "wrong_error":
+                mutant["refused_preparation_guards"][0]["error"] = "RuntimeError"
+            else:
+                mutant["clocks"][0]["finish_attempts"].append(dict(endpoint))
+            assert not _semantic_preparation_window(mutant, id(clock))["valid"], fault
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_semantic_timed_out_finish_keeps_one_finish_endpoint_and_original_error(monkeypatch):
+    profile = SemanticPreparationProfile(enabled=True)
+    original_guard = ContinuationActionClock.require_preparation_time
+    failures = []
+
+    def expired(clock, *, monotonic_now=None):
+        try:
+            return original_guard(clock, monotonic_now=clock.preparation_deadline_monotonic + 0.001)
+        except TimeoutError as original:
+            failures.append(original)
+            raise
+
+    monkeypatch.setattr(ContinuationActionClock, "require_preparation_time", expired)
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine):
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            profile.select_clock(clock)
+            with pytest.raises(TimeoutError) as raised:
+                clock.finish_preparation()
+            assert raised.value is failures[0] and clock._seen == set()
+        snapshot = profile.snapshot()
+        assert snapshot["preparation"]["valid"]
+        assert snapshot["preparation"]["endpoint_kind"] == "finish_preparation"
+        assert snapshot["preparation"]["finish_error"] == "TimeoutError"
+        assert snapshot["refused_preparation_guards"] == []
+        assert len(snapshot["clocks"][0]["finish_attempts"]) == 1
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_semantic_profile_predecessor_failure_cannot_create_a_preparation_window(monkeypatch):
+    profile = SemanticPreparationProfile(enabled=True)
+    profile.bind_driver_operation(operation_id="not-reached", session_id="not-reached")
+    original = RuntimeError("PRIVATE_PREDECESSOR")
+    engine = create_session_engine("sqlite://")
+    try:
+        with pytest.raises(RuntimeError) as raised, profile.install(monkeypatch, engine):
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+            clock.finish_preparation()
+            raise original
+        assert raised.value is original
+        snapshot = profile.snapshot()
+        assert profile.target_clock is None and not snapshot["preparation"]["valid"]
+        assert snapshot["driver_selection"] is None and snapshot["refused_preparation_guards"] == []
+        assert "PRIVATE_PREDECESSOR" not in json.dumps(snapshot)
     finally:
         engine.dispose()
 

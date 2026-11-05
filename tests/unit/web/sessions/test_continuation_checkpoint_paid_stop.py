@@ -52,14 +52,20 @@ from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_continuation_semantic_advisor import _reply
 from tests.unit.web.composer.test_prompt_guard_admission import _GuardClient
 from tests.unit.web.sessions import test_continuation_initialization as initialization_fixture
-from tests.unit.web.sessions import test_continuation_live_phases as phase_fixture
 from tests.unit.web.sessions.test_continuation_checkpoint_early_physical import _early_attempt, _early_case, _invoke_early
+from tests.unit.web.sessions.test_continuation_checkpoint_early_projected_overflow import (
+    _assert_complete_early_profile,
+    _assert_fitting_primary_profile,
+    _assert_pre_h_projection_overflow,
+    _early_response_profile,
+    _install_primary_response_profile,
+    _observe_original_pair_capacity,
+)
 from tests.unit.web.sessions.test_continuation_checkpoint_end_incomplete_sql import _incomplete_response
 from tests.unit.web.sessions.test_continuation_checkpoint_end_incomplete_sql import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import initialized_primary_input
 
 operation_store = _operation_store
-_CLEAN = json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "Coherent.", "note": None})
 
 
 def _stop(authority, running, user_id):
@@ -244,22 +250,14 @@ async def test_original_end_incomplete_finishes_after_authenticated_owner_stop(o
 async def test_original_early_projected_overflow_after_stop(operation_store, tmp_path, monkeypatch, outcome):
     # Original external responses individually fit; the resulting evidence pair
     # does not. No codec, capacity limit, clock or overflow witness is replaced.
-    original_response = phase_fixture.ModelResponse
-
-    def primary_response(**kwargs):
-        kwargs["choices"][0]["message"]["content"] = "p" * 260_000
-        kwargs["choices"][0]["message"]["reasoning_content"] = "r" * 350_000
-        return original_response(**kwargs)
-
-    monkeypatch.setattr(phase_fixture, "ModelResponse", primary_response)
+    _install_primary_response_profile(monkeypatch, oversized=True)
     async with _early_case(operation_store, tmp_path, monkeypatch) as (_store, owner, running, selected, primary_sdk):
+        _assert_fitting_primary_profile(owner.runtime, oversized=True)
         sdk_calls = []
 
         async def completion(**_kwargs):
             sdk_calls.append(1)
-            response = _reply(_CLEAN)
-            response.choices[0].message.reasoning_content = "e" * 490_000
-            return response
+            return _early_response_profile(oversized=True)
 
         monkeypatch.setattr(litellm, "acompletion", completion)
         async with _early_attempt(owner, selected) as source:
@@ -277,25 +275,29 @@ async def test_original_early_projected_overflow_after_stop(operation_store, tmp
                 env_ref_names=runtime.env_ref_names,
             )
             assert type(returned) is CheckpointReturnedResponseObservation
+            _assert_complete_early_profile(returned, oversized=True)
             current = await load_selected_continuation(
                 authority=phases.authority, running=running, selected=admission.selected, required_work=phases.work
             )
             inventory = await materialize_continuation_env_inventory(
                 advisor=phases.service._advisor_checkpoint, authority=phases.authority, selected=current, required_work=phases.work
             )
-            projected = await project_early_checkpoint_result(
-                prepared=prepared,
-                admission=admission,
-                detached=checkpoint_early_detached_runtime(source),
-                original=runtime,
-                selected=current,
-                inventory=inventory,
-                custody=custody,
-                returned=returned,
-                accounting=CheckpointPassAccounting(0, 1, None, None, False),
-                physical_source=source,
-            )
+            with monkeypatch.context() as projection_patch:
+                pair_overflows = _observe_original_pair_capacity(projection_patch)
+                projected = await project_early_checkpoint_result(
+                    prepared=prepared,
+                    admission=admission,
+                    detached=checkpoint_early_detached_runtime(source),
+                    original=runtime,
+                    selected=current,
+                    inventory=inventory,
+                    custody=custody,
+                    returned=returned,
+                    accounting=CheckpointPassAccounting(0, 1, None, None, False),
+                    physical_source=source,
+                )
             assert type(projected) is ProjectedEarlyCheckpointOverflow
+            _assert_pre_h_projection_overflow(projected, pair_overflows)
             _stop(phases.authority, running, runtime.bindings.user_id)
             service = prepared.composer._require_sessions_service()
             arguments = {"service": service, "prepared": prepared, "admission": admission, "returned": returned, "projected": projected}

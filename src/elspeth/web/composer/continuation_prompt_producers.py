@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_control_transitions import ControlResultToolMessage
     from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
     from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+    from elspeth.web.composer.continuation_message_families import _ToolFeedbackFamilySource, _ToolResultFamilySource
     from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot
     from elspeth.web.composer.continuation_metadata_preparation import PreparedMetadataToolCall
     from elspeth.web.composer.continuation_pipeline_preparation import PreparedPipelineToolCall
@@ -174,6 +175,13 @@ class _CurrentProducerInputs:
         object.__setattr__(self, "evidence", self.admitted_evidence.snapshot)
 
 
+@dataclass(frozen=True, slots=True)
+class _CurrentProducerRead:
+    inputs: _CurrentProducerInputs
+    result_sources: tuple[_ToolResultFamilySource, ...]
+    feedback_sources: tuple[_ToolFeedbackFamilySource, ...]
+
+
 def require_original_bootstrap_transcript_on_connection(conn: Connection, bootstrap: ContinuationBootstrapSnapshot) -> None:
     """Exact original prefix/private/ingress proof; current authority belongs to the caller."""
     validate_transcript_private_custody(conn, bootstrap.logical.session_id)
@@ -220,13 +228,13 @@ def require_original_bootstrap_transcript_on_connection(conn: Connection, bootst
         raise AuditIntegrityError("message inputs changed their complete original ordered transcript prefix")
 
 
-def _read_current_inputs(
+def _read_current_input_evidence(
     conn: Connection,
     *,
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
     finish_read: ContinuationFinishRead | None = None,
-) -> _CurrentProducerInputs:
+) -> AdmittedTurnEvidence:
     # This real reader proves ordinary current claim/lease/CAS, private custody,
     # original actor/request/base and transcript/evidence/recorder links.
     if finish_read is None:
@@ -238,13 +246,42 @@ def _read_current_inputs(
             raise AuditIntegrityError("message read received a foreign owed-finish facet")
         finish_read.require_selection(selected, inventory)
         evidence = finish_read.read_evidence(conn)
+    return evidence
+
+
+def _read_current_inputs(
+    conn: Connection,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    finish_read: ContinuationFinishRead | None = None,
+) -> _CurrentProducerInputs:
+    evidence = _read_current_input_evidence(conn, selected=selected, inventory=inventory, finish_read=finish_read)
     return _inputs_from_current_evidence_on_connection(conn, selected=selected, inventory=inventory, evidence=evidence)
+
+
+def _read_current_inputs_with_tool_sources(
+    conn: Connection,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    finish_read: ContinuationFinishRead | None = None,
+) -> _CurrentProducerRead:
+    evidence = _read_current_input_evidence(conn, selected=selected, inventory=inventory, finish_read=finish_read)
+    return _inputs_with_tool_sources_on_connection(conn, selected=selected, inventory=inventory, evidence=evidence)
 
 
 def _inputs_from_current_evidence_on_connection(
     conn: Connection, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory, evidence: AdmittedTurnEvidence
 ) -> _CurrentProducerInputs:
     """Shared DATA projection; its caller owns the actual SQL evidence read."""
+    return _inputs_with_tool_sources_on_connection(conn, selected=selected, inventory=inventory, evidence=evidence).inputs
+
+
+def _inputs_with_tool_sources_on_connection(
+    conn: Connection, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory, evidence: AdmittedTurnEvidence
+) -> _CurrentProducerRead:
+    """Retain the actual recipe results only for paired lexical assembly."""
     from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
 
     admitted = require_admitted_turn_evidence(evidence, env_ref_names=inventory.names)
@@ -286,9 +323,13 @@ def _inputs_from_current_evidence_on_connection(
         _admit_selected_tool_recipes_on_connection,
     )
 
-    _admit_selected_tool_recipes_on_connection(conn, inventory.running, selected=selected, admitted=admitted, names=inventory.names)
-    return _CurrentProducerInputs(
-        bootstrap, values, iteration.producer_inputs, encode_message_shelf(snapshot.transcript).canonical, admitted
+    results, feedback = _admit_selected_tool_recipes_on_connection(
+        conn, inventory.running, selected=selected, admitted=admitted, names=inventory.names
+    )
+    return _CurrentProducerRead(
+        _CurrentProducerInputs(bootstrap, values, iteration.producer_inputs, encode_message_shelf(snapshot.transcript).canonical, admitted),
+        results,
+        feedback,
     )
 
 
@@ -614,12 +655,35 @@ class CurrentContinuationMessageProducers:
                 raise
             finish_read = ContinuationFinishRead(self.inventory.running, self.selected, self.inventory)
             actual = _read_current_inputs(conn, selected=self.selected, inventory=self.inventory, finish_read=finish_read)
+        self._require_same_current_inputs(actual)
+        self.finish_read = finish_read
+        return actual
+
+    def _require_same_current_inputs(self, actual: _CurrentProducerInputs) -> None:
+        if type(self.inputs) is not _CurrentProducerInputs:
+            raise AuditIntegrityError("ready message producer has no existing Compose/family source")
         if (
             actual.bootstrap != self.inputs.bootstrap
             or actual.producer_inputs != self.inputs.producer_inputs
             or actual.evidence_messages_json != self.inputs.evidence_messages_json
         ):
             raise AuditIntegrityError("message producer inputs differ from their current selected owner")
+
+    def _require_current_with_tool_sources_on_connection(self, conn: Connection) -> _CurrentProducerRead:
+        if type(self.inputs) is not _CurrentProducerInputs:
+            raise AuditIntegrityError("ready message producer has no existing Compose/family source")
+        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+        from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
+
+        finish_read = self.finish_read
+        try:
+            actual = _read_current_inputs_with_tool_sources(conn, selected=self.selected, inventory=self.inventory, finish_read=finish_read)
+        except ComposerOperationCancelledDuringTurn:
+            if type(self.selected.stack.frames[-1]) is not ToolBatchFrame:
+                raise
+            finish_read = ContinuationFinishRead(self.inventory.running, self.selected, self.inventory)
+            actual = _read_current_inputs_with_tool_sources(conn, selected=self.selected, inventory=self.inventory, finish_read=finish_read)
+        self._require_same_current_inputs(actual.inputs)
         self.finish_read = finish_read
         return actual
 
@@ -1583,6 +1647,34 @@ class CurrentContinuationMessageProducers:
     def restore_shelf(self, snapshot: MessageShelfSnapshot) -> list[dict[str, Any]]:
         inputs = self._require_current()
         restored = self._rebuild_shelf(snapshot, inputs=inputs)
+        self._require_current()
+        return restored
+
+    def _restore_shelf_for_semantic_request(self, snapshot: MessageShelfSnapshot) -> list[dict[str, Any]]:
+        """Pair ordinary source acquisition, then assemble outside its SQL lock."""
+        if type(self.inputs) is not _CurrentProducerInputs:
+            raise AuditIntegrityError("ready message producer has no existing Compose/family source")
+        cohort: _RestoredFamilyCohort | None = None
+        with locked_session_transaction(self.authority._engine, str(self.inventory.running.claim.session_id)) as conn:
+            actual = self._require_current_with_tool_sources_on_connection(conn)
+            positions, requests = self._shelf_family_requests(snapshot, inputs=actual.inputs)
+            if self.finish_read is None and not any(type(recipe) is FailureSchemaMessageRecipe for recipe, _text in requests):
+                cohort = CurrentContinuationMessageFamilies(
+                    self.service, self.authority, self.selected, self.inventory
+                )._assemble_paired_cohort_on_connection(
+                    conn,
+                    requests,
+                    admitted=actual.inputs.admitted_evidence,
+                    result_sources=actual.result_sources,
+                    feedback_sources=actual.feedback_sources,
+                )
+        # Initial/schema callbacks can acquire policy or issue their own CAS.
+        # Owed and FailureSchema families retain their existing full brackets.
+        restored = (
+            self._rebuild_shelf(snapshot, inputs=actual.inputs)
+            if cohort is None
+            else self._assemble_shelf(snapshot, family_positions=positions, family_cohort=cohort)
+        )
         self._require_current()
         return restored
 

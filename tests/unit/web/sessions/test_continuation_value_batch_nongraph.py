@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -117,13 +118,28 @@ async def test_original_read_only_value_batch_preserves_nongraph_receipt_and_col
             changed_receipt = receipt.model_copy(update={"chat_message_hashes": ("0" * 64, *receipt.chat_message_hashes[1:])})
             with pytest.raises(AuditIntegrityError, match="changed its exact original receipt/input/row cohort"):
                 original_prepare(**{**arguments, "receipt": changed_receipt}, publication=publication)
-            with pytest.raises(AuditIntegrityError, match="changed its historical authored state hash"):
-                original_prepare(
-                    **{**arguments, "receipt": receipt.model_copy(update={"authored_state_hash": "0" * 64})}, publication=publication
-                )
+            invented_hash_receipt = receipt.model_copy(update={"authored_state_hash": "0" * 64})
+            with pytest.raises(AuditIntegrityError, match=r"^tool continuation member violates its owned contract$") as invalid_receipt:
+                original_prepare(**{**arguments, "receipt": invented_hash_receipt}, publication=publication)
+            cause = invalid_receipt.value.__cause__
+            assert type(cause) is ValidationError
+            assert cause.errors(include_input=False, include_url=False, include_context=False) == [
+                {
+                    "type": "value_error",
+                    "loc": (),
+                    "msg": "Value error, P4 receipt invented a newly inserted checkpoint",
+                }
+            ]
+            assert receipt.authored_state_hash is None and not receipt.inserted_state_ids and not receipt.state_row_hashes
+            assert receipt.checkpoint_disposition == ("no_new_checkpoint" if existing_graph else "empty")
 
             result = original_prepare(**arguments, publication=publication)
             assert result.result.historical_effect is None and result.result.publication is publication
+            require_prepared_nongraph_p4_result(result.result, env_ref_names=env_ref_names)
+            with pytest.raises(
+                AuditIntegrityError, match=r"^prepared nongraph P4 invented an authored checkpoint or changed its original publication$"
+            ):
+                require_prepared_nongraph_p4_result(replace(result.result, receipt=invented_hash_receipt), env_ref_names=env_ref_names)
             require_prepared_nongraph_p4_result(result.result, env_ref_names=env_ref_names)
             invented = HistoricalEffectLocator(
                 receipt.effect_key, receipt.input_sha256, receipt.creator_operation_id, str(receipt.assistant_id), (), "0" * 64

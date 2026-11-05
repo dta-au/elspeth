@@ -1112,7 +1112,7 @@ def finish_legacy_advisor_preparation_memo(clock: ContinuationActionClock) -> No
 def borrow_legacy_advisor_inflight_memo(memo: RetentionStageMemo | None, clock: ContinuationActionClock | None) -> Iterator[None]:
     """Keep one fresh full SQL proof while borrowing pure preparation DATA."""
     if memo is None:
-        with retention_stage_memo_scope():
+        with borrow_v4_preparation_memo_scope():
             yield
         return
     if (
