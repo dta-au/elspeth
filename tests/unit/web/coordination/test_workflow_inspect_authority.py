@@ -24,6 +24,12 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import AuditAccessLogAuthority, AuditAccessLogWriteError, WorkflowInspectDenied
 
+SESSION_ID = "10000000-0000-4000-8000-000000000001"
+SECOND_SESSION_ID = "10000000-0000-4000-8000-000000000002"
+MISSING_SESSION_ID = "10000000-0000-4000-8000-000000000003"
+STATE_ID = "20000000-0000-4000-8000-000000000001"
+SECOND_STATE_ID = "20000000-0000-4000-8000-000000000002"
+
 
 @pytest.fixture
 def seeded(engine: Engine) -> Engine:
@@ -47,7 +53,7 @@ def seeded(engine: Engine) -> Engine:
                     granted_by_identity_id="root",
                 )
             )
-        for session_id, state_id in (("session-1", "state-1"), ("session-2", "state-2")):
+        for session_id, state_id in ((SESSION_ID, STATE_ID), (SECOND_SESSION_ID, SECOND_STATE_ID)):
             conn.execute(
                 insert(sessions_table).values(
                     id=session_id, user_id="alice", auth_provider_type="local", title="workflow", created_at=now, updated_at=now
@@ -68,8 +74,8 @@ def seeded(engine: Engine) -> Engine:
         conn.execute(
             insert(approvals_table).values(
                 approval_id="approval-1",
-                session_id="session-1",
-                state_id="state-1",
+                session_id=SESSION_ID,
+                state_id=STATE_ID,
                 binding_json={},
                 requested_by_identity_id="alice",
                 approver_identity_id="bob",
@@ -79,8 +85,8 @@ def seeded(engine: Engine) -> Engine:
         conn.execute(
             insert(review_requests_table).values(
                 request_id="review-1",
-                session_id="session-2",
-                state_id="state-2",
+                session_id=SECOND_SESSION_ID,
+                state_id=SECOND_STATE_ID,
                 requested_by_identity_id="alice",
                 reviewer_identity_id=None,
                 requested_at=now,
@@ -89,7 +95,7 @@ def seeded(engine: Engine) -> Engine:
     return engine
 
 
-def _record(engine: Engine, *, session_id: str = "session-1", state_id: str = "state-1", caller: str = "dave"):
+def _record(engine: Engine, *, session_id: str = SESSION_ID, state_id: str = STATE_ID, caller: str = "dave"):
     return RepositoryAuditAccessLogAuthority(engine).record_workflow_inspect(
         session_id=session_id,
         state_id=state_id,
@@ -111,14 +117,14 @@ def test_role_eligible_approver_other_than_addressee_can_inspect_and_writer_fixe
 
     assert record.requesting_principal == "dave"
     assert record.writer_principal == "workflow_inspect"
-    assert record.request_path == "/api/workflow/inspect/session-1/state-1"
+    assert record.request_path == f"/api/workflow/inspect/{SESSION_ID}/{STATE_ID}"
     assert record.query_args == {}
     assert record.ip_address == "192.0.2.1"
     assert _count(seeded) == 1
 
 
 def test_reviewer_can_inspect_unaddressed_open_request(seeded: Engine) -> None:
-    record = _record(seeded, session_id="session-2", state_id="state-2", caller="carol")
+    record = _record(seeded, session_id=SECOND_SESSION_ID, state_id=SECOND_STATE_ID, caller="carol")
     assert record.writer_principal == "workflow_inspect"
     assert _count(seeded) == 1
 
@@ -126,12 +132,12 @@ def test_reviewer_can_inspect_unaddressed_open_request(seeded: Engine) -> None:
 @pytest.mark.parametrize(
     ("session_id", "state_id", "caller"),
     [
-        ("session-1", "state-1", "alice"),  # author holds both roles
-        ("session-1", "state-1", "carol"),  # reviewer role cannot use approval request
-        ("session-2", "state-2", "dave"),  # approver role cannot use review request
-        ("session-1", "state-2", "dave"),  # state belongs to another session
-        ("session-2", "state-1", "carol"),
-        ("missing", "state-1", "dave"),
+        (SESSION_ID, STATE_ID, "alice"),  # author holds both roles
+        (SESSION_ID, STATE_ID, "carol"),  # reviewer role cannot use approval request
+        (SECOND_SESSION_ID, SECOND_STATE_ID, "dave"),  # approver role cannot use review request
+        (SESSION_ID, SECOND_STATE_ID, "dave"),  # state belongs to another session
+        (SECOND_SESSION_ID, STATE_ID, "carol"),
+        (MISSING_SESSION_ID, STATE_ID, "dave"),
     ],
 )
 def test_denied_reads_write_no_audit_row(seeded: Engine, session_id: str, state_id: str, caller: str) -> None:
@@ -160,7 +166,7 @@ def test_access_ends_with_identity_grant_request_or_session(seeded: Engine, chan
         elif change == "closed":
             conn.execute(update(approvals_table).where(approvals_table.c.approval_id == "approval-1").values(decision="approved"))
         else:
-            conn.execute(update(sessions_table).where(sessions_table.c.id == "session-1").values(archived_at=datetime.now(UTC)))
+            conn.execute(update(sessions_table).where(sessions_table.c.id == SESSION_ID).values(archived_at=datetime.now(UTC)))
     with pytest.raises(WorkflowInspectDenied):
         _record(seeded)
     assert _count(seeded) == 0
@@ -171,8 +177,8 @@ def test_attestation_closes_reviewer_inspection(seeded: Engine) -> None:
         conn.execute(
             insert(review_attestations_table).values(
                 attestation_id="attestation-1",
-                session_id="session-2",
-                state_id="state-2",
+                session_id=SECOND_SESSION_ID,
+                state_id=SECOND_STATE_ID,
                 payload_digest="sha256:" + "ab" * 32,
                 reviewer_identity_id="carol",
                 author_identity_id="alice",
@@ -181,7 +187,7 @@ def test_attestation_closes_reviewer_inspection(seeded: Engine) -> None:
             )
         )
     with pytest.raises(WorkflowInspectDenied):
-        _record(seeded, session_id="session-2", state_id="state-2", caller="carol")
+        _record(seeded, session_id=SECOND_SESSION_ID, state_id=SECOND_STATE_ID, caller="carol")
     assert _count(seeded) == 0
 
 
@@ -207,11 +213,13 @@ def test_reviewer_inspection_requires_a_matching_open_request_and_live_role(seed
                 update(identity_roles_table).where(identity_roles_table.c.role_id == "carol-reviewer").values(revoked_at=datetime.now(UTC))
             )
     with pytest.raises(WorkflowInspectDenied):
-        _record(seeded, session_id="session-2", state_id="state-2", caller="carol")
+        _record(seeded, session_id=SECOND_SESSION_ID, state_id=SECOND_STATE_ID, caller="carol")
     assert _count(seeded) == 0
 
 
-@pytest.mark.parametrize(("caller", "session_id", "state_id"), [("dave", "session-1", "state-1"), ("carol", "session-2", "state-2")])
+@pytest.mark.parametrize(
+    ("caller", "session_id", "state_id"), [("dave", SESSION_ID, STATE_ID), ("carol", SECOND_SESSION_ID, SECOND_STATE_ID)]
+)
 def test_malformed_service_provider_with_human_kind_cannot_inspect(seeded: Engine, caller: str, session_id: str, state_id: str) -> None:
     with seeded.begin() as conn:
         conn.execute(update(identities_table).where(identities_table.c.identity_id == caller).values(provider="service", kind="human"))

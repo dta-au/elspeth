@@ -201,8 +201,8 @@ class EndPreparationProfile:
     FIRST_CAPTURE_PARENT = "elspeth.web.composer.continuation_checkpoint_end_physical.capture_continuation_runtime_owners"
 
     def __init__(self, *, enabled: bool, cpu_profile: bool = False, cpu_selection: str = "all_workers") -> None:
-        if cpu_selection not in {"all_workers", "checkpoint_source", "first_capture"}:
-            raise ValueError("CPU selection must be all_workers, checkpoint_source or first_capture")
+        if cpu_selection not in {"all_workers", "checkpoint_source", "first_capture", "selected_scope"}:
+            raise ValueError("CPU selection must be all_workers, checkpoint_source, first_capture or selected_scope")
         self.enabled = enabled
         self.cpu_profile = cpu_profile
         self.cpu_selection = cpu_selection
@@ -761,6 +761,10 @@ class EndPreparationProfile:
                         "initial capture Python frame entry excluded; both authority reads and _capture_owners included; "
                         "cProfile overhead included; complete library/builtin/caller stats"
                         if row.get("cprofile_scope") == "original_first_capture_scope"
+                        else "original current-evidence memo scope in original worker; queue and gate excluded; "
+                        "initial method Python frame entry excluded; both fresh authority reads and evidence restoration included; "
+                        "cProfile overhead included; complete library/builtin/caller stats"
+                        if row.get("cprofile_scope") == "original_current_evidence_scope"
                         else "original selected method body in original worker; gate excluded; "
                         "cProfile overhead included; complete library/builtin/caller stats"
                         if row.get("cprofile_scope") == "original_selected_method_body"

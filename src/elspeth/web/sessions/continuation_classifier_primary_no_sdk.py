@@ -611,6 +611,14 @@ def read_classifier_no_sdk_refusal_on_connection(
     ).one_or_none()
     if effect is None or effect.disposition != "refused":
         return None
+    source = _read_source(conn, session_id, operation_id, effect_key)
+    prepared = _chain(conn, source, dispatched=False)
+    if (
+        hold_source.source_checkpoint_id != prepared.checkpoint_id
+        or hold_source.source_cursor != prepared.cursor
+        or hold_source.source_snapshot_sha256 != sha256(prepared.payload_json.encode("utf-8")).hexdigest()
+    ):
+        raise AuditIntegrityError("classifier no-SDK cold proof changed its original prepared H source")
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one()
     terminal = load_snapshot(conn, session_id=sid, operation_id=operation_id)
     terminal_row = conn.execute(
@@ -624,14 +632,13 @@ def read_classifier_no_sdk_refusal_on_connection(
         select(checkpoints).where(
             checkpoints.c.session_id == sid,
             checkpoints.c.operation_id == operation_id,
-            checkpoints.c.cursor == hold_source.source_cursor + 2,
+            checkpoints.c.cursor == hold_source.source_cursor + 1,
         )
     ).one_or_none()
     if admitted_row is None or admitted_row.kind != "transition" or terminal_row.kind != "transition":
         raise AuditIntegrityError("classifier no-SDK cold proof lost original dispatch and terminal heads")
     admitted_text = _bounded_bytes(conn, hold_source, admitted_row.snapshot_chunk_key, "snapshot.v2").decode("utf-8", errors="strict")
     admitted = StoredContinuationSnapshot(admitted_text, admitted_row.cursor, admitted_row.checkpoint_id)
-    source = _read_source(conn, session_id, operation_id, effect_key)
     if _chain(conn, source, dispatched=True) != admitted:
         raise AuditIntegrityError("classifier no-SDK cold proof changed its two-frame original dispatch")
     admitted_root = decode_continuation_snapshot(admitted.payload_json)
@@ -802,21 +809,24 @@ def read_classifier_no_sdk_refusal_on_connection(
         )
     ):
         raise AuditIntegrityError("classifier no-SDK cold proof lost its zero-use physical cancellation cohort")
-    refusal_row = conn.execute(
-        select(checkpoints).where(
-            checkpoints.c.session_id == sid,
-            checkpoints.c.operation_id == operation_id,
-            checkpoints.c.cursor == admitted.cursor + 1,
+    # Both terminal events belong to one reserved append and one final checkpoint.
+    # The refusal event has no separately published intermediate snapshot.
+    appended_checkpoints = (
+        conn.execute(
+            select(checkpoints.c.checkpoint_id)
+            .where(
+                checkpoints.c.session_id == sid,
+                checkpoints.c.operation_id == operation_id,
+                checkpoints.c.cursor > admitted.cursor,
+                checkpoints.c.cursor <= terminal.cursor,
+            )
+            .order_by(checkpoints.c.cursor)
         )
-    ).one_or_none()
-    if refusal_row is None or refusal_row.kind != "transition":
-        raise AuditIntegrityError("classifier no-SDK cold proof lost its refused checkpoint")
-    refused_text = _bounded_bytes(conn, hold_source, refusal_row.snapshot_chunk_key, "snapshot.v2").decode("utf-8", errors="strict")
-    refused = StoredContinuationSnapshot(refused_text, refusal_row.cursor, refusal_row.checkpoint_id)
-    if refused.payload_json != encode_continuation_snapshot(
-        decode_continuation_snapshot(projected).model_copy(update={"cursor": refused.cursor})
-    ):
-        raise AuditIntegrityError("classifier no-SDK cold proof changed its intermediate refused root")
+        .scalars()
+        .all()
+    )
+    if appended_checkpoints != [terminal.checkpoint_id]:
+        raise AuditIntegrityError("classifier no-SDK cold proof changed its single terminal append")
     return ClassifierNoSdkRefusalReceipt(
         _record_from_row(parent),
         terminal,

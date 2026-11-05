@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import Field, ValidationError, model_validator
 
+from elspeth.contracts._canonical_json_native import canonical_json_native_strings
 from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -129,7 +130,7 @@ def encode_message_shelf(
     if type(snapshot) is not MessageShelfSnapshot:
         raise TypeError("transcript shelf requires its owned snapshot")
     expected = require_message_shelf_retention(snapshot, env_ref_names=env_ref_names) if mandatory_retention else None
-    canonical = canonical_json(snapshot.model_dump(mode="json"))
+    canonical = canonical_json_native_strings(snapshot.model_dump(mode="json"))
     if expected is not None:
         from elspeth.web.composer.continuation_retention import bind_retained_json_encoding
 

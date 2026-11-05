@@ -121,6 +121,7 @@ def _seed_live_continuation_history(operation_store, *, parent_status="running")
     )
     fence = context.fence
     request = SendMessageRequest(operation_id=str(uuid4()), content="Continuation SQL prerequisite")
+    policy = minimal_continuation_policy()
     with engine.begin() as conn:
         now = database_now(conn)
         started = now - timedelta(minutes=1)
@@ -137,6 +138,7 @@ def _seed_live_continuation_history(operation_store, *, parent_status="running")
                 ingress_phase="pending",
                 reserved_user_message_id=str(uuid4()),
                 request_hash=composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=request),
+                continuation_policy_version=policy.schema_version,
                 actor_user_id="alice",
                 request_json=request.model_dump_json(),
                 attempt=1,

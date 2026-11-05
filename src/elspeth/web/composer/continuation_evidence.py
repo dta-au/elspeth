@@ -10,6 +10,7 @@ from uuid import UUID
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
+from elspeth.contracts._canonical_json_native import canonical_json_native_strings
 from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -400,7 +401,7 @@ class AdmittedTurnEvidence:
                 snapshot = TurnEvidenceSnapshot.model_validate_json(source.canonical)
             except (ValidationError, ValueError, TypeError) as exc:
                 raise AuditIntegrityError("evidence chunk violates its closed owned codec") from exc
-            if canonical_json(snapshot.model_dump(mode="json")) != source.canonical:
+            if canonical_json_native_strings(snapshot.model_dump(mode="json")) != source.canonical:
                 raise AuditIntegrityError("evidence chunk changed fields during its owned decode")
         elif type(source) is TurnEvidenceSnapshot:
             snapshot = source
@@ -445,7 +446,7 @@ class AdmittedTurnEvidence:
         with self._graph_lock:
             if self._graph_taken:
                 raise AuditIntegrityError("admitted graph cannot be transferred twice")
-            if canonical_json(self.snapshot.model_dump(mode="json")) != self.source_chunk.canonical:
+            if canonical_json_native_strings(self.snapshot.model_dump(mode="json")) != self.source_chunk.canonical:
                 raise AuditIntegrityError("admitted evidence snapshot changed its original immutable source")
             if self._graph is not None:
                 original = (
@@ -640,13 +641,13 @@ def _encode_turn_evidence_source(
                 )
             )
         raise AuditIntegrityError("evidence and original recorder exceed their complete pair bound")
-    encoded = canonical_json(snapshot.model_dump(mode="json"))
+    encoded = canonical_json_native_strings(snapshot.model_dump(mode="json"))
     bind_retained_json_encoding(encoded, expected_bytes=expected_bytes)
     try:
         checked = TurnEvidenceSnapshot.model_validate_json(encoded)
     except (ValidationError, ValueError, TypeError) as error:
         raise AuditIntegrityError("evidence capture violates its complete owned DATA contract") from error
-    if canonical_json(checked.model_dump(mode="json")) != encoded:
+    if canonical_json_native_strings(checked.model_dump(mode="json")) != encoded:
         raise AuditIntegrityError("evidence capture changed fields during complete admission")
     # Graph, receipt, transcript and recorder admission stays with its actual
     # complete owner; this projection only admits the remaining metadata.

@@ -1,13 +1,16 @@
 """Actual evidence/recorder DATA graph oracles; no SQL authorization claimed here."""
 
 from dataclasses import replace
+from hashlib import sha256
 from uuid import UUID
 
 import pytest
 
 from elspeth.contracts.composer_audit import PrivateToolAuthoring
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence
+from elspeth.web.composer import continuation_evidence as evidence_codec
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_success
 from elspeth.web.composer.continuation import LogicalRequestBinding
@@ -123,6 +126,10 @@ def test_complete_graph_values_aliases_pending_and_private_recorder_roundtrip():
     evidence, messages, recorder, logical, _policy = rich_evidence()
     original = snapshot(evidence, messages, recorder, logical)
     chunk = encode_turn_evidence(original)
+    public_bytes = canonical_json(original.snapshot.model_dump(mode="json")).encode("utf-8")
+    assert chunk.canonical.encode("utf-8") == public_bytes
+    assert chunk.reference.byte_length == len(public_bytes)
+    assert chunk.reference.digest == sha256(public_bytes).hexdigest()
     decoded = decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=original.dependency_chunks)
     restored = _restore_current_evidence(decoded, context=CONTEXT)
     owner = restored.evidence
@@ -152,6 +159,69 @@ def test_complete_graph_values_aliases_pending_and_private_recorder_roundtrip():
     )
     assert snapshot(owner, restored.messages, restored.recorder, logical).snapshot == original.snapshot
     assert encode_turn_evidence(snapshot(owner, restored.messages, restored.recorder, logical)) == chunk
+
+
+def test_native_evidence_projections_keep_public_bytes_and_recheck_changed_source(monkeypatch):
+    owner, messages, recorder, logical, _ = rich_evidence()
+    messages.append({"role": "user", "content": 'Retain "quotes", \\ slash,\n\t café 😀', "retained_numbers": {"tiny": 1e-7}})
+    owner.transcript.observe_messages(messages)
+    original_writer = evidence_codec.canonical_json_native_strings
+    calls = []
+
+    def observe(value):
+        calls.append(True)
+        result = original_writer(value)
+        assert result.encode("utf-8") == canonical_json(value).encode("utf-8")
+        return result
+
+    monkeypatch.setattr(evidence_codec, "canonical_json_native_strings", observe)
+    admitted = snapshot(owner, messages, recorder, logical)
+    assert calls == [True, True]
+    chunk = encode_turn_evidence(admitted)
+    public_bytes = canonical_json(admitted.snapshot.model_dump(mode="json")).encode("utf-8")
+    assert chunk.canonical.encode("utf-8") == public_bytes
+    assert chunk.reference.byte_length == len(public_bytes)
+    assert chunk.reference.digest == sha256(public_bytes).hexdigest()
+    decoded = decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=admitted.dependency_chunks)
+    assert decoded.snapshot == admitted.snapshot and calls == [True] * 5
+    # Frozen model assignment is not the source check: hostile nested storage
+    # mutation must still be compared with the original chunk before transfer.
+    decoded.snapshot.__dict__["actor_user_id"] = "changed-retained-source"
+    with pytest.raises(AuditIntegrityError, match="changed its original immutable source"):
+        decoded.take_graph()
+    assert calls == [True] * 6
+
+
+@pytest.mark.parametrize("stage", ("emit", "self_roundtrip", "decode", "transfer"))
+def test_changed_evidence_writer_is_refused_at_each_original_document_check(monkeypatch, stage):
+    owner, messages, recorder, logical, _ = rich_evidence()
+    admitted = snapshot(owner, messages, recorder, logical)
+    chunk = encode_turn_evidence(admitted)
+    assert decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=admitted.dependency_chunks).snapshot == admitted.snapshot
+    original_writer = evidence_codec.canonical_json_native_strings
+    calls = []
+    changed_call = 2 if stage == "self_roundtrip" else 1
+
+    def changed(value):
+        calls.append(True)
+        result = original_writer(value)
+        return result + " " if len(calls) == changed_call else result
+
+    monkeypatch.setattr(evidence_codec, "canonical_json_native_strings", changed)
+    refusal = {
+        "emit": "private chunk encoding differs from its complete retention preflight",
+        "self_roundtrip": "evidence capture changed fields during complete admission",
+        "decode": "evidence chunk changed fields during its owned decode",
+        "transfer": "admitted evidence snapshot changed its original immutable source",
+    }
+    with pytest.raises(AuditIntegrityError, match=refusal[stage]):
+        if stage == "decode":
+            decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=admitted.dependency_chunks)
+        elif stage == "transfer":
+            admitted.take_graph()
+        else:
+            admit_turn_evidence(admitted.snapshot, env_ref_names=frozenset(), source_chunks=admitted.dependency_chunks)
+    assert calls == [True] * changed_call
 
 
 def test_distinct_equal_initial_latest_are_not_merged_by_json_equality():

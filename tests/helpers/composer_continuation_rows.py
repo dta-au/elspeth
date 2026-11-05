@@ -20,6 +20,7 @@ from elspeth.web.sessions.composer_operations import composer_operation_admissio
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.schemas import SendMessageRequest
+from tests.helpers.continuation_policy import minimal_continuation_policy
 
 PRIVATE_MARKERS = {
     "claim_token": "PRIVATE-CLAIM-MARKER",
@@ -45,6 +46,7 @@ def insert_v2_operation(
     cancel_requested: bool = False,
 ) -> SeededV2Operation:
     request = SendMessageRequest(operation_id=str(uuid4()), content="Seeded continuation request")
+    policy = minimal_continuation_policy()
     checkpoint_id = str(uuid4())
     with engine.begin() as conn:
         now = database_now(conn)
@@ -62,6 +64,7 @@ def insert_v2_operation(
             "ingress_phase": "pending",
             "reserved_user_message_id": str(uuid4()),
             "request_hash": composer_operation_admission_request_hash(session_id=session_id, kind="compose_message", request=request),
+            "continuation_policy_version": policy.schema_version,
             "actor_user_id": actor_user_id,
             "request_json": request.model_dump_json(),
             "attempt": 1,

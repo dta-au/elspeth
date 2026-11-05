@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -12,8 +13,13 @@ import pytest
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer import continuation_clock as clock_module
+from elspeth.web.composer import continuation_current_evidence as evidence_bridge
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.continuation_retention_memo import (
+    CanonicalTextVerificationKey,
+    borrow_v4_preparation_memo_scope,
     current_v4_preparation_memo,
     finish_v4_preparation_memo,
     prepare_retention_sql_callable,
@@ -411,5 +417,403 @@ async def test_early_profile_tracks_original_worker_clock_through_real_sql_conte
             assert submitted[0] is original_bound and submitted[1][0] is adapter
         assert witness.snapshot().callable_finished and failed.snapshot().callable_finished and after_cut.snapshot().callable_finished
         assert ThreadPoolExecutor.submit is actual_submit
+    finally:
+        engine.dispose()
+
+
+def test_early_cpu_profile_is_disabled_by_default_and_does_not_replace_evidence_callable(monkeypatch):
+    profile = EarlyPreparationProfile(enabled=True)
+    original_scope = evidence_bridge.borrow_v4_preparation_memo_scope
+    original_callable = evidence_bridge._restore_current_message_evidence
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine):
+            assert evidence_bridge.borrow_v4_preparation_memo_scope is original_scope
+            assert evidence_bridge._restore_current_message_evidence is original_callable
+        snapshot = profile.snapshot()
+        assert snapshot["cpu_profile_enabled"] is False and snapshot["cpu_profiles"] == []
+        assert snapshot["text_memo"] is not None
+        assert set(snapshot["text_memo"]["families"]) == {"full", "canonical", "block", "request"}
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_early_cpu_profile_selects_one_original_scope_across_real_context_reset_workers(monkeypatch):
+    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True)
+    original_callable = evidence_bridge._restore_current_message_evidence
+    actual_submit = ThreadPoolExecutor.submit
+    marker = object()
+    submissions, calls, verified_text = [], [], []
+    previous_hook = sys.getprofile()
+    tool = sys.monitoring.PROFILER_ID
+    assert sys.monitoring.get_tool(tool) is None
+
+    def observed_submit(executor, function, /, *args, **kwargs):
+        submissions.append((function, args))
+        return actual_submit(executor, function, *args, **kwargs)
+
+    def controlled_body():
+        calls.append(threading.get_native_id())
+        assert sum(range(100)) == 4950
+        return marker
+
+    def verify_text(value):
+        assert value == "{}"
+        verified_text.append(value)
+
+    def original_callback():
+        assert profile.spans._clock.get() is None
+        for _ in range(2):
+            with evidence_bridge.borrow_v4_preparation_memo_scope() as child:
+                assert child._text_parent is parent
+                child.canonical_text_verification(CanonicalTextVerificationKey("{}", 100), verify_text)
+                assert controlled_body() is marker
+        return marker
+
+    engine = create_session_engine("sqlite://")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(ThreadPoolExecutor, "submit", observed_submit)
+            with profile.install(patch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+                assert evidence_bridge._restore_current_message_evidence is original_callable
+                clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+                deadlines = clock.deadline, clock.preparation_deadline_monotonic
+                with v4_preparation_memo_scope(clock) as parent:
+                    adapter = prepare_retention_sql_callable(original_callback)
+                    first, second = RequiredInvocationWitness(1), RequiredInvocationWitness(1)
+                    first_bound, second_bound = first.invoke, second.invoke
+                    one = executor.submit(first_bound, adapter)
+                    first.arm()
+                    assert one.result(timeout=5) is marker
+                    two = executor.submit(second_bound, adapter)
+                    second.arm()
+                    assert two.result(timeout=5) is marker
+                    pending = profile.snapshot()
+                    assert pending["cpu_capture_valid"] is False and pending["cpu_capture_status"] == "partial_invalid"
+                    assert pending["clocks"][0]["finish_attempts"] == [] and clock._seen == set()
+                    clock.finish_preparation()
+                    finish_v4_preparation_memo(clock)
+                assert executor.submit(sys.getprofile).result(timeout=5) is None
+                assert (clock.deadline, clock.preparation_deadline_monotonic) == deadlines and clock._seen == {"preparation"}
+        assert evidence_bridge._restore_current_message_evidence is original_callable
+        assert submissions[0][0] is first_bound and submissions[0][1][0] is adapter
+        assert submissions[1][0] is second_bound and submissions[1][1][0] is adapter
+        assert first.snapshot().callable_finished and second.snapshot().callable_finished and len(calls) == 4
+        snapshot = profile.snapshot()
+        assert snapshot["cpu_capture_valid"] is True and snapshot["cpu_capture_status"] == "captured_preparation"
+        assert snapshot["cpu_target_clocks"] == [id(clock)] and len(snapshot["cpu_profiles"]) == 1
+        captured = snapshot["cpu_profiles"][0]
+        assert captured["clock"] == id(clock) and captured["witness"] == first.identity
+        assert captured["within_preparation_window"] is True and "original current-evidence memo scope" in captured["scope"]
+        assert captured["timer"] == "time.thread_time_ns" and captured["timeunit"] == 1e-9
+        assert captured["selected_method"] == {
+            "module": original_callable.__module__,
+            "qualname": original_callable.__qualname__,
+            "file": original_callable.__code__.co_filename,
+            "line": original_callable.__code__.co_firstlineno,
+        }
+        assert "controlled_body" in {entry["function"] for entry in captured["entries"]}
+        assert snapshot["text_memo"]["families"]["canonical"]["requests"] == 4
+        assert snapshot["text_memo"]["families"]["canonical"]["hits"] == 3 and verified_text == ["{}"]
+        assert snapshot["text_memo"]["observer_errors"] == 0
+        assert not snapshot["errors"] and not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
+        assert sys.getprofile() is previous_hook and sys.monitoring.get_tool(tool) is None
+        assert sys.monitoring.get_events(tool) == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("unowned", "other_module", "after_finish", "aborted_gate", "never_entered", "foreign_clock"))
+async def test_early_cpu_profile_refuses_unselected_or_closed_original_work(monkeypatch, kind):
+    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True)
+    marker = object()
+    calls = []
+
+    def selected_callback():
+        assert profile.spans._clock.get() is None
+        with evidence_bridge.borrow_v4_preparation_memo_scope():
+            calls.append("selected")
+        return marker
+
+    def other_scope_callback():
+        with borrow_v4_preparation_memo_scope():
+            calls.append("other_module")
+        return marker
+
+    def no_scope_callback():
+        calls.append("no_scope")
+        return marker
+
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            with v4_preparation_memo_scope(clock):
+                callback = (
+                    other_scope_callback if kind == "other_module" else no_scope_callback if kind == "never_entered" else selected_callback
+                )
+                adapter = prepare_retention_sql_callable(callback)
+                if kind == "after_finish":
+                    clock.finish_preparation()
+                    finish_v4_preparation_memo(clock)
+                if kind == "unowned":
+                    assert executor.submit(adapter).result(timeout=5) is marker
+                elif kind != "foreign_clock":
+                    witness = RequiredInvocationWitness(1)
+                    submitted = executor.submit(witness.invoke, adapter)
+                    if kind == "aborted_gate":
+                        witness.abort()
+                        with pytest.raises(RequiredInvocationAborted):
+                            submitted.result(timeout=5)
+                        assert witness.snapshot().valid_aborted_exit and calls == []
+                    else:
+                        witness.arm()
+                        assert submitted.result(timeout=5) is marker and witness.snapshot().callable_finished
+            if kind == "foreign_clock":
+                foreign = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+                with v4_preparation_memo_scope(foreign):
+                    foreign_adapter = prepare_retention_sql_callable(selected_callback)
+                    witness = RequiredInvocationWitness(1)
+                    submitted = executor.submit(witness.invoke, foreign_adapter)
+                    witness.arm()
+                    assert submitted.result(timeout=5) is marker
+                    foreign.finish_preparation()
+                    finish_v4_preparation_memo(foreign)
+            if kind != "after_finish":
+                clock.finish_preparation()
+            assert clock._seen == {"preparation"}
+        snapshot = profile.snapshot()
+        assert snapshot["cpu_capture_valid"] is False and snapshot["cpu_capture_status"] == "invalid"
+        assert snapshot["cpu_profiles"] == [] and snapshot["cpu_target_clocks"] == [id(clock)]
+        assert "CPU capture did not reach the original current-evidence memo scope" in snapshot["cpu_capture_issues"]
+        assert not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_early_cpu_profile_refuses_existing_worker_hook_without_replacing_it(monkeypatch):
+    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True)
+    marker = object()
+    before = sys.getprofile()
+
+    def existing_hook(_frame, _event, _argument):
+        return None
+
+    def initialize():
+        sys.setprofile(existing_hook)
+
+    def original_callback():
+        with evidence_bridge.borrow_v4_preparation_memo_scope():
+            assert sys.getprofile() is existing_hook
+        return marker
+
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine), ThreadPoolExecutor(max_workers=1, initializer=initialize) as executor:
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            with v4_preparation_memo_scope(clock):
+                adapter = prepare_retention_sql_callable(original_callback)
+                witness = RequiredInvocationWitness(1)
+                future = executor.submit(witness.invoke, adapter)
+                witness.arm()
+                assert future.result(timeout=5) is marker
+                assert executor.submit(sys.getprofile).result(timeout=5) is existing_hook
+                executor.submit(sys.setprofile, None).result(timeout=5)
+                clock.finish_preparation()
+                finish_v4_preparation_memo(clock)
+        snapshot = profile.snapshot()
+        assert snapshot["cpu_capture_valid"] is False and snapshot["cpu_capture_status"] == "invalid"
+        assert snapshot["cpu_profiles"] == []
+        assert "worker CPU profile refused an existing thread hook" in snapshot["errors"]
+        assert witness.snapshot().callable_finished and sys.getprofile() is before
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_early_cpu_profile_keeps_original_scope_exception_partial_until_original_finish(monkeypatch):
+    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True)
+    original = RuntimeError("private selected original scope error")
+
+    def original_callback():
+        with evidence_bridge.borrow_v4_preparation_memo_scope():
+            raise original
+
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            deadlines = clock.deadline, clock.preparation_deadline_monotonic
+            with v4_preparation_memo_scope(clock):
+                adapter = prepare_retention_sql_callable(original_callback)
+                witness = RequiredInvocationWitness(1)
+                future = executor.submit(witness.invoke, adapter)
+                witness.arm()
+                with pytest.raises(RuntimeError) as raised:
+                    future.result(timeout=5)
+                assert raised.value is original and witness.snapshot().callable_finished
+                pending = profile.snapshot()
+                assert pending["cpu_capture_valid"] is False and pending["cpu_capture_status"] == "partial_invalid"
+                assert len(pending["cpu_profiles"]) == 1 and pending["clocks"][0]["finish_attempts"] == []
+                assert clock._seen == set() and (clock.deadline, clock.preparation_deadline_monotonic) == deadlines
+                clock.finish_preparation()
+                finish_v4_preparation_memo(clock)
+        snapshot = profile.snapshot()
+        assert snapshot["cpu_capture_valid"] is False and snapshot["cpu_capture_status"] == "partial_invalid"
+        assert len(snapshot["clocks"][0]["finish_attempts"]) == 1
+        assert snapshot["clocks"][0]["finish_attempts"][0]["error"] is None
+        assert "private selected original scope error" not in json.dumps(snapshot)
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_raises", (False, True), ids=("valid-third-attempt", "original-third-error"))
+async def test_early_cpu_profile_preserves_rejected_attempts_without_ending_original_preparation(monkeypatch, target_raises):
+    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True)
+    refused = (AuditIntegrityError("first original refusal"), AuditIntegrityError("second original refusal"))
+    target_error = RuntimeError("original selected third attempt error")
+    marker = object()
+    attempts, submitted, adapters, witnesses = [], [], [], []
+    actual_submit = ThreadPoolExecutor.submit
+
+    def observe_submission(executor, function, /, *args, **kwargs):
+        submitted.append((function, args))
+        return actual_submit(executor, function, *args, **kwargs)
+
+    def selected_body():
+        assert profile.spans._clock.get() is None
+        with evidence_bridge.borrow_v4_preparation_memo_scope() as child:
+            assert child._text_parent is parent
+            if target_raises:
+                raise target_error
+            return marker
+
+    async def original_binder_attempt():
+        ordinal = len(attempts)
+        attempts.append(ordinal)
+        if ordinal < 2:
+            raise refused[ordinal]
+        adapter = prepare_retention_sql_callable(selected_body)
+        adapters.append(adapter)
+        witness = RequiredInvocationWitness(1)
+        witnesses.append(witness)
+        bound = witness.invoke
+        future = executor.submit(bound, adapter)
+        assert submitted[-1][0] is bound and submitted[-1][1][0] is adapter
+        witness.arm()
+        return future.result(timeout=5)
+
+    observed_attempt = profile._async("calibration.binder", original_binder_attempt, preparation_entry=True)
+    engine = create_session_engine("sqlite://")
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(ThreadPoolExecutor, "submit", observe_submission)
+            with profile.install(patch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+                clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+                deadlines = clock.deadline, clock.preparation_deadline_monotonic
+                with v4_preparation_memo_scope(clock) as parent:
+                    for refusal in refused:
+                        with pytest.raises(AuditIntegrityError) as raised:
+                            await observed_attempt()
+                        assert raised.value is refusal
+                    rejected = profile.snapshot()
+                    assert rejected["cpu_profiles"] == [] and rejected["clocks"][0]["finish_attempts"] == []
+                    assert rejected["cpu_target_boundaries"][0]["boundary"] is None
+                    assert [attempt["kind"] for attempt in rejected["binder_attempts"]] == ["binder_attempt_raised"] * 2
+                    if target_raises:
+                        with pytest.raises(RuntimeError) as third:
+                            await observed_attempt()
+                        assert third.value is target_error
+                    else:
+                        assert await observed_attempt() is marker
+                    assert len(adapters) == len(witnesses) == len(submitted) == 1
+                    assert witnesses[0].snapshot().callable_finished and attempts == [0, 1, 2]
+                    assert clock._seen == set() and (clock.deadline, clock.preparation_deadline_monotonic) == deadlines
+                    clock.finish_preparation()
+                    finish_v4_preparation_memo(clock)
+        snapshot = profile.snapshot()
+        assert len(snapshot["cpu_profiles"]) == 1
+        assert snapshot["cpu_profiles"][0]["clock"] == id(clock)
+        assert snapshot["cpu_profiles"][0]["witness"] == witnesses[0].identity
+        assert snapshot["cpu_capture_valid"] is (not target_raises)
+        assert snapshot["cpu_capture_status"] == ("partial_invalid" if target_raises else "captured_preparation")
+        assert [attempt["kind"] for attempt in snapshot["binder_attempts"]] == [
+            "binder_attempt_raised",
+            "binder_attempt_raised",
+            "binder_attempt_raised" if target_raises else "binder_attempt_returned",
+        ]
+        assert [attempt["error"] for attempt in snapshot["binder_attempts"]] == [
+            "AuditIntegrityError",
+            "AuditIntegrityError",
+            "RuntimeError" if target_raises else None,
+        ]
+        assert all(attempt["clock"] == id(clock) and attempt["label"] == "calibration.binder" for attempt in snapshot["binder_attempts"])
+        assert len(snapshot["clocks"][0]["finish_attempts"]) == 1
+        assert not snapshot["errors"] and not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ("finished_then_refusal", "timed_out_finish", "closed_parent"))
+async def test_early_cpu_profile_actual_finish_or_closed_creator_blocks_later_scope(monkeypatch, boundary):
+    profile = EarlyPreparationProfile(enabled=True, cpu_profile=True)
+    marker = object()
+    refusal = AuditIntegrityError("original refusal after actual finish")
+    calls = []
+
+    def selected_body():
+        assert profile.spans._clock.get() is None
+        with evidence_bridge.borrow_v4_preparation_memo_scope():
+            calls.append(marker)
+        return marker
+
+    async def refused_attempt():
+        raise refusal
+
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            deadlines = clock.deadline, clock.preparation_deadline_monotonic
+            with v4_preparation_memo_scope(clock) as parent:
+                adapter = prepare_retention_sql_callable(selected_body)
+                if boundary == "finished_then_refusal":
+                    clock.finish_preparation()
+                    observed = profile._async("calibration.refused-after-finish", refused_attempt, preparation_entry=True)
+                    with pytest.raises(AuditIntegrityError) as raised:
+                        await observed()
+                    assert raised.value is refusal and parent.active
+                elif boundary == "timed_out_finish":
+                    # Change only the original monotonic observation at the
+                    # actual finish call; the clock and its bounds stay intact.
+                    with monkeypatch.context() as observation:
+                        observation.setattr(clock_module.time, "monotonic", lambda: deadlines[1] + 0.001)
+                        with pytest.raises(TimeoutError, match="continuation preparation allowance expired"):
+                            clock.finish_preparation()
+                    assert clock._seen == set() and parent.active
+                else:
+                    parent.close()
+                    assert not parent.active and clock._seen == set()
+                witness = RequiredInvocationWitness(1)
+                future = executor.submit(witness.invoke, adapter)
+                witness.arm()
+                assert future.result(timeout=5) is marker and witness.snapshot().callable_finished
+                assert calls == [marker] and (clock.deadline, clock.preparation_deadline_monotonic) == deadlines
+                if boundary == "closed_parent":
+                    assert profile.snapshot()["clocks"][0]["finish_attempts"] == []
+                    clock.finish_preparation()
+                snapshot = profile.snapshot()
+                assert snapshot["cpu_capture_valid"] is False and snapshot["cpu_capture_status"] == "invalid"
+                assert snapshot["cpu_profiles"] == []
+                finish_attempts = snapshot["clocks"][0]["finish_attempts"]
+                assert len(finish_attempts) == 1
+                assert finish_attempts[0]["error"] == ("TimeoutError" if boundary == "timed_out_finish" else None)
+                assert finish_attempts[0]["seen"] == ([] if boundary == "timed_out_finish" else ["preparation"])
+                assert not snapshot["errors"] and not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
     finally:
         engine.dispose()

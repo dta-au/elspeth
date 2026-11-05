@@ -1,8 +1,9 @@
 """Scoped JCS writer using native string quoting and public RFC primitives.
 
-This private entrypoint shares the existing contracts normalizer and serves the
-explicit recorder projection. Public canonical_json remains unchanged. Numeric
-formatting, unusual object keys and unsupported values remain RFC-owned.
+This private entrypoint shares the existing contracts normalizer and serves
+explicit continuation document projections. Public canonical_json remains
+unchanged. Numeric formatting, unusual object keys and unsupported values
+remain RFC-owned.
 """
 
 from __future__ import annotations

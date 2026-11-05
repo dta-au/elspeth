@@ -703,8 +703,8 @@ class _SegmentDriver:
                 )
             )
         ):
-            # A successful earlier tool's retained receiver does not own this
-            # classifier error. Actual tool/P4 failures keep their precedence.
+            # Admit only the original classifier boundary. Actual retained
+            # tool/P4 failures keep their existing settlement precedence.
             return await self._settle_classifier_prephysical(classifier)
         owns_failure = source is not None or (custody is not None and (custody.completed or original is not None))
         if owns_failure:

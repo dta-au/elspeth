@@ -2,20 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
 from hashlib import sha256
+from threading import Event
 
 import pytest
 from sqlalchemy import update
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.prompt_guard import detach_prompt_guard_evidence
 from elspeth.web.composer import continuation_current_evidence as bridge
 from elspeth.web.composer.continuation_current_evidence import restore_current_turn_evidence
+from elspeth.web.composer.continuation_evidence_graph import _restore_current_evidence
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
-from elspeth.web.continuation_retention_memo import current_retention_stage_memo
+from elspeth.web.continuation_retention_memo import (
+    RetentionStageMemo,
+    borrow_v4_preparation_memo_scope,
+    current_retention_stage_memo,
+    current_v4_preparation_memo,
+    v4_preparation_memo_scope,
+)
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from tests.unit.web.coordination import test_composer_operation_authority as operations
+from tests.unit.web.sessions.test_continuation_checkpoint_early_physical import _early_case
 from tests.unit.web.sessions.test_continuation_current_evidence import guarded_case
+from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 
 operation_store = operations.operation_store
 
@@ -147,3 +161,240 @@ async def test_current_evidence_memo_does_not_clear_changed_credential_policy(op
         kwargs["required_work"].coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_v4_current_evidence_borrows_text_parent_but_restores_fresh_sql_and_mutable_owners(
+    operation_store, tmp_path, monkeypatch
+) -> None:
+    async with _early_case(operation_store, tmp_path, monkeypatch) as (store, phases, _running, selected, primary_sdk):
+        runtime, clock = phases.runtime, phases.action_clock
+        assert runtime is not None and clock is not None
+        materialization = runtime.materialization
+        actual_scope = borrow_v4_preparation_memo_scope
+        actual_read = CurrentContinuationMessageProducers._require_current
+        actual_graph = _restore_current_evidence
+        children, closed, observed, transferred = [], [], [], []
+        phase = "before"
+
+        @contextmanager
+        def observed_scope():
+            with actual_scope() as child:
+                assert child._text_parent is parent and current_v4_preparation_memo(clock) is parent
+                assert child.cached_entry_count == 0
+                assert not child._snapshots and not child._chunks and not child._credentials and not child._states
+                children.append(child)
+                yield child
+            assert not child.active and child.cached_entry_count == 0
+            closed.append(child)
+
+        def read(self):
+            assert self is materialization and current_retention_stage_memo() is children[-1]
+            value = actual_read(self)
+            observed.append((phase, children[-1], value))
+            return value
+
+        def graph(admitted, **values):
+            nonlocal phase
+            assert phase == "before" and admitted is observed[-1][2].admitted_evidence
+            assert admitted is not materialization.inputs.admitted_evidence
+            phase = "graph"
+            try:
+                result = actual_graph(admitted, **values)
+                transferred.append(admitted)
+                return result
+            finally:
+                phase = "after"
+
+        monkeypatch.setattr(bridge, "borrow_v4_preparation_memo_scope", observed_scope)
+        monkeypatch.setattr(CurrentContinuationMessageProducers, "_require_current", read)
+        monkeypatch.setattr(bridge, "_restore_current_evidence", graph)
+        before = stored_rows(store[0])
+        with v4_preparation_memo_scope(clock) as parent:
+            first = await restore_current_turn_evidence(
+                service=phases.service,
+                authority=phases.authority,
+                selected=selected,
+                inventory=materialization.inventory,
+                materialization=materialization,
+                required_work=phases.work,
+            )
+            first_messages = canonical_json(detach_prompt_guard_evidence(first.messages).messages)
+            first_recorder = first.recorder.snapshot_for_continuation(drained=first.drained)
+            assert first.messages and first_recorder.llm_calls
+            first.messages[0]["content"] = "Changed only on the first restored owner."
+            # Remove an actual retained audit from this isolated mutable owner;
+            # no replacement provider audit or source authority is invented.
+            with first.recorder._lock:
+                assert first.recorder._llm_calls.pop() == first_recorder.llm_calls[-1]
+            phase = "before"
+            second = await restore_current_turn_evidence(
+                service=phases.service,
+                authority=phases.authority,
+                selected=selected,
+                inventory=materialization.inventory,
+                materialization=materialization,
+                required_work=phases.work,
+            )
+            assert canonical_json(detach_prompt_guard_evidence(second.messages).messages) == first_messages
+            assert second.recorder.snapshot_for_continuation(drained=second.drained) == first_recorder
+            assert first.messages is not second.messages and first.recorder is not second.recorder
+            assert first.evidence is not second.evidence and first.evidence.transcript is not second.evidence.transcript
+            assert not {id(message) for message in first.messages} & {id(message) for message in second.messages}
+            assert len(children) == 2 and children[0] is not children[1] and closed == children
+            for child in children:
+                reads = [(stage, value) for stage, owner, value in observed if owner is child]
+                assert len(reads) >= 3 and reads[0][0] == "before" and reads[-1][0] == "after"
+                assert all(stage == "graph" for stage, _value in reads[1:-1])
+                assert all(value == materialization.inputs for _stage, value in reads)
+                assert all(value.evidence is value.admitted_evidence.snapshot for _stage, value in reads)
+                assert len({id(value.admitted_evidence) for _stage, value in reads}) == len(reads)
+            assert transferred == [
+                observed[0][2].admitted_evidence,
+                next(value.admitted_evidence for _stage, child, value in observed if child is children[1]),
+            ]
+            assert parent.active and parent.cached_entry_count > 0 and current_retention_stage_memo() is parent
+        assert (parent.active, parent.cached_entry_count, current_retention_stage_memo()) == (False, 0, None)
+        assert stored_rows(store[0]) == before and len(primary_sdk) == 1
+        phases.work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_v4_current_evidence_parent_never_clears_changed_selected_chunk(operation_store, tmp_path, monkeypatch) -> None:
+    async with _early_case(operation_store, tmp_path, monkeypatch) as (store, phases, running, selected, primary_sdk):
+        runtime, clock = phases.runtime, phases.action_clock
+        assert runtime is not None and clock is not None
+        materialization = runtime.materialization
+        reference = selected.stack.frames[0].evidence
+        actual_graph = _restore_current_evidence
+        actual_read = CurrentContinuationMessageProducers._require_current
+        graph_calls, reads = [], []
+        children: list[RetentionStageMemo] = []
+        graph_done = False
+
+        def read(self):
+            assert self is materialization
+            child = current_retention_stage_memo()
+            assert child is not None and child.active and child._text_parent is parent
+            reads.append(graph_done)
+            if not children or children[-1] is not child:
+                children.append(child)
+            return actual_read(self)
+
+        def change_after_graph(*args, **values):
+            nonlocal graph_done
+            result = actual_graph(*args, **values)
+            graph_calls.append(result)
+            changed = b"{}"
+            with store[0].begin() as conn:
+                mutation = conn.execute(
+                    update(chunks)
+                    .where(
+                        chunks.c.session_id == str(running.claim.session_id),
+                        chunks.c.operation_id == running.claim.operation_id,
+                        chunks.c.chunk_key == f"value:{reference.codec}:{reference.digest}",
+                    )
+                    .values(payload=changed, sha256=sha256(changed).hexdigest(), byte_length=len(changed))
+                )
+                assert mutation.rowcount == 1
+            graph_done = True
+            return result
+
+        monkeypatch.setattr(bridge, "_restore_current_evidence", change_after_graph)
+        monkeypatch.setattr(CurrentContinuationMessageProducers, "_require_current", read)
+        with v4_preparation_memo_scope(clock) as parent:
+            with pytest.raises(AuditIntegrityError, match="cold evidence storage differs from its selected bytes"):
+                await restore_current_turn_evidence(
+                    service=phases.service,
+                    authority=phases.authority,
+                    selected=selected,
+                    inventory=materialization.inventory,
+                    materialization=materialization,
+                    required_work=phases.work,
+                )
+            assert reads[0] is False and reads[-1] is True and len(graph_calls) == 1
+            assert not children[0].active and children[0].cached_entry_count == 0 and parent.active
+            after_mutation = stored_rows(store[0])
+            previous_reads = len(reads)
+            with pytest.raises(AuditIntegrityError, match="cold evidence storage differs from its selected bytes"):
+                await restore_current_turn_evidence(
+                    service=phases.service,
+                    authority=phases.authority,
+                    selected=selected,
+                    inventory=materialization.inventory,
+                    materialization=materialization,
+                    required_work=phases.work,
+                )
+            assert len(reads) == previous_reads + 1 and len(graph_calls) == 1
+            assert len(children) == 2 and children[1] is not children[0]
+            assert not children[1].active and children[1].cached_entry_count == 0
+            assert stored_rows(store[0]) == after_mutation
+        assert (parent.active, parent.cached_entry_count, current_retention_stage_memo()) == (False, 0, None)
+        assert len(primary_sdk) == 1
+        phases.work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_v4_current_evidence_final_read_survives_parent_close_without_late_publication(
+    operation_store, tmp_path, monkeypatch
+) -> None:
+    async with _early_case(operation_store, tmp_path, monkeypatch) as (store, phases, _running, selected, primary_sdk):
+        runtime, clock = phases.runtime, phases.action_clock
+        assert runtime is not None and clock is not None
+        materialization = runtime.materialization
+        actual_graph = _restore_current_evidence
+        actual_read = CurrentContinuationMessageProducers._require_current
+        entered, release = Event(), Event()
+        children, admissions, transferred = [], [], []
+        graph_done = False
+
+        def read(self):
+            assert self is materialization
+            child = current_retention_stage_memo()
+            assert child is not None and child.active
+            result = actual_read(self)
+            admissions.append((graph_done, result.admitted_evidence, parent.active))
+            return result
+
+        def held_graph(admitted, **values):
+            nonlocal graph_done
+            assert admitted is admissions[-1][1]
+            result = actual_graph(admitted, **values)
+            child = current_retention_stage_memo()
+            assert child is not None and child.active and child._text_parent is parent
+            children.append(child)
+            transferred.append(result)
+            graph_done = True
+            entered.set()
+            assert release.wait(10)
+            return result
+
+        monkeypatch.setattr(bridge, "_restore_current_evidence", held_graph)
+        monkeypatch.setattr(CurrentContinuationMessageProducers, "_require_current", read)
+        before = stored_rows(store[0])
+        with v4_preparation_memo_scope(clock) as parent:
+            task = asyncio.create_task(
+                restore_current_turn_evidence(
+                    service=phases.service,
+                    authority=phases.authority,
+                    selected=selected,
+                    inventory=materialization.inventory,
+                    materialization=materialization,
+                    required_work=phases.work,
+                )
+            )
+            try:
+                assert await asyncio.to_thread(entered.wait, 60)
+                assert parent.active and parent.cached_entry_count > 0 and children[0].active
+                parent.close()
+                assert (parent.active, parent.cached_entry_count, children[0].active) == (False, 0, True)
+            finally:
+                release.set()
+                result = await task
+            assert result is transferred[0]
+            assert admissions[-1][0] is True and admissions[-1][2] is False
+            assert admissions[-1][1] is not admissions[0][1]
+            assert not children[0].active and children[0].cached_entry_count == 0
+            assert (parent.active, parent.cached_entry_count) == (False, 0)
+        assert current_retention_stage_memo() is None and stored_rows(store[0]) == before and len(primary_sdk) == 1
+        phases.work.coordinator.assert_completed()

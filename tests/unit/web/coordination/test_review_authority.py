@@ -32,6 +32,11 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 
+SESSION_ID = "10000000-0000-4000-8000-000000000001"
+STATE_ID = "20000000-0000-4000-8000-000000000001"
+SECOND_STATE_ID = "20000000-0000-4000-8000-000000000002"
+MISSING_STATE_ID = "20000000-0000-4000-8000-000000000003"
+
 
 def _noop(_value: object) -> None:
     pass
@@ -55,15 +60,15 @@ def authority(engine: Engine) -> RepositoryReviewAuthority:
             )
         conn.execute(
             insert(sessions_table).values(
-                id="session-1", user_id="alice", auth_provider_type="local", title="review", created_at=now, updated_at=now
+                id=SESSION_ID, user_id="alice", auth_provider_type="local", title="review", created_at=now, updated_at=now
             )
         )
         conn.execute(
             insert(composition_states_table).values(
                 **stamped_state_values(
                     metadata_=stored_default_pipeline_metadata(),
-                    id="state-1",
-                    session_id="session-1",
+                    id=STATE_ID,
+                    session_id=SESSION_ID,
                     version=1,
                     provenance="session_seed",
                     created_at=now,
@@ -75,14 +80,14 @@ def authority(engine: Engine) -> RepositoryReviewAuthority:
 
 def _request(authority: RepositoryReviewAuthority, *, reviewer: str | None = "bob"):
     return authority.request(
-        session_id="session-1", state_id="state-1", requested_by="alice", reviewer=reviewer, note="  please review  ", record=_noop
+        session_id=SESSION_ID, state_id=STATE_ID, requested_by="alice", reviewer=reviewer, note="  please review  ", record=_noop
     )
 
 
 def _attest(authority: RepositoryReviewAuthority, *, reviewer: str = "bob", verdict: str = "signed_off", note: str | None = None):
     return authority.attest(
-        session_id="session-1",
-        state_id="state-1",
+        session_id=SESSION_ID,
+        state_id=STATE_ID,
         payload_digest="sha256:" + "ab" * 32,
         reviewer=reviewer,
         verdict=verdict,
@@ -94,7 +99,7 @@ def _attest(authority: RepositoryReviewAuthority, *, reviewer: str = "bob", verd
 def test_request_is_owned_and_audited_before_commit(engine: Engine, authority: RepositoryReviewAuthority) -> None:
     seen: list[ReviewRequestRecord] = []
     row = authority.request(
-        session_id="session-1", state_id="state-1", requested_by="alice", reviewer="bob", note="  please review  ", record=seen.append
+        session_id=SESSION_ID, state_id=STATE_ID, requested_by="alice", reviewer="bob", note="  please review  ", record=seen.append
     )
     assert seen == [row]
     assert row.open and row.request_note == "please review" and row.reviewer_identity_id == "bob"
@@ -105,9 +110,9 @@ def test_request_is_owned_and_audited_before_commit(engine: Engine, authority: R
 
 def test_request_refuses_bad_owner_state_and_reviewer(authority: RepositoryReviewAuthority, engine: Engine) -> None:
     with pytest.raises(SessionNotOwnedByRequester):
-        authority.request(session_id="session-1", state_id="state-1", requested_by="carol", reviewer="bob", note=None, record=_noop)
+        authority.request(session_id=SESSION_ID, state_id=STATE_ID, requested_by="carol", reviewer="bob", note=None, record=_noop)
     with pytest.raises(StateNotInSession):
-        authority.request(session_id="session-1", state_id="missing", requested_by="alice", reviewer="bob", note=None, record=_noop)
+        authority.request(session_id=SESSION_ID, state_id=MISSING_STATE_ID, requested_by="alice", reviewer="bob", note=None, record=_noop)
     with pytest.raises(ReviewerIsAuthor):
         _request(authority, reviewer="alice")
     with pytest.raises(ReviewerRoleRequired):
@@ -159,7 +164,7 @@ def test_historical_service_provider_marked_human_cannot_review(authority: Repos
     with pytest.raises(ReviewerRoleRequired):
         authority.open_for(reviewer="bob")
     with pytest.raises(ReviewerRoleRequired):
-        authority.open_request_for(reviewer="bob", session_id="session-1", state_id="state-1")
+        authority.open_request_for(reviewer="bob", session_id=SESSION_ID, state_id=STATE_ID)
     with pytest.raises(ReviewerRoleRequired):
         _attest(authority)
 
@@ -202,7 +207,7 @@ def test_attestation_requires_open_exact_state_request_and_remains_a_non_gating_
         _attest(authority, verdict="changes_requested")
     row = _attest(authority, verdict="changes_requested", note="  fix edge  ")
     assert row.note == "fix edge" and row.verdict == "changes_requested"
-    assert authority.attestations_for(session_id="session-1", state_id="state-1") == (row,)
+    assert authority.attestations_for(session_id=SESSION_ID, state_id=STATE_ID) == (row,)
     with engine.connect() as conn:
         assert conn.execute(select(review_attestations_table.c.author_identity_id)).scalar_one() == "alice"
 
@@ -212,7 +217,7 @@ def test_audit_failure_rolls_back_each_mutation(authority: RepositoryReviewAutho
         raise RuntimeError("audit unavailable")
 
     with pytest.raises(RuntimeError, match="audit unavailable"):
-        authority.request(session_id="session-1", state_id="state-1", requested_by="alice", reviewer="bob", note=None, record=fail)
+        authority.request(session_id=SESSION_ID, state_id=STATE_ID, requested_by="alice", reviewer="bob", note=None, record=fail)
     with engine.connect() as conn:
         assert conn.execute(select(review_requests_table)).all() == []
     row = _request(authority)
@@ -222,26 +227,26 @@ def test_audit_failure_rolls_back_each_mutation(authority: RepositoryReviewAutho
     assert persisted is not None and persisted.open
     with pytest.raises(RuntimeError, match="audit unavailable"):
         authority.attest(
-            session_id="session-1",
-            state_id="state-1",
+            session_id=SESSION_ID,
+            state_id=STATE_ID,
             payload_digest="sha256:" + "ab" * 32,
             reviewer="bob",
             verdict="signed_off",
             note=None,
             record=fail,
         )
-    assert authority.attestations_for(session_id="session-1", state_id="state-1") == ()
+    assert authority.attestations_for(session_id=SESSION_ID, state_id=STATE_ID) == ()
 
 
 def test_cancel_and_sent_history(authority: RepositoryReviewAuthority) -> None:
     row = _request(authority, reviewer=None)
     assert authority.open_for(reviewer="bob") == (row,)
-    assert authority.open_request_for(reviewer="bob", session_id="session-1", state_id="state-1") == row
-    assert authority.open_request_for(reviewer="bob", session_id="session-1", state_id="absent") is None
+    assert authority.open_request_for(reviewer="bob", session_id=SESSION_ID, state_id=STATE_ID) == row
+    assert authority.open_request_for(reviewer="bob", session_id=SESSION_ID, state_id=MISSING_STATE_ID) is None
     with pytest.raises(ReviewerRoleRequired):
         authority.open_for(reviewer="dave")
     with pytest.raises(ReviewerRoleRequired):
-        authority.open_request_for(reviewer="dave", session_id="session-1", state_id="state-1")
+        authority.open_request_for(reviewer="dave", session_id=SESSION_ID, state_id=STATE_ID)
     cancelled = authority.cancel(request_id=row.request_id, requested_by="alice", record=_noop)
     assert not cancelled.open and cancelled.cancelled_at is not None
     assert authority.open_for(reviewer="bob") == ()
@@ -262,20 +267,20 @@ def test_author_with_reviewer_role_cannot_see_their_unaddressed_request(authorit
             )
         )
     assert authority.open_for(reviewer="alice") == ()
-    assert authority.open_request_for(reviewer="alice", session_id="session-1", state_id="state-1") is None
+    assert authority.open_request_for(reviewer="alice", session_id=SESSION_ID, state_id=STATE_ID) is None
 
 
 def test_original_requester_can_cancel_after_session_ownership_changes(authority: RepositoryReviewAuthority, engine: Engine) -> None:
     requested = _request(authority)
     with engine.begin() as conn:
-        conn.execute(update(sessions_table).where(sessions_table.c.id == "session-1").values(user_id="carol"))
+        conn.execute(update(sessions_table).where(sessions_table.c.id == SESSION_ID).values(user_id="carol"))
     cancelled = authority.cancel(request_id=requested.request_id, requested_by="alice", record=_noop)
     assert cancelled.cancelled_at is not None and cancelled.open is False
 
 
 def test_note_limit_is_utf8_bytes(authority: RepositoryReviewAuthority) -> None:
     with pytest.raises(ReviewNoteTooLong):
-        authority.request(session_id="session-1", state_id="state-1", requested_by="alice", reviewer=None, note="€" * 1366, record=_noop)
+        authority.request(session_id=SESSION_ID, state_id=STATE_ID, requested_by="alice", reviewer=None, note="€" * 1366, record=_noop)
 
 
 def test_re_request_after_attestation_stays_open_on_coarse_sqlite_clock(authority: RepositoryReviewAuthority) -> None:
@@ -318,8 +323,8 @@ def test_attestation_snapshots_author_even_if_session_is_reowned(authority: Repo
     row = _attest(authority)
     assert row.author_identity_id == "alice"
     with engine.begin() as conn:
-        conn.execute(update(sessions_table).where(sessions_table.c.id == "session-1").values(user_id="carol"))
-    assert authority.attestations_for(session_id="session-1", state_id="state-1")[0].author_identity_id == "alice"
+        conn.execute(update(sessions_table).where(sessions_table.c.id == SESSION_ID).values(user_id="carol"))
+    assert authority.attestations_for(session_id=SESSION_ID, state_id=STATE_ID)[0].author_identity_id == "alice"
 
 
 def test_addressed_request_only_admits_its_reviewer_and_cancelled_request_admits_none(
@@ -328,15 +333,15 @@ def test_addressed_request_only_admits_its_reviewer_and_cancelled_request_admits
     request = _request(authority, reviewer="bob")
     with pytest.raises(OpenReviewRequestRequired):
         _attest(authority, reviewer="carol")
-    assert authority.open_request_for(reviewer="carol", session_id="session-1", state_id="state-1") is None
-    assert authority.open_request_for(reviewer="bob", session_id="session-1", state_id="state-1") == request
+    assert authority.open_request_for(reviewer="carol", session_id=SESSION_ID, state_id=STATE_ID) is None
+    assert authority.open_request_for(reviewer="bob", session_id=SESSION_ID, state_id=STATE_ID) == request
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
                 **stamped_state_values(
                     metadata_=stored_default_pipeline_metadata(),
-                    id="state-2",
-                    session_id="session-1",
+                    id=SECOND_STATE_ID,
+                    session_id=SESSION_ID,
                     version=2,
                     provenance="session_seed",
                     created_at=datetime.now(UTC),
@@ -345,8 +350,8 @@ def test_addressed_request_only_admits_its_reviewer_and_cancelled_request_admits
         )
     with pytest.raises(OpenReviewRequestRequired):
         authority.attest(
-            session_id="session-1",
-            state_id="state-2",
+            session_id=SESSION_ID,
+            state_id=SECOND_STATE_ID,
             payload_digest="sha256:" + "cd" * 32,
             reviewer="bob",
             verdict="signed_off",
@@ -354,11 +359,11 @@ def test_addressed_request_only_admits_its_reviewer_and_cancelled_request_admits
             record=_noop,
         )
     authority.cancel(request_id=request.request_id, requested_by="alice", record=_noop)
-    assert authority.open_request_for(reviewer="bob", session_id="session-1", state_id="state-1") is None
+    assert authority.open_request_for(reviewer="bob", session_id=SESSION_ID, state_id=STATE_ID) is None
     with pytest.raises(OpenReviewRequestRequired):
         _attest(authority, reviewer="bob")
     unaddressed = _request(authority, reviewer=None)
-    assert authority.open_request_for(reviewer="carol", session_id="session-1", state_id="state-1") == unaddressed
+    assert authority.open_request_for(reviewer="carol", session_id=SESSION_ID, state_id=STATE_ID) == unaddressed
     attested = _attest(authority, reviewer="carol")
     assert attested.reviewer_identity_id == "carol"
     assert attested.authorizing_request_id is not None

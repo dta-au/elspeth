@@ -1,4 +1,5 @@
 import json
+from hashlib import sha256
 
 import pytest
 
@@ -11,6 +12,7 @@ from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_TRUST_KEY,
     PromptGuardTrust,
 )
+from elspeth.web.composer import continuation_message_shelf as shelf_codec
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk
 from elspeth.web.composer.continuation_message_shelf import (
@@ -50,6 +52,66 @@ def tool_message(arguments):
             {"type": "redacted_thinking", "data": "opaque-second"},
         ],
     }
+
+
+@pytest.mark.parametrize("mandatory_retention", (False, True))
+def test_native_outer_shelf_preserves_public_bytes_and_ordered_inner_aliases(monkeypatch, mandatory_retention):
+    owner = AdvisorTranscriptOwner(request="Build and inspect")
+    message = {
+        "role": "user",
+        "content": 'Retain "quotes", \\ slash,\n\t café 😀',
+        "retained_numbers": {"tiny": 1e-7, "negative_zero": -0.0, "max_safe_integer": 2**53 - 1},
+    }
+    messages = [message, message, dict(message)]
+    owner.observe_messages(messages)
+    snapshot = owner.snapshot_for_continuation(messages)
+    public_bytes = canonical_json(snapshot.model_dump(mode="json")).encode("utf-8")
+    original_writer = shelf_codec.canonical_json_native_strings
+    calls = []
+
+    def observe(value):
+        calls.append(True)
+        return original_writer(value)
+
+    monkeypatch.setattr(shelf_codec, "canonical_json_native_strings", observe)
+    chunk = encode_message_shelf(snapshot, mandatory_retention=mandatory_retention)
+    assert calls == [True]
+    assert chunk.canonical.encode("utf-8") == public_bytes
+    assert chunk.reference.byte_length == len(public_bytes)
+    assert chunk.reference.digest == sha256(public_bytes).hexdigest()
+    decoded = decode_message_shelf(chunk)
+    assert decoded == snapshot
+    restored, actual = AdvisorTranscriptOwner.for_continuation(
+        decoded, session_id="session", actor_user_id="actor", request_id="original", request="Build and inspect"
+    )
+    assert actual == messages and actual[0] is actual[1] and actual[0] is not actual[2]
+    assert tuple(actual[0]) == tuple(message)
+    assert tuple(actual[0]["retained_numbers"]) == tuple(message["retained_numbers"])
+    assert restored.snapshot() == owner.snapshot()
+    assert shelf_codec.encode_transcript_object_json(message) == json.dumps(
+        message, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    )
+
+
+@pytest.mark.parametrize("mandatory_retention", (False, True))
+def test_changed_outer_shelf_writer_is_refused_after_actual_roundtrip(monkeypatch, mandatory_retention):
+    owner = AdvisorTranscriptOwner(request="Build and inspect")
+    messages = [{"role": "user", "content": "Keep this plain event"}]
+    owner.observe_messages(messages)
+    snapshot = owner.snapshot_for_continuation(messages)
+    assert decode_message_shelf(encode_message_shelf(snapshot, mandatory_retention=mandatory_retention)) == snapshot
+    original_writer = shelf_codec.canonical_json_native_strings
+    calls = []
+
+    def changed(value):
+        calls.append(True)
+        return original_writer(value) + " "
+
+    monkeypatch.setattr(shelf_codec, "canonical_json_native_strings", changed)
+    refusal = "complete retention preflight" if mandatory_retention else "canonical strict JSON"
+    with pytest.raises(AuditIntegrityError, match=refusal):
+        encode_message_shelf(snapshot, mandatory_retention=mandatory_retention)
+    assert calls == [True]
 
 
 def test_pending_adoption_excluded_aliases_native_and_elided_messages_survive_cold_roundtrip():

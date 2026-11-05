@@ -31,7 +31,7 @@ from elspeth.web.sessions import continuation_driver, continuation_next_iteratio
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.continuation_driver import ContinuationSegmentSettled
 from elspeth.web.sessions.continuation_iteration_return import read_iteration_stage_on_connection
-from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration
+from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -118,7 +118,12 @@ async def _warm_progress_owned_metadata_case(store, tmp_path, monkeypatch):
         assert owner.runtime is None and driver.progress_owner is None
         await driver.start_progress(await driver.record())
         assert driver.progress_owner is not None and owner.progress is driver.progress_owner.sink
-        owner.bind_initial(runtime)
+        original_runtime = runtime
+        runtime, inventory = await owner.current(original_runtime.source.selected)
+        assert runtime is owner.runtime and runtime is not original_runtime
+        assert inventory is runtime.materialization.inventory
+        assert runtime.bindings.progress is owner.progress and runtime.source.selected is original_runtime.source.selected
+        del original_runtime
 
         async def completion(**sdk_kwargs):
             _assert_required_guard_admitted(
@@ -328,14 +333,18 @@ async def test_actual_worker_retains_prephysical_classifier_convergence_without_
 
 
 @pytest.mark.asyncio
-async def test_actual_warm_tool_owner_keeps_successful_custody_out_of_classifier_failure(operation_store, tmp_path, monkeypatch):
+async def test_actual_warm_v4_metadata_owner_retains_prephysical_classifier_convergence(operation_store, tmp_path, monkeypatch):
     async with _warm_progress_owned_metadata_case(operation_store, tmp_path, monkeypatch) as (store, warm, running, driver, prior_sdk):
+        # The first advance enters the provider-authored tool batch. The
+        # next original phase consumes its metadata value and retains P4.
+        await phase_fixture._advance(warm)
         stored = warm.latest_snapshot
         assert stored is not None and warm.finished_batch is None
         selected = await load_selected_continuation(authority=warm.authority, running=running, selected=stored, required_work=warm.work)
-        custody = warm.failure_custody
-        assert custody is not None and not custody.completed
-        assert custody.original is None and custody.errors == [] and custody.wrapper is None
+        assert is_applied_batch_cut(selected)
+        # V4 metadata is admitted by the closed value path before the legacy
+        # _execute_one_owned branch that creates a tool failure custody.
+        assert warm.failure_custody is None and warm.tool_refusal is None
         assert warm.service._max_composition_turns == 1 and len(prior_sdk) == 1
         clock = warm.work.coordinator.sql_deadline_owner
         assert type(clock) is ContinuationSQLDeadlineOwner
@@ -346,7 +355,7 @@ async def test_actual_warm_tool_owner_keeps_successful_custody_out_of_classifier
         with store[0].connect() as conn:
             stage = read_iteration_stage_on_connection(conn, running, selected=ready)
         assert stage is not None and stage.stage == "classify_ready"
-        assert ready.cursor == selected.stack.cursor + 1 and warm.failure_custody is custody
+        assert ready.cursor == selected.stack.cursor + 1 and warm.failure_custody is None
         sid, oid = str(running.claim.session_id), running.claim.operation_id
         with store[0].connect() as conn:
             before_physical = tuple(conn.execute(select(physical).where(physical.c.session_id == sid)))
@@ -365,7 +374,7 @@ async def test_actual_warm_tool_owner_keeps_successful_custody_out_of_classifier
 
         async def expire_then_observe(phases, runtime, *, selected, dispatch, persist):
             assert phases is warm and phases.action_clock is not None
-            assert phases.failure_custody is custody and not custody.completed and custody.original is None and custody.errors == []
+            assert phases.failure_custody is None and phases.tool_refusal is None
             await asyncio.sleep(max(0.0, phases.action_clock.preparation_deadline_monotonic - monotonic()) + 0.001)
             try:
                 return await actual_observer(phases, runtime, selected=selected, dispatch=dispatch, persist=persist)
@@ -400,8 +409,7 @@ async def test_actual_warm_tool_owner_keeps_successful_custody_out_of_classifier
             assert driver.worker._local_cancels.pop(key) is local_cancel
 
         assert len(originals) == 1 and not sdk_calls and len(prior_sdk) == 1
-        assert warm.failure_custody is custody and not custody.completed
-        assert custody.original is None and custody.errors == [] and custody.wrapper is None
+        assert warm.failure_custody is None and warm.tool_refusal is None
         assert type(outcome) is ContinuationSegmentSettled
         terminal = outcome.terminal
         assert terminal.status == "failed" and terminal.failure_code == "http_error" and terminal.result_json is not None
