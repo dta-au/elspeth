@@ -27,11 +27,25 @@ from tests.helpers.continuation_end_profile import EndPreparationProfile, EndTex
 PROFILE_FLAG = "ELSPETH_TEST_EARLY_PREPARATION_PROFILE"
 PROFILE_DIRECTORY = "ELSPETH_TEST_EARLY_PREPARATION_PROFILE_DIRECTORY"
 CPU_PROFILE_FLAG = "ELSPETH_TEST_EARLY_PREPARATION_CPU"
+SEMANTIC_PROFILE_FLAG = "ELSPETH_TEST_SEMANTIC_PREPARATION_PROFILE"
+SEMANTIC_PROFILE_DIRECTORY = "ELSPETH_TEST_SEMANTIC_PREPARATION_PROFILE_DIRECTORY"
+
+
+def _cpu_sample() -> dict[str, int]:
+    before = time.monotonic_ns()
+    thread, process = time.thread_time_ns(), time.process_time_ns()
+    return {"wall_before_ns": before, "wall_after_ns": time.monotonic_ns(), "thread_ns": thread, "process_ns": process}
 
 
 class EarlyPreparationProfile:
     def __init__(
-        self, *, enabled: bool, cpu_profile: bool = False, observe_memo: bool = True, cpu_selection: str = "current_evidence"
+        self,
+        *,
+        enabled: bool,
+        cpu_profile: bool = False,
+        observe_memo: bool = True,
+        cpu_selection: str = "current_evidence",
+        observe_process_cpu: bool = False,
     ) -> None:
         if cpu_selection not in {"current_evidence", "all_workers"}:
             raise ValueError("EARLY CPU selection must be current_evidence or all_workers")
@@ -40,6 +54,7 @@ class EarlyPreparationProfile:
         self.enabled = enabled
         self.cpu_profile = cpu_profile
         self.cpu_selection = cpu_selection
+        self.observe_process_cpu = observe_process_cpu
         self.spans = EndPreparationProfile(
             enabled=enabled,
             cpu_profile=cpu_profile,
@@ -174,6 +189,7 @@ class EarlyPreparationProfile:
 
         def initialize(clock, policy):
             original_init(clock, policy)
+            cpu_start = _cpu_sample() if profile.observe_process_cpu else None
             row = {
                 "identity": id(clock),
                 "policy_identity": id(policy),
@@ -185,6 +201,8 @@ class EarlyPreparationProfile:
                 "thread_cpu_start_ns": time.thread_time_ns(),
                 "finish_attempts": [],
             }
+            if cpu_start is not None:
+                row["cpu_samples_start"] = cpu_start
             with profile._lock:
                 profile.clocks.append(row)
                 profile._by_clock[id(clock)] = row
@@ -195,6 +213,7 @@ class EarlyPreparationProfile:
 
         def finish(clock):
             entered = time.monotonic_ns()
+            cpu_entry = _cpu_sample() if profile.observe_process_cpu else None
             error = None
             try:
                 return original_finish(clock)
@@ -217,6 +236,11 @@ class EarlyPreparationProfile:
                         }
                         if attempt["same_thread"]:
                             attempt["thread_cpu_ns"] = cpu - row["thread_cpu_start_ns"]
+                        if cpu_entry is not None:
+                            attempt["cpu_samples_entry"] = cpu_entry
+                            attempt["entry_process_cpu_ns"] = cpu_entry["process_ns"] - row["cpu_samples_start"]["process_ns"]
+                            if attempt["same_thread"]:
+                                attempt["entry_thread_cpu_ns"] = cpu_entry["thread_ns"] - row["cpu_samples_start"]["thread_ns"]
                         row["finish_attempts"].append(attempt)
                 with profile.spans._lock:
                     profile.spans._closed_clocks.setdefault(id(clock), ended)
@@ -409,3 +433,153 @@ def early_preparation_profile(monkeypatch, engine, *, output_key):
         failure = profile.flush(directory / f"{output_key}.json")
         if failure is not None:
             profile.spans.errors.append("EARLY diagnostic output write failed: " + type(failure).__name__)
+
+
+def _semantic_preparation_window(snapshot, target_clock):
+    """Qualify native observations without treating post-finish work as preparation."""
+    issues = list(snapshot["errors"])
+    clocks = [row for row in snapshot["clocks"] if row["identity"] == target_clock]
+    if len(clocks) != 1 or len(clocks[0]["finish_attempts"]) != 1:
+        return {"valid": False, "issues": [*issues, "semantic target needs one original clock and finish attempt"]}
+    clock = clocks[0]
+    finish = clock["finish_attempts"][0]
+    start, end = clock["start_ns"], finish["entry_ns"]
+    if end < start or not finish["same_thread"]:
+        issues.append("semantic clock has an invalid interval or changed finish thread")
+    if snapshot["incomplete_spans"] or snapshot["unpaired_submissions"] or snapshot["pending_sql_contexts"]:
+        issues.append("semantic observations have unfinished spans, workers or SQL")
+    if snapshot["cpu_profile_enabled"] or snapshot["cpu_profiles"] or snapshot["text_memo"] is not None:
+        issues.append("semantic observation must exclude CPU profiling and memo probes")
+    records = snapshot["records"]
+    by_id = {row["id"]: row for row in records}
+    selected = [row for row in records if row["clock"] == target_clock]
+    submissions = [row for row in selected if row["kind"] == "submission" and start <= row["start_ns"] <= end]
+    for submission in submissions:
+        if submission.get("submission_failed"):
+            continue
+        worker = by_id.get(submission.get("worker_id"))
+        if (
+            worker is None
+            or worker["clock"] != target_clock
+            or worker["kind"] != "worker"
+            or worker.get("submission") != submission["id"]
+            or not start <= worker["start_ns"] <= worker.get("end_ns", end + 1) <= end
+        ):
+            issues.append("semantic preparation submission lost its complete original worker window")
+    contained = [row["id"] for row in selected if start <= row["start_ns"] <= row.get("end_ns", end + 1) <= end]
+    crossing = [row["id"] for row in selected if row["start_ns"] < end < row.get("end_ns", end + 1)]
+    after = [row["id"] for row in selected if row["start_ns"] >= end]
+    if "cpu_samples_start" not in clock or "cpu_samples_entry" not in finish:
+        issues.append("semantic preparation lacks its aligned process/thread CPU samples")
+    return {
+        "valid": not issues,
+        "issues": issues,
+        "clock": target_clock,
+        "start_ns": start,
+        "finish_entry_ns": end,
+        "finish_exit_ns": finish["end_ns"],
+        "elapsed_to_entry_ns": finish["elapsed_to_entry_ns"],
+        "elapsed_to_exit_ns": finish["elapsed_to_exit_ns"],
+        "headroom_at_entry_ns": round(clock["preparation_deadline_monotonic"] * 1_000_000_000) - end,
+        "headroom_at_exit_ns": round(clock["preparation_deadline_monotonic"] * 1_000_000_000) - finish["end_ns"],
+        "finish_error": finish["error"],
+        "contained_record_ids": contained,
+        "crossing_record_ids": crossing,
+        "postfinish_record_ids": after,
+        "preparation_submission_ids": [row["id"] for row in submissions],
+    }
+
+
+class SemanticPreparationProfile(EarlyPreparationProfile):
+    """Spans-only adapter around the actual shared fixture's initial semantic clock."""
+
+    def __init__(self, *, enabled: bool) -> None:
+        super().__init__(enabled=enabled, cpu_profile=False, observe_memo=False, observe_process_cpu=True)
+        self.target_clock: int | None = None
+
+    def select_clock(self, clock: ContinuationActionClock) -> None:
+        if type(clock) is not ContinuationActionClock or id(clock) not in self._by_clock or self.target_clock is not None:
+            raise ValueError("semantic observation requires its one original constructed clock")
+        self.target_clock = id(clock)
+
+    def _active(self):
+        with self.spans._lock:
+            worker = self.spans._workers.get(threading.get_native_id())
+            identity = self.spans._clock.get() if worker is None else worker["clock"]
+        return identity == self.target_clock and self.target_clock is not None and super()._active()
+
+    @contextmanager
+    def install(self, monkeypatch, engine):
+        # Import the same bindings in inclusive-only and selected-span modes,
+        # before the actual clock. None is a hash/render/memo dependency.
+        from elspeth.web.composer import continuation_runtime as runtime
+        from elspeth.web.composer import continuation_semantic_advisor as semantic
+        from elspeth.web.composer import continuation_semantic_advisor_phase as phase
+        from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+        from elspeth.web.sessions import continuation_semantic_advisor as sql_semantic
+
+        synchronous = (
+            (phase, "select_semantic_advisor_current_graph_on_connection", phase.select_semantic_advisor_current_graph_on_connection),
+            (phase, "capture_semantic_advisor_source", phase.capture_semantic_advisor_source),
+            (phase, "make_semantic_advisor_invocation", phase.make_semantic_advisor_invocation),
+            (phase, "read_semantic_advisor_retained_inputs_on_connection", phase.read_semantic_advisor_retained_inputs_on_connection),
+            (phase, "prepare_semantic_advisor_request", phase.prepare_semantic_advisor_request),
+            (phase, "prepare_semantic_advisor_on_connection", phase.prepare_semantic_advisor_on_connection),
+            (sql_semantic, "read_runtime_source_on_connection", sql_semantic.read_runtime_source_on_connection),
+            (semantic, "prepare_provider_input", semantic.prepare_provider_input),
+            (semantic.PreparedSemanticAdvisorRequest, "verify", semantic.PreparedSemanticAdvisorRequest.verify),
+        )
+        asynchronous = (
+            (ContinuationLivePhases, "current", ContinuationLivePhases.current),
+            (runtime, "_restore_runtime", runtime._restore_runtime),
+            (phase, "_run_semantic_advisor_preparation", phase._run_semantic_advisor_preparation),
+            # The outcome owner imports this function locally on invocation.
+            (semantic, "run_semantic_advisor", semantic.run_semantic_advisor),
+        )
+        with super().install(monkeypatch, engine), monkeypatch.context() as patch:
+            if self.enabled:
+                for owner, name, original in synchronous:
+                    patch.setattr(owner, name, self._sync(f"{owner.__name__}.{name}", original))
+                for owner, name, original in asynchronous:
+                    patch.setattr(owner, name, self._async(f"{owner.__name__}.{name}", original))
+            yield self
+
+    def snapshot(self):
+        result = super().snapshot()
+        result.update(
+            observer="original_initial_semantic_preparation",
+            process_id=os.getpid(),
+            preparation=_semantic_preparation_window(result, self.target_clock),
+            process_cpu_scope="all threads in this process between the recorded post-constructor and finish-entry CPU samples",
+            thread_cpu_scope="event-loop thread only; async intervals include other activity; native workers are recorded separately",
+            wall_scope="original clock anchor to forwarded finish entry/exit; inclusive spans may overlap and must not be summed",
+        )
+        return result
+
+
+@contextmanager
+def semantic_preparation_profile(monkeypatch, engine, *, output_key):
+    mode = os.environ.get(SEMANTIC_PROFILE_FLAG)
+    if mode is None:
+        yield None
+        return
+    assert mode in {"0", "2"}, "semantic timing supports inclusive-only 0 or spans-only 2"
+    root = Path(__file__).resolve().parents[2]
+    directory = Path(os.environ.get(SEMANTIC_PROFILE_DIRECTORY, ".claude/lanes/semantic-preparation-profile"))
+    if not directory.is_absolute():
+        directory = root / directory
+    directory = directory.resolve()
+    assert directory.is_relative_to(root), "semantic diagnostic output must remain inside this project"
+    profile = SemanticPreparationProfile(enabled=mode == "2")
+    try:
+        with profile.install(monkeypatch, engine):
+            yield profile
+    except BaseException as original:
+        profile.case_outcome = {"status": "raised", "error": type(original).__name__}
+        raise
+    else:
+        profile.case_outcome = {"status": "returned"}
+    finally:
+        failure = profile.flush(directory / f"{output_key}.json")
+        if failure is not None:
+            profile.spans.errors.append("semantic diagnostic output write failed: " + type(failure).__name__)

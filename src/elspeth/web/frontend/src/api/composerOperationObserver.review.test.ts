@@ -5,7 +5,7 @@ vi.mock("./client", () => ({
   submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(), composerActiveOperation: vi.fn(() => null),
 }));
 import * as api from "./client";
-import { ComposerObservationDetached, ComposerSessionMissing, observeComposerOperation, submitAndObserveComposerOperation } from "./composerOperationObserver";
+import { ComposerObservationDetached, ComposerObservationFault, ComposerSessionMissing, observeComposerOperation, submitAndObserveComposerOperation } from "./composerOperationObserver";
 import { COMPOSER_STOP_KEY, acquireComposerOperationCustody, attachComposerObserver, authenticateComposerCustody, composerStopRequested, findComposerOperationCustody, purgeComposerCustody, requestComposerStop } from "@/stores/composerOperationCustody";
 import type { ComposerOperationSnapshot, ComposerOperationStatus, OperationCustody, SubmittedCustody } from "@/types/composerOperations";
 
@@ -87,11 +87,12 @@ describe("U-42 review regressions", () => {
     const descriptor = observer(); requestComposerStop(descriptor);
     vi.mocked(api.cancelComposerOperation).mockRejectedValueOnce(failure).mockResolvedValue({ ...live(5), cancel_requested: true });
     vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(sse(frame("terminal", 0, { status: "completed", phase: "settled", status_revision: 9 }, 9)));
-    vi.mocked(api.fetchComposerOperation).mockResolvedValue(done);
+    vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce(live()).mockResolvedValue(done);
     const unconfirmed: boolean[] = [];
     const observing = observeComposerOperation(descriptor, { stopUnconfirmed: (value) => unconfirmed.push(value) });
     await vi.advanceTimersByTimeAsync(10);
     expect(api.fetchComposerOperationStream).not.toHaveBeenCalled();
+    expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
     expect(unconfirmed).toEqual([true]);
     expect(composerStopRequested(descriptor)).toBe(true);
     expect(findComposerOperationCustody(scope, sid).foreground?.operationId).toBe(id);
@@ -175,6 +176,174 @@ describe("U-42 review regressions", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await expect(observing).resolves.toBe(done.result);
     expect(api.fetchComposerOperationStream).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("D1 durable observation during unconfirmed Stop", () => {
+  const failed: ComposerOperationSnapshot = {
+    ...status(9, { status: "failed", phase: "settled", segment: null }), result: null,
+    error: { http_status: 500, body: { detail: "Actual retained failure" }, error_type: null, failure_code: "operation_failed", diagnostic_id: "66666666-6666-4666-8666-666666666666" },
+  };
+
+  it.each([
+    ["offline", "completed"], ["503", "completed"], ["operation_missing", "completed"],
+    ["offline", "failed"], ["503", "failed"], ["operation_missing", "failed"],
+  ] as const)("a permanent %s cancel answer cannot hide a healthy %s GET", async (cancelAnswer, terminalStatus) => {
+    vi.useFakeTimers();
+    const descriptor = observer(); requestComposerStop(descriptor);
+    if (cancelAnswer === "operation_missing") vi.mocked(api.cancelComposerOperation).mockResolvedValue({ kind: "operation_missing" });
+    else vi.mocked(api.cancelComposerOperation).mockRejectedValue(cancelAnswer === "offline" ? new Error("offline") : { status: 503, detail: "Unavailable" });
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue(terminalStatus === "completed" ? done : failed);
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 500, detail: "Actual retained failure" });
+    const pending: boolean[] = [];
+    const observing = observeComposerOperation(descriptor, { stopUnconfirmed: (value) => {
+      expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+      expect(composerStopRequested(descriptor)).toBe(true);
+      pending.push(value);
+    } }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const result = await observing;
+    if (terminalStatus === "completed") expect(result).toBe(done.result);
+    else expect(result).toMatchObject({ status: 500, detail: "Actual retained failure", failure_code: "operation_failed", diagnostic_id: failed.error!.diagnostic_id, composer_operation: { operation_id: id, kind: "compose_message", failure_code: "operation_failed" } });
+    expect(pending).toEqual([true, false]);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    expect(composerStopRequested(descriptor)).toBe(false);
+    expect(api.cancelComposerOperation).toHaveBeenCalledOnce();
+    expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
+    expect(api.fetchComposerOperation).toHaveBeenCalledWith(sid, id);
+    expect(api.fetchComposerOperationStream).not.toHaveBeenCalled();
+    expect(api.submitComposerOperation).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["cancel", "GET"] as const)("exact session_missing from %s clears pending Stop before session custody", async (route) => {
+    vi.useFakeTimers();
+    const descriptor = observer(); requestComposerStop(descriptor);
+    if (route === "cancel") vi.mocked(api.cancelComposerOperation).mockResolvedValue({ kind: "session_missing" });
+    else vi.mocked(api.cancelComposerOperation).mockRejectedValue(new Error("offline"));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ kind: "session_missing" });
+    const pending: boolean[] = [];
+    const observing = observeComposerOperation(descriptor, { stopUnconfirmed: (value) => {
+      expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+      expect(composerStopRequested(descriptor)).toBe(true);
+      pending.push(value);
+    } }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await observing).toBeInstanceOf(ComposerSessionMissing);
+    expect(pending).toEqual(route === "cancel" ? [false] : [true, false]);
+    expect(api.fetchComposerOperation).toHaveBeenCalledTimes(route === "cancel" ? 0 : 1);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    expect(composerStopRequested(descriptor)).toBe(false);
+    expect(api.fetchComposerOperationStream).not.toHaveBeenCalled();
+    expect(api.submitComposerOperation).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["transport", "malformed", "operation_missing"] as const)("both routes unavailable retain the original submitted body and Stop (%s)", async (readFailure) => {
+    vi.useFakeTimers();
+    const submitted: SubmittedCustody = { mode: "submitted", scope, sessionId: sid, operationId: id, kind: "compose_message", createdAt: Date.now(), body: { operation_id: id, content: "Keep this exact draft", state_id: null } };
+    const descriptor = acquireComposerOperationCustody(submitted); requestComposerStop(descriptor);
+    vi.mocked(api.cancelComposerOperation).mockRejectedValue(new Error("cancel offline"));
+    if (readFailure === "operation_missing") vi.mocked(api.fetchComposerOperation).mockResolvedValue({ kind: "operation_missing" });
+    else vi.mocked(api.fetchComposerOperation).mockRejectedValue(readFailure === "malformed" ? new SyntaxError("Invalid JSON") : new Error("GET offline"));
+    const controller = new AbortController(), pending = vi.fn();
+    const observing = observeComposerOperation(descriptor, { signal: controller.signal, stopUnconfirmed: pending }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(3_100);
+      expect(api.cancelComposerOperation).toHaveBeenCalledTimes(3);
+      expect(api.fetchComposerOperation).toHaveBeenCalledTimes(3);
+      expect(findComposerOperationCustody(scope, sid).foreground).toEqual(submitted);
+      expect(composerStopRequested(descriptor)).toBe(true);
+      expect(pending).not.toHaveBeenCalledWith(false);
+      expect(api.fetchComposerOperationStream).not.toHaveBeenCalled();
+      expect(api.submitComposerOperation).not.toHaveBeenCalled();
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); }
+    expect(await observing).toBeInstanceOf(ComposerObservationDetached);
+    expect(composerStopRequested(descriptor)).toBe(true);
+    expect(pending).not.toHaveBeenCalledWith(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["refused", "wrong_kind"] as const)("a %s Stop-branch GET escapes without retiring custody", async (readFailure) => {
+    vi.useFakeTimers();
+    const descriptor = observer(); requestComposerStop(descriptor);
+    vi.mocked(api.cancelComposerOperation).mockRejectedValue(new Error("offline"));
+    const refusal = { status: 403, detail: "Forbidden" };
+    if (readFailure === "refused") vi.mocked(api.fetchComposerOperation).mockRejectedValue(refusal);
+    else vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...done, kind: "compose_recompose" });
+    const pending = vi.fn();
+    const observing = observeComposerOperation(descriptor, { stopUnconfirmed: pending }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    if (readFailure === "refused") expect(await observing).toBe(refusal);
+    else expect(await observing).toMatchObject({ name: "ComposerObservationFault", code: "snapshot_kind_mismatch" });
+    expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+    expect(composerStopRequested(descriptor)).toBe(true);
+    expect(pending.mock.calls).toEqual([[true]]);
+    expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
+    expect(api.fetchComposerOperationStream).not.toHaveBeenCalled();
+    expect(api.submitComposerOperation).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["completed", "session_missing"] as const)("a stale owner cannot apply a deferred %s Stop-branch GET", async (answer) => {
+    vi.useFakeTimers();
+    const descriptor = observer(); requestComposerStop(descriptor);
+    vi.mocked(api.cancelComposerOperation).mockRejectedValue(new Error("offline"));
+    let release!: (value: Awaited<ReturnType<typeof api.fetchComposerOperation>>) => void;
+    vi.mocked(api.fetchComposerOperation).mockReturnValue(new Promise((resolve) => { release = resolve; }));
+    let current = true;
+    const pending = vi.fn(), accepted = vi.fn();
+    const observing = observeComposerOperation(descriptor, { current: () => current, stopUnconfirmed: pending, status: accepted }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
+    current = false;
+    release(answer === "completed" ? done : { kind: "session_missing" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await observing).toBeInstanceOf(ComposerObservationDetached);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+    expect(composerStopRequested(descriptor)).toBe(true);
+    expect(accepted).not.toHaveBeenCalled();
+    expect(pending.mock.calls).toEqual([[true]]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["completed", "failed", "session_missing", "cancel_session_missing"] as const)("a false-UI callback fault preserves custody for %s", async (answer) => {
+    vi.useFakeTimers();
+    const descriptor = observer(); requestComposerStop(descriptor);
+    if (answer === "cancel_session_missing") vi.mocked(api.cancelComposerOperation).mockResolvedValue({ kind: "session_missing" });
+    else vi.mocked(api.cancelComposerOperation).mockRejectedValue(new Error("offline"));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue(answer === "completed" ? done : answer === "failed" ? failed : { kind: "session_missing" });
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 500, detail: "Actual retained failure" });
+    const cause = new Error("private callback failure");
+    const pending = vi.fn((value: boolean) => { if (!value) throw cause; });
+    const observing = observeComposerOperation(descriptor, { stopUnconfirmed: pending }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const error = await observing;
+    expect(error).toBeInstanceOf(ComposerObservationFault);
+    expect((error as ComposerObservationFault).cause).toBe(cause);
+    expect(JSON.stringify(error)).not.toContain(cause.message);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+    expect(composerStopRequested(descriptor)).toBe(true);
+    expect(api.fetchComposerOperation).toHaveBeenCalledTimes(answer === "cancel_session_missing" ? 0 : 1);
+    expect(api.fetchComposerOperationStream).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["completed", "session_missing", "cancel_session_missing"] as const)("false-UI callback ownership change prevents %s custody retirement", async (answer) => {
+    vi.useFakeTimers();
+    const descriptor = observer(); requestComposerStop(descriptor);
+    if (answer === "cancel_session_missing") vi.mocked(api.cancelComposerOperation).mockResolvedValue({ kind: "session_missing" });
+    else vi.mocked(api.cancelComposerOperation).mockRejectedValue(new Error("offline"));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue(answer === "completed" ? done : { kind: "session_missing" });
+    let current = true;
+    const pending = vi.fn((value: boolean) => { if (!value) current = false; });
+    const observing = observeComposerOperation(descriptor, { current: () => current, stopUnconfirmed: pending }).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await observing).toBeInstanceOf(ComposerObservationDetached);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+    expect(composerStopRequested(descriptor)).toBe(true);
+    expect(pending).toHaveBeenCalledWith(false);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

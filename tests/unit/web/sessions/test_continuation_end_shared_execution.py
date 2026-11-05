@@ -39,6 +39,7 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from tests.helpers.continuation_early_profile import semantic_preparation_profile
 from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
 from tests.unit.web.sessions import test_continuation_semantic_v4_live as semantic_v4_fixture
 from tests.unit.web.sessions.test_continuation_completion_owners import _end_admit
@@ -74,11 +75,16 @@ async def actual_shared_end_case(store, tmp_path, monkeypatch, *, outcome="clean
             semantic_phases = semantic_v4_fixture._phases(case)
             # This is the first bound action clock, after fixture-only request
             # setup and before the actual phase's preparation/guard/quota.
-            action_clock = ContinuationActionClock(runtime.source.policy.actions.advisor)
-            if case["sql_deadline"] is not None:
-                case["sql_deadline"].begin_action(action_clock.policy, started_at=action_clock.started_monotonic)
-            semantic_phases.bind_action_clock(action_clock)
-            result = await run_continuation_semantic_advisor(semantic_phases, original)
+            with semantic_preparation_profile(
+                monkeypatch, store[0], output_key=f"{case['running'].claim.session_id}-{case['running'].claim.operation_id}"
+            ) as profile:
+                action_clock = ContinuationActionClock(runtime.source.policy.actions.advisor)
+                if profile is not None:
+                    profile.select_clock(action_clock)
+                if case["sql_deadline"] is not None:
+                    case["sql_deadline"].begin_action(action_clock.policy, started_at=action_clock.started_monotonic)
+                semantic_phases.bind_action_clock(action_clock)
+                result = await run_continuation_semantic_advisor(semantic_phases, original)
             assert result is None and len(sdk) == 1
             paid_snapshot = semantic_phases.latest_snapshot
             assert paid_snapshot is not None

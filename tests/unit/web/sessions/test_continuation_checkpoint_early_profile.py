@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 
 import pytest
 from sqlalchemy import event, text
@@ -27,8 +28,242 @@ from elspeth.web.continuation_retention_memo import (
 )
 from elspeth.web.required_executor import InvocationGate, RequiredInvocationAborted, RequiredInvocationWitness
 from elspeth.web.sessions.engine import create_session_engine
-from tests.helpers.continuation_early_profile import PROFILE_FLAG, EarlyPreparationProfile, early_preparation_profile
+from tests.helpers.continuation_early_profile import (
+    PROFILE_FLAG,
+    SEMANTIC_PROFILE_DIRECTORY,
+    SEMANTIC_PROFILE_FLAG,
+    EarlyPreparationProfile,
+    SemanticPreparationProfile,
+    _semantic_preparation_window,
+    early_preparation_profile,
+    semantic_preparation_profile,
+)
 from tests.helpers.continuation_policy import minimal_continuation_policy
+
+
+@pytest.mark.asyncio
+async def test_semantic_profile_absent_flag_keeps_original_clock_and_aliases(monkeypatch):
+    from elspeth.web.composer import continuation_semantic_advisor_phase as phase
+
+    monkeypatch.delenv(SEMANTIC_PROFILE_FLAG, raising=False)
+    original_clock = ContinuationActionClock.__init__
+    original_request = phase.prepare_semantic_advisor_request
+    engine = create_session_engine("sqlite://")
+    try:
+        with semantic_preparation_profile(monkeypatch, engine, output_key="disabled-semantic-control") as profile:
+            assert profile is None
+            assert ContinuationActionClock.__init__ is original_clock
+            assert phase.prepare_semantic_advisor_request is original_request
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            clock.finish_preparation()
+            assert clock._seen == {"preparation"}
+        assert ContinuationActionClock.__init__ is original_clock
+        assert phase.prepare_semantic_advisor_request is original_request
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("0", "2"))
+async def test_semantic_profile_context_keeps_original_finish_error_when_output_is_unavailable(monkeypatch, mode):
+    monkeypatch.setenv(SEMANTIC_PROFILE_FLAG, mode)
+    monkeypatch.setenv(SEMANTIC_PROFILE_DIRECTORY, ".claude/lanes/semantic-profile-unwritten-control")
+    snapshots, originals = [], []
+
+    def flush(profile, path):
+        assert path.name == "same-original-failure.json"
+        snapshots.append(profile.snapshot())
+        return OSError("controlled diagnostic output refusal")
+
+    monkeypatch.setattr(SemanticPreparationProfile, "flush", flush)
+    engine = create_session_engine("sqlite://")
+    try:
+        with (
+            pytest.raises(ValueError) as raised,
+            semantic_preparation_profile(monkeypatch, engine, output_key="same-original-failure") as profile,
+        ):
+            assert type(profile) is SemanticPreparationProfile and not profile.cpu_profile and profile.spans.text_memo is None
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            profile.select_clock(clock)
+            deadlines = clock.deadline, clock.preparation_deadline_monotonic
+            clock.finish_preparation()
+            try:
+                clock.finish_preparation()
+            except ValueError as original:
+                originals.append(original)
+                raise
+        assert raised.value is originals[0] and clock._seen == {"preparation"}
+        assert (clock.deadline, clock.preparation_deadline_monotonic) == deadlines
+        assert len(snapshots) == 1
+        assert snapshots[0]["case_outcome"] == {"status": "raised", "error": "ValueError"}
+        assert snapshots[0]["mode"] == ("inclusive_only" if mode == "0" else "spans_only")
+        assert not snapshots[0]["preparation"]["valid"]  # A second finish cannot renew the one measured window.
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", (False, True), ids=("inclusive-only", "selected-spans"))
+async def test_semantic_profile_observes_original_clock_cpu_async_aliases_and_only_selected_window(monkeypatch, enabled):
+    from elspeth.web.composer import continuation_semantic_advisor as semantic
+    from elspeth.web.composer import continuation_semantic_advisor_phase as phase
+    from elspeth.web.sessions import continuation_semantic_advisor as sql_semantic
+
+    profile = SemanticPreparationProfile(enabled=enabled)
+    marker = object()
+    original_error = RuntimeError("private semantic async control")
+
+    def source():
+        return marker
+
+    async def asynchronous(*, fails=False):
+        await asyncio.sleep(0)
+        if fails:
+            raise original_error
+        return marker
+
+    observed = profile._sync("semantic.control.source", source)
+    awaited = profile._async("semantic.control.async", asynchronous)
+    originals = (phase.prepare_semantic_advisor_request, sql_semantic.read_runtime_source_on_connection, semantic.run_semantic_advisor)
+    engine = create_session_engine("sqlite://")
+    try:
+        with profile.install(monkeypatch, engine):
+            current = (
+                phase.prepare_semantic_advisor_request,
+                sql_semantic.read_runtime_source_on_connection,
+                semantic.run_semantic_advisor,
+            )
+            for actual, original in zip(current, originals, strict=True):
+                if enabled:
+                    assert actual.__wrapped__ is original
+                else:
+                    assert actual is original
+            assert observed() is marker and await awaited() is marker
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            assert observed() is marker  # Constructed but not explicitly selected.
+            assert profile.spans.records == []
+            profile.select_clock(clock)
+            deadlines = clock.deadline, clock.preparation_deadline_monotonic
+            assert observed() is marker and await awaited() is marker
+            with pytest.raises(RuntimeError) as raised:
+                await awaited(fails=True)
+            assert raised.value is original_error
+            active = profile.snapshot()
+            assert [row["label"] for row in active["records"]] == (
+                ["semantic.control.source", "semantic.control.async", "semantic.control.async"] if enabled else []
+            )
+            assert not active["preparation"]["valid"]  # No actual finish yet.
+            clock.finish_preparation()
+            assert observed() is marker and await awaited() is marker
+            other = ContinuationActionClock(clock.policy)
+            assert observed() is marker and await awaited() is marker
+            other.finish_preparation()
+            assert profile.spans.records == active["records"]
+            assert clock._seen == {"preparation"} and (clock.deadline, clock.preparation_deadline_monotonic) == deadlines
+        snapshot = profile.snapshot()
+        assert snapshot["preparation"]["valid"] and snapshot["preparation"]["clock"] == id(clock)
+        assert snapshot["observer"] == "original_initial_semantic_preparation"
+        assert snapshot["cpu_profile_enabled"] is False and snapshot["cpu_profiles"] == [] and snapshot["text_memo"] is None
+        assert snapshot["mode"] == ("spans_only" if enabled else "inclusive_only")
+        original_clock = next(row for row in snapshot["clocks"] if row["identity"] == id(clock))
+        finish = original_clock["finish_attempts"][0]
+        assert original_clock["start_ns"] <= original_clock["cpu_samples_start"]["wall_before_ns"]
+        assert original_clock["cpu_samples_start"]["wall_after_ns"] <= finish["entry_ns"]
+        assert finish["entry_ns"] <= finish["cpu_samples_entry"]["wall_before_ns"] <= finish["cpu_samples_entry"]["wall_after_ns"]
+        assert finish["entry_process_cpu_ns"] >= 0 and finish["entry_thread_cpu_ns"] >= 0
+        assert finish["same_thread"] and finish["error"] is None and finish["seen"] == ["preparation"]
+        assert (
+            phase.prepare_semantic_advisor_request,
+            sql_semantic.read_runtime_source_on_connection,
+            semantic.run_semantic_advisor,
+        ) == originals
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_semantic_profile_pairs_real_context_reset_workers_sql_and_rejects_window_corruption(monkeypatch):
+    profile = SemanticPreparationProfile(enabled=True)
+    marker = object()
+    original_error = RuntimeError("private semantic worker control")
+    actual_submit = ThreadPoolExecutor.submit
+    submitted, calls = [], []
+    should_fail = False
+
+    def submit(executor, function, /, *args, **kwargs):
+        submitted.append((function, args))
+        return actual_submit(executor, function, *args, **kwargs)
+
+    engine = create_session_engine("sqlite://")
+
+    def body():
+        assert profile.spans._clock.get() is None
+        calls.append(current_v4_preparation_memo(clock))
+        with engine.connect() as conn:
+            assert conn.execute(text("select :value"), {"value": "PRIVATE_SEMANTIC_PARAMETER"}).scalar_one() == "PRIVATE_SEMANTIC_PARAMETER"
+        if should_fail:
+            raise original_error
+        return marker
+
+    observed = profile._sync("semantic.control.worker_body", body)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(ThreadPoolExecutor, "submit", submit)
+            with profile.install(patch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+                clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+                profile.select_clock(clock)
+                with v4_preparation_memo_scope(clock) as memo:
+                    adapter = prepare_retention_sql_callable(observed)
+                    first = RequiredInvocationWitness(1)
+                    first_bound = first.invoke
+                    returned = executor.submit(first_bound, adapter)
+                    first.arm()
+                    assert returned.result(timeout=5) is marker
+                    should_fail = True
+                    second = RequiredInvocationWitness(1)
+                    second_bound = second.invoke
+                    failed = executor.submit(second_bound, adapter)
+                    second.arm()
+                    with pytest.raises(RuntimeError) as raised:
+                        failed.result(timeout=5)
+                    assert raised.value is original_error
+                    should_fail = False
+                    clock.finish_preparation()
+                    after = RequiredInvocationWitness(1)
+                    after_bound = after.invoke
+                    postfinish = executor.submit(after_bound, adapter)
+                    after.arm()
+                    assert postfinish.result(timeout=5) is marker
+        snapshot = profile.snapshot()
+        assert snapshot["preparation"]["valid"]
+        assert calls == [memo, memo, memo]
+        assert submitted == [(first_bound, (adapter,)), (second_bound, (adapter,)), (after_bound, (adapter,))]
+        assert first.snapshot().callable_finished and second.snapshot().callable_finished and after.snapshot().callable_finished
+        target = [row for row in snapshot["records"] if row["label"] == "semantic.control.worker_body"]
+        assert len(target) == 2 and [row["error"] for row in target] == [None, "RuntimeError"]
+        assert all(row["clock"] == id(clock) and row["worker"] is not None and row["thread_cpu_ns"] >= 0 for row in target)
+        assert len(snapshot["preparation"]["preparation_submission_ids"]) == 2
+        assert snapshot["preparation"]["postfinish_record_ids"]
+        assert snapshot["pending_sql_contexts"] == 0 and snapshot["incomplete_spans"] == snapshot["unpaired_submissions"] == []
+        assert "PRIVATE_SEMANTIC_PARAMETER" not in json.dumps(snapshot)
+        assert ThreadPoolExecutor.submit is actual_submit
+        for fault in ("missing_worker", "wrong_clock", "outside_window", "unfinished"):
+            mutant = deepcopy(snapshot)
+            submission_id = mutant["preparation"]["preparation_submission_ids"][0]
+            submission = next(row for row in mutant["records"] if row["id"] == submission_id)
+            worker = next(row for row in mutant["records"] if row["id"] == submission["worker_id"])
+            if fault == "missing_worker":
+                mutant["records"].remove(worker)
+            elif fault == "wrong_clock":
+                worker["clock"] = -1
+            elif fault == "outside_window":
+                worker["end_ns"] = mutant["preparation"]["finish_entry_ns"] + 1
+            else:
+                mutant["incomplete_spans"].append(worker["id"])
+            assert not _semantic_preparation_window(mutant, id(clock))["valid"], fault
+        assert _semantic_preparation_window(snapshot, id(clock))["valid"]
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.asyncio

@@ -353,11 +353,18 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
   // The durable GET. Returns the sealed result, throws a sealed failure, or
   // returns "live" / "missing".
   type Durable = { done: true; result: MessageWithStateResponse } | { done: false; why: "live" | "missing" };
+  const reportStopRetirement = () => {
+    check();
+    if (composerStopRequested(descriptor) && !stopAcknowledged) {
+      deliverComposerObservation(() => options.stopUnconfirmed?.(false));
+      check(); // The callback may detach or replace this observer synchronously.
+    }
+  };
   const readDurable = async (): Promise<Durable> => {
     const read = await api.fetchComposerOperation(descriptor.sessionId, descriptor.operationId);
     check();
     if (!("operation_id" in read)) {
-      if (read.kind === "session_missing") { clearComposerSessionCustody(descriptor.scope, descriptor.sessionId); throw new ComposerSessionMissing(); }
+      if (read.kind === "session_missing") { reportStopRetirement(); clearComposerSessionCustody(descriptor.scope, descriptor.sessionId); throw new ComposerSessionMissing(); }
       return { done: false, why: "missing" };
     }
     return apply(read);
@@ -369,7 +376,7 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
     // The terminal GET is read for its sealed result even at an equal revision.
     if (snapshot.status === "failed") validateComposerRecoveryBody(snapshot.error!.body, descriptor.sessionId);
     const bodyError = snapshot.status === "failed" ? await api.apiErrorFromBody(snapshot.error!.http_status, snapshot.error!.body) : null;
-    check();
+    reportStopRetirement();
     settleComposerCustody(descriptor);
     if (snapshot.status === "completed") return { done: true, result: snapshot.result! };
     throw {
@@ -381,6 +388,11 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
   };
   // A sealed failure or a lost session ends observation; any other read error keeps custody and retries.
   const isFinal = (error: unknown) => error instanceof ComposerSessionMissing || error instanceof ComposerObservationDetached || (typeof error === "object" && error !== null && "composer_operation" in error);
+  const handleDurableError = (error: unknown) => {
+    check();
+    if (error instanceof ComposerObservationFault || isFinal(error) || api.isDefinitiveComposerRefusal(error)) throw error;
+    // Transient or malformed reads retain custody and Stop intent for retry.
+  };
 
   if (first !== null) {
     try {
@@ -400,7 +412,7 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
         const stopped = await api.cancelComposerOperation(descriptor.sessionId, descriptor.operationId);
         check();
         if (!("operation_id" in stopped)) {
-          if (stopped.kind === "session_missing") { clearComposerSessionCustody(descriptor.scope, descriptor.sessionId); throw new ComposerSessionMissing(); }
+          if (stopped.kind === "session_missing") { reportStopRetirement(); clearComposerSessionCustody(descriptor.scope, descriptor.sessionId); throw new ComposerSessionMissing(); }
           stopFailures += 1;
         } else {
           const decision = accept(stopped, "cancel_kind_mismatch");
@@ -423,6 +435,13 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
       }
       if (!stopAcknowledged && composerStopRequested(descriptor)) {
         deliverComposerObservation(() => options.stopUnconfirmed?.(true));
+        check();
+        try {
+          const durable = await readDurable();
+          if (durable.done) return durable.result;
+        } catch (error) {
+          handleDurableError(error);
+        }
         await sleep(owner, backoff(stopFailures));
         continue;
       }
@@ -447,10 +466,7 @@ async function follow(owner: Owner, options: ComposerObserverOptions, current: (
         const durable = await readDurable();
         if (durable.done) return durable.result;
       } catch (error) {
-        check();
-        if (error instanceof ComposerObservationFault) throw error;
-        if (isFinal(error)) throw error;
-        if (api.isDefinitiveComposerRefusal(error)) throw error; // custody is kept: a refused read proves nothing
+        handleDurableError(error);
       }
     }
     if (end === "failed") await sleep(owner, backoff(consecutiveFailures));
