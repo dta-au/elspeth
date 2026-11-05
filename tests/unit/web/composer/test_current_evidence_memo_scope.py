@@ -15,7 +15,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.prompt_guard import detach_prompt_guard_evidence
 from elspeth.web.composer import continuation_current_evidence as bridge
 from elspeth.web.composer.continuation_current_evidence import restore_current_turn_evidence
-from elspeth.web.composer.continuation_evidence_graph import _restore_current_evidence
+from elspeth.web.composer.continuation_evidence_graph import _finish_current_evidence
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 from elspeth.web.continuation_retention_memo import (
     RetentionStageMemo,
@@ -39,7 +39,7 @@ async def test_current_evidence_reuses_pure_checks_only_within_each_complete_rea
     kwargs, materialization, _shelf, _recorder = await guarded_case(operation_store)
     running = kwargs["inventory"].running
     original = CurrentContinuationMessageProducers._require_current
-    original_graph = bridge._restore_current_evidence
+    original_graph = bridge._finish_current_evidence
     observations = []
     phase = "before"
 
@@ -61,13 +61,13 @@ async def test_current_evidence_reuses_pure_checks_only_within_each_complete_rea
         observations.append((phase, memo, before, memo.cached_entry_count))
         return result
 
-    monkeypatch.setattr(bridge, "_restore_current_evidence", observed_graph)
+    monkeypatch.setattr(bridge, "_finish_current_evidence", observed_graph)
     monkeypatch.setattr(CurrentContinuationMessageProducers, "_require_current", observed)
     try:
         assert current_retention_stage_memo() is None
         await restore_current_turn_evidence(**kwargs, materialization=materialization)
-        assert len(observations) >= 3
-        assert [entry[0] for entry in observations] == ["before", *(["graph"] * (len(observations) - 2)), "after"]
+        assert len(observations) == 2
+        assert [entry[0] for entry in observations] == ["before", "after"]
         first_memo = observations[0][1]
         assert all(entry[1] is first_memo for entry in observations)
         assert observations[0][3] > observations[0][2]
@@ -78,8 +78,8 @@ async def test_current_evidence_reuses_pure_checks_only_within_each_complete_rea
         observations.clear()
         phase = "before"
         await restore_current_turn_evidence(**kwargs, materialization=materialization)
-        assert len(observations) >= 3
-        assert [entry[0] for entry in observations] == ["before", *(["graph"] * (len(observations) - 2)), "after"]
+        assert len(observations) == 2
+        assert [entry[0] for entry in observations] == ["before", "after"]
         assert all(entry[1] is observations[0][1] for entry in observations)
         assert observations[0][1] is not first_memo
         assert observations[-1][3] == observations[-1][2]
@@ -96,7 +96,7 @@ async def test_current_evidence_second_sql_proof_refuses_changed_chunk_bytes(ope
     frame = kwargs["selected"].stack.frames[-1]
     reference = frame.evidence
     original = CurrentContinuationMessageProducers._require_current
-    original_graph = bridge._restore_current_evidence
+    original_graph = bridge._finish_current_evidence
     calls = []
     graph_done = False
     changed = b"{}"
@@ -123,12 +123,12 @@ async def test_current_evidence_second_sql_proof_refuses_changed_chunk_bytes(ope
         graph_done = True
         return restored
 
-    monkeypatch.setattr(bridge, "_restore_current_evidence", change_after_graph)
+    monkeypatch.setattr(bridge, "_finish_current_evidence", change_after_graph)
     monkeypatch.setattr(CurrentContinuationMessageProducers, "_require_current", observed)
     try:
         with pytest.raises(AuditIntegrityError, match="cold evidence storage differs from its selected bytes"):
             await restore_current_turn_evidence(**kwargs, materialization=materialization)
-        assert len(calls) >= 3 and calls[0] is False and calls[-1] is True
+        assert calls == [False, True]
         assert current_retention_stage_memo() is None
         kwargs["required_work"].coordinator.assert_completed()
     finally:
@@ -173,7 +173,7 @@ async def test_v4_current_evidence_borrows_text_parent_but_restores_fresh_sql_an
         materialization = runtime.materialization
         actual_scope = borrow_v4_preparation_memo_scope
         actual_read = CurrentContinuationMessageProducers._require_current
-        actual_graph = _restore_current_evidence
+        actual_graph = _finish_current_evidence
         children, closed, observed, transferred = [], [], [], []
         phase = "before"
 
@@ -208,7 +208,7 @@ async def test_v4_current_evidence_borrows_text_parent_but_restores_fresh_sql_an
 
         monkeypatch.setattr(bridge, "borrow_v4_preparation_memo_scope", observed_scope)
         monkeypatch.setattr(CurrentContinuationMessageProducers, "_require_current", read)
-        monkeypatch.setattr(bridge, "_restore_current_evidence", graph)
+        monkeypatch.setattr(bridge, "_finish_current_evidence", graph)
         before = stored_rows(store[0])
         with v4_preparation_memo_scope(clock) as parent:
             first = await restore_current_turn_evidence(
@@ -244,8 +244,8 @@ async def test_v4_current_evidence_borrows_text_parent_but_restores_fresh_sql_an
             assert len(children) == 2 and children[0] is not children[1] and closed == children
             for child in children:
                 reads = [(stage, value) for stage, owner, value in observed if owner is child]
-                assert len(reads) >= 3 and reads[0][0] == "before" and reads[-1][0] == "after"
-                assert all(stage == "graph" for stage, _value in reads[1:-1])
+                assert len(reads) == 2
+                assert [stage for stage, _value in reads] == ["before", "after"]
                 assert all(value == materialization.inputs for _stage, value in reads)
                 assert all(value.evidence is value.admitted_evidence.snapshot for _stage, value in reads)
                 assert len({id(value.admitted_evidence) for _stage, value in reads}) == len(reads)
@@ -266,7 +266,7 @@ async def test_v4_current_evidence_parent_never_clears_changed_selected_chunk(op
         assert runtime is not None and clock is not None
         materialization = runtime.materialization
         reference = selected.stack.frames[0].evidence
-        actual_graph = _restore_current_evidence
+        actual_graph = _finish_current_evidence
         actual_read = CurrentContinuationMessageProducers._require_current
         graph_calls, reads = [], []
         children: list[RetentionStageMemo] = []
@@ -300,7 +300,7 @@ async def test_v4_current_evidence_parent_never_clears_changed_selected_chunk(op
             graph_done = True
             return result
 
-        monkeypatch.setattr(bridge, "_restore_current_evidence", change_after_graph)
+        monkeypatch.setattr(bridge, "_finish_current_evidence", change_after_graph)
         monkeypatch.setattr(CurrentContinuationMessageProducers, "_require_current", read)
         with v4_preparation_memo_scope(clock) as parent:
             with pytest.raises(AuditIntegrityError, match="cold evidence storage differs from its selected bytes"):
@@ -312,7 +312,7 @@ async def test_v4_current_evidence_parent_never_clears_changed_selected_chunk(op
                     materialization=materialization,
                     required_work=phases.work,
                 )
-            assert reads[0] is False and reads[-1] is True and len(graph_calls) == 1
+            assert reads == [False, True] and len(graph_calls) == 1
             assert not children[0].active and children[0].cached_entry_count == 0 and parent.active
             after_mutation = stored_rows(store[0])
             previous_reads = len(reads)
@@ -342,7 +342,7 @@ async def test_v4_current_evidence_final_read_survives_parent_close_without_late
         runtime, clock = phases.runtime, phases.action_clock
         assert runtime is not None and clock is not None
         materialization = runtime.materialization
-        actual_graph = _restore_current_evidence
+        actual_graph = _finish_current_evidence
         actual_read = CurrentContinuationMessageProducers._require_current
         entered, release = Event(), Event()
         children, admissions, transferred = [], [], []
@@ -369,7 +369,7 @@ async def test_v4_current_evidence_final_read_survives_parent_close_without_late
             assert release.wait(10)
             return result
 
-        monkeypatch.setattr(bridge, "_restore_current_evidence", held_graph)
+        monkeypatch.setattr(bridge, "_finish_current_evidence", held_graph)
         monkeypatch.setattr(CurrentContinuationMessageProducers, "_require_current", read)
         before = stored_rows(store[0])
         with v4_preparation_memo_scope(clock) as parent:
@@ -392,6 +392,7 @@ async def test_v4_current_evidence_final_read_survives_parent_close_without_late
                 release.set()
                 result = await task
             assert result is transferred[0]
+            assert len(admissions) == 2
             assert admissions[-1][0] is True and admissions[-1][2] is False
             assert admissions[-1][1] is not admissions[0][1]
             assert not children[0].active and children[0].cached_entry_count == 0

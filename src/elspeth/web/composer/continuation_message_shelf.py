@@ -95,15 +95,19 @@ def require_message_shelf_retention(snapshot: MessageShelfSnapshot, *, env_ref_n
 
 def require_message_shelf_integrity(snapshot: MessageShelfSnapshot, *, env_ref_names: frozenset[str] = frozenset()) -> None:
     """Complete owned/native/credential admission, without a capacity decision."""
-    from elspeth.web.composer.continuation_retention import (
-        require_retention_message_credentials,
-        validate_retained_model,
-    )
-    from elspeth.web.credential_guard import require_no_credential_material
+    from elspeth.web.composer.continuation_retention import validate_retained_model
 
     if type(snapshot) is not MessageShelfSnapshot:
         raise TypeError("transcript integrity requires its complete owned shelf")
     validate_retained_model(snapshot)
+    _require_message_shelf_semantics(snapshot, env_ref_names=env_ref_names)
+
+
+def _require_message_shelf_semantics(snapshot: MessageShelfSnapshot, *, env_ref_names: frozenset[str]) -> None:
+    """Admit embedded message data after the containing shelf's schema was validated."""
+    from elspeth.web.composer.continuation_retention import require_retention_message_credentials
+    from elspeth.web.credential_guard import require_no_credential_material
+
     for text in (*snapshot.messages_json, *(entry.event_json for entry in snapshot.observed)):
         value, error = parse_json_strict(text)
         if error is not None or type(value) is not dict:

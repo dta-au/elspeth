@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, select
@@ -10,6 +11,7 @@ from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, select
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.sessions.continuation_cost import _closed_call
@@ -17,7 +19,11 @@ from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteRece
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowReceipt, encode_paid_overflow_cost_amount
 from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource
 from elspeth.web.sessions.models import chat_messages_table as messages
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.time_normalization import restore_utc
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_checkpoint_early_return import VerifiedEarlyCompleteReturn
 
 
 def require_checkpoint_paid_public_audit_on_connection(
@@ -30,6 +36,7 @@ def require_checkpoint_paid_public_audit_on_connection(
     physical_settled_at: datetime,
     response_finished_at: datetime,
     receipt: PaidOverflowReceipt | PaidIncompleteReceipt,
+    early_owed: VerifiedEarlyCompleteReturn | None = None,
 ) -> None:
     """Reprove one bounded original sidecar before granting a cold terminal."""
     try:
@@ -80,6 +87,43 @@ def require_checkpoint_paid_public_audit_on_connection(
         ProviderAuditSource(source.session_id, source.session_operation_id, source.session_operation_epoch),
         attempt_id,
     )
+    if early_owed is not None:
+        from elspeth.web.sessions.continuation_checkpoint_early_return import (
+            VerifiedEarlyCompleteReturn,
+            read_early_overflow_return_history_on_connection,
+        )
+
+        # Only the independently proved EARLY H arm supplies this DATA. Re-read
+        # it here as well: a constructible DTO cannot waive the status rule.
+        if (
+            type(early_owed) is not VerifiedEarlyCompleteReturn
+            or type(receipt) is not PaidOverflowReceipt
+            or early_owed.source.phase != "early"
+            or early_owed.source.kind != "iteration_early"
+            or early_owed.attempt_id != attempt_id
+            or early_owed.new_hold != source
+            or receipt.representation != "retained_tail"
+        ):
+            raise AuditIntegrityError("EARLY owed public audit lacks its exact original H source")
+        hold_state = conn.execute(
+            select(holds.c.state).where(
+                holds.c.session_id == source.session_id,
+                holds.c.operation_id == source.operation_id,
+                holds.c.effect_key == source.effect_key,
+            )
+        ).scalar_one()
+        if hold_state not in ("active", "consumed"):
+            raise AuditIntegrityError("EARLY owed public audit lost its original hold state")
+        fresh = read_early_overflow_return_history_on_connection(
+            conn,
+            session_id=source.session_id,
+            operation_id=source.operation_id,
+            selected=early_owed.selected,
+            names=early_owed.source.env_ref_names,
+            hold_state="active" if hold_state == "active" else "consumed",
+        )
+        if fresh != early_owed or llm_call_audit_envelope(call) != llm_call_audit_envelope(fresh.call):
+            raise AuditIntegrityError("EARLY owed public audit changed its full original public projection")
     # SQLite's database clock records whole seconds; the physical audit keeps
     # microseconds. Compare the audit finish at SQLite's stored precision while
     # retaining the original timestamp and exact PostgreSQL ordering.
@@ -101,7 +145,10 @@ def require_checkpoint_paid_public_audit_on_connection(
         ):
             raise AuditIntegrityError("checkpoint paid incomplete changed its original malformed audit")
     elif type(receipt) is PaidOverflowReceipt:
-        if call.status is not ComposerLLMCallStatus.SUCCESS or call.error_class is not None or call.error_message is not None:
+        if early_owed is not None:
+            if call.status not in (ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.MALFORMED_RESPONSE):
+                raise AuditIntegrityError("EARLY owed overflow changed its original returned audit")
+        elif call.status is not ComposerLLMCallStatus.SUCCESS or call.error_class is not None or call.error_message is not None:
             raise AuditIntegrityError("checkpoint paid overflow changed its original successful audit")
     else:
         raise AuditIntegrityError("checkpoint paid audit crossed terminal receipt types")

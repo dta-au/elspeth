@@ -68,22 +68,30 @@ async def test_real_complete_shelf_uses_one_locked_family_window_without_changin
     else:
         case = await cases.failure_current_case(operation_store)
     connections = []
+    current_connections = []
     original = families._read_current_sources
+    original_current = families.require_current_env_inventory_on_connection
 
     def observe(conn, **kwargs):
         assert conn.in_transaction()
         connections.append(conn)
         return original(conn, **kwargs)
 
+    def observe_current(conn, *args, **kwargs):
+        assert conn.in_transaction()
+        current_connections.append(conn)
+        return original_current(conn, *args, **kwargs)
+
     monkeypatch.setattr(families, "_read_current_sources", observe)
+    monkeypatch.setattr(families, "require_current_env_inventory_on_connection", observe_current)
     try:
         await renew(operation_store, case)
         production = await cases.restore_case(operation_store, case)
         assert detach_prompt_guard_evidence(production.messages) == detach_prompt_guard_evidence(case["original_messages"])
         # Failure policy acquisition performs one separate original current
         # read before invoking the real snapshot supplier outside the lock.
-        assert len(connections) == (3 if family == "failure" else 2)
-        assert connections[-2] is connections[-1]
+        assert len(connections) == (2 if family == "failure" else 1)
+        assert len(current_connections) == 1 and current_connections[0] is connections[-1]
         assert all(not conn.in_transaction() for conn in connections)
         # Every interned message, including observed history, is rebuilt and
         # re-registered at its actual slot; current_indexes only selects output.
@@ -99,23 +107,32 @@ async def test_repeated_actual_recipe_has_distinct_messages_and_no_cross_call_so
     owner = current_families(case)
     request = native_request(case)
     original = families._read_current_sources
+    original_current = families.require_current_env_inventory_on_connection
     connections = []
+    current_connections = []
 
     def observe(conn, **kwargs):
         connections.append(conn)
         return original(conn, **kwargs)
 
+    def observe_current(conn, *args, **kwargs):
+        assert conn.in_transaction()
+        current_connections.append(conn)
+        return original_current(conn, *args, **kwargs)
+
     monkeypatch.setattr(families, "_read_current_sources", observe)
+    monkeypatch.setattr(families, "require_current_env_inventory_on_connection", observe_current)
     try:
         await renew(operation_store, case)
         before = stored_rows(operation_store[0])
         first = await asyncio.to_thread(owner.restore_messages, (request, request))
         assert first[0] is not first[1]
         assert detach_prompt_guard_evidence([first[0]]) == detach_prompt_guard_evidence([first[1]])
-        assert len(connections) == 2 and connections[0] is connections[1]
+        assert len(connections) == 1 and len(current_connections) == 1 and connections[0] is current_connections[0]
         second = await asyncio.to_thread(owner.restore_messages, (request,))
         assert second[0] is not first[0]
-        assert len(connections) == 4 and connections[2] is connections[3] and connections[2] is not connections[0]
+        assert len(connections) == 2 and len(current_connections) == 2
+        assert connections[1] is current_connections[1] and connections[1] is not connections[0]
         assert stored_rows(operation_store[0]) == before
     finally:
         operation_store[1].release(case["kwargs"]["inventory"].running.session_operation_context)
@@ -127,12 +144,19 @@ async def test_final_actual_current_read_refuses_stop_inside_the_same_transactio
     owner = current_families(case)
     request = native_request(case)
     original_read = families._read_current_sources
+    original_current = families.require_current_env_inventory_on_connection
     original_build = families.rebuild_native_message
     connections = []
+    current_connections = []
 
     def observe(conn, **kwargs):
         connections.append(conn)
         return original_read(conn, **kwargs)
+
+    def observe_current(conn, *args, **kwargs):
+        assert conn.in_transaction()
+        current_connections.append(conn)
+        return original_current(conn, *args, **kwargs)
 
     def stop_after_build(**kwargs):
         message = original_build(**kwargs)
@@ -151,10 +175,11 @@ async def test_final_actual_current_read_refuses_stop_inside_the_same_transactio
         await renew(operation_store, case)
         before = stored_rows(operation_store[0])
         monkeypatch.setattr(families, "_read_current_sources", observe)
+        monkeypatch.setattr(families, "require_current_env_inventory_on_connection", observe_current)
         monkeypatch.setattr(families, "rebuild_native_message", stop_after_build)
         with pytest.raises(ComposerOperationCancelledDuringTurn):
             await asyncio.to_thread(owner.restore_messages, (request,))
-        assert len(connections) == 2 and connections[0] is connections[1]
+        assert len(connections) == 1 and len(current_connections) == 1 and connections[0] is current_connections[0]
         # The deliberate in-transaction mutation rolls back with original Stop.
         assert stored_rows(operation_store[0]) == before
     finally:

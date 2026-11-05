@@ -20,8 +20,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, TypeGuard
 
-import rfc8785
-
+from elspeth.contracts._canonical_json_writer import _dumps
 from elspeth.contracts.trust_boundary import trust_boundary
 
 # Version string stored with every run for hash verification.
@@ -45,6 +44,13 @@ def _normalize_frozen_and_reject_non_finite(obj: Any) -> Any:
     - Rejects NaN/Infinity with ``ValueError``
     - Returns the normalized structure ready for ``rfc8785.dumps()``
     """
+    kind = type(obj)
+    if kind is str or kind is int or kind is bool or obj is None:
+        return obj
+    if kind is dict:
+        return {k: _normalize_frozen_and_reject_non_finite(v) for k, v in obj.items()}
+    if kind is list or kind is tuple:
+        return [_normalize_frozen_and_reject_non_finite(item) for item in obj]
     if isinstance(obj, float):
         if math.isnan(obj):
             raise ValueError(f"Cannot canonicalize NaN. Use None for missing values, not NaN. Got: {obj!r}")
@@ -83,7 +89,7 @@ def canonical_json(obj: Any) -> str:
         TypeError: If data contains frozenset or other non-serializable types
     """
     normalized = _normalize_frozen_and_reject_non_finite(obj)
-    result: bytes = rfc8785.dumps(normalized)
+    result = _dumps(normalized)
     return result.decode("utf-8")
 
 

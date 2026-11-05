@@ -54,7 +54,9 @@ async def _projection_case(operation_store, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("alias", ("runtime", "live", "recorder", "messages", "evidence", "anti_anchor", "materialization", "graph"))
+@pytest.mark.parametrize(
+    "alias", ("runtime", "live", "recorder", "messages", "message", "evidence", "anti_anchor", "materialization", "graph")
+)
 async def test_checkpoint_detached_source_rejects_original_mutable_alias(operation_store, tmp_path, monkeypatch, alias):
     original, detached, work = await _projection_case(operation_store, tmp_path, monkeypatch)
     before = original.live.recorder.snapshot_for_continuation(drained=original.drained)
@@ -66,6 +68,10 @@ async def test_checkpoint_detached_source_rejects_original_mutable_alias(operati
         changed = replace(detached, live=replace(detached.live, recorder=original.live.recorder))
     elif alias == "messages":
         changed = replace(detached, live=replace(detached.live, llm_messages=original.live.llm_messages))
+    elif alias == "message":
+        messages = list(detached.live.llm_messages)
+        messages[0] = original.live.llm_messages[0]
+        changed = replace(detached, live=replace(detached.live, llm_messages=messages))
     elif alias == "evidence":
         changed = replace(detached, live=replace(detached.live, turn_evidence=original.live.turn_evidence))
     elif alias == "anti_anchor":

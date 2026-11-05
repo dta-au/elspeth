@@ -16,7 +16,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import Context, ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256 as _TRUSTED_SHA256
 from sys import getsizeof
 from threading import Lock
@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.credential_material import (
     CREDENTIAL_DETECTOR_VERSION,
+    CredentialCategory,
     CredentialMaterialFinding,
     CredentialTraversalPolicy,
     find_credential_material,
@@ -141,6 +142,12 @@ class _RecorderRequestTextEntry:
     retained_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class _CredentialStringEntry:
+    category: CredentialCategory | None
+    retained_bytes: int
+
+
 type CredentialInputKind = Literal["null", "bool", "int", "float", "string", "mapping", "mapping_proxy", "list", "tuple", "end"]
 
 
@@ -187,7 +194,7 @@ type CredentialDetector = Callable[[object, CredentialTraversalPolicy], Credenti
 @dataclass(frozen=True, slots=True)
 class CredentialScanKey:
     scanner_role: CredentialScannerRole
-    surface: str
+    surface: str = field(compare=False)
     content: tuple[CredentialInputToken, ...]
     policy: CredentialPolicyKey
     detector: CredentialDetector = find_credential_material
@@ -302,6 +309,10 @@ class RetentionStageMemo:
             _RecorderRequestTextEntry,
         ] = OrderedDict()
         self._v4_recorder_request_bytes = 0
+        self._credential_strings: OrderedDict[tuple[Callable[[str], CredentialCategory | None], str], _CredentialStringEntry] = (
+            OrderedDict()
+        )
+        self._credential_string_bytes = 0
         self._recorder_request: (
             tuple[Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None], RecorderRequestTextKey, RecorderRequestTextProof]
             | None
@@ -332,6 +343,7 @@ class RetentionStageMemo:
                 + len(self._canonical_verifications)
                 + len(self._recorder_block_hashes)
                 + len(self._v4_recorder_requests)
+                + len(self._credential_strings)
                 + int(self._recorder_request is not None)
             )
 
@@ -349,6 +361,8 @@ class RetentionStageMemo:
             self._recorder_block_hash_bytes = 0
             self._v4_recorder_requests.clear()
             self._v4_recorder_request_bytes = 0
+            self._credential_strings.clear()
+            self._credential_string_bytes = 0
             self._recorder_request = None
             self._credentials.clear()
             self._states.clear()
@@ -416,6 +430,8 @@ class RetentionStageMemo:
                 self._recorder_block_hash_bytes = 0
                 self._v4_recorder_requests.clear()
                 self._v4_recorder_request_bytes = 0
+                self._credential_strings.clear()
+                self._credential_string_bytes = 0
                 self._canonical_text = (producer, key, value)
         return value
 
@@ -489,6 +505,7 @@ class RetentionStageMemo:
                 + self._canonical_verification_bytes
                 + self._recorder_block_hash_bytes
                 + self._v4_recorder_request_bytes
+                + self._credential_string_bytes
                 + size
                 > self._shared_text_budget_bytes
             ):
@@ -498,9 +515,12 @@ class RetentionStageMemo:
                 elif self._recorder_block_hashes:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
-                else:
+                elif self._v4_recorder_requests:
                     _, evicted_request = self._v4_recorder_requests.popitem(last=False)
                     self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                else:
+                    _, evicted_category = self._credential_strings.popitem(last=False)
+                    self._credential_string_bytes -= evicted_category.retained_bytes
             self._canonical_proofs[cache_key] = proof
             self._canonical_proof_bytes += size
         return proof
@@ -553,6 +573,7 @@ class RetentionStageMemo:
                 + self._canonical_verification_bytes
                 + self._recorder_block_hash_bytes
                 + self._v4_recorder_request_bytes
+                + self._credential_string_bytes
                 + size
                 > self._shared_text_budget_bytes
             ):
@@ -565,9 +586,12 @@ class RetentionStageMemo:
                 elif self._recorder_block_hashes:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
-                else:
+                elif self._v4_recorder_requests:
                     _, evicted_request = self._v4_recorder_requests.popitem(last=False)
                     self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                else:
+                    _, evicted_category = self._credential_strings.popitem(last=False)
+                    self._credential_string_bytes -= evicted_category.retained_bytes
             self._canonical_verifications[cache_key] = size
             self._canonical_verification_bytes += size
 
@@ -600,6 +624,7 @@ class RetentionStageMemo:
                 + self._canonical_verification_bytes
                 + self._recorder_block_hash_bytes
                 + self._v4_recorder_request_bytes
+                + self._credential_string_bytes
                 + size
                 > self._shared_text_budget_bytes
             ):
@@ -612,9 +637,12 @@ class RetentionStageMemo:
                 elif self._canonical_proofs:
                     _, evicted_proof = self._canonical_proofs.popitem(last=False)
                     self._canonical_proof_bytes -= evicted_proof.retained_bytes
-                else:
+                elif self._v4_recorder_requests:
                     _, evicted_request = self._v4_recorder_requests.popitem(last=False)
                     self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                else:
+                    _, evicted_category = self._credential_strings.popitem(last=False)
+                    self._credential_string_bytes -= evicted_category.retained_bytes
             self._recorder_block_hashes[cache_key] = size
             self._recorder_block_hash_bytes += size
 
@@ -687,6 +715,7 @@ class RetentionStageMemo:
                 + self._canonical_verification_bytes
                 + self._recorder_block_hash_bytes
                 + self._v4_recorder_request_bytes
+                + self._credential_string_bytes
                 + entry.retained_bytes
                 > self._shared_text_budget_bytes
             ):
@@ -699,9 +728,12 @@ class RetentionStageMemo:
                 elif self._canonical_proofs:
                     _, evicted_proof = self._canonical_proofs.popitem(last=False)
                     self._canonical_proof_bytes -= evicted_proof.retained_bytes
-                else:
+                elif self._recorder_block_hashes:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
+                else:
+                    _, evicted_category = self._credential_strings.popitem(last=False)
+                    self._credential_string_bytes -= evicted_category.retained_bytes
             self._v4_recorder_requests[cache_key] = entry
             self._v4_recorder_request_bytes += entry.retained_bytes
         return value
@@ -752,6 +784,82 @@ class RetentionStageMemo:
                     return entry[2]
                 self._recorder_request = (producer, key, value)
         return value
+
+    def credential_string_category(self, text: str, classifier: Callable[[str], CredentialCategory | None]) -> CredentialCategory | None:
+        """Pure category only; traversal policy and finding location stay fresh."""
+        if type(text) is not str:
+            raise TypeError("Credential text memo requires exact immutable text")
+        _require_function_producer(classifier)
+        with self._lock:
+            parent = self._text_parent if not self._closed else None
+        if parent is not None:
+            return parent.credential_string_category(text, classifier)
+        cache_key = (classifier, text)
+        with self._lock:
+            hit = self._credential_strings.get(cache_key) if not self._closed else None
+            if hit is not None:
+                self._credential_strings.move_to_end(cache_key)
+                return hit.category
+        result_classifier: Callable[[str], object] = classifier
+        result = result_classifier(text)
+        if result is not None and (
+            type(result) is not str
+            or result
+            not in (
+                "credential_field",
+                "token_shape",
+                "private_key",
+                "credential_url",
+                "sensitive_url_parameter",
+                "traversal_limit",
+                "unsupported_value",
+            )
+        ):
+            raise TypeError("Credential text memo requires a value-free category")
+        category = cast(CredentialCategory | None, result)
+        text_bytes = utf8_size(text, errors="replace", limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+        entry = _CredentialStringEntry(category, 0)
+        size = text_bytes + (len(category) if category is not None else 0) + getsizeof(cache_key) + getsizeof(entry)
+        entry = _CredentialStringEntry(category, size)
+        with self._lock:
+            if self._closed or size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+                return category
+            hit = self._credential_strings.get(cache_key)
+            if hit is not None:
+                self._credential_strings.move_to_end(cache_key)
+                return hit.category
+            self._canonical_text = None
+            while (
+                self._canonical_proof_bytes
+                + self._canonical_verification_bytes
+                + self._recorder_block_hash_bytes
+                + self._v4_recorder_request_bytes
+                + self._credential_string_bytes
+                + size
+                > self._shared_text_budget_bytes
+            ):
+                if self._credential_strings:
+                    _, evicted_category = self._credential_strings.popitem(last=False)
+                    self._credential_string_bytes -= evicted_category.retained_bytes
+                elif self._canonical_verifications:
+                    _, evicted_size = self._canonical_verifications.popitem(last=False)
+                    self._canonical_verification_bytes -= evicted_size
+                elif self._canonical_proofs:
+                    _, evicted_proof = self._canonical_proofs.popitem(last=False)
+                    self._canonical_proof_bytes -= evicted_proof.retained_bytes
+                elif self._recorder_block_hashes:
+                    _, evicted_size = self._recorder_block_hashes.popitem(last=False)
+                    self._recorder_block_hash_bytes -= evicted_size
+                else:
+                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
+                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+            self._credential_strings[cache_key] = entry
+            self._credential_string_bytes += size
+        return category
+
+    @property
+    def caches_credential_inputs(self) -> bool:
+        return self._legacy_advisor_owner is None and self._v4_preparation_owner is None
 
     def credential(
         self, key: CredentialScanKey, producer: Callable[[CredentialScanKey], CredentialMaterialFinding | None]

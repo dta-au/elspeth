@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy import Connection, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness
 from elspeth.web.composer.continuation_checkpoint_observation import (
     CheckpointIncompleteResponseObservation,
     CheckpointOverflowUsageObservation,
@@ -14,8 +15,15 @@ from elspeth.web.composer.continuation_checkpoint_observation import (
     original_v4_checkpoint_returned_audit_call,
     require_original_v4_checkpoint_returned_response,
 )
+from elspeth.web.composer.continuation_checkpoint_projection import (
+    ProjectedEarlyCheckpointOverflow,
+    require_original_early_checkpoint_overflow,
+)
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
-from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_limits import (
+    CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES,
+    CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+)
 from elspeth.web.composer.provider_audit_source import capture_provider_audit_source
 from elspeth.web.coordination.composer_operation_authority import _terminal_values
 from elspeth.web.coordination.database_clock import database_now
@@ -73,16 +81,40 @@ def _receipt(
     observation: CheckpointIncompleteResponseObservation | CheckpointReturnedResponseObservation,
     observed_at: datetime,
     overflow: ContinuationRetainedCapacityExceeded | None,
+    projected_witness: ContinuationCaptureOverflowWitness | None = None,
 ) -> PaidOverflowReceipt:
     if type(observation) is CheckpointReturnedResponseObservation:
-        if (
-            type(overflow) is not ContinuationRetainedCapacityExceeded
-            or overflow.observed_bytes <= overflow.limit_bytes
-            or overflow.limit_bytes > CANONICAL_INTEGER_MAX - 1
-            or observation.phase != admission.original_source.phase
-            or observation.attempt is not admission.attempt
-        ):
-            raise AuditIntegrityError("checkpoint complete response lacks its original measured pre-H capacity refusal")
+        if projected_witness is None:
+            if (
+                type(overflow) is not ContinuationRetainedCapacityExceeded
+                or overflow.observed_bytes <= overflow.limit_bytes
+                or overflow.limit_bytes > CANONICAL_INTEGER_MAX - 1
+                or observation.phase != admission.original_source.phase
+                or observation.attempt is not admission.attempt
+            ):
+                raise AuditIntegrityError("checkpoint complete response lacks its original measured pre-H capacity refusal")
+            measured_bytes, limit_bytes = overflow.observed_bytes, overflow.limit_bytes
+            exact = True
+        else:
+            if (
+                type(projected_witness) is not ContinuationCaptureOverflowWitness
+                or overflow is not None
+                or observation.phase != "early"
+                or admission.original_source.phase != "early"
+                or observation.attempt is not admission.attempt
+                or projected_witness.observed_bytes <= projected_witness.limit_bytes
+                or (
+                    projected_witness.unit == "private_chunk"
+                    and projected_witness.limit_bytes != CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+                )
+                or (
+                    projected_witness.unit == "evidence_pair" and projected_witness.limit_bytes != CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES
+                )
+                or projected_witness.unit not in ("private_chunk", "evidence_pair")
+            ):
+                raise AuditIntegrityError("EARLY projected overflow lost its sink-verified capture measurement")
+            measured_bytes, limit_bytes = projected_witness.observed_bytes, projected_witness.limit_bytes
+            exact = projected_witness.size_is_exact
         call = original_v4_checkpoint_returned_audit_call(
             observation, attempt_id=admission.attempt.attempt_id, request_sha256=admission.hold.source_input_sha256
         )
@@ -125,20 +157,27 @@ def _receipt(
             outcome="terminal_paid_overflow",
             evidence_status="incomplete",
             retryable=False,
-            reason="retained_payload_bytes",
-            representation="response",
-            measurement="exact" if overflow.observed_bytes <= CANONICAL_INTEGER_MAX else "at_least",
-            observed_bytes=min(
-                overflow.observed_bytes,
-                overflow.limit_bytes + 1 if overflow.observed_bytes > CANONICAL_INTEGER_MAX else CANONICAL_INTEGER_MAX,
+            reason=(
+                "retained_payload_bytes"
+                if projected_witness is None
+                else "private_document_bytes"
+                if projected_witness.unit == "private_chunk"
+                else "evidence_pair_bytes"
             ),
-            limit_bytes=overflow.limit_bytes,
+            representation="response" if projected_witness is None else "retained_tail",
+            measurement="exact" if exact and measured_bytes <= CANONICAL_INTEGER_MAX else "at_least",
+            observed_bytes=min(
+                measured_bytes,
+                limit_bytes + 1 if measured_bytes > CANONICAL_INTEGER_MAX else CANONICAL_INTEGER_MAX,
+            ),
+            limit_bytes=limit_bytes,
             cost=cost,
             usage=measured_usage,
         )
     if (
         type(observation) is not CheckpointIncompleteResponseObservation
         or overflow is not None
+        or projected_witness is not None
         or type(observation.usage) is not CheckpointOverflowUsageObservation
         or observation.phase != admission.original_source.phase
         or observation.attempt_id != admission.attempt.attempt_id
@@ -204,6 +243,7 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
     admission: V4CheckpointProviderAdmission,
     observation: CheckpointIncompleteResponseObservation | CheckpointReturnedResponseObservation,
     overflow: ContinuationRetainedCapacityExceeded | None = None,
+    projected_early: ProjectedEarlyCheckpointOverflow | None = None,
 ) -> VerifiedCheckpointPaidOverflowTerminal:
     """Commit child receipt, outer unknowns, failed parent, ledger and H once."""
     if (
@@ -217,6 +257,19 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
         )
     ):
         raise AuditIntegrityError("checkpoint overflow changed its original paid invocation")
+    projected_witness = None
+    if projected_early is not None:
+        if (
+            type(projected_early) is not ProjectedEarlyCheckpointOverflow
+            or type(observation) is not CheckpointReturnedResponseObservation
+            or prepared.prepared_source.phase != "early"
+            or observation.phase != "early"
+            or overflow is not None
+        ):
+            raise AuditIntegrityError("EARLY projected overflow requires its original complete EARLY projection")
+        projected_witness = require_original_early_checkpoint_overflow(
+            projected_early, prepared=prepared, admission=admission, returned=observation
+        )
     require_original_v4_checkpoint_returned_response(
         observation,
         attempt_id=admission.attempt.attempt_id,
@@ -269,7 +322,7 @@ def settle_v4_checkpoint_returned_overflow_on_connection(
     observed_at = database_now(conn)
     if observed_at < restore_utc(physical_row.started_at):
         raise AuditIntegrityError("checkpoint overflow observation predates its original paid admission")
-    receipt = _receipt(admission, observation, observed_at, overflow)
+    receipt = _receipt(admission, observation, observed_at, overflow, projected_witness)
     cohort = checkpoint_paid_audit_cohort(call, running.session_operation_context)
     batch = build_checkpoint_paid_overflow_tail_batch(
         admission.paid_tail, receipt=receipt, published_at=observed_at, private_audit_sha256=cohort.private_sha256

@@ -223,6 +223,11 @@ def prepared_p4_members(value: PreparedP4Value, *, env_ref_names: frozenset[str]
         raise TypeError("P4 decode requires its complete owned value")
     # Revalidate even model_construct/model_copy inputs before reading fields.
     value = _decode_owned(_P4_VALUE, canonical_json(value.model_dump(mode="json", warnings="error")))
+    return _decoded_prepared_p4_members(value, env_ref_names=env_ref_names)
+
+
+def _decoded_prepared_p4_members(value: PreparedP4Value, *, env_ref_names: frozenset[str]) -> PreparedP4Members:
+    """Admit members of the value just strictly decoded by this module."""
     require_no_credential_material(
         {
             "session_id": value.session_id,
@@ -556,7 +561,7 @@ def _decode_prepared_p4_with_members(
 ) -> tuple[PreparedP4Value, PreparedP4Members]:
     """Return this decode's complete member admission for immediate use."""
     value = _decode_owned(_P4_VALUE, encoded)
-    members = prepared_p4_members(value, env_ref_names=env_ref_names)
+    members = _decoded_prepared_p4_members(value, env_ref_names=env_ref_names)
     return value, members
 
 

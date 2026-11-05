@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
 
 from elspeth.contracts import _canonical_json_native as native_json
+from elspeth.contracts import _canonical_json_writer as canonical_writer
 from elspeth.contracts import hashing, json_parser
 from elspeth.contracts._canonical_json_native import canonical_json_native_strings
 from elspeth.contracts.composer_audit import ComposerToolInvocation
@@ -20,7 +21,6 @@ from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer._compose_loop_carriers import _ToolOutcome
 from elspeth.web.composer.audit import _normalize_audit_payload
 from elspeth.web.composer.continuation_codec import owned_json
-from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_result_credentials import restore_retained_plugin_schema_data
 from elspeth.web.composer.discovery_response import admit_discovery_result, require_discovery_result_data
 from elspeth.web.composer.response_contracts import ResponseContract
@@ -29,12 +29,6 @@ from elspeth.web.composer.tool_result_envelope import ValidationGuidance
 from elspeth.web.composer.tools._common import AppliedComponentEcho, ToolResult
 from elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA_RESPONSE_CONTRACT
 from elspeth.web.composer.tools._registry import ASYNC_TOOL_EFFECTS, response_contract_for
-from elspeth.web.continuation_retention_memo import (
-    CanonicalTextVerificationDependencies,
-    CanonicalTextVerificationKey,
-    current_retention_stage_memo,
-    current_v4_preparation_memo,
-)
 from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.execution.schemas import ValidationResult
 
@@ -77,15 +71,15 @@ def _tool_canonical_references() -> tuple[object, ...]:
         json_parser.__dict__["json"].loads,
         json_parser._reject_duplicate_keys,
         json_parser._reject_non_finite,
-        native_json.canonical_json_native_strings,
         native_json.__dict__["_normalize_frozen_and_reject_non_finite"],
         hashing._normalize_frozen_and_reject_non_finite,
         hashing.__dict__["math"].isnan,
         hashing.__dict__["math"].isinf,
-        native_json._write,
-        native_json._native_string_bytes,
-        native_json.__dict__["encode_basestring"],
-        native_json.__dict__["rfc8785"].dump,
+        native_json._dumps,
+        canonical_writer._write,
+        canonical_writer._native_string_bytes,
+        canonical_writer.__dict__["encode_basestring"],
+        canonical_writer.__dict__["rfc8785"].dump,
         _verify_tool_canonical_text,
         _tool_canonical_dependencies_current,
     )
@@ -95,8 +89,8 @@ def _tool_canonical_dependencies_current() -> bool:
     try:
         if (
             _tool_canonical_references is not _ORIGINAL_TOOL_REFERENCE_READER
-            or native_json.__dict__["BytesIO"] is not _ORIGINAL_NATIVE_BYTES_IO
-            or native_json.__dict__["rfc8785"] is not _ORIGINAL_NATIVE_RFC
+            or canonical_writer.__dict__["BytesIO"] is not _ORIGINAL_NATIVE_BYTES_IO
+            or canonical_writer.__dict__["rfc8785"] is not _ORIGINAL_NATIVE_RFC
         ):
             return False
         references = _ORIGINAL_TOOL_REFERENCE_READER()
@@ -128,44 +122,14 @@ _ORIGINAL_TOOL_PARSER = parse_json_strict
 _ORIGINAL_TOOL_RENDERER = canonical_json_native_strings
 _ORIGINAL_TOOL_REFERENCE_READER = _tool_canonical_references
 _ORIGINAL_TOOL_DEPENDENCIES_CURRENT = _tool_canonical_dependencies_current
-_ORIGINAL_NATIVE_BYTES_IO = native_json.__dict__["BytesIO"]
-_ORIGINAL_NATIVE_RFC = native_json.__dict__["rfc8785"]
+_ORIGINAL_NATIVE_BYTES_IO = canonical_writer.__dict__["BytesIO"]
+_ORIGINAL_NATIVE_RFC = canonical_writer.__dict__["rfc8785"]
 _ORIGINAL_TOOL_REFERENCES = _tool_canonical_references()
 
 
 def _read_json_value(encoded: str) -> JsonValue:
-    parser = parse_json_strict
-    parent = current_v4_preparation_memo()
-    original_implementations = parent is not None and parser is _ORIGINAL_TOOL_PARSER and _ORIGINAL_TOOL_DEPENDENCIES_CURRENT()
-    value, error = parser(encoded)
-    if error is not None:
-        raise AuditIntegrityError("tool continuation value is not complete canonical JSON")
-    if (
-        original_implementations
-        and type(encoded) is str
-        and len(encoded) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
-        and _ORIGINAL_TOOL_DEPENDENCIES_CURRENT()
-        and current_v4_preparation_memo() is parent
-    ):
-        memo = current_retention_stage_memo()
-        if memo is not None:
-            dependencies = CanonicalTextVerificationDependencies(_ORIGINAL_TOOL_REFERENCES, _ORIGINAL_TOOL_DEPENDENCIES_CURRENT)
-            try:
-                memo.canonical_text_verification(
-                    CanonicalTextVerificationKey(encoded, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, dependencies),
-                    _verify_tool_canonical_text,
-                )
-            except _ToolCanonicalImplementationChangedError:
-                pass
-            except Exception:
-                if _ORIGINAL_TOOL_DEPENDENCIES_CURRENT():
-                    raise
-            else:
-                if _ORIGINAL_TOOL_DEPENDENCIES_CURRENT():
-                    return owned_json(value)
-    # Also used after an interrupted proof, OUTSIDE its exception handler:
-    # compare the actual first parsed graph using the actual current renderer.
-    if canonical_json_native_strings(value) != encoded:
+    value, error = parse_json_strict(encoded)
+    if error is not None or canonical_json_native_strings(value) != encoded:
         raise AuditIntegrityError("tool continuation value is not complete canonical JSON")
     return owned_json(value)
 

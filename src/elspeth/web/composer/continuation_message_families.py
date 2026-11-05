@@ -15,7 +15,10 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import ComposeFrame, EffectFrontierEntry, PrivateChunkRef, ToolBatchFrame
 from elspeth.web.composer.continuation_codec import PrivateChunk, RetainedCompletion, decode_continuation_response, verify_private_chunk
-from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
+from elspeth.web.composer.continuation_env_inventory import (
+    CurrentContinuationEnvInventory,
+    require_current_env_inventory_on_connection,
+)
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_message_family_builders import (
     failure_schema_message,
@@ -1129,6 +1132,18 @@ class CurrentContinuationMessageFamilies:
                 if family_message_wire(message) != text:
                     raise AuditIntegrityError("family cohort producer differs from complete original selected wire")
                 messages.append(message)
+            if self.finish_read is None:
+                # These builders consume admitted DATA while this transaction
+                # excludes session writers. Only time/current authority can
+                # change here; do not rebuild the same historical proof.
+                require_current_env_inventory_on_connection(
+                    conn,
+                    self.inventory.running,
+                    inventory=self.inventory,
+                    expected_checkpoint_id=self.selected.checkpoint_id,
+                    expected_cursor=self.selected.stack.cursor,
+                )
+                return _RestoredFamilyCohort(tuple(messages), tuple(feedback), before.tool_feedback)
             after = _read_current_sources(conn, selected=self.selected, inventory=self.inventory, finish_read=self.finish_read)
             # Both are actual full readers. Equality does not grant admission;
             # it binds their complete selected cohorts across pure rebuilding.

@@ -9,6 +9,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, select
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
@@ -19,7 +20,10 @@ from elspeth.web.sessions.composer_operations import (
     composer_operation_result_hash,
 )
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, load_snapshot
-from elspeth.web.sessions.continuation_checkpoint_end_owed import read_v4_checkpoint_end_settled_owed_history_on_connection
+from elspeth.web.sessions.continuation_checkpoint_end_owed import (
+    VerifiedCheckpointEndOwed,
+    read_v4_checkpoint_end_settled_owed_history_on_connection,
+)
 from elspeth.web.sessions.continuation_checkpoint_paid_audit import require_checkpoint_paid_public_audit_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_incomplete_tail import (
     CheckpointPaidIncompleteTailBatch,
@@ -223,10 +227,17 @@ def _read_v4_checkpoint_terminal_on_connection(
         early_input=replay.early_input,
     )
     effective_admitted = admitted
+    private_audit_incomplete = disposition == "paid_incomplete"
+    early_owed_source = None
     plan: CheckpointPaidOverflowTailPlan | CheckpointPaidIncompleteTailPlan
     if post_h:
-        if disposition != "paid_overflow" or replay.phase != "end" or type(names) is not frozenset:
-            raise AuditIntegrityError("post-H checkpoint overflow requires its actual END inventory")
+        from elspeth.web.sessions.continuation_checkpoint_early_return import (
+            VerifiedEarlyCompleteReturn,
+            read_early_overflow_return_history_on_connection,
+        )
+
+        if disposition != "paid_overflow" or replay.phase not in ("early", "end") or type(names) is not frozenset:
+            raise AuditIntegrityError("post-H checkpoint overflow requires its actual phase and inventory")
         owed_row = conn.execute(
             select(checkpoints.c.checkpoint_id).where(
                 checkpoints.c.session_id == sid,
@@ -236,16 +247,29 @@ def _read_v4_checkpoint_terminal_on_connection(
         ).one_or_none()
         if owed_row is None:
             raise AuditIntegrityError("post-H checkpoint overflow lost its complete returned head")
-        owed = read_v4_checkpoint_end_settled_owed_history_on_connection(
-            conn,
-            session_id=sid,
-            operation_id=operation_id,
-            attempt_id=identity.attempt_id,
-            owed_checkpoint_id=owed_row.checkpoint_id,
-            names=names,
-            child_disposition="paid_overflow",
-            hold_state=post_h_hold_state,
-        )
+        owed: VerifiedEarlyCompleteReturn | VerifiedCheckpointEndOwed
+        if replay.phase == "early":
+            owed = read_early_overflow_return_history_on_connection(
+                conn,
+                session_id=sid,
+                operation_id=operation_id,
+                selected=_checkpoint_at(conn, source, owed_row.checkpoint_id),
+                names=names,
+                hold_state=post_h_hold_state,
+            )
+            private_audit_incomplete = owed.call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE
+            early_owed_source = owed
+        else:
+            owed = read_v4_checkpoint_end_settled_owed_history_on_connection(
+                conn,
+                session_id=sid,
+                operation_id=operation_id,
+                attempt_id=identity.attempt_id,
+                owed_checkpoint_id=owed_row.checkpoint_id,
+                names=names,
+                child_disposition="paid_overflow",
+                hold_state=post_h_hold_state,
+            )
         overflow_receipt = receipt
         if (
             owed.original_selected != admitted
@@ -285,11 +309,16 @@ def _read_v4_checkpoint_terminal_on_connection(
         batch = build_checkpoint_paid_overflow_tail_batch(
             plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at), private_audit_sha256=private_audit_sha256
         )
-        expected_error = (
-            checkpoint_end_owed_overflow_error(parent.request_id, receipt.cost)
-            if post_h
-            else checkpoint_paid_overflow_error(parent.request_id, receipt.cost)
-        )
+        if post_h and replay.phase == "early":
+            from elspeth.web.sessions.continuation_checkpoint_early_owed_overflow import checkpoint_early_owed_overflow_error
+
+            expected_error = checkpoint_early_owed_overflow_error(parent.request_id, receipt.cost)
+        else:
+            expected_error = (
+                checkpoint_end_owed_overflow_error(parent.request_id, receipt.cost)
+                if post_h
+                else checkpoint_paid_overflow_error(parent.request_id, receipt.cost)
+            )
     elif type(plan) is CheckpointPaidIncompleteTailPlan and type(receipt) is PaidIncompleteReceipt:
         batch = build_checkpoint_paid_incomplete_tail_batch(
             plan, receipt=receipt, published_at=restore_utc(terminal_row.created_at), private_audit_sha256=private_audit_sha256
@@ -389,20 +418,21 @@ def _read_v4_checkpoint_terminal_on_connection(
         physical_settled_at=physical_row.settled_at,
         response_finished_at=effect.response_finished_at,
         receipt=receipt,
+        early_owed=early_owed_source,
     )
     require_checkpoint_paid_private_audit_on_connection(
         conn,
         source=source,
         attempt_id=identity.attempt_id,
         private_sha256=private_audit_sha256,
-        incomplete=disposition == "paid_incomplete",
+        incomplete=private_audit_incomplete,
     )
     segment = conn.execute(
         select(segments).where(
             segments.c.session_id == sid, segments.c.operation_id == operation_id, segments.c.sequence == source.creator_sequence
         )
     ).one()
-    settled_generation = parent.ownership_generation if post_h else source.creator_generation
+    settled_generation = parent.ownership_generation if post_h and replay.phase == "end" else source.creator_generation
     history = conn.execute(
         select(attempts).where(
             attempts.c.session_id == sid,
@@ -411,9 +441,11 @@ def _read_v4_checkpoint_terminal_on_connection(
             attempts.c.generation == settled_generation,
         )
     ).one()
-    if post_h:
+    if post_h and replay.phase == "end":
         from elspeth.web.sessions.continuation_checkpoint_end_recovery import require_end_h_anchored_generation_chain_on_connection
 
+        if type(owed) is not VerifiedCheckpointEndOwed:
+            raise AuditIntegrityError("END overflow changed its exact historical END source")
         require_end_h_anchored_generation_chain_on_connection(conn, owed=owed, generation=settled_generation)
         if (
             history.session_operation_id != parent.session_operation_id
@@ -422,6 +454,14 @@ def _read_v4_checkpoint_terminal_on_connection(
             or history.claim_attempt != parent.attempt
         ):
             raise AuditIntegrityError("checkpoint END overflow lost its final replacement fence")
+    elif post_h and (
+        parent.attempt != source.claim_attempt
+        or parent.session_operation_id != source.session_operation_id
+        or parent.session_operation_epoch != source.session_operation_epoch
+        or type(parent.session_operation_lease_token) is not str
+        or sha256(parent.session_operation_lease_token.encode("utf-8")).hexdigest() != source.lease_sha256
+    ):
+        raise AuditIntegrityError("EARLY owed overflow cannot borrow a replacement writer")
     if (
         segment.state != "settled"
         or segment.generation != settled_generation
@@ -477,7 +517,7 @@ def read_v4_checkpoint_end_owed_overflow_terminal_on_connection(
         post_h=True,
         post_h_hold_state=hold_state,
     )
-    if result is None or type(result) is VerifiedCheckpointPaidOverflowTerminal:
+    if result is None or (type(result) is VerifiedCheckpointPaidOverflowTerminal and result.phase == "end"):
         return result
     raise AuditIntegrityError("END owed overflow reader crossed its terminal disposition")
 

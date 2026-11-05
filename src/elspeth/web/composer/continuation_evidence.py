@@ -409,15 +409,35 @@ class AdmittedTurnEvidence:
             raise TypeError("evidence admission requires its actual snapshot or private chunk source")
         sources = P4ApplicationSources(snapshot.application_entry, source_chunks)
         recorder_chunk = _select_recorder_chunk(snapshot, source_chunks)
-        chunk, graph = _encode_turn_evidence_source(
-            snapshot,
-            env_ref_names=env_ref_names,
-            mandatory_retention=mandatory_retention,
-            sources=sources,
-            recorder_chunk=recorder_chunk,
-        )
-        if type(source) is PrivateChunk and chunk != source:
-            raise AuditIntegrityError("evidence complete admission changed its chunk")
+        if type(source) is PrivateChunk:
+            # This model was just decoded from the verified original bytes and
+            # has not escaped. Admit its meaning without manufacturing a new
+            # chunk and reading that new representation back again.
+            graph = _require_evidence_field_semantics(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+            from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
+            from elspeth.web.composer.continuation_message_shelf import _require_message_shelf_semantics
+
+            _require_message_shelf_semantics(snapshot.transcript, env_ref_names=env_ref_names)
+            _require_evidence_pair_capacity(
+                evidence_bytes=source.reference.byte_length,
+                recorder_chunk=recorder_chunk,
+                mandatory_retention=mandatory_retention,
+            )
+            require_no_credential_material(
+                source.canonical,
+                surface="composer_continuation_private_chunk",
+                env_ref_names=env_ref_names,
+                max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+            )
+            chunk = source
+        else:
+            chunk, graph = _encode_turn_evidence_source(
+                snapshot,
+                env_ref_names=env_ref_names,
+                mandatory_retention=mandatory_retention,
+                sources=sources,
+                recorder_chunk=recorder_chunk,
+            )
         object.__setattr__(self, "snapshot", snapshot)
         object.__setattr__(self, "_graph", graph)
         object.__setattr__(self, "_graph_lock", Lock())
@@ -557,6 +577,24 @@ def require_evidence_fields_admission(
     from elspeth.web.composer.continuation_retention import validate_retained_model
 
     validate_retained_model(snapshot)
+    return _require_evidence_field_semantics(
+        snapshot,
+        env_ref_names=env_ref_names,
+        recorder_chunk=recorder_chunk,
+        sources=sources,
+        recorder_source=recorder_source,
+    )
+
+
+def _require_evidence_field_semantics(
+    snapshot: TurnEvidenceFields,
+    *,
+    env_ref_names: frozenset[str],
+    recorder_chunk: PrivateChunk,
+    sources: P4ApplicationSources | None = None,
+    recorder_source: ApplicationRecorderSource | None = None,
+) -> ApplicationGraph | None:
+    """Check source relationships after owned schema admission, without repeating it."""
     if recorder_source is None:
         recorder_source = _require_recorder_chunk(snapshot, recorder_chunk, env_ref_names=env_ref_names)
     else:
@@ -597,11 +635,7 @@ def _encode_turn_evidence_source(
     if type(snapshot) is not TurnEvidenceSnapshot:
         raise TypeError("evidence requires its owned closed snapshot")
     from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
-    from elspeth.web.composer.continuation_capture_overflow import (
-        ContinuationCaptureOverflowWitness,
-        ContinuationMandatoryCaptureOverflow,
-        require_capture_retention_capacity,
-    )
+    from elspeth.web.composer.continuation_capture_overflow import require_capture_retention_capacity
     from elspeth.web.composer.continuation_retention import (
         bind_retained_json_encoding,
         retained_model_json_view,
@@ -625,22 +659,7 @@ def _encode_turn_evidence_source(
         if measured.admitted_bytes is None:
             raise AuditIntegrityError("evidence source exceeds its original complete document bound")
         expected_bytes = measured.admitted_bytes
-    # This is one explicit two-document unit, independent of the selected
-    # frame's reference occurrence. It is not a complete-closure/work bound.
-    if expected_bytes + recorder_chunk.reference.byte_length > CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES:
-        if mandatory_retention:
-            from elspeth.web.composer.protocol import ComposerContextUnsupported
-
-            raise ComposerContextUnsupported("retained_chunk_bytes") from ContinuationMandatoryCaptureOverflow(
-                ContinuationCaptureOverflowWitness(
-                    unit="evidence_pair",
-                    codec="composer.evidence.v2",
-                    observed_bytes=expected_bytes + recorder_chunk.reference.byte_length,
-                    limit_bytes=CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES,
-                    size_is_exact=True,
-                )
-            )
-        raise AuditIntegrityError("evidence and original recorder exceed their complete pair bound")
+    _require_evidence_pair_capacity(evidence_bytes=expected_bytes, recorder_chunk=recorder_chunk, mandatory_retention=mandatory_retention)
     encoded = canonical_json_native_strings(snapshot.model_dump(mode="json"))
     bind_retained_json_encoding(encoded, expected_bytes=expected_bytes)
     try:
@@ -657,6 +676,30 @@ def _encode_turn_evidence_source(
         env_ref_names=env_ref_names,
     )
     return chunk, graph
+
+
+def _require_evidence_pair_capacity(*, evidence_bytes: int, recorder_chunk: PrivateChunk, mandatory_retention: bool) -> None:
+    # This is one explicit two-document unit, independent of the selected
+    # frame's reference occurrence. It is not a complete-closure/work bound.
+    pair_bytes = evidence_bytes + recorder_chunk.reference.byte_length
+    if pair_bytes > CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES:
+        if mandatory_retention:
+            from elspeth.web.composer.continuation_capture_overflow import (
+                ContinuationCaptureOverflowWitness,
+                ContinuationMandatoryCaptureOverflow,
+            )
+            from elspeth.web.composer.protocol import ComposerContextUnsupported
+
+            raise ComposerContextUnsupported("retained_chunk_bytes") from ContinuationMandatoryCaptureOverflow(
+                ContinuationCaptureOverflowWitness(
+                    unit="evidence_pair",
+                    codec="composer.evidence.v2",
+                    observed_bytes=pair_bytes,
+                    limit_bytes=CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES,
+                    size_is_exact=True,
+                )
+            )
+        raise AuditIntegrityError("evidence and original recorder exceed their complete pair bound")
 
 
 def decode_turn_evidence(

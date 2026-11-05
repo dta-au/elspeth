@@ -183,13 +183,13 @@ def test_native_evidence_projections_keep_public_bytes_and_recheck_changed_sourc
     assert chunk.reference.byte_length == len(public_bytes)
     assert chunk.reference.digest == sha256(public_bytes).hexdigest()
     decoded = decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=admitted.dependency_chunks)
-    assert decoded.snapshot == admitted.snapshot and calls == [True] * 5
+    assert decoded.snapshot == admitted.snapshot and calls == [True] * 3
     # Frozen model assignment is not the source check: hostile nested storage
     # mutation must still be compared with the original chunk before transfer.
     decoded.snapshot.__dict__["actor_user_id"] = "changed-retained-source"
     with pytest.raises(AuditIntegrityError, match="changed its original immutable source"):
         decoded.take_graph()
-    assert calls == [True] * 6
+    assert calls == [True] * 4
 
 
 @pytest.mark.parametrize("stage", ("emit", "self_roundtrip", "decode", "transfer"))

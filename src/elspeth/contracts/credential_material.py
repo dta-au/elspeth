@@ -10,7 +10,7 @@ general-purpose DLP system.
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Iterable, Mapping, Set
+from collections.abc import Callable, Collection, Iterable, Mapping, Set
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final, Literal, cast
@@ -188,6 +188,16 @@ def find_credential_material(
     return _find(value, state=state, depth=0, location="root", credential_parent=False)
 
 
+def _find_credential_material_with_classifier(
+    value: Any,
+    policy: CredentialTraversalPolicy,
+    classifier: Callable[[str], CredentialCategory | None],
+) -> CredentialMaterialFinding | None:
+    """Internal traversal with invocation-owned pure text classification only."""
+    state = _TraversalState(policy=policy, active_ids=set(), classifier=classifier)
+    return _find(value, state=state, depth=0, location="root", credential_parent=False)
+
+
 def find_credential_material_in_projected_sequence(
     values: Iterable[object],
     *,
@@ -224,6 +234,7 @@ class _TraversalState:
     active_ids: set[int]
     nodes: int = 0
     measured_text: bool = False
+    classifier: Callable[[str], CredentialCategory | None] | None = None
 
 
 def _find(
@@ -251,7 +262,7 @@ def _find(
     if type(value) is str:
         if utf8_size(value, errors="replace", limit=state.policy.max_string_bytes) > state.policy.max_string_bytes:
             return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
-        category = _classify_string(value)
+        category = _classify_string(value) if state.classifier is None else state.classifier(value)
         return CredentialMaterialFinding(category, location) if category is not None else None
     if value is None or type(value) in (bool, int, float):
         return None
@@ -268,7 +279,7 @@ def _find(
                     return CredentialMaterialFinding("unsupported_value", "mapping_key")
                 if utf8_size(key, errors="replace", limit=state.policy.max_string_bytes) > state.policy.max_string_bytes:
                     return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
-                key_category = _classify_string(key)
+                key_category = _classify_string(key) if state.classifier is None else state.classifier(key)
                 if key_category is not None:
                     return CredentialMaterialFinding(key_category, "mapping_key")
                 finding = _find(

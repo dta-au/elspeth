@@ -229,7 +229,7 @@ def _read_early_complete_return(
     operation_id: str,
     selected: StoredContinuationSnapshot,
     names: frozenset[str],
-    child_disposition: Literal["dispatched", "committed"],
+    child_disposition: Literal["dispatched", "committed", "paid_overflow"],
     hold_state: Literal["active", "consumed"],
 ) -> VerifiedEarlyCompleteReturn:
     if type(selected) is not StoredContinuationSnapshot or type(names) is not frozenset:
@@ -407,6 +407,36 @@ def read_early_settled_return_history_on_connection(
         names=names,
         child_disposition="committed",
         hold_state="consumed",
+    )
+
+
+def read_early_overflow_return_history_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str],
+    hold_state: Literal["active", "consumed"],
+) -> VerifiedEarlyCompleteReturn:
+    """Historical H for its paid-overflow child; never current business authority."""
+    kind = conn.execute(
+        select(checkpoints.c.kind).where(
+            checkpoints.c.session_id == session_id,
+            checkpoints.c.operation_id == operation_id,
+            checkpoints.c.checkpoint_id == selected.checkpoint_id,
+        )
+    ).scalar_one_or_none()
+    if kind != "transition":
+        raise AuditIntegrityError("EARLY overflow lost its exact original H transition")
+    return _read_early_complete_return(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        selected=selected,
+        names=names,
+        child_disposition="paid_overflow",
+        hold_state=hold_state,
     )
 
 

@@ -15,7 +15,7 @@ from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
 
 
 def sdk_terminal_family_for_custody(custody: ProviderCallCustody) -> SdkTerminalFamily:
-    from elspeth.web.sessions.continuation_checkpoint_paid import V4CheckpointProviderAdmission
+    from elspeth.web.sessions.continuation_checkpoint_paid import CheckpointPreparedSource, V4CheckpointProviderAdmission
     from elspeth.web.sessions.continuation_classifier_primary import V4ClassifierProviderAdmission
     from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission
     from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission
@@ -37,8 +37,20 @@ def sdk_terminal_family_for_custody(custody: ProviderCallCustody) -> SdkTerminal
     if len(admissions) != 1:
         raise AuditIntegrityError("SDK family lost its sole original admission")
     admission = admissions[0]
-    if type(admission) is V4CheckpointProviderAdmission and admission.original_source.phase == "end":
-        return SdkTerminalFamily.CHECKPOINT_END
+    if type(admission) is V4CheckpointProviderAdmission:
+        checkpoint = admission.original_source
+        if type(checkpoint) is not CheckpointPreparedSource:
+            raise AuditIntegrityError("SDK checkpoint family lost its nominal original source")
+        if checkpoint.phase == "end" and checkpoint.early_input_ref is None:
+            return SdkTerminalFamily.CHECKPOINT_END
+        if (
+            checkpoint.phase == "early"
+            and checkpoint.kind == "iteration_early"
+            and checkpoint.early_input_ref is not None
+            and checkpoint.end_input_ref is None
+        ):
+            return SdkTerminalFamily.CHECKPOINT_EARLY
+        raise AuditIntegrityError("SDK checkpoint family has no installed original phase/input")
     if type(admission) is V4PrimaryProviderAdmission:
         return SdkTerminalFamily.PRIMARY
     if type(admission) is V4ClassifierProviderAdmission:
@@ -61,7 +73,11 @@ def require_sdk_live_source_on_connection(
 
     require_original_v4_sdk_failure(observation, custody=custody)
     if custody.continuation_checkpoint_v4 is not None:
-        return require_checkpoint_sdk_source_on_connection(conn, custody=custody, observation=observation)
+        family = sdk_terminal_family_for_custody(custody)
+        verified = require_checkpoint_sdk_source_on_connection(conn, custody=custody, observation=observation)
+        if verified.source.family is not family:
+            raise AuditIntegrityError("SDK checkpoint live source changed its original admission family")
+        return verified
     if custody.continuation_primary_v4 is not None:
         return require_primary_sdk_source_on_connection(conn, custody=custody, observation=observation)
     if custody.continuation_semantic_v4 is not None:
@@ -93,10 +109,13 @@ def require_sdk_cold_source_on_connection(
 
     if type(family) is not SdkTerminalFamily:
         raise TypeError("SDK cold source requires a nominal family selector")
-    if family is SdkTerminalFamily.CHECKPOINT_END:
-        return require_checkpoint_sdk_cold_source_on_connection(
+    if family in (SdkTerminalFamily.CHECKPOINT_END, SdkTerminalFamily.CHECKPOINT_EARLY):
+        verified = require_checkpoint_sdk_cold_source_on_connection(
             conn, source=source, admitted=admitted, identity=identity, effect=effect, physical_row=physical_row, parent=parent, names=names
         )
+        if verified.family is not family:
+            raise AuditIntegrityError("SDK checkpoint cold source changed its requested family")
+        return verified
     if family is SdkTerminalFamily.PRIMARY:
         return require_primary_sdk_cold_source_on_connection(
             conn, source=source, admitted=admitted, identity=identity, effect=effect, physical_row=physical_row, parent=parent, names=names

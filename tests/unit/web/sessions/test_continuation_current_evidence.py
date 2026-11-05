@@ -153,7 +153,7 @@ async def test_current_restore_receives_the_exact_fresh_sql_admission_and_keeps_
     running = kwargs["inventory"].running
     original_inputs = materialization.inputs
     actual_read = producers.CurrentContinuationMessageProducers._require_current
-    actual_restore = bridge._restore_current_evidence
+    actual_restore = bridge._finish_current_evidence
     observed = []
     transferred = []
 
@@ -170,11 +170,11 @@ async def test_current_restore_receives_the_exact_fresh_sql_admission_and_keeps_
         return result
 
     monkeypatch.setattr(producers.CurrentContinuationMessageProducers, "_require_current", read)
-    monkeypatch.setattr(bridge, "_restore_current_evidence", restore)
+    monkeypatch.setattr(bridge, "_finish_current_evidence", restore)
     try:
         result = await restore_current_turn_evidence(**kwargs, materialization=materialization)
         assert len(transferred) == 1
-        assert len(observed) > transferred[0][1]
+        assert len(observed) == 2 and transferred[0][1] == 1
         assert observed[-1].admitted_evidence is not transferred[0][0]
         assert all(value == original_inputs for value in observed)
         assert all(value.evidence is value.admitted_evidence.snapshot for value in observed)
@@ -262,7 +262,7 @@ async def test_current_graph_refuses_stop_after_actual_reconstruction(operation_
 
     kwargs, materialization, _shelf, _recorder = await guarded_case(operation_store)
     running = kwargs["inventory"].running
-    actual = bridge._restore_current_evidence
+    actual = bridge._finish_current_evidence
 
     def stop_after_graph(*args, **values):
         restored = actual(*args, **values)
@@ -274,7 +274,7 @@ async def test_current_graph_refuses_stop_after_actual_reconstruction(operation_
 
     try:
         await restore_current_turn_evidence(**kwargs, materialization=materialization)
-        monkeypatch.setattr(bridge, "_restore_current_evidence", stop_after_graph)
+        monkeypatch.setattr(bridge, "_finish_current_evidence", stop_after_graph)
         with pytest.raises(ComposerOperationCancelledDuringTurn):
             await restore_current_turn_evidence(**kwargs, materialization=materialization)
         kwargs["required_work"].coordinator.assert_completed()

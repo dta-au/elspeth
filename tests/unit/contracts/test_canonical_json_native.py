@@ -1,10 +1,13 @@
-"""Native-string writer parity against the unchanged public serializer."""
+"""Public/private writer parity against the independent original RFC path."""
 
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 import struct
+import sys
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -15,10 +18,32 @@ import pytest
 import rfc8785
 
 from elspeth.contracts import _canonical_json_native as candidate
+from elspeth.contracts import _canonical_json_writer as writer
 from elspeth.contracts import hashing
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.hashing import canonical_json, canonical_json_loads
 from elspeth.contracts.readonly_json import ReadonlyJsonArray, ReadonlyJsonObject, ReadonlyJsonString
+
+
+def _legacy_normalize(obj):
+    """Original contracts normalizer, independent of production dispatch."""
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            raise ValueError(f"Cannot canonicalize NaN. Use None for missing values, not NaN. Got: {obj!r}")
+        if math.isinf(obj):
+            raise ValueError(f"Cannot canonicalize Infinity. Use None for missing values, not Infinity. Got: {obj!r}")
+        return obj
+    if isinstance(obj, frozenset):
+        raise TypeError("frozenset is not JSON-serializable and has no canonical ordering. Use list or tuple for ordered collections.")
+    if isinstance(obj, Mapping):
+        return {key: _legacy_normalize(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_legacy_normalize(item) for item in obj]
+    return obj
+
+
+def _legacy_canonical_json(value):
+    return rfc8785.dumps(_legacy_normalize(value)).decode("utf-8")
 
 
 def _outcome(serialize, value):
@@ -37,22 +62,25 @@ def _outcome(serialize, value):
 
 
 def _assert_same(value):
-    expected = _outcome(canonical_json, value)
-    actual = _outcome(candidate.canonical_json_native_strings, value)
-    assert actual == expected
-    return actual
+    expected = _outcome(_legacy_canonical_json, value)
+    for serialize in (canonical_json, candidate.canonical_json_native_strings):
+        assert _outcome(serialize, value) == expected
+    return expected
 
 
 def test_comparator_detects_deliberately_wrong_escape(monkeypatch):
     value = {"text": 'quote " slash / backslash \\ newline\n'}
     assert _assert_same(value)[0] == "bytes"
-    original = candidate._native_string_bytes
+    original = writer._native_string_bytes
 
     def wrong_escape(text):
         encoded = original(text)
         return None if encoded is None else encoded.replace(b"\\n", b"\\u000a")
 
-    monkeypatch.setattr(candidate, "_native_string_bytes", wrong_escape)
+    monkeypatch.setattr(writer, "_native_string_bytes", wrong_escape)
+    expected = _outcome(_legacy_canonical_json, value)
+    assert _outcome(canonical_json, value) != expected
+    assert _outcome(candidate.canonical_json_native_strings, value) != expected
     with pytest.raises(AssertionError):
         _assert_same(value)
 
@@ -230,6 +258,40 @@ def test_nested_containers_and_cycle_refusal():
             serialize(cycle)
 
 
+def test_public_and_private_recursion_boundary_matches_original_path(record_property):
+    def passes(serialize, depth):
+        value = "leaf"
+        for _ in range(depth):
+            value = [value]
+        try:
+            serialize(value)
+        except RecursionError:
+            return False
+        return True
+
+    def first_failure(serialize):
+        low, high = 0, 512
+        assert passes(serialize, low) and not passes(serialize, high)
+        while high - low > 1:
+            middle = (low + high) // 2
+            if passes(serialize, middle):
+                low = middle
+            else:
+                high = middle
+        assert passes(serialize, high - 1) and not passes(serialize, high)
+        return high
+
+    original_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(512)
+        expected = first_failure(_legacy_canonical_json)
+        assert first_failure(canonical_json) == expected
+        assert first_failure(candidate.canonical_json_native_strings) == expected
+        record_property("canonical_first_refused_list_depth_at_limit_512", expected)
+    finally:
+        sys.setrecursionlimit(original_limit)
+
+
 @pytest.mark.parametrize("count", (0, 1, 3))
 def test_actual_recorder_projection_corpus_and_reference_digest_without_wiring(count):
     from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
@@ -243,7 +305,7 @@ def test_actual_recorder_projection_corpus_and_reference_digest_without_wiring(c
     chunk = encode_recorder_snapshot(snapshot)
     projected = canonical_json_loads(chunk.canonical)
     encoded = candidate.canonical_json_native_strings(projected).encode()
-    assert encoded == canonical_json(projected).encode()
+    assert encoded == _legacy_canonical_json(projected).encode()
     assert encoded == chunk.canonical.encode()
     assert len(encoded) == chunk.reference.byte_length
     assert hashlib.sha256(encoded).hexdigest() == chunk.reference.digest

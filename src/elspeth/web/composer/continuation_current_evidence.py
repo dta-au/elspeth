@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, _restore_current_evidence
+from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, _begin_current_evidence, _finish_current_evidence
 from elspeth.web.composer.continuation_evidence_restore import _require_current_reader_service
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -57,7 +58,8 @@ def _restore_current_message_evidence(
     # Use this actual just-validated complete read, not the owner's older input
     # DATA. Reconstruction remains bracketed by an independent fresh final read.
     with borrow_v4_preparation_memo_scope():
-        admitted = materialization._require_current().admitted_evidence
+        inputs = materialization._require_current()
+        admitted = inputs.admitted_evidence
         snapshot = admitted.snapshot
         reader = None
         if snapshot.requires_blob_reader:
@@ -66,12 +68,30 @@ def _restore_current_message_evidence(
             reader = CurrentTranscriptBlobReader.from_service(
                 service, session_id=str(running.claim.session_id), context=running.session_operation_context
             )
-        restored = _restore_current_evidence(
+        # The outer current reads bracket this whole reconstruction, including
+        # policy callbacks. Reuse their actual inputs for assembly instead of
+        # nesting restore_shelf's second pair of complete current-history reads.
+        owner, initial, latest = _begin_current_evidence(snapshot, context=running.session_operation_context)
+        history = AdvisorTranscriptOwner._continuation_history(
+            snapshot.transcript,
+            session_id=snapshot.session_id,
+            actor_user_id=snapshot.actor_user_id,
+            request_id=snapshot.request_id,
+            request=snapshot.transcript.request,
+        )
+        shelf = materialization._rebuild_shelf(snapshot.transcript, inputs=inputs)
+        owner.transcript, messages = AdvisorTranscriptOwner._from_continuation_shelf(
+            snapshot.transcript, request=snapshot.transcript.request, history=history, shelf=shelf
+        )
+        restored = _finish_current_evidence(
             admitted,
             context=running.session_operation_context,
+            owner=owner,
+            initial=initial,
+            latest=latest,
+            messages=messages,
             reader=reader,
             env_ref_names=inventory.names,
-            materialization=materialization,
         )
         materialization._require_current()
         return restored

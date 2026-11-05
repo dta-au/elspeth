@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from pydantic import ValidationError
 
+from elspeth.contracts import credential_material as credential_detector
 from elspeth.contracts.credential_material import (
     CREDENTIAL_DETECTOR_VERSION,
     DEFAULT_CREDENTIAL_TRAVERSAL_POLICY,
+    CredentialCategory,
     CredentialMaterialFinding,
     CredentialTraversalPolicy,
     find_credential_material,
@@ -31,6 +33,7 @@ from elspeth.web.composer.bounded_json import (
 )
 from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.continuation_retention_memo import (
+    CredentialDetector,
     CredentialInputKind,
     CredentialInputToken,
     CredentialPolicyKey,
@@ -46,6 +49,8 @@ if TYPE_CHECKING:
 
 _OUT_OF_SCOPE_DATA_PLANE_CONTENT = "<data-plane-content>"
 _MALFORMED_TOOL_WIRE = object()
+_ORIGINAL_CREDENTIAL_DETECTOR = find_credential_material
+_ORIGINAL_STRING_CLASSIFIER = credential_detector._classify_string
 
 
 class CredentialMaterialRefusalPayload(TypedDict):
@@ -259,7 +264,7 @@ def _credential_input_from_tokens(content: tuple[CredentialInputToken, ...]) -> 
 
 def _credential_finding_from_key(key: CredentialScanKey) -> CredentialMaterialFinding | None:
     policy = key.policy
-    return key.detector(
+    return _find_with_credential_text_memo(
         _credential_input_from_tokens(key.content),
         CredentialTraversalPolicy(
             env_ref_names=policy.env_ref_names,
@@ -269,7 +274,22 @@ def _credential_finding_from_key(key: CredentialScanKey) -> CredentialMaterialFi
             max_width=policy.max_width,
             max_string_bytes=policy.max_string_bytes,
         ),
+        key.detector,
     )
+
+
+def _find_with_credential_text_memo(
+    value: object, policy: CredentialTraversalPolicy, detector: CredentialDetector
+) -> CredentialMaterialFinding | None:
+    memo = current_retention_stage_memo()
+    classifier = credential_detector._classify_string
+    if memo is not None and detector is _ORIGINAL_CREDENTIAL_DETECTOR and classifier is _ORIGINAL_STRING_CLASSIFIER:
+
+        def classify(text: str) -> CredentialCategory | None:
+            return memo.credential_string_category(text, classifier)
+
+        return credential_detector._find_credential_material_with_classifier(value, policy, classify)
+    return detector(value, policy)
 
 
 def _retention_credential_finding(
@@ -278,9 +298,16 @@ def _retention_credential_finding(
     memo = current_retention_stage_memo()
     if memo is None:
         return find_credential_material(value, policy)
+    if (
+        find_credential_material is _ORIGINAL_CREDENTIAL_DETECTOR
+        and credential_detector._classify_string is not _ORIGINAL_STRING_CLASSIFIER
+    ):
+        return find_credential_material(value, policy)
+    if not memo.caches_credential_inputs and find_credential_material is _ORIGINAL_CREDENTIAL_DETECTOR:
+        return _find_with_credential_text_memo(value, policy, find_credential_material)
     key = _credential_scan_key(value, policy=policy, surface=surface, scanner_role=scanner_role)
     if key is None:
-        return find_credential_material(value, policy)
+        return _find_with_credential_text_memo(value, policy, find_credential_material)
     return memo.credential(key, _credential_finding_from_key)
 
 
@@ -309,11 +336,18 @@ def _retention_state_options_finding(
     memo = current_retention_stage_memo()
     if memo is None:
         return find_credential_material(value, policy)
+    if (
+        find_credential_material is _ORIGINAL_CREDENTIAL_DETECTOR
+        and credential_detector._classify_string is not _ORIGINAL_STRING_CLASSIFIER
+    ):
+        return find_credential_material(value, policy)
+    if not memo.caches_credential_inputs and find_credential_material is _ORIGINAL_CREDENTIAL_DETECTOR:
+        return _find_with_credential_text_memo(value, policy, find_credential_material)
     if not _current_owned_options(value, owner):
         return _retention_credential_finding(value, policy=policy, surface=surface, scanner_role="state_component")
     key = _credential_scan_key(value, policy=policy, surface=surface, scanner_role="state_component", options_owner=owner)
     if key is None:
-        return find_credential_material(value, policy)
+        return _find_with_credential_text_memo(value, policy, find_credential_material)
     return memo.state_credentials(StateCredentialStepKey(key), _state_credential_finding_from_key)
 
 

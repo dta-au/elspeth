@@ -263,6 +263,7 @@ async def test_foreign_stateful_parser_bypasses_warm_proof_and_returns_its_first
         "renderer",
         "normalizer",
         "recursive_normalizer",
+        "writer_entry",
         "write",
         "quote",
         "quote_primitive",
@@ -277,13 +278,14 @@ async def test_warm_tool_proof_bypasses_changed_subordinate_implementations(monk
         "renderer": (tool_batch, "canonical_json_native_strings"),
         "normalizer": (tool_batch.native_json, "_normalize_frozen_and_reject_non_finite"),
         "recursive_normalizer": (tool_batch.hashing, "_normalize_frozen_and_reject_non_finite"),
-        "write": (tool_batch.native_json, "_write"),
-        "quote": (tool_batch.native_json, "_native_string_bytes"),
-        "quote_primitive": (tool_batch.native_json, "encode_basestring"),
+        "writer_entry": (tool_batch.native_json, "_dumps"),
+        "write": (tool_batch.canonical_writer, "_write"),
+        "quote": (tool_batch.canonical_writer, "_native_string_bytes"),
+        "quote_primitive": (tool_batch.canonical_writer, "encode_basestring"),
         "json_loader": (tool_batch.json_parser.json, "loads"),
         "duplicate_hook": (tool_batch.json_parser, "_reject_duplicate_keys"),
         "nonfinite_hook": (tool_batch.json_parser, "_reject_non_finite"),
-        "numeric_dump": (tool_batch.native_json.rfc8785, "dump"),
+        "numeric_dump": (tool_batch.canonical_writer.rfc8785, "dump"),
     }
     module, field = targets[dependency]
     original = module.__dict__[field]

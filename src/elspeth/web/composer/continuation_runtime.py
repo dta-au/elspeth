@@ -992,7 +992,15 @@ async def capture_continuation_runtime_owners(
         from elspeth.web.composer.continuation_evidence import state_from_evidence_json
         from elspeth.web.composer.protocol import ComposerContextUnsupported
 
-        source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
+        if runtime.source.selected is selected and runtime.source.evidence_env_ref_names == inventory.names:
+            current = authority.read_continuation_env_selection(
+                running, expected_checkpoint_id=selected.checkpoint_id, expected_cursor=selected.stack.cursor
+            )
+            if current != inventory.selection:
+                raise AuditIntegrityError("runtime capture changed its current environment selection")
+            source = runtime.source
+        else:
+            source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
         try:
             captured = _capture_owners(runtime, source=source, inventory=inventory)
         except ComposerContextUnsupported as refused:

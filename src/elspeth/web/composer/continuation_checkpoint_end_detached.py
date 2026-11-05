@@ -42,7 +42,7 @@ def require_detached_end_owners(detached: RestoredContinuationRuntime, original:
         or detached.live.turn_evidence is original.live.turn_evidence
         or detached.live.turn_evidence.transcript is original.live.turn_evidence.transcript
         or detached.live.llm_messages is original.live.llm_messages
-        or any(message is other for message in detached.live.llm_messages for other in original.live.llm_messages)
+        or not {id(message) for message in detached.live.llm_messages}.isdisjoint(id(other) for other in original.live.llm_messages)
         or type(detached.detached_disclosure) is not SchemaDisclosureTracker
         or detached.detached_disclosure is original.materialization.service._schema_disclosure
         or detached.bindings.required_work is not original.bindings.required_work

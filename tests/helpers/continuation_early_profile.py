@@ -2,8 +2,9 @@
 
 Mode zero observes only inclusive clock-to-preparation-finish time. Mode one
 adds selected inclusive spans, native thread CPU, SQL and the already calibrated
-original-witness observer, plus four-family memo statistics. A separate CPU
-opt-in captures only the first current-evidence memo scope. Neither mode
+original-witness observer, plus four-family memo statistics. Mode two records
+the same spans without the memo observer. A separate CPU opt-in, available
+only in mode one, captures the first current-evidence memo scope. No mode
 replaces submitted callables, adjusts a deadline, consumes a clock stage,
 caches a result or records private payloads.
 """
@@ -28,7 +29,7 @@ CPU_PROFILE_FLAG = "ELSPETH_TEST_EARLY_PREPARATION_CPU"
 
 
 class EarlyPreparationProfile:
-    def __init__(self, *, enabled: bool, cpu_profile: bool = False) -> None:
+    def __init__(self, *, enabled: bool, cpu_profile: bool = False, observe_memo: bool = True) -> None:
         if cpu_profile and not enabled:
             raise ValueError("EARLY CPU capture requires selected-span observations")
         self.enabled = enabled
@@ -44,7 +45,7 @@ class EarlyPreparationProfile:
         self._cpu_claimed = False
         self._cpu_selected_scope: dict[str, Any] | None = None
         self._binder_attempts: list[dict[str, Any]] = []
-        if enabled:
+        if enabled and observe_memo:
             self.spans.text_memo = EndTextMemoObservation()
         self.case_outcome = {"status": "not_completed"}
 
@@ -145,7 +146,7 @@ class EarlyPreparationProfile:
 
     @contextmanager
     def install(self, monkeypatch, engine):
-        # Both diagnostic modes import the same boundaries before the original
+        # All diagnostic modes import the same boundaries before the original
         # clock begins. Timed work and all original ownership checks remain.
         from elspeth.web.composer import advisor_checkpoint as advisor
         from elspeth.web.composer import continuation_checkpoint_early_physical as physical
@@ -269,7 +270,7 @@ class EarlyPreparationProfile:
         with self._lock:
             result.update(
                 observer="original_early_preparation",
-                mode="spans" if self.enabled else "inclusive_only",
+                mode="inclusive_only" if not self.enabled else "spans" if self.spans.text_memo is not None else "spans_only",
                 clocks=[{**row, "finish_attempts": [dict(attempt) for attempt in row["finish_attempts"]]} for row in self.clocks],
                 case_outcome=dict(self.case_outcome),
                 binder_attempts=[dict(attempt) for attempt in self._binder_attempts],
@@ -316,7 +317,7 @@ def early_preparation_profile(monkeypatch, engine, *, output_key):
     if mode is None:
         yield None
         return
-    assert mode in {"0", "1"}
+    assert mode in {"0", "1", "2"}
     cpu_mode = os.environ.get(CPU_PROFILE_FLAG)
     assert cpu_mode in {None, "current_evidence"}, "EARLY CPU target must be current_evidence"
     assert cpu_mode is None or mode == "1", "EARLY CPU capture requires selected-span mode"
@@ -326,7 +327,7 @@ def early_preparation_profile(monkeypatch, engine, *, output_key):
         directory = root / directory
     directory = directory.resolve()
     assert directory.is_relative_to(root), "EARLY diagnostic output must remain inside this project"
-    profile = EarlyPreparationProfile(enabled=mode == "1", cpu_profile=cpu_mode == "current_evidence")
+    profile = EarlyPreparationProfile(enabled=mode in {"1", "2"}, cpu_profile=cpu_mode == "current_evidence", observe_memo=mode == "1")
     try:
         with profile.install(monkeypatch, engine):
             yield profile

@@ -33,6 +33,8 @@ class _CanonicalIntegerDomainError(rfc8785.IntegerDomainError):
 
 
 def _require_utf8(text: str, *, object_key: bool = False) -> None:
+    if str.isascii(text):
+        return
     match = _SURROGATE.search(text)
     if match is not None:
         # RFC 8785 sorts object keys using UTF-16BE before encoding their text.

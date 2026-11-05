@@ -19,6 +19,7 @@ from sqlalchemy.engine import Connection
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, EffectFrontierEntry, PrivateChunkRef, ToolBatchFrame
+from elspeth.web.composer.continuation_capture_overflow import ContinuationCaptureOverflowWitness, ContinuationMandatoryCaptureOverflow
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
@@ -1131,8 +1132,17 @@ def _retain(
 ) -> StoredContinuationSnapshot:
     current = _current(conn, running, selected, inventory)
     canonical = canonical_json(record.model_dump(mode="json"))
-    if len(canonical.encode("utf-8")) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
-        raise AuditIntegrityError("iteration stage exceeds its complete private document bound")
+    encoded = canonical.encode("utf-8")
+    if len(encoded) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+        raise AuditIntegrityError("iteration stage exceeds its complete private document bound") from ContinuationMandatoryCaptureOverflow(
+            ContinuationCaptureOverflowWitness(
+                unit="private_chunk",
+                codec=record.schema_version,
+                observed_bytes=len(encoded),
+                limit_bytes=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+                size_is_exact=True,
+            )
+        )
     require_no_credential_material(
         canonical,
         surface="composer_continuation_iteration_stage",
@@ -1152,7 +1162,7 @@ def _retain(
                 payload=chunk.canonical.encode("utf-8"),
                 codec=chunk.reference.codec,
             )
-    put_chunk(conn, session_id=sid, operation_id=operation, key=key, payload=canonical.encode("utf-8"), codec=record.schema_version)
+    put_chunk(conn, session_id=sid, operation_id=operation, key=key, payload=encoded, codec=record.schema_version)
     _compose, batch = applied_batch_cut(selected.stack.frames)
     source_batch = _source_batch(conn, record)
     main, early = advance_effect_key(batch.response), f"advance-early:{batch.response.digest}"

@@ -262,6 +262,48 @@ def admit_v4_checkpoint_end_owed_overflow_tail_on_connection(
     plan: CheckpointPaidOverflowTailPlan,
     batch: CheckpointPaidOverflowTailBatch,
 ) -> Iterator[None]:
+    """Spend only the exact END rebound hold; no other phase is admitted."""
+    with _admit_v4_checkpoint_owed_overflow_tail_on_connection(conn, source=source, plan=plan, batch=batch, phase="end"):
+        yield
+
+
+@contextmanager
+def admit_v4_checkpoint_early_owed_overflow_tail_on_connection(
+    conn: Connection,
+    *,
+    source: ProviderTerminalHoldSource,
+    plan: CheckpointPaidOverflowTailPlan,
+    batch: CheckpointPaidOverflowTailBatch,
+    names: frozenset[str],
+) -> Iterator[None]:
+    """Reprove actual EARLY H before issuing its exact transaction-local credit."""
+    from elspeth.web.sessions.continuation_checkpoint_early_return import read_early_complete_return_on_connection
+
+    if (
+        type(source) is not ProviderTerminalHoldSource
+        or type(plan) is not CheckpointPaidOverflowTailPlan
+        or type(batch) is not CheckpointPaidOverflowTailBatch
+        or plan.phase != "early"
+    ):
+        raise AuditIntegrityError("EARLY owed overflow requires its original EARLY tail")
+    owed = read_early_complete_return_on_connection(
+        conn, session_id=source.session_id, operation_id=source.operation_id, selected=plan.admitted, names=names
+    )
+    if owed.new_hold != source or owed.terminal_tail != plan:
+        raise AuditIntegrityError("EARLY owed overflow changed its deep current H")
+    with _admit_v4_checkpoint_owed_overflow_tail_on_connection(conn, source=source, plan=plan, batch=batch, phase="early"):
+        yield
+
+
+@contextmanager
+def _admit_v4_checkpoint_owed_overflow_tail_on_connection(
+    conn: Connection,
+    *,
+    source: ProviderTerminalHoldSource,
+    plan: CheckpointPaidOverflowTailPlan,
+    batch: CheckpointPaidOverflowTailBatch,
+    phase: Literal["early", "end"],
+) -> Iterator[None]:
     """Spend only the rebound H on one exact complete-response consequence overflow.
 
     The original provider response remains in the preceding END-owed checkpoint.
@@ -279,7 +321,7 @@ def admit_v4_checkpoint_end_owed_overflow_tail_on_connection(
     if type(transaction) is not RootTransaction or not transaction.is_active:
         raise AuditIntegrityError("END-owed overflow requires its original root transaction")
     if (
-        plan.phase != "end"
+        plan.phase != phase
         or source.session_id != plan.identity.session_id
         or source.operation_id != plan.identity.operation_id
         or source.effect_key != plan.identity.effect_key

@@ -63,6 +63,7 @@ from sqlalchemy.util import _collections as sql_collections
 from sqlalchemy.util import immutabledict
 from sqlalchemy.util import langhelpers as sql_langhelpers
 
+from elspeth.contracts import _canonical_json_writer as canonical_writer
 from elspeth.contracts import bounded_serialization, credential_material, hashing, json_parser
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.sources.llm.source import LLMSource
@@ -197,8 +198,10 @@ _NESTED_CHUNKS_FUNCTION = continuation_selection.nested_private_chunks
 _NESTED_CHUNKS = _NESTED_CHUNKS_FUNCTION.__code__
 _PRIVATE_UTF8_LIMIT = continuation_selection.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 _ENCODE_CHUNK = continuation_codec.encode_private_chunk.__code__
-_RFC_DUMPS = hashing.rfc8785.dumps
-_SNAPSHOT_RFC_CODE = _RFC_DUMPS.__code__ if type(_RFC_DUMPS) is FunctionType else None
+# Observe the actual public serializer's normalized-byte producer. The
+# independent old RFC oracle lives in the contracts parity tests, not here.
+_CANONICAL_DUMPS = canonical_writer._dumps
+_CANONICAL_DUMPS_CODE = _CANONICAL_DUMPS.__code__
 _REGISTER_CALLBACK = sys.monitoring.register_callback
 _CATALOG_CLASS = catalog_service.CatalogServiceImpl
 _CATALOG_STAGE_CONTEXT = retention_memo._RETENTION_STAGE_MEMO
@@ -5705,8 +5708,9 @@ class RetentionMemoTrace:
             and _ORIGINAL_CANONICAL.__code__ is _CANONICAL
             and continuation_policy.decode_continuation_policy is _SNAPSHOT_POLICY
             and _SNAPSHOT_POLICY.__code__ is _SNAPSHOT_POLICY_CODE
-            and hashing.rfc8785.dumps is _RFC_DUMPS
-            and (type(_RFC_DUMPS) is not FunctionType or _RFC_DUMPS.__code__ is _SNAPSHOT_RFC_CODE)
+            and hashing.__dict__["_dumps"] is _CANONICAL_DUMPS
+            and canonical_writer._dumps is _CANONICAL_DUMPS
+            and _CANONICAL_DUMPS.__code__ is _CANONICAL_DUMPS_CODE
         )
 
     @staticmethod
@@ -5747,8 +5751,9 @@ class RetentionMemoTrace:
             and continuation_codec.canonical_json is _ORIGINAL_CANONICAL
             and hashing.canonical_json is _ORIGINAL_CANONICAL
             and _ORIGINAL_CANONICAL.__code__ is _CANONICAL
-            and hashing.rfc8785.dumps is _RFC_DUMPS
-            and (type(_RFC_DUMPS) is not FunctionType or _RFC_DUMPS.__code__ is _SNAPSHOT_RFC_CODE)
+            and hashing.__dict__["_dumps"] is _CANONICAL_DUMPS
+            and canonical_writer._dumps is _CANONICAL_DUMPS
+            and _CANONICAL_DUMPS.__code__ is _CANONICAL_DUMPS_CODE
             and continuation_codec.sha256 is _SHA256
             and continuation_codec.__dict__.get("len", builtins.len) is builtins.len
             and continuation_codec.__dict__.get("str", builtins.str) is builtins.str
@@ -6774,12 +6779,12 @@ class RetentionMemoTrace:
                 self._byte_private_payloads[id(parent)] = (id(arg), len(arg))
         if event == "return" and code is _LOW_CODE_OBJECTS[2][0]:
             self._byte_detector_frames.pop(id(frame), None)
-        if event == "return" and type(_RFC_DUMPS) is FunctionType and code is _RFC_DUMPS.__code__:
+        if event == "return" and code is _CANONICAL_DUMPS_CODE:
             parent = frame.f_back
             if parent is not None and parent.f_code is _CANONICAL and id(parent) in self._byte_canonical_owners and type(arg) is bytes:
                 self._byte_canonical_buffers[id(parent)] = (id(arg), len(arg))
             elif any(current_retention_stage_memo() is memo for memo in self.memos):
-                self._byte_error("RFC8785 work lacks its original canonical DATA owner", frame, expected_id)
+                self._byte_error("normalized writer work lacks its original canonical DATA owner", frame, expected_id)
             return
         if code is _CANONICAL:
             if event == "call":
@@ -6804,9 +6809,11 @@ class RetentionMemoTrace:
                     type(arg) is not str
                     or type(result) is not bytes
                     or native != (id(result), len(result))
-                    or hashing.rfc8785.dumps is not _RFC_DUMPS
+                    or hashing.__dict__["_dumps"] is not _CANONICAL_DUMPS
+                    or canonical_writer._dumps is not _CANONICAL_DUMPS
+                    or _CANONICAL_DUMPS.__code__ is not _CANONICAL_DUMPS_CODE
                 ):
-                    self._byte_error("canonical output has no original RFC8785 buffer", frame, expected_id, owner)
+                    self._byte_error("canonical output has no original normalized writer buffer", frame, expected_id, owner)
                 else:
                     owner.byte_calls["canonical"] += 1
                     owner.byte_counts["canonical"] += len(result)

@@ -2622,19 +2622,19 @@ def test_native_byte_canonical_channel_refuses_a_wrapped_serializer_even_with_eq
     payload = b'{"message":"ordinary"}'
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
     connection, stack = _native_private_chunk_reader(chunk, payload)
-    original = hashing.rfc8785.dumps
+    original = hashing.__dict__["_dumps"]
 
     def wrapped(value):
         return original(value)
 
     monkeypatch.setattr(selection, "required_private_chunks", lambda _stack: (chunk.reference,))
-    monkeypatch.setattr(hashing.rfc8785, "dumps", wrapped)
+    monkeypatch.setattr(hashing, "_dumps", wrapped)
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
         assert selection.load_private_chunks(
             connection, session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
         ) == (chunk,)
-    assert "canonical output has no original RFC8785 buffer" in trace.byte_errors
+    assert "canonical output has no original normalized writer buffer" in trace.byte_errors
     with pytest.raises(AssertionError, match="native byte provenance invalid"):
         trace.finish(stages=1, require_snapshot=False)
 
@@ -2743,11 +2743,11 @@ def test_native_byte_mode_is_explicit_and_legacy_work_counts_claim_no_byte_evide
     assert _native_monitor_state() == before and sys.getprofile() is prior
 
 
-@pytest.mark.parametrize("bypass", ["strict-parse", "canonical", "rfc8785"])
+@pytest.mark.parametrize("bypass", ["strict-parse", "canonical", "normalized-writer"])
 def test_native_byte_actual_unwrapped_producers_cannot_hide_behind_balanced_memo_counts(monkeypatch, request, bypass):
     from elspeth.contracts import hashing, json_parser
 
-    parse, canonical, dumps = json_parser.parse_json_strict, hashing.canonical_json, hashing.rfc8785.dumps
+    parse, canonical, dumps = json_parser.parse_json_strict, hashing.canonical_json, hashing.__dict__["_dumps"]
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
         for _ in range(2):
@@ -3207,7 +3207,7 @@ def test_native_byte_real_stack_exhaustion_cannot_authorize_a_nearer_chunk_owner
         assert trace.byte_errors == [
             "capture ancestry search exhausted; canonical ownership is unproven",
             "canonical work lacks its complete DATA owner",
-            "RFC8785 work lacks its original canonical DATA owner",
+            "normalized writer work lacks its original canonical DATA owner",
         ]
         assert all(record.byte_calls["canonical"] == record.byte_counts["canonical"] == 0 for record in trace.records)
         assert not trace.uncached_validations and not trace.context_canonical_inspections
@@ -3488,7 +3488,7 @@ def test_native_byte_refusal_diagnostic_retains_only_bounded_source_and_carrier(
     assert len(trace.byte_errors) == 24 and len(diagnostics) == 2
     assert [item["message"] for item in diagnostics] == [
         "canonical work lacks its complete DATA owner",
-        "RFC8785 work lacks its original canonical DATA owner",
+        "normalized writer work lacks its original canonical DATA owner",
     ]
     assert [item["error_index"] for item in diagnostics] == [1, 2]
     for item in diagnostics:
@@ -3508,9 +3508,9 @@ def test_native_byte_refusal_diagnostic_retains_only_bounded_source_and_carrier(
                 "error_count": 24,
                 "messages": [
                     "canonical work lacks its complete DATA owner",
-                    "RFC8785 work lacks its original canonical DATA owner",
+                    "normalized writer work lacks its original canonical DATA owner",
                 ],
-                "first_qualnames": ["canonical_json", "dumps"],
+                "first_qualnames": ["canonical_json", "_dumps"],
             }
         ),
     )
