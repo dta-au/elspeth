@@ -367,7 +367,7 @@ def reconstruct_semantic_no_sdk_tail_batch(
     )
     if (
         tuple(len(item.payload_json.encode("utf-8")) for item in events) != plan.event_bytes
-        or len(append.snapshot_json.encode("utf-8")) != plan.terminal_snapshot_bytes
+        or len(append.snapshot_json.encode("utf-8")) > plan.terminal_snapshot_bytes
         or sum(len(item.payload) for item in prospective) > plan.reserved_bytes
     ):
         raise AuditIntegrityError("V4 semantic no-SDK cold tail exceeded its original H")

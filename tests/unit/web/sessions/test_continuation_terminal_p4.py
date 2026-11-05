@@ -44,6 +44,7 @@ from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationFenceLost
 from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot
+from elspeth.web.sessions.continuation_driver import ContinuationSegmentSettled
 from elspeth.web.sessions.continuation_p4 import (
     read_lost_terminal_p4_on_connection,
     read_p4_transaction_outcome_on_connection,
@@ -53,12 +54,17 @@ from elspeth.web.sessions.continuation_p4_application_store import CommittedCont
 from elspeth.web.sessions.continuation_recovery_candidates import list_recoverable_segments
 from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
+from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+from elspeth.web.sessions.models import composition_states_table as states
+from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import session_operation_fences_table as fences
 from elspeth.web.sessions.models import sessions_table as sessions_rows
+from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.models import user_secrets_table as secret_rows
 from elspeth.web.sessions.service import ComposerP4SQLCompletionUnknown, ComposerTerminalSQLCompletionUnknown
 from tests.unit.web.composer._helpers import _persisted_tool_responses
@@ -69,6 +75,7 @@ from tests.unit.web.sessions import test_continuation_initialization as initiali
 from tests.unit.web.sessions.test_continuation_live_phases import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_p4_product import _contains_identity
 from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
+from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver, _install_original_deadline
 
 operation_store = _operation_store
 
@@ -926,6 +933,149 @@ async def test_terminal_p4_actual_unavailable_publication_precedes_cold_projecti
         assert stored_rows(operation_store[0]) == before
         assert owner.failure_custody.original is original and original.__cause__ is cause and sql_error.__cause__ is sql_cause
         assert len(sdk) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unavailable", "stop_when", "mislabelled_outcome"),
+    (
+        pytest.param(True, "before_driver", False, id="unavailable-observed-stop"),
+        pytest.param(True, "before_authority", False, id="unavailable-late-stop"),
+        pytest.param(False, "before_driver", False, id="ordinary-observed-stop"),
+        pytest.param(False, "before_authority", False, id="ordinary-late-stop"),
+        pytest.param(True, "never", False, id="unavailable-original-service-error"),
+        pytest.param(False, "before_driver", True, id="ordinary-supplied-integrity-label"),
+    ),
+)
+async def test_terminal_p4_live_settlement_derives_integrity_priority_from_retained_source(
+    operation_store, tmp_path, monkeypatch, unavailable, stop_when, mislabelled_outcome
+):
+    _install_original_deadline(operation_store, monkeypatch)
+    producer = _actual_unavailable_terminal_case if unavailable else _terminal_case
+    async with producer(operation_store, tmp_path, monkeypatch) as case:
+        if unavailable:
+            owner, running, sdk, original, cause, sql_error, sql_cause, phase, retained = case
+        else:
+            owner, running, sdk, original, cause, _entered, phase = case
+            sql_error = sql_cause = None
+            retained = decode_terminal_p4_result(
+                phase.application.result_document, input_document=phase.application.input_document, env_ref_names=phase.inventory.names
+            )
+        assert retained.receipt.unwind_audit_failed is unavailable
+        driver = _actual_failure_driver(operation_store, owner, running)
+        driver.work, driver.provider = owner.work, owner.provider_owner
+        record = await driver.record()
+        assert record.cancel_requested_at is None
+        with operation_store[0].connect() as conn:
+            session = conn.execute(select(sessions_rows).where(sessions_rows.c.id == str(running.claim.session_id))).one()
+        assert record.actor_user_id == session.user_id
+
+        def mark_stop():
+            marked = owner.authority.request_owner_cancel(
+                session_id=running.claim.session_id,
+                operation_id=running.claim.operation_id,
+                actor_user_id=session.user_id,
+                auth_provider_type=session.auth_provider_type,
+            )
+            assert marked is not None and marked.status == "running" and marked.cancel_requested_at is not None
+            return marked
+
+        if stop_when == "before_driver":
+            record = await asyncio.to_thread(mark_stop)
+        actual_settle = owner.authority.settle_continuation_owner
+        actual_verify = driver.worker._verify_terminal_before_release
+        projected, supplied, verified = [], [], []
+        projected_original = project_composer_operation_error(original, request_id=record.request_id)
+        assert projected_original.error_type != "audit_integrity_error"
+
+        def settle(actual_running, **kwargs):
+            assert actual_running is running
+            projected.append(kwargs["outcome"])
+            if stop_when == "before_authority":
+                mark_stop()
+            if mislabelled_outcome:
+                kwargs["outcome"] = project_composer_operation_error(
+                    AuditIntegrityError("a caller label cannot replace retained provenance"), request_id=record.request_id
+                )
+                assert kwargs["outcome"].error_type == "audit_integrity_error"
+            supplied.append(kwargs["outcome"])
+            return actual_settle(actual_running, **kwargs)
+
+        async def verify(actual_running, actual_lease, terminal, settlement):
+            assert actual_running is running and actual_lease is owner.lease
+            with operation_store[0].connect() as conn:
+                fence = conn.execute(select(fences).where(fences.c.session_id == str(running.claim.session_id))).one()
+            expected = running.session_operation_context.fence
+            assert (fence.operation_id, fence.operation_epoch, fence.lease_token) == (
+                expected.operation_id,
+                expected.operation_epoch,
+                expected.lease_token,
+            )
+            assert fence.released_at is None
+            await actual_verify(actual_running, actual_lease, terminal, settlement)
+            verified.append(terminal)
+
+        def unchanged_rows():
+            with operation_store[0].connect() as conn:
+                return tuple(
+                    tuple(conn.execute(select(table).order_by(*table.primary_key.columns))) for table in (messages, states, physical, usage)
+                )
+
+        before = unchanged_rows()
+        with monkeypatch.context() as patch:
+            patch.setattr(owner.authority, "settle_continuation_owner", settle)
+            patch.setattr(driver.worker, "_verify_terminal_before_release", verify)
+            result = await driver.settle(record, original)
+        assert type(result) is ContinuationSegmentSettled and len(projected) == len(supplied) == len(verified) == 1
+        terminal = result.terminal
+        assert verified[0] == terminal and terminal.status == "failed" and terminal.settled_by == "owner_terminal"
+        assert (terminal.cancel_requested_at is None) is (stop_when == "never")
+        if unavailable:
+            assert projected[0].error_type == "audit_integrity_error", "the driver must prefer actual retained integrity to Stop or service"
+        elif stop_when == "before_driver":
+            assert projected[0].error_type == "request_cancelled"
+        else:
+            assert projected[0] == projected_original, "the authority must observe Stop after the driver's original projection"
+        assert terminal.result_json is not None
+        error = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
+        assert error.body["request_id"] == terminal.request_id
+        if unavailable:
+            assert error.error_type == error.body["error_type"] == "audit_integrity_error"
+            assert error.http_status == 500 and terminal.failure_code == error.failure_code == "http_error"
+            assert error.diagnostic_id is None
+            assert error.body["detail"] == "ELSPETH stopped before replying because it could not verify this session's audit trail."
+            assert sql_error.__cause__ is sql_cause
+        else:
+            assert error.error_type == error.body["error_type"] == "request_cancelled"
+            assert error.http_status == 499 and terminal.failure_code == error.failure_code == "request_cancelled"
+        with operation_store[0].connect() as conn:
+            segment = conn.execute(
+                select(segments).where(
+                    segments.c.session_id == str(running.claim.session_id),
+                    segments.c.operation_id == running.claim.operation_id,
+                    segments.c.sequence == running.claim.segment_sequence,
+                )
+            ).one()
+            attempt = conn.execute(
+                select(attempts).where(
+                    attempts.c.session_id == str(running.claim.session_id),
+                    attempts.c.operation_id == running.claim.operation_id,
+                    attempts.c.sequence == running.claim.segment_sequence,
+                    attempts.c.generation == running.claim.ownership_generation,
+                )
+            ).one()
+        assert segment.state == "settled" and attempt.outcome == "settled" and attempt.revoked_at is not None
+        assert unchanged_rows() == before, "parent settlement must not replay provider usage or publish another assistant"
+        assert await asyncio.to_thread(_readback, operation_store[0], phase) is phase.committed_outcome.audit_outcome
+        assert (
+            decode_terminal_p4_result(
+                phase.application.result_document, input_document=phase.application.input_document, env_ref_names=phase.inventory.names
+            )
+            == retained
+        )
+        assert len(sdk) == 1 and owner.failure_custody.original is original and original.__cause__ is cause
+        await _close_released_lease(operation_store, owner, running)
+        owner.work.coordinator.assert_completed()
 
 
 @pytest.mark.asyncio

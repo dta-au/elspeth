@@ -101,7 +101,9 @@ async def test_actual_semantic_review_repair_preserves_paid_lineage_without_anot
 ):
     from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointRepairContinued
     from elspeth.web.sessions import continuation_checkpoint_end_complete_repair as repair_store
+    from elspeth.web.sessions.continuation_checkpoint_end_complete_repair_cold import require_end_complete_repair_postwrite_on_connection
     from elspeth.web.sessions.continuation_semantic_actions import read_original_dispatched_semantic_review_on_connection
+    from elspeth.web.sessions.models import session_operation_fences_table as fences
     from tests.unit.web.sessions import test_continuation_end_shared_execution as shared_fixture
     from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 
@@ -216,6 +218,65 @@ async def test_actual_semantic_review_repair_preserves_paid_lineage_without_anot
             projected = await project_first_cold_end_repair(gate=gate)
             assert type(projected) is ColdProjectedEndRepair
             batch = sessions.complete_v4_checkpoint_end_cold_repair_sync(projected=projected)
+            before_opponent = stored_rows(store[0])
+            with locked_session_transaction(store[0], sid) as conn:
+                paid = conn.execute(select(physical).where(physical.c.attempt_id == batch.owed.attempt_id)).one()
+                original_hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == batch.owed.attempt_id)).one()
+                write_fence = conn.execute(select(fences).where(fences.c.session_id == sid)).one()
+                original_identity = (paid.operation_id, paid.operation_epoch, paid.lease_token)
+                replacement_identity = (context.fence.operation_id, context.fence.operation_epoch, context.fence.lease_token)
+                assert (write_fence.operation_id, write_fence.operation_epoch, write_fence.lease_token) == replacement_identity
+                assert all(original != replacement for original, replacement in zip(original_identity, replacement_identity, strict=True))
+                assert paid.operation_id == batch.owed.new_hold.session_operation_id
+                assert paid.operation_epoch == batch.owed.new_hold.session_operation_epoch
+                assert original_hold.state == "consumed"
+                pass_row = conn.execute(select(messages).where(messages.c.id == batch.pass_audit.message_id)).one()
+                withheld_sequence = (
+                    conn.execute(select(messages.c.sequence_no).where(messages.c.id == projected.withheld.message_id)).scalar_one()
+                    if projected.withheld is not None
+                    else None
+                )
+
+                def require_original_paid():
+                    return require_end_complete_repair_postwrite_on_connection(
+                        conn,
+                        prepared=None,
+                        batch=batch,
+                        pass_sequence=pass_row.sequence_no,
+                        withheld_sequence=withheld_sequence,
+                        observed_at=pass_row.created_at,
+                        hold_state="consumed",
+                        cold_running=replacement,
+                        cold_names=names,
+                    )
+
+                proven_original = require_original_paid()
+                assert proven_original.checkpoint_id == batch.append.checkpoint_id
+                corrupted = conn.begin_nested()
+                try:
+                    # All three fields belong to the real current writer, but
+                    # this paid attempt must retain its original creator fence.
+                    updated = conn.execute(
+                        update(physical)
+                        .where(physical.c.attempt_id == batch.owed.attempt_id)
+                        .values(
+                            operation_id=context.fence.operation_id,
+                            operation_epoch=context.fence.operation_epoch,
+                            lease_token=context.fence.lease_token,
+                        )
+                    )
+                    assert updated.rowcount == 1
+                    substituted = conn.execute(select(physical).where(physical.c.attempt_id == batch.owed.attempt_id)).one()
+                    assert (substituted.operation_id, substituted.operation_epoch, substituted.lease_token) == replacement_identity
+                    with pytest.raises(AuditIntegrityError, match=r"^END repair cold check lost its original quota ledger$"):
+                        require_original_paid()
+                finally:
+                    corrupted.rollback()
+                assert require_original_paid() == proven_original
+                assert conn.execute(select(physical).where(physical.c.attempt_id == batch.owed.attempt_id)).one() == paid
+                assert conn.execute(select(holds).where(holds.c.provider_attempt_id == batch.owed.attempt_id)).one() == original_hold
+                assert conn.execute(select(fences).where(fences.c.session_id == sid)).one() == write_fence
+            assert stored_rows(store[0]) == before_opponent and len(end_requests) == 1
         finally:
             await lease.close()
             work.coordinator.assert_completed()

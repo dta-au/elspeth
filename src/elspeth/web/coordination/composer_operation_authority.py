@@ -770,8 +770,8 @@ class ComposerAsyncOperationAuthority:
         with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
             from elspeth.web.composer.continuation_next_action import validate_continuation_structure_on_connection
             from elspeth.web.composer.continuation_selection import SelectedContinuationState
-            from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection
-            from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Preparation
+            from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection, terminal_service_failure
+            from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
             from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
             from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
 
@@ -779,19 +779,23 @@ class ComposerAsyncOperationAuthority:
             terminal_source = read_terminal_p4_source_on_connection(
                 conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, env_ref_names=env_ref_names
             )
-            if type(terminal_source) is StoredTerminalP4Preparation:
-                raise ComposerTerminalSQLCompletionUnknown("terminal P4 preparation cannot become a claimed completion")
             if terminal_source is not None:
+                if not isinstance(terminal_source, StoredTerminalP4Application):
+                    raise ComposerTerminalSQLCompletionUnknown("terminal P4 preparation cannot become a claimed completion")
                 if type(outcome) is not ComposerOperationError:
                     raise AuditIntegrityError("terminal service completion cannot publish operation success")
                 parent = _read(conn, running.claim.session_id, running.claim.operation_id)
                 if parent is None:
                     raise AuditIntegrityError("terminal P4 disposition lost its actual logical request")
-                if parent.cancel_requested_at is not None:
+                terminal_failure = terminal_service_failure(terminal_source, request_id=parent.request_id)
+                authoritative_failure = terminal_failure.error_type == "audit_integrity_error"
+                if authoritative_failure:
+                    outcome = terminal_failure
+                elif parent.cancel_requested_at is not None:
                     from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 
                     outcome = request_cancelled_error(request_id=parent.request_id)
-                return settle_composer_operation_on_connection(conn, running, outcome=outcome)
+                return settle_composer_operation_on_connection(conn, running, outcome=outcome, authoritative_failure=authoritative_failure)
 
             stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
             selected = SelectedContinuationState(

@@ -6,6 +6,7 @@ import json
 from contextlib import AsyncExitStack
 from dataclasses import replace
 from datetime import timedelta
+from hashlib import sha256
 
 import litellm
 import pytest
@@ -14,11 +15,17 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer import continuation_semantic_advisor as semantic_physical
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.bounded_json import PROVIDER_ARTIFACT_UNAVAILABLE
+from elspeth.web.composer.continuation import AdvisorFrame
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
-from elspeth.web.composer.continuation_codec import decode_continuation_response
+from elspeth.web.composer.continuation_codec import (
+    decode_continuation_response,
+    decode_continuation_snapshot,
+    encode_continuation_snapshot,
+)
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
@@ -32,16 +39,20 @@ from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.visible_tool_event import visible_response_gap_for_source
+from elspeth.web.config import WebSettings
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.sessions import continuation_primary as primary_sql
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
-from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.continuation import load_snapshot, read_chunk
 from elspeth.web.sessions.continuation_cost import _closed_call
 from elspeth.web.sessions.continuation_semantic_advisor import read_semantic_advisor_outcome_on_connection
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_terminal import read_v4_semantic_paid_incomplete_terminal_on_connection
+from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import reconstruct_semantic_no_sdk_tail_batch
 from elspeth.web.sessions.continuation_semantic_v4_no_sdk_terminal import read_v4_semantic_no_sdk_terminal_on_connection
 from elspeth.web.sessions.models import chat_messages_table as messages
+from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import quota_provider_attempts_table as attempts
@@ -52,6 +63,7 @@ from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, _reply
 from tests.unit.web.sessions import test_continuation_initialization as initialization_fixture
 from tests.unit.web.sessions import test_continuation_primary_v4_live as primary_fixture
+from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
 from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST
 from tests.unit.web.sessions.test_continuation_semantic_advisor import _semantic_case
 from tests.unit.web.sessions.test_continuation_semantic_advisor import operation_store as _operation_store
@@ -368,11 +380,23 @@ async def test_v4_semantic_changed_bounded_audit_is_rejected_before_paid_settlem
 
 
 @pytest.mark.asyncio
-async def test_v4_semantic_pre_sdk_failure_closes_original_zero_use_and_cold_terminal(operation_store, tmp_path, monkeypatch):
+@pytest.mark.parametrize("requested_model", (None, "openai/" + "m" * 204 + "\\" * 45), ids=("ordinary", "escaped-model"))
+async def test_v4_semantic_pre_sdk_failure_closes_original_zero_use_and_cold_terminal(
+    operation_store, tmp_path, monkeypatch, requested_model
+):
+    if requested_model is not None:
+        original_settings = semantic_fixture._required_guard_settings
+
+        def configured_settings(tmp_path, monkeypatch):
+            settings, requests = original_settings(tmp_path, monkeypatch)
+            return WebSettings.model_validate({**settings.model_dump(), "composer_advisor_model": requested_model}), requests
+
+        monkeypatch.setattr(semantic_fixture, "_required_guard_settings", configured_settings)
     store = _v4_store(operation_store, monkeypatch)
     async with _semantic_case(store, tmp_path, monkeypatch) as case:
         assert type(case["runtime"].source.policy) is ContinuationAdmissionPolicyV4
         sdk = []
+        admissions = []
 
         async def completion(**_kwargs):
             sdk.append(1)
@@ -382,6 +406,7 @@ async def test_v4_semantic_pre_sdk_failure_closes_original_zero_use_and_cold_ter
 
         def refuse_after_admission(self):
             if self.continuation_semantic_v4_admission is not None:
+                admissions.append(self.continuation_semantic_v4_admission)
                 raise TimeoutError("injected semantic pre-SDK after original H")
             return original(self)
 
@@ -390,6 +415,9 @@ async def test_v4_semantic_pre_sdk_failure_closes_original_zero_use_and_cold_ter
         phases = _phases(case)
         result = await run_continuation_semantic_advisor(phases, case["runtime"].source.selected)
         assert type(result) is SemanticAdvisorNoSdkTerminal and not sdk
+        assert len(admissions) == 1
+        admission = admissions[0]
+        plan = admission.no_sdk_tail
         running = case["running"]
         sid, operation = str(running.claim.session_id), running.claim.operation_id
         with store[0].connect() as conn:
@@ -400,10 +428,94 @@ async def test_v4_semantic_pre_sdk_failure_closes_original_zero_use_and_cold_ter
             cold = read_v4_semantic_no_sdk_terminal_on_connection(
                 conn, session_id=running.claim.session_id, operation_id=operation, effect_key=effect.effect_key
             )
+            assert cold is not None
+            terminal_published_at = restore_utc(
+                conn.execute(
+                    select(checkpoints.c.created_at).where(
+                        checkpoints.c.session_id == sid,
+                        checkpoints.c.operation_id == operation,
+                        checkpoints.c.checkpoint_id == cold.terminal.checkpoint_id,
+                    )
+                ).scalar_one()
+            )
+            receipt_json = read_chunk(conn, session_id=sid, operation_id=operation, key=effect.result_chunk_key).decode("utf-8")
         assert cold is not None and cold.hold_state == "consumed"
         assert effect.disposition == "refused" and hold.state == "consumed"
         assert physical.settled_at is not None and physical.ledger_entry_id == entries[0].entry_id
         assert len(entries) == 1 and entries[0].prompt_tokens == entries[0].completion_tokens == 0
+        assert case["request"].options["model"] == plan.requested_model == effect.requested_model == entries[0].model
+        assert cold.provider_attempt_id == admission.attempt.attempt_id == physical.attempt_id
+
+        def reconstruct(tail_plan, retained_receipt=receipt_json):
+            return reconstruct_semantic_no_sdk_tail_batch(
+                tail_plan,
+                receipt_json=retained_receipt,
+                input_sha256=effect.input_sha256,
+                effect_key=effect.effect_key,
+                creator_sequence=effect.creator_sequence,
+                creator_generation=effect.creator_generation,
+                published_at=terminal_published_at,
+            )
+
+        if requested_model is not None:
+            assert requested_model.isprintable() and len(requested_model.encode("utf-8")) == 256
+            assert plan.requested_model == requested_model
+            receipt_bytes = len(receipt_json.encode("utf-8"))
+            assert len(str(plan.maximum_receipt_bytes)) == len(str(receipt_bytes)) + 1
+            terminal_bytes = len(cold.terminal.payload_json.encode("utf-8"))
+            assert terminal_bytes + 1 == plan.terminal_snapshot_bytes
+            tail = reconstruct(plan)
+            assert tail.append.snapshot_json == cold.terminal.payload_json
+            actual_bytes = sum(len(item.payload) for item in tail.prospective)
+            assert actual_bytes <= plan.reserved_bytes <= admission.hold.reserved_bytes
+
+            # These copies are bound-check DATA opponents, never issued SQL authority.
+            for smaller_bound in (
+                replace(plan, terminal_snapshot_bytes=terminal_bytes - 1),
+                replace(plan, reserved_bytes=actual_bytes - 1),
+            ):
+                with pytest.raises(AuditIntegrityError, match="cold tail exceeded its original H"):
+                    reconstruct(smaller_bound)
+            oversized_receipt = json.loads(receipt_json)
+            oversized_receipt["guard_disposition"] = "x" * plan.maximum_receipt_bytes
+            oversized_json = canonical_json(oversized_receipt)
+            assert len(oversized_json.encode("utf-8")) > plan.maximum_receipt_bytes
+            with pytest.raises(AuditIntegrityError, match="cold receipt changed its exact original source"):
+                reconstruct(plan, oversized_json)
+
+            root = decode_continuation_snapshot(cold.terminal.payload_json)
+            frame = root.frames[-1]
+            assert type(frame) is AdvisorFrame and frame.response is not None
+            changed_frame = frame.model_copy(update={"response": frame.response.model_copy(update={"byte_length": receipt_bytes - 1})})
+            changed_json = encode_continuation_snapshot(root.model_copy(update={"frames": (*root.frames[:-1], changed_frame)}))
+            changed_payload = changed_json.encode("utf-8")
+            assert changed_json != cold.terminal.payload_json and len(changed_payload) <= plan.terminal_snapshot_bytes
+            with store[0].begin() as conn:
+                savepoint = conn.begin_nested()
+                try:
+                    changed = conn.execute(
+                        update(chunks)
+                        .where(
+                            chunks.c.session_id == sid,
+                            chunks.c.operation_id == operation,
+                            chunks.c.chunk_key == f"snapshot:{cold.terminal.checkpoint_id}",
+                        )
+                        .values(payload=changed_payload, sha256=sha256(changed_payload).hexdigest(), byte_length=len(changed_payload))
+                    )
+                    assert changed.rowcount == 1
+                    assert load_snapshot(conn, session_id=sid, operation_id=operation).payload_json == changed_json
+                    with pytest.raises(AuditIntegrityError, match="lost its exact failed parent/root"):
+                        read_v4_semantic_no_sdk_terminal_on_connection(
+                            conn, session_id=running.claim.session_id, operation_id=operation, effect_key=effect.effect_key
+                        )
+                finally:
+                    savepoint.rollback()
+                assert (
+                    read_v4_semantic_no_sdk_terminal_on_connection(
+                        conn, session_id=running.claim.session_id, operation_id=operation, effect_key=effect.effect_key
+                    )
+                    == cold
+                )
 
 
 @pytest.mark.asyncio

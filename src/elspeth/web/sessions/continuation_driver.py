@@ -659,13 +659,15 @@ class _SegmentDriver:
             combined = self.join_failure(unresolved)
             raise combined from combined.__cause__
         if type(source) is StoredTerminalP4Application:
-            failure = (
-                request_cancelled_error(request_id=record.request_id)
-                if record.cancel_requested_at is not None
-                else project_composer_operation_error(original, request_id=record.request_id)
-                if original is not None
-                else terminal_service_failure(source, request_id=record.request_id)
-            )
+            terminal_failure = terminal_service_failure(source, request_id=record.request_id)
+            if terminal_failure.error_type == "audit_integrity_error":
+                failure = terminal_failure
+            elif record.cancel_requested_at is not None:
+                failure = request_cancelled_error(request_id=record.request_id)
+            elif original is not None:
+                failure = project_composer_operation_error(original, request_id=record.request_id)
+            else:
+                failure = terminal_failure
             terminal = await _registered(
                 work=self.work,
                 source=RequiredWorkSource.CONTINUATION_STATE_SQL,
