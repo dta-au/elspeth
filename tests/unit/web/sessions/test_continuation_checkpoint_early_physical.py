@@ -36,6 +36,7 @@ from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.continuation_retention_memo import current_v4_preparation_memo
 from elspeth.web.coordination.database_clock import database_now
@@ -180,14 +181,15 @@ def _early_arguments(source):
 
 async def _invoke_early(source):
     owner = source.phase_owner
-    return await owner.phases.service._advisor_checkpoint._call_advisor_with_audit(
-        _early_arguments(source),
-        recorder=owner.runtime.live.recorder,
-        provider_owner=owner.phases.provider_owner,
-        structured_output=True,
-        _outcome=source.capture,
-        checkpoint_early_source=source,
-    )
+    with prompt_guard_user_scope(owner.runtime.bindings.message):
+        return await owner.phases.service._advisor_checkpoint._call_advisor_with_audit(
+            _early_arguments(source),
+            recorder=owner.runtime.live.recorder,
+            provider_owner=owner.phases.provider_owner,
+            structured_output=True,
+            _outcome=source.capture,
+            checkpoint_early_source=source,
+        )
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,7 @@ from elspeth.web.composer.continuation_evidence_application_data import (
     require_portable_p4_application,
     retain_portable_application_on_live_evidence,
 )
-from elspeth.web.composer.continuation_evidence_application_values import PortableP4ApplicationEntry
+from elspeth.web.composer.continuation_evidence_application_values import P4ApplicationSources, PortableP4ApplicationEntry
 from elspeth.web.composer.continuation_evidence_graph import _restore_current_evidence, capture_turn_evidence
 from elspeth.web.composer.state import CompositionState
 from tests.helpers.continuation_inventory import inventory_work
@@ -527,6 +527,173 @@ async def test_portable_projection_carries_actual_input_members_without_repeated
         with pytest.raises(AuditIntegrityError, match="buffer drain cursor exceeds its retained channel"):
             live_application._project_recorder(invalid_recorder, malformed, values["result"], env_ref_names=names)
         assert len(attempts) == start + 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("graph", "nongraph"))
+async def test_journal_admission_reuses_only_matching_receipt_prepared_sources(operation_store, tmp_path, monkeypatch, kind):
+    from elspeth.contracts.hashing import canonical_json
+    from elspeth.web.sessions import continuation_p4 as receipts
+
+    async with portable_input(operation_store, tmp_path, monkeypatch, kind=kind) as (_running, _args, values, _audit, _messages):
+        bundle = build_portable_p4_application(**values)
+        source, sources = bundle.evidence_after.snapshot, bundle.evidence_after.sources
+        names = values["env_ref_names"]
+        recorder = _recorder_source(bundle.evidence_after)
+        actual_receipt = application_data._decode_p4_receipt_with_prepared
+        actual_prepared = receipts._decode_prepared_p4_with_members
+        actual_independent = application_data.decode_prepared_p4
+        actual_pending = application_data._pending_chunk
+        actual_locators = application_data._journal_effect_locators_from_values
+        prepared_pairs, receipt_values, independent, pending, projected = [], [], [], [], []
+
+        def decode_prepared(encoded, *, env_ref_names):
+            result = actual_prepared(encoded, env_ref_names=env_ref_names)
+            prepared_pairs.append(result)
+            return result
+
+        def decode_receipt(encoded, *, env_ref_names):
+            previous = len(prepared_pairs)
+            result = actual_receipt(encoded, env_ref_names=env_ref_names)
+            assert len(prepared_pairs) == previous + 1 and result[2] is prepared_pairs[-1][0]
+            receipt_values.append(result)
+            return result
+
+        def decode_independent(encoded, *, env_ref_names):
+            independent.append(encoded)
+            return actual_independent(encoded, env_ref_names=env_ref_names)
+
+        def encode_pending(data, *, env_ref_names):
+            result = actual_pending(data, env_ref_names=env_ref_names)
+            pending.append(result)
+            return result
+
+        def project_locators(cohort):
+            result = actual_locators(cohort)
+            projected.append((cohort, result))
+            return result
+
+        monkeypatch.setattr(receipts, "_decode_prepared_p4_with_members", decode_prepared)
+        monkeypatch.setattr(receipts, "_decode_p4_receipt_with_prepared", decode_receipt)
+        monkeypatch.setattr(application_data, "_decode_p4_receipt_with_prepared", decode_receipt)
+        monkeypatch.setattr(application_data, "decode_prepared_p4", decode_independent)
+        monkeypatch.setattr(application_data, "_pending_chunk", encode_pending)
+        monkeypatch.setattr(application_data, "_journal_effect_locators_from_values", project_locators)
+        standalone = application_data.admit_journal_values(bundle.entry, env_ref_names=names, sources=sources, recorder_source=recorder)
+        assert len(receipt_values) == len(prepared_pairs) == len(bundle.entry.applications) == 1
+        assert independent == projected == [] and len(pending) == 1
+        first_receipt, _first_outcome, first_prepared = receipt_values[0]
+        assert first_receipt.prepared_p4_json == sources.chunk(bundle.entry.applications[0].prepared_input).canonical
+        assert canonical_json(first_prepared.model_dump(mode="json")) == first_receipt.prepared_p4_json
+
+        linked = application_data.require_evidence_application_links(source, env_ref_names=names, sources=sources, recorder_source=recorder)
+        assert len(receipt_values) == len(prepared_pairs) == 2 and independent == []
+        assert len(projected) == 1 and projected[0][1] == source.effect_locators
+        record, receipt, outcome = projected[0][0][0]
+        assert record is source.application_entry.applications[0]
+        assert receipt is receipt_values[-1][0] and outcome is receipt_values[-1][1]
+        assert standalone is not linked and standalone.selected.batch.tool_outcomes is not linked.selected.batch.tool_outcomes
+        assert linked.effects is linked.cuts[-1].effects_after
+        assert encode_application_graph(linked, env_ref_names=names, recorder_source=recorder) == bundle.entry.graph_json
+
+        # Public locator projection must still admit its own original receipt.
+        previous = len(receipt_values)
+        assert application_data.journal_effect_locators(bundle.entry, env_ref_names=names, sources=sources) == source.effect_locators
+        assert len(receipt_values) == len(prepared_pairs) == previous + 1 and len(projected) == 1
+
+        # A valid but different independent prepared document is decoded before
+        # the original join refuses; equality is eligibility, not clearance.
+        different = first_prepared.model_copy(update={"assistant_content": first_prepared.assistant_content + " Different retained text."})
+        different_text = canonical_json(different.model_dump(mode="json"))
+        assert actual_independent(different_text, env_ref_names=names) == different
+        malformed = encode_private_chunk(codec="composer.prepared-p4.v1", canonical="{}")
+        different_chunk = encode_private_chunk(codec="composer.prepared-p4.v1", canonical=different_text)
+        bad_pending = encode_private_chunk(codec="composer.p4-pending-batch.v1", canonical="{}")
+        for chunk in (different_chunk, malformed):
+            changed_record = bundle.entry.applications[0].model_copy(
+                update={"prepared_input": chunk.reference, "pending_batch": bad_pending.reference}
+            )
+            entry = bundle.entry.model_copy(update={"applications": (changed_record,)})
+            changed_sources = P4ApplicationSources(entry, (*sources.chunks, chunk, bad_pending))
+            before_pending, before_receipts, before_independent = len(pending), len(receipt_values), len(independent)
+            if chunk is malformed:
+                with pytest.raises(AuditIntegrityError) as expected:
+                    actual_independent(chunk.canonical, env_ref_names=names)
+                with pytest.raises(AuditIntegrityError) as refused:
+                    application_data.admit_journal_values(entry, env_ref_names=names, sources=changed_sources, recorder_source=recorder)
+                assert str(refused.value) == str(expected.value)
+                assert len(pending) == before_pending
+            else:
+                with pytest.raises(AuditIntegrityError, match="portable journal changed its complete selected input/result joins"):
+                    application_data.admit_journal_values(entry, env_ref_names=names, sources=changed_sources, recorder_source=recorder)
+                assert len(pending) == before_pending + 1
+            assert len(receipt_values) == before_receipts + 1 and len(independent) == before_independent + 1
+            assert independent[-1] == chunk.canonical and len(projected) == 1
+
+
+@pytest.mark.asyncio
+async def test_later_real_journal_record_refuses_before_snapshot_locator_comparison(operation_store, monkeypatch):
+    from tests.unit.web.sessions.test_continuation_owed_evidence import committed_evidence_case
+    from tests.unit.web.sessions.test_continuation_p4_application_store import apply_case, second_pending
+
+    running, selected, inventory, _snapshot, first = await committed_evidence_case(operation_store, graph=True, joint=True)
+    try:
+        await apply_case(operation_store, running, selected, inventory)
+        same_running, selected, inventory, _snapshot, second = await second_pending(operation_store, running)
+        assert same_running is running and first.effect_key != second.effect_key
+        applied = await apply_case(operation_store, running, selected, inventory)
+        bundle = applied.bundle
+        source, sources = bundle.evidence_after.snapshot, bundle.evidence_after.sources
+        recorder = _recorder_source(bundle.evidence_after)
+        actual_receipt = application_data._decode_p4_receipt_with_prepared
+        actual_locators = application_data._journal_effect_locators_from_values
+        events = []
+
+        def decode_receipt(encoded, *, env_ref_names):
+            result = actual_receipt(encoded, env_ref_names=env_ref_names)
+            events.append(result[0].effect_key)
+            return result
+
+        def project_locators(cohort):
+            events.append("locator-projection")
+            return actual_locators(cohort)
+
+        monkeypatch.setattr(application_data, "_decode_p4_receipt_with_prepared", decode_receipt)
+        monkeypatch.setattr(application_data, "_journal_effect_locators_from_values", project_locators)
+        assert tuple(record.effect_key for record in source.application_entry.applications) == (first.effect_key, second.effect_key)
+        assert source.effect_locators
+        assert (
+            application_data.require_evidence_application_links(
+                source, env_ref_names=inventory.names, sources=sources, recorder_source=recorder
+            )
+            is not None
+        )
+        assert events == [first.effect_key, second.effect_key, "locator-projection"]
+
+        # First calibrate each independent refusal, then combine them. Both
+        # real receipt decoders must finish before the later record refuses.
+        wrong_locators = source.model_copy(update={"effect_locators": ()})
+        events.clear()
+        with pytest.raises(AuditIntegrityError, match="evidence changed its exact historical graph locators"):
+            application_data.require_evidence_application_links(
+                wrong_locators, env_ref_names=inventory.names, sources=sources, recorder_source=recorder
+            )
+        assert events == [first.effect_key, second.effect_key, "locator-projection"]
+        earlier, later = source.application_entry.applications
+        bad_later = later.model_copy(update={"receipt_id": "different-well-formed-receipt"})
+        changed_entry = source.application_entry.model_copy(update={"applications": (earlier, bad_later)})
+        for candidate in (source, wrong_locators):
+            events.clear()
+            with pytest.raises(AuditIntegrityError, match="portable journal changed its immutable receipt locator"):
+                application_data.require_evidence_application_links(
+                    candidate.model_copy(update={"application_entry": changed_entry}),
+                    env_ref_names=inventory.names,
+                    sources=sources,
+                    recorder_source=recorder,
+                )
+            assert events == [first.effect_key, second.effect_key]
+    finally:
+        operation_store[1].release(running.session_operation_context)
 
 
 @pytest.mark.asyncio

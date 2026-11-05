@@ -50,6 +50,7 @@ from elspeth.web.composer.continuation_evidence_application_values import (
 )
 from elspeth.web.composer.continuation_p4_application import HistoricalP4Application, _project_effects, _project_recorder_cohort
 from elspeth.web.composer.continuation_p4_batch import encode_p4_pending_batch_chunk
+from elspeth.web.composer.continuation_p4_outcome import RetainedAuditOutcome
 from elspeth.web.composer.continuation_prepared_p4 import (
     PreparedP4Members,
     _decode_prepared_p4_with_members,
@@ -60,9 +61,11 @@ from elspeth.web.composer.continuation_tool_batch import _read_json_value
 from elspeth.web.composer.turn_effects import PersistedTurnEffects, TurnEvidence, authored_state_hash
 from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.sessions.continuation import HistoricalEffectLocator
+from elspeth.web.sessions.continuation_owner_results import PersistedComposerTurnReceipt
 from elspeth.web.sessions.continuation_p4 import (
     PreparedP4ResultData,
     ReadmittedP4Result,
+    _decode_p4_receipt_with_prepared,
     decode_p4_receipt,
     require_prepared_issued_preview_p4_result,
 )
@@ -725,6 +728,28 @@ def journal_effect_locators(
     return tuple(locators)
 
 
+def _journal_effect_locators_from_values(
+    values: tuple[tuple[PortableP4ApplicationRecord, PersistedComposerTurnReceipt, RetainedAuditOutcome], ...],
+) -> tuple[RetainedHistoricalEffect, ...]:
+    """Project this journal walk's actual receipts at the evidence locator boundary."""
+    locators = []
+    for record, receipt, outcome in values:
+        if outcome.checkpoint_disposition == "committed":
+            if receipt.authored_state_hash is None:
+                raise AuditIntegrityError("graph receipt lost its actual authored hash")
+            locators.append(
+                RetainedHistoricalEffect(
+                    effect_key=record.effect_key,
+                    input_sha256=record.input_sha256,
+                    creator_operation_id=record.creator_operation_id,
+                    receipt_id=record.receipt_id,
+                    inserted_state_ids=receipt.inserted_state_ids,
+                    authored_state_hash=receipt.authored_state_hash,
+                )
+            )
+    return tuple(locators)
+
+
 def admit_journal_values(
     entry: PortableP4ApplicationEntry,
     *,
@@ -756,7 +781,9 @@ def _admit_application_source(
         if canonical_json(checked.model_dump(mode="json")) != encoded:
             raise AuditIntegrityError("portable journal changed during complete inner admission")
 
-    def require_journal_graph(entry: PortableP4ApplicationEntry, graph: ApplicationGraph) -> None:
+    def require_journal_graph(
+        entry: PortableP4ApplicationEntry, graph: ApplicationGraph
+    ) -> tuple[tuple[PortableP4ApplicationRecord, PersistedComposerTurnReceipt, RetainedAuditOutcome], ...]:
         if len(graph.cuts) != len(entry.applications):
             raise AuditIntegrityError("portable journal lost its exact ordered cuts")
         _require_initial_frontier(graph.cuts[0].effects_before, entry.logical)
@@ -770,6 +797,7 @@ def _admit_application_source(
         if type(sources) is not P4ApplicationSources:
             raise AuditIntegrityError("journal graph lost its original dependency owners")
         _require_completed_graph(graph, entry.applications[-1], sources)
+        values: list[tuple[PortableP4ApplicationRecord, PersistedComposerTurnReceipt, RetainedAuditOutcome]] = []
         for index, record in enumerate(entry.applications):
             response = sources.chunk(record.response)
             pending_chunk = sources.chunk(record.pending_batch)
@@ -788,8 +816,11 @@ def _admit_application_source(
             decoded_response = decode_continuation_response(response)
             if record.result.codec != "composer.owner-result.v1" or record.prepared_input.codec != "composer.prepared-p4.v1":
                 raise AuditIntegrityError("portable journal substituted an immutable owner codec")
-            receipt, outcome = decode_p4_receipt(result_chunk.canonical, env_ref_names=env_ref_names)
-            prepared = decode_prepared_p4(prepared_chunk.canonical, env_ref_names=env_ref_names)
+            receipt, outcome, prepared = _decode_p4_receipt_with_prepared(result_chunk.canonical, env_ref_names=env_ref_names)
+            if receipt.prepared_p4_json != prepared_chunk.canonical:
+                # A different independent source keeps its original decode
+                # before the combined mutable graph/source join can refuse it.
+                prepared = decode_prepared_p4(prepared_chunk.canonical, env_ref_names=env_ref_names)
             cut = graph.cuts[index]
             if (
                 _pending_chunk(cut.data, env_ref_names=env_ref_names) != pending_chunk
@@ -815,6 +846,8 @@ def _admit_application_source(
             )
             _record_effects_aliases(cut.effects_before, cut.effects_after, record.verification)
             _recorder_aliases(cut.recorder_before, cut.recorder_after)
+            values.append((record, receipt, outcome))
+        return tuple(values)
 
     if type(source) is PortableP4ApplicationEntry:
         require_canonical_entry(source)
@@ -858,8 +891,8 @@ def _admit_application_source(
         if type(sources) is not P4ApplicationSources:
             raise AuditIntegrityError("evidence journal lost its original dependency owners")
         require_canonical_entry(entry)
-        require_journal_graph(entry, graph)
-        if snapshot.effect_locators != journal_effect_locators(entry, env_ref_names=env_ref_names, sources=sources):
+        journal_values = require_journal_graph(entry, graph)
+        if snapshot.effect_locators != _journal_effect_locators_from_values(journal_values):
             raise AuditIntegrityError("evidence changed its exact historical graph locators")
     if graph.cuts:
         if graph.effects is not graph.cuts[-1].effects_after:

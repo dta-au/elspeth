@@ -701,6 +701,14 @@ def planned_p4_rejection_hash(
 def decode_p4_receipt(
     encoded: str, *, env_ref_names: frozenset[str] = frozenset()
 ) -> tuple[PersistedComposerTurnReceipt, RetainedAuditOutcome]:
+    receipt, data, _prepared = _decode_p4_receipt_with_prepared(encoded, env_ref_names=env_ref_names)
+    return receipt, data
+
+
+def _decode_p4_receipt_with_prepared(
+    encoded: str, *, env_ref_names: frozenset[str] = frozenset()
+) -> tuple[PersistedComposerTurnReceipt, RetainedAuditOutcome, PreparedP4Value]:
+    """Retain this receipt decode's actual complete prepared input for local joins."""
     receipt = _decode_owned(_RECEIPT, encoded)
     if receipt.schema_version != "composer.persisted-turn.v2" or receipt.prepared_p4_json is None or receipt.audit_outcome_json is None:
         raise AuditIntegrityError("P4 current recovery requires its complete actual writer receipt")
@@ -759,7 +767,7 @@ def decode_p4_receipt(
     ):
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise AuditIntegrityError("P4 receipt lost a complete canonical digest")
-    return receipt, data
+    return receipt, data, prepared
 
 
 def prepare_p4_receipt_data(

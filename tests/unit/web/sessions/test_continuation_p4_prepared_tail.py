@@ -181,6 +181,7 @@ async def test_complete_p4_receipt_reuses_its_initial_prepared_members_and_prese
     from elspeth.contracts.hashing import canonical_json
     from elspeth.web.composer import continuation_p4_outcome as outcomes
     from elspeth.web.composer import continuation_prepared_p4 as prepared_values
+    from elspeth.web.sessions import continuation_p4 as receipts
     from elspeth.web.sessions.continuation_p4 import decode_p4_receipt
 
     engine, repository, _authority, _service, sid = operation_store
@@ -196,7 +197,9 @@ async def test_complete_p4_receipt_reuses_its_initial_prepared_members_and_prese
         encoded = canonical_json(receipt.model_dump(mode="json"))
         actual_members = prepared_values._decoded_prepared_p4_members
         actual_projection = outcomes._audit_outcome_from_prepared_members
+        actual_receipt = receipts._decode_p4_receipt_with_prepared
         attempts, admissions, projections = [], [], []
+        receipt_inputs, receipt_values = [], []
 
         def admit(value, *, env_ref_names):
             assert env_ref_names is inventory.names
@@ -210,8 +213,15 @@ async def test_complete_p4_receipt_reuses_its_initial_prepared_members_and_prese
             projections.append((prepared, members, result))
             return result
 
+        def retain_prepared(encoded, *, env_ref_names):
+            receipt_inputs.append(encoded)
+            result = actual_receipt(encoded, env_ref_names=env_ref_names)
+            receipt_values.append(result)
+            return result
+
         monkeypatch.setattr(prepared_values, "_decoded_prepared_p4_members", admit)
         monkeypatch.setattr(outcomes, "_audit_outcome_from_prepared_members", project)
+        monkeypatch.setattr(receipts, "_decode_p4_receipt_with_prepared", retain_prepared)
         before = retained_rows(engine)
         decoded_receipt, decoded_outcome = decode_p4_receipt(encoded, env_ref_names=inventory.names)
         assert decoded_receipt == receipt and decoded_outcome == checked.result.outcome
@@ -220,6 +230,9 @@ async def test_complete_p4_receipt_reuses_its_initial_prepared_members_and_prese
         assert attempts[0] is initial_prepared
         assert projections[0][0] is initial_prepared and projections[0][1] is initial_members
         assert projections[0][2] is decoded_outcome
+        assert receipt_inputs == [encoded] and len(receipt_values) == 1
+        assert receipt_values[0][0] is decoded_receipt and receipt_values[0][1] is decoded_outcome
+        assert receipt_values[0][2] is initial_prepared
 
         # Calibrate both sides of the call observer: a pure projection performs
         # no admission; public APIs accepting supplied DATA still admit it.
@@ -245,6 +258,19 @@ async def test_complete_p4_receipt_reuses_its_initial_prepared_members_and_prese
         with pytest.raises(AuditIntegrityError) as both_invalid:
             outcomes.decode_audit_outcome_data("{}", prepared=malformed, env_ref_names=inventory.names)
         assert str(both_invalid.value) == str(invalid_outcome.value)
+        assert len(attempts) == 4 and len(admissions) == 3 and len(projections) == 1
+
+        # The public pair still enters the complete decoder, including strict
+        # receipt parsing and its original embedded-prepared refusal.
+        with pytest.raises(AuditIntegrityError):
+            decode_p4_receipt("{}", env_ref_names=inventory.names)
+        with pytest.raises(AuditIntegrityError) as prepared_error:
+            prepared_values.decode_prepared_p4("{}", env_ref_names=inventory.names)
+        bad_embedded = canonical_json(receipt.model_copy(update={"prepared_p4_json": "{}"}).model_dump(mode="json"))
+        with pytest.raises(AuditIntegrityError) as embedded_error:
+            decode_p4_receipt(bad_embedded, env_ref_names=inventory.names)
+        assert str(embedded_error.value) == str(prepared_error.value)
+        assert receipt_inputs == [encoded, "{}", bad_embedded] and len(receipt_values) == 1
         assert len(attempts) == 4 and len(admissions) == 3 and len(projections) == 1
         assert retained_rows(engine) == before
     finally:
