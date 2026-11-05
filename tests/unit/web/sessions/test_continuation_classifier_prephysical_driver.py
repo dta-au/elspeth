@@ -26,6 +26,7 @@ from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
+from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions import continuation_classifier_prephysical_failure as prephysical
 from elspeth.web.sessions import continuation_driver, continuation_next_iteration
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
@@ -33,6 +34,7 @@ from elspeth.web.sessions.continuation_driver import ContinuationSegmentSettled
 from elspeth.web.sessions.continuation_iteration_return import read_iteration_stage_on_connection
 from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
@@ -326,6 +328,166 @@ async def test_actual_worker_retains_prephysical_classifier_convergence_without_
             ).one()
             assert effect.disposition == "unknown" and effect.provider_attempt_id is None
             assert parent.status == "failed" and parent.result_json == terminal.result_json
+            assert fence.released_at is not None
+        assert fold_owner.lease.closed and fold_owner.lease._close_task is not None and fold_owner.lease._close_task.done()
+        assert fold_owner.lease._renewal_task is not None and fold_owner.lease._renewal_task.done()
+        fold_owner.work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_actual_worker_preserves_postcommit_classifier_sql_delivery_error_after_cold_verification(
+    operation_store, tmp_path, monkeypatch
+):
+    original_input = phase_fixture.initialized_primary_input
+
+    async def capped_input(current_store, current_path, current_patch, *, settings_overrides=None):
+        return await original_input(
+            current_store,
+            current_path,
+            current_patch,
+            settings_overrides={**(settings_overrides or {}), "composer_max_composition_turns": 1},
+        )
+
+    monkeypatch.setattr(phase_fixture, "initialized_primary_input", capped_input)
+    async with _v4_applied_timed_case(operation_store, tmp_path, monkeypatch) as (
+        fold_owner,
+        running,
+        applied,
+        _inventory,
+        _captured,
+        prior_sdk,
+    ):
+        store = (operation_store[0], operation_store[1], fold_owner.authority, operation_store[3], operation_store[4])
+        clock = fold_owner.work.coordinator.sql_deadline_owner
+        assert type(clock) is ContinuationSQLDeadlineOwner
+        fresh = ContinuationLivePhases(
+            fold_owner.service, fold_owner.authority, fold_owner.work, fold_owner.provider_owner, fold_owner.lease
+        )
+        driver = _actual_failure_driver(store, fresh, running, drain_signal=clock.drain_signal)
+        driver.work, driver.provider = fresh.work, fresh.provider_owner
+        assert fresh.runtime is None and fold_owner.service._max_composition_turns == 1
+        assert await advance_continuation_iteration(fold_owner, driver.services, applied) is None
+        ready = fold_owner.authority.load_continuation_snapshot(running)
+        with store[0].connect() as conn:
+            stage = read_iteration_stage_on_connection(conn, running, selected=ready)
+        assert stage is not None and stage.stage == "classify_ready" and ready.cursor == applied.stack.cursor + 1
+        sid, oid = str(running.claim.session_id), running.claim.operation_id
+        with store[0].connect() as conn:
+            before_physical = tuple(conn.execute(select(physical).where(physical.c.session_id == sid)))
+            before_holds = tuple(conn.execute(select(holds).where(holds.c.session_id == sid)))
+            before_ledger = tuple(conn.execute(select(ledger).where(ledger.c.session_id == sid)))
+        actual_observer = continuation_next_iteration.observe_continuation_iteration_classification
+        original_run = prephysical.run_required_sql_finish_once
+        actual_cold = continuation_driver.read_classifier_prephysical_terminal_on_connection
+        actual_verify = type(driver.worker)._verify_terminal_before_release
+        originals, writes, cold_reads, worker_verifications, sdk_calls = [], [], [], [], []
+        lost_delivery = OSError("actual postcommit classifier SQL delivery")
+
+        async def expire_then_observe(phases, runtime, *, selected, dispatch, persist):
+            assert phases is fresh and phases.action_clock is not None
+            await asyncio.sleep(max(0.0, phases.action_clock.preparation_deadline_monotonic - monotonic()) + 0.001)
+            try:
+                return await actual_observer(phases, runtime, selected=selected, dispatch=dispatch, persist=persist)
+            except ComposerConvergenceError as original:
+                marker = prephysical.original_classifier_prephysical_failure(phases, original)
+                assert type(marker) is prephysical.ClassifierPrephysicalFailure
+                assert type(original.__context__) is TimeoutError
+                assert clock.remaining_action(monotonic_now=monotonic()) > 0
+                originals.append((original, marker))
+                raise
+
+        async def after_commit(ticket, operation):
+            if ticket.key.source is RequiredWorkSource.TERMINAL_FAILURE_SQL:
+                actual_operation = operation
+
+                def operation():
+                    result = actual_operation()
+                    writes.append(result)
+                    raise lost_delivery
+
+            return await original_run(ticket, operation)
+
+        def cold_read(conn, **kwargs):
+            result = actual_cold(conn, **kwargs)
+            cold_reads.append(result)
+            return result
+
+        async def verify(self, *args, **kwargs):
+            result = await actual_verify(self, *args, **kwargs)
+            worker_verifications.append(result)
+            return result
+
+        async def forbidden_sdk(**kwargs):
+            sdk_calls.append(kwargs)
+            raise AssertionError("postcommit prephysical classifier entered another SDK")
+
+        def construct(*args, **kwargs):
+            assert args == (driver.worker, driver.services, running, fold_owner.lease) and not kwargs
+            return driver
+
+        key = running.claim.session_id, oid
+        local_cancel = asyncio.Event()
+        assert key not in driver.worker._local_cancels
+        driver.worker._local_cancels[key] = local_cancel
+        monkeypatch.setattr(litellm, "acompletion", forbidden_sdk)
+        try:
+            with monkeypatch.context() as scoped:
+                scoped.setattr(continuation_next_iteration, "observe_continuation_iteration_classification", expire_then_observe)
+                scoped.setattr(prephysical, "run_required_sql_finish_once", after_commit)
+                scoped.setattr(continuation_driver, "read_classifier_prephysical_terminal_on_connection", cold_read)
+                scoped.setattr(type(driver.worker), "_verify_terminal_before_release", verify)
+                scoped.setattr(continuation_driver, "_SegmentDriver", construct)
+                with pytest.raises(BaseException) as caught:
+                    await continuation_driver.run_continuation_segment(driver.worker, driver.services, running, fold_owner.lease)
+        finally:
+            assert driver.worker._local_cancels.pop(key) is local_cancel
+
+        def leaves(error):
+            if isinstance(error, BaseExceptionGroup):
+                return tuple(item for nested in error.exceptions for item in leaves(nested))
+            return (error,)
+
+        assert len(originals) == len(writes) == len(cold_reads) == len(worker_verifications) == 1
+        original, marker = originals[0]
+        actual = leaves(caught.value)
+        assert sum(item is original for item in actual) == sum(item is lost_delivery for item in actual) == 1
+        assert len({id(item) for item in actual}) == len(actual)
+        committed = driver._committed_classifier_prephysical
+        assert type(committed) is prephysical.CommittedClassifierPrephysicalFailure
+        assert committed.original is original and committed.original_errors == (lost_delivery,)
+        assert prephysical.original_classifier_prephysical_failure(fresh, original) is marker
+        assert cold_reads[0] == committed.verified
+        assert not sdk_calls and len(prior_sdk) == 1
+        with store[0].connect() as conn:
+            cold = prephysical.read_classifier_prephysical_terminal_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=oid
+            )
+            assert cold == committed.verified and cold is not None
+            terminal = cold.terminal
+            assert terminal.status == "failed" and terminal.failure_code == "http_error" and terminal.result_json is not None
+            public = json.loads(terminal.result_json)
+            detail = public["body"]["detail"]
+            assert public["http_status"] == 422 and public["error_type"] == detail["error_type"] == "convergence"
+            assert detail["budget_exhausted"] == "timeout" and detail["turns_used"] == 1
+            assert "timeout_seconds" not in detail
+            private = conn.execute(select(messages).where(messages.c.id == str(cold.private_message_id))).one()
+            assert private.role == "audit"
+            assert tuple(conn.execute(select(physical).where(physical.c.session_id == sid))) == before_physical
+            assert tuple(conn.execute(select(holds).where(holds.c.session_id == sid))) == before_holds
+            assert tuple(conn.execute(select(ledger).where(ledger.c.session_id == sid))) == before_ledger
+            assert tuple(
+                conn.execute(
+                    select(events.c.tag)
+                    .where(events.c.session_id == sid, events.c.operation_id == oid, events.c.sequence > cold.original_source.cursor)
+                    .order_by(events.c.sequence)
+                ).scalars()
+            ) == ("effect_unknown", "settled")
+            fence = conn.execute(
+                select(fences).where(
+                    fences.c.session_id == sid,
+                    fences.c.operation_id == running.session_operation_context.fence.operation_id,
+                )
+            ).one()
             assert fence.released_at is not None
         assert fold_owner.lease.closed and fold_owner.lease._close_task is not None and fold_owner.lease._close_task.done()
         assert fold_owner.lease._renewal_task is not None and fold_owner.lease._renewal_task.done()

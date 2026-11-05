@@ -30,7 +30,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcome,
 )
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner
-from elspeth.web.composer.audit import begin_dispatch, finish_plugin_crash, finish_success
+from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_plugin_crash, finish_success
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
@@ -83,6 +83,7 @@ def completed_cut(
     call_id="owned-p4-call",
     current_state_id=None,
     prior_withheld_replies=(),
+    recorder: BufferingRecorder | None = None,
 ):
     """Actual completed owners, retaining state/result aliases and source audit."""
     context = running.session_operation_context
@@ -252,6 +253,12 @@ def completed_cut(
             "test",
         ),
     )
+    if recorder is not None:
+        recorder.record_private_tool_authoring(authoring)
+        recorder.record(audit)
+        recorded = recorder.invocations[-1]
+        assert recorded.private_authoring is batch.private_authorings_by_call[call.id]
+        recorder.record_visible_tool_event(recorded, visible)
     return batch, acc, completion, prepared
 
 

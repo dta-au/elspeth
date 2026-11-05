@@ -20,7 +20,7 @@ from elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall
 from elspeth.web.composer.audit import _normalize_audit_payload
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, decode_coupled_batch_data, encode_coupled_batch_data
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json, verify_private_chunk
-from elspeth.web.composer.continuation_prepared_p4 import decode_prepared_p4, prepared_p4_members
+from elspeth.web.composer.continuation_prepared_p4 import _decode_prepared_p4_with_members
 from elspeth.web.composer.continuation_tool_batch import _decode_owned, _dump_owned
 from elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState
 from elspeth.web.composer.tools._common import ToolResult
@@ -53,8 +53,7 @@ def _joined(data: RestoredBatchData, *, env_ref_names: frozenset[str]) -> None:
         or batch.current_call is not None
     ):
         raise AuditIntegrityError("P4 pending cut contains an unowned result or incomplete input")
-    prepared = decode_prepared_p4(batch.p4_input_json, env_ref_names=env_ref_names)
-    members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
+    prepared, members = _decode_prepared_p4_with_members(batch.p4_input_json, env_ref_names=env_ref_names)
     failure = batch.retained_failure
     if failure is not None and failure.kind in ("plugin_crash", "advisor_failure"):
         last = batch.tool_outcomes[-1]

@@ -173,6 +173,7 @@ async def committed_evidence_case(
         call_id=call_id,
         current_state_id=restored.evidence.effects.latest_committed_state_id,
         prior_withheld_replies=prior_withheld,
+        recorder=restored.recorder,
     )
     batch.assistant_message_index = len(restored.messages)
     members = prepared_p4_members(prepared)
@@ -189,13 +190,9 @@ async def committed_evidence_case(
     for row in members.redacted_rows:
         restored.messages.append({"role": "tool", "tool_call_id": row.tool_call_id, "content": row.content})
     restored.evidence.transcript.observe_messages(restored.messages)
-    for authoring in members.authorings:
-        restored.recorder.record_private_tool_authoring(authoring)
-    for invocation in members.invocations:
-        restored.recorder.record(invocation)
-        row = next(row for row in members.redacted_rows if row.tool_call_id == invocation.tool_call_id)
-        if row.visible_event is not None:
-            restored.recorder.record_visible_tool_event(restored.recorder.invocations[-1], row.visible_event)
+    for outcome in batch.tool_outcomes:
+        (invocation,) = tuple(item for item in restored.recorder.invocations if item.tool_call_id == outcome.call.id)
+        assert invocation.private_authoring is batch.private_authorings_by_call[outcome.call.id]
     for reply in members.withheld_replies[len(prior_withheld) :]:
         restored.recorder.record_withheld_reply(reply.origin, reply.content)
     pending_batch = replace(batch, phase="p4_pending", p4_input_json=encode_prepared_p4(prepared))

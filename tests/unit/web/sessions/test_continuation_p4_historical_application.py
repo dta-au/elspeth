@@ -14,8 +14,8 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import continuation_p4_application as application
 from elspeth.web.composer.audit import BufferingRecorder, PrivatePlannerCandidate, begin_dispatch, finish_success
 from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
-from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors
-from elspeth.web.composer.continuation_batch_data import decode_coupled_batch_chunk, encode_coupled_batch_chunk
+from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, RecorderSnapshot, RetainedVisibleLink
+from elspeth.web.composer.continuation_batch_data import RestoredBatchData, decode_coupled_batch_chunk, encode_coupled_batch_chunk
 from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_evidence import decode_turn_evidence
@@ -23,7 +23,7 @@ from elspeth.web.composer.continuation_evidence_application_values import P4Effe
 from elspeth.web.composer.continuation_evidence_graph import _begin_current_evidence
 from elspeth.web.composer.continuation_owed_p4 import materialize_owed_p4_env_inventory
 from elspeth.web.composer.continuation_p4_application import apply_selected_p4_to_live_evidence, selected_p4_batch_data
-from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk
+from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk, encode_p4_pending_batch_chunk
 from elspeth.web.composer.continuation_prepared_p4 import decode_prepared_p4, encode_prepared_p4, prepared_p4_members
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.turn_effects import TurnEvidence
@@ -44,6 +44,41 @@ from tests.unit.web.sessions.test_continuation_primary_result import initialized
 from tests.unit.web.sessions.test_continuation_terminal_p4 import _close_released_lease
 
 operation_store = test_composer_operation_authority.operation_store
+
+
+def append_original_selected_cohort(
+    recorder: BufferingRecorder,
+    data: RestoredBatchData,
+    source: RecorderSnapshot,
+    drained: RecorderDrainCursors,
+) -> BufferingRecorder:
+    """Augment historical DATA with the joined graph's original audit objects."""
+    call_ids = tuple(outcome.call.id for outcome in data.batch.tool_outcomes)
+    selected_indexes = tuple(index for index, invocation in enumerate(source.invocations) if invocation.tool_call_id in call_ids)
+    invocations = tuple(source.invocations[index] for index in selected_indexes)
+    assert tuple(invocation.tool_call_id for invocation in invocations) == call_ids
+    authorings_by_id = {authoring.tool_call_id: authoring for authoring in source.private_authorings}
+    authorings = tuple(authorings_by_id[call_id] for call_id in call_ids)
+    for invocation, authoring in zip(invocations, authorings, strict=True):
+        assert invocation.private_authoring is authoring
+        assert authoring is data.batch.private_authorings_by_call[invocation.tool_call_id]
+    prefix = recorder.snapshot_for_continuation(drained=drained)
+    joined_indexes = {source_index: len(prefix.invocations) + index for index, source_index in enumerate(selected_indexes)}
+    visible = tuple(
+        RetainedVisibleLink(joined_indexes[link.invocation_index], link.event)
+        for link in source.visible_tool_events
+        if link.invocation_index in joined_indexes
+    )
+    joined = replace(
+        prefix,
+        invocations=(*prefix.invocations, *invocations),
+        private_authorings=(*prefix.private_authorings, *authorings),
+        visible_tool_events=(*prefix.visible_tool_events, *visible),
+    )
+    restored, restored_drained = BufferingRecorder.for_continuation(joined)
+    assert restored_drained == drained
+    assert all(actual is original for actual, original in zip(restored.invocations[len(prefix.invocations) :], invocations, strict=True))
+    return restored
 
 
 def portable_historical_data_owners(running, admitted, prepared, names):
@@ -75,13 +110,7 @@ def portable_historical_data_owners(running, admitted, prepared, names):
     )
     recorder.record_withheld_reply("planner_prose_unadmitted", "prior withheld")
     drained = RecorderDrainCursors(invocations=1, withheld_replies=1)
-    for authoring in members.authorings:
-        recorder.record_private_tool_authoring(authoring)
-    for invocation in members.invocations:
-        recorder.record(invocation)
-    for invocation, row in zip(recorder.invocations[drained.invocations :], members.redacted_rows, strict=True):
-        if row.visible_event is not None:
-            recorder.record_visible_tool_event(invocation, row.visible_event)
+    recorder = append_original_selected_cohort(recorder, data, graph.recorder, drained)
     for reply in members.withheld_replies:
         recorder.record_withheld_reply(reply.origin, reply.content)
     recorder.record(
@@ -369,7 +398,21 @@ async def pending_portable_library_case(store, tmp_path, monkeypatch, *, graph):
 
 
 def live_projection_owners(running, selected, prepared, names):
-    data = selected_p4_batch_data(selected, env_ref_names=names)
+    compose = selected.stack.frames[0]
+    assert type(compose) is ComposeFrame
+    admitted = decode_turn_evidence(
+        next(chunk for chunk in selected.chunks if chunk.reference == compose.evidence),
+        env_ref_names=names,
+        source_chunks=selected.chunks,
+    )
+    graph = admitted.take_graph()
+    assert graph is not None
+    data = graph.selected
+    frame = selected.stack.frames[-1]
+    assert type(frame) is ToolBatchFrame
+    assert encode_p4_pending_batch_chunk(batch=data.batch, accumulator=data.accumulator, calls=data.calls, env_ref_names=names) == next(
+        chunk for chunk in selected.chunks if chunk.reference == frame.accumulator
+    )
     members = prepared_p4_members(prepared, env_ref_names=names)
     recorder = BufferingRecorder()
     physical, _metadata = actual_record()
@@ -384,14 +427,7 @@ def live_projection_owners(running, selected, prepared, names):
     recorder.record(prefix)
     recorder.record_withheld_reply("planner_prose_unadmitted", "prior withheld")
     drained = RecorderDrainCursors(invocations=1, withheld_replies=1)
-    for authoring in members.authorings:
-        recorder.record_private_tool_authoring(authoring)
-    for invocation in members.invocations:
-        recorder.record(invocation)
-    recorded = recorder.invocations[drained.invocations :]
-    for invocation, row in zip(recorded, members.redacted_rows, strict=True):
-        if row.visible_event is not None:
-            recorder.record_visible_tool_event(invocation, row.visible_event)
+    recorder = append_original_selected_cohort(recorder, data, graph.recorder, drained)
     for reply in members.withheld_replies:
         recorder.record_withheld_reply(reply.origin, reply.content)
     suffix = finish_success(
@@ -401,8 +437,6 @@ def live_projection_owners(running, selected, prepared, names):
     )
     recorder.record(suffix)
     recorder.record_withheld_reply("planner_prose_unadmitted", "later withheld")
-    compose = selected.stack.frames[0]
-    assert type(compose) is ComposeFrame
     bootstrap = decode_continuation_bootstrap(next(chunk for chunk in selected.chunks if chunk.reference == compose.bootstrap))
     assert bootstrap.logical == selected.stack.logical
     original = bootstrap_values(bootstrap)

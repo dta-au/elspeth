@@ -551,9 +551,17 @@ def encode_prepared_p4(value: PreparedP4Value, *, env_ref_names: frozenset[str] 
     return canonical_json(value.model_dump(mode="json", warnings="error"))
 
 
-def decode_prepared_p4(encoded: str, *, env_ref_names: frozenset[str] = frozenset()) -> PreparedP4Value:
+def _decode_prepared_p4_with_members(
+    encoded: str, *, env_ref_names: frozenset[str] = frozenset()
+) -> tuple[PreparedP4Value, PreparedP4Members]:
+    """Return this decode's complete member admission for immediate use."""
     value = _decode_owned(_P4_VALUE, encoded)
-    prepared_p4_members(value, env_ref_names=env_ref_names)
+    members = prepared_p4_members(value, env_ref_names=env_ref_names)
+    return value, members
+
+
+def decode_prepared_p4(encoded: str, *, env_ref_names: frozenset[str] = frozenset()) -> PreparedP4Value:
+    value, _members = _decode_prepared_p4_with_members(encoded, env_ref_names=env_ref_names)
     return value
 
 

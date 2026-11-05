@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from contextvars import Context, ContextVar
 from dataclasses import dataclass
 from hashlib import sha256 as _TRUSTED_SHA256
+from sys import getsizeof
 from threading import Lock
 from types import BuiltinFunctionType, FunctionType
 from typing import TYPE_CHECKING, Literal, Protocol, cast
@@ -60,9 +61,32 @@ class CanonicalTextEncodingKey:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalTextVerificationDependencies:
+    """Closed implementation references, never parsed input or admission state."""
+
+    functions: tuple[object, ...]
+    current: Callable[[], bool]
+
+    def cacheable(self) -> bool:
+        return (
+            type(self.functions) is tuple
+            and len(self.functions) == 17
+            and all(type(function) in (FunctionType, BuiltinFunctionType) for function in self.functions)
+            and type(self.current) is FunctionType
+        )
+
+    @property
+    def retained_bytes(self) -> int:
+        # Charge the descriptor and its reference tuple per entry, including
+        # conservative duplicate charging when implementations share a tuple.
+        return getsizeof(self) + getsizeof(self.functions)
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalTextVerificationKey:
     canonical: str
     cache_bound_bytes: int
+    dependencies: CanonicalTextVerificationDependencies | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,6 +514,9 @@ class RetentionStageMemo:
             or key.cache_bound_bytes < 1
         ):
             raise TypeError("Canonical verification memo requires its exact bounded text key")
+        dependencies = key.dependencies
+        if dependencies is not None and (type(dependencies) is not CanonicalTextVerificationDependencies or not dependencies.cacheable()):
+            raise TypeError("Canonical verification requires its immutable implementation references")
         _require_function_producer(producer)
         with self._lock:
             parent = self._text_parent if not self._closed else None
@@ -497,18 +524,25 @@ class RetentionStageMemo:
             return parent.canonical_text_verification(key, producer)
         cache_key = (producer, key)
         with self._lock:
-            if not self._closed and cache_key in self._canonical_verifications:
+            if not self._closed and (dependencies is None or dependencies.current()) and cache_key in self._canonical_verifications:
                 self._canonical_verifications.move_to_end(cache_key)
                 return
         result_producer: Callable[[str], object] = producer
         if result_producer(key.canonical) is not None:
             raise TypeError("Canonical verification producer must return no mutable value")
+        if dependencies is not None and not dependencies.current():
+            return
         # The bound decides retention only, after the original proof succeeds.
         # Measure actual text, never a possibly corrupt reference byte length.
         text_bytes = utf8_size(key.canonical)
-        size = text_bytes + len(str(key.cache_bound_bytes))
+        size = text_bytes + len(str(key.cache_bound_bytes)) + (dependencies.retained_bytes if dependencies is not None else 0)
         with self._lock:
-            if self._closed or text_bytes > key.cache_bound_bytes or size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            if (
+                self._closed
+                or (dependencies is not None and not dependencies.current())
+                or text_bytes > key.cache_bound_bytes
+                or size > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+            ):
                 return
             if cache_key in self._canonical_verifications:
                 self._canonical_verifications.move_to_end(cache_key)

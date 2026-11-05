@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import replace
 from itertools import permutations
+from sys import getsizeof
 from typing import cast
 
 import pytest
@@ -35,6 +36,7 @@ from elspeth.web.composer.continuation_limits import (
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy
 from elspeth.web.continuation_retention_memo import (
     CanonicalTextEncodingKey,
+    CanonicalTextVerificationDependencies,
     CanonicalTextVerificationKey,
     CredentialInputToken,
     CredentialPolicyKey,
@@ -1160,8 +1162,15 @@ async def test_v4_canonical_only_oversize_failure_and_late_completion_never_publ
         with pytest.raises(TypeError, match="no mutable value"):
             parent.canonical_text_verification(CanonicalTextVerificationKey("foreign", 100), foreign)
         assert parent.cached_entry_count == 0
+
+        def current() -> bool:
+            return True
+
+        delayed_dependencies = CanonicalTextVerificationDependencies((delayed,) * 17, current)
         with borrow_v4_preparation_memo_scope() as child, ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(child.canonical_text_verification, CanonicalTextVerificationKey("late", 100), delayed)
+            future = executor.submit(
+                child.canonical_text_verification, CanonicalTextVerificationKey("late", 100, delayed_dependencies), delayed
+            )
             assert entered.wait(5)
             parent.close()
             release.set()
@@ -1186,6 +1195,86 @@ def test_canonical_encoding_replacement_clears_canonical_only_family() -> None:
 
 
 @pytest.mark.asyncio
+async def test_canonical_dependency_charge_affects_retention_only_at_exact_entry_bound() -> None:
+    calls: list[int] = []
+
+    def current() -> bool:
+        return True
+
+    def verify(text: str) -> None:
+        calls.append(len(text))
+
+    dependencies = CanonicalTextVerificationDependencies((verify,) * 17, current)
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    text = "x" * (bound - len(str(bound)) - dependencies.retained_bytes)
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for candidate in (text, text, text + "x", text + "x"):
+            parent.canonical_text_verification(CanonicalTextVerificationKey(candidate, bound, dependencies), verify)
+        assert calls == [len(text), len(text) + 1, len(text) + 1]
+        assert len(parent._canonical_verifications) == 1 and parent._canonical_verification_bytes == bound
+
+
+@pytest.mark.asyncio
+async def test_canonical_dependency_metadata_is_charged_and_observer_counts_exact_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+
+    calls: list[str] = []
+
+    def current() -> bool:
+        return True
+
+    def verify(text: str) -> None:
+        calls.append(text)
+
+    dependencies = CanonicalTextVerificationDependencies((verify,) * 17, current)
+    key = CanonicalTextVerificationKey("😀", 100, dependencies)
+    weight = 4 + len(str(key.cache_bound_bytes)) + getsizeof(dependencies) + getsizeof(dependencies.functions)
+    assert dependencies.retained_bytes == getsizeof(dependencies) + getsizeof(dependencies.functions)
+    observation = EndTextMemoObservation()
+    with observation.install(monkeypatch), v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for _ in range(2):
+            with borrow_v4_preparation_memo_scope() as child:
+                child.canonical_text_verification(key, verify)
+        assert calls == ["😀"] and parent._canonical_verification_bytes == weight
+        assert parent._canonical_verifications[(verify, key)] == weight
+    result = observation.snapshot()
+    assert result["families"]["canonical"]["hits"] == 1 and result["families"]["canonical"]["misses"] == 1
+    assert result["families"]["canonical"]["admissions"] == 1
+    assert result["peak_retained_bytes"] == weight
+    assert result["parents"][0]["closed_empty"] is True
+    assert result["observer_errors"] == result["budget_violations"] == result["fingerprint_drops"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change_at", ("producer", "size"))
+async def test_canonical_dependency_changes_before_publication_never_publish(monkeypatch: pytest.MonkeyPatch, change_at: str) -> None:
+    active = True
+    original_size = memo_module.utf8_size
+    calls: list[str] = []
+
+    def current() -> bool:
+        return active
+
+    def verify(text: str) -> None:
+        nonlocal active
+        calls.append(text)
+        if change_at == "producer":
+            active = False
+
+    def size(text: str) -> int:
+        nonlocal active
+        assert change_at == "size"
+        active = False
+        return original_size(text)
+
+    dependencies = CanonicalTextVerificationDependencies((verify,) * 17, current)
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        monkeypatch.setattr(memo_module, "utf8_size", size)
+        parent.canonical_text_verification(CanonicalTextVerificationKey("value", 100, dependencies), verify)
+        assert calls == ["value"] and parent.cached_entry_count == 0 and parent._canonical_verification_bytes == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("order", tuple(permutations(("full", "canonical", "block", "request"))))
 async def test_four_family_insertions_account_every_retained_entry(monkeypatch: pytest.MonkeyPatch, order: tuple[str, ...]) -> None:
     bound = 1_048_576
@@ -1207,6 +1296,11 @@ async def test_four_family_insertions_account_every_retained_entry(monkeypatch: 
         return RecorderRequestTextProof("r" * 200_000, ())
 
     dependencies = RecorderRequestTextDependencies(encode, encode, hashlib.sha256, frozenset({"shape"}))
+
+    def current() -> bool:
+        return True
+
+    canonical_dependencies = CanonicalTextVerificationDependencies((canonical,) * 17, current)
     with v4_preparation_memo_scope(_advisor_clock()) as parent:
 
         def admit(family: str, request_text: str = "q") -> None:
@@ -1214,7 +1308,7 @@ async def test_four_family_insertions_account_every_retained_entry(monkeypatch: 
                 if family == "full":
                     child.canonical_text_proof(CanonicalTextEncodingKey("f" * 200_000, bound), encode, hashlib.sha256)
                 elif family == "canonical":
-                    child.canonical_text_verification(CanonicalTextVerificationKey("c" * 400_000, bound), canonical)
+                    child.canonical_text_verification(CanonicalTextVerificationKey("c" * 400_000, bound, canonical_dependencies), canonical)
                 elif family == "block":
                     child.recorder_block_hash(RecorderBlockHashKey("0" * 64, "b" * 400_000), block)
                 else:
