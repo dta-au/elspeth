@@ -29,7 +29,7 @@ class EndTextMemoObservation:
     these observations never authorize cache hits or product behavior.
     """
 
-    families = ("full", "canonical", "block", "request")
+    families = ("full", "canonical", "block", "request", "credential", "evidence")
 
     def __init__(self, *, max_fingerprints: int = 1024) -> None:
         self.max_fingerprints = max_fingerprints
@@ -61,17 +61,26 @@ class EndTextMemoObservation:
 
     def _state(self, memo, family, cache_key):
         with memo._lock:
-            entries = (memo._canonical_proofs, memo._canonical_verifications, memo._recorder_block_hashes, memo._v4_recorder_requests)
+            entries = (
+                memo._canonical_proofs,
+                memo._canonical_verifications,
+                memo._recorder_block_hashes,
+                memo._v4_recorder_requests,
+                memo._credential_strings,
+                memo._evidence_references,
+            )
             weights = (
                 memo._canonical_proof_bytes,
                 memo._canonical_verification_bytes,
                 memo._recorder_block_hash_bytes,
                 memo._v4_recorder_request_bytes,
+                memo._credential_string_bytes,
+                memo._evidence_reference_bytes,
             )
             selected = entries[self.families.index(family)]
             hit = cache_key in selected
             value = selected[cache_key] if hit else None
-            weight = value.retained_bytes if hit and family in {"full", "request"} else (value if hit else 0)
+            weight = value.retained_bytes if hit and family in {"full", "request", "credential", "evidence"} else (value if hit else 0)
             return hit, weight, tuple(len(items) for items in entries), weights, memo._shared_text_budget_bytes, not memo._closed
 
     def _observe(self, memo, family, key, producer, digest_producer, operation):
@@ -148,6 +157,8 @@ class EndTextMemoObservation:
         original_canonical = RetentionStageMemo.canonical_text_verification
         original_block = RetentionStageMemo.recorder_block_hash
         original_request = RetentionStageMemo.v4_recorder_request_text
+        original_credential = RetentionStageMemo.credential_string_category
+        original_evidence = RetentionStageMemo.evidence_references
         original_close = RetentionStageMemo.close
 
         def full(memo, key, producer, digest_producer):
@@ -164,18 +175,29 @@ class EndTextMemoObservation:
                 return original_request(memo, key, dependencies, producer)
             return self._observe(memo, "request", key, producer, dependencies, lambda: original_request(memo, key, dependencies, producer))
 
+        def credential(memo, text, classifier):
+            return self._observe(memo, "credential", text, classifier, None, lambda: original_credential(memo, text, classifier))
+
+        def evidence(memo, key, producer):
+            return self._observe(memo, "evidence", key, producer, None, lambda: original_evidence(memo, key, producer))
+
         def close(memo):
             original_close(memo)
+            state = self._state(memo, "full", None)
             with self._lock:
                 ordinal = self._parents.get(memo)
                 if ordinal is not None:
-                    self._parent_states[ordinal]["closed_empty"] = not memo.active and memo.cached_entry_count == 0
+                    self._parent_states[ordinal]["closed_empty"] = (
+                        not memo.active and memo.cached_entry_count == 0 and not any(state[2]) and not any(state[3])
+                    )
 
         with monkeypatch.context() as patch:
             patch.setattr(RetentionStageMemo, "canonical_text_proof", full)
             patch.setattr(RetentionStageMemo, "canonical_text_verification", canonical)
             patch.setattr(RetentionStageMemo, "recorder_block_hash", block)
             patch.setattr(RetentionStageMemo, "v4_recorder_request_text", request)
+            patch.setattr(RetentionStageMemo, "credential_string_category", credential)
+            patch.setattr(RetentionStageMemo, "evidence_references", evidence)
             patch.setattr(RetentionStageMemo, "close", close)
             yield self
 

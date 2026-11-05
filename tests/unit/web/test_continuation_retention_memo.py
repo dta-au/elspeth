@@ -20,7 +20,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web import async_workers
 from elspeth.web import continuation_retention_memo as memo_module
 from elspeth.web.composer import prompt_guard
-from elspeth.web.composer.continuation import ContinuationFrameStack, InitializeFrame
+from elspeth.web.composer.continuation import ContinuationFrameStack, InitializeFrame, PrivateChunkRef
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import (
     _decode_continuation_snapshot_uncached,
@@ -931,7 +931,7 @@ async def test_v4_preparation_sql_cuts_share_only_canonical_and_block_proofs() -
             assert isinstance(outcome, RequiredSQLReturned) and outcome.value == ordinal
         assert calls == {"text": 1, "block": 1, "encoding": 3, "request": 3, "snapshot": 3, "chunk": 3, "scan": 3, "state": 3}
         assert len({id(child) for child in children}) == 3
-        assert parent._shared_text_budget_bytes == CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES == 6_291_456
+        assert parent._shared_text_budget_bytes == CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES == 33_554_432
         with v4_preparation_memo_scope(clock) as nested:
             assert nested is parent
         assert parent.active
@@ -1381,3 +1381,293 @@ async def test_v4_request_lru_key_bound_producer_oversize_and_late_close(monkeyp
             release.set()
             assert future.result(timeout=5) == RecorderRequestTextProof("{}", ())
         assert parent.cached_entry_count == parent._v4_recorder_request_bytes == 0
+
+
+def _evidence_key(canonical: str = '{"source":true}') -> PrivateChunkVerificationKey:
+    chunk = encode_private_chunk(codec="composer.evidence.v2", canonical=canonical)
+    return PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_memo_keys_complete_reference_text_and_producer() -> None:
+    key = _evidence_key()
+    reference = encode_private_chunk(codec="composer.messages.v1", canonical="[]").reference
+    result = (reference, reference)
+    calls: list[str] = []
+
+    def produce(text: str) -> tuple[PrivateChunkRef, ...]:
+        calls.append(text)
+        return result
+
+    def replacement(text: str) -> tuple[PrivateChunkRef, ...]:
+        calls.append("replacement:" + text)
+        return ()
+
+    variants = (
+        key,
+        replace(key, canonical='{"source":false}'),
+        replace(key, reference=key.reference.model_copy(update={"codec": "composer.messages.v1"})),
+        replace(key, reference=key.reference.model_copy(update={"digest": "f" * 64})),
+        replace(key, reference=key.reference.model_copy(update={"byte_length": key.reference.byte_length + 1})),
+    )
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for variant in variants:
+            assert parent.evidence_references(variant, produce) is result
+            assert parent.evidence_references(variant, produce) is result
+        assert calls == [variant.canonical for variant in variants]
+        assert parent.evidence_references(key, replacement) == ()
+        assert parent.evidence_references(key, replacement) == ()
+        assert len(calls) == len(variants) + 1
+        assert parent.cached_entry_count == len(variants) + 1
+        assert parent._evidence_references[(produce, key)].references == (reference, reference)
+        with pytest.raises(ValidationError):
+            reference.byte_length = 99
+    assert parent.cached_entry_count == parent._evidence_reference_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_failures_and_oversize_successes_do_not_publish() -> None:
+    key = _evidence_key()
+    marker = AuditIntegrityError("original evidence parser failure")
+    failures = 0
+    successes = 0
+
+    def fail(_text: str) -> tuple[PrivateChunkRef, ...]:
+        nonlocal failures
+        failures += 1
+        raise marker
+
+    def produce(_text: str) -> tuple[PrivateChunkRef, ...]:
+        nonlocal successes
+        successes += 1
+        return (key.reference,)
+
+    def large_result(_text: str) -> tuple[PrivateChunkRef, ...]:
+        nonlocal successes
+        successes += 1
+        return (key.reference,) * 20_000
+
+    oversized_text = replace(key, canonical="x" * (CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES + 1))
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for _ in range(2):
+            with pytest.raises(AuditIntegrityError) as raised:
+                parent.evidence_references(key, fail)
+            assert raised.value is marker
+            assert parent.evidence_references(oversized_text, produce) == (key.reference,)
+            assert len(parent.evidence_references(key, large_result)) == 20_000
+            assert parent.cached_entry_count == parent._evidence_reference_bytes == 0
+        assert failures == 2 and successes == 4
+        assert parent.evidence_references(key, produce) == (key.reference,)
+        assert parent.evidence_references(key, produce) == (key.reference,)
+        assert successes == 5 and parent.cached_entry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_foreign_results_never_enter_the_cache() -> None:
+    key = _evidence_key()
+    calls = 0
+
+    def produce(_text: str) -> tuple[PrivateChunkRef, ...]:
+        nonlocal calls
+        calls += 1
+        return cast(tuple[PrivateChunkRef, ...], ({"mutable": "graph"},))
+
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for _ in range(2):
+            with pytest.raises(TypeError, match="immutable reference tuple"):
+                parent.evidence_references(key, produce)
+            assert parent.cached_entry_count == parent._evidence_reference_bytes == 0
+        assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_results_borrow_only_original_v4_parent() -> None:
+    key = _evidence_key()
+    calls = 0
+
+    def produce(_text: str) -> tuple[PrivateChunkRef, ...]:
+        nonlocal calls
+        calls += 1
+        return (key.reference,)
+
+    with retention_stage_memo_scope() as ordinary:
+        ordinary.evidence_references(key, produce)
+        ordinary.evidence_references(key, produce)
+        assert ordinary.cached_entry_count == 0
+    with legacy_advisor_preparation_memo_scope(_advisor_clock()) as legacy:
+        legacy.evidence_references(key, produce)
+        legacy.evidence_references(key, produce)
+        assert legacy.cached_entry_count == 0
+    assert calls == 4
+    clock = _advisor_clock()
+    with v4_preparation_memo_scope(clock) as parent:
+        for _ in range(2):
+            with borrow_v4_preparation_memo_scope() as child:
+                child.evidence_references(key, produce)
+                assert child.cached_entry_count == 0 and parent.cached_entry_count == 1
+            assert not child.active and parent.active
+        assert calls == 5
+        clock.finish_preparation()
+        finish_v4_preparation_memo(clock)
+        assert parent.cached_entry_count == parent._evidence_reference_bytes == 0
+        parent.evidence_references(key, produce)
+        assert calls == 6 and parent.cached_entry_count == 0
+    with v4_preparation_memo_scope(_advisor_clock()) as other:
+        other.evidence_references(key, produce)
+        assert calls == 7
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_entry_larger_than_selected_pool_returns_uncached(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", 131_072)
+    key = _evidence_key('"' + "e" * 650_000 + '"')
+    calls = 0
+
+    def produce(_text: str) -> tuple[PrivateChunkRef, ...]:
+        nonlocal calls
+        calls += 1
+        return (key.reference,)
+
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for _ in range(2):
+            assert parent.evidence_references(key, produce) == (key.reference,)
+            assert parent.cached_entry_count == parent._evidence_reference_bytes == 0
+        assert calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ("full", "canonical", "block", "request", "category"))
+@pytest.mark.parametrize("evidence_first", (False, True))
+async def test_evidence_reference_pressure_evicts_across_every_existing_family(
+    monkeypatch: pytest.MonkeyPatch, family: str, evidence_first: bool
+) -> None:
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", bound)
+    key = _evidence_key('"' + "e" * 650_000 + '"')
+    calls = {"evidence": 0, "other": 0}
+
+    def evidence(_text: str) -> tuple[PrivateChunkRef, ...]:
+        calls["evidence"] += 1
+        return (key.reference,)
+
+    def full(other: CanonicalTextEncodingKey) -> bytes:
+        calls["other"] += 1
+        return other.canonical.encode()
+
+    def canonical(_text: str) -> None:
+        calls["other"] += 1
+
+    def block(_key: RecorderBlockHashKey) -> None:
+        calls["other"] += 1
+
+    def request(_key: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        calls["other"] += 1
+        return RecorderRequestTextProof("r" * 325_000, ())
+
+    def category(_text: str) -> None:
+        calls["other"] += 1
+
+    dependencies = RecorderRequestTextDependencies(full, full, hashlib.sha256, frozenset({"shape"}))
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+
+        def admit(is_evidence: bool) -> None:
+            with borrow_v4_preparation_memo_scope() as child:
+                if is_evidence:
+                    child.evidence_references(key, evidence)
+                elif family == "full":
+                    child.canonical_text_proof(CanonicalTextEncodingKey("f" * 350_000, bound), full, hashlib.sha256)
+                elif family == "canonical":
+                    child.canonical_text_verification(CanonicalTextVerificationKey("c" * 650_000, bound), canonical)
+                elif family == "block":
+                    child.recorder_block_hash(RecorderBlockHashKey("0" * 64, "b" * 650_000), block)
+                elif family == "request":
+                    child.v4_recorder_request_text(RecorderRequestTextKey("q" * 325_000, bound), dependencies, request)
+                else:
+                    child.credential_string_category("s" * 650_000, category)
+            # Each successful entry retains over half the pool in payload alone.
+            # Two entries therefore demonstrate missing cross-family accounting,
+            # independently of the implementation's metadata-charge arithmetic.
+            assert parent.cached_entry_count == 1
+
+        admit(evidence_first)
+        admit(not evidence_first)
+        assert calls == {"evidence": 1, "other": 1}
+        admit(not evidence_first)
+        assert calls == {"evidence": 1, "other": 1}
+        admit(evidence_first)
+        assert calls["evidence" if evidence_first else "other"] == 2
+    assert parent.cached_entry_count == parent._evidence_reference_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_pressure_control_detects_omitted_new_family_charge(monkeypatch: pytest.MonkeyPatch) -> None:
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", bound)
+    key = _evidence_key('"' + "e" * 650_000 + '"')
+
+    def evidence(_text: str) -> tuple[PrivateChunkRef, ...]:
+        return (key.reference,)
+
+    def category(_text: str) -> None:
+        return None
+
+    for omit_charge in (False, True):
+        with v4_preparation_memo_scope(_advisor_clock()) as parent:
+            parent.evidence_references(key, evidence)
+            assert parent._evidence_reference_bytes > 650_000
+            if omit_charge:
+                monkeypatch.setattr(parent, "_evidence_reference_bytes", 0)
+            parent.credential_string_category("s" * 650_000, category)
+
+            def require_one_entry() -> None:
+                assert parent.cached_entry_count == 1
+
+            if omit_charge:
+                with pytest.raises(AssertionError):
+                    require_one_entry()
+            else:
+                require_one_entry()
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_overlapping_misses_publish_one_result() -> None:
+    key = _evidence_key()
+    barrier = threading.Barrier(2)
+
+    def produce(_text: str) -> tuple[PrivateChunkRef, ...]:
+        result = (key.reference,)
+        barrier.wait(timeout=5)
+        return result
+
+    with v4_preparation_memo_scope(_advisor_clock()) as parent, ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(parent.evidence_references, key, produce)
+        second = executor.submit(parent.evidence_references, key, produce)
+        assert first.result(timeout=5) is second.result(timeout=5)
+        assert parent.cached_entry_count == 1
+        assert parent._evidence_reference_bytes == parent._evidence_references[(produce, key)].retained_bytes
+
+
+@pytest.mark.asyncio
+async def test_evidence_reference_close_during_borrowed_miss_cannot_publish() -> None:
+    key = _evidence_key()
+    entered, release = threading.Event(), threading.Event()
+
+    def produce(_text: str) -> tuple[PrivateChunkRef, ...]:
+        entered.set()
+        assert release.wait(5)
+        return (key.reference,)
+
+    with (
+        v4_preparation_memo_scope(_advisor_clock()) as parent,
+        borrow_v4_preparation_memo_scope() as child,
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        future = executor.submit(child.evidence_references, key, produce)
+        try:
+            assert entered.wait(5)
+            parent.close()
+        finally:
+            release.set()
+        assert future.result(timeout=5) == (key.reference,)
+        assert parent.cached_entry_count == child.cached_entry_count == 0
+        assert parent._evidence_reference_bytes == 0

@@ -417,3 +417,113 @@ def test_bounded_scanner_preserves_the_original_exception_after_real_size_work(m
     trace.finish(
         stages=1, require_snapshot=False, require_population=False, native_byte_limits=(_native_scan_budget(1, "café☃", 8, requests=1),)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omitted", (None, "credential", "evidence"))
+async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_charges(monkeypatch, omitted):
+    from hashlib import sha256
+
+    from elspeth.web import continuation_retention_memo as memo
+    from elspeth.web.sessions.continuation_selection import _evidence_private_references
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+    from tests.unit.web.composer.test_continuation_evidence_graph import rich_evidence
+    from tests.unit.web.composer.test_continuation_evidence_graph import snapshot as capture_snapshot
+    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+
+    evidence, messages, recorder, logical, _policy = rich_evidence()
+    captured = capture_snapshot(evidence, messages, recorder, logical)
+    chunk = captured.source_chunk
+    canonical = '{"message":"observer"}'
+    calls = dict.fromkeys(EndTextMemoObservation.families, 0)
+
+    def encode(key):
+        calls["full"] += 1
+        return key.canonical.encode("utf-8")
+
+    def verify(_text):
+        calls["canonical"] += 1
+
+    def block(key):
+        calls["block"] += 1
+        assert sha256(key.canonical.encode("utf-8")).hexdigest() == key.expected_digest
+
+    def request(_key):
+        calls["request"] += 1
+        return memo.RecorderRequestTextProof(canonical, ())
+
+    def category(text):
+        calls["credential"] += 1
+        return credential_material._classify_string(text)
+
+    def references(text):
+        calls["evidence"] += 1
+        return _evidence_private_references(text)
+
+    def current():
+        return True
+
+    canonical_dependencies = memo.CanonicalTextVerificationDependencies((verify,) * 17, current)
+    request_dependencies = memo.RecorderRequestTextDependencies(encode, verify, sha256, frozenset({"shape"}))
+    observation = EndTextMemoObservation()
+    if omitted is not None:
+        actual_state = observation._state
+
+        def omit_charge(*args):
+            state = actual_state(*args)
+            weights = tuple(0 if family == omitted else weight for family, weight in zip(observation.families, state[3], strict=True))
+            return (*state[:3], weights, *state[4:])
+
+        monkeypatch.setattr(observation, "_state", omit_charge)
+
+    with observation.install(monkeypatch), memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for _ in range(2):
+            with memo.borrow_v4_preparation_memo_scope() as child:
+                child.canonical_text_proof(memo.CanonicalTextEncodingKey(canonical, 1_048_576), encode, sha256)
+                child.canonical_text_verification(memo.CanonicalTextVerificationKey(canonical, 1_048_576, canonical_dependencies), verify)
+                child.recorder_block_hash(memo.RecorderBlockHashKey(sha256(canonical.encode("utf-8")).hexdigest(), canonical), block)
+                child.v4_recorder_request_text(memo.RecorderRequestTextKey(canonical, 1_048_576), request_dependencies, request)
+                assert child.credential_string_category("ordinary observer text", category) is None
+                assert child.evidence_references(memo.PrivateChunkVerificationKey(chunk.reference, chunk.canonical), references) == (
+                    captured.snapshot.recorder,
+                )
+        entries = (
+            parent._canonical_proofs,
+            parent._canonical_verifications,
+            parent._recorder_block_hashes,
+            parent._v4_recorder_requests,
+            parent._credential_strings,
+            parent._evidence_references,
+        )
+        retained = (
+            sum(entry.retained_bytes for entry in parent._canonical_proofs.values()),
+            sum(parent._canonical_verifications.values()),
+            sum(parent._recorder_block_hashes.values()),
+            sum(entry.retained_bytes for entry in parent._v4_recorder_requests.values()),
+            sum(entry.retained_bytes for entry in parent._credential_strings.values()),
+            sum(entry.retained_bytes for entry in parent._evidence_references.values()),
+        )
+        assert all(entries) and all(weight > 0 for weight in retained)
+        assert retained == (
+            parent._canonical_proof_bytes,
+            parent._canonical_verification_bytes,
+            parent._recorder_block_hash_bytes,
+            parent._v4_recorder_request_bytes,
+            parent._credential_string_bytes,
+            parent._evidence_reference_bytes,
+        )
+        assert all(count == 1 for count in calls.values())
+        result = observation.snapshot()
+        assert set(result["families"]) == {"full", "canonical", "block", "request", "credential", "evidence"}
+        for counts in result["families"].values():
+            assert (counts["requests"], counts["misses"], counts["hits"], counts["admissions"]) == (2, 1, 1, 1)
+        if omitted is None:
+            assert result["peak_retained_bytes"] == sum(retained)
+        else:
+            # A deliberately incomplete observer must fail the independent
+            # entry-based accounting oracle, rather than certify its own sum.
+            with pytest.raises(AssertionError):
+                assert result["peak_retained_bytes"] == sum(retained)
+    result = observation.snapshot()
+    assert result["parents"] and all(row["closed_empty"] for row in result["parents"])
+    assert result["observer_errors"] == result["budget_violations"] == result["fingerprint_drops"] == 0

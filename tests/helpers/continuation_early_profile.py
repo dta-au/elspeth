@@ -2,7 +2,7 @@
 
 Mode zero observes only inclusive clock-to-preparation-finish time. Mode one
 adds selected inclusive spans, native thread CPU, SQL and the already calibrated
-original-witness observer, plus four-family memo statistics. Mode two records
+original-witness observer, plus six-family memo statistics. Mode two records
 the same spans without the memo observer. A separate CPU opt-in, available
 in either span mode, captures the first current-evidence memo scope or every
 original required worker. No mode

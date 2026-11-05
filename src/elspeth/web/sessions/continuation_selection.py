@@ -24,6 +24,7 @@ from elspeth.web.composer.continuation_codec import (
     verify_private_chunk,
 )
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey, current_v4_preparation_memo
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
@@ -98,6 +99,24 @@ def required_private_chunks(stack: ContinuationFrameStack) -> tuple[PrivateChunk
     return tuple(unique.values())
 
 
+def _evidence_private_references(canonical: str) -> tuple[PrivateChunkRef, ...]:
+    from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
+
+    try:
+        snapshot = TurnEvidenceSnapshot.model_validate_json(canonical)
+    except (ValueError, TypeError) as error:
+        raise AuditIntegrityError("private evidence dependency walk lost its closed original schema") from error
+    entry = snapshot.application_entry
+    return (
+        snapshot.recorder,
+        *tuple(
+            reference
+            for record in (() if entry is None else entry.applications)
+            for reference in (record.response, record.pending_batch, record.prepared_input, record.result)
+        ),
+    )
+
+
 def nested_private_chunks(chunk: PrivateChunk) -> tuple[PrivateChunkRef, ...]:
     """Only closed END, Advisor, checkpoint-input and application schemas add edges.
 
@@ -115,21 +134,10 @@ def nested_private_chunks(chunk: PrivateChunk) -> tuple[PrivateChunkRef, ...]:
     ):
         raise AuditIntegrityError("nested private source exceeds its complete document bound")
     if chunk.reference.codec == "composer.evidence.v2":
-        from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
-
-        try:
-            snapshot = TurnEvidenceSnapshot.model_validate_json(chunk.canonical)
-        except (ValueError, TypeError) as error:
-            raise AuditIntegrityError("private evidence dependency walk lost its closed original schema") from error
-        entry = snapshot.application_entry
-        return (
-            snapshot.recorder,
-            *tuple(
-                reference
-                for record in (() if entry is None else entry.applications)
-                for reference in (record.response, record.pending_batch, record.prepared_input, record.result)
-            ),
-        )
+        memo = current_v4_preparation_memo()
+        if memo is not None:
+            return memo.evidence_references(PrivateChunkVerificationKey(chunk.reference, chunk.canonical), _evidence_private_references)
+        return _evidence_private_references(chunk.canonical)
     if chunk.reference.codec == "composer.end.v1":
         candidate = decode_end_candidate(chunk)
         refs = [candidate.response, candidate.state, candidate.evidence, candidate.iteration]

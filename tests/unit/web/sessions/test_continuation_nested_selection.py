@@ -229,3 +229,101 @@ async def test_nested_selection_keeps_original_head_and_current_claim_refusals(o
         assert decode_continuation_snapshot(stored.payload_json).cursor == stored.cursor
     finally:
         operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_actual_evidence_reference_reuse_keeps_semantics_full_keys_and_original_scope(operation_store, tmp_path, monkeypatch):
+    import json
+
+    from elspeth.contracts.hashing import canonical_json
+    from elspeth.web import continuation_retention_memo as memo
+    from elspeth.web.composer.continuation_codec import encode_private_chunk, verify_private_chunk
+    from elspeth.web.sessions import continuation_selection as selection
+    from tests.unit.web.composer.test_portable_evidence_application import build_portable_p4_application, portable_input
+    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+
+    async with portable_input(operation_store, tmp_path, monkeypatch) as (_running, _args, values, _audit, _messages):
+        bundle = build_portable_p4_application(**values)
+        chunk, snapshot = bundle.evidence_chunk, bundle.evidence_after.snapshot
+        assert chunk.reference.codec == "composer.evidence.v2" and snapshot.application_entry is not None
+        expected = (
+            snapshot.recorder,
+            *tuple(
+                reference
+                for record in snapshot.application_entry.applications
+                for reference in (record.response, record.pending_batch, record.prepared_input, record.result)
+            ),
+        )
+        assert len(expected) > 1
+        original = selection._evidence_private_references
+        calls = []
+
+        def references(canonical):
+            calls.append(sha256(canonical.encode("utf-8")).hexdigest())
+            return original(canonical)
+
+        monkeypatch.setattr(selection, "_evidence_private_references", references)
+        for _ in range(2):
+            assert selection.nested_private_chunks(chunk) == expected
+        assert len(calls) == 2
+        with memo.retention_stage_memo_scope() as ordinary:
+            for _ in range(2):
+                assert selection.nested_private_chunks(chunk) == expected
+            assert not ordinary._evidence_references
+        assert len(calls) == 4
+
+        with memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
+            first = selection.nested_private_chunks(chunk)
+            assert first == expected and len(calls) == 5
+            assert selection.nested_private_chunks(chunk) is first and len(calls) == 5
+            with memo.borrow_v4_preparation_memo_scope() as child:
+                assert selection.nested_private_chunks(chunk) is first
+                assert not child._evidence_references
+            assert parent.active and len(calls) == 5
+
+            # Dependency extraction historically relies on its caller for the
+            # digest proof. A changed full ref must miss, preserving that result.
+            digest = chunk.reference.digest
+            other_digest = ("1" if digest[0] == "0" else "0") + digest[1:]
+            different_ref = replace(chunk, reference=chunk.reference.model_copy(update={"digest": other_digest}))
+            assert selection.nested_private_chunks(different_ref) == expected and len(calls) == 6
+            with pytest.raises(AuditIntegrityError):
+                verify_private_chunk(different_ref.reference, different_ref.canonical)
+            other_codec = encode_private_chunk(codec="composer.messages.v1", canonical=chunk.canonical)
+            assert selection.nested_private_chunks(other_codec) == () and len(calls) == 6
+            wrong_length = replace(chunk, reference=chunk.reference.model_copy(update={"byte_length": chunk.reference.byte_length + 1}))
+            with pytest.raises(AuditIntegrityError, match="nested private source exceeds its complete document bound"):
+                selection.nested_private_chunks(wrong_length)
+            assert len(calls) == 6
+
+            for defect in ("authored_hash", "schema"):
+                changed = json.loads(chunk.canonical)
+                if defect == "authored_hash":
+                    current = changed["effects"]["initial_authored_state_hash"]
+                    changed["effects"]["initial_authored_state_hash"] = ("1" if current[0] == "0" else "0") + current[1:]
+                else:
+                    changed["schema_version"] = "not-the-evidence-schema"
+                # Recorder/journal references remain exactly the successful
+                # source's refs; only actual content and its outer hash change.
+                assert changed["recorder"] == json.loads(chunk.canonical)["recorder"]
+                assert changed["application_entry"] == json.loads(chunk.canonical)["application_entry"]
+                malformed = encode_private_chunk(codec=chunk.reference.codec, canonical=canonical_json(changed))
+                verify_private_chunk(malformed.reference, malformed.canonical)
+                prior_calls = len(calls)
+                retained = len(parent._evidence_references), parent._evidence_reference_bytes
+                for _ in range(2):
+                    with pytest.raises(
+                        AuditIntegrityError, match="private evidence dependency walk lost its closed original schema"
+                    ) as refused:
+                        selection.nested_private_chunks(malformed)
+                    if defect == "authored_hash":
+                        assert "evidence altered its actual authored graph hashes" in str(refused.value.__cause__)
+                assert len(calls) == prior_calls + 2
+                assert (len(parent._evidence_references), parent._evidence_reference_bytes) == retained
+
+            prior_calls = len(calls)
+            parent.close()
+            for _ in range(2):
+                assert selection.nested_private_chunks(chunk) == expected
+            assert len(calls) == prior_calls + 2
+            assert not parent._evidence_references and parent._evidence_reference_bytes == 0
