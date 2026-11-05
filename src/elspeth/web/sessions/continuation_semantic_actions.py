@@ -313,6 +313,32 @@ def install_semantic_action_on_connection(
 ) -> StoredContinuationSnapshot:
     """Persist the exact admitted read/review/whole-Stop decision once."""
     admission = read_semantic_action_admission_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    return _install_semantic_action_admission(conn, running, selected=selected, admission=admission)
+
+
+def _install_semantic_action_from_paid_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: StoredContinuationSnapshot,
+    paid: SemanticAdvisorPaidDecisionData,
+) -> StoredContinuationSnapshot:
+    """Join the combined current reader's actual DATA to its original owner.
+
+    Only the lexical read-and-install owner calls this before any root write.
+    Registry, coverage, END candidate and action admission remain unchanged.
+    """
+    admission = _admit_paid(conn, paid)
+    return _install_semantic_action_admission(conn, running, selected=selected, admission=admission)
+
+
+def _install_semantic_action_admission(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: StoredContinuationSnapshot,
+    admission: SemanticActionAdmission,
+) -> StoredContinuationSnapshot:
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     with conn.begin_nested():
         put_chunk(

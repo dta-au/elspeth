@@ -13,15 +13,149 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web import app as app_module
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
+from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_events_table as events
+from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.helpers.composer_operations import message_body
-from tests.helpers.continuation_app import ScriptedSDK, continuation_app, install_sdk, submit_and_settle, tool_call
+from tests.helpers.continuation_app import ScriptedSDK, continuation_app, install_sdk, observe_supported_path, submit_and_settle, tool_call
 from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
 from tests.unit.web.sessions.test_continuation_semantic_advisor import _issuer, _prepare, _rows, _rows_on_connection, _semantic_case
+from tests.unit.web.sessions.test_continuation_semantic_v4_live import _v4_store
 
 operation_store = semantic_fixture.operation_store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end_candidate", (False, True))
+async def test_paired_semantic_selection_reuses_one_actual_source_observation_in_its_original_transaction(
+    operation_store, tmp_path, monkeypatch, end_candidate
+):
+    store = _v4_store(operation_store, monkeypatch)
+    async with _semantic_case(store, tmp_path, monkeypatch, end_candidate=end_candidate) as case:
+        runtime = case["runtime"]
+        selected, inventory = runtime.source.selected, runtime.materialization.inventory
+        observed, assembled, full_reads = [], [], []
+        actual_observe = semantic_sql._input_end_source_observation
+        actual_assemble = semantic_sql._retained_inputs_from_observation
+        actual_read = semantic_sql.read_runtime_source_on_connection
+
+        def observe(conn, *args, **kwargs):
+            result = actual_observe(conn, *args, **kwargs)
+            observed.append((conn, conn.get_transaction(), result))
+            return result
+
+        def assemble(conn, *args, **kwargs):
+            assert observed[-1][0] is conn and observed[-1][1] is conn.get_transaction()
+            assert observed[-1][2] is kwargs["original"]
+            result = actual_assemble(conn, *args, **kwargs)
+            assembled.append(result)
+            return result
+
+        def read(*args, **kwargs):
+            full_reads.append(args[0])
+            return actual_read(*args, **kwargs)
+
+        monkeypatch.setattr(semantic_sql, "_input_end_source_observation", observe)
+        monkeypatch.setattr(semantic_sql, "_retained_inputs_from_observation", assemble)
+        monkeypatch.setattr(semantic_sql, "read_runtime_source_on_connection", read)
+        before = _rows(store[0])
+        with locked_session_transaction(store[0], str(store[4])) as conn:
+            paired = semantic_sql.select_semantic_advisor_graph_and_inputs_on_connection(
+                conn, case["running"], selected=selected, inventory=inventory
+            )
+            assert type(paired) is semantic_sql.SemanticAdvisorGraphSelection
+            assert paired.snapshot.checkpoint_id == selected.checkpoint_id and paired.snapshot.cursor == selected.stack.cursor
+            assert len(observed) == len(assembled) == 1 and full_reads == []
+            assert (observed[0][2].candidate is not None) is end_candidate
+            assert paired.retained_inputs is assembled[0]
+            assert paired.retained_inputs is not None
+            assert _rows_on_connection(conn) == before
+            independent = semantic_sql.read_semantic_advisor_retained_inputs_on_connection(conn, case["running"], selected=paired.snapshot)
+            assert independent == paired.retained_inputs and independent is not paired.retained_inputs
+            assert len(observed) == len(assembled) == 2 and full_reads == []
+            assert _rows_on_connection(conn) == before
+        assert _rows(store[0]) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ("state_bytes", "frontier_bytes", "paid_ledger", "stop"))
+async def test_paired_paid_end_source_does_not_replace_fresh_semantic_writer_admission(operation_store, tmp_path, monkeypatch, drift):
+    store = _v4_store(operation_store, monkeypatch)
+    async with _semantic_case(store, tmp_path, monkeypatch, end_candidate=True) as case:
+        runtime, running = case["runtime"], case["running"]
+        selected, inventory = runtime.source.selected, runtime.materialization.inventory
+        with locked_session_transaction(store[0], str(store[4])) as conn:
+            paired = semantic_sql.select_semantic_advisor_graph_and_inputs_on_connection(
+                conn, running, selected=selected, inventory=inventory
+            )
+            assert paired.snapshot.checkpoint_id == selected.checkpoint_id and paired.retained_inputs is not None
+        if drift == "stop":
+            stopped = runtime.materialization.authority.request_cancel(
+                session_id=running.claim.session_id, operation_id=running.claim.operation_id
+            )
+            assert stopped is not None and stopped.cancel_requested_at is not None
+        before = _rows(store[0])
+        with locked_session_transaction(store[0], str(store[4])) as conn:
+            savepoint = conn.begin_nested()
+            try:
+                if drift in ("state_bytes", "frontier_bytes"):
+                    reference = selected.stack.frames[0].state if drift == "state_bytes" else selected.stack.semantic_frontier
+                    assert reference is not None
+                    changed = conn.execute(
+                        update(chunks)
+                        .where(
+                            chunks.c.session_id == str(store[4]),
+                            chunks.c.operation_id == running.claim.operation_id,
+                            chunks.c.chunk_key == f"value:{reference.codec}:{reference.digest}",
+                        )
+                        .values(sha256="0" * 64)
+                    )
+                    assert changed.rowcount == 1
+                elif drift == "paid_ledger":
+                    changed = conn.execute(update(usage).where(usage.c.session_id == str(store[4])).values(prompt_tokens=999))
+                    assert changed.rowcount == 1
+                damaged = _rows_on_connection(conn)
+                expected = ComposerOperationCancelledDuringTurn if drift == "stop" else AuditIntegrityError
+                with pytest.raises(expected):
+                    _prepare(conn, case, _issuer(case))
+                assert _rows_on_connection(conn) == damaged
+            finally:
+                savepoint.rollback()
+        assert _rows(store[0]) == before
+
+
+@pytest.mark.asyncio
+async def test_paired_semantic_inputs_leave_original_writer_retained_source_read_intact(operation_store, tmp_path, monkeypatch):
+    store = _v4_store(operation_store, monkeypatch)
+    async with _semantic_case(store, tmp_path, monkeypatch) as case:
+        runtime = case["runtime"]
+        selected, inventory = runtime.source.selected, runtime.materialization.inventory
+        actual = semantic_sql._retained_inputs_data
+        reads = []
+
+        def retained(conn, *args, **kwargs):
+            result = actual(conn, *args, **kwargs)
+            reads.append((conn, result))
+            return result
+
+        monkeypatch.setattr(semantic_sql, "_retained_inputs_data", retained)
+        before = _rows(store[0])
+        with locked_session_transaction(store[0], str(store[4])) as conn:
+            paired = semantic_sql.select_semantic_advisor_graph_and_inputs_on_connection(
+                conn, case["running"], selected=selected, inventory=inventory
+            )
+            assert paired.retained_inputs is not None and reads == []
+            savepoint = conn.begin_nested()
+            try:
+                prepared = _prepare(conn, case, _issuer(case))
+                assert prepared.binding.input_sha256 == case["request"].request_sha256
+                assert len(reads) == 1 and reads[0][0] is conn
+                assert reads[0][1] == paired.retained_inputs and reads[0][1] is not paired.retained_inputs
+            finally:
+                savepoint.rollback()
+        assert _rows(store[0]) == before
 
 
 @pytest.mark.asyncio
@@ -195,7 +329,7 @@ async def test_real_mutation_selector_reproves_history_before_frontier_append_an
     monkeypatch.setattr(app_module, "continuation_policy_from_settings", policy)
     operation = str(uuid4())
     reached, full_reads = [], []
-    original_select = phase.select_semantic_advisor_current_graph_on_connection
+    original_select = phase.select_semantic_advisor_graph_and_inputs_on_connection
     original_read = semantic_sql.read_runtime_source_on_connection
     inside_selector = False
 
@@ -231,14 +365,15 @@ async def test_real_mutation_selector_reproves_history_before_frontier_append_an
         finally:
             inside_selector = False
         selected = kwargs["selected"]
-        assert result.checkpoint_id != selected.checkpoint_id and result.cursor == selected.stack.cursor + 1
+        assert result.snapshot.checkpoint_id != selected.checkpoint_id and result.snapshot.cursor == selected.stack.cursor + 1
+        assert result.retained_inputs is None
         assert len(full_reads) == 1 and _rows_on_connection(conn) != before
         assert len(graph_events(conn)) == 1
         reached.append(result)
         raise SelectionRollbackProbe("controlled rollback after actual graph selection")
 
     monkeypatch.setattr(semantic_sql, "read_runtime_source_on_connection", read)
-    monkeypatch.setattr(phase, "select_semantic_advisor_current_graph_on_connection", selector)
+    monkeypatch.setattr(phase, "select_semantic_advisor_graph_and_inputs_on_connection", selector)
     async with continuation_app(tmp_path, monkeypatch) as harness:
         blob = tmp_path / "blobs" / str(harness.session_id)
         blob.mkdir(parents=True, exist_ok=True)
@@ -256,8 +391,14 @@ async def test_real_mutation_selector_reproves_history_before_frontier_append_an
         clean = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "The provider's draft is coherent.", "note": None}
         sdk = ScriptedSDK([("primary", primary), ("early", clean)], app_ref=[harness.app])
         install_sdk(monkeypatch, sdk)
-        terminal = await submit_and_settle(harness, message_body("Build and explain the requested pipeline.", operation_id=operation))
-        assert len(reached) == 1, "The original mutation driver must reach actual changed graph selection before fault injection"
-        assert terminal.status == "failed" and sdk.roles == ["primary", "early"] and not sdk.steps
-        with harness.app.state.session_engine.connect() as conn:
-            assert graph_events(conn) == ()
+        with observe_supported_path(
+            monkeypatch,
+            operation_id=operation,
+            session_id=harness.session_id,
+            artifact=tmp_path / "semantic-mutation-selector-driver.json",
+        ):
+            terminal = await submit_and_settle(harness, message_body("Build and explain the requested pipeline.", operation_id=operation))
+            assert len(reached) == 1, "The original mutation driver must reach actual changed graph selection before fault injection"
+            assert terminal.status == "failed" and sdk.roles == ["primary", "early"] and not sdk.steps
+            with harness.app.state.session_engine.connect() as conn:
+                assert graph_events(conn) == ()

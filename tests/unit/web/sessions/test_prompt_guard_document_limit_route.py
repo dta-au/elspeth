@@ -343,8 +343,8 @@ def _install_advisor_preparation_profile(
 
     monkeypatch.setattr(
         continuation_semantic_advisor_phase,
-        "select_semantic_advisor_current_graph_on_connection",
-        wrap_cut("select_current", continuation_semantic_advisor_phase.select_semantic_advisor_current_graph_on_connection),
+        "select_semantic_advisor_graph_and_inputs_on_connection",
+        wrap_cut("select_current", continuation_semantic_advisor_phase.select_semantic_advisor_graph_and_inputs_on_connection),
     )
     monkeypatch.setattr(
         continuation_semantic_advisor_phase,

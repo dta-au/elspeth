@@ -66,6 +66,7 @@ from elspeth.web.sessions.continuation import (
 from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
 from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult, VerifiedSdkTerminal
 from elspeth.web.sessions.continuation_semantic_advisor import (
+    SemanticAdvisorGraphSelection,
     SemanticAdvisorProviderResult,
     _semantic_checkpoint_kind_data,
     begin_semantic_advisor_on_connection,
@@ -75,12 +76,11 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
     consume_semantic_advisor_primary_on_connection,
     consume_semantic_advisor_review_on_connection,
     consume_semantic_advisor_terminal_iteration_stop_on_connection,
-    install_semantic_advisor_decision_on_connection,
+    install_current_semantic_decision_on_connection,
     prepare_semantic_advisor_on_connection,
-    read_current_paid_semantic_decision_on_connection,
     read_semantic_advisor_retained_inputs_on_connection,
     retain_semantic_advisor_outcome_on_connection,
-    select_semantic_advisor_current_graph_on_connection,
+    select_semantic_advisor_graph_and_inputs_on_connection,
 )
 from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
 from elspeth.web.sessions.continuation_semantic_v4_no_sdk_close import close_v4_semantic_no_sdk_on_connection
@@ -205,15 +205,9 @@ async def _consume_current_decision(phases: ContinuationLivePhases, selected: Se
     stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
 
     def consume(conn: Connection) -> StoredContinuationSnapshot:
-        from elspeth.web.sessions.continuation_semantic_actions import install_semantic_action_on_connection
-
         current = stored
         if frame.phase == "response_retained":
-            paid = read_current_paid_semantic_decision_on_connection(conn, running, selected=current, effect_key=effect_key)
-            if type(paid.decision.prescribed_action) is PrimaryContinuationAction:
-                current = install_semantic_advisor_decision_on_connection(conn, running, selected=current, effect_key=effect_key)
-            else:
-                current = install_semantic_action_on_connection(conn, running, selected=current, effect_key=effect_key)
+            current = install_current_semantic_decision_on_connection(conn, running, selected=current, effect_key=effect_key)
         root = decode_continuation_snapshot(current.payload_json)
         action = decode_prescribed_continuation_action(root.active_action_json) if root.active_action_json is not None else None
         if type(action) is PrimaryContinuationAction:
@@ -370,27 +364,37 @@ async def _run_semantic_advisor_preparation(
     | None
 ):
     runtime, inventory = await phases.current(selected)
-    current = await _registered(
+    acquisition = await _registered(
         work=phases.work,
         source=RequiredWorkSource.CONTINUATION_STATE_SQL,
         operation=lambda: _transaction(
-            phases, lambda conn: select_semantic_advisor_current_graph_on_connection(conn, running, selected=selected, inventory=inventory)
+            phases,
+            lambda conn: select_semantic_advisor_graph_and_inputs_on_connection(conn, running, selected=selected, inventory=inventory),
         ),
-        expected=StoredContinuationSnapshot,
+        expected=SemanticAdvisorGraphSelection,
     )
+    current = acquisition.snapshot
+    retained_inputs = acquisition.retained_inputs
     if current.checkpoint_id != selected.checkpoint_id:
         selected = await load_selected_continuation(
             authority=phases.authority, running=running, selected=current, required_work=phases.work
         )
         runtime, inventory = await phases.current(selected)
+        if retained_inputs is not None:
+            raise AuditIntegrityError("Semantic graph append retained inputs before its original runtime refresh")
+    elif retained_inputs is None:
+        raise AuditIntegrityError("Semantic unchanged graph selection lost its actual retained inputs")
 
     def build_request() -> _SemanticRequestPreparation:
         raw = capture_semantic_advisor_source(runtime)
         invocation = make_semantic_advisor_invocation(raw)
         stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
-        retained_inputs = _transaction(
-            phases, lambda conn: read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=stored)
-        )
+        inputs = retained_inputs
+        if inputs is None:
+            # A real graph append still uses the original fresh acquisition
+            # after selected/runtime refresh. Unchanged selection already read
+            # these immutable inputs beside its complete original END proof.
+            inputs = _transaction(phases, lambda conn: read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=stored))
         # The retained-input transaction is closed before policy callbacks,
         # transcript acquisition and initial content-scope CAS open their own.
         request = prepare_semantic_advisor_request(
@@ -403,7 +407,7 @@ async def _run_semantic_advisor_preparation(
             user_message=runtime.bindings.message,
             runtime=runtime,
             env_ref_names=runtime.env_ref_names,
-            retained_inputs=retained_inputs,
+            retained_inputs=inputs,
         )
         return _SemanticRequestPreparation(invocation, request)
 

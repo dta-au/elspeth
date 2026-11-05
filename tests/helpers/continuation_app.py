@@ -366,18 +366,21 @@ def observe_supported_path(
 def observe_original_driver_failures(monkeypatch: pytest.MonkeyPatch, operation_id: str, *, session_id: UUID) -> list[dict[str, Any]]:
     """Observe original worker failures without changing dispatch or logging payloads.
 
-    Retained private failure facts omit traceback locations. Tests print this
-    bounded metadata only after an unexpected public failure, while the exact
-    original exception still flows through the real driver and settlement.
+    Retained private failure facts omit traceback locations. Observe both
+    escaping exceptions and originals carried by successfully reserved no-SDK
+    permits. Tests retain bounded metadata while original results, exceptions
+    and settlement remain unchanged.
     """
     from hashlib import sha256
     from time import monotonic, perf_counter
     from traceback import extract_tb
 
+    from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalPermit
     from elspeth.web.sessions.continuation_driver import _SegmentDriver
 
     observations: list[dict[str, Any]] = []
     original_advance, original_settle = _SegmentDriver.advance, _SegmentDriver.settle
+    original_refusal, original_v4_refusal = PrimaryNoSdkIssuer.reserve_refusal, PrimaryNoSdkIssuer.reserve_v4_refusal
 
     project_root = Path(__file__).resolve().parents[2]
 
@@ -402,6 +405,39 @@ def observe_original_driver_failures(monkeypatch: pytest.MonkeyPatch, operation_
         if isinstance(error, BaseExceptionGroup):
             data["members"] = tuple(exception_data(member, depth + 1) for member in error.exceptions[:8]) if depth < 2 else ("depth_limit",)
         return data
+
+    def record_refusal(permit: PrimaryNoSdkRefusalPermit, method: str) -> None:
+        matched = False
+        try:
+            claim = permit.issuer.running.claim
+            matched = claim.operation_id == operation_id and claim.session_id == session_id
+            if matched:
+                observations.append(
+                    {
+                        "boundary": "primary_no_sdk_refusal",
+                        "event": "reserved",
+                        "method": method,
+                        "reason": permit.reason.value,
+                        "cursor": permit.prepared.snapshot.cursor,
+                        "effect_key": permit.prepared.binding.effect_key,
+                        "original": exception_data(permit.original_failure),
+                    }
+                )
+        except Exception:
+            if matched:
+                observations.append({"boundary": "primary_no_sdk_refusal", "event": "observation_unavailable", "method": method})
+
+    def reserve_refusal(issuer: PrimaryNoSdkIssuer, *, reason: Any, original_failure: BaseException) -> PrimaryNoSdkRefusalPermit:
+        permit = original_refusal(issuer, reason=reason, original_failure=original_failure)
+        record_refusal(permit, "reserve_refusal")
+        return permit
+
+    def reserve_v4_refusal(
+        issuer: PrimaryNoSdkIssuer, *, admission: Any, reason: Any, original_failure: BaseException
+    ) -> PrimaryNoSdkRefusalPermit:
+        permit = original_v4_refusal(issuer, admission=admission, reason=reason, original_failure=original_failure)
+        record_refusal(permit, "reserve_v4_refusal")
+        return permit
 
     def action_kind(driver: _SegmentDriver, clock: Any) -> str | None:
         if clock is None:
@@ -521,6 +557,8 @@ def observe_original_driver_failures(monkeypatch: pytest.MonkeyPatch, operation_
 
     monkeypatch.setattr(_SegmentDriver, "advance", advance)
     monkeypatch.setattr(_SegmentDriver, "settle", settle)
+    monkeypatch.setattr(PrimaryNoSdkIssuer, "reserve_refusal", reserve_refusal)
+    monkeypatch.setattr(PrimaryNoSdkIssuer, "reserve_v4_refusal", reserve_v4_refusal)
     return observations
 
 

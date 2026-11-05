@@ -641,7 +641,7 @@ class SemanticPreparationProfile(EarlyPreparationProfile):
         from elspeth.web.sessions import continuation_semantic_advisor as sql_semantic
 
         synchronous = (
-            (phase, "select_semantic_advisor_current_graph_on_connection", phase.select_semantic_advisor_current_graph_on_connection),
+            (phase, "select_semantic_advisor_graph_and_inputs_on_connection", phase.select_semantic_advisor_graph_and_inputs_on_connection),
             (phase, "capture_semantic_advisor_source", phase.capture_semantic_advisor_source),
             (phase, "make_semantic_advisor_invocation", phase.make_semantic_advisor_invocation),
             (phase, "read_semantic_advisor_retained_inputs_on_connection", phase.read_semantic_advisor_retained_inputs_on_connection),

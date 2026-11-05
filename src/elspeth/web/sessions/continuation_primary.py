@@ -872,7 +872,41 @@ def _v4_dispatch_action_projection(
     dispatched_json: str,
     disposition: Literal["dispatched", "committed", "refused"] = "dispatched",
 ) -> tuple[str, PrivateChunk | None]:
-    """Predict the existing action-receipt writer's exact bytes before H is reserved."""
+    """Read the actual persisted frontier for existing SQL action writers."""
+    if effect.action_json is None:
+        return dispatched_json, None
+    ref = root.semantic_frontier
+    if ref is None:
+        raise AuditIntegrityError("V4 PRIMARY prescribed dispatch lost its original semantic frontier")
+    canonical = read_chunk(
+        conn,
+        session_id=str(root.logical.session_id),
+        operation_id=root.logical.operation_id,
+        key=f"value:{ref.codec}:{ref.digest}",
+    ).decode("utf-8", errors="strict")
+    return _v4_action_projection_from_frontier(
+        root=root,
+        effect=effect,
+        frontier_chunk=PrivateChunk(reference=ref, canonical=canonical),
+        dispatched_json=dispatched_json,
+        disposition=disposition,
+    )
+
+
+def _v4_action_projection_from_frontier(
+    *,
+    root: ContinuationFrameStack,
+    effect: Row[Any],
+    frontier_chunk: PrivateChunk | None,
+    dispatched_json: str,
+    disposition: Literal["dispatched", "committed", "refused"] = "dispatched",
+) -> tuple[str, PrivateChunk | None]:
+    """Project exact action bytes from explicit persisted or prospective DATA.
+
+    The refused tail extends the dispatched projection before either is stored.
+    Its input must therefore be the first projection's actual chunk, not a SQL
+    lookup of the prospective reference or a restart from the original frontier.
+    """
     if effect.action_json is None:
         return dispatched_json, None
     from elspeth.web.composer.continuation_progress import (
@@ -885,14 +919,9 @@ def _v4_dispatch_action_projection(
     )
 
     ref = root.semantic_frontier
-    if ref is None:
+    if ref is None or frontier_chunk is None or frontier_chunk.reference != ref:
         raise AuditIntegrityError("V4 PRIMARY prescribed dispatch lost its original semantic frontier")
-    canonical = read_chunk(
-        conn,
-        session_id=str(root.logical.session_id),
-        operation_id=root.logical.operation_id,
-        key=f"value:{ref.codec}:{ref.digest}",
-    ).decode("utf-8", errors="strict")
+    canonical = frontier_chunk.canonical
     verify_private_chunk(ref, canonical)
     frontier = decode_continuation_frontier(canonical)
     action = decode_prescribed_continuation_action(effect.action_json)
@@ -993,10 +1022,10 @@ def admit_v4_primary_provider_on_connection(
         disposition="refused",
         receipt_id="00000000-0000-4000-8000-000000000000",
     )
-    _refused_json, no_sdk_action_chunk = _v4_dispatch_action_projection(
-        conn,
+    _refused_json, no_sdk_action_chunk = _v4_action_projection_from_frontier(
         root=decode_continuation_snapshot(admitted.payload_json),
         effect=effect,
+        frontier_chunk=action_chunk,
         dispatched_json=refused_projection,
         disposition="refused",
     )

@@ -27,6 +27,7 @@ from tests.helpers.continuation_app import (
     continuation_app,
     end_admit,
     install_sdk,
+    observe_supported_path,
     semantic_primary_response,
     semantic_review_response,
     semantic_stop_response,
@@ -150,7 +151,7 @@ async def test_paired_semantic_shelf_reuses_actual_recipes_and_keeps_final_sql_p
         assert tuple(map(family_message_wire, restored)) == expected
         assert stored_rows(operation_store[0]) == before and len(sdk) == 1
         assert runtime.graph.batch.calls is primary.outcome.completion.tool_batch.calls
-        owner.work.coordinator.assert_completed()
+    owner.work.coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
@@ -281,11 +282,17 @@ async def test_real_semantic_builder_uses_registered_worker_and_original_sql_own
     install_sdk(monkeypatch, checked_sdk)
     async with continuation_app(tmp_path, monkeypatch) as harness:
         app_ref.append(harness.app)
-        result = await submit_and_settle(
-            harness, message_body("Inspect the pipeline and explain its current state.", operation_id=operation)
-        )
-        assert result.status == "completed", result.error
-        assert sdk.roles == ["primary", "semantic", "primary", "semantic", "end", "semantic"] and not sdk.steps
+        with observe_supported_path(
+            monkeypatch,
+            operation_id=operation,
+            session_id=harness.session_id,
+            artifact=tmp_path / "semantic-builder-driver.json",
+        ):
+            result = await submit_and_settle(
+                harness, message_body("Inspect the pipeline and explain its current state.", operation_id=operation), rounds=720
+            )
+            assert result.status == "completed", result.error
+            assert sdk.roles == ["primary", "semantic", "primary", "semantic", "end", "semantic"] and not sdk.steps
     assert [kind for kind, *_rest in observed] == ["capture", "request"] * 3
     assert finished == parents and len(parents) == 3
     assert all(not parent.active and parent.cached_entry_count == 0 for parent in parents)

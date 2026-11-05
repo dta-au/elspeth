@@ -2088,6 +2088,20 @@ def read_current_paid_semantic_decision_on_connection(
     root = _current(conn, running, selected)
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
+    return _paid_decision_from_result(conn, running, selected, root, effect_key, result, data, paid_root)
+
+
+def _paid_decision_from_result(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    selected: StoredContinuationSnapshot,
+    root: ContinuationFrameStack,
+    effect_key: str,
+    result: SemanticAdvisorProviderResult,
+    data: SemanticAdvisorInvocationData,
+    paid_root: ContinuationFrameStack,
+) -> SemanticAdvisorPaidDecisionData:
+    """Finish this current SQL read from its actual complete paid result DATA."""
     if (
         _advisor(root).phase != "response_retained"
         or root != paid_root.model_copy(update={"cursor": selected.cursor})
@@ -2096,6 +2110,7 @@ def read_current_paid_semantic_decision_on_connection(
         or result.response is None
     ):
         raise AuditIntegrityError("Semantic action admission requires its uninstalled original successful paid decision")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
     effect = _effect_data(conn, sid, operation, root, effect_key)
     creator = _creator_data(conn, sid, operation, effect)
     canonical = canonical_json(result.decision.model_dump(mode="json"))
@@ -2120,10 +2135,44 @@ def read_current_paid_semantic_decision_on_connection(
     )
 
 
+def install_current_semantic_decision_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
+) -> StoredContinuationSnapshot:
+    """Read and install one current paid decision without a second cold replay.
+
+    No callback, await or root write separates this proof from its owning
+    installer. Consumers of the resulting changed root still perform their
+    original fresh current/source admissions.
+    """
+    from elspeth.web.sessions.continuation_semantic_actions import _install_semantic_action_from_paid_on_connection
+
+    root = _current(conn, running, selected)
+    result, data, paid_root = _paid_result_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key)
+    paid = _paid_decision_from_result(conn, running, selected, root, effect_key, result, data, paid_root)
+    if type(paid.decision.prescribed_action) is PrimaryContinuationAction:
+        return _install_semantic_advisor_decision_from_result(
+            conn, running, selected=selected, effect_key=effect_key, result=result, data=data
+        )
+    return _install_semantic_action_from_paid_on_connection(conn, running, selected=selected, paid=paid)
+
+
 def install_semantic_advisor_decision_on_connection(
     conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
 ) -> StoredContinuationSnapshot:
     result, data, _paid_root = _paid_result(conn, running, selected, effect_key)
+    return _install_semantic_advisor_decision_from_result(conn, running, selected=selected, effect_key=effect_key, result=result, data=data)
+
+
+def _install_semantic_advisor_decision_from_result(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: StoredContinuationSnapshot,
+    effect_key: str,
+    result: SemanticAdvisorProviderResult,
+    data: SemanticAdvisorInvocationData,
+) -> StoredContinuationSnapshot:
+    """Install the just-read PRIMARY result under the original current guard."""
     root = _current(conn, running, selected)
     if (
         _advisor(root).phase != "response_retained"
@@ -3380,6 +3429,20 @@ def _retained_inputs_data(
     conn: Connection, sid: str, operation: str, root: ContinuationFrameStack, *, checkpoint_id: str, cursor: int
 ) -> SemanticAdvisorRetainedInputs:
     original = _input_end_source_observation(conn, sid, operation, root, checkpoint_id=checkpoint_id, cursor=cursor)
+    return _retained_inputs_from_observation(conn, sid, operation, root, checkpoint_id=checkpoint_id, cursor=cursor, original=original)
+
+
+def _retained_inputs_from_observation(
+    conn: Connection,
+    sid: str,
+    operation: str,
+    root: ContinuationFrameStack,
+    *,
+    checkpoint_id: str,
+    cursor: int,
+    original: _SemanticEndSourceObservation,
+) -> SemanticAdvisorRetainedInputs:
+    """Finish a retained-input read from this transaction's actual source proof."""
     if root.semantic_frontier is None:
         raise AuditIntegrityError("Semantic retained inputs lost their actual source frontier")
     frontier = decode_frontier_chunk(_ref(conn, sid, operation, root.semantic_frontier))
@@ -4129,9 +4192,47 @@ def read_semantic_advisor_runtime_source_on_connection(
     return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticAdvisorGraphSelection:
+    """Selected snapshot and immutable inputs acquired at its unchanged SQL cut.
+
+    An actual graph append requires the caller's ordinary runtime refresh and
+    a later retained-input acquisition; it carries no pre-refresh inputs.
+    """
+
+    snapshot: StoredContinuationSnapshot
+    retained_inputs: SemanticAdvisorRetainedInputs | None
+
+
+def select_semantic_advisor_graph_and_inputs_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+) -> SemanticAdvisorGraphSelection:
+    snapshot, original = _select_semantic_advisor_current_graph_on_connection(conn, running, selected=selected, inventory=inventory)
+    if snapshot.checkpoint_id != selected.checkpoint_id:
+        return SemanticAdvisorGraphSelection(snapshot, None)
+    retained = _retained_inputs_from_observation(
+        conn,
+        str(running.claim.session_id),
+        running.claim.operation_id,
+        selected.stack,
+        checkpoint_id=snapshot.checkpoint_id,
+        cursor=snapshot.cursor,
+        original=original,
+    )
+    return SemanticAdvisorGraphSelection(snapshot, retained)
+
+
 def select_semantic_advisor_current_graph_on_connection(
     conn: Connection, running: ComposerOperationRunning, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
 ) -> StoredContinuationSnapshot:
+    """Keep the standalone selector's original source proof and return contract."""
+    snapshot, _original = _select_semantic_advisor_current_graph_on_connection(conn, running, selected=selected, inventory=inventory)
+    return snapshot
+
+
+def _select_semantic_advisor_current_graph_on_connection(
+    conn: Connection, running: ComposerOperationRunning, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+) -> tuple[StoredContinuationSnapshot, _SemanticEndSourceObservation]:
     """Select only the actual retained authored graph's semantic projection.
 
     An unchanged projection checks its actual current inventory and two strict
@@ -4145,7 +4246,7 @@ def select_semantic_advisor_current_graph_on_connection(
     stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
     root = _current(conn, running, stored)
     parent = _parent(root)
-    _input_end_source_data(
+    original = _input_end_source_observation(
         conn, str(running.claim.session_id), running.claim.operation_id, root, checkpoint_id=stored.checkpoint_id, cursor=stored.cursor
     )
     if (
@@ -4163,7 +4264,7 @@ def select_semantic_advisor_current_graph_on_connection(
     previous = decode_frontier_chunk(_ref(conn, sid, operation, root.semantic_frontier))
     changed = encode_frontier_chunk(replace(previous, graph_hash=authored_state_hash(state)))
     if changed.reference == root.semantic_frontier:
-        return stored
+        return stored, original
     read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
     with conn.begin_nested():
         put_chunk(
@@ -4174,7 +4275,7 @@ def select_semantic_advisor_current_graph_on_connection(
             payload=changed.canonical.encode("utf-8"),
             codec=changed.reference.codec,
         )
-        return append_complete_snapshot(
+        snapshot = append_complete_snapshot(
             conn,
             session_id=sid,
             operation_id=operation,
@@ -4196,3 +4297,4 @@ def select_semantic_advisor_current_graph_on_connection(
             ),
             handoff=False,
         )
+        return snapshot, original

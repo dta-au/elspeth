@@ -33,7 +33,9 @@ def __init__(self, worker: ComposerAsyncWorker, services: ComposerAppServices, r
     self.sql_deadline = sql_deadline
     self._consumed_native: list[BaseException] = []
     self._committed_failure: CommittedContinuationFailure | None = None
+    self._committed_classifier_prephysical: CommittedClassifierPrephysicalFailure | None = None
     self._action_ordinal = 0
+    self._diagnostic_stage = "initialization"
     self.progress_owner: ContinuationProgressOwner | None = None
     self._progress_cleanup_failures: list[BaseException] = []
     self._iteration_stage: IterationStageData | None = None

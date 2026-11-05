@@ -328,23 +328,17 @@ working around it.
 
 ## Project delivery posture
 
-From 0.8.5 onward, backwards compatibility is permitted and must be considered
-when changing public interfaces, configuration, persisted data or operator
-workflows. This is not a guarantee of perpetual support for every historical
-version or format. State compatibility decisions and supported boundaries
-explicitly; retain current preserve/refuse contracts unless a separate change
-is approved. This policy alone does not authorize migrations, resets or
-downgrades.
+Before 1.0.0, ELSPETH does not offer backwards compatibility (maintainer ruling,
+6 November 2026). Do not retain or add implementations, adapters, fallback
+branches or upgrade machinery solely to support obsolete interfaces, policies,
+configuration or persisted formats. Remove obsolete compatibility paths as
+their current callers are consolidated. Current implementation dependencies
+must still work; a version suffix alone does not make a codec or helper obsolete.
 
-For 0.8.7, compatibility with existing Composer graphs is not required.
-Individual adjustments or migrations for older records, including 0.8.6
-records, may be removed when no longer needed; retain the basic dynamic upgrade
-framework. State each actual breaking change and any reinspection or
-reconstruction requirement without claiming every historical graph can be
-reconstructed. Other public interfaces, configuration, operator workflows and
-persisted data still require compatibility consideration. Preserve integrity
-and preserve/refuse contracts; this exception grants no authority to wipe data,
-run migrations, reset stores or downgrade them.
+State the currently supported contract and each actual breaking change
+explicitly. Preserve existing records, evidence and backups, and refuse
+unsupported formats explicitly. This policy does not authorize migrations,
+data deletion, store resets or downgrades.
 
 ELSPETH is pre-release software maintained by a single developer. Keep a
 process, gate, or document only when it materially improves at least one of:

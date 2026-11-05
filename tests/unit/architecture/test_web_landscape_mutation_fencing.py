@@ -17171,6 +17171,36 @@ class ContinuationActionClock:
         ),
         pytest.param(
             "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "or preview_result.owner is not self",
+            "or False",
+            id="foreign-preview-owner",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "or self._action_started_at != preview_result.started_at",
+            "or False",
+            id="substituted-preview-start",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "or self._settlement_expires_at != preview_result.expires_at",
+            "or False",
+            id="substituted-preview-reserve",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "or read_result is not None\n            ):",
+            "or False\n            ):",
+            id="preview-mixed-with-read",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "remaining = min(statement_cap, expires_at - now)",
+            "remaining = expires_at - now",
+            id="preview-bypasses-statement-cap",
+        ),
+        pytest.param(
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
             "if remaining <= 0:",
             "if remaining < -1:",
             id="expired-read-allowed",
@@ -17202,12 +17232,13 @@ class ContinuationActionClock:
     ],
 )
 def test_reserve_sql_deadline_requires_positive_nominal_claim_and_original_read_bounds(path, original, replacement):
+    root = _repo_root()
     paths = (
         "src/elspeth/web/sessions/composer_operations.py",
         "src/elspeth/web/sessions/continuation_sql_deadline.py",
         "src/elspeth/web/required_work.py",
     )
-    units = tuple(_read_source(candidate) for candidate in paths)
+    units = tuple(_read_source(root / candidate, anchor=root) for candidate in paths)
     work = units[-1]
     assert _reserve_sql_deadline_owner_failures(units, work) == []
     selected = next(unit for unit in units if unit.path == path)
@@ -17342,10 +17373,16 @@ def test_reserve_recompose_return_receipt_refuses_capability_and_callback_substi
             "self._handled_reply_deadlines: list[_HandledReplyDeadline] = [self.provider]",
             id="provider-escaped-into-reply-deadline-data",
         ),
+        pytest.param(
+            "self._committed_classifier_prephysical: CommittedClassifierPrephysicalFailure | None = None",
+            "self._committed_classifier_prephysical: CommittedClassifierPrephysicalFailure | None = foreign",
+            id="classifier-failure-carrier-substituted",
+        ),
     ],
 )
 def test_reserve_driver_storage_receipt_preserves_exact_context_binding_provider_and_phases(original, replacement):
-    unit = _read_source("src/elspeth/web/sessions/continuation_driver.py")
+    root = _repo_root()
+    unit = _read_source(root / "src/elspeth/web/sessions/continuation_driver.py", anchor=root)
     failures, receipt = _reserve_provider_mint_contract.provider_driver_constructor_contract((unit,))
     assert failures == [] and receipt is not None
     assert len(receipt["owner_constructor_stores"]) == 1
@@ -17355,6 +17392,77 @@ def test_reserve_driver_storage_receipt_preserves_exact_context_binding_provider
     failures, rejected = _reserve_provider_mint_contract.provider_driver_constructor_contract((changed,))
     assert failures and rejected is None
     assert _reserve_provider_mint_contract.provider_driver_constructor_contract((unit,)) == ([], receipt)
+
+
+@pytest.mark.parametrize(
+    "original, replacement",
+    [
+        pytest.param(
+            "work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+            "foreign.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+            id="foreign-reserve-receiver",
+        ),
+        pytest.param(
+            "work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+            'getattr(work.coordinator, "reserve")(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)',
+            id="dynamic-reserve-receiver",
+        ),
+        pytest.param(
+            "sql = work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+            "from elspeth.core.landscape.execution.sink_effects import SinkEffectRepository\n"
+            "    reserve = SinkEffectRepository.reserve\n"
+            "    sql = reserve(work.coordinator, RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+            id="real-landscape-reserve-alias",
+        ),
+        pytest.param(
+            "work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+            "work.coordinator.reserve(RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, sql_attempt_ordinal=0)",
+            id="changed-terminal-source",
+        ),
+        pytest.param(
+            "timing is None or timing.running is not running",
+            "timing is None",
+            id="foreign-sql-clock",
+        ),
+        pytest.param(
+            "_require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)",
+            "None",
+            id="unfenced-terminal-writer",
+        ),
+        pytest.param(
+            "outcome = await run_required_sql_finish_once(sql, write)",
+            "outcome = write()",
+            id="finish-once-handoff-bypassed",
+        ),
+        pytest.param(
+            "RequiredWorkSource.TERMINAL_WRITER_READ_SQL,\n            RequiredWorkSource.TERMINAL_WRITER_READ_PROJECTION,",
+            "RequiredWorkSource.CONTINUATION_READ_SQL,\n            RequiredWorkSource.TERMINAL_WRITER_READ_PROJECTION,",
+            id="writer-readback-source-substituted",
+        ),
+        pytest.param(
+            "sql = work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+            "from sqlalchemy import text\n    with service._engine.begin() as conn:\n"
+            "        conn.execute(text('UPDATE composer_operations SET status = 0'))\n"
+            "    sql = work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+            id="raw-terminal-dml-before-ticket",
+        ),
+    ],
+)
+def test_classifier_terminal_reserve_receipt_rejects_changed_custody(original, replacement):
+    root = _repo_root()
+    paths = (
+        "src/elspeth/web/sessions/continuation_driver.py",
+        "src/elspeth/web/sessions/continuation_tool_failure.py",
+        "src/elspeth/web/sessions/continuation_classifier_prephysical_failure.py",
+    )
+    units = tuple(_read_source(root / path, anchor=root) for path in paths)
+    failures, receipt = _reserve_continuation_transfers.terminal_failure_reserve_transfers(units)
+    assert failures == [] and len(receipt["reserve_calls"]) == 3
+    classifier = units[-1]
+    assert classifier.source.count(original) == 1
+    changed = _parse_source(classifier.path, classifier.source.replace(original, replacement))
+    rejected, empty = _reserve_continuation_transfers.terminal_failure_reserve_transfers((*units[:-1], changed))
+    assert rejected and empty == {}
 
 
 def test_reserve_recompose_receipt_does_not_admit_other_returned_or_stored_capabilities():
@@ -17548,9 +17656,32 @@ class ContinuationSQLDeadlineOwner:
                 raise AuditIntegrityError("Read result timing requires the original begun read action")
             return ContinuationReadResultDeadline(self, self._action_expires_at, self._settlement_expires_at)
 
+    def capture_preview_result_deadline(self) -> ContinuationPreviewResultDeadline:
+        with self._lock:
+            if (
+                type(self.policy) is not ContinuationAdmissionPolicyV4
+                or self._active_action is None
+                or self._action_started_at is None
+                or not any(
+                    self._active_action is action
+                    for action in (
+                        self.policy.actions.read,
+                        self.policy.actions.session_sql,
+                        self.policy.actions.blob,
+                        self.policy.actions.external,
+                    )
+                )
+                or self._action_expires_at != min(self.hard_expires_at, self._action_started_at + self._active_action.total)
+            ):
+                raise AuditIntegrityError("Preview result timing requires the original begun unpaid action")
+            return ContinuationPreviewResultDeadline(
+                self, self._active_action, self._action_started_at, self._action_expires_at, self._settlement_expires_at
+            )
+
     def remaining_statement(
         self, *, session_id: str, deadline: ComposerDrainDeadline | None = None,
         lifecycle: bool = False, paid_settlement: bool = False, read_result: ContinuationReadResultDeadline | None = None,
+        preview_result: ContinuationPreviewResultDeadline | None = None,
     ) -> float:
         if session_id != str(self.running.claim.session_id):
             raise AuditIntegrityError("SQL timing cannot cover another session")
@@ -17558,6 +17689,18 @@ class ContinuationSQLDeadlineOwner:
             raise AuditIntegrityError("SQL timing cannot combine paid settlement with lifecycle scope")
         now = time.monotonic()
         with self._lock:
+            if preview_result is not None and (
+                type(preview_result) is not ContinuationPreviewResultDeadline
+                or preview_result.owner is not self
+                or self._active_action is not preview_result.action
+                or self._action_started_at != preview_result.started_at
+                or self._action_expires_at != preview_result.action_expires_at
+                or self._settlement_expires_at != preview_result.expires_at
+                or lifecycle
+                or paid_settlement
+                or read_result is not None
+            ):
+                raise AuditIntegrityError("Preview disposition changed its original action timing")
             if read_result is not None and (
                 type(read_result) is not ContinuationReadResultDeadline
                 or read_result.owner is not self
@@ -17569,9 +17712,12 @@ class ContinuationSQLDeadlineOwner:
             ):
                 raise AuditIntegrityError("Read disposition changed its original action timing")
             settlement = paid_settlement or self._settling
-            disposition = lifecycle or settlement or read_result is not None
+            disposition = lifecycle or settlement or read_result is not None or preview_result is not None
             expires_at = (
-                read_result.expires_at if read_result is not None
+                preview_result.expires_at
+                if preview_result is not None
+                else read_result.expires_at
+                if read_result is not None
                 else self.hard_expires_at if lifecycle
                 else self._settlement_expires_at if settlement
                 else self._action_expires_at
@@ -17607,6 +17753,22 @@ class ContinuationReadResultDeadline:
     ).body[0]
     if read_deadline is None or stable_ast_dump(read_deadline) != stable_ast_dump(expected_read_deadline):
         return ["owned SQL deadline original Read timing record changed"]
+    preview_deadline = _reserve_node_at(deadline, "ContinuationPreviewResultDeadline")
+    expected_preview_deadline = ast.parse(
+        '''
+@final
+@dataclass(frozen=True, slots=True)
+class ContinuationPreviewResultDeadline:
+    """Original unpaid action/reserve snapshot, never producer authority."""
+    owner: ContinuationSQLDeadlineOwner
+    action: ContinuationActionPolicy
+    started_at: float
+    action_expires_at: float
+    expires_at: float
+'''
+    ).body[0]
+    if preview_deadline is None or stable_ast_dump(preview_deadline) != stable_ast_dump(expected_preview_deadline):
+        return ["owned SQL deadline original Preview timing record changed"]
     ticket = _reserve_node_at(work, "RequiredWorkTicket")
     for cls in (owner, ticket):
         if (
@@ -19396,6 +19558,7 @@ def _reserve_current_call_inventory(units):
         # V1 worker/turn reserves were deleted; the current driver owns these calls.
         "src/elspeth/web/sessions/continuation_driver.py": 3,
         "src/elspeth/web/sessions/continuation_classifier_primary.py": 1,
+        "src/elspeth/web/sessions/continuation_classifier_prephysical_failure.py": 1,
         "src/elspeth/web/sessions/continuation_tool_failure.py": 1,
         "src/elspeth/web/sessions/routes/_helpers.py": 3,
         "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": 8,
@@ -21777,6 +21940,8 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     continuation_calls = (
         initialization["reserve_calls"] | title_transfer["reserve_calls"] | terminal_reserves["reserve_calls"] | v4_no_sdk["reserve_calls"]
     )
+    classifier_path = "src/elspeth/web/sessions/continuation_classifier_prephysical_failure.py"
+    classifier_terminal_calls = frozenset(call for call in terminal_reserves["reserve_calls"] if call[0] == classifier_path)
     continuation_state_writes = iteration["additional_transfers"]["state_writes"]
     transferred = frozenset(compose["validated_transfer_nodes"])
     # V1 queued/run-started/turn/error wrappers were deleted. Current transfer
@@ -21855,6 +22020,8 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
         or len(six_calls) != 4
         or len(child_calls) != 8
         or len(terminal_calls) != 2
+        or len(terminal_reserves["reserve_calls"]) != 3
+        or classifier_terminal_calls != reserve_inventory[classifier_path]
         or not (route_calls | six_calls | child_calls | terminal_calls) <= actual_nodes
         or sum(map(len, (route_calls, six_calls, child_calls, terminal_calls)))
         != len(route_calls | six_calls | child_calls | terminal_calls)

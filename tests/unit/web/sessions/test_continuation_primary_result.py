@@ -6,9 +6,12 @@ current message producers, quota, original audit and settlement are real.
 
 import asyncio
 import json
+import traceback
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
+from uuid import uuid4
 
 import litellm
 import pytest
@@ -64,6 +67,7 @@ from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.time_normalization import restore_utc
 from tests.fixtures.identities import grant_test_pipeline_user
+from tests.helpers.continuation_app import observe_original_driver_failures
 from tests.helpers.continuation_inventory import inventory_advisor, inventory_work
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
 from tests.unit.web.coordination import test_composer_operation_authority
@@ -709,7 +713,10 @@ async def test_primary_current_reader_refuses_one_corrupted_source_after_actual_
 
 
 @pytest.mark.asyncio
-async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_preparation_positive(operation_store, tmp_path, monkeypatch):
+@pytest.mark.parametrize("observer_scope", ("matching", "other_operation", "other_session", "projection_failure"))
+async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_preparation_positive(
+    operation_store, tmp_path, monkeypatch, observer_scope
+):
     original = ProviderGateway.prepare_continuation_primary
     original_outcome = ProviderGateway._call_llm_outcome_with_audit
     original_refuse = PrimaryNoSdkIssuer.reserve_refusal
@@ -728,6 +735,9 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
         try:
             return await original_outcome(self, *args, **kwargs)
         except AuditIntegrityError as original_failure:
+            # Retain the real boundary exception while exercising diagnostic
+            # redaction of provider-like text in that original live object.
+            original_failure.args = (original_failure.args[0] + " PRIVATE_NO_SDK_DIAGNOSTIC_MARKER",)
             originals.append(original_failure)
             raise
 
@@ -745,6 +755,18 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
     # invented for an unentered physical call. Its durable intent stays finite.
     kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
     running = kwargs["inventory"].running
+    target_operation = str(uuid4()) if observer_scope == "other_operation" else running.claim.operation_id
+    target_session = uuid4() if observer_scope == "other_session" else running.claim.session_id
+
+    def unavailable_frames(_traceback):
+        raise RuntimeError("controlled observer projection failure")
+
+    with monkeypatch.context() as diagnostic_source:
+        if observer_scope == "projection_failure":
+            diagnostic_source.setattr(traceback, "extract_tb", unavailable_frames)
+        # The observer captures its formatter here. Restore the global stdlib
+        # function immediately; only this observer retains the failing control.
+        diagnostics = observe_original_driver_failures(monkeypatch, target_operation, session_id=target_session)
     sdk = []
 
     async def unexpected(**kwargs):
@@ -772,6 +794,22 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
         assert len(originals) == len(permits) == 1
         assert "actual prepared continuation input" in str(originals[0])
         assert permits[0].original_failure is originals[0]
+        observed = [event for event in diagnostics if event["boundary"] == "primary_no_sdk_refusal"]
+        if observer_scope in ("other_operation", "other_session"):
+            assert observed == []
+        elif observer_scope == "projection_failure":
+            assert observed == [{"boundary": "primary_no_sdk_refusal", "event": "observation_unavailable", "method": "reserve_refusal"}]
+        else:
+            assert len(observed) == 1
+            event = observed[0]
+            assert (event["event"], event["method"], event["reason"]) == ("reserved", "reserve_refusal", "integrity_refused")
+            assert event["effect_key"] == permits[0].prepared.binding.effect_key
+            original_data = event["original"]
+            line = originals[0].args[0].splitlines()[0]
+            assert original_data["type"] == "AuditIntegrityError" and original_data["first_line"] == "[redacted]"
+            assert original_data["line_length"] == len(line) and original_data["line_sha256"] == sha256(line.encode()).hexdigest()
+            assert original_data["frames"]
+        assert "PRIVATE_NO_SDK_DIAGNOSTIC_MARKER" not in json.dumps(diagnostics)
         assert permits[0].prepared.binding.input_sha256 == prepared[0].input_sha256
         assert continuation_provider_input_hash(prepared[0].kwargs) == prepared[0].input_sha256
         assert prepared[0].kwargs.get("seed") != 404
@@ -790,6 +828,58 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
             )
         assert type(cold) is primary_sql.PrimaryNoSdkRefusalReceipt and cold == refused
         assert len(prepared) == len(originals) == len(permits) == 1 and sdk == [] and recorder.llm_calls == ()
+        work.coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_original_refusal_observer_leaves_actual_ordinary_success_unrecorded(operation_store, tmp_path, monkeypatch):
+    kwargs, produced, recorder, requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    running = kwargs["inventory"].running
+    diagnostics = observe_original_driver_failures(monkeypatch, running.claim.operation_id, session_id=running.claim.session_id)
+    sdk = []
+
+    async def completion(**sdk_kwargs):
+        _assert_required_guard_admitted(
+            operation_store[0], running.session_operation_context, requests, role="composer", user_prompt=REQUEST
+        )
+        sdk.append(sdk_kwargs)
+        return ModelResponse(
+            model="test/model",
+            choices=[
+                {"finish_reason": "stop", "message": {"role": "assistant", "content": "Original ordinary reply.", "tool_calls": None}}
+            ],
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    work = kwargs["required_work"]
+    try:
+        with prompt_guard_user_scope(REQUEST):
+            result = await run_continuation_primary(
+                service=kwargs["service"],
+                authority=kwargs["authority"],
+                selected=kwargs["selected"],
+                producers=produced.producers,
+                messages=list(produced.messages),
+                tools=[],
+                recorder=recorder,
+                drained=RecorderDrainCursors(),
+                required_work=work,
+                provider_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work),
+                timeout=5,
+            )
+        assert result.outcome.completion.message.content == "Original ordinary reply."
+        assert len(sdk) == len(recorder.llm_calls) == 1
+        assert result.outcome.audit_call is recorder.llm_calls[0]
+        assert diagnostics == []
+        with operation_store[0].connect() as conn:
+            effect = conn.execute(select(effects)).one()
+            attempt = conn.execute(select(physical)).one()
+            ledger = conn.execute(select(usage)).one()
+        assert effect.disposition == "committed" and attempt.ledger_entry_id == ledger.entry_id
+        assert ledger.prompt_tokens == 7 and ledger.completion_tokens == 3
         work.coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)

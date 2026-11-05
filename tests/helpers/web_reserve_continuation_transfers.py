@@ -2343,21 +2343,41 @@ TERMINAL_RESERVE_BODY_BINDINGS = {
     (
         "src/elspeth/web/sessions/continuation_driver.py",
         "_SegmentDriver",
-    ): "2481a590687e03d07ddbfca3fc48a9ffa9210f91c50f4dd2441994b5ebf3723b",
+    ): "f2d33d7e790d9b3523c96cd84bd4ad2eb746c72d1580bbfd4e57134fcb63b55c",
     (
         "src/elspeth/web/sessions/continuation_tool_failure.py",
         "fail_continuation_tool_operation",
-    ): "3e8a8761c26186465d4efb57a1a42e5bf6d410063deb3f178d276a36ba66688c",
+    ): "07d4aad2fd17deddb0e685a13d7432eec9543c8b93c8e25dfa8c53aa6ad98c3d",
+    (
+        "src/elspeth/web/sessions/continuation_classifier_prephysical_failure.py",
+        "fail_classifier_prephysical_operation",
+    ): "2a9c259bc74ade1ee7a529b9d5426471a7a8ff960332e388c4e1bda7c795084d",
+}
+_CLASSIFIER_PREPHYSICAL_SOURCE = "src/elspeth/web/sessions/continuation_classifier_prephysical_failure.py"
+_CLASSIFIER_PREPHYSICAL_SOURCE_SHA256 = "9c544bd316901346b1b2ec6625eff017dc6a5fe1ed6d97f2e1dd501a8bbb4882"
+_CLASSIFIER_PREPHYSICAL_PREREQUISITES = {
+    "_require_native": "3ce532c6db39e1172c7f5878215a252844952ba17284f5149ee9f952b69a42dd",
+    "_require_joined_body": "e86e89d3f9de295371c3aa9469ee257c919f0f4495f3001c7589e0eb3974aee4",
 }
 
 
 def terminal_failure_reserve_transfers(units):
-    """Join only the existing driver projection and two bounded SQL slots."""
+    """Join the driver/tool failure and original classifier terminal SQL callers."""
     indexed = {unit.path: unit for unit in units}
     failures, receipt = [], _empty()
     selected = {}
     if len(indexed) != len(units):
         return ["terminal reserve source set duplicated"], {}
+    classifier_unit = indexed.get(_CLASSIFIER_PREPHYSICAL_SOURCE)
+    if (
+        classifier_unit is None
+        or hashlib.sha256(classifier_unit.source.encode("utf-8")).hexdigest() != _CLASSIFIER_PREPHYSICAL_SOURCE_SHA256
+    ):
+        return ["classifier terminal complete source changed"], {}
+    for symbol, digest in _CLASSIFIER_PREPHYSICAL_PREREQUISITES.items():
+        node = _custody_node_at(classifier_unit, symbol)
+        if node is None or _digest(node) != digest:
+            failures.append("classifier terminal original prerequisite changed " + symbol)
     for (path, symbol), digest in TERMINAL_RESERVE_BODY_BINDINGS.items():
         unit = indexed.get(path)
         node = _custody_node_at(unit, symbol) if unit is not None else None
@@ -2374,6 +2394,7 @@ def terminal_failure_reserve_transfers(units):
         return failures, {}
     driver_path, driver = selected["_SegmentDriver"]
     failure_path, failure = selected["fail_continuation_tool_operation"]
+    classifier_path, classifier = selected["fail_classifier_prephysical_operation"]
     if (
         not isinstance(driver, ast.ClassDef)
         or driver.bases
@@ -2383,6 +2404,9 @@ def terminal_failure_reserve_transfers(units):
         or not isinstance(failure, ast.AsyncFunctionDef)
         or failure.decorator_list
         or failure.type_params
+        or not isinstance(classifier, ast.AsyncFunctionDef)
+        or classifier.decorator_list
+        or classifier.type_params
     ):
         return ["terminal reserve original declaration/header changed"], {}
     settle = _find(indexed[driver_path].tree, "_SegmentDriver.settle")
@@ -2492,13 +2516,75 @@ def terminal_failure_reserve_transfers(units):
             and reserve is not None,
             "terminal reserve original deadline/ticket/physical-result join changed",
         )
+    classifier_guards = (
+        "saved, original = _require_native(custody, phases, running, work)",
+        "_require_joined_body(work, original)",
+        "timing = work.coordinator.sql_deadline_owner",
+        "if timing is None or timing.running is not running:\n"
+        '    raise AuditIntegrityError("classifier failure lost its original bounded settlement owner")',
+        "timing.begin_settlement()",
+    )
+    guard_positions = [
+        [index for index, statement in enumerate(classifier.body) if _same(statement, spelling)] for spelling in classifier_guards
+    ]
+    writer = next((node for node in classifier.body if isinstance(node, ast.FunctionDef) and node.name == "write"), None)
+    sql_statements = [
+        (index, node)
+        for index, node in enumerate(classifier.body)
+        if _same(node, "sql = work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)")
+    ]
+    classifier_reserve = _one_call(
+        failures,
+        receipt,
+        classifier_path,
+        classifier,
+        "work.coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=0)",
+        "classifier terminal original SQL source/ordinal changed",
+        key="reserve_calls",
+    )
+    _require(
+        failures,
+        all(len(positions) == 1 for positions in guard_positions)
+        and [positions[0] for positions in guard_positions] == sorted(positions[0] for positions in guard_positions)
+        and len(sql_statements) == 1
+        and writer is not None
+        and guard_positions[-1][0] < classifier.body.index(writer) < sql_statements[0][0]
+        and classifier_reserve is not None,
+        "classifier terminal native/joined/clock guards no longer dominate its SQL ticket",
+    )
+    if len(sql_statements) == 1:
+        sql_index = sql_statements[0][0]
+        joined = classifier.body[sql_index + 1] if sql_index + 1 < len(classifier.body) else None
+        _require(
+            failures,
+            isinstance(joined, ast.Try)
+            and len(joined.body) == 2
+            and _same(joined.body[0], "outcome = await run_required_sql_finish_once(sql, write)")
+            and _same(
+                joined.body[1],
+                "work.coordinator.validate_terminal_failure_sql_outcome("
+                "ticket=sql, actual_outcome=outcome, expected_sql_attempt_ordinal=0)",
+            ),
+            "classifier terminal ticket/finish-once/actual-outcome join changed",
+        )
+    readback = _one_call(
+        failures,
+        receipt,
+        classifier_path,
+        classifier,
+        "work.coordinator.reserve_pair("
+        "RequiredWorkSource.TERMINAL_WRITER_READ_SQL, RequiredWorkSource.TERMINAL_WRITER_READ_PROJECTION, "
+        "transition_ordinal=0, semantic_ordinal=0)",
+        "classifier terminal original writer readback pair changed",
+    )
+    _require(failures, readback is not None, "classifier terminal uncertain completion lost its separate readback")
     actual = {
         (path, id(node))
-        for path, owner in ((driver_path, settle), (failure_path, failure))
+        for path, owner in ((driver_path, settle), (failure_path, failure), (classifier_path, classifier))
         for node in ast.walk(owner)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "reserve"
     }
-    _require(failures, actual == receipt["reserve_calls"] and len(actual) == 2, "terminal reserve complete original call set changed")
+    _require(failures, actual == receipt["reserve_calls"] and len(actual) == 3, "terminal reserve complete original call set changed")
     return _finish(failures, receipt)
 
 

@@ -46,6 +46,7 @@ from elspeth.web.sessions.models import composer_continuation_provider_ordinals_
 from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
+from tests.helpers.continuation_app import observe_original_driver_failures
 from tests.unit.web.composer.test_prompt_guard_admission import _GuardClient
 from tests.unit.web.sessions.test_continuation_primary_v4_live import _v4_primary_input
 from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST
@@ -743,13 +744,94 @@ async def test_v4_guard_refusal_closes_pre_h_with_original_audit_and_no_physical
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refuse", (True, False), ids=("handled-integrity", "successful-sdk"))
+async def test_original_observer_preserves_actual_v4_integrity_refusal_after_admission(operation_store, tmp_path, monkeypatch, refuse):
+    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    running = kwargs["inventory"].running
+    original_error = AuditIntegrityError("PRIVATE_V4_NO_SDK_DIAGNOSTIC_MARKER")
+    original_dispatch, original_reserve = ProviderCallCustody.require_cost_dispatch, PrimaryNoSdkIssuer.reserve_v4_refusal
+    permits, reached, sdk = [], [], []
+
+    def after_admission(custody):
+        if custody.continuation_primary_v4_admission is not None:
+            reached.append(custody.continuation_primary_v4_admission)
+            if refuse:
+                raise original_error
+        return original_dispatch(custody)
+
+    def reserve(issuer, **values):
+        permit = original_reserve(issuer, **values)
+        permits.append(permit)
+        return permit
+
+    async def completion(**_kwargs):
+        sdk.append(1)
+        assert not refuse, "original no-SDK refusal entered SDK"
+        return litellm.ModelResponse(
+            model="test/model",
+            choices=[
+                {"finish_reason": "stop", "message": {"role": "assistant", "content": "Original successful response.", "tool_calls": None}}
+            ],
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
+        )
+
+    monkeypatch.setattr(PrimaryNoSdkIssuer, "reserve_v4_refusal", reserve)
+    diagnostics = observe_original_driver_failures(monkeypatch, running.claim.operation_id, session_id=running.claim.session_id)
+    monkeypatch.setattr(ProviderCallCustody, "require_cost_dispatch", after_admission)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    receipt = await _run_v4_guard_case(kwargs, produced, recorder, store)
+    observed = [event for event in diagnostics if event["boundary"] == "primary_no_sdk_refusal"]
+    if not refuse:
+        assert type(receipt) is primary_source.PrimaryProviderResult
+        assert reached and len(sdk) == 1 and permits == [] and observed == []
+        rows = _rows(store[0], running)
+        assert len(rows["effect"]) == len(rows["physical"]) == len(rows["usage"]) == 1
+        assert rows["effect"][0]["disposition"] == "committed" and rows["physical"][0]["settled_at"] is not None
+        assert rows["usage"][0]["prompt_tokens"] == 7 and rows["usage"][0]["completion_tokens"] == 3
+        kwargs["required_work"].coordinator.assert_completed()
+        return
+    assert type(receipt) is primary_sql.PrimaryNoSdkRefusalReceipt
+    assert len(reached) == len(permits) == 1 and permits[0].original_failure is original_error and sdk == []
+    assert len(observed) == 1
+    assert (observed[0]["event"], observed[0]["method"], observed[0]["reason"]) == (
+        "reserved",
+        "reserve_v4_refusal",
+        "integrity_refused",
+    )
+    assert observed[0]["effect_key"] == receipt.effect_key == permits[0].prepared.binding.effect_key
+    original = observed[0]["original"]
+    assert original["type"] == "AuditIntegrityError" and original["first_line"] == "[redacted]" and original["frames"]
+    assert original["line_sha256"] == sha256(original_error.args[0].encode()).hexdigest()
+    assert "PRIVATE_V4_NO_SDK_DIAGNOSTIC_MARKER" not in json.dumps(diagnostics)
+    rows = _rows(store[0], running)
+    assert len(rows["effect"]) == len(rows["physical"]) == len(rows["usage"]) == 1
+    assert rows["effect"][0]["disposition"] == "refused" and rows["physical"][0]["settled_at"] is not None
+    assert rows["usage"][0]["prompt_tokens"] == rows["usage"][0]["completion_tokens"] == 0
+    with store[0].connect() as conn:
+        assert _cold_no_sdk_receipt(conn, running, receipt.effect_key) == receipt
+    kwargs["required_work"].coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
 async def test_v4_admitted_h_cannot_relabel_later_guard_error_as_no_sdk_refusal(operation_store, tmp_path, monkeypatch):
     kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
     running = kwargs["inventory"].running
     assert running is not None
     forged = PromptGuardRefused(decision=PromptGuardDecision("blocked", "policy_blocked"), audit_id=str(uuid4()))
     original = ProviderCallCustody.require_cost_dispatch
+    original_reserve = PrimaryNoSdkIssuer.reserve_v4_refusal
+    reservation_errors = []
     sdk = []
+
+    def reserve(issuer, **kwargs):
+        try:
+            return original_reserve(issuer, **kwargs)
+        except BaseException as error:
+            reservation_errors.append(error)
+            raise
+
+    monkeypatch.setattr(PrimaryNoSdkIssuer, "reserve_v4_refusal", reserve)
+    diagnostics = observe_original_driver_failures(monkeypatch, running.claim.operation_id, session_id=running.claim.session_id)
 
     def after_admission(custody):
         if custody.continuation_primary_v4_admission is not None:
@@ -762,8 +844,10 @@ async def test_v4_admitted_h_cannot_relabel_later_guard_error_as_no_sdk_refusal(
 
     monkeypatch.setattr(ProviderCallCustody, "require_cost_dispatch", after_admission)
     monkeypatch.setattr(litellm, "acompletion", completion)
-    with pytest.raises(AuditIntegrityError, match="V4 PRIMARY no-SDK refusal lacks proved unentered admitted custody"):
+    with pytest.raises(AuditIntegrityError, match="V4 PRIMARY no-SDK refusal lacks proved unentered admitted custody") as raised:
         await _run_v4_guard_case(kwargs, produced, recorder, store)
+    assert reservation_errors == [raised.value]
+    assert not [event for event in diagnostics if event["boundary"] == "primary_no_sdk_refusal"]
     rows = _rows(store[0], running)
     assert sdk == [] and len(rows["effect"]) == len(rows["physical"]) == 1
     assert rows["effect"][0]["disposition"] == "dispatched"
