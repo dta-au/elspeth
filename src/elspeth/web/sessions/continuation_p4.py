@@ -36,6 +36,7 @@ from elspeth.web.composer.continuation_codec import (
 from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk
 from elspeth.web.composer.continuation_p4_outcome import (
     RetainedAuditOutcome,
+    _decode_audit_outcome_with_prepared_members,
     decode_audit_outcome_data,
     encode_audit_outcome_data,
     historical_checkpoint_columns_json,
@@ -43,6 +44,8 @@ from elspeth.web.composer.continuation_p4_outcome import (
 )
 from elspeth.web.composer.continuation_prepared_p4 import (
     PreparedP4Value,
+    _decode_prepared_p4_with_members,
+    _prepared_p4_semantic_input,
     capture_prepared_p4,
     decode_prepared_p4,
     encode_prepared_p4,
@@ -701,11 +704,13 @@ def decode_p4_receipt(
     receipt = _decode_owned(_RECEIPT, encoded)
     if receipt.schema_version != "composer.persisted-turn.v2" or receipt.prepared_p4_json is None or receipt.audit_outcome_json is None:
         raise AuditIntegrityError("P4 current recovery requires its complete actual writer receipt")
-    prepared = decode_prepared_p4(receipt.prepared_p4_json, env_ref_names=env_ref_names)
-    data = decode_audit_outcome_data(receipt.audit_outcome_json, prepared=prepared, env_ref_names=env_ref_names)
+    prepared, members = _decode_prepared_p4_with_members(receipt.prepared_p4_json, env_ref_names=env_ref_names)
+    data = _decode_audit_outcome_with_prepared_members(
+        receipt.audit_outcome_json, prepared=prepared, members=members, env_ref_names=env_ref_names
+    )
     checkpoint = data.checkpoint
     if (
-        receipt.input_sha256 != stable_hash(_read_json_value(p4_semantic_input(prepared, env_ref_names=env_ref_names)))
+        receipt.input_sha256 != stable_hash(_read_json_value(_prepared_p4_semantic_input(prepared)))
         or receipt.creator_operation_id != prepared.creator_operation_id
         or (None if receipt.assistant_id is None else str(receipt.assistant_id)) != data.assistant_id
         or (None if receipt.current_state_id is None else str(receipt.current_state_id)) != data.current_state_id
@@ -721,7 +726,6 @@ def decode_p4_receipt(
     )
     if receipt.authored_state_hash != expected_hash:
         raise AuditIntegrityError("P4 receipt changed its historical authored state hash")
-    members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
     if not data.unwind_audit_failed and (
         receipt.invocation_ids != tuple(item.tool_call_id for item in members.invocations)
         or receipt.invocation_hashes

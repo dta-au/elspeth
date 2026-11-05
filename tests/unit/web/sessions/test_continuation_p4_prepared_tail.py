@@ -174,3 +174,78 @@ async def test_planned_nominal_row_hashes_reproduce_real_complete_p4_receipt(ope
         assert retained_rows(engine) == before
     finally:
         repository.release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_complete_p4_receipt_reuses_its_initial_prepared_members_and_preserves_public_admission(operation_store, monkeypatch):
+    from elspeth.contracts.hashing import canonical_json
+    from elspeth.web.composer import continuation_p4_outcome as outcomes
+    from elspeth.web.composer import continuation_prepared_p4 as prepared_values
+    from elspeth.web.sessions.continuation_p4 import decode_p4_receipt
+
+    engine, repository, _authority, _service, sid = operation_store
+    running, selected, inventory, _snapshot, commit = await committed_evidence_case(operation_store, graph=True, joint=True)
+    try:
+        with locked_session_transaction(engine, str(sid)) as conn:
+            checked = read_owed_p4_evidence_on_connection(
+                conn, running, selected=selected, inventory=inventory, effect_key=commit.effect_key
+            )
+        receipt = checked.result.receipt
+        assert receipt.prepared_p4_json is not None and receipt.audit_outcome_json is not None
+        assert receipt.assistant_id is not None and receipt.authored_state_hash is not None
+        encoded = canonical_json(receipt.model_dump(mode="json"))
+        actual_members = prepared_values._decoded_prepared_p4_members
+        actual_projection = outcomes._audit_outcome_from_prepared_members
+        attempts, admissions, projections = [], [], []
+
+        def admit(value, *, env_ref_names):
+            assert env_ref_names is inventory.names
+            attempts.append(value)
+            members = actual_members(value, env_ref_names=env_ref_names)
+            admissions.append((value, members))
+            return members
+
+        def project(value, *, prepared, members, env_ref_names):
+            result = actual_projection(value, prepared=prepared, members=members, env_ref_names=env_ref_names)
+            projections.append((prepared, members, result))
+            return result
+
+        monkeypatch.setattr(prepared_values, "_decoded_prepared_p4_members", admit)
+        monkeypatch.setattr(outcomes, "_audit_outcome_from_prepared_members", project)
+        before = retained_rows(engine)
+        decoded_receipt, decoded_outcome = decode_p4_receipt(encoded, env_ref_names=inventory.names)
+        assert decoded_receipt == receipt and decoded_outcome == checked.result.outcome
+        assert len(attempts) == len(admissions) == len(projections) == 1
+        initial_prepared, initial_members = admissions[0]
+        assert attempts[0] is initial_prepared
+        assert projections[0][0] is initial_prepared and projections[0][1] is initial_members
+        assert projections[0][2] is decoded_outcome
+
+        # Calibrate both sides of the call observer: a pure projection performs
+        # no admission; public APIs accepting supplied DATA still admit it.
+        semantic = prepared_values._prepared_p4_semantic_input(initial_prepared)
+        assert len(attempts) == len(admissions) == 1
+        public_members = prepared_values.prepared_p4_members(initial_prepared, env_ref_names=inventory.names)
+        assert public_members == initial_members
+        assert len(attempts) == len(admissions) == 2
+        assert admissions[-1][0] == initial_prepared and admissions[-1][0] is not initial_prepared
+        assert admissions[-1][1] is public_members
+        assert prepared_values.p4_semantic_input(initial_prepared, env_ref_names=inventory.names) == semantic
+        assert len(attempts) == len(admissions) == 3
+
+        malformed = initial_prepared.model_copy(update={"redacted_calls_json": "{}"})
+        with pytest.raises(AuditIntegrityError, match="retained P4 calls are not their object array"):
+            outcomes.decode_audit_outcome_data(receipt.audit_outcome_json, prepared=malformed, env_ref_names=inventory.names)
+        assert len(attempts) == 4 and len(admissions) == 3 and len(projections) == 1
+
+        # Public outcome parsing must still precede supplied-prepared admission.
+        # Compare against the real malformed-outcome/valid-prepared control.
+        with pytest.raises(AuditIntegrityError) as invalid_outcome:
+            outcomes.decode_audit_outcome_data("{}", prepared=initial_prepared, env_ref_names=inventory.names)
+        with pytest.raises(AuditIntegrityError) as both_invalid:
+            outcomes.decode_audit_outcome_data("{}", prepared=malformed, env_ref_names=inventory.names)
+        assert str(both_invalid.value) == str(invalid_outcome.value)
+        assert len(attempts) == 4 and len(admissions) == 3 and len(projections) == 1
+        assert retained_rows(engine) == before
+    finally:
+        repository.release(running.session_operation_context)

@@ -152,7 +152,6 @@ class EarlyPreparationProfile:
         from elspeth.web.composer import continuation_checkpoint_early_physical as physical
         from elspeth.web.composer import continuation_checkpoint_end_detached as detached
         from elspeth.web.composer import continuation_current_evidence as current_evidence
-        from elspeth.web.composer import continuation_evidence_restore as evidence_restore
         from elspeth.web.composer import continuation_prompt_producers as prompt_producers
         from elspeth.web.composer import continuation_runtime as runtime
         from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
@@ -263,34 +262,16 @@ class EarlyPreparationProfile:
                             "runtime.sql_private_closure",
                         ),
                         (
-                            sql_runtime,
-                            "require_runtime_source_current_on_connection",
-                            sql_runtime.require_runtime_source_current_on_connection,
-                            "runtime.final_source_verifier",
-                        ),
-                        (
                             AdmittedTurnEvidence,
                             "_require_original_graph",
                             AdmittedTurnEvidence._require_original_graph,
                             "evidence.original_graph",
                         ),
                         (
-                            evidence_restore,
-                            "_require_selected_evidence_relations_on_connection",
-                            evidence_restore._require_selected_evidence_relations_on_connection,
-                            "evidence.sql_relations",
-                        ),
-                        (
                             prompt_producers,
                             "_inputs_from_current_evidence_on_connection",
                             prompt_producers._inputs_from_current_evidence_on_connection,
                             "runtime.message_inputs",
-                        ),
-                        (
-                            sql_runtime,
-                            "_assemble_runtime_source_on_connection",
-                            sql_runtime._assemble_runtime_source_on_connection,
-                            "runtime.source_assembly",
                         ),
                         (
                             application_store,

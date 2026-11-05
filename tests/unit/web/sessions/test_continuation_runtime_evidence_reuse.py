@@ -39,7 +39,7 @@ async def test_runtime_source_retains_its_actual_validated_evidence_and_rejects_
         assert recovery_rows(operation_store[0]) == before
         another = replace(running)
         assert another == running and another is not running
-        with pytest.raises(AuditIntegrityError, match="current inventory owner"):
+        with pytest.raises(AuditIntegrityError, match="runtime read requires its actual current and selected owners"):
             await asyncio.to_thread(
                 arguments["authority"].read_continuation_runtime,
                 another,

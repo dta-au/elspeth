@@ -577,5 +577,10 @@ def p4_semantic_input(value: PreparedP4Value, *, env_ref_names: frozenset[str] =
     projection deliberately includes creator and visible-event provenance.
     """
     prepared_p4_members(value, env_ref_names=env_ref_names)
+    return _prepared_p4_semantic_input(value)
+
+
+def _prepared_p4_semantic_input(value: PreparedP4Value) -> str:
+    """Project the complete input of the locally admitted prepared value."""
     payload = value.model_dump(mode="json", warnings="error")
     return canonical_json({"schema": "composer.p4-input.v1", "prepared": owned_json(payload)})

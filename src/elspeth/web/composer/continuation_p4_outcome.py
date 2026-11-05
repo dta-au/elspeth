@@ -22,6 +22,7 @@ from elspeth.web.composer._compose_loop_carriers import _PersistOutcome
 from elspeth.web.composer.continuation_codec import owned_json
 from elspeth.web.composer.continuation_p4_state_payload import encode_p4_state_payload
 from elspeth.web.composer.continuation_prepared_p4 import (
+    PreparedP4Members,
     PreparedP4Value,
     _p4_rows_json,
     decode_prepared_p4,
@@ -396,6 +397,21 @@ def decode_audit_outcome_data(
     # under their actual selected domains. Publication can select only one of
     # its two complete actual cohorts, never a generic JSON-schema waiver.
     members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
+    return _audit_outcome_from_prepared_members(value, prepared=prepared, members=members, env_ref_names=env_ref_names)
+
+
+def _decode_audit_outcome_with_prepared_members(
+    encoded: str, *, prepared: PreparedP4Value, members: PreparedP4Members, env_ref_names: frozenset[str]
+) -> RetainedAuditOutcome:
+    """Decode outcome bytes using this receipt decode's actual prepared members."""
+    value = _decode_owned(_AUDIT_VALUE, encoded)
+    return _audit_outcome_from_prepared_members(value, prepared=prepared, members=members, env_ref_names=env_ref_names)
+
+
+def _audit_outcome_from_prepared_members(
+    value: RetainedAuditOutcome, *, prepared: PreparedP4Value, members: PreparedP4Members, env_ref_names: frozenset[str]
+) -> RetainedAuditOutcome:
+    """Check outcome semantics against the already admitted prepared DATA."""
     revocation = None if value.authority_revocation_json is None else _decode_owned(_REVOCATION, value.authority_revocation_json)
     if value.checkpoint_disposition == "unavailable":
         if (

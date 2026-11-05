@@ -109,7 +109,9 @@ def read_selected_turn_evidence_graph_on_connection(
     names: frozenset[str],
 ) -> AdmittedTurnEvidence:
     """Validate selected evidence DATA after the caller proves current admission."""
-    _require_current_evidence_principal_on_connection(conn, session_id=running.claim.session_id)
+    principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(running.claim.session_id))).one()
+    if principal.archived_at is not None:
+        raise AuditIntegrityError("cold evidence changed its principal or committed ingress")
     return read_selected_turn_evidence_graph_data_on_connection(
         conn,
         session_id=running.claim.session_id,
@@ -117,12 +119,6 @@ def read_selected_turn_evidence_graph_on_connection(
         selected=selected,
         names=names,
     )
-
-
-def _require_current_evidence_principal_on_connection(conn: Connection, *, session_id: UUID) -> None:
-    principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(session_id))).one()
-    if principal.archived_at is not None:
-        raise AuditIntegrityError("cold evidence changed its principal or committed ingress")
 
 
 def read_selected_turn_evidence_graph_data_on_connection(
@@ -139,21 +135,6 @@ def read_selected_turn_evidence_graph_data_on_connection(
     wrapper; lost-owner settlement proves it in its own repository transaction.
     Every original graph, transcript, base, creator and application check stays.
     """
-    frame = _selected_evidence_frame(selected, session_id=session_id, operation_id=operation_id)
-    admitted = decode_turn_evidence(
-        _selected_evidence_chunk_on_connection(
-            conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=frame.evidence
-        ),
-        env_ref_names=names,
-        source_chunks=selected.chunks,
-    )
-    _require_selected_evidence_relations_on_connection(
-        conn, session_id=session_id, operation_id=operation_id, selected=selected, names=names, admitted=admitted
-    )
-    return admitted
-
-
-def _selected_evidence_frame(selected: SelectedContinuationState, *, session_id: UUID, operation_id: str) -> ComposeFrame:
     root = selected.stack
     compose = tuple(frame for frame in root.frames if type(frame) is ComposeFrame)
     if len(compose) != 1:
@@ -164,47 +145,18 @@ def _selected_evidence_frame(selected: SelectedContinuationState, *, session_id:
     sid = str(session_id)
     if (root.logical.session_id, root.logical.operation_id) != (sid, operation_id):
         raise AuditIntegrityError("cold evidence changed its logical SQL identity")
-    return frame
-
-
-def _selected_evidence_chunk_on_connection(
-    conn: Connection,
-    *,
-    session_id: UUID,
-    operation_id: str,
-    selected: SelectedContinuationState,
-    reference: PrivateChunkRef,
-) -> PrivateChunk:
-    candidates = tuple(item for item in selected.chunks if item.reference == reference)
-    if len(candidates) != 1:
-        raise AuditIntegrityError("cold evidence lost its selected chunk")
-    raw = read_chunk(conn, session_id=str(session_id), operation_id=operation_id, key=f"value:{reference.codec}:{reference.digest}")
-    if raw != candidates[0].canonical.encode("utf-8"):
-        raise AuditIntegrityError("cold evidence storage differs from its selected bytes")
-    verify_private_chunk(reference, candidates[0].canonical)
-    return candidates[0]
-
-
-def _require_selected_evidence_relations_on_connection(
-    conn: Connection,
-    *,
-    session_id: UUID,
-    operation_id: str,
-    selected: SelectedContinuationState,
-    names: frozenset[str],
-    admitted: AdmittedTurnEvidence,
-) -> None:
-    """Recheck the original SQL joins using the caller's actual admitted DATA."""
-    admitted = require_admitted_turn_evidence(admitted, env_ref_names=names)
-    root = selected.stack
-    frame = _selected_evidence_frame(selected, session_id=session_id, operation_id=operation_id)
-    sid = str(session_id)
 
     def actual_chunk(reference: PrivateChunkRef) -> PrivateChunk:
-        return _selected_evidence_chunk_on_connection(
-            conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=reference
-        )
+        candidates = tuple(item for item in selected.chunks if item.reference == reference)
+        if len(candidates) != 1:
+            raise AuditIntegrityError("cold evidence lost its selected chunk")
+        raw = read_chunk(conn, session_id=sid, operation_id=operation_id, key=f"value:{reference.codec}:{reference.digest}")
+        if raw != candidates[0].canonical.encode("utf-8"):
+            raise AuditIntegrityError("cold evidence storage differs from its selected bytes")
+        verify_private_chunk(reference, candidates[0].canonical)
+        return candidates[0]
 
+    admitted = decode_turn_evidence(actual_chunk(frame.evidence), env_ref_names=names, source_chunks=selected.chunks)
     snapshot = admitted.snapshot
     if snapshot.logical != root.logical:
         raise AuditIntegrityError("cold evidence changed its complete logical binding")
@@ -283,6 +235,7 @@ def _require_selected_evidence_relations_on_connection(
     require_attachment_applications_data_on_connection(
         conn, session_id=session_id, operation_id=operation_id, selected=selected, evidence=admitted, env_ref_names=names
     )
+    return admitted
 
 
 async def restore_turn_evidence(

@@ -11,7 +11,6 @@ from sqlalchemy import delete, select, text, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
-from elspeth.web.composer import continuation_evidence_restore as evidence_reader
 from elspeth.web.composer import continuation_runtime as runtime_owner
 from elspeth.web.composer.continuation_codec import (
     decode_continuation_snapshot,
@@ -54,12 +53,7 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
     # initial acquisition rather than the same-object env-only optimization.
     arguments = {**arguments, "selected": replace(arguments["selected"])}
     original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owners
-    original_require = sql_owner.require_runtime_source_current_on_connection
-    original_decode = evidence_reader.decode_turn_evidence
-    original_closure = sql_owner.load_selected_private_chunks_on_connection
     sql_reads, captures, lookups, computations = [], [], [], []
-    sources, current_decodes, closures, final_sources = [], [], [], []
-    in_final = False
     original_lookup = RetentionStageMemo._lookup
     entered, release = Event(), Event()
     original_error = ValueError("original physical capture error")
@@ -68,35 +62,9 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
         memo = current_retention_stage_memo()
         assert type(memo) is RetentionStageMemo and memo.active
         sql_reads.append((memo, conn))
-        if outcome == "initial-read-error":
+        if outcome == "initial-read-error" or (outcome == "final-read-error" and len(sql_reads) == 2):
             raise original_error
-        result = original_read(conn, *args, **kwargs)
-        sources.append(result)
-        return result
-
-    def require(conn, *args, **kwargs):
-        nonlocal in_final
-        memo = current_retention_stage_memo()
-        assert memo is captures[-1] and memo.active
-        assert kwargs["source"] is sources[-1]
-        final_sources.append(kwargs["source"])
-        sql_reads.append((memo, conn))
-        if outcome == "final-read-error":
-            raise original_error
-        in_final = True
-        try:
-            return original_require(conn, *args, **kwargs)
-        finally:
-            in_final = False
-
-    def decode(chunk, **kwargs):
-        if chunk.reference == arguments["selected"].stack.frames[0].evidence:
-            current_decodes.append(in_final)
-        return original_decode(chunk, **kwargs)
-
-    def closure(*args, **kwargs):
-        closures.append(in_final)
-        return original_closure(*args, **kwargs)
+        return original_read(conn, *args, **kwargs)
 
     def lookup(memo, entries, key, compute):
         lookups.append(memo)
@@ -121,9 +89,6 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
         return result
 
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
-    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
-    monkeypatch.setattr(evidence_reader, "decode_turn_evidence", decode)
-    monkeypatch.setattr(sql_owner, "load_selected_private_chunks_on_connection", closure)
     monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
     monkeypatch.setattr(RetentionStageMemo, "_lookup", lookup)
     before = recovery_rows(operation_store[0])
@@ -161,11 +126,6 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
         assert len(sql_reads) == len(expected)
         assert all(actual is wanted for (actual, _conn), wanted in zip(sql_reads, expected, strict=True))
         assert all(conn.closed for _memo, conn in sql_reads)
-        assert not any(current_decodes) and not any(closures)
-        if outcome != "initial-read-error":
-            assert current_decodes and closures
-            assert len(sources) == len(captures)
-        assert len(final_sources) == (0 if outcome in ("initial-read-error", "capture-error") else len(captures))
         if outcome not in ("initial-read-error", "capture-error"):
             assert sql_reads[0][1] is not sql_reads[1][1]
         assert current_retention_stage_memo() is None
@@ -178,45 +138,33 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("facade", ("read", "require"))
-async def test_runtime_facade_defaults_to_fresh_isolation_and_borrows_only_explicit_current_memo(operation_store, monkeypatch, facade):
+async def test_runtime_facade_defaults_to_fresh_isolation_and_borrows_only_explicit_current_memo(operation_store, monkeypatch):
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running
     original_read = sql_owner.read_runtime_source_on_connection
-    original_require = sql_owner.require_runtime_source_current_on_connection
     authority = arguments["authority"]
-    source = await asyncio.to_thread(
-        authority.read_continuation_runtime, running, selected=arguments["selected"], inventory=arguments["inventory"]
-    )
-    method = authority.read_continuation_runtime if facade == "read" else authority.require_continuation_runtime_current
-    values = {"selected": arguments["selected"]} if facade == "read" else {"source": source}
     observed = []
 
     def read(*args, **kwargs):
         observed.append(current_retention_stage_memo())
         return original_read(*args, **kwargs)
 
-    def require(*args, **kwargs):
-        observed.append(current_retention_stage_memo())
-        return original_require(*args, **kwargs)
-
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
-    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
     try:
         with retention_stage_memo_scope() as outer:
             for _ in range(2):
                 await asyncio.to_thread(
-                    method,
+                    authority.read_continuation_runtime,
                     running,
-                    **values,
+                    selected=arguments["selected"],
                     inventory=arguments["inventory"],
                 )
                 assert observed[-1] is not outer and not observed[-1].active
             assert observed[0] is not observed[1]
             await asyncio.to_thread(
-                method,
+                authority.read_continuation_runtime,
                 running,
-                **values,
+                selected=arguments["selected"],
                 inventory=arguments["inventory"],
                 retention_memo=outer,
             )
@@ -229,30 +177,18 @@ async def test_runtime_facade_defaults_to_fresh_isolation_and_borrows_only_expli
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["foreign", "closed", "wrong-current"])
-@pytest.mark.parametrize("facade", ("read", "require"))
-async def test_runtime_facade_refuses_invalid_borrow_before_sql(operation_store, monkeypatch, kind, facade):
+async def test_runtime_facade_refuses_invalid_borrow_before_sql(operation_store, monkeypatch, kind):
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running
     original_read = sql_owner.read_runtime_source_on_connection
-    original_require = sql_owner.require_runtime_source_current_on_connection
     authority = arguments["authority"]
-    source = await asyncio.to_thread(
-        authority.read_continuation_runtime, running, selected=arguments["selected"], inventory=arguments["inventory"]
-    )
-    method = authority.read_continuation_runtime if facade == "read" else authority.require_continuation_runtime_current
-    values = {"selected": arguments["selected"]} if facade == "read" else {"source": source}
     observed = []
 
     def read(*args, **kwargs):
         observed.append(True)
         return original_read(*args, **kwargs)
 
-    def require(*args, **kwargs):
-        observed.append(True)
-        return original_require(*args, **kwargs)
-
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
-    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
     with retention_stage_memo_scope() as closed:
         pass
     try:
@@ -261,9 +197,9 @@ async def test_runtime_facade_refuses_invalid_borrow_before_sql(operation_store,
             before = recovery_rows(operation_store[0])
             with pytest.raises(AuditIntegrityError, match="exact active retention memo"):
                 await asyncio.to_thread(
-                    method,
+                    authority.read_continuation_runtime,
                     running,
-                    **values,
+                    selected=arguments["selected"],
                     inventory=arguments["inventory"],
                     retention_memo=borrowed,
                 )
@@ -283,22 +219,14 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
     await _capture(runtime, arguments)
     arguments = {**arguments, "selected": replace(arguments["selected"])}
     original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owners
-    original_require = sql_owner.require_runtime_source_current_on_connection
     reads, capture_memos, after_mutation = [], [], []
-    capture_sources = []
 
     def read(*args, **kwargs):
         reads.append(current_retention_stage_memo())
         return original_read(*args, **kwargs)
 
-    def require(*args, **kwargs):
-        reads.append(current_retention_stage_memo())
-        assert kwargs["source"] is capture_sources[-1]
-        return original_require(*args, **kwargs)
-
     def capture(*args, **kwargs):
         capture_memos.append(current_retention_stage_memo())
-        capture_sources.append(kwargs["source"])
         result = original_capture(*args, **kwargs)
         with locked_session_transaction(operation_store[0], str(running.claim.session_id)) as conn:
             if change in ("sql-bytes", "sql-missing", "sql-storage-type"):
@@ -372,7 +300,6 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
         return result
 
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
-    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
     monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
     try:
         with pytest.raises(AuditIntegrityError):
@@ -403,7 +330,7 @@ async def test_final_capture_rechecks_nonselected_historical_witness(operation_s
         await _capture(runtime, arguments)
         assert len(sdk) == 1
         actual_capture = runtime_owner._capture_owners
-        actual_require = sql_owner.require_runtime_source_current_on_connection
+        actual_read = sql_owner.read_runtime_source_on_connection
         mutated, final_errors = [], []
 
         def capture(*args, **values):
@@ -432,16 +359,16 @@ async def test_final_capture_rechecks_nonselected_historical_witness(operation_s
             mutated.append((source, recovery_rows(store[0])))
             return result
 
-        def require(*args, **values):
-            assert values["source"] is mutated[-1][0]
+        def read(*args, **values):
+            assert values["selected"] is mutated[-1][0].selected
             try:
-                return actual_require(*args, **values)
+                return actual_read(*args, **values)
             except AuditIntegrityError as error:
                 final_errors.append(error)
                 raise
 
         monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
-        monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
+        monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
         with pytest.raises(AuditIntegrityError) as refused:
             await _capture(runtime, arguments)
         assert len(mutated) == 1 and final_errors == [refused.value]
@@ -456,7 +383,7 @@ async def test_final_capture_preserves_actual_retention_refusal_and_final_failur
     running = arguments["inventory"].running
     runtime = await runtime_owner.restore_continuation_runtime(**arguments)
     await _capture(runtime, arguments)
-    actual_capture, actual_require = runtime_owner._capture_owners, sql_owner.require_runtime_source_current_on_connection
+    actual_capture, actual_read = runtime_owner._capture_owners, sql_owner.read_runtime_source_on_connection
     refusals, failures, checked, after_mutation = [], [], [], []
 
     def capture(*args, **values):
@@ -487,17 +414,17 @@ async def test_final_capture_preserves_actual_retention_refusal_and_final_failur
             raise
         raise AssertionError("actual over-bound mandatory document was accepted")
 
-    def require(*args, **values):
-        checked.append(values["source"])
-        assert values["source"] is runtime.source
+    def read(*args, **values):
+        checked.append(values["selected"])
+        assert values["selected"] is arguments["selected"]
         try:
-            return actual_require(*args, **values)
+            return actual_read(*args, **values)
         except AuditIntegrityError as error:
             failures.append(error)
             raise
 
     monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
-    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
+    monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
     try:
         if final_failure:
             with pytest.raises(BaseExceptionGroup, match="Retention refusal and final current-source admission") as grouped:
@@ -511,7 +438,7 @@ async def test_final_capture_preserves_actual_retention_refusal_and_final_failur
             assert carried.value.__cause__ is refusals[0] and carried.value.reason == refusals[0].reason == "retained_chunk_bytes"
             assert carried.value.tool_invocations == runtime.live.recorder.invocations[runtime.drained.invocations :]
             assert carried.value.llm_calls == runtime.live.recorder.llm_calls[runtime.drained.llm_calls :]
-        assert checked == [runtime.source] and len(after_mutation) == 1
+        assert checked == [arguments["selected"]] and len(after_mutation) == 1
         assert recovery_rows(operation_store[0]) == after_mutation[0]
         arguments["required_work"].coordinator.assert_completed()
     finally:
@@ -555,7 +482,9 @@ async def test_capture_prefix_uses_original_roundtripped_chunk_and_one_fresh_liv
         monkeypatch.setattr(runtime_owner, "decode_recorder_snapshot", decode)
         monkeypatch.setattr(runtime_owner, "encode_recorder_snapshot", encode)
         result = await _capture(runtime, arguments)
-        assert len(reads) == 1 and len(decoded) == len(encoded) == 1
+        # The original source and final SQL proof both use the full reader.
+        assert len(reads) == 2
+        assert len(decoded) == len(encoded) == 1
         assert decoded[0][0] is reads[0].admitted_evidence.recorder_chunk
         assert encoded[0] == decoded[0][0]
         frame = result.stack.frames[0]
