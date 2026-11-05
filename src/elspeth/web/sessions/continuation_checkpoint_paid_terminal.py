@@ -220,6 +220,7 @@ def _read_v4_checkpoint_terminal_on_connection(
         creator_sequence=source.creator_sequence,
         requested_model=effect.requested_model,
         historical_contract_sha256=None if post_h else source.fallback_contract_sha256,
+        early_input=replay.early_input,
     )
     effective_admitted = admitted
     plan: CheckpointPaidOverflowTailPlan | CheckpointPaidIncompleteTailPlan

@@ -17,7 +17,6 @@ from elspeth.contracts.prompt_guard import detach_prompt_guard_evidence
 from elspeth.web.composer.advisor_audit import AdvisorCheckpointPassRecord
 from elspeth.web.composer.advisor_checkpoint import (
     AdvisorCheckpointVerdict,
-    _parse_advisor_checkpoint_guidance,
     checkpoint_pass_record,
     early_checkpoint_injection,
 )
@@ -44,9 +43,11 @@ from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
+from elspeth.web.required_work import RequiredWorkBinding
 from elspeth.web.sessions.locking import locked_session_transaction
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_checkpoint_early_physical import CheckpointEarlyPhysicalSource
     from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
 
 
@@ -208,6 +209,7 @@ async def _capture_dispatched_projection(
     detached: RestoredContinuationRuntime,
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
+    runtime_work: RequiredWorkBinding,
 ) -> _ProjectionCapture:
     from elspeth.web.sessions.continuation_checkpoint_paid import require_current_checkpoint_dispatched_on_connection
 
@@ -229,7 +231,9 @@ async def _capture_dispatched_projection(
         != before
         or inventory.running is not prepared.running
         or inventory.names != detached.env_ref_names
-        or detached.bindings.required_work is not prepared.work
+        or detached.bindings.required_work is not runtime_work
+        or runtime_work.coordinator is not prepared.work.coordinator
+        or runtime_work.running is not prepared.running
         or detached.materialization.authority is not prepared.authority
     ):
         raise AuditIntegrityError("checkpoint projection replaced its exact pre-call graph at dispatch")
@@ -271,6 +275,7 @@ async def project_early_checkpoint_result(
     custody: ProviderCallCustody,
     returned: CheckpointReturnedResponseObservation,
     accounting: CheckpointPassAccounting,
+    physical_source: CheckpointEarlyPhysicalSource | None = None,
 ) -> ProjectedEarlyCheckpoint | ProjectedEarlyCheckpointOverflow:
     """Measure the original call and exact EARLY consequence on an isolated graph.
 
@@ -278,7 +283,12 @@ async def project_early_checkpoint_result(
     settled by the paid owner; this function never retries or substitutes a
     model outcome when capture fails.
     """
-    _require_detached_source(detached, original)
+    if physical_source is None:
+        _require_detached_source(detached, original)
+    else:
+        from elspeth.web.composer.continuation_checkpoint_early_physical import require_checkpoint_early_detached_source
+
+        require_checkpoint_early_detached_source(physical_source, detached=detached, original=original)
     if (
         type(returned) is not CheckpointReturnedResponseObservation
         or returned.phase != "early"
@@ -298,9 +308,9 @@ async def project_early_checkpoint_result(
         or (
             accounting.provider_attempts == 2
             and (
-                type(accounting.first_attempt_schema_valid) is not bool
-                or accounting.first_attempt_accepted is not False
-                or not accounting.format_reprompt_sent
+                (accounting.first_attempt_schema_valid is None) != (accounting.first_attempt_accepted is None)
+                or (accounting.first_attempt_accepted is not None and accounting.first_attempt_accepted is not False)
+                or accounting.format_reprompt_sent != (accounting.first_attempt_schema_valid is not None)
             )
         )
         or returned.attempt is not admission.attempt
@@ -309,17 +319,23 @@ async def project_early_checkpoint_result(
         or custody.required_work is not prepared.work
         or returned.audit_call.messages_hash != prepared.request_sha256
         or any(call.call_id == returned.audit_call.call_id for call in detached.live.recorder.llm_calls)
-        or type(returned.message.content) is not str
     ):
         raise AuditIntegrityError("EARLY projection changed its original physical attempt or pass")
     completeness = returned.provider_metadata.v4_completeness
     if type(completeness) is not V4ProviderResultCompleteness:
         raise AuditIntegrityError("EARLY projection lacks original V4 raw-result completeness")
     custody.require_v4_result_completeness(completeness)
-    completeness.require_result(returned.provider_metadata, content=returned.message.content, tool_calls=())
-    verdict = _parse_advisor_checkpoint_guidance(returned.message.content, phase="early")
+    completeness.require_result(returned.provider_metadata, content=returned.message.content, tool_calls=returned.tool_batch.calls)
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+    from elspeth.web.composer.continuation_checkpoint_early_observation import early_returned_checkpoint_verdict
+
+    verdict = early_returned_checkpoint_verdict(_AdmittedLLMCompletion(returned.message, returned.tool_batch, returned.provider_metadata))
     first_valid = verdict.response_schema_valid if accounting.provider_attempts == 1 else accounting.first_attempt_schema_valid
-    first_accepted = verdict.ok if accounting.provider_attempts == 1 else accounting.first_attempt_accepted
+    first_accepted = (
+        (verdict.ok if type(returned.message.content) is str else None)
+        if accounting.provider_attempts == 1
+        else accounting.first_attempt_accepted
+    )
     retry_pending = not verdict.ok and accounting.provider_attempts < 2
     pass_record = (
         None
@@ -336,14 +352,22 @@ async def project_early_checkpoint_result(
             format_reprompt_sent=accounting.format_reprompt_sent,
         )
     )
-    injection = early_checkpoint_injection(verdict)
+    injection = None if retry_pending else early_checkpoint_injection(verdict)
     detached.live.recorder.record_llm_call(returned.audit_call, provider_custody=custody)
     if injection is not None:
         detached.live.llm_messages.append({"role": "user", "content": injection})
         detached.live.advisor_repair_context_introduced = True
     detached.live.turn_evidence.transcript.observe_messages(detached.live.llm_messages)
+    runtime_work = original.bindings.required_work if physical_source is not None else prepared.work
+    if type(runtime_work) is not RequiredWorkBinding:
+        raise AuditIntegrityError("EARLY projection lost its original runtime work owner")
     capture = await _capture_dispatched_projection(
-        prepared=prepared, admission=admission, detached=detached, selected=selected, inventory=inventory
+        prepared=prepared,
+        admission=admission,
+        detached=detached,
+        selected=selected,
+        inventory=inventory,
+        runtime_work=runtime_work,
     )
     if capture.overflow is not None:
         overflow = ProjectedEarlyCheckpointOverflow(capture.overflow)

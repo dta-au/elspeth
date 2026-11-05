@@ -53,6 +53,7 @@ class EarlyFormatRetryMarker(ContinuationValue):
     early_input_ref: PrivateChunkRef
     response_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     first_attempt_schema_valid: bool | None
+    format_reprompt_required: bool
     retry_ordinal: Literal[0] = 0
     next_retry_ordinal: Literal[1] = 1
 
@@ -72,6 +73,8 @@ def retain_early_format_retry_on_connection(
     inventory: CurrentContinuationEnvInventory,
     completion_proof: EarlyCheckpointChildCommitted,
 ) -> StoredContinuationSnapshot:
+    from elspeth.web.composer.continuation_checkpoint_early_observation import early_format_reprompt_required
+    from elspeth.web.composer.continuation_codec import decode_continuation_response
     from elspeth.web.sessions.continuation_checkpoint_early_return import read_original_early_child_source_on_connection
 
     _require_current_continuation_running(conn, running)
@@ -101,6 +104,7 @@ def retain_early_format_retry_on_connection(
         early_input_ref=reference,
         response_sha256=child.response.reference.digest,
         first_attempt_schema_valid=child.accounting.first_attempt_schema_valid,
+        format_reprompt_required=early_format_reprompt_required(decode_continuation_response(child.response)),
     )
     text = canonical_json(marker.model_dump(mode="json"))
     if len(text.encode("utf-8")) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
@@ -146,6 +150,8 @@ def read_early_format_retry_on_connection(
     operation_id: str,
     selected: StoredContinuationSnapshot,
 ) -> VerifiedEarlyFormatRetry | None:
+    from elspeth.web.composer.continuation_checkpoint_early_observation import early_format_reprompt_required
+    from elspeth.web.composer.continuation_codec import decode_continuation_response
     from elspeth.web.sessions.continuation_checkpoint_early_return import read_original_early_child_source_on_connection
     from elspeth.web.sessions.continuation_iteration_return import _historical
 
@@ -196,6 +202,7 @@ def read_early_format_retry_on_connection(
         or marker.outer_effect_key != child.owed.outer_effect_key
         or marker.early_input_ref != child.owed.source.early_input_ref
         or marker.response_sha256 != child.response.reference.digest
+        or marker.format_reprompt_required != early_format_reprompt_required(decode_continuation_response(child.response))
     ):
         raise AuditIntegrityError("EARLY retry changed its first complete response or original request")
     return VerifiedEarlyFormatRetry(marker, child, selected)

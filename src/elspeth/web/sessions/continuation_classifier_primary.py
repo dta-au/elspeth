@@ -1835,9 +1835,7 @@ class ClassifierPrimaryIssuer:
                 recurrence_ordinal=recurrence,
             )
             outcome = await sessions.cancel_v4_continuation_classifier_unentered(permit=permit, required_work=ticket)
-            self.work.coordinator.validate_continuation_sql_outcome(
-                ticket=ticket, expected_source=RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL, actual_outcome=outcome
-            )
+            self.work.coordinator.validate_undispatched_cancellation_sql_outcome(ticket=ticket, actual_outcome=outcome)
             cancellations.extend(item for item in outcome.deferred_cancellations if all(item is not prior for prior in cancellations))
             if type(outcome) is RequiredSQLReturned:
                 if type(outcome.value) is not ClassifierNoSdkRefusalReceipt:

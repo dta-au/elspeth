@@ -64,6 +64,7 @@ from elspeth.web.composer.continuation_title_provider import (
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
+from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import ContinuationStage, SessionOperationLease
 from elspeth.web.required_work import (
@@ -113,6 +114,14 @@ from elspeth.web.sessions.continuation_checkpoint_paid_terminal import (
 from elspeth.web.sessions.continuation_checkpoint_unbound_refusal import (
     VerifiedCheckpointUnboundRefusal,
     read_v4_checkpoint_unbound_refusal_on_connection,
+)
+from elspeth.web.sessions.continuation_classifier_prephysical_failure import (
+    ClassifierPrephysicalFailure,
+    CommittedClassifierPrephysicalFailure,
+    VerifiedClassifierPrephysicalTerminal,
+    fail_classifier_prephysical_operation,
+    original_classifier_prephysical_failure,
+    read_classifier_prephysical_terminal_on_connection,
 )
 from elspeth.web.sessions.continuation_classifier_primary import (
     VerifiedClassifierPaidIncompleteTerminal,
@@ -365,6 +374,7 @@ class _SegmentDriver:
         self.sql_deadline = sql_deadline
         self._consumed_native: list[BaseException] = []
         self._committed_failure: CommittedContinuationFailure | None = None
+        self._committed_classifier_prephysical: CommittedClassifierPrephysicalFailure | None = None
         self._action_ordinal = 0
         self.progress_owner: ContinuationProgressOwner | None = None
         self._progress_cleanup_failures: list[BaseException] = []
@@ -425,6 +435,11 @@ class _SegmentDriver:
                     values.append(actual.error)
                 values.extend(actual.deferred_cancellations)
             observation = observation.prior
+        classifier = self._committed_classifier_prephysical
+        if classifier is not None:
+            values.append(classifier.original)
+            values.extend(classifier.original_errors)
+            values.extend(classifier.deferred_cancellations)
         values.extend((*additional, error))
         return combine_failure_objects(values[0], *values[1:])
 
@@ -561,6 +576,54 @@ class _SegmentDriver:
             raise original from original.__cause__
         return ContinuationSegmentSettled(terminal)
 
+    async def _settle_classifier_prephysical(self, custody: ClassifierPrephysicalFailure) -> ContinuationSegmentSettled:
+        from elspeth.web.sessions.composer_async_worker import _StartedSettlement
+        from elspeth.web.sessions.service import SessionServiceImpl
+
+        try:
+            sessions = self.services.session_service
+            if type(sessions) is not SessionServiceImpl:
+                raise AuditIntegrityError("Classifier preparation failure lost its actual Sessions owner")
+            committed = await fail_classifier_prephysical_operation(
+                sessions, self.running, work=self.work, phases=self.phases, custody=custody
+            )
+            # Retain the actual committing carrier before any later await.
+            self._committed_classifier_prephysical = committed
+
+            def verify() -> VerifiedClassifierPrephysicalTerminal:
+                with (
+                    locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn,
+                    retention_stage_memo_scope(),
+                ):
+                    actual = read_classifier_prephysical_terminal_on_connection(
+                        conn, session_id=self.running.claim.session_id, operation_id=self.running.claim.operation_id
+                    )
+                if type(actual) is not VerifiedClassifierPrephysicalTerminal or actual != committed.verified:
+                    raise AuditIntegrityError("Classifier preparation failure lost its exact committed cold terminal")
+                return actual
+
+            await _registered(
+                work=self.work,
+                source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                operation=verify,
+                expected=VerifiedClassifierPrephysicalTerminal,
+            )
+            await self.worker._verify_terminal_before_release(
+                self.running,
+                self.lease,
+                committed.terminal,
+                _StartedSettlement(terminal_receipt=committed.terminal, deferred_cancellations=list(committed.deferred_cancellations)),
+            )
+        except BaseException as error:
+            combined = self.join_failure(error)
+            if combined is error:
+                raise
+            raise combined from combined.__cause__
+        if committed.original_errors:
+            combined = self.join_failure(committed.original_errors[0], *committed.original_errors[1:])
+            raise combined from combined.__cause__
+        return ContinuationSegmentSettled(committed.terminal)
+
     async def settle(
         self,
         record: ComposerOperationRecord,
@@ -621,6 +684,28 @@ class _SegmentDriver:
             return ContinuationSegmentSettled(terminal)
         if source is not None and (not isinstance(source, RetainedToolFailureSource) or type(source) is not RetainedToolFailureSource):
             raise AuditIntegrityError("continuation settlement lost its closed failure source owner")
+        classifier = (
+            original_classifier_prephysical_failure(self.phases, original)
+            if original is not None and expired_failure is None and not self._worker_is_draining()
+            else None
+        )
+        if (
+            classifier is not None
+            and source is None
+            and (custody is None or (not custody.completed and custody.original is None and not custody.errors and custody.wrapper is None))
+            and (p4 is None or (not p4.deferred_failures and not p4.deferred_cancellations))
+            and (
+                p4_writer_observation is None
+                or (
+                    p4_writer_observation.original_error is None
+                    and not p4_writer_observation.prior_errors
+                    and not p4_writer_observation.failed_candidates
+                )
+            )
+        ):
+            # A successful earlier tool's retained receiver does not own this
+            # classifier error. Actual tool/P4 failures keep their precedence.
+            return await self._settle_classifier_prephysical(classifier)
         owns_failure = source is not None or (custody is not None and (custody.completed or original is not None))
         if owns_failure:
             if source is not None and not source.applied:

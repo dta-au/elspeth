@@ -1,4 +1,4 @@
-"""Original END checkpoint source proof for the shared SDK terminal core."""
+"""Closed original END/EARLY source proof for the shared SDK terminal core."""
 
 from __future__ import annotations
 
@@ -9,15 +9,20 @@ from sqlalchemy import Connection, Row, select
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.continuation_checkpoint_early_physical import (
+    CheckpointEarlyPhysicalSource,
+    checkpoint_early_physical_custody,
+)
 from elspeth.web.composer.continuation_checkpoint_end_physical import (
     CheckpointEndPhysicalSource,
     checkpoint_end_physical_custody,
-    require_checkpoint_end_prepared_clock,
 )
+from elspeth.web.composer.continuation_checkpoint_prepared_clock import require_checkpoint_prepared_clock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation, require_original_v4_sdk_failure
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+from elspeth.web.sessions.continuation_checkpoint_early_source import CheckpointEarlyInput, encode_checkpoint_early_input
 from elspeth.web.sessions.continuation_checkpoint_paid import (
     PreparedCheckpointProvider,
     V4CheckpointProviderAdmission,
@@ -50,8 +55,27 @@ def _source_data(
     replay: CheckpointProviderSourceData,
     call: ComposerLLMCall | None,
 ) -> SdkTerminalSource:
-    if replay.phase != "end" or replay.admitted != admitted or replay.identity != identity:
-        raise AuditIntegrityError("SDK checkpoint source requires the exact original END dispatch")
+    if replay.admitted != admitted or replay.identity != identity:
+        raise AuditIntegrityError("SDK checkpoint source requires its exact original dispatch")
+    if replay.phase == "early":
+        if (
+            replay.kind != "iteration_early"
+            or type(replay.early_input) is not CheckpointEarlyInput
+            or replay.early_input_ref != encode_checkpoint_early_input(replay.early_input).reference
+            or replay.end_input_ref is not None
+            or replay.pass_index != 0
+            or replay.retry_ordinal != replay.early_input.retry_ordinal
+            or replay.early_input.messages_sha256 != source.source_input_sha256
+            or replay.early_input.env_ref_names != tuple(sorted(replay.env_ref_names))
+        ):
+            raise AuditIntegrityError("SDK EARLY requires its versioned original request and environment commitment")
+        family = SdkTerminalFamily.CHECKPOINT_EARLY
+    elif replay.phase == "end":
+        if replay.early_input is not None or replay.early_input_ref is not None:
+            raise AuditIntegrityError("SDK END cannot borrow an EARLY request commitment")
+        family = SdkTerminalFamily.CHECKPOINT_END
+    else:
+        raise AuditIntegrityError("SDK checkpoint source has no installed original phase")
     sid, operation = source.session_id, source.operation_id
     principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one()
     creator = conn.execute(
@@ -72,7 +96,7 @@ def _source_data(
         != (source.session_operation_id, source.session_operation_epoch, physical_row.lease_token)
         or creator.claim_attempt != source.claim_attempt
     ):
-        raise AuditIntegrityError("SDK END source lost its original principal and physical fence")
+        raise AuditIntegrityError("SDK checkpoint source lost its original principal and physical fence")
     if call is not None and (
         type(call) is not ComposerLLMCall
         or call.call_id != identity.attempt_id
@@ -80,7 +104,7 @@ def _source_data(
         or call.model_requested != replay.requested_model
         or call.messages_hash != source.source_input_sha256
     ):
-        raise AuditIntegrityError("SDK END audit changed its original actual request")
+        raise AuditIntegrityError("SDK checkpoint audit changed its original actual request")
     root = decode_continuation_snapshot(admitted.payload_json)
     origin = decode_continuation_snapshot(replay.origin.payload_json)
     outer = tuple(
@@ -92,13 +116,13 @@ def _source_data(
         or replay.outer_effect_key not in outer
         or any(item.disposition == "prepared" for item in root.effect_frontier)
     ):
-        raise AuditIntegrityError("SDK END changed its complete original unpaid outer vector")
+        raise AuditIntegrityError("SDK checkpoint changed its complete original unpaid outer vector")
     if effect.disposition == "dispatched":
         expected_outer = "dispatched"
     elif effect.disposition == "sdk_terminal":
         expected_outer = "unknown"
     else:
-        raise AuditIntegrityError("SDK END cannot borrow a returned or replacement provider disposition")
+        raise AuditIntegrityError("SDK checkpoint cannot borrow a returned or replacement provider disposition")
     for key in outer:
         row = conn.execute(
             select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == key)
@@ -111,15 +135,18 @@ def _source_data(
             or row.result_chunk_key is not None
             or (key == replay.outer_effect_key and row.owner != ("composer_end" if replay.kind == "end_review" else "composer_iteration"))
         ):
-            raise AuditIntegrityError("SDK END outer vector includes a different paid or completed effect")
+            raise AuditIntegrityError("SDK checkpoint outer vector includes a different paid or completed effect")
     combined = prepare_checkpoint_sdk_terminal_hold_plan(
-        identity=identity, admitted=admitted, phase="end", creator_sequence=source.creator_sequence, requested_model=replay.requested_model
+        identity=identity,
+        admitted=admitted,
+        phase=replay.phase,
+        creator_sequence=source.creator_sequence,
+        requested_model=replay.requested_model,
+        early_input=replay.early_input,
     )
     if source.reserved_bytes != combined.reserved_bytes or source.fallback_contract_sha256 != combined.contract_sha256:
-        raise AuditIntegrityError("SDK END requires its original SDK-capable H recipe")
-    tail = prepare_sdk_tail_plan(
-        identity=identity, admitted=admitted, creator_sequence=source.creator_sequence, family=SdkTerminalFamily.CHECKPOINT_END
-    )
+        raise AuditIntegrityError("SDK checkpoint requires its original SDK-capable H recipe")
+    tail = prepare_sdk_tail_plan(identity=identity, admitted=admitted, creator_sequence=source.creator_sequence, family=family)
     return SdkTerminalSource(source, admitted, replay.requested_model, tail, replay.env_ref_names, outer)
 
 
@@ -129,14 +156,22 @@ def require_checkpoint_sdk_source_on_connection(
     require_original_v4_sdk_failure(observation, custody=custody)
     prepared, admission = custody.continuation_checkpoint_v4, custody.continuation_checkpoint_v4_admission
     if type(prepared) is not PreparedCheckpointProvider or type(admission) is not V4CheckpointProviderAdmission:
-        raise AuditIntegrityError("SDK END requires its original nominal prepared request/admission")
-    require_checkpoint_end_prepared_clock(prepared)
+        raise AuditIntegrityError("SDK checkpoint requires its original nominal prepared request/admission")
+    require_checkpoint_prepared_clock(prepared)
     physical_source = prepared.physical_source()
-    if not isinstance(physical_source, CheckpointEndPhysicalSource) or type(physical_source) is not CheckpointEndPhysicalSource:
-        raise AuditIntegrityError("SDK checkpoint requires its installed original END source")
+    if type(physical_source) is CheckpointEndPhysicalSource:
+        original_custody = checkpoint_end_physical_custody(physical_source)
+        expected_phase = "end"
+    elif type(physical_source) is CheckpointEarlyPhysicalSource:
+        original_custody = checkpoint_early_physical_custody(physical_source)
+        expected_phase = "early"
+        if prepared.prepared_source.kind != "iteration_early" or prepared.prepared_source.early_input_ref is None:
+            raise AuditIntegrityError("SDK EARLY lost its original versioned iteration request")
+    else:
+        raise AuditIntegrityError("SDK checkpoint requires its installed original END/EARLY source")
     if (
-        checkpoint_end_physical_custody(physical_source) is not custody
-        or prepared.prepared_source.phase != "end"
+        original_custody is not custody
+        or prepared.prepared_source.phase != expected_phase
         or admission.original_source is not prepared.prepared_source
         or custody.attempt is not admission.attempt
         or observation.attempt is not admission.attempt
@@ -144,7 +179,7 @@ def require_checkpoint_sdk_source_on_connection(
         or custody.required_work is not prepared.work
         or prepared.request_sha256 != admission.hold.source_input_sha256
     ):
-        raise AuditIntegrityError("SDK END lost its original weak-issued physical custody")
+        raise AuditIntegrityError("SDK checkpoint lost its original weak-issued physical custody")
     selected = require_current_checkpoint_dispatched_on_connection(
         conn, prepared.running, admission, allow_cancel=True, allow_expired_segment=True
     )
@@ -167,10 +202,12 @@ def require_checkpoint_sdk_source_on_connection(
         or replay.pass_index != original.pass_index
         or replay.retry_ordinal != prepared.retry_ordinal
         or replay.end_input_ref != original.end_input_ref
+        or replay.early_input_ref != original.early_input_ref
+        or replay.phase != original.phase
         or replay.env_ref_names != prepared.env_ref_names
         or replay.requested_model != prepared.requested_model
     ):
-        raise AuditIntegrityError("SDK END replay changed original gate input, retry or request")
+        raise AuditIntegrityError("SDK checkpoint replay changed original gate input, retry or request")
     data = _source_data(
         conn,
         source=source,

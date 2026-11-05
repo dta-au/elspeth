@@ -6,6 +6,8 @@ request DATA cannot recreate this weak-issued live authority after a restart.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from weakref import ReferenceType, WeakKeyDictionary, ref
@@ -19,6 +21,7 @@ from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkI
 from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner, prepare_checkpoint_phase_owner
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import owned_json
+from elspeth.web.composer.continuation_env_inventory import require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash
@@ -26,6 +29,7 @@ from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntim
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.required_work import RequiredWorkRole, RequiredWorkSource
+from elspeth.web.sessions.continuation_checkpoint_early_retry import VerifiedEarlyFormatRetry
 from elspeth.web.sessions.continuation_checkpoint_early_source import (
     CapturedCheckpointEarlyInput,
     CheckpointEarlyGuardCommitment,
@@ -37,11 +41,16 @@ from elspeth.web.sessions.service import SessionServiceImpl
 
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _DispatchOutcome, _PersistOutcome
+    from elspeth.web.composer.continuation_checkpoint_observation import (
+        CheckpointIncompleteResponseObservation,
+        CheckpointReturnedResponseObservation,
+    )
     from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchPersistData
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
     from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.state import CompositionState
+    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
@@ -70,9 +79,48 @@ class _OriginalEarlySource:
     issuer: CheckpointNoSdkIssuer | None = None
     request_identity: str | None = None
     early_input: CapturedCheckpointEarlyInput | None = None
+    retry: VerifiedEarlyFormatRetry | None = None
+    detached: RestoredContinuationRuntime | None = None
+    detached_capture: CapturedContinuationRuntime | None = None
 
 
 _issued: WeakKeyDictionary[CheckpointEarlyPhysicalSource, _OriginalEarlySource] = WeakKeyDictionary()
+
+
+@asynccontextmanager
+async def checkpoint_early_physical_preparation(
+    phases: ContinuationLivePhases,
+    runtime: RestoredContinuationRuntime,
+    *,
+    selected: SelectedContinuationState,
+    dispatch: _DispatchOutcome,
+    persist: _PersistOutcome | ColdPostBatchPersistData,
+    pre_batch_state: CompositionState,
+) -> AsyncIterator[CheckpointEarlyPhysicalSource]:
+    """Own one original EARLY action's text parent before its first capture.
+
+    The driver has already admitted and bound this clock. Source SQL and each
+    worker borrow text proofs while keeping their own fresh authority checks.
+    The physical binder seals preparation before guard/quota/SDK stages; this
+    lexical owner must exit before a later driver-admitted retry action starts.
+    """
+    from elspeth.web.continuation_retention_memo import v4_preparation_memo_scope
+
+    clock = phases.action_clock
+    deadline = phases.work.coordinator.sql_deadline_owner
+    if type(clock) is not ContinuationActionClock or deadline is None:
+        raise AuditIntegrityError("EARLY preparation requires its original driver clock and SQL timing owner")
+    deadline.require_action_clock(clock)
+    with v4_preparation_memo_scope(clock):
+        source = await prepare_checkpoint_early_physical_source(
+            phases,
+            runtime,
+            selected=selected,
+            dispatch=dispatch,
+            persist=persist,
+            pre_batch_state=pre_batch_state,
+        )
+        yield source
 
 
 def _prepared_guard_commitment(supplied: PreparedProviderInput) -> CheckpointEarlyGuardCommitment:
@@ -151,10 +199,47 @@ async def prepare_checkpoint_early_physical_source(
     ):
         raise AuditIntegrityError("EARLY issuance requires its original paid iteration transition")
     owner = await prepare_checkpoint_phase_owner(phases, runtime, selected, superseded_reply_index=None, elide_advisor_exchange=False)
+    if len(owner.phase_source.completed_children) > 1:
+        raise AuditIntegrityError("EARLY source exceeded its one original format retry")
+    retry = None
+    if owner.phase_source.completed_children:
+        from elspeth.web.composer.continuation_runtime import _registered_read
+        from elspeth.web.sessions.continuation import _require_current_continuation_running, load_snapshot
+        from elspeth.web.sessions.continuation_checkpoint_early_retry import read_early_format_retry_on_connection
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        running = phases.work.running
+        if running is None:
+            raise AuditIntegrityError("EARLY retry lost its original running work")
+
+        def read_retry() -> VerifiedEarlyFormatRetry:
+            with locked_session_transaction(phases.authority._engine, str(running.claim.session_id)) as conn:
+                _require_current_continuation_running(conn, running)
+                stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+                if stored != owner.phase_source.current:
+                    raise AuditIntegrityError("EARLY retry changed its actual driver-admitted head")
+                require_current_env_inventory_on_connection(
+                    conn,
+                    running,
+                    inventory=owner.inventory,
+                    expected_checkpoint_id=stored.checkpoint_id,
+                    expected_cursor=stored.cursor,
+                )
+                result = read_early_format_retry_on_connection(
+                    conn,
+                    session_id=str(running.claim.session_id),
+                    operation_id=running.claim.operation_id,
+                    selected=stored,
+                )
+                if result is None or owner.phase_source.completed_children != (result.marker.effect_key,):
+                    raise AuditIntegrityError("EARLY retry lost its original consumed first complete child")
+                return result
+
+        retry = await _registered_read(phases.work, VerifiedEarlyFormatRetry, read_retry)
     captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=runtime.materialization.inventory)
     capture = _AdvisorInvocationCapture()
     source = CheckpointEarlyPhysicalSource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture)
-    _issued[source] = _OriginalEarlySource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture)
+    _issued[source] = _OriginalEarlySource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture, retry=retry)
     require_original_checkpoint_early_physical_source(source)
     return source
 
@@ -239,7 +324,7 @@ async def bind_checkpoint_early_physical_request(
         original_checkpoint_id=owner.selected.checkpoint_id,
         original_cursor=owner.selected.stack.cursor,
         outer_effect_key=owner.phase_source.outer_effect_key,
-        retry_ordinal=0,
+        retry_ordinal=1 if original.retry is not None else 0,
         captured_runtime_sha256=stable_hash(source.captured.stack.model_dump(mode="json")),
         runtime_chunks=tuple(chunk.reference for chunk in source.captured.chunks),
         state_sha256=compose.state.digest,
@@ -273,13 +358,24 @@ async def bind_checkpoint_early_physical_request(
         operation=lambda: sessions.prepare_v4_checkpoint_source_sync(prepared=preparation),
         expected=CheckpointPreparedSource,
     )
+    # Restore and prove the retained warm graph before quota/SDK admission.
+    # This existing restoration helper verifies complete capture bytes and
+    # independent mutable owners; it derives no provider authority.
+    from elspeth.web.composer.continuation_checkpoint_end_detached import restore_prepared_end_runtime
+
+    detached, detached_capture = await restore_prepared_end_runtime(
+        phase_owner=owner,
+        prepared=prepared_source,
+        captured=source.captured,
+    )
+    original.detached, original.detached_capture = detached, detached_capture
     prepared = PreparedCheckpointProvider(
         running=running,
         prepared_source=prepared_source,
         work=custody.required_work,
         composer=owner.phases.service,
         authority=owner.phases.authority,
-        retry_ordinal=0,
+        retry_ordinal=1 if original.retry is not None else 0,
         request_sha256=snapshot.messages_sha256,
         requested_model=prepared_input.model,
         env_ref_names=owner.runtime.env_ref_names,
@@ -293,6 +389,13 @@ async def bind_checkpoint_early_physical_request(
     custody.bind_continuation_checkpoint_v4(prepared, issuer)
     original.custody, original.issuer = custody, issuer
     request_options["continuation_input_sha256"] = identity
+    _bind_early_finalizers(source, custody=custody, prepared=prepared, sessions=sessions)
+    from elspeth.web.continuation_retention_memo import finish_v4_preparation_memo
+
+    try:
+        clock.finish_preparation()
+    finally:
+        finish_v4_preparation_memo(clock)
 
 
 def require_original_checkpoint_early_input(
@@ -327,3 +430,145 @@ def checkpoint_early_physical_custody(source: CheckpointEarlyPhysicalSource) -> 
     if custody is None:
         raise AuditIntegrityError("EARLY physical source has no original bound custody")
     return custody
+
+
+def checkpoint_early_format_retry(source: CheckpointEarlyPhysicalSource) -> VerifiedEarlyFormatRetry | None:
+    require_original_checkpoint_early_physical_source(source)
+    return _issued[source].retry
+
+
+def require_checkpoint_early_detached_source(
+    source: CheckpointEarlyPhysicalSource,
+    *,
+    detached: RestoredContinuationRuntime,
+    original: RestoredContinuationRuntime,
+) -> None:
+    from elspeth.web.composer.continuation_checkpoint_end_detached import require_detached_end_capture
+
+    require_original_checkpoint_early_physical_source(source)
+    issued = _issued[source]
+    if (
+        issued.detached is not detached
+        or source.phase_owner.runtime is not original
+        or issued.detached_capture is None
+        or issued.prepared is None
+        or detached.source.selected.checkpoint_id != issued.prepared.prepared_source.prepared_selected.checkpoint_id
+    ):
+        raise AuditIntegrityError("EARLY projection replaced its original independent pre-call graph")
+    require_detached_end_capture(detached, expected=issued.detached_capture, phase_owner=source.phase_owner)
+
+
+def checkpoint_early_detached_runtime(source: CheckpointEarlyPhysicalSource) -> RestoredContinuationRuntime:
+    require_original_checkpoint_early_physical_source(source)
+    detached = _issued[source].detached
+    if detached is None:
+        raise AuditIntegrityError("EARLY physical source has no original retained detached graph")
+    require_checkpoint_early_detached_source(source, detached=detached, original=source.phase_owner.runtime)
+    return detached
+
+
+def note_checkpoint_early_physical_failure(source: CheckpointEarlyPhysicalSource, error: BaseException) -> None:
+    require_original_checkpoint_early_physical_source(source)
+    original = _issued[source]
+    if original.issuer is not None and original.custody is not None:
+        original.issuer.note_original_failure(original.custody, error)
+
+
+def checkpoint_early_physical_no_sdk_issuer(source: CheckpointEarlyPhysicalSource) -> CheckpointNoSdkIssuer:
+    require_original_checkpoint_early_physical_source(source)
+    issuer = _issued[source].issuer
+    if issuer is None:
+        raise AuditIntegrityError("EARLY physical source has no original no-SDK issuer")
+    return issuer
+
+
+def observe_checkpoint_early_physical_return(
+    source: CheckpointEarlyPhysicalSource,
+) -> CheckpointReturnedResponseObservation | CheckpointIncompleteResponseObservation:
+    from elspeth.web.composer.continuation_checkpoint_early_observation import observe_v4_early_checkpoint_returned_response
+
+    custody = checkpoint_early_physical_custody(source)
+    owner = source.phase_owner
+    context, policy = owner.runtime.bindings.session_operation_context, owner.runtime.source.policy
+    if custody.attempt is None or context is None or type(policy) is not ContinuationAdmissionPolicyV4:
+        raise AuditIntegrityError("EARLY physical return lost its original paid attempt or operation")
+    return observe_v4_early_checkpoint_returned_response(
+        source.capture.snapshot(),
+        custody=custody,
+        policy=policy,
+        attempt=custody.attempt,
+        context=context,
+        env_ref_names=owner.runtime.env_ref_names,
+    )
+
+
+def observe_checkpoint_early_sdk_companion(
+    source: CheckpointEarlyPhysicalSource,
+    failure: BaseException,
+) -> SdkTerminalFailure | None:
+    from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure
+
+    require_original_checkpoint_early_physical_source(source)
+    custody = _issued[source].custody
+    return None if custody is None else capture_sdk_terminal_failure(failure, custody=custody)
+
+
+def _bind_early_finalizers(
+    source: CheckpointEarlyPhysicalSource,
+    *,
+    custody: ProviderCallCustody,
+    prepared: PreparedCheckpointProvider,
+    sessions: SessionServiceImpl,
+) -> None:
+    from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
+    from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
+    from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
+    from elspeth.web.required_work import RequiredWorkTicket
+    from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+    from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
+
+    def require_admission() -> None:
+        require_original_checkpoint_early_physical_source(source)
+        if (
+            _issued[source].custody is not custody
+            or custody.continuation_checkpoint_v4 is not prepared
+            or custody.continuation_checkpoint_v4_admission is None
+            or source.phase_owner.phases.service._sessions_service is not sessions
+        ):
+            raise AuditIntegrityError("EARLY terminal finalizer lost its original admitted physical source")
+
+    async def finalize_incomplete(
+        incomplete: V4ProviderResultIncomplete,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+        require_admission()
+        admission = custody.continuation_checkpoint_v4_admission
+        if admission is None:
+            raise AuditIntegrityError("EARLY incomplete finalizer lost its original admission")
+        return await sessions.finalize_v4_continuation_checkpoint_incomplete(
+            prepared=prepared,
+            admission=admission,
+            custody=custody,
+            incomplete=incomplete,
+            required_work=required_work,
+        )
+
+    async def finalize_sdk(
+        observation: V4SdkFailureObservation,
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+        require_admission()
+        admission = custody.continuation_checkpoint_v4_admission
+        if admission is None or custody.attempt is not admission.attempt or observation.attempt is not admission.attempt:
+            raise AuditIntegrityError("EARLY SDK finalizer changed its original physical attempt")
+        coordinator = source.phase_owner.phases.work.coordinator
+        deadline = coordinator.sql_deadline_owner
+        if deadline is None:
+            raise AuditIntegrityError("EARLY SDK finalizer lost its original timing owner")
+        deadline.begin_settlement()
+        outcome = await sessions.finalize_v4_sdk_terminal(observation=observation, custody=custody, required_work=required_work)
+        coordinator.validate_provider_settlement_sql_outcome(ticket=required_work, actual_outcome=outcome)
+        return outcome
+
+    custody.bind_v4_returned_incomplete_finalizer(finalize_incomplete)
+    custody.bind_v4_sdk_finalizer(finalize_sdk)

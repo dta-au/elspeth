@@ -126,7 +126,7 @@ async def _v4_applied_timed_case(store, tmp_path, monkeypatch):
 
     monkeypatch.setattr(initialization, "inventory_work", timed_work)
     async with _v4_applied_case(v4_store, tmp_path, monkeypatch) as case:
-        _current_store, owner, _running, _selected, _inventory, _captured, _sdk = case
+        owner, _running, _selected, _inventory, _captured, _sdk = case
         assert type(owner.work.coordinator.sql_deadline_owner) is ContinuationSQLDeadlineOwner
         assert owner.lease.required_work is owner.work.coordinator
         yield case

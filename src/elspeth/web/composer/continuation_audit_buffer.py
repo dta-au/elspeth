@@ -6,6 +6,7 @@ from typing import Final, Literal
 from pydantic import ConfigDict, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass
 
+from elspeth.contracts._canonical_json_native import canonical_json_native_strings
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
@@ -24,9 +25,11 @@ from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply
 from elspeth.web.continuation_retention_memo import (
     RecorderBlockHashKey,
+    RecorderRequestTextDependencies,
     RecorderRequestTextKey,
     RecorderRequestTextProof,
     current_retention_stage_memo,
+    current_v4_preparation_memo,
 )
 
 
@@ -146,7 +149,14 @@ def _deduplicate_request(request: object, blocks: _RecorderBlocks) -> object:
         raise AuditIntegrityError("retained provider context lost its closed receipt shape")
     key = RecorderRequestTextKey(request["canonical"], CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
     memo = current_retention_stage_memo()
-    prepared = memo.recorder_request_text(key, _prepared_request_text) if memo is not None else _prepared_request_text(key)
+    if memo is not None and current_v4_preparation_memo() is not None:
+        prepared = memo.v4_recorder_request_text(
+            key,
+            RecorderRequestTextDependencies(parse_json_strict, canonical_json, hashlib.sha256, _CONTEXT_KEYS),
+            _prepared_request_text,
+        )
+    else:
+        prepared = memo.recorder_request_text(key, _prepared_request_text) if memo is not None else _prepared_request_text(key)
     return request if prepared is None else _transfer_prepared_request_text(prepared, blocks)
 
 
@@ -242,7 +252,7 @@ def recorder_snapshot_json(snapshot: RecorderSnapshot) -> str:
         if call["cost_response_accountable"] is None:
             del call["cost_response_accountable"]
         call["private_request"] = _deduplicate_request(call["private_request"], blocks)
-    return canonical_json({"blocks": blocks.document(), "snapshot": projected})
+    return canonical_json_native_strings({"blocks": blocks.document(), "snapshot": projected})
 
 
 def encode_recorder_snapshot(snapshot: RecorderSnapshot) -> PrivateChunk:

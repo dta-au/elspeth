@@ -698,7 +698,8 @@ def _capture_owners(
     names = inventory.names
     if source.admitted_evidence.snapshot is not source.evidence:
         raise AuditIntegrityError("runtime source lost its resolved original evidence cohort")
-    current_recorder = decode_recorder_snapshot(source.admitted_evidence.recorder_chunk)
+    recorder_chunk = source.admitted_evidence.recorder_chunk
+    current_recorder = decode_recorder_snapshot(recorder_chunk)
     actual_recorder = live.recorder.snapshot_for_continuation(drained=runtime.drained)
     if (
         len(actual_recorder.invocations) < len(current_recorder.invocations)
@@ -733,7 +734,9 @@ def _capture_owners(
         private_authorings=actual_recorder.private_authorings[: len(current_recorder.private_authorings)],
         drained=current_recorder.drained,
     )
-    if encode_recorder_snapshot(current_prefix) != encode_recorder_snapshot(current_recorder):
+    # The fresh decoder already round-tripped this complete immutable chunk.
+    # Re-encode the live prefix to detect mutation; keep its full ref/byte check.
+    if encode_recorder_snapshot(current_prefix) != recorder_chunk:
         raise AuditIntegrityError("runtime capture changed its complete current SQL recorder prefix")
     service = runtime.materialization.service
     current_snapshot, current_catalog = service._policy_context.build(source.bootstrap.actor_user_id)

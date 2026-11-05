@@ -26,6 +26,10 @@ from elspeth.web.composer.advisor_audit import (
 )
 from elspeth.web.composer.advisor_transcript import _wire_event
 from elspeth.web.composer.continuation import ComposeFrame, ContinuationValue, PrivateChunkRef, ToolBatchFrame
+from elspeth.web.composer.continuation_checkpoint_early_observation import (
+    early_returned_checkpoint_verdict,
+    require_v4_checkpoint_early_returned_audit,
+)
 from elspeth.web.composer.continuation_checkpoint_observation import (
     CheckpointReturnedResponseObservation,
     require_original_v4_checkpoint_returned_response,
@@ -46,7 +50,6 @@ from elspeth.web.composer.continuation_codec import (
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot, RetainedObservedMessage, encode_transcript_object_json
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
-from elspeth.web.composer.continuation_provider_outcomes import require_v4_successful_response_audit
 from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.continuation import (
@@ -304,6 +307,7 @@ def _read_early_complete_return(
         creator_sequence=hold.creator_sequence,
         requested_model=replay.requested_model,
         historical_contract_sha256=event.old_hold_contract_sha256,
+        early_input=replay.early_input,
     )
     tail = prepare_checkpoint_paid_overflow_tail_plan(
         identity=replay.identity, admitted=selected, phase="early", creator_sequence=hold.creator_sequence
@@ -344,15 +348,12 @@ def _read_early_complete_return(
         or call.messages_hash != event.request_sha256
         or call.model_requested != replay.requested_model
         or call.started_at != restore_utc(attempt.started_at)
-        or call.status is not ComposerLLMCallStatus.SUCCESS
-        or type(decoded.message.content) is not str
-        or not decoded.message.content.strip()
-        or decoded.tool_batch.calls
+        or call.status not in (ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.MALFORMED_RESPONSE)
     ):
-        raise AuditIntegrityError("EARLY complete return lacks its actual successful text/audit source")
-    require_v4_successful_response_audit(
+        raise AuditIntegrityError("EARLY complete return lacks its actual returned response/audit source")
+    require_v4_checkpoint_early_returned_audit(
         call,
-        decoded.provider_metadata,
+        decoded,
         policy=policy,
         attempt_id=event.attempt_id,
         started_at=call.started_at,
@@ -431,9 +432,10 @@ def retain_early_complete_return_on_connection(
         or returned.phase != "early"
         or returned.attempt is not admission.attempt
         or returned.audit_call.messages_hash != prepared.request_sha256
-        or returned.audit_call.status is not ComposerLLMCallStatus.SUCCESS
+        or returned.audit_call.status not in (ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.MALFORMED_RESPONSE)
         or decode_retained_physical_audit_call(returned.response) != returned.audit_call
         or decode_continuation_response(returned.response).message != returned.message
+        or decode_continuation_response(returned.response).tool_batch != returned.tool_batch
     ):
         raise AuditIntegrityError("EARLY H requires its actual original complete returned response")
     require_original_v4_checkpoint_returned_response(
@@ -550,8 +552,8 @@ class _EarlyChildEvent(ContinuationValue):
     receipt_key: str
     retry_pending: bool
     provider_attempts: Literal[1, 2]
-    first_attempt_schema_valid: bool
-    first_attempt_accepted: bool
+    first_attempt_schema_valid: bool | None
+    first_attempt_accepted: bool | None
     format_reprompt_sent: bool
     private_audit_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     pass_message_id: str | None
@@ -566,7 +568,7 @@ class EarlyCheckpointChildData:
     owed: VerifiedEarlyCompleteReturn
     response: PrivateChunk
     retry_pending: bool
-    first_attempt_schema_valid: bool
+    first_attempt_schema_valid: bool | None
     accounting: CheckpointPassAccounting
     names: frozenset[str]
     pass_message_id: str | None
@@ -580,7 +582,7 @@ class EarlyCheckpointChildCommitted:
     owed: VerifiedEarlyCompleteReturn
     response: PrivateChunk
     retry_pending: bool
-    first_attempt_schema_valid: bool
+    first_attempt_schema_valid: bool | None
     accounting: CheckpointPassAccounting
     names: frozenset[str]
     pass_message_id: str | None
@@ -642,7 +644,7 @@ def _expected_child_frames(
     *,
     retry_pending: bool,
 ) -> tuple[ComposeFrame, ToolBatchFrame, tuple[PrivateChunk, ...]]:
-    from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance, early_checkpoint_injection
+    from elspeth.web.composer.advisor_checkpoint import early_checkpoint_injection
     from elspeth.web.composer.continuation_audit_buffer import RECORDER_CODEC, decode_recorder_snapshot, validate_recorder_projection
     from elspeth.web.composer.continuation_evidence import admit_turn_evidence, decode_turn_evidence, encode_turn_evidence
     from elspeth.web.composer.continuation_message_shelf import decode_message_shelf, encode_message_shelf
@@ -655,10 +657,7 @@ def _expected_child_frames(
     if not isinstance(frame, ComposeFrame) or not isinstance(batch, ToolBatchFrame):
         raise AuditIntegrityError("EARLY consequence lost its original applied Compose/batch pair")
     decoded = decode_continuation_response(owed.response)
-    content = decoded.message.content
-    if type(content) is not str:
-        raise AuditIntegrityError("EARLY consequence lacks its complete original response text")
-    verdict = _parse_advisor_checkpoint_guidance(content, phase="early")
+    verdict = early_returned_checkpoint_verdict(decoded)
     if retry_pending != (not verdict.ok and owed.retry_ordinal == 0):
         raise AuditIntegrityError("EARLY consequence changed its original bounded format retry decision")
     injection = None if retry_pending else early_checkpoint_injection(verdict)
@@ -732,7 +731,6 @@ def read_original_early_child_source_on_connection(
     names: frozenset[str] | None = None,
 ) -> EarlyCheckpointChildData:
     """Re-derive C from exact H and actual response; no ancestor search or grant."""
-    from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance
     from elspeth.web.composer.audit import llm_call_audit_envelope
     from elspeth.web.coordination.quota_authority import _usage_entry_id, token_usage_entry_from_llm_call_envelope
     from elspeth.web.sessions.continuation_checkpoint_early_source import resolve_early_original_stage_on_connection
@@ -769,16 +767,20 @@ def read_original_early_child_source_on_connection(
         conn, session_id=session_id, operation_id=operation_id, selected=owed_selected, names=names
     )
     original = resolve_early_original_stage_on_connection(conn, source=owed.source, names=names)
-    content = decode_continuation_response(owed.response).message.content
-    if type(content) is not str:
-        raise AuditIntegrityError("EARLY child lost its actual returned text")
-    verdict = _parse_advisor_checkpoint_guidance(content, phase="early")
+    decoded = decode_continuation_response(owed.response)
+    verdict = early_returned_checkpoint_verdict(decoded)
+    expected_first_schema = verdict.response_schema_valid if type(decoded.message.content) is str else None
+    expected_first_accepted = verdict.ok if type(decoded.message.content) is str else None
+    expected_reprompt_sent = False
     if owed.retry_ordinal == 1:
         from elspeth.web.sessions.continuation_checkpoint_early_retry import read_early_format_retry_on_connection
 
         retry = read_early_format_retry_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=owed.source.origin)
         if retry is None or marker.first_attempt_schema_valid != retry.marker.first_attempt_schema_valid:
             raise AuditIntegrityError("EARLY second consequence changed its original first response accounting")
+        expected_reprompt_sent = retry.marker.format_reprompt_required
+        expected_first_schema = retry.marker.first_attempt_schema_valid
+        expected_first_accepted = retry.child.accounting.first_attempt_accepted
     expected_frame, batch, _expected_chunks = _expected_child_frames(conn, owed, retry_pending=marker.retry_pending)
     root = decode_continuation_snapshot(owed.selected.payload_json)
     frontier = tuple(
@@ -802,12 +804,9 @@ def read_original_early_child_source_on_connection(
         or marker.receipt_key != f"checkpoint-early-child:{owed.attempt_id}"
         or decode_continuation_snapshot(selected.payload_json) != expected
         or marker.provider_attempts != owed.retry_ordinal + 1
-        or marker.format_reprompt_sent != (owed.retry_ordinal == 1)
-        or (
-            owed.retry_ordinal == 0
-            and (marker.first_attempt_schema_valid != verdict.response_schema_valid or marker.first_attempt_accepted != verdict.ok)
-        )
-        or (owed.retry_ordinal == 1 and marker.first_attempt_accepted)
+        or marker.format_reprompt_sent != expected_reprompt_sent
+        or marker.first_attempt_schema_valid != expected_first_schema
+        or marker.first_attempt_accepted != expected_first_accepted
         or (marker.pass_message_id is None) != marker.retry_pending
     ):
         raise AuditIntegrityError("EARLY child changed its exact complete return consequence")
@@ -841,7 +840,11 @@ def read_original_early_child_source_on_connection(
     ):
         raise AuditIntegrityError("EARLY child changed its actual paid accounting or receipt")
     require_checkpoint_paid_private_audit_on_connection(
-        conn, source=owed.new_hold, attempt_id=owed.attempt_id, private_sha256=marker.private_audit_sha256, incomplete=False
+        conn,
+        source=owed.new_hold,
+        attempt_id=owed.attempt_id,
+        private_sha256=marker.private_audit_sha256,
+        incomplete=owed.call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE,
     )
     accounting = CheckpointPassAccounting(
         0, marker.provider_attempts, marker.first_attempt_schema_valid, marker.first_attempt_accepted, marker.format_reprompt_sent
@@ -866,17 +869,14 @@ def _early_pass(
     owed: VerifiedEarlyCompleteReturn,
     accounting: CheckpointPassAccounting,
 ) -> tuple[AdvisorCheckpointPassRecord, AdvisorCheckpointPassAuditEnvelope, str]:
-    from elspeth.web.composer.advisor_checkpoint import _parse_advisor_checkpoint_guidance, checkpoint_pass_record
+    from elspeth.web.composer.advisor_checkpoint import checkpoint_pass_record
     from elspeth.web.composer.continuation_evidence import state_from_evidence_json
 
     root = decode_continuation_snapshot(owed.selected.payload_json)
     frame = root.frames[0]
     if not isinstance(frame, ComposeFrame):
         raise AuditIntegrityError("EARLY pass lost its original composition")
-    content = decode_continuation_response(owed.response).message.content
-    if type(content) is not str:
-        raise AuditIntegrityError("EARLY pass lost its original complete response")
-    verdict = _parse_advisor_checkpoint_guidance(content, phase="early")
+    verdict = early_returned_checkpoint_verdict(decode_continuation_response(owed.response))
     record = checkpoint_pass_record(
         verdict,
         phase="early",
@@ -989,15 +989,11 @@ def complete_early_checkpoint_on_connection(
         or captured.stack.model_copy(update={"frames": current_root.frames, "cursor": current_root.cursor}) != current_root
         or any(chunk not in captured.chunks for chunk in expected_chunks)
         or projected.accounting.provider_attempts != owed.retry_ordinal + 1
-        or type(projected.accounting.first_attempt_schema_valid) is not bool
-        or type(projected.accounting.first_attempt_accepted) is not bool
     ):
         raise AuditIntegrityError("EARLY completion substituted its exact cold-derived projection")
     accounting = projected.accounting
     first_schema = accounting.first_attempt_schema_valid
     first_accepted = accounting.first_attempt_accepted
-    if type(first_schema) is not bool or type(first_accepted) is not bool:
-        raise AuditIntegrityError("EARLY completion lacks its actual first response accounting")
     entry = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(owed.call))
     if entry is None or entry.call_id != owed.attempt_id:
         raise AuditIntegrityError("EARLY completion lost its original complete paid accounting")

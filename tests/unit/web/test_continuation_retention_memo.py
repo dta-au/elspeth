@@ -41,6 +41,7 @@ from elspeth.web.continuation_retention_memo import (
     CredentialScanKey,
     PrivateChunkVerificationKey,
     RecorderBlockHashKey,
+    RecorderRequestTextDependencies,
     RecorderRequestTextKey,
     RecorderRequestTextProof,
     RetentionStageMemo,
@@ -928,7 +929,7 @@ async def test_v4_preparation_sql_cuts_share_only_canonical_and_block_proofs() -
             assert isinstance(outcome, RequiredSQLReturned) and outcome.value == ordinal
         assert calls == {"text": 1, "block": 1, "encoding": 3, "request": 3, "snapshot": 3, "chunk": 3, "scan": 3, "state": 3}
         assert len({id(child) for child in children}) == 3
-        assert parent._shared_text_budget_bytes == CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES == 5_242_880
+        assert parent._shared_text_budget_bytes == CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES == 6_291_456
         with v4_preparation_memo_scope(clock) as nested:
             assert nested is parent
         assert parent.active
@@ -1182,3 +1183,107 @@ def test_canonical_encoding_replacement_clears_canonical_only_family() -> None:
         assert memo.cached_entry_count == 1
         memo.canonical_text_encoding(CanonicalTextEncodingKey("replacement", 100), encode)
         assert memo.cached_entry_count == 1 and memo._canonical_verification_bytes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", tuple(permutations(("full", "canonical", "block", "request"))))
+async def test_four_family_insertions_account_every_retained_entry(monkeypatch: pytest.MonkeyPatch, order: tuple[str, ...]) -> None:
+    bound = 1_048_576
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", bound)
+    calls = dict.fromkeys(order, 0)
+
+    def encode(key: CanonicalTextEncodingKey) -> bytes:
+        calls["full"] += 1
+        return key.canonical.encode()
+
+    def canonical(_text: str) -> None:
+        calls["canonical"] += 1
+
+    def block(_key: RecorderBlockHashKey) -> None:
+        calls["block"] += 1
+
+    def request(_key: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        calls["request"] += 1
+        return RecorderRequestTextProof("r" * 200_000, ())
+
+    dependencies = RecorderRequestTextDependencies(encode, encode, hashlib.sha256, frozenset({"shape"}))
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+
+        def admit(family: str, request_text: str = "q") -> None:
+            with borrow_v4_preparation_memo_scope() as child:
+                if family == "full":
+                    child.canonical_text_proof(CanonicalTextEncodingKey("f" * 200_000, bound), encode, hashlib.sha256)
+                elif family == "canonical":
+                    child.canonical_text_verification(CanonicalTextVerificationKey("c" * 400_000, bound), canonical)
+                elif family == "block":
+                    child.recorder_block_hash(RecorderBlockHashKey("0" * 64, "b" * 400_000), block)
+                else:
+                    child.v4_recorder_request_text(RecorderRequestTextKey(request_text * 200_000, bound), dependencies, request)
+            actual = (
+                sum(value.retained_bytes for value in parent._canonical_proofs.values())
+                + sum(parent._canonical_verifications.values())
+                + sum(parent._recorder_block_hashes.values())
+                + sum(value.retained_bytes for value in parent._v4_recorder_requests.values())
+            )
+            charged = (
+                parent._canonical_proof_bytes
+                + parent._canonical_verification_bytes
+                + parent._recorder_block_hash_bytes
+                + parent._v4_recorder_request_bytes
+            )
+            assert actual == charged <= bound
+            for entry in parent._v4_recorder_requests.values():
+                assert entry.retained_bytes == 400_000 + len(str(bound)) + len("shape")
+
+        for family in order:
+            admit(family)
+        assert calls == dict.fromkeys(order, 1)
+        assert parent.cached_entry_count == 2
+        for family in order:
+            admit(family)
+        admit("request", "z")
+        assert max(calls.values()) > 1
+    assert parent.cached_entry_count == parent._v4_recorder_request_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_v4_request_lru_key_bound_producer_oversize_and_late_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", 1_048_576)
+    calls = []
+
+    def produce(key: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        calls.append(key.canonical[:1])
+        return RecorderRequestTextProof("r" * 200_000, ())
+
+    def replacement(key: RecorderRequestTextKey) -> RecorderRequestTextProof:
+        calls.append("replacement")
+        return RecorderRequestTextProof("{}", ())
+
+    dependencies = RecorderRequestTextDependencies(produce, produce, hashlib.sha256, frozenset({"shape"}))
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        keys = [RecorderRequestTextKey(char * 200_000, 1_048_576) for char in "abc"]
+        for key in (keys[0], keys[1], keys[0], keys[2], keys[0], keys[1]):
+            parent.v4_recorder_request_text(key, dependencies, produce)
+        assert calls == ["a", "b", "c", "b"]
+        parent.v4_recorder_request_text(keys[0], dependencies, replacement)
+        parent.v4_recorder_request_text(replace(keys[0], cache_bound_bytes=100), dependencies, produce)
+        parent.v4_recorder_request_text(replace(keys[0], cache_bound_bytes=100), dependencies, produce)
+        assert calls[-3:] == ["replacement", "a", "a"]
+        unsupported = replace(dependencies, context_keys=[])
+        parent.v4_recorder_request_text(keys[0], unsupported, produce)
+        parent.v4_recorder_request_text(keys[0], unsupported, produce)
+        assert calls[-2:] == ["a", "a"]
+        entered, release = threading.Event(), threading.Event()
+
+        def delayed(_key: RecorderRequestTextKey) -> RecorderRequestTextProof:
+            entered.set()
+            assert release.wait(5)
+            return RecorderRequestTextProof("{}", ())
+
+        with borrow_v4_preparation_memo_scope() as child, ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(child.v4_recorder_request_text, RecorderRequestTextKey("late", 100), dependencies, delayed)
+            assert entered.wait(5)
+            parent.close()
+            release.set()
+            assert future.result(timeout=5) == RecorderRequestTextProof("{}", ())
+        assert parent.cached_entry_count == parent._v4_recorder_request_bytes == 0

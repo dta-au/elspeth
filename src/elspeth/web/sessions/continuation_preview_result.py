@@ -19,7 +19,7 @@ from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
 
 import rfc8785
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from sqlalchemy import Connection, insert, select, update
 from sqlalchemy.engine import RootTransaction
 
@@ -51,7 +51,13 @@ from elspeth.web.composer.discovery_response import admit_discovery_result, seri
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.execution.schemas import ValidationResult
-from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_FAILURE_CODES, ComposerOperationError, ComposerOperationRunning
+from elspeth.web.sessions.composer_operations import (
+    COMPOSER_OPERATION_FAILURE_CODES,
+    COMPOSER_OPERATION_RESULT_SCHEMA_ERROR,
+    ComposerOperationError,
+    ComposerOperationRunning,
+    composer_operation_result_hash,
+)
 from elspeth.web.sessions.continuation import (
     ContinuationEvent,
     StoredContinuationSnapshot,
@@ -117,6 +123,19 @@ class PreviewTailIncompleteReceipt(BaseModel):
     automatic_retry_allowed: Literal[False] = False
     returned_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     returned_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}\+00:00$")
+
+    @model_validator(mode="after")
+    def require_tail_measurement(self) -> PreviewTailIncompleteReceipt:
+        if self.observed_at_least != self.limit + 1:
+            raise ValueError("preview tail receipt requires its explicit saturated lower bound")
+        if self.surface != "retained_history" and self.limit != CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            raise ValueError("preview mandatory tail receipt changed its original document limit")
+        if self.original_result is not None and (
+            self.original_result.codec != "composer.preview-observation.v1"
+            or self.original_result.byte_length > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        ):
+            raise ValueError("preview tail receipt cannot retain another or oversized original result")
+        return self
 
 
 type PreviewIncompleteReceipt = ValidationIncompleteReceipt | PreviewTailIncompleteReceipt
@@ -1251,6 +1270,27 @@ def consume_preview_holds_for_failed_settlement_on_connection(
     return tuple(marked)
 
 
+def _decode_preview_terminal_error(
+    *,
+    status: str,
+    failure_code: str | None,
+    result_schema: str | None,
+    result_json: str | None,
+    result_sha256: str | None,
+) -> ComposerOperationError:
+    """Validate terminal value bytes; this grants no source or SQL authority."""
+    if status != "failed" or result_schema != COMPOSER_OPERATION_RESULT_SCHEMA_ERROR or type(result_json) is not str:
+        raise AuditIntegrityError("preview incomplete has no sealed failed parent result")
+    try:
+        error = ComposerOperationError.model_validate_json(result_json, strict=True)
+        digest = composer_operation_result_hash(result_json)
+    except (TypeError, ValueError) as malformed:
+        raise AuditIntegrityError("preview incomplete has a malformed owned terminal error") from malformed
+    if canonical_json(error.model_dump(mode="json")) != result_json or result_sha256 != digest or failure_code != error.failure_code:
+        raise AuditIntegrityError("preview incomplete changed its canonical terminal error or digest")
+    return error
+
+
 def read_preview_validation_incomplete_on_connection(
     conn: Connection,
     *,
@@ -1332,9 +1372,15 @@ def read_preview_validation_incomplete_on_connection(
     ):
         raise AuditIntegrityError("preview incomplete changed its original missing-output receipt")
     parent = conn.execute(select(jobs).where(jobs.c.session_id == session_id, jobs.c.operation_id == operation_id)).one()
-    if parent.status != "failed" or parent.error_json is None:
+    if parent.phase != "settled" or parent.settled_at is None or parent.settled_by != "owner_terminal":
         raise AuditIntegrityError("preview incomplete has no sealed failed parent")
-    error = ComposerOperationError.model_validate_json(parent.error_json, strict=True)
+    error = _decode_preview_terminal_error(
+        status=parent.status,
+        failure_code=parent.failure_code,
+        result_schema=parent.result_schema,
+        result_json=parent.result_json,
+        result_sha256=parent.result_sha256,
+    )
     expected_error = (
         request_cancelled_error(request_id=parent.request_id)
         if error.failure_code == "request_cancelled" and parent.cancel_requested_at is not None

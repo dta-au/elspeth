@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import CodeType
 
@@ -25,10 +25,13 @@ from elspeth.web.continuation_retention_memo import (
     CanonicalTextEncodingKey,
     CanonicalTextVerificationKey,
     RecorderBlockHashKey,
+    RecorderRequestTextDependencies,
+    RecorderRequestTextKey,
+    RecorderRequestTextProof,
     retention_stage_memo_scope,
     v4_preparation_memo_scope,
 )
-from elspeth.web.required_executor import RequiredInvocationWitness
+from elspeth.web.required_executor import RequiredInvocationAborted, RequiredInvocationWitness
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.service import SessionServiceImpl
 from tests.helpers.continuation_end_profile import EndPreparationProfile, EndTextMemoObservation
@@ -90,7 +93,7 @@ async def test_actual_end_review_preparation_profile(operation_store, tmp_path, 
     profile = EndPreparationProfile(enabled=mode == "1", cpu_profile=cpu_mode == "1", cpu_selection=cpu_selection)
     default_budget_mib = memo_module.CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES // 1_048_576
     budget_mib = os.environ.get(TEXT_MEMO_BUDGET_FLAG, str(default_budget_mib))
-    assert budget_mib in {"1", "5"}
+    assert budget_mib in {"1", "5", "6"}
     monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", int(budget_mib) * 1_048_576)
     record_property("end_preparation_text_memo_budget_mib", int(budget_mib))
     profile.text_memo_budget_bytes = int(budget_mib) * 1_048_576
@@ -138,6 +141,9 @@ async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_
     def block(_key):
         pass
 
+    def request(_key):
+        return RecorderRequestTextProof("{}", ())
+
     with observer.install(monkeypatch):
         with retention_stage_memo_scope() as ordinary:
             ordinary.canonical_text_verification(first, verify)
@@ -151,6 +157,11 @@ async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_
             for _ in range(2):
                 parent.canonical_text_proof(full_key, encode, hashlib.sha256)
                 parent.recorder_block_hash(block_key, block)
+                parent.v4_recorder_request_text(
+                    RecorderRequestTextKey("request", 100),
+                    RecorderRequestTextDependencies(encode, encode, hashlib.sha256, frozenset({"shape"})),
+                    request,
+                )
             with pytest.raises(RuntimeError) as raised:
                 parent.canonical_text_verification(CanonicalTextVerificationKey("fails", 100), fails)
             assert raised.value is original_error
@@ -162,7 +173,7 @@ async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_
     assert canonical["evictions"] == (2 if budget_mib == 1 else 0)
     assert canonical["recomputations"] == (2 if budget_mib == 1 else 1)
     assert len(calls) == (5 if budget_mib == 1 else 4)
-    assert all(snapshot["families"][family]["hits"] == 1 for family in ("full", "block"))
+    assert all(snapshot["families"][family]["hits"] == 1 for family in ("full", "block", "request"))
     assert snapshot["parents"] == [{"budget": budget_mib * 1_048_576, "closed_empty": True}]
     assert snapshot["observer_errors"] == snapshot["overlapping_calls"] == snapshot["budget_violations"] == 0
     assert snapshot["peak_retained_bytes"] <= budget_mib * 1_048_576 and snapshot["observer_ns"] > 0
@@ -659,6 +670,159 @@ async def test_end_cpu_profile_selected_method_not_reached_is_invalid(monkeypatc
         assert not data["cpu_capture_valid"] and data["cpu_capture_status"] == "invalid"
         assert data["cpu_profiles"] == data["cpu_expected_workers"] == []
         assert "CPU capture did not reach the original selected checkpoint-source method" in data["cpu_capture_issues"]
+        _assert_cpu_monitoring_cleanup()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", (False, True), ids=("returned", "aborted-entry"))
+@pytest.mark.parametrize("existing_hook", (False, True), ids=("capture", "retain-existing-hook"))
+async def test_first_capture_cpu_selects_original_scope_once_and_preserves_worker_controls(monkeypatch, failed, existing_hook):
+    from elspeth.web.composer import continuation_runtime as runtime
+
+    profile = EndPreparationProfile(enabled=True, cpu_profile=True, cpu_selection="first_capture")
+    engine = create_session_engine("sqlite://")
+    marker = object()
+    original_error = RuntimeError("original first capture error")
+    original_scope = runtime.borrow_v4_preparation_memo_scope
+    original_invoke = RequiredInvocationWitness.invoke
+    received = []
+    expected = []
+    scopes = []
+    calls = []
+    thread_calls = []
+
+    @contextmanager
+    def counted_original_scope(*args, **kwargs):
+        scopes.append("enter")
+        try:
+            with original_scope(*args, **kwargs) as memo:
+                yield memo
+        finally:
+            scopes.append("exit")
+
+    def tracked_invoke(witness, callable_):
+        received.append((witness, callable_))
+        return original_invoke(witness, callable_)
+
+    def preserve_hook(_frame, _event, _arg):
+        pass
+
+    def initialize():
+        if existing_hook:
+            sys.setprofile(preserve_hook)
+
+    def authority_read_control():
+        calls.append("authority")
+
+    def capture_owners_control():
+        calls.append("capture")
+
+    def unrelated_thread_control():
+        thread_calls.append(marker)
+
+    def first_capture_worker():
+        with runtime.borrow_v4_preparation_memo_scope():
+            authority_read_control()
+            capture_owners_control()
+            authority_read_control()
+            peer = threading.Thread(target=unrelated_thread_control)
+            peer.start()
+            peer.join()
+            if failed:
+                raise original_error
+            return marker
+
+    def other_capture_worker():
+        with runtime.borrow_v4_preparation_memo_scope():
+            return marker
+
+    def submit(executor, callable_, *, aborted=False):
+        witness = RequiredInvocationWitness(1)
+        expected.append((witness, callable_))
+        future = executor.submit(witness.invoke, callable_)
+        witness.abort() if aborted else witness.arm()
+        return witness, future
+
+    monkeypatch.setattr(runtime, "borrow_v4_preparation_memo_scope", counted_original_scope)
+    monkeypatch.setattr(RequiredInvocationWitness, "invoke", tracked_invoke)
+    try:
+        with profile.install(monkeypatch, engine), ThreadPoolExecutor(max_workers=1, initializer=initialize) as executor:
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            foreign_clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            with pytest.raises(RuntimeError) if failed else nullcontext() as raised, profile.end_entry(clock):
+                with profile.span("earlier._retain"):
+                    unrelated, future = submit(executor, other_capture_worker)
+                    assert future.result(timeout=5) is marker and unrelated.snapshot().callable_finished
+                token = profile._clock.set(id(foreign_clock))
+                try:
+                    with profile.span(profile.FIRST_CAPTURE_PARENT):
+                        foreign, future = submit(executor, other_capture_worker)
+                        assert future.result(timeout=5) is marker and foreign.snapshot().callable_finished
+                finally:
+                    profile._clock.reset(token)
+                with profile.span(profile.FIRST_CAPTURE_PARENT):
+                    aborted, future = submit(executor, other_capture_worker, aborted=True)
+                    with pytest.raises(RequiredInvocationAborted):
+                        future.result(timeout=5)
+                    assert aborted.snapshot().valid_aborted_exit
+                    selected, future = submit(executor, first_capture_worker)
+                    if failed:
+                        with pytest.raises(RuntimeError) as worker_failure:
+                            future.result(timeout=5)
+                        assert worker_failure.value is original_error
+                    else:
+                        assert future.result(timeout=5) is marker
+                    second, future = submit(executor, other_capture_worker)
+                    assert future.result(timeout=5) is marker and second.snapshot().callable_finished
+                assert executor.submit(sys.getprofile).result(timeout=5) is (preserve_hook if existing_hook else None)
+                if failed:
+                    raise original_error
+                clock.finish_preparation()
+            if failed:
+                assert raised.value is original_error
+            assert selected.snapshot().callable_finished
+        assert received == expected and scopes == ["enter", "exit"] * 4
+        assert calls == ["authority", "capture", "authority"] and thread_calls == [marker]
+        data = profile.snapshot()
+        selected_rows = [row for row in data["records"] if "cprofile_selected_method" in row]
+        assert len(selected_rows) == 1
+        assert data["records"][selected_rows[0]["submission"]]["witness"] == selected.identity
+        if existing_hook:
+            assert not data["cpu_capture_valid"] and not data["cpu_profiles"]
+            assert selected_rows[0]["cprofile_refused"] == "existing thread profile hook"
+        else:
+            assert data["cpu_capture_valid"] and len(data["cpu_profiles"]) == 1
+            captured = data["cpu_profiles"][0]
+            assert captured["witness"] == selected.identity and captured["clock"] == id(clock)
+            assert "initial capture Python frame entry excluded" in captured["scope"]
+            assert "queue and gate excluded" in captured["scope"]
+            assert captured["selected_method"]["qualname"] == "capture_continuation_runtime_owners.<locals>.capture"
+            names = {entry["function"]: entry for entry in captured["entries"]}
+            assert names["authority_read_control"]["total_calls"] == 2
+            assert names["capture_owners_control"]["total_calls"] == 1
+            assert not {"other_capture_worker", "unrelated_thread_control", "invoke"} & names.keys()
+            assert data["cpu_capture_status"] == ("captured_aborted_entry" if failed else "captured_preparation")
+        _assert_cpu_monitoring_cleanup()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_first_capture_cpu_not_reached_keeps_original_error_and_invalid_receipt(monkeypatch):
+    profile = EndPreparationProfile(enabled=True, cpu_profile=True, cpu_selection="first_capture")
+    engine = create_session_engine("sqlite://")
+    original = RuntimeError("first capture was never reached")
+    try:
+        with profile.install(monkeypatch, engine):
+            clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+            with pytest.raises(RuntimeError) as raised, profile.end_entry(clock):
+                raise original
+        assert raised.value is original
+        data = profile.snapshot()
+        assert not data["cpu_capture_valid"] and not data["cpu_profiles"]
+        assert "CPU capture did not reach the original first physical capture scope" in data["cpu_capture_issues"]
         _assert_cpu_monitoring_cleanup()
     finally:
         engine.dispose()

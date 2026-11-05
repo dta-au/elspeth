@@ -19,6 +19,7 @@ from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUME
 from elspeth.web.coordination.quota_authority import _undispatched_cancellation_event_id, _usage_entry_id
 from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_RESULT_SCHEMA_ERROR, composer_operation_result_hash
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, _effect_snapshot, load_snapshot
+from elspeth.web.sessions.continuation_checkpoint_early_source import read_checkpoint_early_input_for_hold_on_connection
 from elspeth.web.sessions.continuation_checkpoint_no_sdk_tail import build_checkpoint_no_sdk_tail_batch
 from elspeth.web.sessions.continuation_checkpoint_paid_terminal import _bounded_bytes, _checkpoint_at, _event_at, _stored_hold_source
 from elspeth.web.sessions.continuation_checkpoint_sdk_reservation import prepare_checkpoint_sdk_terminal_hold_plan
@@ -109,6 +110,7 @@ def read_v4_checkpoint_no_sdk_terminal_on_connection(
         raise AuditIntegrityError("checkpoint no-SDK terminal changed its original prepared source")
     preparation_tag, preparation_text = _event_at(conn, source, prepared.cursor)
     preparation, error = parse_json_strict(preparation_text)
+    new_early = error is None and type(preparation) is dict and preparation.get("version") == 2 and preparation.get("phase") == "early"
     if (
         preparation_tag != "checkpoint"
         or error is not None
@@ -131,8 +133,9 @@ def read_v4_checkpoint_no_sdk_terminal_on_connection(
             "end_env_ref_names",
             "captured_root_sha256",
         }
+        | ({"early_input_chunk_key", "early_input_sha256"} if new_early else set())
         or preparation["owner"] != "composer_checkpoint_source"
-        or preparation["version"] != 1
+        or preparation["version"] != (2 if new_early else 1)
         or preparation["stage"] != "source_prepared"
         or preparation["phase"] not in ("early", "end")
         or preparation["kind"] not in ("iteration_early", "iteration_end", "end_review")
@@ -228,8 +231,9 @@ def read_v4_checkpoint_no_sdk_terminal_on_connection(
             "end_input_sha256",
             "end_env_ref_names",
         }
+        | ({"early_input_chunk_key", "early_input_sha256"} if new_early else set())
         or dispatch["owner"] != "composer_checkpoint_paid"
-        or dispatch["version"] != 1
+        or dispatch["version"] != (2 if new_early else 1)
         or dispatch["stage"] != "dispatched"
         or dispatch["phase"] != preparation["phase"]
         or dispatch["kind"] != preparation["kind"]
@@ -261,6 +265,9 @@ def read_v4_checkpoint_no_sdk_terminal_on_connection(
     ).model_copy(update={"cursor": admitted.cursor})
     if admitted.cursor != prepared.cursor + 1 or decode_continuation_snapshot(admitted.payload_json) != expected_dispatched:
         raise AuditIntegrityError("checkpoint no-SDK terminal changed its complete original admitted root")
+    early_input = read_checkpoint_early_input_for_hold_on_connection(conn, source=source)
+    if new_early and (early_input is None or names != frozenset(early_input.env_ref_names)):
+        raise AuditIntegrityError("EARLY no-SDK terminal changed its original current guard inventory")
     identity = PaidOverflowIdentity(
         session_id=sid,
         operation_id=operation_id,
@@ -282,6 +289,7 @@ def read_v4_checkpoint_no_sdk_terminal_on_connection(
         creator_sequence=source.creator_sequence,
         requested_model=effect.requested_model,
         historical_contract_sha256=source.fallback_contract_sha256,
+        early_input=early_input,
     )
     if source.reserved_bytes != combined.reserved_bytes or source.fallback_contract_sha256 != combined.contract_sha256:
         raise AuditIntegrityError("checkpoint no-SDK terminal changed its original combined H")

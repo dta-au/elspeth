@@ -134,6 +134,7 @@ from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 from elspeth.web.execution.schemas import ValidationResult
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_checkpoint_early_physical import CheckpointEarlyPhysicalSource
     from elspeth.web.composer.continuation_checkpoint_end_format_retry import CheckpointEndFormatRetrySource
     from elspeth.web.composer.continuation_checkpoint_end_locals import CheckpointEndGateLocals
     from elspeth.web.composer.continuation_checkpoint_end_physical import CheckpointEndPhysicalSource
@@ -540,6 +541,7 @@ class AdvisorCheckpointOwner:
         _outcome: _AdvisorInvocationCapture | None = None,
         failure_observation: ContinuationDispatchFailureObservation | None = None,
         checkpoint_end_source: CheckpointEndPhysicalSource | None = None,
+        checkpoint_early_source: CheckpointEarlyPhysicalSource | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -694,6 +696,23 @@ class AdvisorCheckpointOwner:
             # This full request continuity proof is distinct from the audit
             # messages_hash retained by checkpoint SQL and its terminal hold.
             kwargs["continuation_input_sha256"] = checkpoint_end_request_identity(kwargs)
+        if checkpoint_early_source is not None:
+            from elspeth.web.composer.continuation_checkpoint_early_physical import bind_checkpoint_early_physical_request
+
+            if (
+                checkpoint_end_source is not None
+                or checkpoint_phase != "early"
+                or provider_custody is None
+                or _outcome is not checkpoint_early_source.capture
+                or private_request.disposition != "retained"
+            ):
+                raise AuditIntegrityError("EARLY physical adapter lost its original structured prepared invocation")
+            await bind_checkpoint_early_physical_request(
+                checkpoint_early_source,
+                custody=provider_custody,
+                prepared_input=prepared_input,
+                request_options=kwargs,
+            )
         # Reserve only a successfully prepared attempt. A graph/allowance
         # refusal above has no physical request and spends no continuation
         # allowance. The physical dispatch callback retains deadline/cost checks.
@@ -724,12 +743,24 @@ class AdvisorCheckpointOwner:
                 credential_surface="composer_advisor_response",
                 require_tool_calls_field=structured_output,
             )
-            if checkpoint_end_source is not None:
+            if checkpoint_end_source is not None or checkpoint_early_source is not None:
                 witness = response_metadata.v4_completeness
                 if witness is None or provider_custody is None:
                     raise AuditIntegrityError("END physical result lost its original complete SDK witness")
                 provider_custody.require_v4_result_completeness(witness)
                 witness.require_result(response_metadata, content=message.content, tool_calls=tool_calls)
+            if checkpoint_early_source is not None:
+                if _outcome is not checkpoint_early_source.capture:
+                    raise AuditIntegrityError("EARLY returned fields lost their original capture")
+                complete = provider_gateway._admit_captured_composer_llm_completion(
+                    message,
+                    tool_calls,
+                    response_metadata,
+                    wrap_tool_batch_error=True,
+                )
+                _outcome.message = complete.message
+                _outcome.provider_metadata = complete.provider_metadata
+                _outcome.tool_batch = complete.tool_batch
             # F4: validate content BEFORE marking SUCCESS. None / empty /
             # whitespace-only content (content-filter triggered, malformed
             # provider output, tool-call-only response) must classify as
@@ -819,6 +850,8 @@ class AdvisorCheckpointOwner:
             error_message = "paid_result_incomplete"
             raise
         except _MalformedLLMResponseError as exc:
+            if checkpoint_early_source is not None:
+                failure_to_capture = exc
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
             response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
@@ -937,7 +970,57 @@ class AdvisorCheckpointOwner:
         failure_observation: ContinuationDispatchFailureObservation | None = None,
         checkpoint_end_source: CheckpointEndPhysicalSource | None = None,
         checkpoint_end_retry: CheckpointEndFormatRetrySource | None = None,
+        checkpoint_early_source: CheckpointEarlyPhysicalSource | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        if checkpoint_early_source is not None:
+            from elspeth.web.composer.continuation_checkpoint_early_physical import (
+                checkpoint_early_format_retry,
+                require_original_checkpoint_early_physical_source,
+            )
+
+            require_original_checkpoint_early_physical_source(checkpoint_early_source)
+            early_owner = checkpoint_early_source.phase_owner
+            if (
+                checkpoint_end_source is not None
+                or checkpoint_end_retry is not None
+                or _outcome is not checkpoint_early_source.capture
+                or provider_owner is not early_owner.phases.provider_owner
+                or recorder is not early_owner.runtime.live.recorder
+                or self is not early_owner.phases.service._advisor_checkpoint
+                or not structured_output
+                or failure_observation is not None
+                or continuation_budget is not None
+                or on_provider_dispatch is not None
+            ):
+                raise AuditIntegrityError("EARLY physical call changed its original capture, provider owner or recorder")
+            early_bindings = early_owner.runtime.bindings
+            if early_bindings.session_id is None or early_bindings.session_operation_context is None:
+                raise AuditIntegrityError("EARLY physical call lost its original session graph authority")
+            early_names = await self._current_env_ref_names(early_bindings.session_id)
+            if early_names != early_owner.runtime.env_ref_names:
+                raise AuditIntegrityError("EARLY physical call changed its original environment inventory")
+            early_scope = composition_scope_for_operation(
+                early_owner.runtime.live.state,
+                session_id=early_bindings.session_id,
+                session_operation_context=early_bindings.session_operation_context,
+                session_operation_authority=self._require_sessions_service().session_operation_authority,
+            )
+            early_arguments = self._build_checkpoint_arguments(
+                phase="early",
+                state=early_owner.runtime.live.state,
+                content_scope=early_scope,
+                env_ref_names=early_names,
+                advisor_transcript=early_owner.runtime.live.turn_evidence.transcript.snapshot(),
+            )
+            self._require_complete_graph_summary(early_arguments["_elspeth_advisor_summary_parts"])
+            early_retry = checkpoint_early_format_retry(checkpoint_early_source)
+            if early_retry is not None and early_retry.marker.format_reprompt_required:
+                early_arguments = _advisor_policy.advisor_arguments_with_format_reprompt(
+                    early_arguments,
+                    schema_valid=early_retry.marker.first_attempt_schema_valid is True,
+                )
+            if arguments != early_arguments:
+                raise AuditIntegrityError("EARLY physical call substituted its original complete arguments")
         if checkpoint_end_retry is not None and checkpoint_end_source is None:
             raise AuditIntegrityError("END format re-prompt requires its original physical source")
         if checkpoint_end_source is not None:
@@ -1011,6 +1094,33 @@ class AdvisorCheckpointOwner:
                 continuation_budget=continuation_budget,
             )
         provider_custody = self._new_advisor_custody(provider_owner)
+        if checkpoint_early_source is not None:
+            from elspeth.web.composer.continuation_checkpoint_early_physical import note_checkpoint_early_physical_failure
+            from elspeth.web.composer.provider_sdk_terminal import capture_sdk_terminal_failure, sdk_terminal_failure_scope
+
+            try:
+                async with sdk_terminal_failure_scope(provider_custody), provider_call_scope(provider_custody):
+                    try:
+                        return await self._call_advisor_with_audit_body(
+                            arguments,
+                            recorder=recorder,
+                            timeout=timeout,
+                            structured_output=True,
+                            provider_custody=provider_custody,
+                            _outcome=_outcome,
+                            checkpoint_early_source=checkpoint_early_source,
+                        )
+                    except V4ProviderResultIncomplete as incomplete:
+                        if not provider_custody.has_v4_returned_incomplete_finalizer():
+                            raise
+                        finalized = await provider_custody.finalize_v4_returned_incomplete(incomplete)
+                        raise V4PaidIncompleteCommitted(finalized) from None
+            except (V4PaidIncompleteCommitted, V4SdkTerminalCommitted):
+                raise
+            except BaseException as original:
+                if capture_sdk_terminal_failure(original, custody=provider_custody) is None:
+                    note_checkpoint_early_physical_failure(checkpoint_early_source, original)
+                raise
         if checkpoint_end_source is not None:
             from elspeth.web.composer.continuation_checkpoint_end_dispositions import _EndCheckpointDispositionControl
             from elspeth.web.composer.continuation_checkpoint_end_physical import (

@@ -12,6 +12,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
     _AdmittedLLMProviderMetadata,
+    _AdmittedToolBatch,
 )
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
@@ -34,6 +35,7 @@ class AdvisorInvocationObservation:
     audit_call: ComposerLLMCall | None
     recorder_completed: bool
     continuation_budget_completed: bool
+    tool_batch: _AdmittedToolBatch | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "metadata")
@@ -68,6 +70,7 @@ class _AdvisorInvocationCapture:
     audit_call: ComposerLLMCall | None = None
     recorder_completed: bool = False
     continuation_budget_completed: bool = False
+    tool_batch: _AdmittedToolBatch | None = None
 
     def snapshot(self) -> AdvisorInvocationObservation:
         return AdvisorInvocationObservation(
@@ -79,6 +82,7 @@ class _AdvisorInvocationCapture:
             self.audit_call,
             self.recorder_completed,
             self.continuation_budget_completed,
+            self.tool_batch,
         )
 
 

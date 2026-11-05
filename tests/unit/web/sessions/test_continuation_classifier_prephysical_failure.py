@@ -16,7 +16,7 @@ from weakref import ref
 import litellm
 import pytest
 from sqlalchemy import insert, select, text, update
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -25,6 +25,7 @@ from elspeth.web.composer.continuation_semantic_advisor_return import observe_co
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.required_work import RequiredWorkIncomplete, RequiredWorkSource
 from elspeth.web.sessions import continuation_classifier_prephysical_failure as owner
+from elspeth.web.sessions.content_publication import prepare_content_publication
 from elspeth.web.sessions.continuation_classifier_primary import _stage_key
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
@@ -34,6 +35,10 @@ from elspeth.web.sessions.models import composer_provider_terminal_holds_table a
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from elspeth.web.sessions.models import composition_states_table as states
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
+from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.routes._helpers import _state_from_record
+from elspeth.web.sessions.state_decoder import state_record_from_row
+from elspeth.web.sessions.state_envelope import envelope_state_column
 from tests.unit.web.sessions import test_continuation_live_phases as phase_fixture
 from tests.unit.web.sessions.test_continuation_classifier_primary_v4_paid import _v4_classifier_case
 from tests.unit.web.sessions.test_continuation_classifier_primary_v4_paid import operation_store as _operation_store
@@ -140,31 +145,58 @@ async def test_actual_preparation_failure_commits_once_and_cold_reproves_all_ori
             descriptor = owner._Descriptor.model_validate_json(row.payload)
             private = conn.execute(select(messages).where(messages.c.id == str(descriptor.message_id))).one()
             assert private.role == "audit"
+            recovery = state_record_from_row(
+                conn.execute(select(states).where(states.c.id == detail["partial_state"]["id"], states.c.session_id == sid)).one()
+            )
+            captured_state = json.loads(descriptor.state_json)
+            assert captured_state["version"] > descriptor.initial_version
+            assert captured_state["version"] != recovery.version == detail["partial_state"]["version"]
 
         # Each semantic opponent rewrites its own chunk digest/length too,
         # ensuring the cold source/private proof itself detects the mutation.
         mutations = (
             ("private_facts", descriptor.private_facts + " "),
+            ("audit_content", "changed private failure"),
             ("max_turns", descriptor.max_turns + 1),
             ("initial_version", descriptor.initial_version + 1),
             ("state_json", canonical_json({**json.loads(descriptor.state_json), "version": 999})),
+            ("state_json", canonical_json({**captured_state, "version": recovery.version})),
             ("clock_policy_json", "{}"),
             ("clock_started", descriptor.clock_started + 1.0),
         )
         with store[0].begin() as conn:
-            for column in ("sha256", "byte_length"):
-                savepoint = conn.begin_nested()
-                try:
-                    value = "0" * 64 if column == "sha256" else row.byte_length + 1
+            savepoint = conn.begin_nested()
+            try:
+                # The storage contract rejects a mismatched length before a
+                # reader can observe it. Preserve that independent boundary.
+                with pytest.raises(IntegrityError, match="ck_composer_chunks_exact_bytes"):
                     conn.execute(
                         update(chunks)
                         .where(chunks.c.session_id == sid, chunks.c.operation_id == oid, chunks.c.chunk_key == row.chunk_key)
-                        .values(**{column: value})
+                        .values(byte_length=row.byte_length + 1)
                     )
-                    with pytest.raises(AuditIntegrityError):
-                        _cold(conn, running)
-                finally:
-                    savepoint.rollback()
+            finally:
+                savepoint.rollback()
+            assert (
+                conn.execute(
+                    select(chunks).where(chunks.c.session_id == sid, chunks.c.operation_id == oid, chunks.c.chunk_key == row.chunk_key)
+                ).one()
+                == row
+            )
+            assert _cold(conn, running) == committed.verified
+            savepoint = conn.begin_nested()
+            try:
+                # A syntactically valid SHA with unchanged bytes/length does
+                # reach the actual cold digest proof after storage accepts it.
+                conn.execute(
+                    update(chunks)
+                    .where(chunks.c.session_id == sid, chunks.c.operation_id == oid, chunks.c.chunk_key == row.chunk_key)
+                    .values(sha256="0" * 64)
+                )
+                with pytest.raises(AuditIntegrityError):
+                    _cold(conn, running)
+            finally:
+                savepoint.rollback()
             for field, value in mutations:
                 savepoint = conn.begin_nested()
                 try:
@@ -192,11 +224,62 @@ async def test_actual_preparation_failure_commits_once_and_cold_reproves_all_ori
                 savepoint.rollback()
             savepoint = conn.begin_nested()
             try:
-                conn.execute(update(messages).where(messages.c.id == str(descriptor.message_id)).values(content="changed private failure"))
-                with pytest.raises(AuditIntegrityError, match="private cohort"):
-                    _cold(conn, running)
+                # Actual audit content is append-only at storage. Its retained
+                # DATA comparand is independently opposed above; do not bypass
+                # this trigger to pretend a forbidden SQL row reached cold read.
+                with pytest.raises(IntegrityError, match=r"chat_messages\.content is append-only"):
+                    conn.execute(
+                        update(messages).where(messages.c.id == str(descriptor.message_id)).values(content="changed private failure")
+                    )
             finally:
                 savepoint.rollback()
+            assert conn.execute(select(messages).where(messages.c.id == str(descriptor.message_id))).one() == private
+            assert _cold(conn, running) == committed.verified
+            # Rebinding the ordinary content-publication metadata must not
+            # permit a changed SQL checkpoint to replace its original P4 row.
+            # In the version case the resulting domain graph even equals the
+            # captured local graph: the historical checkpoint still differs.
+            for change in ("checkpoint_version", "graph_content"):
+                savepoint = conn.begin_nested()
+                try:
+                    metadata = recovery.metadata_ if change == "checkpoint_version" else {**recovery.metadata_, "name": "changed graph"}
+                    version = captured_state["version"] if change == "checkpoint_version" else recovery.version
+                    rebound = prepare_content_publication(
+                        CompositionStateData(
+                            sources=recovery.sources,
+                            nodes=recovery.nodes,
+                            edges=recovery.edges,
+                            outputs=recovery.outputs,
+                            metadata_=metadata,
+                            is_valid=recovery.is_valid,
+                            validation_errors=recovery.validation_errors,
+                            composer_meta=recovery.composer_meta,
+                        ),
+                        session_id=recovery.session_id,
+                        state_id=recovery.id,
+                        state_version=version,
+                    )
+                    conn.execute(
+                        update(states)
+                        .where(states.c.id == str(recovery.id), states.c.session_id == sid)
+                        .values(
+                            version=version,
+                            metadata_=envelope_state_column(rebound.metadata_),
+                            composer_meta=envelope_state_column(rebound.composer_meta),
+                        )
+                    )
+                    changed = state_record_from_row(
+                        conn.execute(select(states).where(states.c.id == str(recovery.id), states.c.session_id == sid)).one()
+                    )
+                    assert changed.version == version
+                    if change == "checkpoint_version":
+                        assert canonical_json(_state_from_record(changed).to_dict()) == descriptor.state_json
+                    else:
+                        assert _state_from_record(changed).metadata.name == "changed graph"
+                    with pytest.raises(AuditIntegrityError):
+                        _cold(conn, running)
+                finally:
+                    savepoint.rollback()
             owner._require_candidate(_cold(conn, running), descriptor)
             with pytest.raises(AuditIntegrityError, match="prepared terminal candidate"):
                 owner._require_candidate(committed.verified, descriptor.model_copy(update={"message_id": uuid4()}))
@@ -273,7 +356,7 @@ async def test_original_prephysical_source_refuses_each_orphan_without_publishin
             )
             prior = conn.execute(select(physical).where(physical.c.session_id == sid)).one()
             hold = conn.execute(select(holds).where(holds.c.session_id == sid, holds.c.operation_id == oid)).one()
-            for kind in ("anchor", "source", "hold", "physical", "other_history_physical", "unresolved"):
+            for kind in ("anchor", "source", "hold", "active_hold", "physical", "other_history_physical", "unresolved"):
                 savepoint = conn.begin_nested()
                 try:
                     if kind in ("anchor", "source"):
@@ -293,9 +376,36 @@ async def test_original_prephysical_source_refuses_each_orphan_without_publishin
                             )
                         )
                     elif kind == "hold":
+                        attempt_id = str(uuid4())
+                        orphan_attempt = dict(prior._mapping)
+                        orphan_attempt.update(attempt_id=attempt_id, settled_at=None, ledger_entry_id=None)
+                        conn.execute(insert(physical).values(**orphan_attempt))
+                        original_provider = conn.execute(
+                            select(effects).where(
+                                effects.c.session_id == sid,
+                                effects.c.operation_id == oid,
+                                effects.c.effect_key == hold.effect_key,
+                            )
+                        ).one()
+                        orphan_effect = dict(original_provider._mapping)
+                        orphan_effect.update(
+                            effect_key="provider:0:999",
+                            disposition="dispatched",
+                            provider_attempt_id=attempt_id,
+                            receipt_key=None,
+                            result_chunk_key=None,
+                            response_finished_at=None,
+                        )
+                        conn.execute(insert(effects).values(**orphan_effect))
                         values = dict(hold._mapping)
-                        values["effect_key"] = "provider:0:999"
+                        values.update(effect_key="provider:0:999", provider_attempt_id=attempt_id, state="active", consumed_at=None)
                         conn.execute(insert(holds).values(**values))
+                    elif kind == "active_hold":
+                        conn.execute(
+                            update(holds)
+                            .where(holds.c.session_id == sid, holds.c.operation_id == oid, holds.c.effect_key == hold.effect_key)
+                            .values(state="active", consumed_at=None)
+                        )
                     elif kind in ("physical", "other_history_physical"):
                         values = dict(prior._mapping)
                         values.update(attempt_id=str(uuid4()), settled_at=None, ledger_entry_id=None)
@@ -308,9 +418,18 @@ async def test_original_prephysical_source_refuses_each_orphan_without_publishin
                                 )
                             ).one()
                             creator = dict(history._mapping)
-                            creator.update(generation=running.claim.ownership_generation + 1, session_operation_id=str(uuid4()))
+                            epochs = tuple(
+                                conn.execute(select(attempts.c.session_operation_epoch).where(attempts.c.session_id == sid)).scalars()
+                            )
+                            creator.update(
+                                generation=running.claim.ownership_generation + 1,
+                                claim_attempt=history.claim_attempt + 1,
+                                session_operation_id=str(uuid4()),
+                                session_operation_epoch=max(epochs) + 1,
+                            )
                             conn.execute(insert(attempts).values(**creator))
                             values["operation_id"] = creator["session_operation_id"]
+                            values["operation_epoch"] = creator["session_operation_epoch"]
                         conn.execute(insert(physical).values(**values))
                     else:
                         logical = conn.execute(

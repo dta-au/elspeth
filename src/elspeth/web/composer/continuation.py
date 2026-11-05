@@ -93,6 +93,7 @@ class PrivateChunkRef(ContinuationValue):
         "composer.attachment-admissions.v1",
         "composer.response.v1",
         "composer.primary-no-sdk-refusal.v1",
+        "composer.classifier-primary-no-sdk-refusal.v1",
         "composer.semantic-no-sdk-refusal.v1",
         "composer.title-input.v1",
         "composer.title-no-sdk-refusal.v1",

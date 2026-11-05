@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from elspeth.contracts import hashing
 from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolStatus,
@@ -21,6 +22,7 @@ from elspeth.contracts.session_operation import (
     SessionOperationFence,
     SessionOperationKind,
 )
+from elspeth.web.composer import continuation_audit_buffer as audit_buffer
 from elspeth.web.composer.audit import BufferingRecorder, PrivatePlannerCandidate
 from elspeth.web.composer.continuation_audit_buffer import (
     RecorderDrainCursors,
@@ -30,6 +32,63 @@ from elspeth.web.composer.continuation_audit_buffer import (
 from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from tests.unit.web.composer.test_continuation_physical_outcomes import actual_record
+
+
+def test_recorder_projection_selects_native_writer_and_reader_preserves_public_canonical_bytes(monkeypatch):
+    from tests.unit.web.composer.test_continuation_audit_buffer_blocks import _snapshot
+
+    snapshot = _snapshot(2)
+    native, public = audit_buffer.canonical_json_native_strings, audit_buffer.canonical_json
+    native_calls, public_calls = [], []
+
+    def observe_native(value):
+        native_calls.append(True)
+        result = native(value)
+        assert result == public(value)
+        return result
+
+    def observe_public(value):
+        public_calls.append(True)
+        return public(value)
+
+    monkeypatch.setattr(audit_buffer, "canonical_json_native_strings", observe_native)
+    monkeypatch.setattr(audit_buffer, "canonical_json", observe_public)
+    chunk = encode_recorder_snapshot(snapshot)
+    assert native_calls == [True] and public_calls
+    assert decode_recorder_snapshot(chunk) == snapshot
+    assert native_calls == [True, True]
+    assert hashing.canonical_json is public
+
+
+@pytest.mark.asyncio
+async def test_changed_final_writer_cannot_hide_behind_warm_request_proofs(monkeypatch):
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
+    from elspeth.web.composer.continuation_policy import ContinuationActionPolicy
+    from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope, v4_preparation_memo_scope
+    from tests.unit.web.composer.test_continuation_audit_buffer_blocks import _snapshot
+
+    snapshot = _snapshot(2)
+    original_prepared = audit_buffer._prepared_request_text
+    original_writer = audit_buffer.canonical_json_native_strings
+    projected = []
+
+    def prepare(key):
+        projected.append(True)
+        return original_prepared(key)
+
+    def changed_writer(value):
+        return original_writer(value) + " "
+
+    monkeypatch.setattr(audit_buffer, "_prepared_request_text", prepare)
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=10, guard=1, quota=1, physical=1, retention=1))
+    with v4_preparation_memo_scope(clock):
+        with borrow_v4_preparation_memo_scope():
+            encode_recorder_snapshot(snapshot)
+        assert projected == [True, True]
+        monkeypatch.setattr(audit_buffer, "canonical_json_native_strings", changed_writer)
+        with borrow_v4_preparation_memo_scope(), pytest.raises(AuditIntegrityError, match="canonical strict JSON"):
+            encode_recorder_snapshot(snapshot)
+        assert projected == [True, True]
 
 
 def test_buffer_cold_roundtrip_preserves_private_channels_lock_alias_and_partial_drain():

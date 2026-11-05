@@ -704,6 +704,20 @@ def admit_v4_checkpoint_provider_on_connection(
         phase=source.phase,
         creator_sequence=running.claim.segment_sequence,
         requested_model=requested.value,
+        early_input=(
+            require_early_input_on_connection(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                reference=source.early_input_ref,
+                allowance=policy.max_retained_payload_bytes,
+                origin=source.source,
+                prepared=source.prepared_selected,
+                outer_effect_key=source.outer_effect_key,
+            )
+            if source.early_input_ref is not None
+            else None
+        ),
     )
     tail = terminal_hold.paid_overflow
     hold = ProviderTerminalHoldSource(

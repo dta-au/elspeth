@@ -7,7 +7,7 @@ retention authority. A later owner must authenticate original phase and source.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 from weakref import WeakKeyDictionary
 
@@ -78,6 +78,7 @@ class CheckpointReturnedResponseObservation:
     provider_metadata: _AdmittedLLMProviderMetadata
     audit_call: ComposerLLMCall
     response: PrivateChunk
+    tool_batch: _AdmittedToolBatch = field(default_factory=lambda: _AdmittedToolBatch((), frozenset()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,7 +376,9 @@ def require_original_v4_checkpoint_returned_response(
             or result.response.reference.digest != source.response_digest
         ):
             raise AuditIntegrityError("V4 checkpoint result substituted original complete DATA")
-        source.witness.require_result(result.provider_metadata, content=result.message.content, tool_calls=())
+        source.witness.require_result(result.provider_metadata, content=result.message.content, tool_calls=result.tool_batch.calls)
+        if source.original.tool_batch is not None and result.tool_batch is not source.original.tool_batch:
+            raise AuditIntegrityError("V4 checkpoint result replaced its original complete tool batch")
     elif type(result) is CheckpointIncompleteResponseObservation:
         if result.attempt_id != attempt_id or result.request_sha256 != request_sha256:
             raise AuditIntegrityError("V4 checkpoint overflow substituted its original physical source")
@@ -408,5 +411,9 @@ def original_v4_checkpoint_returned_audit_call(
         or call.messages_hash != request_sha256
     ):
         raise AuditIntegrityError("V4 checkpoint audit call lost its original physical return custody")
-    source.witness.require_result(metadata, content=message.content, tool_calls=())
+    source.witness.require_result(
+        metadata,
+        content=message.content,
+        tool_calls=source.original.tool_batch.calls if source.original.tool_batch is not None else (),
+    )
     return call

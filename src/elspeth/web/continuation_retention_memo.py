@@ -94,6 +94,29 @@ class RecorderRequestTextProof:
     blocks: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RecorderRequestTextDependencies:
+    parser: object
+    renderer: object
+    sha256: object
+    context_keys: object
+
+    def cacheable(self) -> bool:
+        return (
+            type(self.parser) is FunctionType
+            and type(self.renderer) is FunctionType
+            and (type(self.sha256) is FunctionType or type(self.sha256) is BuiltinFunctionType)
+            and type(self.context_keys) is frozenset
+            and all(type(part) is str for part in self.context_keys)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _RecorderRequestTextEntry:
+    proof: RecorderRequestTextProof
+    retained_bytes: int
+
+
 type CredentialInputKind = Literal["null", "bool", "int", "float", "string", "mapping", "mapping_proxy", "list", "tuple", "end"]
 
 
@@ -248,6 +271,13 @@ class RetentionStageMemo:
         self._canonical_verification_bytes = 0
         self._recorder_block_hashes: OrderedDict[tuple[Callable[[RecorderBlockHashKey], object], RecorderBlockHashKey], int] = OrderedDict()
         self._recorder_block_hash_bytes = 0
+        self._v4_recorder_requests: OrderedDict[
+            tuple[
+                Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None], RecorderRequestTextDependencies, RecorderRequestTextKey
+            ],
+            _RecorderRequestTextEntry,
+        ] = OrderedDict()
+        self._v4_recorder_request_bytes = 0
         self._recorder_request: (
             tuple[Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None], RecorderRequestTextKey, RecorderRequestTextProof]
             | None
@@ -277,6 +307,7 @@ class RetentionStageMemo:
                 + len(self._canonical_proofs)
                 + len(self._canonical_verifications)
                 + len(self._recorder_block_hashes)
+                + len(self._v4_recorder_requests)
                 + int(self._recorder_request is not None)
             )
 
@@ -292,6 +323,8 @@ class RetentionStageMemo:
             self._canonical_verification_bytes = 0
             self._recorder_block_hashes.clear()
             self._recorder_block_hash_bytes = 0
+            self._v4_recorder_requests.clear()
+            self._v4_recorder_request_bytes = 0
             self._recorder_request = None
             self._credentials.clear()
             self._states.clear()
@@ -357,6 +390,8 @@ class RetentionStageMemo:
                 self._canonical_verification_bytes = 0
                 self._recorder_block_hashes.clear()
                 self._recorder_block_hash_bytes = 0
+                self._v4_recorder_requests.clear()
+                self._v4_recorder_request_bytes = 0
                 self._canonical_text = (producer, key, value)
         return value
 
@@ -426,15 +461,22 @@ class RetentionStageMemo:
                 _, evicted = self._canonical_proofs.popitem(last=False)
                 self._canonical_proof_bytes -= evicted.retained_bytes
             while (
-                self._canonical_proof_bytes + self._canonical_verification_bytes + self._recorder_block_hash_bytes + size
+                self._canonical_proof_bytes
+                + self._canonical_verification_bytes
+                + self._recorder_block_hash_bytes
+                + self._v4_recorder_request_bytes
+                + size
                 > self._shared_text_budget_bytes
             ):
                 if self._canonical_verifications:
                     _, evicted_size = self._canonical_verifications.popitem(last=False)
                     self._canonical_verification_bytes -= evicted_size
-                else:
+                elif self._recorder_block_hashes:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
+                else:
+                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
+                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
             self._canonical_proofs[cache_key] = proof
             self._canonical_proof_bytes += size
         return proof
@@ -473,7 +515,11 @@ class RetentionStageMemo:
                 return
             self._canonical_text = None
             while (
-                self._canonical_proof_bytes + self._canonical_verification_bytes + self._recorder_block_hash_bytes + size
+                self._canonical_proof_bytes
+                + self._canonical_verification_bytes
+                + self._recorder_block_hash_bytes
+                + self._v4_recorder_request_bytes
+                + size
                 > self._shared_text_budget_bytes
             ):
                 if self._canonical_verifications:
@@ -482,9 +528,12 @@ class RetentionStageMemo:
                 elif self._canonical_proofs:
                     _, evicted_proof = self._canonical_proofs.popitem(last=False)
                     self._canonical_proof_bytes -= evicted_proof.retained_bytes
-                else:
+                elif self._recorder_block_hashes:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
+                else:
+                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
+                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
             self._canonical_verifications[cache_key] = size
             self._canonical_verification_bytes += size
 
@@ -513,7 +562,11 @@ class RetentionStageMemo:
                 return
             self._canonical_text = None
             while (
-                self._canonical_proof_bytes + self._canonical_verification_bytes + self._recorder_block_hash_bytes + size
+                self._canonical_proof_bytes
+                + self._canonical_verification_bytes
+                + self._recorder_block_hash_bytes
+                + self._v4_recorder_request_bytes
+                + size
                 > self._shared_text_budget_bytes
             ):
                 if self._recorder_block_hashes:
@@ -522,11 +575,102 @@ class RetentionStageMemo:
                 elif self._canonical_verifications:
                     _, evicted_size = self._canonical_verifications.popitem(last=False)
                     self._canonical_verification_bytes -= evicted_size
-                else:
+                elif self._canonical_proofs:
                     _, evicted_proof = self._canonical_proofs.popitem(last=False)
                     self._canonical_proof_bytes -= evicted_proof.retained_bytes
+                else:
+                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
+                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
             self._recorder_block_hashes[cache_key] = size
             self._recorder_block_hash_bytes += size
+
+    def v4_recorder_request_text(
+        self,
+        key: RecorderRequestTextKey,
+        dependencies: RecorderRequestTextDependencies,
+        producer: Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None],
+    ) -> RecorderRequestTextProof | None:
+        """V4-only immutable projections; every transfer still rebuilds fresh values."""
+        if (
+            type(key) is not RecorderRequestTextKey
+            or type(key.canonical) is not str
+            or type(key.cache_bound_bytes) is not int
+            or key.cache_bound_bytes < 1
+        ):
+            raise TypeError("Recorder request memo requires its exact bounded key")
+        _require_function_producer(producer)
+        if type(dependencies) is not RecorderRequestTextDependencies or not dependencies.cacheable():
+            return producer(key)
+        with self._lock:
+            parent = self._text_parent if not self._closed else None
+        if parent is not None and parent._v4_preparation_owner is not None:
+            return parent.v4_recorder_request_text(key, dependencies, producer)
+        if self._v4_preparation_owner is None:
+            return producer(key)
+        cache_key = (producer, dependencies, key)
+        with self._lock:
+            hit = self._v4_recorder_requests.get(cache_key) if not self._closed else None
+            if hit is not None:
+                self._v4_recorder_requests.move_to_end(cache_key)
+                return hit.proof
+        value = producer(key)
+        if value is None:
+            return None
+        if (
+            type(value) is not RecorderRequestTextProof
+            or type(value.ref_document_json) is not str
+            or type(value.blocks) is not tuple
+            or any(
+                type(block) is not tuple or len(block) != 2 or type(block[0]) is not str or type(block[1]) is not str
+                for block in value.blocks
+            )
+        ):
+            raise TypeError("Recorder request memo requires exact immutable text proof")
+        bound = min(key.cache_bound_bytes, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+        remaining = bound - len(str(key.cache_bound_bytes))
+        for item in (
+            *cast(frozenset[str], dependencies.context_keys),
+            key.canonical,
+            value.ref_document_json,
+            *(part for block in value.blocks for part in block),
+        ):
+            if remaining < 0:
+                return value
+            remaining -= utf8_size(item, limit=remaining)
+        if remaining < 0:
+            return value
+        entry = _RecorderRequestTextEntry(value, bound - remaining)
+        with self._lock:
+            if self._closed:
+                return value
+            hit = self._v4_recorder_requests.get(cache_key)
+            if hit is not None:
+                self._v4_recorder_requests.move_to_end(cache_key)
+                return hit.proof
+            self._canonical_text = None
+            while (
+                self._canonical_proof_bytes
+                + self._canonical_verification_bytes
+                + self._recorder_block_hash_bytes
+                + self._v4_recorder_request_bytes
+                + entry.retained_bytes
+                > self._shared_text_budget_bytes
+            ):
+                if self._v4_recorder_requests:
+                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
+                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                elif self._canonical_verifications:
+                    _, evicted_size = self._canonical_verifications.popitem(last=False)
+                    self._canonical_verification_bytes -= evicted_size
+                elif self._canonical_proofs:
+                    _, evicted_proof = self._canonical_proofs.popitem(last=False)
+                    self._canonical_proof_bytes -= evicted_proof.retained_bytes
+                else:
+                    _, evicted_size = self._recorder_block_hashes.popitem(last=False)
+                    self._recorder_block_hash_bytes -= evicted_size
+            self._v4_recorder_requests[cache_key] = entry
+            self._v4_recorder_request_bytes += entry.retained_bytes
+        return value
 
     def recorder_request_text(
         self, key: RecorderRequestTextKey, producer: Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None]

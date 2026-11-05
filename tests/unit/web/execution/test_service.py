@@ -560,8 +560,7 @@ def _composition_state_record(
         id=uuid4(),
         session_id=session_id,
         version=1,
-        source=source if sources is None else next(iter(sources.values())),
-        sources=sources,
+        sources={"source": source} if sources is None else sources,
         nodes=[_with_resolved_model_choice(node) for node in nodes],
         edges=[],
         outputs=[

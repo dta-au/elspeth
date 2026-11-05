@@ -14,6 +14,7 @@ from sqlalchemy.engine import RootTransaction
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.sessions.continuation import PreparedContinuationAppend, StoredContinuationSnapshot, load_snapshot
+from elspeth.web.sessions.continuation_checkpoint_early_source import read_checkpoint_early_input_for_hold_on_connection
 from elspeth.web.sessions.continuation_checkpoint_no_sdk_tail import (
     CheckpointNoSdkTailBatch,
     CheckpointNoSdkTailPlan,
@@ -163,6 +164,7 @@ def admit_v4_checkpoint_paid_tail_on_connection(
             creator_sequence=plan.creator_sequence,
             requested_model=hold_plan.no_sdk.requested_model,
             historical_contract_sha256=source.fallback_contract_sha256,
+            early_input=read_checkpoint_early_input_for_hold_on_connection(conn, source=source),
         )
         != hold_plan
     ):
@@ -407,6 +409,7 @@ def admit_v4_checkpoint_no_sdk_tail_on_connection(
             creator_sequence=plan.creator_sequence,
             requested_model=plan.requested_model,
             historical_contract_sha256=source.fallback_contract_sha256,
+            early_input=read_checkpoint_early_input_for_hold_on_connection(conn, source=source),
         )
         != hold_plan
     ):

@@ -11,7 +11,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -28,8 +29,10 @@ from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_message_family_builders import capture_tool_result_recipe
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_preview_observation import decode_preview_data
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.continuation_tool_batch import decode_tool_result_value
 from elspeth.web.composer.discovery_response import admit_discovery_result
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.database_clock import database_now
@@ -38,6 +41,7 @@ from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.required_executor import RequiredInvocationWitness
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource
+from elspeth.web.sessions import continuation as continuation_sql
 from elspeth.web.sessions import continuation_composition_initialization as composition_initialization_sql
 from elspeth.web.sessions import continuation_prepared_tail as prepared_tail
 from elspeth.web.sessions import continuation_preview_result as preview_result
@@ -50,6 +54,8 @@ from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cu
 from elspeth.web.sessions.continuation_p4 import decode_p4_receipt
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import chat_messages_table as messages
+from elspeth.web.sessions.models import composer_async_operations_table as operations
 from elspeth.web.sessions.models import composer_continuation_chunks_table as retained_chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
@@ -58,6 +64,7 @@ from elspeth.web.sessions.models import composer_segment_attempts_table as segme
 from elspeth.web.sessions.models import composer_validation_terminal_holds_table as holds
 from elspeth.web.sessions.models import composition_states_table as states
 from elspeth.web.sessions.models import quota_provider_attempts_table as provider_attempts
+from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.time_normalization import restore_utc
 from tests.helpers.continuation_end_profile import EndPreparationProfile
@@ -291,6 +298,7 @@ async def actual_preview_case(
     base_state_data: CompositionStateData | None = None,
     available_plugins: frozenset[PluginId] | None = None,
     prior_operation_id: str | None = None,
+    retained_payload_bytes: int = 16 * 1_048_576,
 ):
     actual_work = initialization_fixture.inventory_work
 
@@ -323,7 +331,7 @@ async def actual_preview_case(
     monkeypatch.setattr(initialization_fixture, "inventory_work", timed_work)
     prepared_case = (
         _v4_tool_case(store, tmp_path, monkeypatch, tool="preview_pipeline", arguments={})
-        if base_state_data is None and available_plugins is None and prior_operation_id is None
+        if base_state_data is None and available_plugins is None and prior_operation_id is None and retained_payload_bytes == 16 * 1_048_576
         else _v4_tool_case(
             store,
             tmp_path,
@@ -333,6 +341,7 @@ async def actual_preview_case(
             base_state_data=base_state_data,
             available_plugins=available_plugins,
             prior_operation_id=prior_operation_id,
+            retained_payload_bytes=retained_payload_bytes,
         )
     )
     async with prepared_case as case:
@@ -879,3 +888,394 @@ async def test_actual_nonempty_preview_preserves_provider_authored_base_and_cold
         assert not output_path.exists()
     assert probe.facts["registered_calls"] == 1
     assert all(probe.facts["controls"].values()) and not probe.profile.errors
+
+
+@pytest.mark.asyncio
+async def test_actual_preview_complete_raw_result_full_tail_capacity_refuses_atomically(
+    operation_store, tmp_path, monkeypatch, record_property
+):
+    """A fresh immutable cap must pass real preparation before native refusal."""
+    from elspeth.web.composer.continuation_codec import PrivateChunk
+
+    cap = 4 * 1_048_576
+    blob = await _uploaded_source(operation_store)
+    output_path = Path(operation_store[3]._data_dir) / "outputs" / str(operation_store[4]) / "original-model-output.json"
+    with monkeypatch.context() as author_patch:
+        async with _v4_tool_case(
+            operation_store,
+            tmp_path,
+            author_patch,
+            tool="set_pipeline",
+            arguments=pipeline_arguments(blob, output_path),
+            available_plugins=_PIPELINE_PLUGINS,
+        ) as (store, author, author_running, author_sdk):
+            await phases._advance(author)
+            assert author.latest_snapshot is not None and len(author_sdk) == 1
+            with store[0].connect() as conn:
+                row = conn.execute(
+                    select(states).where(states.c.session_id == str(store[4])).order_by(states.c.version.desc()).limit(1)
+                ).one()
+            saved = store[3]._row_to_state_record(row)
+            assert saved.sources is not None and saved.sources["source"]["options"]["blob_ref"] == str(blob.id)
+            base = CompositionStateData(
+                sources=saved.sources,
+                nodes=saved.nodes,
+                edges=saved.edges,
+                outputs=saved.outputs,
+                metadata_=saved.metadata_,
+                is_valid=saved.is_valid,
+                validation_errors=saved.validation_errors,
+                composer_meta=saved.composer_meta,
+            )
+            cancelled = author.authority.request_cancel(session_id=store[4], operation_id=author_running.claim.operation_id)
+            assert cancelled is not None
+            first = author.authority.settle_continuation_owner(
+                author_running, outcome=request_cancelled_error(request_id=cancelled.request_id)
+            )
+            assert first.status == "failed" and first.failure_code == "request_cancelled"
+            first_context = author_running.session_operation_context
+        assert author.lease.closed
+
+    capacity_records = []
+    capacity_failures = []
+    returned = []
+    preflights = []
+    original_stage = ["bootstrap_primary"]
+    actual_produce = preview.produce_original_preview
+    actual_bind = preview.bind_issued_preview_dispatch_on_connection
+    actual_preflight = ComposerPreflight.cached_runtime_preflight
+    issued_selections = []
+
+    def observe_bound(conn, running, **kwargs):
+        permit = actual_bind(conn, running, **kwargs)
+        issued_selections.append(kwargs["selected"])
+        return permit
+
+    def observe_produced(permit):
+        value = actual_produce(permit)
+        assert type(value.returned) is preview_result.CompletePreviewReturn
+        assert value.returned.original.result.success
+        assert value.returned.chunk.reference.byte_length <= 1_048_576
+        assert not capacity_failures
+        returned.append(value)
+        original_stage[0] = "returned_original"
+        return value
+
+    async def observe_preflight(preflight, state, **kwargs):
+        original_stage[0] = "original_preflight"
+        value = await actual_preflight(preflight, state, **kwargs)
+        preflights.append(value)
+        return value
+
+    def measure_capacity(original, kind):
+        @wraps(original)
+        def observed(conn, *, session_id, operation_id, prospective, retained_payload_limit_bytes, **kwargs):
+            fact = None
+            if session_id == str(operation_store[4]) and operation_id != first.operation_id:
+                assert retained_payload_limit_bytes == cap and conn.dialect.name == "sqlite"
+                stored = conn.execute(
+                    select(retained_chunks.c.chunk_key, func.length(retained_chunks.c.payload)).where(
+                        retained_chunks.c.session_id == session_id, retained_chunks.c.operation_id == operation_id
+                    )
+                ).all()
+                existing = {row[0] for row in stored}
+                candidates = {}
+                for candidate in prospective:
+                    assert candidate.key not in candidates or candidates[candidate.key] == candidate
+                    candidates[candidate.key] = candidate
+                live_holds = 0
+                for table in (holds, provider_holds):
+                    live_holds += conn.execute(
+                        select(func.coalesce(func.sum(table.c.reserved_bytes), 0)).where(
+                            table.c.session_id == session_id, table.c.operation_id == operation_id, table.c.state == "active"
+                        )
+                    ).scalar_one()
+                credit = preview_result.preview_returned_credit_on_connection(conn, session_id=session_id, operation_id=operation_id)
+                provider_credit = 0
+                consuming = kwargs.get("consuming_hold")
+                if consuming is not None:
+                    assert credit == 0 and (consuming.session_id, consuming.operation_id) == (session_id, operation_id)
+                    provider_credit = consuming.reserved_bytes
+                    credit = provider_credit
+                used = sum(row[1] for row in stored)
+                added = sum(len(candidate.payload) for key, candidate in candidates.items() if key not in existing)
+                new_hold = kwargs.get("_new_hold_bytes", 0)
+                fact = {
+                    "kind": kind,
+                    "operation_id": operation_id,
+                    "stage": original_stage[0],
+                    "used": used,
+                    "live_holds": live_holds,
+                    "source_credit": credit,
+                    "provider_credit": provider_credit,
+                    "new_hold": new_hold,
+                    "added": added,
+                    "observed_bytes": used + live_holds - credit + new_hold + added,
+                    "limit_bytes": retained_payload_limit_bytes,
+                }
+                capacity_records.append(fact)
+            try:
+                value = original(
+                    conn,
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    prospective=prospective,
+                    retained_payload_limit_bytes=retained_payload_limit_bytes,
+                    **kwargs,
+                )
+            except BaseException as original_error:
+                if fact is not None:
+                    fact["outcome"] = "raised"
+                    capacity_failures.append((fact, original_error))
+                    if kind == "complete_tail_prefix" and len(returned) == 1:
+                        source = returned[0].returned.original.source
+                        head = continuation_sql.load_snapshot(conn, session_id=source.session_id, operation_id=source.operation_id)
+                        assert head.cursor == source.cursor + 1
+                        issued = conn.execute(
+                            select(effects).where(
+                                effects.c.session_id == source.session_id,
+                                effects.c.operation_id == source.operation_id,
+                                effects.c.effect_key == f"tool:{source.response.digest}:{source.tool_index}",
+                            )
+                        ).one()
+                        assert issued.disposition == "dispatched" and issued.result_chunk_key is issued.receipt_key is None
+                        assert not conn.execute(
+                            select(effects).where(
+                                effects.c.session_id == source.session_id,
+                                effects.c.operation_id == source.operation_id,
+                                effects.c.effect_key == f"batch:{source.response.digest}:p4",
+                            )
+                        ).all()
+                raise
+            if fact is not None:
+                fact["outcome"] = "returned"
+            return value
+
+        return observed
+
+    with monkeypatch.context() as observed:
+        for module, kind in (
+            (continuation_sql, "persistence"),
+            (retained_capacity, "provider_or_preview_hold"),
+            (prepared_tail, "complete_tail_prefix"),
+        ):
+            observed.setattr(module, "admit_retained_payload_chunks", measure_capacity(module.admit_retained_payload_chunks, kind))
+        observed.setattr(preview, "produce_original_preview", observe_produced)
+        observed.setattr(preview, "bind_issued_preview_dispatch_on_connection", observe_bound)
+        observed.setattr(ComposerPreflight, "cached_runtime_preflight", observe_preflight)
+        try:
+            async with actual_preview_case(
+                operation_store,
+                tmp_path,
+                monkeypatch,
+                base_state_data=base,
+                available_plugins=_PIPELINE_PLUGINS,
+                prior_operation_id=first.operation_id,
+                retained_payload_bytes=cap,
+            ) as (store, owner, running, sdk):
+                assert capacity_records and {fact["operation_id"] for fact in capacity_records} == {running.claim.operation_id}
+                assert any(fact["used"] == 0 for fact in capacity_records)
+                assert any(fact["new_hold"] > 0 for fact in capacity_records)
+                assert any(fact["provider_credit"] > 0 for fact in capacity_records)
+                assert all(fact["outcome"] == "returned" and fact["observed_bytes"] <= cap for fact in capacity_records)
+                runtime = owner.runtime
+                assert runtime is not None
+                initial_root = runtime.source.selected.stack
+                assert (
+                    decode_continuation_policy(initial_root.admission_policy_json, initial_root.policy_hash).max_retained_payload_bytes
+                    == cap
+                )
+                before_state = runtime.live.state.to_dict()
+                before_guards = guard_checks(store[0])
+                assert len(before_guards) == 2
+                assert {(row["operation_id"], row["operation_epoch"]) for row in before_guards} == {
+                    (first_context.fence.operation_id, first_context.fence.operation_epoch),
+                    (running.session_operation_context.fence.operation_id, running.session_operation_context.fence.operation_epoch),
+                }
+                with store[0].connect() as conn:
+                    before_states = conn.execute(select(states).where(states.c.session_id == str(store[4]))).all()
+                    before_messages = conn.execute(select(messages).where(messages.c.session_id == str(store[4]))).all()
+                    before_usage = conn.execute(select(usage)).all()
+                    before_physical = conn.execute(select(provider_attempts).where(provider_attempts.c.session_id == str(store[4]))).all()
+                assert len(before_physical) == 2 and all(
+                    row.settled_at is not None and row.ledger_entry_id is not None for row in before_physical
+                )
+                original_stage[0] = "preview_issue"
+                await phases._advance(owner)
+                assert len(returned) == 1
+                produced = returned[0]
+                complete = produced.returned
+                assert type(complete) is preview_result.CompletePreviewReturn
+                assert complete.original.result.updated_state.to_dict() == before_state
+                assert any(complete.original.strict is verdict for verdict in preflights)
+                prefixes = [fact for fact in capacity_records if fact["kind"] == "complete_tail_prefix"]
+                assert len(prefixes) == 2
+                assert prefixes[0]["outcome"] == "returned" and prefixes[0]["observed_bytes"] <= cap
+                assert prefixes[1]["outcome"] == "raised" and prefixes[1]["observed_bytes"] > cap
+                assert len(capacity_failures) == 1 and capacity_failures[0][0] is prefixes[1]
+                original_excess = capacity_failures[0][1]
+                assert type(original_excess) is retained_capacity.ContinuationRetainedCapacityExceeded
+                assert original_excess.limit_bytes == cap and original_excess.observed_bytes == prefixes[1]["observed_bytes"]
+                assert prefixes[1]["used"] + complete.chunk.reference.byte_length + prefixes[1]["live_holds"] <= cap
+                terminal = owner.preview_terminal
+                assert type(terminal) is preview_result.PreviewValidationIncompleteTerminal
+                assert owner.runtime is owner.primary is owner.p4 is owner.finished_batch is None
+                assert owner.latest_snapshot == terminal.snapshot
+                receipt = terminal.receipt
+                assert type(receipt) is preview_result.PreviewTailIncompleteReceipt
+                assert receipt.source == complete.original.source and receipt.original_result == complete.chunk.reference
+                assert receipt.reason == "complete_preview_tail_exceeds_limit" and receipt.surface == "retained_history"
+                assert receipt.limit == cap and receipt.observed_at_least == cap + 1 and receipt.measurement == "lower_bound"
+                assert receipt.additional_provider_calls == 0 and receipt.additional_provider_cost_usd == "0"
+                assert not receipt.missing_result_used and not receipt.automatic_retry_allowed
+                assert terminal.error.error_type == "validation_incomplete"
+                assert terminal.error.body == {"error_type": "validation_incomplete", "reason": "preview_tail_capacity_exceeded"}
+                final_root = decode_continuation_snapshot(terminal.snapshot.payload_json)
+                assert len(issued_selections) == 1
+                issued_root = issued_selections[0].stack
+                # Original argument/recorder preparation is retained before
+                # issue. Terminal must preserve that complete actual capture.
+                assert issued_root.cursor == receipt.source.cursor + 1 == initial_root.cursor + 1
+                assert final_root.frames == issued_root.frames
+                assert issued_root.frames[0].state == initial_root.frames[0].state
+                assert final_root.provider_cost_policy == issued_root.provider_cost_policy == initial_root.provider_cost_policy
+                assert final_root.admission_policy_json == initial_root.admission_policy_json
+                source = receipt.source
+                effect_key = f"tool:{source.response.digest}:{source.tool_index}"
+                with store[0].connect() as conn:
+                    assert preview_result._issued_root_on_connection(conn, source) == issued_root
+                    current_effects = conn.execute(
+                        select(effects).where(effects.c.session_id == source.session_id, effects.c.operation_id == source.operation_id)
+                    ).all()
+                    hold = conn.execute(
+                        select(holds).where(holds.c.session_id == source.session_id, holds.c.operation_id == source.operation_id)
+                    ).one()
+                    parent = conn.execute(
+                        select(operations).where(
+                            operations.c.session_id == source.session_id, operations.c.operation_id == source.operation_id
+                        )
+                    ).one()
+                    assert conn.execute(select(states).where(states.c.session_id == str(store[4]))).all() == before_states
+                    assert conn.execute(select(messages).where(messages.c.session_id == str(store[4]))).all() == before_messages
+                    assert conn.execute(select(usage)).all() == before_usage
+                    assert (
+                        conn.execute(select(provider_attempts).where(provider_attempts.c.session_id == str(store[4]))).all()
+                        == before_physical
+                    )
+                    raw = continuation_sql.read_chunk(
+                        conn,
+                        session_id=source.session_id,
+                        operation_id=source.operation_id,
+                        key=continuation_sql.private_chunk_key(complete.chunk),
+                    ).decode("utf-8", errors="strict")
+                assert raw == complete.chunk.canonical
+                retained = decode_preview_data(
+                    PrivateChunk(complete.chunk.reference, raw), expected_source=source, env_ref_names=terminal.env_ref_names
+                )
+                assert retained == complete.original.data
+                forensic = decode_tool_result_value(retained.result, env_ref_names=terminal.env_ref_names)
+                assert forensic.runtime_preflight == complete.original.strict and forensic.updated_state.to_dict() == before_state
+                assert hold.state == "consumed" and hold.consumed_at is not None
+                assert parent.status == "failed" and parent.checkpoint_id == terminal.snapshot.checkpoint_id
+                assert [(row.effect_key, row.disposition) for row in current_effects if row.owner == "tool_dispatch"] == [
+                    (effect_key, "validation_incomplete")
+                ]
+                assert all(row.effect_key != f"batch:{source.response.digest}:p4" for row in current_effects)
+
+                def forbidden(*args, **kwargs):
+                    raise AssertionError("terminal/cold preview retried original work or used missing P4 evidence")
+
+                observed.setattr(preview, "execute_tool", forbidden)
+                observed.setattr(ComposerPreflight, "cached_runtime_preflight", forbidden)
+                before_cold = stored_rows(store[0])
+                with store[0].connect() as conn:
+                    cold = preview_result.read_preview_validation_incomplete_on_connection(
+                        conn,
+                        session_id=source.session_id,
+                        operation_id=source.operation_id,
+                        effect_key=effect_key,
+                        env_ref_names=terminal.env_ref_names,
+                    )
+                assert cold == terminal and stored_rows(store[0]) == before_cold
+                terminal_values = {
+                    "status": parent.status,
+                    "failure_code": parent.failure_code,
+                    "result_schema": parent.result_schema,
+                    "result_json": parent.result_json,
+                    "result_sha256": parent.result_sha256,
+                }
+                # The existing pure decoder validates values only. The
+                # positive above already proves the actual terminal source.
+                assert preview_result._decode_preview_terminal_error(**terminal_values) == terminal.error
+                for mutation, message in (
+                    ({"result_schema": "message_with_state.v1"}, "sealed failed parent result"),
+                    ({"result_sha256": "0" * 64}, "canonical terminal error or digest"),
+                    ({"result_json": json.dumps(terminal.error.model_dump(mode="json"), indent=2)}, "canonical terminal error or digest"),
+                    ({"failure_code": "request_cancelled"}, "canonical terminal error or digest"),
+                ):
+                    with pytest.raises(AuditIntegrityError, match=message):
+                        preview_result._decode_preview_terminal_error(**{**terminal_values, **mutation})
+                changed_error = terminal.error.model_copy(
+                    update={"body": {"error_type": "validation_incomplete", "reason": "foreign complete result"}}
+                )
+                changed_json = canonical_json(changed_error.model_dump(mode="json"))
+                # A correctly encoded other body is valid DATA, not proof of
+                # this original terminal. Its substitution is storage-refused
+                # below; no fake connection lets it reach the cold comparator.
+                assert (
+                    preview_result._decode_preview_terminal_error(
+                        **{
+                            **terminal_values,
+                            "result_json": changed_json,
+                            "result_sha256": preview_result.composer_operation_result_hash(changed_json),
+                        }
+                    )
+                    == changed_error
+                )
+                with store[0].connect() as conn:
+                    before_holds = tuple(
+                        tuple(conn.execute(select(table).where(table.c.session_id == source.session_id)).all())
+                        for table in (holds, provider_holds)
+                    )
+                # The actual named transition trigger forbids EVERY update
+                # of an already failed parent. Exercise that storage boundary
+                # for all four original mutations, without disabling it.
+                for mutation in (
+                    {"result_sha256": "0" * 64},
+                    {"result_json": changed_json, "result_sha256": preview_result.composer_operation_result_hash(changed_json)},
+                    {"result_json": json.dumps(terminal.error.model_dump(mode="json"), indent=2)},
+                    {"failure_code": "request_cancelled"},
+                ):
+                    with store[0].connect() as conn:
+                        rollback = conn.begin_nested()
+                        try:
+                            with pytest.raises(IntegrityError, match="composer operation immutable transition") as refused:
+                                conn.execute(
+                                    update(operations)
+                                    .where(operations.c.session_id == source.session_id, operations.c.operation_id == source.operation_id)
+                                    .values(**mutation)
+                                )
+                            assert refused.value.orig.args == ("composer operation immutable transition",)
+                        finally:
+                            rollback.rollback()
+                        assert (
+                            tuple(
+                                tuple(conn.execute(select(table).where(table.c.session_id == source.session_id)).all())
+                                for table in (holds, provider_holds)
+                            )
+                            == before_holds
+                        )
+                        assert conn.execute(select(states).where(states.c.session_id == str(store[4]))).all() == before_states
+                        unchanged = preview_result.read_preview_validation_incomplete_on_connection(
+                            conn,
+                            session_id=source.session_id,
+                            operation_id=source.operation_id,
+                            effect_key=effect_key,
+                            env_ref_names=terminal.env_ref_names,
+                        )
+                        assert unchanged == terminal
+                    assert stored_rows(store[0]) == before_cold
+                assert len(sdk) == len(author_sdk) == 1 and guard_checks(store[0]) == before_guards
+                assert not output_path.exists()
+        finally:
+            record_property("preview_actual_tail_capacity", json.dumps(capacity_records, sort_keys=True))

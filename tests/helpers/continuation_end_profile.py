@@ -14,7 +14,7 @@ from contextvars import ContextVar
 from functools import wraps
 from hashlib import sha256
 from pathlib import Path
-from types import MethodType
+from types import CodeType, MethodType
 from typing import Any
 from weakref import WeakKeyDictionary
 
@@ -29,7 +29,7 @@ class EndTextMemoObservation:
     these observations never authorize cache hits or product behavior.
     """
 
-    families = ("full", "canonical", "block")
+    families = ("full", "canonical", "block", "request")
 
     def __init__(self, *, max_fingerprints: int = 1024) -> None:
         self.max_fingerprints = max_fingerprints
@@ -61,22 +61,28 @@ class EndTextMemoObservation:
 
     def _state(self, memo, family, cache_key):
         with memo._lock:
-            entries = (memo._canonical_proofs, memo._canonical_verifications, memo._recorder_block_hashes)
-            weights = (memo._canonical_proof_bytes, memo._canonical_verification_bytes, memo._recorder_block_hash_bytes)
+            entries = (memo._canonical_proofs, memo._canonical_verifications, memo._recorder_block_hashes, memo._v4_recorder_requests)
+            weights = (
+                memo._canonical_proof_bytes,
+                memo._canonical_verification_bytes,
+                memo._recorder_block_hash_bytes,
+                memo._v4_recorder_request_bytes,
+            )
             selected = entries[self.families.index(family)]
             hit = cache_key in selected
             value = selected[cache_key] if hit else None
-            weight = value.retained_bytes if hit and family == "full" else (value if hit else 0)
+            weight = value.retained_bytes if hit and family in {"full", "request"} else (value if hit else 0)
             return hit, weight, tuple(len(items) for items in entries), weights, memo._shared_text_budget_bytes, not memo._closed
 
     def _observe(self, memo, family, key, producer, digest_producer, operation):
         if memo._v4_preparation_owner is None:
             return operation()
         before_ns = time.monotonic_ns()
-        cache_key = (producer, digest_producer, key) if family == "full" else (producer, key)
+        cache_key = (producer, digest_producer, key) if family in {"full", "request"} else (producer, key)
         try:
             before = self._state(memo, family, cache_key)
-            fingerprint = (family, id(producer), id(digest_producer), hash(key))
+            dependency_fingerprint = hash(digest_producer) if family == "request" else id(digest_producer)
+            fingerprint = (family, id(producer), dependency_fingerprint, hash(key))
             with self._lock:
                 ordinal = self._parents.get(memo)
                 if ordinal is None:
@@ -136,11 +142,12 @@ class EndTextMemoObservation:
 
     @contextmanager
     def install(self, monkeypatch):
-        from elspeth.web.continuation_retention_memo import RetentionStageMemo
+        from elspeth.web.continuation_retention_memo import RecorderRequestTextDependencies, RetentionStageMemo
 
         original_full = RetentionStageMemo.canonical_text_proof
         original_canonical = RetentionStageMemo.canonical_text_verification
         original_block = RetentionStageMemo.recorder_block_hash
+        original_request = RetentionStageMemo.v4_recorder_request_text
         original_close = RetentionStageMemo.close
 
         def full(memo, key, producer, digest_producer):
@@ -151,6 +158,11 @@ class EndTextMemoObservation:
 
         def block(memo, key, producer):
             return self._observe(memo, "block", key, producer, None, lambda: original_block(memo, key, producer))
+
+        def request(memo, key, dependencies, producer):
+            if type(dependencies) is not RecorderRequestTextDependencies or not dependencies.cacheable():
+                return original_request(memo, key, dependencies, producer)
+            return self._observe(memo, "request", key, producer, dependencies, lambda: original_request(memo, key, dependencies, producer))
 
         def close(memo):
             original_close(memo)
@@ -163,6 +175,7 @@ class EndTextMemoObservation:
             patch.setattr(RetentionStageMemo, "canonical_text_proof", full)
             patch.setattr(RetentionStageMemo, "canonical_text_verification", canonical)
             patch.setattr(RetentionStageMemo, "recorder_block_hash", block)
+            patch.setattr(RetentionStageMemo, "v4_recorder_request_text", request)
             patch.setattr(RetentionStageMemo, "close", close)
             yield self
 
@@ -185,9 +198,11 @@ class EndTextMemoObservation:
 
 
 class EndPreparationProfile:
+    FIRST_CAPTURE_PARENT = "elspeth.web.composer.continuation_checkpoint_end_physical.capture_continuation_runtime_owners"
+
     def __init__(self, *, enabled: bool, cpu_profile: bool = False, cpu_selection: str = "all_workers") -> None:
-        if cpu_selection not in {"all_workers", "checkpoint_source"}:
-            raise ValueError("CPU selection must be all_workers or checkpoint_source")
+        if cpu_selection not in {"all_workers", "checkpoint_source", "first_capture"}:
+            raise ValueError("CPU selection must be all_workers, checkpoint_source or first_capture")
         self.enabled = enabled
         self.cpu_profile = cpu_profile
         self.cpu_selection = cpu_selection
@@ -205,6 +220,7 @@ class EndPreparationProfile:
         self._closed_clocks: dict[int, int] = {}
         self._end_exits: dict[int, dict[str, Any]] = {}
         self._cpu_profiles: list[tuple[dict[str, Any], Any]] = []
+        self._first_capture_clocks: set[int] = set()
         self.installed = False
         self.text_memo: EndTextMemoObservation | None = None
         self.text_memo_budget_bytes: int | None = None
@@ -390,6 +406,11 @@ class EndPreparationProfile:
             yield
 
     def _profile_worker[T](self, row: dict[str, Any], original: Callable[[], T]) -> T:
+        with self._worker_cpu_capture(row):
+            return original()
+
+    @contextmanager
+    def _worker_cpu_capture(self, row: dict[str, Any]) -> Iterator[None]:
         import cProfile
 
         previous_hook = sys.getprofile()
@@ -397,12 +418,14 @@ class EndPreparationProfile:
         if previous_hook is not None:
             row["cprofile_refused"] = "existing thread profile hook"
             self.errors.append("worker CPU profile refused an existing thread hook")
-            return original()
+            yield
+            return
         tool = sys.monitoring.PROFILER_ID
         if sys.monitoring.get_tool(tool) is not None:
             row["cprofile_refused"] = "existing monitoring profiler slot"
             self.errors.append("worker CPU profile refused an existing monitoring profiler slot")
-            return original()
+            yield
+            return
         owner = threading.get_ident()
 
         class WorkerProfile(cProfile.Profile):
@@ -435,13 +458,14 @@ class EndPreparationProfile:
         except Exception as setup_error:
             row["cprofile_refused"] = "setup failed: " + type(setup_error).__name__
             self.errors.append("worker CPU profile setup failed")
-            return original()
+            yield
+            return
         hook_after_enable = sys.getprofile()
         row["cprofile_legacy_hook_after_enable"] = None if hook_after_enable is None else id(hook_after_enable)
         row["cprofile_monitoring_after_enable"] = sys.monitoring.get_tool(tool)
         row["cprofile_monitoring_events_after_enable"] = sys.monitoring.get_events(tool)
         try:
-            return original()
+            yield
         finally:
             # disable owns the monitoring slot; sys.getprofile is the separate
             # legacy hook and remains unchanged by cProfile on this runtime.
@@ -482,6 +506,44 @@ class EndPreparationProfile:
                     row["cprofile_method_span"] = selected_row["id"]
                     return self._profile_worker(row, lambda: original(service, prepared=prepared))
             return original(service, prepared=prepared)
+
+        return selected
+
+    def _first_capture_scope_observer(self, original_scope, capture_code: CodeType, module: str):
+        @contextmanager
+        @wraps(original_scope)
+        def selected(*args, **kwargs):
+            with self._lock:
+                row = self._workers.get(threading.get_native_id())
+                submission = None if row is None else self.records[row["submission"]]
+                eligible = (
+                    self.cpu_profile
+                    and self.cpu_selection == "first_capture"
+                    and row is not None
+                    and row["clock"] in self._end_clocks
+                    and row["clock"] not in self._closed_clocks
+                    and row["clock"] not in self._end_exits
+                    and row["clock"] not in self._first_capture_clocks
+                    and submission is not None
+                    and any(self.records[parent]["label"] == self.FIRST_CAPTURE_PARENT for parent in submission["parents"])
+                )
+                if eligible:
+                    self._first_capture_clocks.add(row["clock"])
+            if eligible:
+                row["cprofile_selected_method"] = {
+                    "module": module,
+                    "qualname": capture_code.co_qualname,
+                    "file": capture_code.co_filename,
+                    "line": capture_code.co_firstlineno,
+                }
+                row["cprofile_scope"] = "original_first_capture_scope"
+                with self.span("cprofile.selected_capture_scope") as selected_row:
+                    row["cprofile_method_span"] = selected_row["id"]
+                    with self._worker_cpu_capture(row), original_scope(*args, **kwargs) as memo:
+                        yield memo
+            else:
+                with original_scope(*args, **kwargs) as memo:
+                    yield memo
 
         return selected
 
@@ -533,6 +595,12 @@ class EndPreparationProfile:
         original_provider_input = provider_input.prepare_provider_input
         original_finish = ContinuationActionClock.finish_preparation
         original_end = shared.execute_continuation_end_review
+        original_capture_scope = runtime.borrow_v4_preparation_memo_scope
+        capture_codes = [
+            value
+            for value in runtime.capture_continuation_runtime_owners.__code__.co_consts
+            if type(value) is CodeType and value.co_name == "capture"
+        ]
 
         async def end_entry(phases, selected):
             with self.end_entry(phases.action_clock):
@@ -599,6 +667,17 @@ class EndPreparationProfile:
             owned.setattr(ContinuationLivePhases, "bind_action_clock", bind)
             owned.setattr(ContinuationActionClock, "finish_preparation", finish)
             owned.setattr(shared, "execute_continuation_end_review", end_entry)
+            if self.cpu_selection == "first_capture":
+                if len(capture_codes) != 1:
+                    self.errors.append("CPU capture could not identify the original registered capture code")
+                else:
+                    owned.setattr(
+                        runtime,
+                        "borrow_v4_preparation_memo_scope",
+                        self._first_capture_scope_observer(
+                            original_capture_scope, capture_codes[0], runtime.capture_continuation_runtime_owners.__module__
+                        ),
+                    )
             for target, name, original in synchronous:
                 owned.setattr(target, name, self.sync(target.__name__ + "." + name, original))
             for target, name, original in asynchronous:
@@ -678,7 +757,11 @@ class EndPreparationProfile:
                     "selected_method": row.get("cprofile_selected_method"),
                     "selected_method_span": row.get("cprofile_method_span"),
                     "scope": (
-                        "original selected method body in original worker; gate excluded; "
+                        "original first physical capture memo scope in original worker; queue and gate excluded; "
+                        "initial capture Python frame entry excluded; both authority reads and _capture_owners included; "
+                        "cProfile overhead included; complete library/builtin/caller stats"
+                        if row.get("cprofile_scope") == "original_first_capture_scope"
+                        else "original selected method body in original worker; gate excluded; "
                         "cProfile overhead included; complete library/builtin/caller stats"
                         if row.get("cprofile_scope") == "original_selected_method_body"
                         else "original worker including gate; cProfile overhead included; complete library/builtin/caller stats"
@@ -722,6 +805,8 @@ class EndPreparationProfile:
                     cpu_issues.append("CPU capture has no expected original END workers")
                     if self.cpu_selection == "checkpoint_source":
                         cpu_issues.append("CPU capture did not reach the original selected checkpoint-source method")
+                    elif self.cpu_selection == "first_capture":
+                        cpu_issues.append("CPU capture did not reach the original first physical capture scope")
                 if missing_cpu:
                     cpu_issues.append("CPU capture is missing expected original END workers")
                 if any(not profile["within_preparation_window"] for profile in cpu_profiles):

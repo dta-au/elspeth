@@ -20,7 +20,8 @@ from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperatio
 from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.state_envelope import envelope_state_column
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import stored_default_pipeline_metadata
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
+from tests.helpers.run_terminal_checks import run_values
 from tests.unit.web.composer.test_tools import (
     _STUB_SHA256,
     _attached_notes,
@@ -821,32 +822,40 @@ class TestDeleteBlobActiveRunGuard:
         with self.engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=self.session_id,
-                    version=1,
-                    source=None,
-                    nodes=None,
-                    edges=None,
-                    outputs=None,
-                    metadata_=stored_default_pipeline_metadata(),
-                    is_valid=False,
-                    validation_errors=None,
-                    # Plan §2294: composer-tools test fixture; provenance
-                    # required for setup row supporting subsequent runs/
-                    # blob_run_links FKs.
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        id=state_id,
+                        session_id=self.session_id,
+                        version=1,
+                        sources=None,
+                        nodes=None,
+                        edges=None,
+                        outputs=None,
+                        metadata_=stored_default_pipeline_metadata(),
+                        is_valid=False,
+                        validation_errors=None,
+                        # Plan §2294: composer-tools test fixture; provenance
+                        # required for setup row supporting subsequent runs/
+                        # blob_run_links FKs.
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
             conn.execute(
                 runs_table.insert().values(
-                    id=self.run_id,
-                    session_id=self.session_id,
-                    state_id=state_id,
-                    status=status,
-                    started_at=now,
-                    rows_processed=0,
-                    rows_failed=0,
+                    {
+                        **run_values(
+                            self.session_id,
+                            state_id,
+                            status=status,
+                            error=None,
+                            landscape_run_id=str(uuid4()) if status == "completed" else None,
+                        ),
+                        "id": self.run_id,
+                        "started_at": now,
+                        "rows_processed": 0,
+                        "rows_failed": 0,
+                    }
                 )
             )
             conn.execute(
@@ -896,40 +905,47 @@ class TestDeleteBlobActiveRunGuard:
         with self.engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=self.session_id,
-                    version=1,
-                    # Production shape, not the pre-2026-05 one. Since
-                    # f0fd36087 every writer folds `source` into
-                    # `sources={"source": ...}` and wraps each JSON column
-                    # through the one envelope rule, so the active-run guard
-                    # this fixture pins must be exercised against that shape --
-                    # seeding a populated, bare `source` is what let
-                    # elspeth-3db5745ba7 stay green while production 500'd.
-                    source=None,
-                    sources=envelope_state_column({"source": source}),
-                    nodes=envelope_state_column([]),
-                    edges=envelope_state_column([]),
-                    outputs=envelope_state_column([]),
-                    metadata_=envelope_state_column({"name": "Test", "description": ""}),
-                    is_valid=False,
-                    validation_errors=None,
-                    # Plan §2294: composer-tools test fixture; provenance
-                    # required for setup row supporting subsequent runs/
-                    # blob_run_links FKs.
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        id=state_id,
+                        session_id=self.session_id,
+                        version=1,
+                        # Production shape, not the pre-2026-05 one. Since
+                        # f0fd36087 every writer folds `source` into
+                        # `sources={"source": ...}` and wraps each JSON column
+                        # through the one envelope rule, so the active-run guard
+                        # this fixture pins must be exercised against that shape --
+                        # seeding a populated, bare `source` is what let
+                        # elspeth-3db5745ba7 stay green while production 500'd.
+                        sources=envelope_state_column({"source": source}),
+                        nodes=envelope_state_column([]),
+                        edges=envelope_state_column([]),
+                        outputs=envelope_state_column([]),
+                        metadata_=envelope_state_column({"name": "Test", "description": ""}),
+                        is_valid=False,
+                        validation_errors=None,
+                        # Plan §2294: composer-tools test fixture; provenance
+                        # required for setup row supporting subsequent runs/
+                        # blob_run_links FKs.
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
             conn.execute(
                 runs_table.insert().values(
-                    id=self.run_id,
-                    session_id=self.session_id,
-                    state_id=state_id,
-                    status=status,
-                    started_at=now,
-                    rows_processed=0,
-                    rows_failed=0,
+                    {
+                        **run_values(
+                            self.session_id,
+                            state_id,
+                            status=status,
+                            error=None,
+                            landscape_run_id=str(uuid4()) if status == "completed" else None,
+                        ),
+                        "id": self.run_id,
+                        "started_at": now,
+                        "rows_processed": 0,
+                        "rows_failed": 0,
+                    }
                 )
             )
 
@@ -3383,32 +3399,40 @@ class TestUpdateBlobActiveRunGuard:
         with self.engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=self.session_id,
-                    version=1,
-                    source=None,
-                    nodes=None,
-                    edges=None,
-                    outputs=None,
-                    metadata_=stored_default_pipeline_metadata(),
-                    is_valid=False,
-                    validation_errors=None,
-                    # Plan §2294: composer-tools test fixture; provenance
-                    # required for setup row supporting subsequent runs/
-                    # blob_run_links FKs.
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        id=state_id,
+                        session_id=self.session_id,
+                        version=1,
+                        sources=None,
+                        nodes=None,
+                        edges=None,
+                        outputs=None,
+                        metadata_=stored_default_pipeline_metadata(),
+                        is_valid=False,
+                        validation_errors=None,
+                        # Plan §2294: composer-tools test fixture; provenance
+                        # required for setup row supporting subsequent runs/
+                        # blob_run_links FKs.
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
             conn.execute(
                 runs_table.insert().values(
-                    id=self.run_id,
-                    session_id=self.session_id,
-                    state_id=state_id,
-                    status=status,
-                    started_at=now,
-                    rows_processed=0,
-                    rows_failed=0,
+                    {
+                        **run_values(
+                            self.session_id,
+                            state_id,
+                            status=status,
+                            error=None,
+                            landscape_run_id=str(uuid4()) if status == "completed" else None,
+                        ),
+                        "id": self.run_id,
+                        "started_at": now,
+                        "rows_processed": 0,
+                        "rows_failed": 0,
+                    }
                 )
             )
             conn.execute(
@@ -3448,40 +3472,47 @@ class TestUpdateBlobActiveRunGuard:
         with self.engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=self.session_id,
-                    version=1,
-                    # Production shape, not the pre-2026-05 one. Since
-                    # f0fd36087 every writer folds `source` into
-                    # `sources={"source": ...}` and wraps each JSON column
-                    # through the one envelope rule, so the active-run guard
-                    # this fixture pins must be exercised against that shape --
-                    # seeding a populated, bare `source` is what let
-                    # elspeth-3db5745ba7 stay green while production 500'd.
-                    source=None,
-                    sources=envelope_state_column({"source": source}),
-                    nodes=envelope_state_column([]),
-                    edges=envelope_state_column([]),
-                    outputs=envelope_state_column([]),
-                    metadata_=envelope_state_column({"name": "Test", "description": ""}),
-                    is_valid=False,
-                    validation_errors=None,
-                    # Plan §2294: composer-tools test fixture; provenance
-                    # required for setup row supporting subsequent runs/
-                    # blob_run_links FKs.
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        id=state_id,
+                        session_id=self.session_id,
+                        version=1,
+                        # Production shape, not the pre-2026-05 one. Since
+                        # f0fd36087 every writer folds `source` into
+                        # `sources={"source": ...}` and wraps each JSON column
+                        # through the one envelope rule, so the active-run guard
+                        # this fixture pins must be exercised against that shape --
+                        # seeding a populated, bare `source` is what let
+                        # elspeth-3db5745ba7 stay green while production 500'd.
+                        sources=envelope_state_column({"source": source}),
+                        nodes=envelope_state_column([]),
+                        edges=envelope_state_column([]),
+                        outputs=envelope_state_column([]),
+                        metadata_=envelope_state_column({"name": "Test", "description": ""}),
+                        is_valid=False,
+                        validation_errors=None,
+                        # Plan §2294: composer-tools test fixture; provenance
+                        # required for setup row supporting subsequent runs/
+                        # blob_run_links FKs.
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
             conn.execute(
                 runs_table.insert().values(
-                    id=self.run_id,
-                    session_id=self.session_id,
-                    state_id=state_id,
-                    status=status,
-                    started_at=now,
-                    rows_processed=0,
-                    rows_failed=0,
+                    {
+                        **run_values(
+                            self.session_id,
+                            state_id,
+                            status=status,
+                            error=None,
+                            landscape_run_id=str(uuid4()) if status == "completed" else None,
+                        ),
+                        "id": self.run_id,
+                        "started_at": now,
+                        "rows_processed": 0,
+                        "rows_failed": 0,
+                    }
                 )
             )
 
@@ -3895,21 +3926,23 @@ class TestUpdateBlobAtomicWrite:
         with self.engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=self.session_id,
-                    version=1,
-                    source=None,
-                    nodes=None,
-                    edges=None,
-                    outputs=None,
-                    metadata_=stored_default_pipeline_metadata(),
-                    is_valid=False,
-                    validation_errors=None,
-                    # Plan §2294: composer-tools test fixture; provenance
-                    # required for setup row supporting subsequent runs/
-                    # blob_run_links FKs.
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        id=state_id,
+                        session_id=self.session_id,
+                        version=1,
+                        sources=None,
+                        nodes=None,
+                        edges=None,
+                        outputs=None,
+                        metadata_=stored_default_pipeline_metadata(),
+                        is_valid=False,
+                        validation_errors=None,
+                        # Plan §2294: composer-tools test fixture; provenance
+                        # required for setup row supporting subsequent runs/
+                        # blob_run_links FKs.
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
             conn.execute(

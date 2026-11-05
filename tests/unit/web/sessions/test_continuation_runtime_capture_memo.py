@@ -1,6 +1,8 @@
 """One physical capture reuses pure work while each current SQL proof remains real."""
 
 import asyncio
+import json
+from dataclasses import replace
 from hashlib import sha256
 from threading import Event
 
@@ -8,6 +10,7 @@ import pytest
 from sqlalchemy import update
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer import continuation_runtime as runtime_owner
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
 from elspeth.web.continuation_retention_memo import (
@@ -270,6 +273,106 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
         assert reads[0] is reads[1] is capture_memos[0]
         assert not reads[0].active and reads[0].cached_entry_count == 0
         assert recovery_rows(operation_store[0]) == after_mutation[0]
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warm", (False, True), ids=("cold", "warm"))
+async def test_capture_prefix_uses_original_roundtripped_chunk_and_one_fresh_live_encoding(operation_store, monkeypatch, warm):
+    arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
+    running = arguments["inventory"].running
+    runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    original_read = sql_owner.read_runtime_source_on_connection
+    original_decode = runtime_owner.decode_recorder_snapshot
+    original_encode = runtime_owner.encode_recorder_snapshot
+    reads, decoded, encoded = [], [], []
+
+    def read(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        reads.append(result)
+        return result
+
+    def decode(chunk):
+        result = original_decode(chunk)
+        decoded.append((chunk, result))
+        return result
+
+    def encode(snapshot):
+        result = original_encode(snapshot)
+        encoded.append(result)
+        return result
+
+    try:
+        if warm:
+            await _capture(runtime, arguments)
+        original_prefix = runtime.live.recorder.withheld_replies
+        assert original_prefix
+        runtime.live.recorder.record_withheld_reply("repair_gate_superseded", "Permitted live append after the retained prefix")
+        monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+        monkeypatch.setattr(runtime_owner, "decode_recorder_snapshot", decode)
+        monkeypatch.setattr(runtime_owner, "encode_recorder_snapshot", encode)
+        result = await _capture(runtime, arguments)
+        assert len(reads) == 2 and len(decoded) == len(encoded) == 1
+        assert decoded[0][0] is reads[0].admitted_evidence.recorder_chunk
+        assert encoded[0] == decoded[0][0]
+        frame = result.stack.frames[0]
+        retained = original_decode(next(chunk for chunk in result.chunks if chunk.reference == frame.audit_buffer))
+        assert retained.withheld_replies[:-1] == original_prefix
+        assert retained.withheld_replies[-1].content == "Permitted live append after the retained prefix"
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("live-prefix", "source-bytes", "source-reference"))
+async def test_capture_prefix_handoff_keeps_fresh_live_and_original_chunk_opponents(operation_store, monkeypatch, change):
+    arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
+    running = arguments["inventory"].running
+    runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    original_read = sql_owner.read_runtime_source_on_connection
+    original_decode = runtime_owner.decode_recorder_snapshot
+    original_encode = runtime_owner.encode_recorder_snapshot
+    reads, decodes, encodes = [], [], []
+
+    def read(*args, **kwargs):
+        reads.append(True)
+        return original_read(*args, **kwargs)
+
+    def decode(chunk):
+        decodes.append(True)
+        if change == "source-bytes":
+            document = json.loads(chunk.canonical)
+            assert document["snapshot"]["withheld_replies"]
+            document["snapshot"]["withheld_replies"][0]["content"] = "Changed original source payload"
+            chunk = replace(chunk, canonical=canonical_json(document))
+        elif change == "source-reference":
+            chunk = replace(chunk, reference=chunk.reference.model_copy(update={"digest": "0" * 64}))
+        return original_decode(chunk)
+
+    def encode(snapshot):
+        encodes.append(True)
+        return original_encode(snapshot)
+
+    try:
+        if change == "live-prefix":
+            assert runtime.live.recorder.withheld_replies
+            original = runtime.live.recorder._withheld_replies[0]
+            runtime.live.recorder._withheld_replies[0] = replace(original, content="Changed retained live prefix")
+        monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+        monkeypatch.setattr(runtime_owner, "decode_recorder_snapshot", decode)
+        monkeypatch.setattr(runtime_owner, "encode_recorder_snapshot", encode)
+        before = recovery_rows(operation_store[0])
+        with pytest.raises(AuditIntegrityError) as refused:
+            await _capture(runtime, arguments)
+        assert reads == decodes == [True]
+        if change == "live-prefix":
+            assert encodes == [True] and "complete current SQL recorder prefix" in str(refused.value)
+        else:
+            assert encodes == [] and "bytes differ from their binding" in str(refused.value)
+        assert recovery_rows(operation_store[0]) == before
         arguments["required_work"].coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)

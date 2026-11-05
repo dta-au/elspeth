@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal
 from weakref import ReferenceType
 
 from pydantic import Field, ValidationError, model_validator
-from sqlalchemy import Connection
+from sqlalchemy import Connection, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
@@ -16,7 +16,7 @@ from elspeth.web.composer.continuation import ContinuationValue, PrivateChunkRef
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot, encode_private_chunk
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
-from elspeth.web.sessions.continuation_retained_capacity import read_bounded_retained_chunk
+from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource, read_bounded_retained_chunk
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_checkpoint_early_physical import CheckpointEarlyPhysicalSource
@@ -101,6 +101,53 @@ def early_source_event_fields(reference: PrivateChunkRef | None) -> dict[str, in
     if reference.codec != "composer.checkpoint-early-input.v1":
         raise AuditIntegrityError("EARLY source changed its installed request codec")
     return {"version": 2, "early_input_chunk_key": f"value:{reference.codec}:{reference.digest}", "early_input_sha256": reference.digest}
+
+
+def read_checkpoint_early_input_for_hold_on_connection(
+    conn: Connection,
+    *,
+    source: ProviderTerminalHoldSource,
+) -> CheckpointEarlyInput | None:
+    """Recover a recipe input through complete bounded source replay.
+
+    A version-one source retains its historical recipe. A version-two EARLY
+    source must reprove the actual prepared graph, request, and encoded guard
+    inventory; reading this DATA creates no live physical authority.
+    """
+    from elspeth.contracts.json_parser import parse_json_strict
+    from elspeth.web.sessions.continuation_checkpoint_paid_terminal import _bounded_bytes, _event_at
+    from elspeth.web.sessions.continuation_checkpoint_source_replay import read_checkpoint_provider_source_on_connection
+    from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+
+    tag, text = _event_at(conn, source, source.source_cursor)
+    value, error = parse_json_strict(text)
+    if tag != "checkpoint" or error is not None or type(value) is not dict:
+        raise AuditIntegrityError("checkpoint hold lost its original prepared-source event")
+    if value.get("version") == 1:
+        return None
+    if value.get("version") != 2 or value.get("phase") != "early":
+        raise AuditIntegrityError("checkpoint hold lost its closed prepared-source version")
+    key, digest = value["early_input_chunk_key"], value["early_input_sha256"]
+    if type(key) is not str or type(digest) is not str or key != f"value:composer.checkpoint-early-input.v1:{digest}":
+        raise AuditIntegrityError("checkpoint hold replaced its original EARLY input reference")
+    payload = _bounded_bytes(conn, source, key, "composer.checkpoint-early-input.v1")
+    early = decode_checkpoint_early_input(
+        PrivateChunk(
+            PrivateChunkRef(codec="composer.checkpoint-early-input.v1", digest=digest, byte_length=len(payload)),
+            payload.decode("utf-8", errors="strict"),
+        )
+    )
+    effect = conn.execute(
+        select(effects).where(
+            effects.c.session_id == source.session_id,
+            effects.c.operation_id == source.operation_id,
+            effects.c.effect_key == source.effect_key,
+        )
+    ).one()
+    replay = read_checkpoint_provider_source_on_connection(conn, source=source, effect=effect, names=frozenset(early.env_ref_names))
+    if replay.phase != "early" or replay.early_input != early:
+        raise AuditIntegrityError("checkpoint hold replaced its complete original EARLY request")
+    return early
 
 
 def require_early_input_on_connection(

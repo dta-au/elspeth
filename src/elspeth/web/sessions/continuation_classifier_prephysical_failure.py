@@ -319,8 +319,11 @@ def _recovery_outcome(
 ) -> ComposerOperationError:
     """Reconstruct failed response DATA from the original durable source only."""
     from elspeth.web.composer.continuation_evidence import state_from_evidence_json
+    from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_data_on_connection
     from elspeth.web.composer.continuation_iteration import decode_continuation_iteration, iteration_values
+    from elspeth.web.composer.continuation_p4_outcome import historical_checkpoint_columns_json, historical_checkpoint_record
     from elspeth.web.sessions.composer_operation_errors import project_convergence_failure_data
+    from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_data_on_connection
     from elspeth.web.sessions.routes._helpers import _state_from_record, _state_response
     from elspeth.web.sessions.state_decoder import state_record_from_row
 
@@ -345,9 +348,41 @@ def _recovery_outcome(
         if row is None:
             raise AuditIntegrityError("classifier recovery lost its original durable state")
         record = state_record_from_row(row)
-        if canonical_json(_state_from_record(record).to_dict()) != state_json:
+        admitted = read_selected_turn_evidence_graph_data_on_connection(
+            conn,
+            session_id=record.session_id,
+            operation_id=source.selected.stack.logical.operation_id,
+            selected=source.selected,
+            names=source.env_ref_names,
+        )
+        applications = require_p4_application_journal_data_on_connection(
+            conn,
+            session_id=record.session_id,
+            operation_id=source.selected.stack.logical.operation_id,
+            selected=source.selected,
+            evidence=admitted,
+            env_ref_names=source.env_ref_names,
+        )
+        checkpoints = tuple(
+            result.outcome.checkpoint
+            for result in applications
+            if result.outcome.checkpoint is not None and result.outcome.checkpoint.id == record.id
+        )
+        if len(checkpoints) != 1:
+            raise AuditIntegrityError("classifier recovery lost its authenticated P4 checkpoint")
+        checkpoint = checkpoints[0]
+        if (
+            record != historical_checkpoint_record(checkpoint, env_ref_names=source.env_ref_names)
+            or historical_checkpoint_columns_json(record) != checkpoint.original_columns_json
+        ):
+            raise AuditIntegrityError("classifier recovery changed its complete original P4 state")
+        # P4 assigns a persisted checkpoint sequence independently of the
+        # local mutation revision. Prove both before comparing the complete
+        # graph at the captured revision; never rewrite the persisted row.
+        captured_revision = replace(_state_from_record(record), version=expected_state.version)
+        if canonical_json(captured_revision.to_dict()) != state_json:
             raise AuditIntegrityError("classifier recovery state differs from its actual captured graph")
-        if record.version > initial_version:
+        if expected_state.version > initial_version:
             public["partial_state"] = _state_response(record).model_dump(mode="json")
     elif expected_state.version > initial_version:
         raise AuditIntegrityError("classifier recovery claimed an absent durable state")
@@ -635,7 +670,11 @@ async def fail_classifier_prephysical_operation(
 
     def write() -> VerifiedClassifierPrephysicalTerminal:
         nonlocal candidate
-        with locked_session_transaction(service._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
+        with (
+            service._session_process_locked_begin(str(running.claim.session_id)) as conn,
+            service._session_write_lock(conn, str(running.claim.session_id)),
+            retention_stage_memo_scope(),
+        ):
             _require_native(custody, phases, running, work)
             if timing.drain_signal.started_at is not None:
                 from elspeth.web.sessions.composer_operations import COMPOSER_SHUTDOWN
