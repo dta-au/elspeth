@@ -8,6 +8,7 @@ contracts. Private authoring identity is explicit across recorder and batch.
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import Any
@@ -251,10 +252,9 @@ def require_application_recorder_source(source: ApplicationRecorderSource, env_r
         if chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
             raise AuditIntegrityError("prospective application recorder lost its actual complete document excess")
         return source
-    _require_source_chunk(source.chunk)
-    if type(source.snapshot) is not RecorderSnapshot or encode_recorder_snapshot(source.snapshot) != source.chunk:
-        raise AuditIntegrityError("application recorder changed its complete original fields")
-    _require_source_credentials(source.chunk, env_ref_names)
+    # The normal constructor strictly decoded the original verified chunk and
+    # owns a deeply immutable snapshot. Reusing that same source and credential
+    # environment does not introduce new bytes or mutable input to admit.
     return source
 
 
@@ -264,6 +264,8 @@ def application_recorder_chunk(snapshot: RecorderSnapshot, *, recorder_source: A
     Historical or unrelated snapshots retain the normal bounded encoder. Only
     the exact complete prospective source document can defer its capacity cut.
     """
+    if type(recorder_source) is ApplicationRecorderSource and snapshot is recorder_source.snapshot:
+        return recorder_source.chunk
     if type(recorder_source) is ProspectiveApplicationRecorderSource:
         require_application_recorder_source(recorder_source, recorder_source.env_ref_names)
         if recorder_snapshot_json(snapshot) == recorder_source.chunk.canonical:
@@ -288,14 +290,16 @@ def application_recorder_slots(
 
 
 def construct_application_llm(source: ApplicationRecorderSource, slot: int) -> ComposerLLMCall:
-    """Fresh complete DTO per graph node, independently of source-cell aliases."""
+    """Fresh node identity with the admitted cell's deeply immutable values."""
     if type(slot) is not int or not 0 <= slot < len(source.snapshot.llm_calls):
         raise AuditIntegrityError("application LLM lost its exact recorder slot")
-    encoded = _atom_json(source.snapshot.llm_calls[slot], ComposerLLMCall)
-    restored = _LLM_ADAPTER.validate_json(encoded, strict=True, extra="forbid")
-    if _atom_json(restored, ComposerLLMCall) != encoded:
-        raise AuditIntegrityError("application LLM changed its complete original fields")
-    return restored
+    actual = source.snapshot.llm_calls[slot]
+    if type(actual) is not ComposerLLMCall:
+        raise TypeError("application LLM requires its actual admitted recorder cell")
+    # Recorder admission has already decoded every field and frozen the JSON
+    # descendants. Copy the instance to retain per-node identity without
+    # encoding and parsing the same unmodified values again.
+    return copy(actual)
 
 
 _ATOMS: dict[str, type[Any]] = {
@@ -554,6 +558,25 @@ def application_result_tools(
                 raise TypeError("application cut lost its actual recorder")
             application_recorder_chunk(snapshot, recorder_source=recorder_source)
     return result_tools
+
+
+def _application_graph_projection(
+    graph: ApplicationGraph, *, env_ref_names: frozenset[str], recorder_source: ApplicationRecorderSource
+) -> str:
+    """Project current mutable values and aliases for an original-source comparison.
+
+    No new wire is published here. The original source already passed the
+    decoder; rebuilding it again would test our constructors rather than the
+    current graph's values or alias partition.
+    """
+    from elspeth.web.composer.continuation_batch_data import _encode
+
+    checked_source = _ValidatedRecorderSource.capture(recorder_source, env_ref_names)
+    encoded = _encode(graph.selected, env_ref_names, application=graph, recorder_source=recorder_source, checked_source=checked_source)
+    if application_recorder_chunk(graph.recorder, recorder_source=recorder_source) != recorder_source.chunk:
+        raise AuditIntegrityError("application graph changed its complete selected recorder")
+    require_application_recorder_source(recorder_source, env_ref_names)
+    return encoded
 
 
 def encode_application_graph(graph: ApplicationGraph, *, env_ref_names: frozenset[str], recorder_source: ApplicationRecorderSource) -> str:

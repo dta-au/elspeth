@@ -405,12 +405,18 @@ async def portable_input(store, tmp_path, monkeypatch, *, kind="graph", share_au
         args = {"data": data, "evidence": evidence, "recorder": recorder, "drained": drained, "inventory": inventory}
         if pending_library:
             args.update(authority=store[2], selected=selected, required_work=inventory_work(running))
-        if share_authoring:
-            # This changes only independently decoded warm DATA. Distinct-equal
-            # controls deliberately retain their separate authoring identities.
-            for item in recorder.snapshot_for_continuation(drained=drained).private_authorings:
-                if item.tool_call_id in data.batch.private_authorings_by_call:
+        # Establish the requested alias partition on independently decoded
+        # historical DATA; the original cohort helper supplies shared atoms.
+        for item in recorder.snapshot_for_continuation(drained=drained).private_authorings:
+            if item.tool_call_id in data.batch.private_authorings_by_call:
+                if share_authoring:
                     data.batch.private_authorings_by_call[item.tool_call_id] = item
+                else:
+                    original_authoring = data.batch.private_authorings_by_call[item.tool_call_id]
+                    assert original_authoring == item
+                    distinct_authoring = replace(original_authoring)
+                    data.batch.private_authorings_by_call[item.tool_call_id] = distinct_authoring
+                    assert distinct_authoring == item and distinct_authoring is not item
         messages = [{"role": "user", "content": "retained current request text"}]
         evidence.transcript.observe_messages(messages)
         values = {

@@ -1883,6 +1883,33 @@ class CurrentMessageProduction:
         )
 
 
+def current_message_producers_from_runtime_source(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    source: ContinuationRuntimeSource,
+    finish_read: ContinuationFinishRead | None = None,
+) -> CurrentContinuationMessageProducers:
+    """Build local producers from the actual source just read for restoration."""
+    from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource, runtime_chunk
+
+    if type(source) is not ContinuationRuntimeSource or source.selected is not selected or source.evidence_env_ref_names != inventory.names:
+        raise AuditIntegrityError("message producers changed their admitted runtime source")
+    frames = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
+    if len(frames) != 1:
+        raise AuditIntegrityError("message producers lost their one Compose source")
+    inputs = _CurrentProducerInputs(
+        source.bootstrap,
+        source.original,
+        source.iteration.producer_inputs,
+        runtime_chunk(selected, frames[0].transcript).canonical,
+        source.admitted_evidence,
+    )
+    return CurrentContinuationMessageProducers(service, authority, selected, inventory, inputs, finish_read=finish_read)
+
+
 def _produce_current_messages(
     *,
     service: ComposerServiceImpl,

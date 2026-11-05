@@ -6,7 +6,7 @@ history/application-ledger cuts are refused until their actual producer is retai
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import FrozenInstanceError
 from typing import TYPE_CHECKING, Any, Self
 
@@ -46,6 +46,7 @@ from elspeth.web.composer.turn_effects import (
 )
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_application_graph import ApplicationGraph
     from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 
 
@@ -535,6 +536,53 @@ def _finish_current_evidence(
     env_ref_names: frozenset[str],
 ) -> RestoredTurnEvidence:
     admitted = ce.require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
+    return _assemble_current_evidence(
+        admitted,
+        context=context,
+        owner=owner,
+        initial=initial,
+        latest=latest,
+        messages=messages,
+        reader=reader,
+        graph_source=admitted.take_graph,
+    )
+
+
+def _finish_copied_current_evidence(
+    evidence: ce.AdmittedTurnEvidence,
+    *,
+    context: SessionOperationContext,
+    owner: TurnEvidence,
+    initial: CompositionState,
+    latest: CompositionState,
+    messages: list[dict[str, Any]],
+    reader: CurrentTranscriptBlobReader | None,
+    env_ref_names: frozenset[str],
+) -> RestoredTurnEvidence:
+    admitted = ce.require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
+    return _assemble_current_evidence(
+        admitted,
+        context=context,
+        owner=owner,
+        initial=initial,
+        latest=latest,
+        messages=messages,
+        reader=reader,
+        graph_source=admitted.copy_graph,
+    )
+
+
+def _assemble_current_evidence(
+    admitted: ce.AdmittedTurnEvidence,
+    *,
+    context: SessionOperationContext,
+    owner: TurnEvidence,
+    initial: CompositionState,
+    latest: CompositionState,
+    messages: list[dict[str, Any]],
+    reader: CurrentTranscriptBlobReader | None,
+    graph_source: Callable[[], ApplicationGraph | None],
+) -> RestoredTurnEvidence:
     snapshot = admitted.snapshot
     retained = snapshot.effects
     if snapshot.requires_blob_reader:
@@ -653,7 +701,7 @@ def _finish_current_evidence(
     # Last use of the fixed admission graph: the following reconstruction
     # transfers its mutable roots to live owners. Later capture admits fresh
     # bytes through the actual live graph codec, never this old carrier.
-    graph = admitted.take_graph()
+    graph = graph_source()
     if graph is None:
         recorder, drained = BufferingRecorder.for_continuation(decode_recorder_snapshot(admitted.recorder_chunk))
         return RestoredTurnEvidence(owner, messages, recorder, drained)

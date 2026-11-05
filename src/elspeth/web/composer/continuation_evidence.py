@@ -461,24 +461,37 @@ class AdmittedTurnEvidence:
 
     def take_graph(self) -> ApplicationGraph | None:
         """Transfer once, after proving exposed nested values still match source."""
-        from elspeth.web.composer.continuation_application_graph import admit_application_recorder_source, encode_application_graph
-
         with self._graph_lock:
-            if self._graph_taken:
-                raise AuditIntegrityError("admitted graph cannot be transferred twice")
-            if canonical_json_native_strings(self.snapshot.model_dump(mode="json")) != self.source_chunk.canonical:
-                raise AuditIntegrityError("admitted evidence snapshot changed its original immutable source")
-            if self._graph is not None:
-                original = (
-                    self.snapshot.joint_graph_json
-                    if self.snapshot.application_entry is None
-                    else self.snapshot.application_entry.graph_json
-                )
-                recorder_source = admit_application_recorder_source(self.recorder_chunk, env_ref_names=self.env_ref_names)
-                if encode_application_graph(self._graph, env_ref_names=self.env_ref_names, recorder_source=recorder_source) != original:
-                    raise AuditIntegrityError("admitted graph changed its original values or alias partition")
+            self._require_original_graph()
             object.__setattr__(self, "_graph_taken", True)
             return self._graph
+
+    def copy_graph(self) -> ApplicationGraph | None:
+        """Give a separate consumer mutable DATA while retaining this source."""
+        from elspeth.web.composer.continuation_application_copy import copy_application_graph
+
+        with self._graph_lock:
+            self._require_original_graph()
+            return None if self._graph is None else copy_application_graph(self._graph)
+
+    def _require_original_graph(self) -> None:
+        """Called under the graph lock before transfer or independent copying."""
+        from elspeth.web.composer.continuation_application_graph import (
+            _application_graph_projection,
+            admit_application_recorder_source,
+        )
+
+        if self._graph_taken:
+            raise AuditIntegrityError("admitted graph cannot be transferred twice")
+        if canonical_json_native_strings(self.snapshot.model_dump(mode="json")) != self.source_chunk.canonical:
+            raise AuditIntegrityError("admitted evidence snapshot changed its original immutable source")
+        if self._graph is not None:
+            original = (
+                self.snapshot.joint_graph_json if self.snapshot.application_entry is None else self.snapshot.application_entry.graph_json
+            )
+            recorder_source = admit_application_recorder_source(self.recorder_chunk, env_ref_names=self.env_ref_names)
+            if _application_graph_projection(self._graph, env_ref_names=self.env_ref_names, recorder_source=recorder_source) != original:
+                raise AuditIntegrityError("admitted graph changed its original values or alias partition")
 
     def __copy__(self) -> Never:
         raise TypeError("evidence copies require fresh source admission")

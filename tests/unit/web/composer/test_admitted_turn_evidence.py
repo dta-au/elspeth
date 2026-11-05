@@ -54,12 +54,13 @@ def _require_no_application_graph_work(counts):
 def _require_owed_joint_final_transfer_work(counts):
     # Received from the actual owed-reader joint/no-history transfer. Other
     # historical shapes need their own measured lineage, not this constant.
+    # R44 projects the admitted graph once without a constructor roundtrip.
     expected = {
         "decode_application_graph": 0,
-        "encode_application_graph": 1,
-        "decode_application_true": 1,
+        "encode_application_graph": 0,
+        "decode_application_true": 0,
         "decode_application_false": 0,
-        "encode_application_true": 2,
+        "encode_application_true": 1,
         "encode_application_false": 0,
     }
     actual = dict(counts)
@@ -72,7 +73,9 @@ def _require_owed_joint_final_transfer_work(counts):
 def _require_owed_joint_final_transfer_recorder_work(counts):
     # Received only for this owed-reader joint/no-history transfer, including
     # its source-context preparation. Historical shapes need their own measure.
-    expected = {"decode_recorder_snapshot": 1, "encode_recorder_snapshot": 11}
+    # R44: one decoder self-check, one selected-recorder capture and one exit
+    # projection; the already admitted immutable source is reused.
+    expected = {"decode_recorder_snapshot": 1, "encode_recorder_snapshot": 3}
     actual = dict(counts)
     assert actual.keys() == expected.keys(), f"final_transfer_recorder_keys: {actual}"
     assert all(type(value) is int and value >= 0 for value in actual.values()), f"final_transfer_recorder_types: {actual}"
@@ -145,6 +148,53 @@ def test_reuse_and_serialization_do_not_accept_a_raw_snapshot_as_an_admission_ce
     for consumer in (require_admitted_turn_evidence, encode_turn_evidence):
         with pytest.raises(TypeError, match="actual source-admitted owner"):
             consumer(admitted.snapshot, env_ref_names=frozenset())
+
+
+@pytest.mark.parametrize("consumer", ("copy", "transfer"))
+@pytest.mark.parametrize("mutation", ("unchanged", "value", "alias"))
+def test_original_graph_comparison_keeps_mutation_proof_without_reconstructing(consumer, mutation):
+    owner, messages, recorder, logical, _policy = rich_evidence()
+    batch, accumulator, calls = actual_cut()
+    original = capture_turn_evidence(
+        owner,
+        messages,
+        logical=logical,
+        recorder=recorder,
+        drained=RecorderDrainCursors(),
+        env_ref_names=frozenset(),
+        data=RestoredBatchData(batch, accumulator, calls),
+    )
+    with _graph_codec_counts() as admission:
+        admitted = decode_turn_evidence(encode_turn_evidence(original), env_ref_names=frozenset(), source_chunks=original.dependency_chunks)
+    assert admission["decode_application_true"] > 0
+    graph = admitted.graph
+    assert graph is not None
+    arguments = graph.selected.batch.decoded_args_by_call_id
+    assert arguments["call-1"] is arguments["call-2"]
+    if mutation == "value":
+        arguments["call-1"]["nested"][2]["label"] = "changed actual value"
+    elif mutation == "alias":
+        arguments["call-1"] = dict(arguments["call-2"])
+        assert arguments["call-1"] == arguments["call-2"]
+        assert arguments["call-1"] is not arguments["call-2"]
+    with _graph_codec_counts() as proof:
+        if mutation == "unchanged":
+            restored = admitted.copy_graph() if consumer == "copy" else admitted.take_graph()
+            assert restored is not None
+            assert restored.selected.batch.decoded_args_by_call_id["call-1"] is restored.selected.batch.decoded_args_by_call_id["call-2"]
+            if consumer == "copy":
+                assert restored is not graph and admitted.graph is graph
+            else:
+                assert restored is graph
+        else:
+            with pytest.raises(AuditIntegrityError, match="original values or alias partition"):
+                if consumer == "copy":
+                    admitted.copy_graph()
+                else:
+                    admitted.take_graph()
+    assert proof["decode_application_graph"] == proof["decode_application_true"] == 0
+    assert proof["encode_application_graph"] == 0
+    assert proof["encode_application_true"] == 1
 
 
 @pytest.mark.parametrize("source_kind", ("snapshot", "chunk"))

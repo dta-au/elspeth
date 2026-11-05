@@ -14,8 +14,8 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, PrivateChunkRef, ToolBatchFrame
 from elspeth.web.composer.continuation_application_graph import (
     ApplicationGraph,
+    _application_graph_projection,
     admit_application_recorder_source,
-    encode_application_graph,
 )
 from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import (
@@ -412,7 +412,7 @@ def require_p4_application_journal_data_on_connection(
             before_snapshot.logical != entry.logical
             or before_snapshot.actor_user_id != snapshot.actor_user_id
             or retained_graph
-            != encode_application_graph(before_graph, env_ref_names=env_ref_names, recorder_source=original_recorder_source)
+            != _application_graph_projection(before_graph, env_ref_names=env_ref_names, recorder_source=original_recorder_source)
             or before_snapshot.effects != retained_effects(cut.effects_before)
             or before_snapshot.recorder != old_compose[0].audit_buffer
             or before_admitted.recorder_chunk != encode_recorder_snapshot(cut.recorder_before)

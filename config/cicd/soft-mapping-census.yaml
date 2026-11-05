@@ -801,6 +801,8 @@ files:
   src/elspeth/web/composer/composition_completion.py:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
+  src/elspeth/web/composer/continuation_application_copy.py:
+    dict[str, Any]: 2
   src/elspeth/web/composer/continuation_application_graph.py:
     dict[str, Any]: 2
   src/elspeth/web/composer/continuation_attachment_read.py:
@@ -813,7 +815,7 @@ files:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/continuation_evidence_graph.py:
     Mapping[str, Any]: 1
-    dict[str, Any]: 2
+    dict[str, Any]: 4
     dict[str, object]: 2
   src/elspeth/web/composer/continuation_message_builders.py:
     dict[str, Any]: 4
@@ -1140,6 +1142,6 @@ totals:
   Mapping[str, object]: 327
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1182
+  dict[str, Any]: 1186
   dict[str, object]: 408
-  soft: 2728
+  soft: 2732

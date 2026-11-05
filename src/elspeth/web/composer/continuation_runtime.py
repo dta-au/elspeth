@@ -38,14 +38,18 @@ from elspeth.web.composer.continuation_caches import (
     restore_continuation_caches,
 )
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_mandatory_private_chunk, encode_private_chunk, verify_private_chunk
-from elspeth.web.composer.continuation_current_evidence import restore_current_turn_evidence
+from elspeth.web.composer.continuation_current_evidence import _assemble_runtime_turn_evidence
 from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
 from elspeth.web.composer.continuation_evidence import encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, capture_turn_evidence
 from elspeth.web.composer.continuation_iteration import capture_continuation_iteration, encode_continuation_iteration, iteration_values
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
-from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers, load_current_message_producers
+from elspeth.web.composer.continuation_prompt_producers import (
+    CurrentContinuationMessageProducers,
+    _CurrentProducerInputs,
+    current_message_producers_from_runtime_source,
+)
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
@@ -95,6 +99,12 @@ class CapturedContinuationRuntime:
     selected: SelectedContinuationState
     stack: ContinuationFrameStack
     chunks: tuple[PrivateChunk, ...]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RuntimeRestorationInputs:
+    source: ContinuationRuntimeSource
+    producers: CurrentContinuationMessageProducers
 
 
 def _work_owners(
@@ -200,6 +210,7 @@ def _restore_live(
     from elspeth.web.composer.service import _chat_ingress_inputs_for_compose
 
     cost_source = source.cost_snapshot
+    pending_cost_budget: CommonProviderCostBudget | None = None
     if cost_source is None:
         if provider_owner.cost_budget is not None:
             raise AuditIntegrityError("legacy runtime gained a current cost owner")
@@ -217,7 +228,10 @@ def _restore_live(
         if cost_source.applicability != "continuation_v2" or cost_source.policy != continuation_common_cost_policy(cost_policy):
             raise AuditIntegrityError("runtime cost source changed immutable admitted limits")
         if provider_owner.cost_budget is None:
-            provider_owner.bind_cost_budget(cost_source_owner)
+            # Construction below needs only local DATA. Bind a new budget only
+            # after the final source proof so a failed restore leaves its
+            # reusable provider owner untouched.
+            pending_cost_budget = cost_source_owner
         elif provider_owner.cost_budget.snapshot() != cost_source:
             raise AuditIntegrityError("warm Continuation cost owner differs from complete durable accounting")
 
@@ -341,10 +355,22 @@ def _restore_live(
     # A later read can only shorten admission; never use its newer remaining
     # observation to renew the monotonic anchor or original logical budgets.
     if finish_read is None:
-        authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
+        final_source = authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
     else:
         finish_read.require_selection(selected, inventory)
-        finish_read.read_runtime(authority)
+        final_source = finish_read.read_runtime(authority)
+    inputs = materialization.inputs
+    if type(inputs) is not _CurrentProducerInputs:
+        raise AuditIntegrityError("ready message producer has no existing Compose/family source")
+    _, final_frame = _compose(final_source.selected)
+    if (
+        final_source.bootstrap != inputs.bootstrap
+        or final_source.iteration.producer_inputs != inputs.producer_inputs
+        or runtime_chunk(final_source.selected, final_frame.transcript).canonical != inputs.evidence_messages_json
+    ):
+        raise AuditIntegrityError("message producer inputs differ from their current selected owner")
+    if pending_cost_budget is not None:
+        provider_owner.bind_cost_budget(pending_cost_budget)
     disclosure = service._schema_disclosure if detached_disclosure is None else detached_disclosure
     disclosure.restore_session_for_continuation(
         source.iteration.disclosure,
@@ -468,27 +494,34 @@ async def _restore_runtime(
         if type(finish_read) is not ContinuationFinishRead:
             raise AuditIntegrityError("runtime restore received a foreign owed-finish facet")
         finish_read.require_selection(selected, inventory)
-    source = await _registered_read(
-        required_work,
-        ContinuationRuntimeSource,
-        lambda: (
+
+    def read_inputs() -> _RuntimeRestorationInputs:
+        source = (
             authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
             if finish_read is None
             else finish_read.read_runtime(authority)
-        ),
-    )
-    if type(source) is not ContinuationRuntimeSource:
-        raise AuditIntegrityError("runtime source returned another nominal owner")
-    production = await load_current_message_producers(
-        service=service, authority=authority, selected=selected, inventory=inventory, required_work=required_work, finish_read=finish_read
-    )
-    graph = await restore_current_turn_evidence(
+        )
+        producers = current_message_producers_from_runtime_source(
+            service=service,
+            authority=authority,
+            selected=selected,
+            inventory=inventory,
+            source=source,
+            finish_read=finish_read,
+        )
+        return _RuntimeRestorationInputs(source, producers)
+
+    inputs = await _registered_read(required_work, _RuntimeRestorationInputs, read_inputs)
+    if type(inputs) is not _RuntimeRestorationInputs:
+        raise AuditIntegrityError("runtime read returned another restoration input owner")
+    source = inputs.source
+    graph = await _assemble_runtime_turn_evidence(
         service=service,
         authority=authority,
         selected=selected,
         inventory=inventory,
         required_work=required_work,
-        materialization=production.producers,
+        materialization=inputs.producers,
     )
     result = await _registered_read(
         required_work,
@@ -502,7 +535,7 @@ async def _restore_runtime(
             provider_owner=provider_owner,
             source=source,
             graph=graph,
-            materialization=production.producers,
+            materialization=inputs.producers,
             monotonic_before_read=monotonic_before_read,
             progress=progress,
             finish_read=finish_read,

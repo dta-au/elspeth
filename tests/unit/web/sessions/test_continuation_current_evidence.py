@@ -146,16 +146,18 @@ async def test_actual_current_source_records_close_bindings_without_freezing_liv
 
 
 @pytest.mark.asyncio
-async def test_current_restore_receives_the_exact_fresh_sql_admission_and_keeps_the_final_read(operation_store, monkeypatch):
+async def test_current_restore_reuses_exact_admitted_data_and_keeps_the_fresh_sql_final_read(operation_store, monkeypatch):
     from elspeth.web.composer import continuation_current_evidence as bridge
 
     kwargs, materialization, _shelf, _recorder = await guarded_case(operation_store)
     running = kwargs["inventory"].running
     original_inputs = materialization.inputs
     actual_read = producers.CurrentContinuationMessageProducers._require_current
-    actual_restore = bridge._finish_current_evidence
+    actual_restore = bridge._finish_copied_current_evidence
+    actual_env = kwargs["authority"].read_continuation_env_selection
     observed = []
     transferred = []
+    prechecks = []
 
     def read(self):
         value = actual_read(self)
@@ -163,18 +165,24 @@ async def test_current_restore_receives_the_exact_fresh_sql_admission_and_keeps_
         return value
 
     def restore(evidence, **values):
-        assert observed and evidence is observed[-1].admitted_evidence
-        assert evidence is not original_inputs.admitted_evidence
+        assert prechecks == [materialization.inventory.selection] and not observed
+        assert evidence is original_inputs.admitted_evidence
         result = actual_restore(evidence, **values)
         transferred.append((evidence, len(observed)))
         return result
 
+    def read_env(*args, **values):
+        value = actual_env(*args, **values)
+        prechecks.append(value)
+        return value
+
     monkeypatch.setattr(producers.CurrentContinuationMessageProducers, "_require_current", read)
-    monkeypatch.setattr(bridge, "_finish_current_evidence", restore)
+    monkeypatch.setattr(bridge, "_finish_copied_current_evidence", restore)
+    monkeypatch.setattr(kwargs["authority"], "read_continuation_env_selection", read_env)
     try:
         result = await restore_current_turn_evidence(**kwargs, materialization=materialization)
         assert len(transferred) == 1
-        assert len(observed) == 2 and transferred[0][1] == 1
+        assert len(observed) == 1 and transferred[0][1] == 0
         assert observed[-1].admitted_evidence is not transferred[0][0]
         assert all(value == original_inputs for value in observed)
         assert all(value.evidence is value.admitted_evidence.snapshot for value in observed)
@@ -262,7 +270,7 @@ async def test_current_graph_refuses_stop_after_actual_reconstruction(operation_
 
     kwargs, materialization, _shelf, _recorder = await guarded_case(operation_store)
     running = kwargs["inventory"].running
-    actual = bridge._finish_current_evidence
+    actual = bridge._finish_copied_current_evidence
 
     def stop_after_graph(*args, **values):
         restored = actual(*args, **values)
@@ -274,7 +282,7 @@ async def test_current_graph_refuses_stop_after_actual_reconstruction(operation_
 
     try:
         await restore_current_turn_evidence(**kwargs, materialization=materialization)
-        monkeypatch.setattr(bridge, "_finish_current_evidence", stop_after_graph)
+        monkeypatch.setattr(bridge, "_finish_copied_current_evidence", stop_after_graph)
         with pytest.raises(ComposerOperationCancelledDuringTurn):
             await restore_current_turn_evidence(**kwargs, materialization=materialization)
         kwargs["required_work"].coordinator.assert_completed()

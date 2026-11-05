@@ -7,27 +7,33 @@ and reconstructs the transcript's shared objects once with that producer.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, _begin_current_evidence, _finish_current_evidence
+from elspeth.web.composer.continuation_evidence_graph import (
+    RestoredTurnEvidence,
+    _begin_current_evidence,
+    _finish_copied_current_evidence,
+    _finish_current_evidence,
+)
 from elspeth.web.composer.continuation_evidence_restore import _require_current_reader_service
-from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
+from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers, _CurrentProducerInputs
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkSource, RequiredWorkTicket
-from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationRunning
 
 if TYPE_CHECKING:
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 
 
-def _restore_current_message_evidence(
+def _assemble_current_message_evidence(
     *,
     service: ComposerServiceImpl,
     authority: ComposerAsyncOperationAuthority,
@@ -35,6 +41,7 @@ def _restore_current_message_evidence(
     inventory: CurrentContinuationEnvInventory,
     materialization: CurrentContinuationMessageProducers,
 ) -> RestoredTurnEvidence:
+    """Build unpublished owners; the calling boundary owes its final proof."""
     if (
         type(selected) is not SelectedContinuationState
         or type(inventory) is not CurrentContinuationEnvInventory
@@ -55,45 +62,104 @@ def _restore_current_message_evidence(
         context=running.session_operation_context,
         actor_user_id=materialization.inputs.bootstrap.actor_user_id,
     )
-    # Use this actual just-validated complete read, not the owner's older input
-    # DATA. Reconstruction remains bracketed by an independent fresh final read.
-    with borrow_v4_preparation_memo_scope():
-        inputs = materialization._require_current()
-        admitted = inputs.admitted_evidence
-        snapshot = admitted.snapshot
-        reader = None
-        if snapshot.requires_blob_reader:
-            from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
-
-            reader = CurrentTranscriptBlobReader.from_service(
-                service, session_id=str(running.claim.session_id), context=running.session_operation_context
+    # Reuse admitted DATA on the ordinary path. Current ownership is still
+    # checked before reconstruction and complete source proof follows it.
+    finish = _finish_current_evidence
+    if materialization.finish_read is None and type(materialization.inputs) is _CurrentProducerInputs:
+        try:
+            current = authority.read_continuation_env_selection(
+                running, expected_checkpoint_id=selected.checkpoint_id, expected_cursor=selected.stack.cursor
             )
-        # The outer current reads bracket this whole reconstruction, including
-        # policy callbacks. Reuse their actual inputs for assembly instead of
-        # nesting restore_shelf's second pair of complete current-history reads.
-        owner, initial, latest = _begin_current_evidence(snapshot, context=running.session_operation_context)
-        history = AdvisorTranscriptOwner._continuation_history(
-            snapshot.transcript,
-            session_id=snapshot.session_id,
-            actor_user_id=snapshot.actor_user_id,
-            request_id=snapshot.request_id,
-            request=snapshot.transcript.request,
+            if current != inventory.selection:
+                raise AuditIntegrityError("current evidence changed its selected environment")
+        except ComposerOperationCancelledDuringTurn:
+            # The existing reader may establish an eligible owed-finish
+            # facet; preserve that full source and Stop policy unchanged.
+            inputs = materialization._require_current()
+        else:
+            inputs = materialization.inputs
+            finish = _finish_copied_current_evidence
+    else:
+        inputs = materialization._require_current()
+    admitted = inputs.admitted_evidence
+    snapshot = admitted.snapshot
+    reader = None
+    if snapshot.requires_blob_reader:
+        from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
+
+        reader = CurrentTranscriptBlobReader.from_service(
+            service, session_id=str(running.claim.session_id), context=running.session_operation_context
         )
-        shelf = materialization._rebuild_shelf(snapshot.transcript, inputs=inputs)
-        owner.transcript, messages = AdvisorTranscriptOwner._from_continuation_shelf(
-            snapshot.transcript, request=snapshot.transcript.request, history=history, shelf=shelf
-        )
-        restored = _finish_current_evidence(
-            admitted,
-            context=running.session_operation_context,
-            owner=owner,
-            initial=initial,
-            latest=latest,
-            messages=messages,
-            reader=reader,
-            env_ref_names=inventory.names,
+    # The outer current reads bracket this whole reconstruction, including
+    # policy callbacks. Reuse their actual inputs for assembly instead of
+    # nesting restore_shelf's second pair of complete current-history reads.
+    owner, initial, latest = _begin_current_evidence(snapshot, context=running.session_operation_context)
+    history = AdvisorTranscriptOwner._continuation_history(
+        snapshot.transcript,
+        session_id=snapshot.session_id,
+        actor_user_id=snapshot.actor_user_id,
+        request_id=snapshot.request_id,
+        request=snapshot.transcript.request,
+    )
+    shelf = materialization._rebuild_shelf(snapshot.transcript, inputs=inputs)
+    owner.transcript, messages = AdvisorTranscriptOwner._from_continuation_shelf(
+        snapshot.transcript, request=snapshot.transcript.request, history=history, shelf=shelf
+    )
+    return finish(
+        admitted,
+        context=running.session_operation_context,
+        owner=owner,
+        initial=initial,
+        latest=latest,
+        messages=messages,
+        reader=reader,
+        env_ref_names=inventory.names,
+    )
+
+
+def _restore_current_message_evidence(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    materialization: CurrentContinuationMessageProducers,
+) -> RestoredTurnEvidence:
+    with borrow_v4_preparation_memo_scope():
+        restored = _assemble_current_message_evidence(
+            service=service, authority=authority, selected=selected, inventory=inventory, materialization=materialization
         )
         materialization._require_current()
+        return restored
+
+
+def _assemble_runtime_message_evidence(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    materialization: CurrentContinuationMessageProducers,
+) -> RestoredTurnEvidence:
+    """Keep this graph private until the outer runtime's complete final read."""
+    with borrow_v4_preparation_memo_scope():
+        restored = _assemble_current_message_evidence(
+            service=service, authority=authority, selected=selected, inventory=inventory, materialization=materialization
+        )
+        if materialization.finish_read is not None:
+            materialization._require_current()
+        else:
+            try:
+                current = authority.read_continuation_env_selection(
+                    inventory.running, expected_checkpoint_id=selected.checkpoint_id, expected_cursor=selected.stack.cursor
+                )
+                if current != inventory.selection:
+                    raise AuditIntegrityError("current evidence changed its selected environment")
+            except ComposerOperationCancelledDuringTurn:
+                # Preserve the existing Compose refusal / eligible ToolBatch
+                # owed-finish policy. The outer runtime keeps its own original
+                # finish facet, rather than acquiring a new success path here.
+                materialization._require_current()
         return restored
 
 
@@ -107,6 +173,46 @@ async def restore_current_turn_evidence(
     required_work: RequiredWorkBinding,
 ) -> RestoredTurnEvidence:
     """Restore the actual shared shelf; this grants no phase or provider action."""
+    return await _run_evidence_assembly(
+        selected=selected,
+        inventory=inventory,
+        materialization=materialization,
+        required_work=required_work,
+        operation=lambda: _restore_current_message_evidence(
+            service=service, authority=authority, selected=selected, inventory=inventory, materialization=materialization
+        ),
+    )
+
+
+async def _assemble_runtime_turn_evidence(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    materialization: CurrentContinuationMessageProducers,
+    required_work: RequiredWorkBinding,
+) -> RestoredTurnEvidence:
+    """Return only an intermediate for the outer runtime's final admission."""
+    return await _run_evidence_assembly(
+        selected=selected,
+        inventory=inventory,
+        materialization=materialization,
+        required_work=required_work,
+        operation=lambda: _assemble_runtime_message_evidence(
+            service=service, authority=authority, selected=selected, inventory=inventory, materialization=materialization
+        ),
+    )
+
+
+async def _run_evidence_assembly(
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    materialization: CurrentContinuationMessageProducers,
+    required_work: RequiredWorkBinding,
+    operation: Callable[[], RestoredTurnEvidence],
+) -> RestoredTurnEvidence:
     if type(required_work) is not RequiredWorkBinding or type(inventory) is not CurrentContinuationEnvInventory:
         raise AuditIntegrityError("current evidence requires its actual required-work inventory")
     running = required_work.running
@@ -124,15 +230,7 @@ async def restore_current_turn_evidence(
         raise AuditIntegrityError("current evidence changed its required-work claim")
     sql, projection = required_work.reserve_pair(RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION)
     try:
-        outcome = await run_required_sql_finish_once(
-            sql,
-            _restore_current_message_evidence,
-            service=service,
-            authority=authority,
-            selected=selected,
-            inventory=inventory,
-            materialization=materialization,
-        )
+        outcome = await run_required_sql_finish_once(sql, operation)
     except BaseException:
         projection.complete_without_submission()
         raise

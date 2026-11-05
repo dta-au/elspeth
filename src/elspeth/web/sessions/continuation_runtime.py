@@ -129,8 +129,9 @@ def _runtime_source_from_inputs_on_connection(
 ) -> ContinuationRuntimeSource:
     """Finish the same current SQL read using its already admitted DATA."""
     # Keep the later live claim/lease/CAS and explicit running-owner check.
-    # The complete evidence graph was already validated on this connection;
-    # the intervening bootstrap/transcript work only reads under the same lock.
+    # Ordinary input readers already admit the graph and application journal on
+    # this connection. WAL readers remain DATA snapshots; the outer independent
+    # reads still own freshness across capture and publication.
     if owed_tool_prefix is not None and owed_tool_issue is not None:
         raise AuditIntegrityError("runtime read mixed completed-prefix and issued-call sources")
     if owed_tool_prefix is None and owed_tool_issue is None:
@@ -165,7 +166,7 @@ def _runtime_source_from_inputs_on_connection(
         elif require_issued_tool_runtime_on_connection(conn, running, selected=selected, env_ref_names=inventory.names) != owed_tool_issue:
             raise AuditIntegrityError("owed runtime replaced its original issued call")
     evidence = inputs.evidence
-    if evidence.application_entry is not None:
+    if evidence.application_entry is not None and (owed_tool_prefix is not None or owed_tool_issue is not None):
         from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection
 
         require_p4_application_journal_on_connection(

@@ -83,7 +83,7 @@ async def test_current_bridge_reuses_actual_read_and_keeps_fresh_final_refusal(o
         restored = await bridge.restore_current_turn_evidence(**arguments, materialization=production.producers)
         assert restored.messages == normal.messages and recovery_rows(engine) == before
         assert restored.evidence.request_id == normal.evidence.request_id
-        actual_restore = bridge._finish_current_evidence
+        actual_restore = bridge._finish_copied_current_evidence
         after_stop = []
 
         def stop_after_actual_restore(*args, **kwargs):
@@ -100,7 +100,7 @@ async def test_current_bridge_reuses_actual_read_and_keeps_fresh_final_refusal(o
             after_stop.append(recovery_rows(engine))
             return result
 
-        monkeypatch.setattr(bridge, "_finish_current_evidence", stop_after_actual_restore)
+        monkeypatch.setattr(bridge, "_finish_copied_current_evidence", stop_after_actual_restore)
         with pytest.raises(ComposerOperationCancelledDuringTurn):
             await bridge.restore_current_turn_evidence(**arguments, materialization=production.producers)
         assert len(after_stop) == 1 and recovery_rows(engine) == after_stop[0]

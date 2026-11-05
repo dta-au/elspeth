@@ -1029,6 +1029,11 @@ allowed_dict_patterns:
   # authority remain nominal and separately admitted by their real owners.
   - "src/elspeth/web/composer/advisor_transcript.py:AdvisorTranscriptOwner._from_continuation_shelf:shelf (list)"
   - "src/elspeth/web/composer/continuation_evidence_graph.py:_finish_current_evidence:messages (list)"
+  - "src/elspeth/web/composer/continuation_evidence_graph.py:_finish_copied_current_evidence:messages (list)"
+  - "src/elspeth/web/composer/continuation_evidence_graph.py:_assemble_current_evidence:messages (list)"
+  # The closed graph copier projects heterogeneous owned fields; this is an
+  # internal copy inventory, not an external parsing or authority boundary.
+  - "src/elspeth/web/composer/continuation_application_copy.py:_copy_members:return"
   # Native/failure families preserve the same complete mutable SDK message
   # and guard partitions; recipes, source receipts and current owners stay nominal.
   - "src/elspeth/web/composer/continuation_message_family_builders.py:native_assistant_message:return"

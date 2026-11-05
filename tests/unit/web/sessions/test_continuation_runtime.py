@@ -34,6 +34,7 @@ from elspeth.web.composer.continuation_caches import (
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, encode_private_chunk
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_iteration import decode_continuation_iteration, encode_continuation_iteration
+from elspeth.web.composer.continuation_prompt_producers import current_message_producers_from_runtime_source
 from elspeth.web.composer.continuation_runtime import (
     build_runtime_tool_batch_context,
     capture_continuation_runtime_owners,
@@ -47,6 +48,7 @@ from elspeth.web.composer.tools.generation import EXPRESSION_GRAMMAR_RESPONSE_CO
 from elspeth.web.execution.runtime_preflight import RuntimePreflightKey
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, private_chunk_key, put_chunk
+from elspeth.web.sessions.continuation_runtime import runtime_chunk
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import sessions_table
@@ -57,6 +59,7 @@ from tests.unit.web.coordination import test_composer_operation_authority as ope
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import current_selected, new_owners, recovery_rows
 from tests.unit.web.sessions.test_continuation_current_evidence import guarded_case
 from tests.unit.web.sessions.test_continuation_primary_result import publish_actual
+from tests.unit.web.sessions.test_continuation_primary_result import stored_rows as provider_stored_rows
 from tests.unit.web.sessions.test_continuation_prompt_producers import current_service
 
 operation_store = operations.operation_store
@@ -261,6 +264,164 @@ async def install_capture(store, arguments, captured):
         required_work=arguments["required_work"],
     )
     return {**arguments, "selected": selected, "inventory": inventory}
+
+
+@pytest.mark.asyncio
+async def test_runtime_source_producers_keep_data_and_refuse_changed_selection_or_environment(operation_store):
+    arguments, _history, _attachments = await runtime_case(operation_store)
+    running = arguments["inventory"].running
+    try:
+        runtime = await restore_continuation_runtime(**arguments)
+        source = runtime.source
+        selected, inventory = arguments["selected"], arguments["inventory"]
+        factory_arguments = {name: arguments[name] for name in ("service", "authority", "selected", "inventory")}
+        before = recovery_rows(operation_store[0])
+        producers = current_message_producers_from_runtime_source(**factory_arguments, source=source)
+        assert producers.selected is selected and producers.inventory is inventory
+        assert producers.inputs == runtime.materialization.inputs and producers.inputs is not runtime.materialization.inputs
+        assert producers.inputs.bootstrap is source.bootstrap and producers.inputs.values is source.original
+        assert producers.inputs.producer_inputs is source.iteration.producer_inputs
+        assert producers.inputs.admitted_evidence is source.admitted_evidence and producers.inputs.evidence is source.evidence
+        assert producers.inputs.evidence_messages_json == runtime_chunk(selected, selected.stack.frames[0].transcript).canonical
+        with pytest.raises(AuditIntegrityError, match="message producers changed their admitted runtime source"):
+            current_message_producers_from_runtime_source(
+                **{**factory_arguments, "inventory": replace(inventory, names=inventory.names | {"CHANGED_REFERENCE_NAME"})},
+                source=source,
+            )
+        assert recovery_rows(operation_store[0]) == before
+
+        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+        following = await install_capture(operation_store, arguments, captured)
+        assert following["selected"].checkpoint_id != selected.checkpoint_id
+        assert following["selected"].stack.cursor > selected.stack.cursor
+        following_source = await asyncio.to_thread(
+            arguments["authority"].read_continuation_runtime,
+            running,
+            selected=following["selected"],
+            inventory=following["inventory"],
+        )
+        following_factory_arguments = {name: following[name] for name in ("service", "authority", "selected", "inventory")}
+        after_capture = recovery_rows(operation_store[0])
+        following_producers = current_message_producers_from_runtime_source(**following_factory_arguments, source=following_source)
+        assert following_producers.inputs.admitted_evidence is following_source.admitted_evidence
+        with pytest.raises(AuditIntegrityError, match="message producers changed their admitted runtime source"):
+            current_message_producers_from_runtime_source(**following_factory_arguments, source=source)
+
+        retained_source = source.evidence.model_dump(mode="json")
+        retained_wire = producers.inputs.evidence_messages_json
+        assert runtime.live.llm_messages is runtime.graph.messages
+        assert runtime.live.llm_messages[-1] is runtime.live.llm_messages[-3]
+        runtime.live.llm_messages[-1]["content"] = "Changed live graph after factory input capture"
+        assert runtime.graph.messages[-3]["content"] == "Changed live graph after factory input capture"
+        assert source.evidence.model_dump(mode="json") == retained_source
+        assert producers.inputs.evidence_messages_json == retained_wire
+        assert producers.inputs.evidence is source.evidence
+        assert recovery_rows(operation_store[0]) == after_capture
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_late_costed_runtime_source_refusal_leaves_provider_and_disclosure_unbound(operation_store, monkeypatch):
+    import litellm
+
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from tests.unit.web.sessions import test_continuation_cold_restore as cold_cases
+    from tests.unit.web.sessions.test_continuation_v4_policy_plumbing import _v4
+
+    policy = _v4()
+    engine, repository, _authority, sessions, sid = operation_store
+    authority = ComposerAsyncOperationAuthority(engine, owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy)
+    monkeypatch.setattr(cold_cases, "minimal_continuation_policy", lambda: policy)
+    arguments, _history, _attachments = await runtime_case((engine, repository, authority, sessions, sid))
+    running, provider = arguments["inventory"].running, arguments["provider_owner"]
+    service, selected = arguments["service"], arguments["selected"]
+    disclosure = service._schema_disclosure
+    _snapshot, catalog = service._policy_context.build("alice")
+    catalog.get_schema("source", "csv")
+    disclosure.mark_plugin_schema_loaded(str(sid), "source", "csv")
+    before_disclosure = {key: set(value) for key, value in disclosure._schemas_loaded_by_session.items()}
+    reference = selected.stack.frames[0].evidence
+    original_chunk = next(chunk for chunk in selected.chunks if chunk.reference == reference)
+    actual_read, actual_live = authority.read_continuation_runtime, runtime_owner._restore_live
+    actual_policy = service._policy_context.build
+    sources, refusals, sdk_attempts, corrupted_rows = [], [], [], []
+    in_live = False
+
+    def rows():
+        return recovery_rows(engine), provider_stored_rows(engine)
+
+    def replace_bytes(payload):
+        with engine.begin() as conn:
+            changed = conn.execute(
+                update(chunks)
+                .where(
+                    chunks.c.session_id == str(sid),
+                    chunks.c.operation_id == running.claim.operation_id,
+                    chunks.c.chunk_key == f"value:{reference.codec}:{reference.digest}",
+                )
+                .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
+            )
+            assert changed.rowcount == 1
+
+    def read(*args, **values):
+        try:
+            source = actual_read(*args, **values)
+        except AuditIntegrityError as error:
+            refusals.append((in_live, error))
+            raise
+        sources.append(source)
+        return source
+
+    def live(**values):
+        nonlocal in_live
+        assert values["source"].cost_snapshot is not None
+        assert values["source"].policy.policy_hash == policy.policy_hash
+        in_live = True
+        try:
+            return actual_live(**values)
+        finally:
+            in_live = False
+
+    def current_policy(actor):
+        result = actual_policy(actor)
+        if in_live and not corrupted_rows:
+            assert len(sources) == 1 and sources[0].cost_snapshot is not None
+            assert sources[0].iteration.disclosure.schemas != tuple(sorted(disclosure.schemas_loaded_for_session(str(sid))))
+            replace_bytes(b"{}")
+            corrupted_rows.append(rows())
+        return result
+
+    async def forbidden_sdk(**values):
+        sdk_attempts.append(values)
+        raise AssertionError("runtime restoration must not invoke the provider")
+
+    monkeypatch.setattr(authority, "read_continuation_runtime", read)
+    monkeypatch.setattr(runtime_owner, "_restore_live", live)
+    monkeypatch.setattr(service._policy_context, "build", current_policy)
+    monkeypatch.setattr(litellm, "acompletion", forbidden_sdk)
+    before = rows()
+    try:
+        assert provider.cost_budget is None
+        with pytest.raises(AuditIntegrityError, match="cold evidence storage differs from its selected bytes") as refused:
+            await restore_continuation_runtime(**arguments)
+        assert refusals == [(True, refused.value)] and len(corrupted_rows) == 1
+        assert provider.cost_budget is None
+        assert disclosure._schemas_loaded_by_session == before_disclosure
+        assert rows() == corrupted_rows[0] and not sdk_attempts
+        arguments["required_work"].coordinator.assert_completed()
+
+        replace_bytes(original_chunk.canonical.encode("utf-8"))
+        assert rows() == before
+        restored = await restore_continuation_runtime(**arguments)
+        assert restored.bindings.provider_owner is provider and provider.cost_budget is not None
+        assert provider.cost_budget.snapshot() == restored.source.cost_snapshot
+        assert disclosure.schemas_loaded_for_session(str(sid)) == frozenset(restored.source.iteration.disclosure.schemas)
+        assert rows() == before and not sdk_attempts and refusals == [(True, refused.value)]
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        repository.release(running.session_operation_context)
 
 
 @pytest.mark.asyncio
