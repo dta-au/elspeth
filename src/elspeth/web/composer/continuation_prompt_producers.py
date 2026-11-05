@@ -53,7 +53,11 @@ from elspeth.web.composer.continuation_message_builders import (
     reply_instruction_message,
     tool_result_message,
 )
-from elspeth.web.composer.continuation_message_families import CurrentContinuationMessageFamilies
+from elspeth.web.composer.continuation_message_families import (
+    CurrentContinuationMessageFamilies,
+    _FamilyRequests,
+    _RestoredFamilyCohort,
+)
 from elspeth.web.composer.continuation_message_family_builders import (
     capture_failure_schema_recipe,
     capture_native_message_recipe,
@@ -1588,6 +1592,23 @@ class CurrentContinuationMessageProducers:
 
     def _rebuild_shelf(self, snapshot: MessageShelfSnapshot, *, inputs: _CurrentProducerInputs) -> list[dict[str, Any]]:
         """Actual assembly only; current read brackets remain caller-owned."""
+        positions, requests = self._shelf_family_requests(snapshot, inputs=inputs)
+        cohort = CurrentContinuationMessageFamilies(
+            self.service, self.authority, self.selected, self.inventory, finish_read=self.finish_read
+        )._restore_cohort(requests)
+        return self._assemble_shelf(snapshot, family_positions=positions, family_cohort=cohort)
+
+    def _rebuild_admitted_shelf(self, snapshot: MessageShelfSnapshot, *, inputs: _CurrentProducerInputs) -> list[dict[str, Any]]:
+        """Reuse source DATA only inside copied assembly's final-read boundary."""
+        positions, requests = self._shelf_family_requests(snapshot, inputs=inputs)
+        cohort = CurrentContinuationMessageFamilies(
+            self.service, self.authority, self.selected, self.inventory, finish_read=self.finish_read
+        )._assemble_admitted_cohort(requests, admitted=inputs.admitted_evidence)
+        return self._assemble_shelf(snapshot, family_positions=positions, family_cohort=cohort)
+
+    def _shelf_family_requests(
+        self, snapshot: MessageShelfSnapshot, *, inputs: _CurrentProducerInputs
+    ) -> tuple[tuple[int, ...], _FamilyRequests]:
         from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot, encode_message_shelf
 
         if type(inputs) is not _CurrentProducerInputs or inputs != self.inputs:
@@ -1623,11 +1644,15 @@ class CurrentContinuationMessageProducers:
             ):
                 family_positions.append(index)
                 family_requests.append((recipe, text))
+        return tuple(family_positions), tuple(family_requests)
+
+    def _assemble_shelf(
+        self, snapshot: MessageShelfSnapshot, *, family_positions: tuple[int, ...], family_cohort: _RestoredFamilyCohort
+    ) -> list[dict[str, Any]]:
         # The cohort transaction ends before initial-message content-scope CAS
         # or schema policy callbacks can open their own current SQL transaction.
-        family_cohort = CurrentContinuationMessageFamilies(
-            self.service, self.authority, self.selected, self.inventory, finish_read=self.finish_read
-        )._restore_cohort(tuple(family_requests))
+        messages_json = snapshot.messages_json
+        producer_recipes = snapshot.producer_recipes or (None,) * len(messages_json)
         by_position = dict(zip(family_positions, family_cohort.messages, strict=True))
         restored: list[dict[str, Any]] = []
         initial: list[dict[str, Any]] | None = None

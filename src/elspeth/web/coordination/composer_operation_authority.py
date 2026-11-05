@@ -1065,6 +1065,42 @@ class ComposerAsyncOperationAuthority:
                 return read_semantic_advisor_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
             return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
+    def require_continuation_runtime_current(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        source: ContinuationRuntimeSource,
+        inventory: CurrentContinuationEnvInventory,
+        retention_memo: RetentionStageMemo | None = None,
+    ) -> None:
+        """Fresh final capture proof using its actual retained source DATA."""
+        from elspeth.web.composer.continuation import AdvisorFrame
+        from elspeth.web.composer.continuation_selection import SelectedContinuationState
+        from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource, require_runtime_source_current_on_connection
+
+        if (
+            type(running) is not ComposerOperationRunning
+            or type(source) is not ContinuationRuntimeSource
+            or type(source.selected) is not SelectedContinuationState
+        ):
+            raise AuditIntegrityError("final runtime proof requires its actual running and source owners")
+        if retention_memo is not None and (
+            type(retention_memo) is not RetentionStageMemo
+            or not retention_memo.active
+            or current_retention_stage_memo() is not retention_memo
+        ):
+            raise AuditIntegrityError("runtime read requires its exact active retention memo")
+        memo_scope = borrow_v4_preparation_memo_scope() if retention_memo is None else nullcontext(retention_memo)
+        selected = source.selected
+        with session_data_read_transaction(self._engine, str(running.claim.session_id)) as conn, memo_scope:
+            if selected.stack.frames and type(selected.stack.frames[-1]) is AdvisorFrame:
+                from elspeth.web.sessions.continuation_semantic_advisor import read_semantic_advisor_runtime_source_on_connection
+
+                # Keep the complete original retained outcome/decision proof.
+                read_semantic_advisor_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+            else:
+                require_runtime_source_current_on_connection(conn, running, source=source, inventory=inventory)
+
     def read_continuation_tool_failure(
         self, running: ComposerOperationRunning, *, env_ref_names: frozenset[str]
     ) -> RetainedToolFailureSource | StoredTerminalP4Preparation | StoredTerminalP4Application | None:

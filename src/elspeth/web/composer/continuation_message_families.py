@@ -55,6 +55,21 @@ if TYPE_CHECKING:
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 
 
+type _FamilyRequests = tuple[
+    tuple[
+        NativeThinkingMessageRecipe
+        | ToolCallArgumentsMessageRecipe
+        | FailureSchemaMessageRecipe
+        | AttachmentResultMessageRecipe
+        | ToolResultMessageRecipe
+        | ToolFeedbackMessageRecipe
+        | ControlResultMessageRecipe,
+        str,
+    ],
+    ...,
+]
+
+
 @dataclass(frozen=True, slots=True)
 class _BatchFamilySource:
     response: PrivateChunkRef
@@ -302,17 +317,7 @@ def _read_current_sources(
     inventory: CurrentContinuationEnvInventory,
     finish_read: ContinuationFinishRead | None = None,
 ) -> _MessageFamilySources:
-    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
-    from elspeth.web.composer.continuation_batch_data import (
-        RestoredBatchData,
-        decode_coupled_batch_chunk,
-        decode_memory_completion_batch_data,
-        decode_prepared_batch_data,
-    )
-    from elspeth.web.composer.continuation_evidence import require_admitted_turn_evidence
-    from elspeth.web.composer.continuation_evidence_application_data import require_selected_applied_batch_chunk
     from elspeth.web.composer.continuation_evidence_restore import read_turn_evidence_on_connection
-    from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk
 
     if type(selected) is not SelectedContinuationState or type(inventory) is not CurrentContinuationEnvInventory:
         raise AuditIntegrityError("message family source requires its actual complete selection/inventory")
@@ -326,6 +331,32 @@ def _read_current_sources(
             raise AuditIntegrityError("message family received a foreign owed-read facet")
         finish_read.require_selection(selected, inventory)
         admitted = finish_read.read_evidence(conn)
+    return _sources_from_admitted_evidence_on_connection(
+        conn, selected=selected, inventory=inventory, admitted=admitted, finish_read=finish_read
+    )
+
+
+def _sources_from_admitted_evidence_on_connection(
+    conn: Connection,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    admitted: AdmittedTurnEvidence,
+    finish_read: ContinuationFinishRead | None = None,
+) -> _MessageFamilySources:
+    """Read family relationships using the caller's actual admitted evidence."""
+    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+    from elspeth.web.composer.continuation_batch_data import (
+        RestoredBatchData,
+        decode_coupled_batch_chunk,
+        decode_memory_completion_batch_data,
+        decode_prepared_batch_data,
+    )
+    from elspeth.web.composer.continuation_evidence import require_admitted_turn_evidence
+    from elspeth.web.composer.continuation_evidence_application_data import require_selected_applied_batch_chunk
+    from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk
+
+    running = inventory.running
     evidence = admitted.snapshot
     compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
     if len(compose) != 1:
@@ -468,7 +499,7 @@ def _require_completed_tool_source_on_connection(
     from elspeth.web.composer.continuation_evidence import require_admitted_turn_evidence
     from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
     from elspeth.web.composer.continuation_phase_transitions import (
-        read_tool_issue_source_on_connection,
+        read_tool_effect_sources_on_connection,
         require_same_sequence_issue_history_on_connection,
         validate_tool_effects_on_connection,
     )
@@ -568,11 +599,16 @@ def _require_completed_tool_source_on_connection(
             read_selected_turn_evidence_graph_on_connection(conn, running, selected=historical, names=names), env_ref_names=names
         )
         return _CompletedToolSource(data, original)
-    issue = read_tool_issue_source_on_connection(conn, running, effect_key=key, env_ref_names=names)
+    # The complete effects read already admits each issue's historical source.
+    # Reuse its actual issue DATA before checking this recipe's completion.
+    issues = read_tool_effect_sources_on_connection(conn, running, selected=selected, env_ref_names=names)
+    matching_issues = tuple(issue for issue in issues if f"tool:{issue.response.digest}:{issue.tool_index}" == key)
+    if len(matching_issues) != 1:
+        raise AuditIntegrityError("tool result source lost its actual immutable issue")
+    issue = matching_issues[0]
     require_same_sequence_issue_history_on_connection(conn, running, selected=selected, issue=issue)
     if (issue.response, issue.tool_index, issue.tool_call_id) != (recipe.response, recipe.tool_index, recipe.tool_call_id):
         raise AuditIntegrityError("tool result source changed its actual immutable issue selector")
-    validate_tool_effects_on_connection(conn, running, selected=selected, env_ref_names=names)
     cursor = issue.cursor + 1
     event = conn.execute(
         select(events).where(events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == cursor)
@@ -916,6 +952,59 @@ def _attachment_source(sources: _MessageFamilySources, recipe: AttachmentResultM
     return found[0]
 
 
+def _assemble_family_cohort(
+    sources: _MessageFamilySources, requests: _FamilyRequests, *, catalogs: dict[int, PolicyCatalogView]
+) -> _RestoredFamilyCohort:
+    """Project actual source DATA; the caller retains SQL/currentness custody."""
+    from elspeth.web.composer.continuation_message_family_builders import attachment_result_message
+    from elspeth.web.composer.continuation_tool_argument_messages import rebuild_tool_argument_message
+
+    messages: list[dict[str, Any]] = []
+    feedback: list[tuple[ToolFeedbackMessageRecipe, _ToolFeedbackFamilySource]] = []
+    for index, (recipe, text) in enumerate(requests):
+        _require_selected_message(sources, text)
+        if type(recipe) is NativeThinkingMessageRecipe:
+            response = _response(sources, recipe.response)
+            _require_native_audit_source(sources, response)
+            message = rebuild_native_message(response=response, recipe=recipe, selected_message_json=text)
+        elif type(recipe) is ToolCallArgumentsMessageRecipe:
+            response = _response(sources, recipe.response)
+            _require_response_audit_source(sources, response)
+            message = rebuild_tool_argument_message(response=response, recipe=recipe, selected_message_json=text)
+        elif type(recipe) is FailureSchemaMessageRecipe:
+            call, result = _failure_source(sources, recipe)
+            message = failure_schema_message(call=call, result=result, catalog=catalogs[index])
+        elif type(recipe) is AttachmentResultMessageRecipe:
+            call, result = _attachment_source(sources, recipe)
+            message = attachment_result_message(call=call, result=result)
+        elif type(recipe) is ToolResultMessageRecipe:
+            _require_response_audit_source(sources, _response(sources, recipe.response))
+            admitted_results = tuple(item for item in sources.tool_results if item.recipe == recipe)
+            if not admitted_results:
+                raise AuditIntegrityError("tool result lost its freshly admitted producer")
+            message = admitted_results[0].message
+        elif type(recipe) is ToolFeedbackMessageRecipe:
+            _require_response_audit_source(sources, _response(sources, recipe.response))
+            admitted_feedback = tuple(item for item in sources.tool_feedback if item.recipe == recipe)
+            if not admitted_feedback:
+                raise AuditIntegrityError("feedback lost its freshly admitted committed producer")
+            message = admitted_feedback[0].message
+            feedback.append((recipe, admitted_feedback[0]))
+        elif type(recipe) is ControlResultMessageRecipe:
+            matches = tuple(wire for original, wire in sources.control_results if original == recipe)
+            if not matches or any(wire != text for wire in matches):
+                raise AuditIntegrityError("control result lost its original paid/checkpoint producer")
+            from elspeth.web.composer.continuation_message_family_builders import retained_family_wire
+
+            message = retained_family_wire(matches[0])
+        else:
+            raise AuditIntegrityError("family cohort lost its admitted recipe")
+        if family_message_wire(message) != text:
+            raise AuditIntegrityError("family cohort producer differs from complete original selected wire")
+        messages.append(message)
+    return _RestoredFamilyCohort(tuple(messages), tuple(feedback), sources.tool_feedback)
+
+
 @dataclass(frozen=True, slots=True)
 class CurrentContinuationMessageFamilies:
     service: ComposerServiceImpl
@@ -1058,9 +1147,6 @@ class CurrentContinuationMessageFamilies:
         it carries no transaction, lease, read or dispatch capability. Final
         reads recheck live custody.
         """
-        from elspeth.web.composer.continuation_message_family_builders import attachment_result_message
-        from elspeth.web.composer.continuation_tool_argument_messages import rebuild_tool_argument_message
-
         if type(requests) is not tuple:
             raise AuditIntegrityError("family cohort requires its complete requests")
         catalogs: dict[int, PolicyCatalogView] = {}
@@ -1089,49 +1175,7 @@ class CurrentContinuationMessageFamilies:
             before = _read_current_sources(conn, selected=self.selected, inventory=self.inventory, finish_read=self.finish_read)
             if policy_sources is not None and policy_sources != before:
                 raise AuditIntegrityError("family cohort changed during current policy acquisition")
-            messages: list[dict[str, Any]] = []
-            feedback: list[tuple[ToolFeedbackMessageRecipe, _ToolFeedbackFamilySource]] = []
-            for index, (recipe, text) in enumerate(requests):
-                _require_selected_message(before, text)
-                if type(recipe) is NativeThinkingMessageRecipe:
-                    response = _response(before, recipe.response)
-                    _require_native_audit_source(before, response)
-                    message = rebuild_native_message(response=response, recipe=recipe, selected_message_json=text)
-                elif type(recipe) is ToolCallArgumentsMessageRecipe:
-                    response = _response(before, recipe.response)
-                    _require_response_audit_source(before, response)
-                    message = rebuild_tool_argument_message(response=response, recipe=recipe, selected_message_json=text)
-                elif type(recipe) is FailureSchemaMessageRecipe:
-                    call, result = _failure_source(before, recipe)
-                    message = failure_schema_message(call=call, result=result, catalog=catalogs[index])
-                elif type(recipe) is AttachmentResultMessageRecipe:
-                    call, result = _attachment_source(before, recipe)
-                    message = attachment_result_message(call=call, result=result)
-                elif type(recipe) is ToolResultMessageRecipe:
-                    _require_response_audit_source(before, _response(before, recipe.response))
-                    admitted_results = tuple(item for item in before.tool_results if item.recipe == recipe)
-                    if not admitted_results:
-                        raise AuditIntegrityError("tool result lost its freshly admitted producer")
-                    message = admitted_results[0].message
-                elif type(recipe) is ToolFeedbackMessageRecipe:
-                    _require_response_audit_source(before, _response(before, recipe.response))
-                    admitted_feedback = tuple(item for item in before.tool_feedback if item.recipe == recipe)
-                    if not admitted_feedback:
-                        raise AuditIntegrityError("feedback lost its freshly admitted committed producer")
-                    message = admitted_feedback[0].message
-                    feedback.append((recipe, admitted_feedback[0]))
-                elif type(recipe) is ControlResultMessageRecipe:
-                    matches = tuple(wire for original, wire in before.control_results if original == recipe)
-                    if not matches or any(wire != text for wire in matches):
-                        raise AuditIntegrityError("control result lost its original paid/checkpoint producer")
-                    from elspeth.web.composer.continuation_message_family_builders import retained_family_wire
-
-                    message = retained_family_wire(matches[0])
-                else:
-                    raise AuditIntegrityError("family cohort lost its admitted recipe")
-                if family_message_wire(message) != text:
-                    raise AuditIntegrityError("family cohort producer differs from complete original selected wire")
-                messages.append(message)
+            cohort = _assemble_family_cohort(before, requests, catalogs=catalogs)
             if self.finish_read is None:
                 # These builders consume admitted DATA while this transaction
                 # excludes session writers. Only time/current authority can
@@ -1143,7 +1187,7 @@ class CurrentContinuationMessageFamilies:
                     expected_checkpoint_id=self.selected.checkpoint_id,
                     expected_cursor=self.selected.stack.cursor,
                 )
-                return _RestoredFamilyCohort(tuple(messages), tuple(feedback), before.tool_feedback)
+                return cohort
             after = _read_current_sources(conn, selected=self.selected, inventory=self.inventory, finish_read=self.finish_read)
             # Both are actual full readers. Equality does not grant admission;
             # it binds their complete selected cohorts across pure rebuilding.
@@ -1182,4 +1226,39 @@ class CurrentContinuationMessageFamilies:
                     if not prior or not current or prior != current:
                         raise AuditIntegrityError("feedback source changed during current reconstruction")
                     _require_response_audit_source(after, _response(after, recipe.response))
-            return _RestoredFamilyCohort(tuple(messages), tuple(feedback), before.tool_feedback)
+            return cohort
+
+    def _assemble_admitted_cohort(self, requests: _FamilyRequests, *, admitted: AdmittedTurnEvidence) -> _RestoredFamilyCohort:
+        """Build private DATA for a caller that owes the complete final source read."""
+        from elspeth.web.composer.continuation_evidence import require_admitted_turn_evidence
+        from elspeth.web.composer.continuation_evidence_restore import _require_ordinary_evidence_read_on_connection
+
+        if self.finish_read is not None or any(type(recipe) is FailureSchemaMessageRecipe for recipe, _text in requests):
+            return self._restore_cohort(requests)
+        if not requests:
+            return _RestoredFamilyCohort((), (), ())
+        with locked_session_transaction(self.authority._engine, str(self.inventory.running.claim.session_id)) as conn:
+            names = _require_ordinary_evidence_read_on_connection(
+                conn, self.inventory.running, selected=self.selected, inventory=self.inventory
+            )
+            admitted = require_admitted_turn_evidence(admitted, env_ref_names=names)
+            compose = tuple(frame for frame in self.selected.stack.frames if type(frame) is ComposeFrame)
+            if (
+                len(compose) != 1
+                or admitted.source_chunk.reference != compose[0].evidence
+                or admitted.snapshot.logical != self.selected.stack.logical
+                or admitted.snapshot.recorder != compose[0].audit_buffer
+            ):
+                raise AuditIntegrityError("private family assembly changed its actual selected evidence source")
+            sources = _sources_from_admitted_evidence_on_connection(
+                conn, selected=self.selected, inventory=self.inventory, admitted=admitted
+            )
+            cohort = _assemble_family_cohort(sources, requests, catalogs={})
+            require_current_env_inventory_on_connection(
+                conn,
+                self.inventory.running,
+                inventory=self.inventory,
+                expected_checkpoint_id=self.selected.checkpoint_id,
+                expected_cursor=self.selected.stack.cursor,
+            )
+            return cohort

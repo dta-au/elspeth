@@ -272,6 +272,40 @@ def validate_tool_effects_data_on_connection(
     env_ref_names: frozenset[str],
 ) -> tuple[str, ...]:
     """Immutable source checks without granting a dispatch or live context."""
+    unresolved, _issues = _read_tool_effects_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, env_ref_names=env_ref_names
+    )
+    return unresolved
+
+
+def read_tool_effect_sources_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    env_ref_names: frozenset[str],
+) -> tuple[ToolIssueSource, ...]:
+    """Read original issue DATA while validating every actual tool effect."""
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    _unresolved, issues = _read_tool_effects_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        env_ref_names=env_ref_names,
+    )
+    return issues
+
+
+def _read_tool_effects_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    env_ref_names: frozenset[str],
+) -> tuple[tuple[str, ...], tuple[ToolIssueSource, ...]]:
+    """Return unresolved keys and the issue DATA read by the complete checks."""
     from elspeth.web.sessions.continuation_primary import read_committed_primary_response_data_on_connection
 
     sid, operation = str(session_id), operation_id
@@ -279,6 +313,7 @@ def validate_tool_effects_data_on_connection(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.owner == "tool_dispatch")
     ).all()
     unresolved: list[str] = []
+    issues: list[ToolIssueSource] = []
     for effect in rows:
         if (
             effect.disposition == "refused"
@@ -302,6 +337,7 @@ def validate_tool_effects_data_on_connection(
         issue = read_tool_issue_data_on_connection(
             conn, session_id=session_id, operation_id=operation_id, effect_key=effect.effect_key, env_ref_names=env_ref_names
         )
+        issues.append(issue)
         read_committed_primary_response_data_on_connection(
             conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=issue.response
         )
@@ -334,7 +370,7 @@ def validate_tool_effects_data_on_connection(
             or completed.batch.current_call is not None
         ):
             raise AuditIntegrityError("tool result changed its exact issued call/completed prefix")
-    return tuple(unresolved)
+    return tuple(unresolved), tuple(issues)
 
 
 def require_tool_issue_on_connection(

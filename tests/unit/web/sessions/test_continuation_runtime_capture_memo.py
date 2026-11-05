@@ -7,12 +7,20 @@ from hashlib import sha256
 from threading import Event
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import delete, select, text, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer import continuation_evidence_restore as evidence_reader
 from elspeth.web.composer import continuation_runtime as runtime_owner
-from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
+from elspeth.web.composer.continuation_codec import (
+    decode_continuation_snapshot,
+    encode_continuation_snapshot,
+    encode_mandatory_private_chunk,
+)
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.continuation_retention_memo import (
     RetentionStageMemo,
     current_retention_stage_memo,
@@ -21,6 +29,7 @@ from elspeth.web.continuation_retention_memo import (
 from elspeth.web.sessions import continuation_runtime as sql_owner
 from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, private_chunk_key, put_chunk
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import recovery_rows
@@ -41,8 +50,16 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running
     runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    # A complete equal selection is valid DATA and exercises the existing full
+    # initial acquisition rather than the same-object env-only optimization.
+    arguments = {**arguments, "selected": replace(arguments["selected"])}
     original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owners
+    original_require = sql_owner.require_runtime_source_current_on_connection
+    original_decode = evidence_reader.decode_turn_evidence
+    original_closure = sql_owner.load_selected_private_chunks_on_connection
     sql_reads, captures, lookups, computations = [], [], [], []
+    sources, current_decodes, closures, final_sources = [], [], [], []
+    in_final = False
     original_lookup = RetentionStageMemo._lookup
     entered, release = Event(), Event()
     original_error = ValueError("original physical capture error")
@@ -51,9 +68,35 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
         memo = current_retention_stage_memo()
         assert type(memo) is RetentionStageMemo and memo.active
         sql_reads.append((memo, conn))
-        if outcome == "initial-read-error" or (outcome == "final-read-error" and len(sql_reads) == 2):
+        if outcome == "initial-read-error":
             raise original_error
-        return original_read(conn, *args, **kwargs)
+        result = original_read(conn, *args, **kwargs)
+        sources.append(result)
+        return result
+
+    def require(conn, *args, **kwargs):
+        nonlocal in_final
+        memo = current_retention_stage_memo()
+        assert memo is captures[-1] and memo.active
+        assert kwargs["source"] is sources[-1]
+        final_sources.append(kwargs["source"])
+        sql_reads.append((memo, conn))
+        if outcome == "final-read-error":
+            raise original_error
+        in_final = True
+        try:
+            return original_require(conn, *args, **kwargs)
+        finally:
+            in_final = False
+
+    def decode(chunk, **kwargs):
+        if chunk.reference == arguments["selected"].stack.frames[0].evidence:
+            current_decodes.append(in_final)
+        return original_decode(chunk, **kwargs)
+
+    def closure(*args, **kwargs):
+        closures.append(in_final)
+        return original_closure(*args, **kwargs)
 
     def lookup(memo, entries, key, compute):
         lookups.append(memo)
@@ -78,6 +121,9 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
         return result
 
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
+    monkeypatch.setattr(evidence_reader, "decode_turn_evidence", decode)
+    monkeypatch.setattr(sql_owner, "load_selected_private_chunks_on_connection", closure)
     monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
     monkeypatch.setattr(RetentionStageMemo, "_lookup", lookup)
     before = recovery_rows(operation_store[0])
@@ -115,6 +161,11 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
         assert len(sql_reads) == len(expected)
         assert all(actual is wanted for (actual, _conn), wanted in zip(sql_reads, expected, strict=True))
         assert all(conn.closed for _memo, conn in sql_reads)
+        assert not any(current_decodes) and not any(closures)
+        if outcome != "initial-read-error":
+            assert current_decodes and closures
+            assert len(sources) == len(captures)
+        assert len(final_sources) == (0 if outcome in ("initial-read-error", "capture-error") else len(captures))
         if outcome not in ("initial-read-error", "capture-error"):
             assert sql_reads[0][1] is not sql_reads[1][1]
         assert current_retention_stage_memo() is None
@@ -127,32 +178,45 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
 
 
 @pytest.mark.asyncio
-async def test_runtime_facade_defaults_to_fresh_isolation_and_borrows_only_explicit_current_memo(operation_store, monkeypatch):
+@pytest.mark.parametrize("facade", ("read", "require"))
+async def test_runtime_facade_defaults_to_fresh_isolation_and_borrows_only_explicit_current_memo(operation_store, monkeypatch, facade):
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running
     original_read = sql_owner.read_runtime_source_on_connection
+    original_require = sql_owner.require_runtime_source_current_on_connection
+    authority = arguments["authority"]
+    source = await asyncio.to_thread(
+        authority.read_continuation_runtime, running, selected=arguments["selected"], inventory=arguments["inventory"]
+    )
+    method = authority.read_continuation_runtime if facade == "read" else authority.require_continuation_runtime_current
+    values = {"selected": arguments["selected"]} if facade == "read" else {"source": source}
     observed = []
 
     def read(*args, **kwargs):
         observed.append(current_retention_stage_memo())
         return original_read(*args, **kwargs)
 
+    def require(*args, **kwargs):
+        observed.append(current_retention_stage_memo())
+        return original_require(*args, **kwargs)
+
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
     try:
         with retention_stage_memo_scope() as outer:
             for _ in range(2):
                 await asyncio.to_thread(
-                    arguments["authority"].read_continuation_runtime,
+                    method,
                     running,
-                    selected=arguments["selected"],
+                    **values,
                     inventory=arguments["inventory"],
                 )
                 assert observed[-1] is not outer and not observed[-1].active
             assert observed[0] is not observed[1]
             await asyncio.to_thread(
-                arguments["authority"].read_continuation_runtime,
+                method,
                 running,
-                selected=arguments["selected"],
+                **values,
                 inventory=arguments["inventory"],
                 retention_memo=outer,
             )
@@ -165,17 +229,30 @@ async def test_runtime_facade_defaults_to_fresh_isolation_and_borrows_only_expli
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["foreign", "closed", "wrong-current"])
-async def test_runtime_facade_refuses_invalid_borrow_before_sql(operation_store, monkeypatch, kind):
+@pytest.mark.parametrize("facade", ("read", "require"))
+async def test_runtime_facade_refuses_invalid_borrow_before_sql(operation_store, monkeypatch, kind, facade):
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running
     original_read = sql_owner.read_runtime_source_on_connection
+    original_require = sql_owner.require_runtime_source_current_on_connection
+    authority = arguments["authority"]
+    source = await asyncio.to_thread(
+        authority.read_continuation_runtime, running, selected=arguments["selected"], inventory=arguments["inventory"]
+    )
+    method = authority.read_continuation_runtime if facade == "read" else authority.require_continuation_runtime_current
+    values = {"selected": arguments["selected"]} if facade == "read" else {"source": source}
     observed = []
 
     def read(*args, **kwargs):
         observed.append(True)
         return original_read(*args, **kwargs)
 
+    def require(*args, **kwargs):
+        observed.append(True)
+        return original_require(*args, **kwargs)
+
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
     with retention_stage_memo_scope() as closed:
         pass
     try:
@@ -184,9 +261,9 @@ async def test_runtime_facade_refuses_invalid_borrow_before_sql(operation_store,
             before = recovery_rows(operation_store[0])
             with pytest.raises(AuditIntegrityError, match="exact active retention memo"):
                 await asyncio.to_thread(
-                    arguments["authority"].read_continuation_runtime,
+                    method,
                     running,
-                    selected=arguments["selected"],
+                    **values,
                     inventory=arguments["inventory"],
                     retention_memo=borrowed,
                 )
@@ -198,35 +275,65 @@ async def test_runtime_facade_refuses_invalid_borrow_before_sql(operation_store,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["sql-bytes", "current-policy", "current-inventory"])
+@pytest.mark.parametrize("change", ["sql-bytes", "sql-missing", "sql-storage-type", "current-policy", "current-inventory"])
 async def test_capture_memo_does_not_replace_final_current_sql_validation(operation_store, monkeypatch, change):
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running
     runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    await _capture(runtime, arguments)
+    arguments = {**arguments, "selected": replace(arguments["selected"])}
     original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owners
+    original_require = sql_owner.require_runtime_source_current_on_connection
     reads, capture_memos, after_mutation = [], [], []
+    capture_sources = []
 
     def read(*args, **kwargs):
         reads.append(current_retention_stage_memo())
         return original_read(*args, **kwargs)
 
+    def require(*args, **kwargs):
+        reads.append(current_retention_stage_memo())
+        assert kwargs["source"] is capture_sources[-1]
+        return original_require(*args, **kwargs)
+
     def capture(*args, **kwargs):
         capture_memos.append(current_retention_stage_memo())
+        capture_sources.append(kwargs["source"])
         result = original_capture(*args, **kwargs)
         with locked_session_transaction(operation_store[0], str(running.claim.session_id)) as conn:
-            if change == "sql-bytes":
+            if change in ("sql-bytes", "sql-missing", "sql-storage-type"):
                 reference = arguments["selected"].stack.frames[0].caches
                 original = next(chunk for chunk in arguments["selected"].chunks if chunk.reference == reference)
-                payload = original.canonical.encode("utf-8") + b" "
-                changed = conn.execute(
-                    update(chunks)
-                    .where(
-                        chunks.c.session_id == str(running.claim.session_id),
-                        chunks.c.operation_id == running.claim.operation_id,
-                        chunks.c.chunk_key == private_chunk_key(original),
-                    )
-                    .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
+                predicate = (
+                    (chunks.c.session_id == str(running.claim.session_id))
+                    & (chunks.c.operation_id == running.claim.operation_id)
+                    & (chunks.c.chunk_key == private_chunk_key(original))
                 )
+                if change == "sql-missing":
+                    changed = conn.execute(delete(chunks).where(predicate))
+                elif change == "sql-storage-type":
+                    assert conn.dialect.name == "sqlite" and original.canonical.isascii()
+                    # Keep actual bytes/length/SHA equal while changing SQLite's
+                    # storage class to TEXT; no constraint is disabled.
+                    changed = conn.execute(
+                        text(
+                            "UPDATE composer_continuation_chunks SET payload=:payload "
+                            "WHERE session_id=:sid AND operation_id=:oid AND chunk_key=:key"
+                        ),
+                        {
+                            "payload": original.canonical,
+                            "sid": str(running.claim.session_id),
+                            "oid": running.claim.operation_id,
+                            "key": private_chunk_key(original),
+                        },
+                    )
+                else:
+                    payload = original.canonical.encode("utf-8") + b" "
+                    changed = conn.execute(
+                        update(chunks)
+                        .where(predicate)
+                        .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
+                    )
                 assert changed.rowcount == 1
             elif change == "current-policy":
                 different = "0" * 64 if arguments["selected"].stack.policy_hash != "0" * 64 else "1" * 64
@@ -265,6 +372,7 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
         return result
 
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
     monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
     try:
         with pytest.raises(AuditIntegrityError):
@@ -279,11 +387,144 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
 
 
 @pytest.mark.asyncio
+async def test_final_capture_rechecks_nonselected_historical_witness(operation_store, tmp_path, monkeypatch):
+    from tests.unit.web.sessions import test_continuation_live_phases as phases
+    from tests.unit.web.sessions.test_continuation_v4_metadata_live import _v4_tool_case
+
+    async with _v4_tool_case(operation_store, tmp_path, monkeypatch) as (store, owner, running, sdk):
+        await phases._advance(owner)
+        assert owner.latest_snapshot is not None
+        selected = await load_selected_continuation(
+            authority=owner.authority, running=running, selected=owner.latest_snapshot, required_work=owner.work
+        )
+        current = await owner.restore_finished_batch(selected)
+        runtime, inventory = current.runtime, current.inventory
+        arguments = {"selected": selected, "inventory": inventory}
+        await _capture(runtime, arguments)
+        assert len(sdk) == 1
+        actual_capture = runtime_owner._capture_owners
+        actual_require = sql_owner.require_runtime_source_current_on_connection
+        mutated, final_errors = [], []
+
+        def capture(*args, **values):
+            result = actual_capture(*args, **values)
+            source = values["source"]
+            assert source.evidence.application_entry is not None
+            record = source.evidence.application_entry.applications[0]
+            with store[0].begin() as conn:
+                old = conn.execute(select(checkpoints).where(checkpoints.c.checkpoint_id == record.checkpoint_id)).one()
+                assert old.snapshot_chunk_key not in {private_chunk_key(chunk) for chunk in source.selected.chunks}
+                chunk = conn.execute(
+                    select(chunks).where(chunks.c.session_id == str(store[4]), chunks.c.chunk_key == old.snapshot_chunk_key)
+                ).one()
+                root = decode_continuation_snapshot(chunk.payload.decode("utf-8"))
+                top = root.frames[-1]
+                changed_top = top.model_copy(update={"next_tool_index": 1 if top.next_tool_index == 0 else 0})
+                changed_root = root.model_copy(update={"frames": (*root.frames[:-1], changed_top)})
+                payload = encode_continuation_snapshot(changed_root).encode("utf-8")
+                assert decode_continuation_snapshot(payload.decode("utf-8")) == changed_root
+                changed = conn.execute(
+                    update(chunks)
+                    .where(chunks.c.session_id == str(store[4]), chunks.c.chunk_key == old.snapshot_chunk_key)
+                    .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
+                )
+                assert changed.rowcount == 1
+            mutated.append((source, recovery_rows(store[0])))
+            return result
+
+        def require(*args, **values):
+            assert values["source"] is mutated[-1][0]
+            try:
+                return actual_require(*args, **values)
+            except AuditIntegrityError as error:
+                final_errors.append(error)
+                raise
+
+        monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
+        monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
+        with pytest.raises(AuditIntegrityError) as refused:
+            await _capture(runtime, arguments)
+        assert len(mutated) == 1 and final_errors == [refused.value]
+        assert recovery_rows(store[0]) == mutated[0][1] and len(sdk) == 1
+        owner.work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_failure", (False, True), ids=("original-refusal", "ordered-refusal-and-source-failure"))
+async def test_final_capture_preserves_actual_retention_refusal_and_final_failure_group(operation_store, monkeypatch, final_failure):
+    arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
+    running = arguments["inventory"].running
+    runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    await _capture(runtime, arguments)
+    actual_capture, actual_require = runtime_owner._capture_owners, sql_owner.require_runtime_source_current_on_connection
+    refusals, failures, checked, after_mutation = [], [], [], []
+
+    def capture(*args, **values):
+        actual_capture(*args, **values)
+        if final_failure:
+            reference = arguments["selected"].stack.frames[0].caches
+            with operation_store[0].begin() as conn:
+                payload = b"{}"
+                changed = conn.execute(
+                    update(chunks)
+                    .where(
+                        chunks.c.session_id == str(running.claim.session_id),
+                        chunks.c.operation_id == running.claim.operation_id,
+                        chunks.c.chunk_key == f"value:{reference.codec}:{reference.digest}",
+                    )
+                    .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
+                )
+                assert changed.rowcount == 1
+        after_mutation.append(recovery_rows(operation_store[0]))
+        # Exercise the real mandatory encoder after real owner capture. This
+        # extra document is test DATA, never a replacement selected source.
+        try:
+            encode_mandatory_private_chunk(
+                codec="composer.messages.v1", value={"padding": "x" * CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES}
+            )
+        except ComposerContextUnsupported as refused:
+            refusals.append(refused)
+            raise
+        raise AssertionError("actual over-bound mandatory document was accepted")
+
+    def require(*args, **values):
+        checked.append(values["source"])
+        assert values["source"] is runtime.source
+        try:
+            return actual_require(*args, **values)
+        except AuditIntegrityError as error:
+            failures.append(error)
+            raise
+
+    monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
+    monkeypatch.setattr(sql_owner, "require_runtime_source_current_on_connection", require)
+    try:
+        if final_failure:
+            with pytest.raises(BaseExceptionGroup, match="Retention refusal and final current-source admission") as grouped:
+                await _capture(runtime, arguments)
+            assert len(refusals) == len(failures) == 1
+            assert grouped.value.exceptions == (refusals[0], failures[0])
+        else:
+            with pytest.raises(ComposerContextUnsupported) as carried:
+                await _capture(runtime, arguments)
+            assert len(refusals) == 1 and not failures
+            assert carried.value.__cause__ is refusals[0] and carried.value.reason == refusals[0].reason == "retained_chunk_bytes"
+            assert carried.value.tool_invocations == runtime.live.recorder.invocations[runtime.drained.invocations :]
+            assert carried.value.llm_calls == runtime.live.recorder.llm_calls[runtime.drained.llm_calls :]
+        assert checked == [runtime.source] and len(after_mutation) == 1
+        assert recovery_rows(operation_store[0]) == after_mutation[0]
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("warm", (False, True), ids=("cold", "warm"))
 async def test_capture_prefix_uses_original_roundtripped_chunk_and_one_fresh_live_encoding(operation_store, monkeypatch, warm):
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running
     runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    arguments = {**arguments, "selected": replace(arguments["selected"])}
     original_read = sql_owner.read_runtime_source_on_connection
     original_decode = runtime_owner.decode_recorder_snapshot
     original_encode = runtime_owner.encode_recorder_snapshot
@@ -314,7 +555,7 @@ async def test_capture_prefix_uses_original_roundtripped_chunk_and_one_fresh_liv
         monkeypatch.setattr(runtime_owner, "decode_recorder_snapshot", decode)
         monkeypatch.setattr(runtime_owner, "encode_recorder_snapshot", encode)
         result = await _capture(runtime, arguments)
-        assert len(reads) == 2 and len(decoded) == len(encoded) == 1
+        assert len(reads) == 1 and len(decoded) == len(encoded) == 1
         assert decoded[0][0] is reads[0].admitted_evidence.recorder_chunk
         assert encoded[0] == decoded[0][0]
         frame = result.stack.frames[0]
@@ -332,6 +573,7 @@ async def test_capture_prefix_handoff_keeps_fresh_live_and_original_chunk_oppone
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running
     runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    arguments = {**arguments, "selected": replace(arguments["selected"])}
     original_read = sql_owner.read_runtime_source_on_connection
     original_decode = runtime_owner.decode_recorder_snapshot
     original_encode = runtime_owner.encode_recorder_snapshot

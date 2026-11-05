@@ -417,3 +417,62 @@ async def test_failed_result_without_actual_private_plugin_identity_cannot_mint_
             await restore_case(operation_store, case)
     finally:
         operation_store[1].release(case["kwargs"]["inventory"].running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_completed_recipe_admits_original_issue_once_and_separate_completion(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer import continuation_evidence_restore as evidence_reader
+    from elspeth.web.composer import continuation_phase_transitions as transitions
+    from elspeth.web.composer.continuation_message_family_builders import family_message_wire
+    from elspeth.web.composer.continuation_message_family_recipes import ToolResultMessageRecipe
+    from tests.unit.web.sessions import test_continuation_live_phases as phases
+
+    async with phases._phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
+        await phases._advance(owner)
+        runtime = owner.runtime
+        message = next(item for item in runtime.live.llm_messages if item.get("tool_call_id") == "first_read")
+        wire, recipe = runtime.materialization.capture_message(message)
+        assert type(recipe) is ToolResultMessageRecipe
+        current = CurrentContinuationMessageFamilies(
+            owner.service, owner.authority, runtime.source.selected, runtime.materialization.inventory
+        )
+        original_issue = transitions.read_tool_issue_data_on_connection
+        original_evidence = evidence_reader.read_selected_turn_evidence_graph_data_on_connection
+        attempts, issues, evidence_proofs = [], [], []
+
+        def read_issue(conn, **values):
+            assert conn.in_transaction()
+            attempts.append((conn, values["effect_key"]))
+            result = original_issue(conn, **values)
+            assert type(result) is transitions.ToolIssueSource
+            issues.append((conn, values["effect_key"], result))
+            return result
+
+        def read_evidence(conn, *args, **values):
+            result = original_evidence(conn, *args, **values)
+            selected = values["selected"]
+            evidence_proofs.append((conn, selected.checkpoint_id, selected.stack.cursor, len(issues)))
+            return result
+
+        monkeypatch.setattr(transitions, "read_tool_issue_data_on_connection", read_issue)
+        monkeypatch.setattr(evidence_reader, "read_selected_turn_evidence_graph_data_on_connection", read_evidence)
+        before = stored_rows(operation_store[0])
+        restored = await asyncio.to_thread(current.restore_messages, ((recipe, wire),))
+        assert len(restored) == 1 and family_message_wire(restored[0]) == wire
+        assert len(issues) == 1
+        conn, effect_key, issue = issues[0]
+        assert attempts == [(conn, f"tool:{recipe.response.digest}:{recipe.tool_index}")]
+        assert effect_key == attempts[0][1]
+        assert (issue.response, issue.tool_index, issue.tool_call_id) == (recipe.response, recipe.tool_index, recipe.tool_call_id)
+        issued = [
+            (checkpoint, cursor) for actual, checkpoint, cursor, completed in evidence_proofs if actual is conn and cursor == issue.cursor
+        ]
+        completed = [
+            (checkpoint, cursor)
+            for actual, checkpoint, cursor, returned_issues in evidence_proofs
+            if actual is conn and cursor == issue.cursor + 1 and returned_issues == 1
+        ]
+        assert len(issued) == len(completed) == 1 and issued[0][0] != completed[0][0]
+        assert conn.closed and stored_rows(operation_store[0]) == before and len(sdk) == 1
+        assert runtime.materialization.capture_message(message) == (wire, recipe)
+        owner.work.coordinator.assert_completed()

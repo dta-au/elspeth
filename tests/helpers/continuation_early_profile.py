@@ -4,7 +4,7 @@ Mode zero observes only inclusive clock-to-preparation-finish time. Mode one
 adds selected inclusive spans, native thread CPU, SQL and the already calibrated
 original-witness observer, plus four-family memo statistics. Mode two records
 the same spans without the memo observer. A separate CPU opt-in, available
-only in mode one, captures the first current-evidence memo scope. No mode
+in either span mode, captures the first current-evidence memo scope. No mode
 replaces submitted callables, adjusts a deadline, consumes a clock stage,
 caches a result or records private payloads.
 """
@@ -152,7 +152,13 @@ class EarlyPreparationProfile:
         from elspeth.web.composer import continuation_checkpoint_early_physical as physical
         from elspeth.web.composer import continuation_checkpoint_end_detached as detached
         from elspeth.web.composer import continuation_current_evidence as current_evidence
+        from elspeth.web.composer import continuation_evidence_restore as evidence_restore
+        from elspeth.web.composer import continuation_prompt_producers as prompt_producers
         from elspeth.web.composer import continuation_runtime as runtime
+        from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
+        from elspeth.web.composer.continuation_selection import SelectedContinuationState
+        from elspeth.web.sessions import continuation_p4_application_store as application_store
+        from elspeth.web.sessions import continuation_runtime as sql_runtime
         from elspeth.web.sessions.service import SessionServiceImpl
 
         original_init = ContinuationActionClock.__init__
@@ -239,10 +245,67 @@ class EarlyPreparationProfile:
                             "borrow_v4_preparation_memo_scope",
                             self._current_evidence_scope(
                                 current_evidence.borrow_v4_preparation_memo_scope,
-                                current_evidence._restore_current_message_evidence,
+                                current_evidence._assemble_runtime_message_evidence,
                             ),
                         )
                     patch.setattr(runtime, "_capture_owners", self._sync("runtime._capture_owners", runtime._capture_owners))
+                    for owner, name, original, label in (
+                        (
+                            sql_runtime,
+                            "read_runtime_source_on_connection",
+                            sql_runtime.read_runtime_source_on_connection,
+                            "runtime.full_source_read",
+                        ),
+                        (
+                            sql_runtime,
+                            "load_selected_private_chunks_on_connection",
+                            sql_runtime.load_selected_private_chunks_on_connection,
+                            "runtime.sql_private_closure",
+                        ),
+                        (
+                            sql_runtime,
+                            "require_runtime_source_current_on_connection",
+                            sql_runtime.require_runtime_source_current_on_connection,
+                            "runtime.final_source_verifier",
+                        ),
+                        (
+                            AdmittedTurnEvidence,
+                            "_require_original_graph",
+                            AdmittedTurnEvidence._require_original_graph,
+                            "evidence.original_graph",
+                        ),
+                        (
+                            evidence_restore,
+                            "_require_selected_evidence_relations_on_connection",
+                            evidence_restore._require_selected_evidence_relations_on_connection,
+                            "evidence.sql_relations",
+                        ),
+                        (
+                            prompt_producers,
+                            "_inputs_from_current_evidence_on_connection",
+                            prompt_producers._inputs_from_current_evidence_on_connection,
+                            "runtime.message_inputs",
+                        ),
+                        (
+                            sql_runtime,
+                            "_assemble_runtime_source_on_connection",
+                            sql_runtime._assemble_runtime_source_on_connection,
+                            "runtime.source_assembly",
+                        ),
+                        (
+                            application_store,
+                            "require_p4_application_journal_on_connection",
+                            application_store.require_p4_application_journal_on_connection,
+                            "evidence.sql_journal",
+                        ),
+                        (
+                            SelectedContinuationState,
+                            "__post_init__",
+                            SelectedContinuationState.__post_init__,
+                            "selection.private_closure",
+                        ),
+                    ):
+                        patch.setattr(owner, name, self._sync(label, original))
                     patch.setattr(
                         advisor, "prepare_provider_input", self._sync("advisor.prepare_provider_input", advisor.prepare_provider_input)
                     )
@@ -320,7 +383,7 @@ def early_preparation_profile(monkeypatch, engine, *, output_key):
     assert mode in {"0", "1", "2"}
     cpu_mode = os.environ.get(CPU_PROFILE_FLAG)
     assert cpu_mode in {None, "current_evidence"}, "EARLY CPU target must be current_evidence"
-    assert cpu_mode is None or mode == "1", "EARLY CPU capture requires selected-span mode"
+    assert cpu_mode is None or mode in {"1", "2"}, "EARLY CPU capture requires selected-span mode"
     root = Path(__file__).resolve().parents[2]
     directory = Path(os.environ.get(PROFILE_DIRECTORY, ".claude/lanes/early-preparation-profile"))
     if not directory.is_absolute():

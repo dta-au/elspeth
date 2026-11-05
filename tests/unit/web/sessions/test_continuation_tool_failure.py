@@ -346,6 +346,170 @@ async def test_actual_advisor_feedback_uses_successful_audit_projection_and_cold
 
 
 @pytest.mark.asyncio
+async def test_copied_advisor_feedback_reuses_admission_and_keeps_source_owners_separate(operation_store, tmp_path, monkeypatch):
+    import asyncio
+    from types import MappingProxyType
+
+    from elspeth.web.composer import continuation_evidence_restore as evidence_reader
+    from elspeth.web.composer import continuation_message_families as families
+    from elspeth.web.composer import continuation_phase_transitions as transitions
+    from elspeth.web.composer import continuation_prompt_producers as producers
+    from elspeth.web.composer.continuation_message_family_builders import family_message_wire
+    from elspeth.web.composer.continuation_message_family_recipes import ToolFeedbackMessageRecipe
+    from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
+    from tests.unit.web.sessions.test_continuation_live_phases import stored_rows
+
+    async with _advisor_case(operation_store, tmp_path, monkeypatch) as (owner, _running, sdk):
+        await _advance(owner)
+        runtime = owner.runtime
+        message = next(item for item in runtime.live.llm_messages if item.get("tool_call_id") == "actual_advisor")
+        wire, recipe = runtime.materialization.capture_message(message)
+        assert type(recipe) is ToolFeedbackMessageRecipe and recipe.source == "advisor_success"
+        actual_current = evidence_reader.read_turn_evidence_on_connection
+        assert producers.read_turn_evidence_on_connection is actual_current
+        actual_issue = transitions.read_tool_issue_data_on_connection
+        actual_historical = evidence_reader.read_selected_turn_evidence_graph_data_on_connection
+        actual_private = families.CurrentContinuationMessageFamilies._assemble_admitted_cohort
+        actual_runtime = owner.authority.read_continuation_runtime
+        phase = "runtime"
+        current_reads, issues, historical, admitted_cohorts, sources = [], [], [], [], []
+
+        def current(*args, **values):
+            result = actual_current(*args, **values)
+            current_reads.append((phase, result))
+            return result
+
+        def issue(conn, **values):
+            result = actual_issue(conn, **values)
+            if phase == "private":
+                assert conn.in_transaction()
+                issues.append((conn, values["effect_key"], result))
+            return result
+
+        def read_historical(conn, *args, **values):
+            result = actual_historical(conn, *args, **values)
+            if phase == "private":
+                assert conn.in_transaction()
+                selected = values["selected"]
+                historical.append((conn, selected.checkpoint_id, selected.stack.cursor, len(issues)))
+            return result
+
+        def read_runtime(*args, **values):
+            assert phase == "runtime"
+            result = actual_runtime(*args, **values)
+            sources.append(result)
+            return result
+
+        def private(self, requests, *, admitted):
+            nonlocal phase
+            assert phase == "runtime" and len(sources) == 1
+            assert admitted is sources[0].admitted_evidence
+            phase = "private"
+            try:
+                result = actual_private(self, requests, admitted=admitted)
+                admitted_cohorts.append(result)
+                return result
+            finally:
+                phase = "runtime"
+
+        monkeypatch.setattr(evidence_reader, "read_turn_evidence_on_connection", current)
+        monkeypatch.setattr(producers, "read_turn_evidence_on_connection", current)
+        monkeypatch.setattr(transitions, "read_tool_issue_data_on_connection", issue)
+        monkeypatch.setattr(evidence_reader, "read_selected_turn_evidence_graph_data_on_connection", read_historical)
+        monkeypatch.setattr(families.CurrentContinuationMessageFamilies, "_assemble_admitted_cohort", private)
+        monkeypatch.setattr(owner.authority, "read_continuation_runtime", read_runtime)
+        before = stored_rows(operation_store[0])
+        restored = await restore_continuation_runtime(
+            service=owner.service,
+            authority=owner.authority,
+            selected=runtime.source.selected,
+            inventory=runtime.materialization.inventory,
+            required_work=owner.work,
+            provider_owner=owner.provider_owner,
+        )
+        assert len(sources) == 2 and restored.source is sources[0]
+        assert len(admitted_cohorts) == 1 and not any(stage == "private" for stage, _result in current_reads)
+        assert current_reads and all(stage == "runtime" for stage, _result in current_reads)
+        assert len(issues) == 1
+        conn, effect_key, issued = issues[0]
+        assert effect_key == f"tool:{recipe.response.digest}:{recipe.tool_index}"
+        assert (issued.response, issued.tool_index, issued.tool_call_id) == (recipe.response, recipe.tool_index, recipe.tool_call_id)
+        issue_proofs = [
+            (checkpoint, cursor) for actual, checkpoint, cursor, _count in historical if actual is conn and cursor == issued.cursor
+        ]
+        completion_proofs = [
+            (checkpoint, cursor)
+            for actual, checkpoint, cursor, returned_issues in historical
+            if actual is conn and cursor == issued.cursor + 1 and returned_issues == 1
+        ]
+        assert len(issue_proofs) == len(completion_proofs) == 1 and issue_proofs[0][0] != completion_proofs[0][0]
+        assert conn.closed
+
+        # Calibrate the observer on the actual public path, which still performs
+        # full current admission rather than receiving the earlier private DATA.
+        phase = "public"
+        public = families.CurrentContinuationMessageFamilies(
+            owner.service, owner.authority, runtime.source.selected, runtime.materialization.inventory
+        )
+        (public_message,) = await asyncio.to_thread(public.restore_messages, ((recipe, wire),))
+        assert family_message_wire(public_message) == wire
+        assert any(stage == "public" for stage, _result in current_reads) and len(admitted_cohorts) == 1
+
+        actual = next(item for item in restored.live.llm_messages if item.get("tool_call_id") == recipe.tool_call_id)
+        record = next(item for item in restored.materialization._feedback_produced if item.message is actual)
+        source_data = restored.source.admitted_evidence.graph.selected
+        live_data = restored.graph.batch
+        assert live_data is not None and live_data is not source_data
+        source_batch, live_batch = source_data.batch, live_data.batch
+        source_outcome = source_batch.tool_outcomes[recipe.tool_index]
+        live_outcome = live_batch.tool_outcomes[recipe.tool_index]
+        # Private provenance deliberately retains the source nodes. The live
+        # mutable closure and fresh message must remain separate from them.
+        assert record.call is source_data.calls[recipe.tool_index] and record.outcome is source_outcome
+        assert record.call is not live_data.calls[recipe.tool_index] and record.outcome is not live_outcome
+        assert live_batch.tool_outcomes is not source_batch.tool_outcomes
+        assert live_batch.decoded_args_by_call_id is not source_batch.decoded_args_by_call_id
+        assert type(source_outcome.response) is type(live_outcome.response) is MappingProxyType
+        assert source_outcome.response == live_outcome.response and source_outcome.response is not live_outcome.response
+        assert actual is not message and actual is not public_message and family_message_wire(actual) == wire
+        original_source = encode_coupled_batch_data(
+            batch=source_batch,
+            accumulator=source_data.accumulator,
+            calls=source_data.calls,
+            env_ref_names=runtime.materialization.inventory.names,
+        )
+        output_key, output_value = next((key, value) for key, value in live_outcome.response.items() if type(value) is str and value)
+        body = actual["content"]
+        changed_output = dict(live_outcome.response)
+        changed_output[output_key] = output_value + " Changed only on the copied live owner."
+        changed_outcome = replace(live_outcome, response=changed_output)
+        try:
+            # Outcomes freeze their response mappings. Replace the entry in the
+            # actual mutable live list instead of inventing a mutable response.
+            live_batch.tool_outcomes[recipe.tool_index] = changed_outcome
+            actual["content"] = body + " Changed only on the copied message."
+            assert live_batch.tool_outcomes[recipe.tool_index].response[output_key] != source_outcome.response[output_key]
+            assert source_outcome.response[output_key] == output_value and source_batch.tool_outcomes[recipe.tool_index] is record.outcome
+            assert (
+                encode_coupled_batch_data(
+                    batch=source_batch,
+                    accumulator=source_data.accumulator,
+                    calls=source_data.calls,
+                    env_ref_names=runtime.materialization.inventory.names,
+                )
+                == original_source
+            )
+        finally:
+            live_batch.tool_outcomes[recipe.tool_index] = live_outcome
+            actual["content"] = body
+        assert restored.materialization.capture_message(actual) == (wire, recipe)
+        assert next(item for item in restored.materialization._feedback_produced if item.message is actual) is record
+        assert record.outcome is source_outcome and record.call is source_data.calls[recipe.tool_index]
+        assert stored_rows(operation_store[0]) == before and len(sdk) == 2
+        owner.work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
 async def test_actual_advisor_issued_argument_refusal_uses_recorded_projected_wire(operation_store, tmp_path, monkeypatch):
     import json
 

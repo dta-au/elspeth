@@ -1024,6 +1024,8 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._schema_message:return"
   - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.restore_shelf:return (list)"
   - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._rebuild_shelf:return (list)"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._rebuild_admitted_shelf:return (list)"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._assemble_shelf:return (list)"
   # Extracted live SDK-message assembly preserves the same mutable message
   # objects and producer guard partitions; retained snapshots and current
   # authority remain nominal and separately admitted by their real owners.

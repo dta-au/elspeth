@@ -101,7 +101,10 @@ def _assemble_current_message_evidence(
         request_id=snapshot.request_id,
         request=snapshot.transcript.request,
     )
-    shelf = materialization._rebuild_shelf(snapshot.transcript, inputs=inputs)
+    if finish is _finish_copied_current_evidence:
+        shelf = materialization._rebuild_admitted_shelf(snapshot.transcript, inputs=inputs)
+    else:
+        shelf = materialization._rebuild_shelf(snapshot.transcript, inputs=inputs)
     owner.transcript, messages = AdvisorTranscriptOwner._from_continuation_shelf(
         snapshot.transcript, request=snapshot.transcript.request, history=history, shelf=shelf
     )
