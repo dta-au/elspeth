@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 from dataclasses import replace
+from hashlib import sha256
 
 import pytest
 
@@ -14,7 +15,13 @@ from tests.unit.web.composer.test_continuation_active_evidence_graph import _rec
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("memo_used", (False, True))
-async def test_fresh_fitting_capture_renders_original_once_but_keeps_decoder_roundtrip_and_source_credentials(monkeypatch, memo_used):
+@pytest.mark.parametrize(
+    "capture",
+    (graph_codec.capture_application_recorder_source, graph_codec.capture_fresh_application_recorder_source),
+    ids=("ordinary", "fresh-fitting"),
+)
+async def test_recorder_capture_admits_original_once_and_keeps_detached_roundtrip_and_environment(monkeypatch, memo_used, capture):
+    from elspeth.web import credential_guard
     from elspeth.web.composer import continuation_audit_buffer as audit_buffer
     from elspeth.web.continuation_retention_memo import v4_preparation_memo_scope
     from tests.unit.web.test_continuation_retention_memo import _advisor_clock
@@ -24,8 +31,9 @@ async def test_fresh_fitting_capture_renders_original_once_but_keeps_decoder_rou
     baseline = graph_codec.capture_application_recorder_source(snapshot, env_ref_names=frozenset())
     original_render = audit_buffer.recorder_snapshot_json
     original_decode = audit_buffer._decode_recorder_document
-    original_guard = graph_codec.require_no_credential_material
-    rendered, decoded, environments = [], [], []
+    original_encode = audit_buffer.encode_private_chunk
+    original_guard = credential_guard.require_no_credential_material
+    rendered, decoded, encoded, guarded = [], [], [], []
 
     def render(value):
         rendered.append(value)
@@ -37,23 +45,35 @@ async def test_fresh_fitting_capture_renders_original_once_but_keeps_decoder_rou
         return value
 
     def guard(value, *, surface, env_ref_names, max_string_bytes):
-        environments.append(env_ref_names)
+        guarded.append((value, surface, env_ref_names))
         return original_guard(value, surface=surface, env_ref_names=env_ref_names, max_string_bytes=max_string_bytes)
+
+    def encode(**values):
+        result = original_encode(**values)
+        encoded.append(result)
+        return result
 
     monkeypatch.setattr(graph_codec, "recorder_snapshot_json", render)
     monkeypatch.setattr(audit_buffer, "recorder_snapshot_json", render)
     monkeypatch.setattr(audit_buffer, "_decode_recorder_document", decode)
-    monkeypatch.setattr(graph_codec, "require_no_credential_material", guard)
+    monkeypatch.setattr(audit_buffer, "encode_private_chunk", encode)
+    monkeypatch.setattr(credential_guard, "require_no_credential_material", guard)
     with v4_preparation_memo_scope(_advisor_clock()) if memo_used else nullcontext():
         for names in (frozenset(), frozenset({"CURRENT_NAME"})):
-            result = graph_codec.capture_fresh_application_recorder_source(snapshot, env_ref_names=names)
+            result = capture(snapshot, env_ref_names=names)
             assert type(result) is graph_codec.ApplicationRecorderSource
             assert result.chunk == baseline.chunk and result.snapshot == baseline.snapshot
             assert result.snapshot is not snapshot and result.env_ref_names is names
+            assert result.chunk is encoded[-1]
+            assert graph_codec.require_application_recorder_source(result, names) is result
+            with pytest.raises(AuditIntegrityError, match="changed its admitted environment"):
+                graph_codec.require_application_recorder_source(result, names | {"ANOTHER_NAME"})
     assert sum(value is snapshot for value in rendered) == 2
     assert len(decoded) == (1 if memo_used else 2)
     assert [value for value in rendered if value is not snapshot] == decoded
-    assert environments == [frozenset(), frozenset({"CURRENT_NAME"})]
+    assert len(encoded) == 2
+    # These observe admission entries, not classifier work hidden by its memo.
+    assert guarded == [(baseline.chunk.canonical, "composer_continuation_private_chunk", frozenset())] * 2
 
 
 def test_fresh_fitting_capture_preserves_actual_credential_refusal():
@@ -118,6 +138,31 @@ def test_recorder_source_admits_original_bytes_and_refuses_new_changed_raw_chunk
     assert changed.reference == source.chunk.reference
     with pytest.raises(AuditIntegrityError, match=r"^application recorder exceeds its original complete document bound$"):
         graph_codec.admit_application_recorder_source(changed, env_ref_names=frozenset())
+
+
+def test_raw_recorder_source_rejects_actual_oversize_before_public_decode(monkeypatch):
+    _graph, source = _recorder_source_graph()
+    actual = graph_codec.decode_recorder_snapshot
+    decoded = []
+
+    def decode(chunk):
+        decoded.append(chunk)
+        return actual(chunk)
+
+    monkeypatch.setattr(graph_codec, "decode_recorder_snapshot", decode)
+    assert graph_codec.admit_application_recorder_source(source.chunk, env_ref_names=frozenset()).chunk == source.chunk
+    assert decoded == [source.chunk]
+    # Malformed oversized bytes would fail parsing if the early bound moved.
+    canonical = "{" + "x" * graph_codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    encoded = canonical.encode("utf-8")
+    reference = replace(
+        source.chunk,
+        reference=source.chunk.reference.model_copy(update={"digest": sha256(encoded).hexdigest(), "byte_length": len(encoded)}),
+        canonical=canonical,
+    )
+    with pytest.raises(AuditIntegrityError, match="application recorder exceeds its original complete document bound"):
+        graph_codec.admit_application_recorder_source(reference, env_ref_names=frozenset())
+    assert decoded == [source.chunk]
 
 
 def test_graph_refuses_equal_python_recorder_with_different_nested_json_types():

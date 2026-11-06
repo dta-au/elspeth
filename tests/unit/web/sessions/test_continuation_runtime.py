@@ -345,7 +345,6 @@ async def test_late_costed_runtime_source_refusal_leaves_provider_and_disclosure
     reference = selected.stack.frames[0].evidence
     original_chunk = next(chunk for chunk in selected.chunks if chunk.reference == reference)
     actual_read, actual_live = authority.read_continuation_runtime, runtime_owner._restore_live
-    actual_restoration = authority.read_continuation_runtime_restoration
     actual_policy = service._policy_context.build
     sources, refusals, sdk_attempts, corrupted_rows = [], [], [], []
     in_live = False
@@ -385,11 +384,6 @@ async def test_late_costed_runtime_source_refusal_leaves_provider_and_disclosure
         finally:
             in_live = False
 
-    def restoration(*args, **values):
-        result = actual_restoration(*args, **values)
-        sources.append(result.source)
-        return result
-
     def current_policy(actor):
         result = actual_policy(actor)
         if in_live and not corrupted_rows:
@@ -404,7 +398,6 @@ async def test_late_costed_runtime_source_refusal_leaves_provider_and_disclosure
         raise AssertionError("runtime restoration must not invoke the provider")
 
     monkeypatch.setattr(authority, "read_continuation_runtime", read)
-    monkeypatch.setattr(authority, "read_continuation_runtime_restoration", restoration)
     monkeypatch.setattr(runtime_owner, "_restore_live", live)
     monkeypatch.setattr(service._policy_context, "build", current_policy)
     monkeypatch.setattr(litellm, "acompletion", forbidden_sdk)
@@ -766,7 +759,7 @@ async def test_runtime_retains_original_worker_failure_and_joins_started_cancell
     try:
         await restore_continuation_runtime(**arguments)
         before = recovery_rows(operation_store[0])
-        actual = arguments["authority"].read_continuation_runtime_restoration
+        actual = arguments["authority"].read_continuation_runtime
         original = ValueError("actual runtime source failure")
         entered, release = Event(), Event()
         completed = []
@@ -780,7 +773,7 @@ async def test_runtime_retains_original_worker_failure_and_joins_started_cancell
             assert release.wait(5)
             return source
 
-        monkeypatch.setattr(arguments["authority"], "read_continuation_runtime_restoration", controlled)
+        monkeypatch.setattr(arguments["authority"], "read_continuation_runtime", controlled)
         if outcome == "error":
             with pytest.raises(ValueError) as caught:
                 await restore_continuation_runtime(**arguments)

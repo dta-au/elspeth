@@ -63,7 +63,7 @@ from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
-from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource, _RuntimeRestorationInputs, runtime_chunk
+from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource, runtime_chunk
 from elspeth.web.sessions.continuation_selection import nested_private_chunks, required_private_chunks
 
 if TYPE_CHECKING:
@@ -153,6 +153,12 @@ async def _registered_runtime_capture[Proof](
         return _capture_runtime_between_reads(read_source=read_source, capture=capture, changed_source_message=changed_source_message)
 
     return await _registered_read(work, _RuntimeCapture, operation)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RuntimeRestorationInputs:
+    source: ContinuationRuntimeSource
+    producers: CurrentContinuationMessageProducers
 
 
 def _work_owners(
@@ -536,9 +542,11 @@ async def _restore_runtime(
         finish_read.require_selection(selected, inventory)
 
     def read_inputs() -> _RuntimeRestorationInputs:
-        if finish_read is None:
-            return authority.read_continuation_runtime_restoration(running, service=service, selected=selected, inventory=inventory)
-        source = finish_read.read_runtime(authority)
+        source = (
+            authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+            if finish_read is None
+            else finish_read.read_runtime(authority)
+        )
         producers = current_message_producers_from_runtime_source(
             service=service,
             authority=authority,
@@ -560,7 +568,6 @@ async def _restore_runtime(
         inventory=inventory,
         required_work=required_work,
         materialization=inputs.producers,
-        paired_shelf=inputs.paired_shelf,
     )
     result = await _registered_read(
         required_work,

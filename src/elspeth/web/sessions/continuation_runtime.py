@@ -7,7 +7,6 @@ provider allowance, fresh inspection, mutation or audit-finisher authority.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from sqlalchemy import Connection, select
 
@@ -27,14 +26,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
-from elspeth.web.composer.continuation_prompt_producers import (
-    CurrentContinuationMessageProducers,
-    _CurrentProducerInputs,
-    _PairedRuntimeShelf,
-    _read_current_inputs,
-    _read_current_inputs_with_tool_sources,
-    current_message_producers_from_runtime_source,
-)
+from elspeth.web.composer.continuation_prompt_producers import _CurrentProducerInputs, _read_current_inputs
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.provider_cost import CommonProviderCostSnapshot
 from elspeth.web.coordination.database_clock import database_now
@@ -44,10 +36,6 @@ from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapsh
 from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.time_normalization import restore_utc
-
-if TYPE_CHECKING:
-    from elspeth.web.composer.service import ComposerServiceImpl
-    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,20 +75,14 @@ def runtime_chunk(selected: SelectedContinuationState, reference: PrivateChunkRe
     return matches[0]
 
 
-@dataclass(frozen=True, slots=True, repr=False)
-class _RuntimeRestorationInputs:
-    source: ContinuationRuntimeSource
-    producers: CurrentContinuationMessageProducers
-    paired_shelf: _PairedRuntimeShelf | None = None
-
-
-def _require_runtime_source_owner_on_connection(
+def read_runtime_source_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
     *,
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
-) -> None:
+    _prior_evidence: AdmittedTurnEvidence | None = None,
+) -> ContinuationRuntimeSource:
     if (
         type(running) is not ComposerOperationRunning
         or type(selected) is not SelectedContinuationState
@@ -126,42 +108,12 @@ def _require_runtime_source_owner_on_connection(
                 require_issued_tool_runtime_on_connection(conn, running, selected=selected, env_ref_names=inventory.names)
         elif frame.phase == "tool_ready" and frame.accumulator.codec == "composer.coupled-batch-data.v1" and frame.next_tool_index:
             require_completed_runtime_prefix_on_connection(conn, running, selected=selected, env_ref_names=inventory.names)
-
-
-def read_runtime_source_on_connection(
-    conn: Connection,
-    running: ComposerOperationRunning,
-    *,
-    selected: SelectedContinuationState,
-    inventory: CurrentContinuationEnvInventory,
-    _prior_evidence: AdmittedTurnEvidence | None = None,
-) -> ContinuationRuntimeSource:
-    _require_runtime_source_owner_on_connection(conn, running, selected=selected, inventory=inventory)
     # Reuse the installed full ingress/evidence/actor/creator/current-inventory
     # checks. A pending attachment is proved by the actual attachment SQL owner
     # inside this current evidence boundary before its original graph restores.
     # No historical authorization class or second bootstrap grant.
     inputs = _read_current_inputs(conn, selected=selected, inventory=inventory, _prior_evidence=_prior_evidence)
     return _runtime_source_from_inputs_on_connection(conn, running, selected=selected, inventory=inventory, inputs=inputs)
-
-
-def read_runtime_restoration_on_connection(
-    conn: Connection,
-    running: ComposerOperationRunning,
-    *,
-    service: ComposerServiceImpl,
-    authority: ComposerAsyncOperationAuthority,
-    selected: SelectedContinuationState,
-    inventory: CurrentContinuationEnvInventory,
-) -> _RuntimeRestorationInputs:
-    _require_runtime_source_owner_on_connection(conn, running, selected=selected, inventory=inventory)
-    actual = _read_current_inputs_with_tool_sources(conn, selected=selected, inventory=inventory)
-    source = _runtime_source_from_inputs_on_connection(conn, running, selected=selected, inventory=inventory, inputs=actual.inputs)
-    producers = current_message_producers_from_runtime_source(
-        service=service, authority=authority, selected=selected, inventory=inventory, source=source
-    )
-    paired_shelf = producers._prepare_runtime_shelf_on_connection(conn, actual)
-    return _RuntimeRestorationInputs(source, producers, paired_shelf)
 
 
 def _runtime_source_from_inputs_on_connection(

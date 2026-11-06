@@ -24,7 +24,8 @@ DISCOVERY = "src/elspeth/web/composer/discovery_response.py"
 RECEIPTS = "src/elspeth/web/composer/continuation_tool_receipts.py"
 APPLICATION = "src/elspeth/web/composer/continuation_application_graph.py"
 FAMILIES = "src/elspeth/web/composer/continuation_message_families.py"
-REQUIRED_PATHS = (DATA, SCHEMA, GENERATION, DISCOVERY, RECEIPTS, APPLICATION, FAMILIES)
+AUDIT_BUFFER = "src/elspeth/web/composer/continuation_audit_buffer.py"
+REQUIRED_PATHS = (DATA, SCHEMA, GENERATION, DISCOVERY, RECEIPTS, APPLICATION, FAMILIES, AUDIT_BUFFER)
 
 # Complete executable namespaces: imports, constants, registries, class fields,
 # bases, decorators, defaults and annotations. Function bodies have independent
@@ -204,13 +205,12 @@ BODY_BINDINGS = {
     (RECEIPTS, "require_receipt_result"): "3e207f927d73012bd0d65d6289b1081d61d3738a134d092949ae1353dd5115f0",
     (APPLICATION, "ApplicationGraphCut"): "69f4e3c832572e424c8b4c3934c210c51f61cb2c5923b33b5e028fc7bbebf8e9",
     (APPLICATION, "ApplicationGraph"): "c04a53fba0584d86e7380bdd690819677a5c20f72a470dd509a5b2c952e3f5d4",
-    (APPLICATION, "ApplicationRecorderSource"): "18f04ae52a559c0a700e0e174eee11499edeee64005ea9451bfd1382d0881547",
+    (APPLICATION, "ApplicationRecorderSource"): "585afad9a522381756da08ea149216dd5e1d2abdaf1f86975ca4d839e651577b",
     (APPLICATION, "_require_source_environment"): "4250c1045487039b3734a80304e3ca551c6b449356536ceda11eb7c3473c9e21",
-    (APPLICATION, "_require_source_chunk"): "5de1b575eda35e417991e706db8fb62e79f6020258124b8bd1c9312e700233dc",
-    (APPLICATION, "_require_source_credentials"): "e230d7605324b4992061e82c46da1f91432bff3d0a247df087aa6b410e88c26b",
+    (APPLICATION, "_require_source_chunk"): "36a023caaf94c71b4e2efd568cc9042192b8c77ff85041f2f641328e3316a1c6",
     (APPLICATION, "capture_application_recorder_source"): "2c30870331665726c24c01616128cd33dfa54685ad74cdc830579bb67ae1fe41",
     (APPLICATION, "admit_application_recorder_source"): "4bc7de23a334690724e751448b65f252630ba5cca6251b672ef6611405843db5",
-    (APPLICATION, "require_application_recorder_source"): "2d8a36b0b5110058d8cada81ddac0423b2e962016bf1199fe13d762f60acb888",
+    (APPLICATION, "require_application_recorder_source"): "83db90660d4dc919332d65f63e8451593cf68af852ebb031c226890f04274be3",
     (APPLICATION, "application_recorder_slots"): "59b9e19bfde75a5964b54223a8cb3333c1c37c041510d8ab9025244ef11be92d",
     (APPLICATION, "construct_application_llm"): "4fa9b476730c315e5f10ecefaa46b2a5361757d2a87d0ed5cc42a34d92330f8d",
     (APPLICATION, "_atom_json"): "d8c18d01bfc09accf187f3876e6401dde588c3f3813035709c4ce2267f41f8a5",
@@ -222,6 +222,64 @@ BODY_BINDINGS = {
     (APPLICATION, "decode_application_graph"): "a2c5c1315453a1dcd60796db8ab6aeac5f25c56c3041b847b5155d20609948b2",
     (FAMILIES, "_read_current_sources"): "f0544018d62a54f58d4466d72092078a54f694633ef9642b1d5753768a538ddf",
     (FAMILIES, "_actual_chunk"): "b1dfd2e12b4f719f73afb8767c094e92b0ee53a41ed0c4fec1463691c6a34286",
+}
+
+# Current constructor admission is independent of the older batch transfer pins.
+RECORDER_BODY_BINDINGS = {
+    (APPLICATION, "_require_source_environment"): "4250c1045487039b3734a80304e3ca551c6b449356536ceda11eb7c3473c9e21",
+    (AUDIT_BUFFER, "_decode_recorder_document"): "c82da319a93b783453c2e1e4cf5534f52e4ce34094a5f3b2f501a1fbdcb7352d",
+    (AUDIT_BUFFER, "recorder_snapshot_json"): "dbbd8b3115dc359543289e89bc97c3791e100c48afcb7f512b8a3f21bcc9b838",
+    (AUDIT_BUFFER, "DecodedRecorderData"): "13aa76a64bca1030afcc8b41b2e8c0a98bb13f39a501b69ec1216fb03139b0de",
+    (APPLICATION, "ApplicationRecorderSource"): "585afad9a522381756da08ea149216dd5e1d2abdaf1f86975ca4d839e651577b",
+    (APPLICATION, "_require_source_chunk_shape"): "acc903e0df2fc2295c2de87061ef77c87436a04879115771b1111ac4110656e3",
+    (APPLICATION, "_require_source_chunk"): "36a023caaf94c71b4e2efd568cc9042192b8c77ff85041f2f641328e3316a1c6",
+    (APPLICATION, "require_application_recorder_source"): "83db90660d4dc919332d65f63e8451593cf68af852ebb031c226890f04274be3",
+    (AUDIT_BUFFER, "_encode_and_decode_recorder_document"): "b78ea9302dfb7c70a107699abdab9b5b1f1a7adfb20ce80c4a33ec50f7edd087",
+    (AUDIT_BUFFER, "decode_recorder_snapshot"): "a1980197afdd07e1abb4c64d32693aa723c60a8254a4f149f2f9f60ea37b9d79",
+    (AUDIT_BUFFER, "_decode_recorder_data"): "14567e4295ff25dcee9051d3fa8f770e13c162f2e1aa1966a5efeaea4e06da3f",
+    (AUDIT_BUFFER, "_admit_recorder_data"): "3cc7ae76b0bb4e73534604fe5ae508d35495c730621b9d1a1bbc45fb4d986075",
+}
+
+# Ordered executable admission statements: mutations must fail even after a
+# body digest is rebound. These are finite current-source contracts, not grants
+# for other audit-buffer work.
+RECORDER_ADMISSION_BODIES = {
+    (
+        APPLICATION,
+        "ApplicationRecorderSource.__init__",
+    ): "_require_source_environment(env_ref_names)\nif type(source) is RecorderSnapshot:\n    chunk, snapshot = _encode_and_decode_recorder_document(recorder_snapshot_json(source))\nelif type(source) is PrivateChunk:\n    chunk = source\n    _require_source_chunk(chunk)\n    snapshot = decode_recorder_snapshot(chunk)\nelse:\n    raise TypeError('application recorder requires its actual complete source')\nobject.__setattr__(self, 'chunk', chunk)\nobject.__setattr__(self, 'snapshot', snapshot)\nobject.__setattr__(self, 'env_ref_names', env_ref_names)",
+    (
+        APPLICATION,
+        "ApplicationRecorderSource._from_canonical",
+    ): "_require_source_environment(env_ref_names)\nchunk, snapshot = _encode_and_decode_recorder_document(canonical)\nsource = object.__new__(ApplicationRecorderSource)\nobject.__setattr__(source, 'chunk', chunk)\nobject.__setattr__(source, 'snapshot', snapshot)\nobject.__setattr__(source, 'env_ref_names', env_ref_names)\nreturn source",
+    (
+        APPLICATION,
+        "_require_source_chunk_shape",
+    ): "if type(chunk) is not PrivateChunk or type(chunk.reference) is not PrivateChunkRef:\n    raise AuditIntegrityError('application recorder lost its complete original source role')\nif (type(chunk.canonical), type(chunk.reference.codec), type(chunk.reference.digest), type(chunk.reference.byte_length)) != (str, str, str, int) or chunk.reference.codec != 'composer.audit-buffer.v2':\n    raise AuditIntegrityError('application recorder lost its complete original source role')",
+    (
+        APPLICATION,
+        "_require_source_chunk",
+    ): "_require_source_chunk_shape(chunk)\nif not 0 <= chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != chunk.reference.byte_length:\n    raise AuditIntegrityError('application recorder exceeds its original complete document bound')",
+    (
+        APPLICATION,
+        "require_application_recorder_source",
+    ): "_require_source_environment(env_ref_names)\nif type(source) not in (ApplicationRecorderSource, ProspectiveApplicationRecorderSource):\n    raise TypeError('application graph requires its actual source-admitted recorder')\n_require_source_environment(source.env_ref_names)\nif source.env_ref_names != env_ref_names:\n    raise AuditIntegrityError('application recorder changed its admitted environment')\nif type(source) is ProspectiveApplicationRecorderSource:\n    _require_source_chunk_shape(source.chunk)\n    chunk, _snapshot = _prospective_recorder_values(source.snapshot, env_ref_names)\n    if chunk != source.chunk:\n        raise AuditIntegrityError('prospective application recorder changed its complete original source')\n    if chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:\n        raise AuditIntegrityError('prospective application recorder lost its actual complete document excess')\n    return source\nreturn source",
+    (
+        AUDIT_BUFFER,
+        "_encode_and_decode_recorder_document",
+    ): "chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)\nkey = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)\n\ndef admit(source: PrivateChunkVerificationKey, data: DecodedRecorderData) -> None:\n    if data.canonical != chunk.canonical:\n        _admit_recorder_data(source, data)\nmemo = current_retention_stage_memo()\nif memo is not None:\n    data = memo.recorder_data(key, _decode_recorder_data, admit)\nelse:\n    data = _decode_recorder_data(chunk.canonical)\n    admit(key, data)\nreturn (chunk, data.snapshot)",
+    (
+        AUDIT_BUFFER,
+        "decode_recorder_snapshot",
+    ): "if type(chunk) is not PrivateChunk or chunk.reference.codec != RECORDER_CODEC:\n    raise AuditIntegrityError('audit buffer has the wrong codec')\nverify_private_chunk(chunk.reference, chunk.canonical)\nkey = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)\nmemo = current_retention_stage_memo()\nif memo is not None:\n    data = memo.recorder_data(key, _decode_recorder_data, _admit_recorder_data)\nelse:\n    data = _decode_recorder_data(chunk.canonical)\n    _admit_recorder_data(key, data)\nreturn data.snapshot",
+    (
+        AUDIT_BUFFER,
+        "_decode_recorder_data",
+    ): "snapshot = _decode_recorder_document(canonical)\nreturn DecodedRecorderData(snapshot, recorder_snapshot_json(snapshot))",
+    (
+        AUDIT_BUFFER,
+        "_admit_recorder_data",
+    ): "if encode_private_chunk(codec=RECORDER_CODEC, canonical=data.canonical).canonical != key.canonical:\n    raise AuditIntegrityError('audit buffer omitted or normalized a retained field')",
 }
 
 SITE_KEYS = (
@@ -861,10 +919,6 @@ def _directional_core_transfers(selected, failures, receipt):
     for symbol, source in (
         ("application_recorder_slots", "slots.setdefault(id(call), index)"),
         ("construct_application_llm", 'restored = TypeAdapter(ComposerLLMCall).validate_json(encoded, strict=True, extra="forbid")'),
-        (
-            "require_application_recorder_source",
-            'if type(source.snapshot) is not RecorderSnapshot or encode_recorder_snapshot(source.snapshot) != source.chunk:\n    raise AuditIntegrityError("application recorder changed its complete original fields")',
-        ),
     ):
         kind = ast.Expr if symbol == "application_recorder_slots" else ast.Assign if symbol == "construct_application_llm" else ast.If
         _one(
@@ -917,6 +971,66 @@ def _external_calls(selected, failures, receipt):
         _sites(receipt, "external_data_uses", FAMILIES, [memory.func])
 
 
+def recorder_source_local_contracts(units):
+    """Receive only the current recorder constructor and relocated admission."""
+    failures, receipt = [], _empty()
+    index = {unit.path: unit for unit in units}
+    if len(index) != len(units) or APPLICATION not in index or AUDIT_BUFFER not in index:
+        return ["recorder admission source set missing or duplicated"], {}
+    for (path, symbol), digest in RECORDER_BODY_BINDINGS.items():
+        declaration = receiver.find(index[path].tree, symbol)
+        _require(failures, declaration is not None and _digest(declaration) == digest, "recorder admission body changed " + symbol)
+        if declaration is not None:
+            _require(
+                failures, receiver.owned_binding(index[path].tree, symbol, declaration), "recorder admission binding changed " + symbol
+            )
+            _sites(receipt, "selected_definitions", path, [declaration])
+            origin = _module(path) + "." + symbol
+            receipt["protected_origins"].add(origin)
+            receipt["supplier_bindings"].add(origin)
+            receipt["class_origins" if isinstance(declaration, ast.ClassDef) else "function_origins"].add(origin)
+    _one(
+        failures,
+        receipt,
+        "member_uses",
+        AUDIT_BUFFER,
+        index[AUDIT_BUFFER].tree,
+        ast.AnnAssign,
+        'RECORDER_CODEC: Final[Literal["composer.audit-buffer.v2"]] = "composer.audit-buffer.v2"',
+        "recorder admission codec changed",
+    )
+    for (path, symbol), source in RECORDER_ADMISSION_BODIES.items():
+        declaration = receiver.find(index[path].tree, symbol)
+        if declaration is None:
+            failures.append("recorder admission order changed " + symbol)
+            continue
+        statements = [
+            node
+            for node in declaration.body
+            if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))
+        ]
+        expected = ast.parse(source).body
+        _require(
+            failures,
+            len(statements) == len(expected)
+            and all(_same(actual, ast.unparse(wanted)) for actual, wanted in zip(statements, expected, strict=True)),
+            "recorder admission order changed " + symbol,
+        )
+        _sites(receipt, "member_uses", path, statements)
+    for path, module, names in (
+        (
+            APPLICATION,
+            "elspeth.web.composer.continuation_audit_buffer",
+            ("RecorderSnapshot", "_encode_and_decode_recorder_document", "decode_recorder_snapshot", "recorder_snapshot_json"),
+        ),
+        (AUDIT_BUFFER, "elspeth.web.composer.continuation_codec", ("PrivateChunk", "encode_private_chunk", "verify_private_chunk")),
+        (AUDIT_BUFFER, "elspeth.web.continuation_retention_memo", ("PrivateChunkVerificationKey", "current_retention_stage_memo")),
+    ):
+        for name in names:
+            _require(failures, receiver.imported(index[path].tree, name, module, name), "recorder admission supplier changed " + name)
+    return failures, {} if failures else receipt
+
+
 def batch_data_local_contracts(units):
     """Supplement the unchanged native three-constructor/common-effect proof."""
     failures, receipt = [], _empty()
@@ -930,6 +1044,11 @@ def batch_data_local_contracts(units):
     _signatures(selected, failures)
     _memory_and_application(unit, selected, failures, receipt)
     _directional_core_transfers(selected, failures, receipt)
+    recorder_failures, recorder_receipt = recorder_source_local_contracts(units)
+    failures.extend(recorder_failures)
+    if not recorder_failures:
+        for key in receipt:
+            receipt[key].update(recorder_receipt[key])
     _external_calls(selected, failures, receipt)
     native = _one(
         failures,

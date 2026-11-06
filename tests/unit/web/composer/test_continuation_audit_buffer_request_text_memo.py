@@ -395,3 +395,135 @@ async def test_recorder_miss_preserves_model_then_credential_then_roundtrip_refu
         assert not parent._recorder_data
         assert decode_recorder_snapshot(chunk) == snapshot
         assert len(parent._recorder_data) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ("fresh", "raw"))
+async def test_fresh_and_raw_recorder_data_share_only_data_and_keep_each_current_admission(monkeypatch, first):
+    chunk = encode_recorder_snapshot(_snapshot(1))
+    original_produce, original_admit = audit_buffer._decode_recorder_data, audit_buffer._admit_recorder_data
+    produced, raw_admitted = [], []
+
+    def produce(text):
+        result = original_produce(text)
+        produced.append(result)
+        return result
+
+    def admit(key, data):
+        raw_admitted.append(data)
+        original_admit(key, data)
+
+    monkeypatch.setattr(audit_buffer, "_decode_recorder_data", produce)
+    monkeypatch.setattr(audit_buffer, "_admit_recorder_data", admit)
+    with v4_preparation_memo_scope(_clock()) as parent:
+        if first == "fresh":
+            fresh_chunk, fresh = audit_buffer._encode_and_decode_recorder_document(chunk.canonical)
+            raw = decode_recorder_snapshot(chunk)
+        else:
+            raw = decode_recorder_snapshot(chunk)
+            fresh_chunk, fresh = audit_buffer._encode_and_decode_recorder_document(chunk.canonical)
+        assert fresh_chunk == chunk and fresh is raw
+        assert len(produced) == 1 and raw_admitted == produced
+        retained = parent._recorder_data_bytes
+        assert retained > 0
+        monkeypatch.setattr(codec, "CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES", chunk.reference.byte_length - 1)
+        with pytest.raises(AuditIntegrityError, match="admission bound"):
+            decode_recorder_snapshot(chunk)
+        assert raw_admitted == produced * 2
+        with pytest.raises(AuditIntegrityError, match="admission bound"):
+            audit_buffer._encode_and_decode_recorder_document(chunk.canonical)
+        assert len(produced) == 1 and parent._recorder_data_bytes == retained
+    assert not parent._recorder_data and parent._recorder_data_bytes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("omitted_field", "projected_credential", "projected_bound"))
+async def test_fresh_recorder_projection_mismatch_keeps_admission_before_field_loss(monkeypatch, change):
+    from elspeth.web.composer.withheld_replies import WithheldReply
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+
+    snapshot = _snapshot(1)
+    canonical = recorder_snapshot_json(snapshot)
+    if change == "omitted_field":
+        document = json.loads(canonical)
+        del document["snapshot"]["llm_calls"][0]["finish_reason"]
+        canonical = canonical_json(document)
+        error, message = AuditIntegrityError, "omitted or normalized"
+    else:
+        text = (
+            "https://user:password@example.com"
+            if change == "projected_credential"
+            else "x" * codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        )
+        changed = replace(snapshot, withheld_replies=(WithheldReply("planner_prose_unadmitted", text),))
+        projected = recorder_snapshot_json(changed)
+
+        def changed_projection(_decoded):
+            return projected
+
+        monkeypatch.setattr(audit_buffer, "recorder_snapshot_json", changed_projection)
+        error, message = (CredentialMaterialRefused, "") if change == "projected_credential" else (AuditIntegrityError, "admission bound")
+    original = audit_buffer._admit_recorder_data
+    admitted = []
+
+    def admit(key, data):
+        admitted.append((key.canonical, data.canonical))
+        original(key, data)
+
+    monkeypatch.setattr(audit_buffer, "_admit_recorder_data", admit)
+    with v4_preparation_memo_scope(_clock()) as parent:
+        with pytest.raises(error, match=message):
+            audit_buffer._encode_and_decode_recorder_document(canonical)
+        assert len(admitted) == 1 and admitted[0][0] != admitted[0][1]
+        assert not parent._recorder_data and parent._recorder_data_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_fresh_recorder_changed_text_is_admitted_before_decode_even_with_warm_data(monkeypatch):
+    from elspeth.web.composer.withheld_replies import WithheldReply
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+
+    snapshot = _snapshot(1)
+    canonical = recorder_snapshot_json(snapshot)
+    changed = replace(snapshot, withheld_replies=(WithheldReply("planner_prose_unadmitted", "https://user:password@example.com"),))
+    document = json.loads(recorder_snapshot_json(changed))
+    del document["snapshot"]["invocations"]
+    changed_text = canonical_json(document)
+    original = audit_buffer._decode_recorder_data
+    produced = []
+
+    def produce(text):
+        produced.append(text)
+        return original(text)
+
+    monkeypatch.setattr(audit_buffer, "_decode_recorder_data", produce)
+    with v4_preparation_memo_scope(_clock()) as parent:
+        chunk, restored = audit_buffer._encode_and_decode_recorder_document(canonical)
+        assert restored == snapshot and chunk.canonical == canonical
+        with pytest.raises(CredentialMaterialRefused):
+            audit_buffer._encode_and_decode_recorder_document(changed_text)
+        assert produced == [canonical] and len(parent._recorder_data) == 1
+        # Independent raw input retains model-before-projected-credential order.
+        encoded = changed_text.encode("utf-8")
+        reference = chunk.reference.model_copy(update={"digest": codec.sha256(encoded).hexdigest(), "byte_length": len(encoded)})
+        with pytest.raises(AuditIntegrityError, match="owned codec"):
+            decode_recorder_snapshot(codec.PrivateChunk(reference, changed_text))
+        assert produced == [canonical, changed_text]
+
+
+@pytest.mark.parametrize("change", ("document_shape", "unknown_field", "cursor"))
+def test_fresh_recorder_keeps_complete_schema_and_cursor_refusals(change):
+    document = json.loads(recorder_snapshot_json(_snapshot(1)))
+    if change == "document_shape":
+        document["unexpected"] = []
+    elif change == "unknown_field":
+        document["snapshot"]["unexpected"] = []
+    else:
+        document["snapshot"]["drained"]["llm_calls"] = 2
+    canonical = canonical_json(document)
+    chunk = codec.encode_private_chunk(codec=audit_buffer.RECORDER_CODEC, canonical=canonical)
+    with pytest.raises(AuditIntegrityError) as raw:
+        decode_recorder_snapshot(chunk)
+    with pytest.raises(AuditIntegrityError) as fresh:
+        audit_buffer._encode_and_decode_recorder_document(canonical)
+    assert str(fresh.value) == str(raw.value)

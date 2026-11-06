@@ -447,6 +447,26 @@ def encode_recorder_snapshot(snapshot: RecorderSnapshot) -> PrivateChunk:
     return encode_private_chunk(codec=RECORDER_CODEC, canonical=recorder_snapshot_json(snapshot))
 
 
+def _encode_and_decode_recorder_document(canonical: str) -> tuple[PrivateChunk, RecorderSnapshot]:
+    """Admit fresh text and return its original chunk with detached DATA."""
+    chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)
+    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+
+    def admit(source: PrivateChunkVerificationKey, data: DecodedRecorderData) -> None:
+        # Equal text has just passed this invocation's complete admission.
+        # A changed projection still owes its own admission before field loss.
+        if data.canonical != chunk.canonical:
+            _admit_recorder_data(source, data)
+
+    memo = current_retention_stage_memo()
+    if memo is not None:
+        data = memo.recorder_data(key, _decode_recorder_data, admit)
+    else:
+        data = _decode_recorder_data(chunk.canonical)
+        admit(key, data)
+    return chunk, data.snapshot
+
+
 def validate_recorder_projection(snapshot: RecorderSnapshot) -> tuple[str, RecorderSnapshot]:
     """Validate complete prospective DATA before deciding its capacity.
 

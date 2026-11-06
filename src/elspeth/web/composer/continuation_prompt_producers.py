@@ -182,14 +182,6 @@ class _CurrentProducerRead:
     feedback_sources: tuple[_ToolFeedbackFamilySource, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _PairedRuntimeShelf:
-    producers: CurrentContinuationMessageProducers
-    admitted: AdmittedTurnEvidence
-    positions: tuple[int, ...]
-    cohort: _RestoredFamilyCohort
-
-
 def require_original_bootstrap_transcript_on_connection(conn: Connection, bootstrap: ContinuationBootstrapSnapshot) -> None:
     """Exact original prefix/private/ingress proof; current authority belongs to the caller."""
     validate_transcript_private_custody(conn, bootstrap.logical.session_id)
@@ -1689,26 +1681,6 @@ class CurrentContinuationMessageProducers:
         )
         self._require_current()
         return restored
-
-    def _prepare_runtime_shelf_on_connection(self, conn: Connection, actual: _CurrentProducerRead) -> _PairedRuntimeShelf | None:
-        """Carry this transaction's actual recipe sources to one restoration."""
-        if type(self.inputs) is not _CurrentProducerInputs:
-            raise AuditIntegrityError("ready message producer has no existing Compose/family source")
-        if actual.inputs.admitted_evidence is not self.inputs.admitted_evidence:
-            raise AuditIntegrityError("runtime shelf changed its original evidence owner")
-        positions, requests = self._shelf_family_requests(actual.inputs.evidence.transcript, inputs=actual.inputs)
-        if self.finish_read is not None or any(type(recipe) is FailureSchemaMessageRecipe for recipe, _text in requests):
-            return None
-        cohort = CurrentContinuationMessageFamilies(
-            self.service, self.authority, self.selected, self.inventory
-        )._assemble_paired_cohort_on_connection(
-            conn,
-            requests,
-            admitted=actual.inputs.admitted_evidence,
-            result_sources=actual.result_sources,
-            feedback_sources=actual.feedback_sources,
-        )
-        return _PairedRuntimeShelf(self, actual.inputs.admitted_evidence, positions, cohort)
 
     def _rebuild_shelf(self, snapshot: MessageShelfSnapshot, *, inputs: _CurrentProducerInputs) -> list[dict[str, Any]]:
         """Actual assembly only; current read brackets remain caller-owned."""

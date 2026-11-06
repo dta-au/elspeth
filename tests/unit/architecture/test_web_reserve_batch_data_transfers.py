@@ -63,6 +63,100 @@ def _rebind_body(monkeypatch, units, path, symbol):
     monkeypatch.setattr(helper, "BODY_BINDINGS", bindings)
 
 
+def test_current_recorder_admission_receipt_keeps_constructor_and_raw_decoder_sources():
+    units = _units()
+    failures, receipt = helper.recorder_source_local_contracts(units)
+    assert not failures and receipt, failures
+    actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    for key in helper.SITE_KEYS:
+        assert receipt[key] <= actual
+    assert receipt["selected_definitions"] and receipt["member_uses"]
+    assert (helper.APPLICATION, "_require_source_credentials") not in helper.BODY_BINDINGS
+    assert helper.AUDIT_BUFFER in helper.REQUIRED_PATHS
+
+
+@pytest.mark.parametrize(
+    ("path", "symbol", "before", "after"),
+    [
+        (
+            helper.APPLICATION,
+            "ApplicationRecorderSource",
+            "if type(source) is RecorderSnapshot:",
+            "if isinstance(source, RecorderSnapshot):",
+        ),
+        (
+            helper.APPLICATION,
+            "ApplicationRecorderSource",
+            "_require_source_chunk(chunk)\n            # Preserve early source bounds and the public decoder's current\n            # verification/schema/projected-admission refusal order.\n            snapshot = decode_recorder_snapshot(chunk)",
+            "snapshot = decode_recorder_snapshot(chunk)\n            _require_source_chunk(chunk)",
+        ),
+        (
+            helper.APPLICATION,
+            "ApplicationRecorderSource",
+            "chunk, snapshot = _encode_and_decode_recorder_document(canonical)",
+            "chunk, snapshot = foreign_decoder(canonical)",
+        ),
+        (helper.APPLICATION, "_require_source_chunk", "_require_source_chunk_shape(chunk)", "pass"),
+        (helper.APPLICATION, "require_application_recorder_source", "if source.env_ref_names != env_ref_names:", "if False:"),
+        (
+            helper.AUDIT_BUFFER,
+            "_encode_and_decode_recorder_document",
+            "chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)",
+            "chunk = foreign_encoder(codec=RECORDER_CODEC, canonical=canonical)",
+        ),
+        (
+            helper.AUDIT_BUFFER,
+            "_encode_and_decode_recorder_document",
+            "if data.canonical != chunk.canonical:",
+            "if False:",
+        ),
+        (
+            helper.AUDIT_BUFFER,
+            "_encode_and_decode_recorder_document",
+            "memo.recorder_data(key, _decode_recorder_data, admit)",
+            "memo.recorder_data(key, _decode_recorder_data, None)",
+        ),
+        (helper.AUDIT_BUFFER, "decode_recorder_snapshot", "verify_private_chunk(chunk.reference, chunk.canonical)", "pass"),
+        (
+            helper.AUDIT_BUFFER,
+            "decode_recorder_snapshot",
+            "memo.recorder_data(key, _decode_recorder_data, _admit_recorder_data)",
+            "memo.recorder_data(key, _decode_recorder_data, None)",
+        ),
+        (helper.AUDIT_BUFFER, "decode_recorder_snapshot", "_admit_recorder_data(key, data)", "pass"),
+        (
+            helper.AUDIT_BUFFER,
+            "_decode_recorder_data",
+            "snapshot = _decode_recorder_document(canonical)",
+            "snapshot = foreign_decoder(canonical)",
+        ),
+        (helper.AUDIT_BUFFER, "_admit_recorder_data", ".canonical != key.canonical:", ".canonical == key.canonical:"),
+    ],
+)
+def test_recorder_admission_refuses_changed_order_or_supplier_after_body_rebind(monkeypatch, path, symbol, before, after):
+    failures, healthy = helper.recorder_source_local_contracts(_units())
+    assert not failures and healthy, failures
+    units = _change_symbol(path, symbol, before, after)
+    declaration = helper.receiver.find(next(unit.tree for unit in units if unit.path == path), symbol)
+    assert declaration is not None
+    bindings = dict(helper.RECORDER_BODY_BINDINGS)
+    bindings[path, symbol] = hashlib.sha256(stable_ast_dump(declaration).encode()).hexdigest()
+    monkeypatch.setattr(helper, "RECORDER_BODY_BINDINGS", bindings)
+    failures, receipt = helper.recorder_source_local_contracts(units)
+    assert any("recorder admission order changed" in failure for failure in failures), failures
+    assert not any("recorder admission body changed" in failure for failure in failures), failures
+    assert not receipt
+
+
+def test_recorder_raw_decoder_import_cannot_borrow_an_original_supplier():
+    failures, healthy = helper.recorder_source_local_contracts(_units())
+    assert not failures and healthy, failures
+    units = _change(helper.AUDIT_BUFFER, "    verify_private_chunk,", "    encode_private_chunk as verify_private_chunk,")
+    failures, receipt = helper.recorder_source_local_contracts(units)
+    assert "batch DATA recorder admission supplier changed verify_private_chunk" in failures
+    assert not receipt
+
+
 def test_current_batch_data_receipt_has_actual_source_sites_and_separate_import_roles():
     units = _units()
     failures, receipt = helper.batch_data_local_contracts(units)

@@ -385,7 +385,7 @@ def retain_semantic_review_result_on_connection(
     semantic_effect_key: str,
     execution: EndReviewExecution,
     captured: CapturedContinuationRuntime,
-) -> StoredContinuationSnapshot:
+) -> tuple[StoredContinuationSnapshot, str]:
     """Commit the real shared END gate result, effect and action receipt once."""
     if (
         type(execution) is not EndReviewExecution
@@ -596,7 +596,7 @@ def retain_semantic_review_result_on_connection(
             selected=complete_selected,
             names=execution.runtime.materialization.inventory.names,
         )
-        return stored
+        return stored, owner_key
 
 
 def read_original_semantic_review_result_on_connection(

@@ -22,6 +22,11 @@ from weakref import WeakKeyDictionary
 from sqlalchemy import Engine, event
 
 
+def _elspeth_selected_end_preparation_worker[**P, T](original: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Keep one sampling ancestor around an unchanged selected worker call."""
+    return original(*args, **kwargs)
+
+
 def _driver_review_observer(profile, original, *, session_id, operation_id, cursor=None):
     from elspeth.web.composer.continuation import EndFrame
     from elspeth.web.composer.continuation_clock import ContinuationActionClock
@@ -61,6 +66,9 @@ def _driver_review_observer(profile, original, *, session_id, operation_id, curs
 def driver_end_preparation_profile(monkeypatch, engine, *, session_id, operation_id):
     """Opt-in existing collector around the original driver's prescribed Review."""
     mode = os.environ.get("ELSPETH_TEST_DRIVER_END_PROFILE")
+    marker = os.environ.get("ELSPETH_TEST_DRIVER_END_SAMPLE_MARKER")
+    assert marker in {None, "1"}, "END sample marker must be unset or 1"
+    assert marker is None or mode == "spans", "END sample marker requires spans mode"
     if mode is None:
         yield
         return
@@ -76,7 +84,7 @@ def driver_end_preparation_profile(monkeypatch, engine, *, session_id, operation
     profile = (
         StopDecisionProfile(enabled=True, cpu_profile=True)
         if mode == "stop_cpu"
-        else EndPreparationProfile(enabled=True, cpu_profile=mode == "cpu", cpu_selection="all_workers")
+        else EndPreparationProfile(enabled=True, cpu_profile=mode == "cpu", cpu_selection="all_workers", sample_worker_marker=marker == "1")
     )
     if mode == "spans":
         profile.text_memo = EndTextMemoObservation(include=profile.include_review_memo)
@@ -401,12 +409,15 @@ class EndTextMemoObservation:
 class EndPreparationProfile:
     FIRST_CAPTURE_PARENT = "elspeth.web.composer.continuation_checkpoint_end_physical.capture_continuation_runtime_owners"
 
-    def __init__(self, *, enabled: bool, cpu_profile: bool = False, cpu_selection: str = "all_workers") -> None:
+    def __init__(
+        self, *, enabled: bool, cpu_profile: bool = False, cpu_selection: str = "all_workers", sample_worker_marker: bool = False
+    ) -> None:
         if cpu_selection not in {"all_workers", "checkpoint_source", "first_capture", "selected_scope"}:
             raise ValueError("CPU selection must be all_workers, checkpoint_source, first_capture or selected_scope")
         self.enabled = enabled
         self.cpu_profile = cpu_profile
         self.cpu_selection = cpu_selection
+        self.sample_worker_marker = sample_worker_marker
         self.records: list[dict[str, Any]] = []
         self.clocks: list[dict[str, Any]] = []
         self.errors: list[str] = []
@@ -657,6 +668,18 @@ class EndPreparationProfile:
                         self._workers[threading.get_native_id()] = row
                     try:
                         # Preserve this exact witness, callable and gated body.
+                        if (
+                            self.sample_worker_marker
+                            and submission["clock"] in self._end_clocks
+                            and submission["clock"] not in self._closed_clocks
+                            and submission["clock"] not in self._end_exits
+                        ):
+                            row["sample_marker_calls"] = row.get("sample_marker_calls", 0) + 1
+                            row["sample_marker_start_ns"] = time.monotonic_ns()
+                            try:
+                                return _elspeth_selected_end_preparation_worker(original_invoke, witness, callable_)
+                            finally:
+                                row["sample_marker_end_ns"] = time.monotonic_ns()
                         if (
                             self.cpu_profile
                             and self.cpu_selection == "all_workers"
@@ -1048,6 +1071,122 @@ class EndPreparationProfile:
             )
         return output
 
+    def _sample_marker_snapshot(self, clock_starts, boundaries, unpaired) -> dict[str, Any]:
+        targets = self._end_clocks
+        entries = [row for row in self.records if row["label"] == "END.execute_continuation_end_review" and row["clock"] in targets]
+        entry_starts = {row["clock"]: row["start_ns"] for row in entries}
+        excluded = [
+            row
+            for row in self.records
+            if row["kind"] == "worker" and row["clock"] in entry_starts and row["start_ns"] < entry_starts[row["clock"]]
+        ]
+        expected = [
+            row["id"]
+            for row in self.records
+            if row["kind"] == "worker"
+            and row["clock"] in targets
+            and row["clock"] in entry_starts
+            and row["start_ns"] >= entry_starts[row["clock"]]
+            and (boundaries[row["clock"]] is None or row["start_ns"] <= boundaries[row["clock"]]["end_ns"])
+        ]
+        marked = [row for row in self.records if "sample_marker_start_ns" in row]
+        missing = sorted(set(expected) - {row["id"] for row in marked})
+        unexpected = sorted({row["id"] for row in marked} - set(expected))
+        pending = [
+            index
+            for index in unpaired
+            if self.records[index]["clock"] in entry_starts
+            and self.records[index]["start_ns"] >= entry_starts[self.records[index]["clock"]]
+            and (
+                boundaries[self.records[index]["clock"]] is None
+                or self.records[index]["start_ns"] <= boundaries[self.records[index]["clock"]]["end_ns"]
+            )
+        ]
+        workers = []
+        issues = []
+        if not self.enabled or self.cpu_profile:
+            issues.append("Sample marker requires timing observations without cProfile")
+        if len(targets) != 1 or None in targets:
+            issues.append("Sample marker requires exactly one selected original END clock")
+        if len(entries) != 1:
+            issues.append("Sample marker requires exactly one actual selected END entry")
+        for clock in targets:
+            if clock not in clock_starts:
+                issues.append("Sample marker target has no original clock start")
+            if boundaries[clock] is None or boundaries[clock]["kind"] != "preparation_finish":
+                issues.append("Sample marker target has no actual preparation-finish boundary")
+        for row in marked:
+            boundary = boundaries.get(row["clock"])
+            start = entry_starts.get(row["clock"])
+            within = (
+                row["clock"] in targets
+                and start is not None
+                and boundary is not None
+                and boundary["kind"] == "preparation_finish"
+                and "end_ns" in row
+                and "sample_marker_end_ns" in row
+                and start
+                <= row["start_ns"]
+                <= row["sample_marker_start_ns"]
+                <= row["sample_marker_end_ns"]
+                <= row["end_ns"]
+                <= boundary["end_ns"]
+            )
+            workers.append(
+                {
+                    "worker_id": row["id"],
+                    "clock": row["clock"],
+                    "thread": row["thread"],
+                    "worker_start_ns": row["start_ns"],
+                    "worker_end_ns": row.get("end_ns"),
+                    "marker_start_ns": row["sample_marker_start_ns"],
+                    "marker_end_ns": row.get("sample_marker_end_ns"),
+                    "calls": row["sample_marker_calls"],
+                    "within_preparation_window": within,
+                }
+            )
+        if not expected:
+            issues.append("Sample marker has no expected selected workers")
+        if missing or unexpected or pending:
+            issues.append("Sample marker coverage does not match selected registered workers")
+        if any(row.get("end_ns", entry_starts[row["clock"]] + 1) > entry_starts[row["clock"]] for row in excluded):
+            issues.append("An unmarked preselection worker overlaps the selected END entry")
+        if any(not worker["within_preparation_window"] or worker["calls"] != 1 for worker in workers):
+            issues.append("Sample marker has an incomplete, repeated or outside-window worker")
+        if self.errors:
+            issues.append("Sample marker capture has observer errors")
+        return {
+            "function": _elspeth_selected_end_preparation_worker.__name__,
+            "file": str(Path(__file__).resolve()),
+            "coverage_valid": not issues,
+            "issues": issues,
+            "target_clocks": sorted(clock for clock in targets if clock is not None),
+            "entry_scopes": [
+                {
+                    "clock": row["clock"],
+                    "original_clock_start_ns": clock_starts.get(row["clock"]),
+                    "entry_start_ns": row["start_ns"],
+                    "excluded_preselection_ns": (
+                        None if row["clock"] not in clock_starts else row["start_ns"] - clock_starts[row["clock"]]
+                    ),
+                }
+                for row in entries
+            ],
+            "excluded_preselection_workers": [
+                {key: row.get(key) for key in ("id", "clock", "thread", "start_ns", "end_ns", "elapsed_ns")} for row in excluded
+            ],
+            "boundaries": [{"clock": clock, "boundary": boundary} for clock, boundary in boundaries.items()],
+            "expected_worker_ids": expected,
+            "missing_worker_ids": missing,
+            "unexpected_worker_ids": unexpected,
+            "unstarted_submission_ids": pending,
+            "workers": workers,
+            "scope": (
+                "selected END-entry-to-preparation-finish registered-worker GIL sample counts/share; "
+                "pre-entry workers excluded; not original-clock whole-window coverage, wall attribution or exact CPU"
+            ),
+        }
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             cpu_profiles = self._cpu_snapshot()
@@ -1148,6 +1287,11 @@ class EndPreparationProfile:
                 "review_memo_interval": self.review_memo,
                 "review_memo_capture_valid": interval is not None and memo_snapshot is not None and not memo_issues,
                 "review_memo_capture_issues": memo_issues,
+                **(
+                    {"selected_worker_sample_marker": self._sample_marker_snapshot(clock_starts, boundaries, unpaired)}
+                    if self.sample_worker_marker
+                    else {}
+                ),
             }
 
     def flush(self, path: Path) -> OSError | None:

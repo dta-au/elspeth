@@ -31,13 +31,14 @@ from elspeth.web.composer.continuation_audit_buffer import (
     RecorderDrainCursors,
     RecorderSnapshot,
     RetainedVisibleLink,
+    _encode_and_decode_recorder_document,
     decode_recorder_snapshot,
     encode_recorder_snapshot,
     recorder_snapshot_json,
     validate_recorder_projection,
 )
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData
-from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json, verify_private_chunk
+from elspeth.web.composer.continuation_codec import PrivateChunk, owned_json
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
@@ -197,18 +198,28 @@ class ApplicationRecorderSource:
     def __init__(self, source: RecorderSnapshot | PrivateChunk, *, env_ref_names: frozenset[str]) -> None:
         _require_source_environment(env_ref_names)
         if type(source) is RecorderSnapshot:
-            chunk = encode_recorder_snapshot(source)
+            chunk, snapshot = _encode_and_decode_recorder_document(recorder_snapshot_json(source))
         elif type(source) is PrivateChunk:
             chunk = source
+            _require_source_chunk(chunk)
+            # Preserve early source bounds and the public decoder's current
+            # verification/schema/projected-admission refusal order.
+            snapshot = decode_recorder_snapshot(chunk)
         else:
             raise TypeError("application recorder requires its actual complete source")
-        _require_source_chunk(chunk)
-        # The full original decoder owns all nested constructors and fields.
-        snapshot = decode_recorder_snapshot(chunk)
-        _require_source_credentials(chunk, env_ref_names)
         object.__setattr__(self, "chunk", chunk)
         object.__setattr__(self, "snapshot", snapshot)
         object.__setattr__(self, "env_ref_names", env_ref_names)
+
+    @staticmethod
+    def _from_canonical(canonical: str, *, env_ref_names: frozenset[str]) -> ApplicationRecorderSource:
+        _require_source_environment(env_ref_names)
+        chunk, snapshot = _encode_and_decode_recorder_document(canonical)
+        source = object.__new__(ApplicationRecorderSource)
+        object.__setattr__(source, "chunk", chunk)
+        object.__setattr__(source, "snapshot", snapshot)
+        object.__setattr__(source, "env_ref_names", env_ref_names)
+        return source
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -296,9 +307,7 @@ def capture_fresh_application_recorder_source(snapshot: RecorderSnapshot, *, env
     _require_source_environment(env_ref_names)
     canonical = recorder_snapshot_json(snapshot)
     if utf8_size(canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
-        return admit_application_recorder_source(
-            encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical), env_ref_names=env_ref_names
-        )
+        return ApplicationRecorderSource._from_canonical(canonical, env_ref_names=env_ref_names)
     chunk, restored = _prospective_recorder_values(snapshot, env_ref_names)
     return ProspectiveApplicationRecorderSource(chunk, restored, env_ref_names)
 
@@ -337,16 +346,6 @@ def _require_source_chunk(chunk: PrivateChunk) -> None:
         utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != chunk.reference.byte_length
     ):
         raise AuditIntegrityError("application recorder exceeds its original complete document bound")
-    verify_private_chunk(chunk.reference, chunk.canonical)
-
-
-def _require_source_credentials(chunk: PrivateChunk, env_ref_names: frozenset[str]) -> None:
-    require_no_credential_material(
-        chunk.canonical,
-        surface="composer_continuation_evidence_recorder",
-        env_ref_names=env_ref_names,
-        max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
-    )
 
 
 def capture_application_recorder_source(snapshot: RecorderSnapshot, *, env_ref_names: frozenset[str]) -> ApplicationRecorderSource:

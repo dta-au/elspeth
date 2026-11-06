@@ -11,7 +11,6 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.advisor_output import ReviewContinuationAction
 from elspeth.web.composer.continuation import EndFrame
 from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
     EndCheckpointNoSdkTerminal,
@@ -24,17 +23,14 @@ from elspeth.web.composer.continuation_checkpoint_end_terminal import (
     EndCheckpointPaidIncompleteTerminal,
     EndCheckpointRepairContinued,
 )
-from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
-from elspeth.web.composer.continuation_end_effects import semantic_end_effect_key
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
-from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope, v4_preparation_memo_scope
+from elspeth.web.continuation_retention_memo import v4_preparation_memo_scope
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_end import EndReviewContinued, EndReviewExecution, execute_continuation_end_review
 from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
-from elspeth.web.sessions.continuation_semantic_actions import SemanticActionAdmission, require_consumed_semantic_review_on_connection
 from elspeth.web.sessions.continuation_semantic_review_result import (
     SemanticReviewCommitted,
     read_original_semantic_review_result_on_connection,
@@ -50,35 +46,17 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.composer_app_services import ComposerAppServices
 
 
-def _read_review_admission(
-    authority: ComposerAsyncOperationAuthority,
-    running: ComposerOperationRunning,
-    selected: SelectedContinuationState,
-    semantic_effect_key: str,
-) -> SemanticActionAdmission:
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
-    with locked_session_transaction(authority._engine, sid) as conn, borrow_v4_preparation_memo_scope():
-        stored = load_snapshot(conn, session_id=sid, operation_id=operation)
-        if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(selected.stack):
-            raise AuditIntegrityError("prescribed Review changed its selected current END cut")
-        admitted = require_consumed_semantic_review_on_connection(conn, running, selected=stored, effect_key=semantic_effect_key)
-        if type(admitted.action) is not ReviewContinuationAction or admitted.review_candidate is None:
-            raise AuditIntegrityError("prescribed Review lost its original paid candidate/action")
-        return admitted
-
-
 def _retain_review_result(
     authority: ComposerAsyncOperationAuthority,
     running: ComposerOperationRunning,
     semantic_effect_key: str,
-    owner_effect_key: str,
     execution: EndReviewExecution,
     captured: CapturedContinuationRuntime,
 ) -> SemanticReviewCommitted:
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     with locked_session_transaction(authority._engine, sid) as conn:
         dispatched = load_snapshot(conn, session_id=sid, operation_id=operation)
-        retained = retain_semantic_review_result_on_connection(
+        retained, owner_effect_key = retain_semantic_review_result_on_connection(
             conn,
             running,
             selected=dispatched,
@@ -130,15 +108,6 @@ async def review_prescribed_continuation_end(
     if clock is None:
         raise AuditIntegrityError("V4 END preparation lost its original driver action clock")
     with v4_preparation_memo_scope(clock):
-        admitted = await _registered(
-            work=phases.work,
-            source=RequiredWorkSource.CONTINUATION_READ_SQL,
-            operation=partial(_read_review_admission, phases.authority, running, selected, source.effect_key),
-            expected=SemanticActionAdmission,
-        )
-        candidate = admitted.review_candidate
-        if candidate is None or admitted.action_key is None:
-            raise AuditIntegrityError("prescribed Review lost its original paid END candidate")
         execution = await execute_continuation_end_review(phases, selected)
     if type(execution) is EndCheckpointFormatRetryReady:
         if execution.completed.cursor <= selected.stack.cursor:
@@ -184,7 +153,6 @@ async def review_prescribed_continuation_end(
             phases.authority,
             running,
             source.effect_key,
-            semantic_end_effect_key(candidate.response, admitted.action_key),
             execution,
             captured,
         ),
