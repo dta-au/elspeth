@@ -240,6 +240,7 @@ async def test_metadata_restore_keeps_shared_disclosure_and_original_source_read
         sql_before = recovery_rows(store[0])
         reads = []
         read_source = type(driver.authority).read_continuation_runtime
+        read_restoration = type(driver.authority).read_continuation_runtime_restoration
 
         def observe_source(self, actual_running, **kwargs):
             result = read_source(self, actual_running, **kwargs)
@@ -248,7 +249,15 @@ async def test_metadata_restore_keeps_shared_disclosure_and_original_source_read
                 raise AuditIntegrityError("controlled original metadata source read refusal")
             return result
 
+        def observe_restoration(self, actual_running, **kwargs):
+            result = read_restoration(self, actual_running, **kwargs)
+            reads.append((actual_running, kwargs["selected"], kwargs["inventory"]))
+            if reject_read == len(reads):
+                raise AuditIntegrityError("controlled original metadata source read refusal")
+            return result
+
         monkeypatch.setattr(type(driver.authority), "read_continuation_runtime", observe_source)
+        monkeypatch.setattr(type(driver.authority), "read_continuation_runtime_restoration", observe_restoration)
         provider = ProviderInvocationOwner(service=store[3], required_work=driver.work)
         if reject_read is not None:
             with pytest.raises(AuditIntegrityError, match="controlled original metadata source read refusal"):

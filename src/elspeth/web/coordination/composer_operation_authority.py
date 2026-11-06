@@ -145,7 +145,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, PrimaryProviderResult, RetainedPrimaryPhaseData
     from elspeth.web.sessions.continuation_publication_projection import PublicationProjectionInput
     from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
-    from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
+    from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource, _RuntimeRestorationInputs
     from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
     from elspeth.web.sessions.graph_recovery import GraphRecoverySettlement
     from elspeth.web.sessions.protocol import ChatMessageRecord, CompositionStateRecord
@@ -1038,6 +1038,34 @@ class ComposerAsyncOperationAuthority:
             raise AuditIntegrityError("first Compose publication requires its actual nominal running owner")
         with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
             return publish_composition_initialization_on_connection(conn, composer, running, owners=owners, captured=captured)
+
+    def read_continuation_runtime_restoration(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        service: ComposerServiceImpl,
+        selected: SelectedContinuationState,
+        inventory: CurrentContinuationEnvInventory,
+    ) -> _RuntimeRestorationInputs:
+        from elspeth.web.composer.continuation import AdvisorFrame
+        from elspeth.web.composer.continuation_prompt_producers import current_message_producers_from_runtime_source
+        from elspeth.web.composer.continuation_selection import SelectedContinuationState
+        from elspeth.web.sessions.continuation_runtime import _RuntimeRestorationInputs, read_runtime_restoration_on_connection
+
+        if type(running) is not ComposerOperationRunning:
+            raise AuditIntegrityError("runtime read requires its actual running owner")
+        with session_data_read_transaction(self._engine, str(running.claim.session_id)) as conn, borrow_v4_preparation_memo_scope():
+            if type(selected) is SelectedContinuationState and selected.stack.frames and type(selected.stack.frames[-1]) is AdvisorFrame:
+                from elspeth.web.sessions.continuation_semantic_advisor import read_semantic_advisor_runtime_source_on_connection
+
+                source = read_semantic_advisor_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+                producers = current_message_producers_from_runtime_source(
+                    service=service, authority=self, selected=selected, inventory=inventory, source=source
+                )
+                return _RuntimeRestorationInputs(source, producers)
+            return read_runtime_restoration_on_connection(
+                conn, running, service=service, authority=self, selected=selected, inventory=inventory
+            )
 
     def read_continuation_runtime(
         self,

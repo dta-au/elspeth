@@ -21,7 +21,11 @@ from elspeth.web.composer.continuation_evidence_graph import (
     _finish_current_evidence,
 )
 from elspeth.web.composer.continuation_evidence_restore import _require_current_reader_service
-from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers, _CurrentProducerInputs
+from elspeth.web.composer.continuation_prompt_producers import (
+    CurrentContinuationMessageProducers,
+    _CurrentProducerInputs,
+    _PairedRuntimeShelf,
+)
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
@@ -40,6 +44,7 @@ def _assemble_current_message_evidence(
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
     materialization: CurrentContinuationMessageProducers,
+    paired_shelf: _PairedRuntimeShelf | None = None,
 ) -> RestoredTurnEvidence:
     """Build unpublished owners; the calling boundary owes its final proof."""
     if (
@@ -101,7 +106,14 @@ def _assemble_current_message_evidence(
         request=snapshot.transcript.request,
     )
     if finish is _finish_copied_current_evidence:
-        shelf = materialization._rebuild_admitted_shelf(snapshot.transcript, inputs=inputs)
+        if paired_shelf is None:
+            shelf = materialization._rebuild_admitted_shelf(snapshot.transcript, inputs=inputs)
+        else:
+            if paired_shelf.producers is not materialization or paired_shelf.admitted is not admitted:
+                raise AuditIntegrityError("runtime shelf changed its actual source producers")
+            shelf = materialization._assemble_shelf(
+                snapshot.transcript, family_positions=paired_shelf.positions, family_cohort=paired_shelf.cohort
+            )
     else:
         shelf = materialization._rebuild_shelf(snapshot.transcript, inputs=inputs)
     owner.transcript, messages = AdvisorTranscriptOwner._from_continuation_shelf(
@@ -142,11 +154,17 @@ def _assemble_runtime_message_evidence(
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
     materialization: CurrentContinuationMessageProducers,
+    paired_shelf: _PairedRuntimeShelf | None,
 ) -> RestoredTurnEvidence:
     """Keep this graph private until the outer runtime's complete final read."""
     with borrow_v4_preparation_memo_scope():
         restored = _assemble_current_message_evidence(
-            service=service, authority=authority, selected=selected, inventory=inventory, materialization=materialization
+            service=service,
+            authority=authority,
+            selected=selected,
+            inventory=inventory,
+            materialization=materialization,
+            paired_shelf=paired_shelf,
         )
         if materialization.finish_read is not None:
             materialization._require_current()
@@ -194,6 +212,7 @@ async def _assemble_runtime_turn_evidence(
     inventory: CurrentContinuationEnvInventory,
     materialization: CurrentContinuationMessageProducers,
     required_work: RequiredWorkBinding,
+    paired_shelf: _PairedRuntimeShelf | None,
 ) -> RestoredTurnEvidence:
     """Return only an intermediate for the outer runtime's final admission."""
     return await _run_evidence_assembly(
@@ -202,7 +221,12 @@ async def _assemble_runtime_turn_evidence(
         materialization=materialization,
         required_work=required_work,
         operation=lambda: _assemble_runtime_message_evidence(
-            service=service, authority=authority, selected=selected, inventory=inventory, materialization=materialization
+            service=service,
+            authority=authority,
+            selected=selected,
+            inventory=inventory,
+            materialization=materialization,
+            paired_shelf=paired_shelf,
         ),
     )
 

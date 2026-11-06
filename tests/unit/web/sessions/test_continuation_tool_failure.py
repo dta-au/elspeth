@@ -369,8 +369,9 @@ async def test_copied_advisor_feedback_reuses_admission_and_keeps_source_owners_
         assert producers.read_turn_evidence_on_connection is actual_current
         actual_issue = transitions._read_tool_issue_with_prepared_data_on_connection
         actual_historical = evidence_reader.read_selected_turn_evidence_graph_data_on_connection
-        actual_private = families.CurrentContinuationMessageFamilies._assemble_admitted_cohort
+        actual_private = families.CurrentContinuationMessageFamilies._assemble_paired_cohort_on_connection
         actual_runtime = owner.authority.read_continuation_runtime
+        actual_restoration = owner.authority.read_continuation_runtime_restoration
         phase = "runtime"
         current_reads, issues, historical, admitted_cohorts, sources = [], [], [], [], []
 
@@ -401,24 +402,32 @@ async def test_copied_advisor_feedback_reuses_admission_and_keeps_source_owners_
             sources.append(result)
             return result
 
-        def private(self, requests, *, admitted):
+        def restoration(*args, **values):
             nonlocal phase
-            assert phase == "runtime" and len(sources) == 1
-            assert admitted is sources[0].admitted_evidence
+            assert phase == "runtime" and not sources
             phase = "private"
             try:
-                result = actual_private(self, requests, admitted=admitted)
-                admitted_cohorts.append(result)
+                result = actual_restoration(*args, **values)
+                sources.append(result.source)
                 return result
             finally:
                 phase = "runtime"
+
+        def private(self, conn, requests, **values):
+            assert phase == "private" and not sources and len(issues) == 1
+            assert values["admitted"] is current_reads[0][1]
+            assert conn is issues[0][0] and conn.in_transaction()
+            result = actual_private(self, conn, requests, **values)
+            admitted_cohorts.append(result)
+            return result
 
         monkeypatch.setattr(evidence_reader, "read_turn_evidence_on_connection", current)
         monkeypatch.setattr(producers, "read_turn_evidence_on_connection", current)
         monkeypatch.setattr(transitions, "_read_tool_issue_with_prepared_data_on_connection", issue)
         monkeypatch.setattr(evidence_reader, "read_selected_turn_evidence_graph_data_on_connection", read_historical)
-        monkeypatch.setattr(families.CurrentContinuationMessageFamilies, "_assemble_admitted_cohort", private)
+        monkeypatch.setattr(families.CurrentContinuationMessageFamilies, "_assemble_paired_cohort_on_connection", private)
         monkeypatch.setattr(owner.authority, "read_continuation_runtime", read_runtime)
+        monkeypatch.setattr(owner.authority, "read_continuation_runtime_restoration", restoration)
         before = stored_rows(operation_store[0])
         restored = await restore_continuation_runtime(
             service=owner.service,
@@ -429,8 +438,8 @@ async def test_copied_advisor_feedback_reuses_admission_and_keeps_source_owners_
             provider_owner=owner.provider_owner,
         )
         assert len(sources) == 2 and restored.source is sources[0]
-        assert len(admitted_cohorts) == 1 and not any(stage == "private" for stage, _result in current_reads)
-        assert current_reads and all(stage == "runtime" for stage, _result in current_reads)
+        assert len(admitted_cohorts) == 1
+        assert [stage for stage, _result in current_reads] == ["private", "runtime"]
         assert len(issues) == 1
         conn, effect_key, issued = issues[0]
         assert effect_key == f"tool:{recipe.response.digest}:{recipe.tool_index}"
