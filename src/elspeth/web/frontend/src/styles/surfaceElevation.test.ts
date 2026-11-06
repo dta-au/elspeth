@@ -293,15 +293,7 @@ describe("ARGOnite material tiers (card, pill, track)", () => {
     for (const tier of ["--shadow-card", "--shadow-pill", "--shadow-track"]) {
       const dark = geometryOf(token("dark", tier));
       expect(dark, `${tier} should have colour layers`).toContain("C");
-      // ARGOnite: the specified light --shadow-track softens the top inset
-      // blur (5px dark, 3px light), so for that tier compare structure
-      // (layer count, inset keyword, offsets) with the first blur blanked.
-      const comparable = (value: string): string =>
-        tier === "--shadow-track" ? value.replace(/(\d+px) \d+px/, "$1 B") : value;
-      expect(
-        comparable(geometryOf(token("light", tier))),
-        `${tier} geometry must match dark`,
-      ).toBe(comparable(dark));
+      expect(geometryOf(token("light", tier)), `${tier} geometry must match dark`).toBe(dark);
     }
   });
 });
