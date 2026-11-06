@@ -9,9 +9,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from tests.unit.web.coordination.test_composer_continuation_claim_start import queued, start_segment
 from tests.unit.web.coordination.test_composer_operation_authority import _admission_rows
@@ -101,36 +102,6 @@ def test_handover_keeps_sequence_advances_generation_and_releases_fence(operatio
     assert successor.fence.operation_epoch > running.session_operation_context.fence.operation_epoch
 
 
-@pytest.mark.parametrize("changed", ["predecessor_outcome", "predecessor_claim"])
-def test_recovered_start_refuses_corrupt_actual_attempt_pair_and_rolls_back(operation_store, monkeypatch, changed):
-    from elspeth.web.sessions import continuation as module
-
-    engine, repository, *_ = operation_store
-    authority, _record, running = _running(operation_store)
-    repository.suspend_composer_segment(running)
-    (claim,) = authority.claim_segment(limit=1)
-    before = _admission_rows(engine)
-    original = module._select_segment_start_on_connection
-    reached = []
-
-    def corrupt_actual_predecessor(conn, actual_claim, **kwargs):
-        pair = conn.execute(select(attempts).order_by(attempts.c.generation)).all()
-        assert len(pair) == 2 and pair[1].generation == claim.ownership_generation
-        reached.append(pair)
-        values = {"outcome": "settled"} if changed == "predecessor_outcome" else {"claim_attempt": claim.attempt}
-        conn.execute(update(attempts).where(attempts.c.generation == running.claim.ownership_generation).values(**values))
-        return original(conn, actual_claim, **kwargs)
-
-    with monkeypatch.context() as scoped:
-        scoped.setattr(module, "_select_segment_start_on_connection", corrupt_actual_predecessor)
-        with pytest.raises(AuditIntegrityError, match="actual interrupted/reclaimed attempt pair"):
-            start_segment(repository, claim)
-    assert len(reached) == 1
-    assert _admission_rows(engine) == before
-    successor = start_segment(repository, claim)
-    assert successor.fence.operation_epoch > running.session_operation_context.fence.operation_epoch
-
-
 def test_handover_readback_survives_a_peer_starting_immediately(operation_store):
     _engine, repository, *_ = operation_store
     authority, _record, running = _running(operation_store)
@@ -197,7 +168,8 @@ def test_start_readback_proves_unstarted_without_minting_a_context(operation_sto
     assert _admission_rows(engine) == before
 
 
-def test_start_readback_recovers_actual_commit_after_return_failure(operation_store, monkeypatch):
+@pytest.mark.parametrize("corruption", [None, "candidate_without_history", "revoked_history", "changed_claim"])
+def test_start_readback_recovers_actual_commit_after_return_failure(operation_store, monkeypatch, corruption):
     from contextlib import contextmanager
 
     from elspeth.web.coordination import repository as module
@@ -229,6 +201,94 @@ def test_start_readback_recovers_actual_commit_after_return_failure(operation_st
     with engine.connect() as conn:
         history = conn.execute(select(attempts)).one()
         assert history.session_operation_id == observation.context.fence.operation_id
+    if corruption is not None:
+        with engine.begin() as conn:
+            if corruption == "candidate_without_history":
+                # Keep the actual committed fence, but make the other rows
+                # resemble an unstarted claim. This is not a rollback.
+                assert conn.execute(delete(attempts)).rowcount == 1
+                assert conn.execute(update(segments).values(state="interrupted")).rowcount == 1
+            elif corruption == "revoked_history":
+                assert conn.execute(update(attempts).values(revoked_at=database_now(conn), outcome="interrupted")).rowcount == 1
+            else:
+                assert conn.execute(update(segments).values(claim_token="changed-after-actual-commit")).rowcount == 1
+        changed = _admission_rows(engine)
+        expected = AuditIntegrityError if corruption in ("candidate_without_history", "changed_claim") else ComposerOperationFenceLost
+        with pytest.raises(expected):
+            repository.reconcile_composer_segment_start(observation)
+        assert _admission_rows(engine) == changed
+
+
+@pytest.mark.parametrize("field", ["attempt", "claim_token", "operation_id", "segment_sequence", "ownership_generation"])
+def test_unstarted_readback_refuses_foreign_claim_without_writes(operation_store, field):
+    engine, repository, *_ = operation_store
+    authority, _record = queued(operation_store)
+    (claim,) = authority.claim_segment(limit=1)
+    changes = {
+        "attempt": claim.attempt + 1,
+        "claim_token": claim.claim_token + "-foreign",
+        "operation_id": str(uuid4()),
+        "segment_sequence": claim.segment_sequence + 1,
+        "ownership_generation": claim.ownership_generation + 1,
+    }
+    observation = ComposerSegmentStartObservation(replace(claim, **{field: changes[field]}))
+    before = _admission_rows(engine)
+    with pytest.raises(ComposerOperationFenceLost):
+        repository.reconcile_composer_segment_start(observation)
+    assert not observation.reconciled and observation.context is None
+    assert _admission_rows(engine) == before
+    assert repository.reconcile_composer_segment_start(ComposerSegmentStartObservation(claim)) is None
+    assert _admission_rows(engine) == before
+
+
+def test_rolled_back_start_readback_refuses_a_later_actual_start(operation_store, monkeypatch):
+    from elspeth.web.sessions import continuation as module
+
+    engine, repository, *_ = operation_store
+    authority, _record = queued(operation_store)
+    (claim,) = authority.claim_segment(limit=1)
+    original = module._select_segment_start_on_connection
+    failed = ComposerSegmentStartObservation(claim)
+    before = _admission_rows(engine)
+    injected = RuntimeError("refuse the actual provisional startup")
+
+    def refuse(conn, actual_claim, **kwargs):
+        original(conn, actual_claim, **kwargs)
+        assert conn.execute(select(attempts)).one().claim_attempt == claim.attempt
+        raise injected
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(module, "_select_segment_start_on_connection", refuse)
+        with pytest.raises(RuntimeError) as caught:
+            start_segment(repository, claim, observation=failed)
+    assert caught.value is injected and failed.context is not None
+    assert _admission_rows(engine) == before
+    committed = ComposerSegmentStartObservation(claim)
+    context = start_segment(repository, claim, observation=committed)
+    assert context is not failed.context and context.fence.operation_id != failed.context.fence.operation_id
+    after = _admission_rows(engine)
+    with pytest.raises(ComposerOperationFenceLost):
+        repository.reconcile_composer_segment_start(failed)
+    assert not failed.reconciled
+    assert repository.reconcile_composer_segment_start(committed) is context
+    assert _admission_rows(engine) == after
+
+
+def test_unstarted_readback_allows_expired_claim_cleanup_without_authority(operation_store):
+    engine, repository, *_ = operation_store
+    authority, _record = queued(operation_store)
+    (claim,) = authority.claim_segment(limit=1)
+    with engine.begin() as conn:
+        assert conn.execute(update(segments).values(claim_expires_at=database_now(conn) - timedelta(seconds=1))).rowcount == 1
+    observation = ComposerSegmentStartObservation(claim)
+    before = _admission_rows(engine)
+    assert repository.reconcile_composer_segment_start(observation) is None
+    assert observation.reconciled and observation.context is None
+    assert _admission_rows(engine) == before
+    authority.release_claim(claim)
+    with engine.connect() as conn:
+        assert conn.execute(select(attempts)).all() == []
+        assert conn.execute(select(segments.c.claim_token)).scalar_one() is None
 
 
 @pytest.mark.parametrize("changed", ("generation", "cursor", "checkpoint", "release"))

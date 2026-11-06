@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import litellm
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import PromptGuardDecision
@@ -27,7 +27,7 @@ from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
-from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.continuation import ComposerSegmentStartObservation, load_snapshot
 from elspeth.web.sessions.continuation_end import enter_continuation_end, execute_continuation_end_review
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -46,9 +46,15 @@ from tests.unit.web.sessions.test_continuation_prompt_producers import current_s
 operation_store = test_composer_operation_authority.operation_store
 
 
-@pytest.mark.parametrize("recover_owner", [False, True], ids=("fresh-runtime", "recovered-owner"))
+@pytest.mark.parametrize(
+    ("recover_owner", "corrupt_pair"),
+    [(False, None), (True, None), (True, "predecessor_outcome"), (True, "predecessor_claim")],
+    ids=("fresh-runtime", "recovered-owner", "predecessor-outcome", "predecessor-claim"),
+)
 @pytest.mark.asyncio
-async def test_cold_malformed_end_closes_h_and_restores_one_original_format_retry(operation_store, tmp_path, monkeypatch, recover_owner):
+async def test_cold_malformed_end_closes_h_and_restores_one_original_format_retry(
+    operation_store, tmp_path, monkeypatch, recover_owner, corrupt_pair
+):
     policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
@@ -170,6 +176,55 @@ async def test_cold_malformed_end_closes_h_and_restores_one_original_format_retr
                         ).all()
                     assert all(row.generation < claim.ownership_generation for row in previous_attempts)
                     assert len(sdk_calls) == 1
+                    if corrupt_pair is not None:
+                        from elspeth.web.sessions import continuation as continuation_module
+
+                        before_start = test_composer_operation_authority._admission_rows(store[0])
+                        original_selector = continuation_module._select_segment_start_on_connection
+                        reached = []
+                        observation = ComposerSegmentStartObservation(claim)
+
+                        def corrupt_actual_pair(conn, actual_claim, **kwargs):
+                            assert actual_claim is claim
+                            pair = conn.execute(
+                                select(attempts)
+                                .where(attempts.c.session_id == sid, attempts.c.operation_id == operation)
+                                .order_by(attempts.c.generation)
+                            ).all()
+                            assert pair[-1].generation == claim.ownership_generation
+                            assert pair[-1].claim_attempt == claim.attempt > pair[-2].claim_attempt
+                            assert pair[-2].outcome == "interrupted" and pair[-2].revoked_at is not None
+                            # Positive proof at the same real END source before
+                            # changing just its actual predecessor SQL row.
+                            original_selector(conn, actual_claim, **kwargs)
+                            reached.append(pair[-1])
+                            values = {"outcome": "settled"} if corrupt_pair == "predecessor_outcome" else {"claim_attempt": claim.attempt}
+                            changed = conn.execute(
+                                update(attempts)
+                                .where(
+                                    attempts.c.session_id == sid,
+                                    attempts.c.operation_id == operation,
+                                    attempts.c.generation == running.claim.ownership_generation,
+                                )
+                                .values(**values)
+                            )
+                            assert changed.rowcount == 1
+                            return original_selector(conn, actual_claim, **kwargs)
+
+                        with monkeypatch.context() as scoped:
+                            scoped.setattr(continuation_module, "_select_segment_start_on_connection", corrupt_actual_pair)
+                            with pytest.raises(AuditIntegrityError, match="actual interrupted/reclaimed attempt pair"):
+                                current_repository.start_composer_segment(
+                                    claim,
+                                    owner_instance_id=current_authority._owner_instance_id,
+                                    lease_seconds=30,
+                                    auth_provider_type="local",
+                                    observation=observation,
+                                )
+                        assert len(reached) == 1 and len(sdk_calls) == 1
+                        assert test_composer_operation_authority._admission_rows(store[0]) == before_start
+                        assert current_repository.reconcile_composer_segment_start(observation) is None
+                        assert test_composer_operation_authority._admission_rows(store[0]) == before_start
                     context = current_repository.start_composer_segment(
                         claim,
                         owner_instance_id=current_authority._owner_instance_id,

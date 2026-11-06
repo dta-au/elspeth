@@ -1543,8 +1543,8 @@ def test_owner_commit_requires_actual_current_claim_history_without_writes(opera
             )
         elif change in ("nonprepared", "wrong_owner"):
             with engine.begin() as conn:
-                values = {"disposition": "dispatched"} if change == "nonprepared" else {"owner": "unowned-test-effect"}
-                conn.execute(
+                values = {"disposition": "dispatched"} if change == "nonprepared" else {"owner": "tool_dispatch"}
+                changed_effect = conn.execute(
                     update(effects)
                     .where(
                         effects.c.session_id == str(sid),
@@ -1553,6 +1553,12 @@ def test_owner_commit_requires_actual_current_claim_history_without_writes(opera
                     )
                     .values(**values)
                 )
+                assert changed_effect.rowcount == 1
+                if change == "wrong_owner":
+                    assert (
+                        conn.execute(select(effects.c.owner).where(effects.c.effect_key == commit.effect_key)).scalar_one()
+                        == "tool_dispatch"
+                    )
             expected_error = ContinuationCASConflict
             expected_message = "SQL owner result is already retained or its prepared authority changed"
         elif change == "nonread_completed_read":

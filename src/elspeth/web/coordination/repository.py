@@ -5825,16 +5825,17 @@ class _SessionOperationAuthorityRepository:
         if type(observation) is not ComposerSegmentStartObservation:
             raise TypeError("start reconciliation requires its actual retained producer observation")
         claim = observation.claim
+        context = observation.context
+        if type(claim) is not ComposerOperationClaim or (
+            context is not None
+            and (
+                type(context) is not SessionOperationContext
+                or context.operation_kind is not SessionOperationKind.COMPOSE
+                or context.fence.session_id != str(claim.session_id)
+            )
+        ):
+            raise AuditIntegrityError("start reconciliation changed its original claim/context")
         with locked_session_transaction(self._engine, str(claim.session_id), deadline=deadline) as conn:
-            if observation.context is not None:
-                running = ComposerOperationRunning(claim=claim, session_operation_context=observation.context)
-                try:
-                    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
-                except ComposerOperationFenceLost:
-                    pass
-                else:
-                    observation.reconciled = True
-                    return observation.context
             history = conn.execute(
                 select(attempts).where(
                     attempts.c.session_id == str(claim.session_id),
@@ -5853,9 +5854,50 @@ class _SessionOperationAuthorityRepository:
                     segments.c.claim_token == claim.claim_token,
                 )
             ).one_or_none()
-            if history is None and segment is not None:
+            parent = conn.execute(
+                select(composer_async_operations_table).where(
+                    composer_async_operations_table.c.session_id == str(claim.session_id),
+                    composer_async_operations_table.c.operation_id == claim.operation_id,
+                )
+            ).one_or_none()
+            if (
+                history is None
+                and segment is not None
+                and parent is not None
+                and parent.status in ("queued", "running")
+                and parent.current_segment_sequence == claim.segment_sequence
+                and parent.ownership_generation == claim.ownership_generation
+                and parent.attempt == claim.attempt
+                and parent.checkpoint_id == segment.checkpoint_id
+            ):
+                if observation.committed:
+                    raise AuditIntegrityError("committed start lost its original attempt")
+                if context is not None:
+                    # A rolled-back candidate was issued one epoch after the
+                    # retained fence. It cannot leave its own fence/history,
+                    # nor can a later owner be mistaken for that rollback.
+                    fence = self._select_fence(conn, session_id=str(claim.session_id))
+                    candidate_history = conn.execute(
+                        select(attempts.c.session_operation_epoch).where(
+                            attempts.c.session_id == str(claim.session_id),
+                            attempts.c.session_operation_epoch == context.fence.operation_epoch,
+                        )
+                    ).one_or_none()
+                    if (
+                        fence is None
+                        or fence.operation_epoch + 1 != context.fence.operation_epoch
+                        or fence.operation_id == context.fence.operation_id
+                        or fence.lease_token == context.fence.lease_token
+                        or candidate_history is not None
+                    ):
+                        raise AuditIntegrityError("unstarted claim retains or replaced the observed start candidate")
                 observation.reconciled = True
                 return None
+            if history is not None and context is not None:
+                running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+                _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+                observation.reconciled = True
+                return context
             raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
 
     def _admit_blob_read(

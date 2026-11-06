@@ -945,13 +945,17 @@ def read_retry_ready_action_source_on_connection(
     """Source-proved current retry cut for sizing/recovery; grants no paid call."""
     if load_snapshot(conn, session_id=session_id, operation_id=operation_id) != selected:
         raise AuditIntegrityError("END retry allowance selected another current SQL head")
+    root = decode_continuation_snapshot(selected.payload_json)
+    if type(root.frames[-1]) is not EndFrame:
+        # This sizing facet owns END Review only. Initializers (including
+        # their real eventless cursor zero) retain their own source reader.
+        return None
     phase = read_end_format_retry_phase_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=selected)
     if phase is None:
         return None
     if phase.kind != "end_review" or phase.current != selected:
         raise AuditIntegrityError("END retry allowance has no supported original END Review source")
     proof = read_end_format_retry_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=selected, names=names)
-    root = decode_continuation_snapshot(selected.payload_json)
     outer = tuple(item for item in root.effect_frontier if item.effect_id == proof.marker.outer_effect_key)
     child = tuple(item for item in root.effect_frontier if item.effect_id == proof.marker.effect_key)
     unresolved = tuple(item.effect_id for item in root.effect_frontier if item.disposition in ("prepared", "dispatched", "unknown"))
