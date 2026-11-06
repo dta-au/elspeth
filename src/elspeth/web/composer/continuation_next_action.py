@@ -521,6 +521,27 @@ def validate_continuation_structure_data_on_connection(
     return ()
 
 
+def require_completed_end_review_source_on_connection(
+    conn: Connection, *, session_id: str, operation_id: str, selected: SelectedContinuationState
+) -> None:
+    """Prove a completed Review at its actual disposition/start transaction.
+
+    The caller owns current selection and SQL admission. Unrelated cuts and
+    consumed semantic Stop retain their separate source owners.
+    """
+    root = selected.stack
+    top = root.frames[-1]
+    if type(top) is not EndFrame or top.phase not in ("repair_needed", "publication_ready") or is_consumed_semantic_stop_cut(selected):
+        return
+    from elspeth.web.sessions.continuation_semantic_advisor import _input_end_source_observation
+
+    original_review = _input_end_source_observation(
+        conn, session_id, operation_id, root, checkpoint_id=selected.checkpoint_id, cursor=root.cursor
+    )
+    if original_review.review is None:
+        raise AuditIntegrityError("completed END handover requires its original paid Review result")
+
+
 class ContinuationCutNotResumable(AuditIntegrityError):
     """A structurally valid retained cut holds work no new owner may redo.
 

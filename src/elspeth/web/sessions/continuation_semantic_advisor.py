@@ -2300,6 +2300,13 @@ def _semantic_iteration_publication_data(
 ) -> SemanticIterationPublicationProof | None:
     from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
+    root = decode_continuation_snapshot(selected.payload_json)
+    if (
+        len(root.frames) != 2
+        or type(root.frames[-1]) is not ToolBatchFrame
+        or root.frames[-1].accumulator.codec != "composer.applied-p4-batch.v2"
+    ):
+        return None
     # Current ownership/CAS belongs to the public caller. Reconstruct the
     # original consumed checkpoint only through proved recovery transitions.
     selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
@@ -2510,6 +2517,13 @@ def _semantic_owned_iteration_publication_data(
 ) -> SemanticOwnedIterationPublicationProof | None:
     from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
+    root = decode_continuation_snapshot(selected.payload_json)
+    if (
+        len(root.frames) != 2
+        or type(root.frames[-1]) is not ToolBatchFrame
+        or root.frames[-1].accumulator.codec != "composer.applied-p4-batch.v2"
+    ):
+        return None
     selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
     from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
     from elspeth.web.sessions.continuation_semantic_actions import _reprove_installed_snapshot
@@ -2947,14 +2961,24 @@ def _semantic_ordinary_recovery_publication_data(
 ) -> SemanticOrdinaryRecoveryPublicationProof | None:
     """Reprove original paid recovery and paid Stop from immutable history."""
     from elspeth.web.sessions.continuation_semantic_actions import _reprove_installed_snapshot
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
     root = decode_continuation_snapshot(selected.payload_json)
-    if len(root.frames) != 2 or type(root.frames[1]) is not EndFrame:
+    if len(root.frames) != 2 or type(root.frames[1]) is not EndFrame or root.frames[1].phase != "publication_ready":
         return None
-    parent, end = _parent(root), root.frames[1]
-    candidate = decode_end_candidate(_ref(conn, sid, operation, end.candidate))
+    parent, selected_end = _parent(root), root.frames[1]
+    candidate = decode_end_candidate(_ref(conn, sid, operation, selected_end.candidate))
     if candidate.kind != "recovery":
         return None
+    # This source owns only the consumed ordinary recovery Stop. Recovery
+    # preserves its complete business root; current authority stays with the
+    # caller, while original adjacency belongs to the proved historical cut.
+    selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
+    root = decode_continuation_snapshot(selected.payload_json)
+    parent, end = _parent(root), root.frames[1]
+    if type(end) is not EndFrame:
+        raise AuditIntegrityError("ordinary recovery publication lost its original END frame")
+    candidate = decode_end_candidate(_ref(conn, sid, operation, end.candidate))
     if selected.cursor < 1 or candidate.semantic_source is None:
         raise AuditIntegrityError("ordinary recovery publication lacks its paid Stop source")
     installed = _historical_snapshot(conn, sid, operation, cursor=selected.cursor - 1)
@@ -3075,17 +3099,21 @@ def consume_committed_semantic_read_on_connection(
     """Expose actual non-provider read values; a receipt alone is not novelty."""
     from elspeth.web.composer.continuation_semantic_advisor_evidence import derive_semantic_read_evidence
     from elspeth.web.sessions.continuation_semantic_actions import read_original_committed_semantic_read_on_connection
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
-    _current(conn, running, selected)
+    root = _current(conn, running, selected)
+    if _advisor(root).phase != "decision_ready" or root.active_action_json is not None:
+        raise AuditIntegrityError("Semantic read consume requires its actual completed Read cut")
     sid, operation = str(running.claim.session_id), running.claim.operation_id
+    committed = semantic_recovery_source(conn, sid, operation, selected).snapshot
     original = read_original_committed_semantic_read_on_connection(
         conn,
         session_id=running.claim.session_id,
         operation_id=operation,
-        commit_checkpoint_id=selected.checkpoint_id,
+        commit_checkpoint_id=committed.checkpoint_id,
         semantic_effect_key=effect_key,
     )
-    if original.committed.snapshot != selected:
+    if original.committed.snapshot != committed:
         raise AuditIntegrityError("Semantic read consume substituted its exact original committed source")
     evidence = derive_semantic_read_evidence(original.admission, original.committed)
     ready, frontier, candidate = _read_consumed_root(conn, sid, operation, selected, evidence.reference)
@@ -3094,8 +3122,8 @@ def consume_committed_semantic_read_on_connection(
         operation_id=operation,
         semantic_effect_key=effect_key,
         owner_effect_key=original.committed.owner_effect_key,
-        commit_checkpoint_id=selected.checkpoint_id,
-        commit_cursor=selected.cursor,
+        commit_checkpoint_id=committed.checkpoint_id,
+        commit_cursor=committed.cursor,
         consume_cursor=selected.cursor + 1,
         source=original.admission.paid.source,
         reference=evidence.reference,
@@ -3133,8 +3161,17 @@ def consume_committed_semantic_read_on_connection(
 
 
 def _read_input_data(conn: Connection, sid: str, operation: str, reference: ContinuationEvidenceRef) -> SemanticAdvisorReadInput:
+    value, _bridge = _read_input_with_bridge_data(conn, sid, operation, reference)
+    return value
+
+
+def _read_input_with_bridge_data(
+    conn: Connection, sid: str, operation: str, reference: ContinuationEvidenceRef
+) -> tuple[SemanticAdvisorReadInput, _ReadSourceBridge]:
+    """Prove original Read DATA and its actual current-predecessor consumption."""
     from elspeth.web.composer.continuation_semantic_advisor_evidence import derive_semantic_read_evidence
     from elspeth.web.sessions.continuation_semantic_actions import read_original_committed_semantic_read_on_connection
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
     bridge = _decode(
         _ReadSourceBridge, _blob(conn, sid, operation, f"semantic-read-source:{reference.receipt_id}", "composer.semantic-read-source.v1")
@@ -3156,7 +3193,6 @@ def _read_input_data(conn: Connection, sid: str, operation: str, reference: Cont
     evidence = derive_semantic_read_evidence(original.admission, original.committed)
     if (
         bridge.commit_cursor != original.committed.snapshot.cursor
-        or bridge.consume_cursor != bridge.commit_cursor + 1
         or bridge.source != original.admission.paid.source
         or bridge.owner_effect_key != original.committed.owner_effect_key
         or bridge.reference != evidence.reference
@@ -3164,7 +3200,10 @@ def _read_input_data(conn: Connection, sid: str, operation: str, reference: Cont
         or bridge.original_result_sha256 != evidence.original_result_sha256
     ):
         raise AuditIntegrityError("Semantic read input changed its exact original result or stable semantic values")
-    expected, frontier, candidate = _read_consumed_root(conn, sid, operation, original.committed.snapshot, evidence.reference)
+    predecessor = _historical_snapshot(conn, sid, operation, cursor=bridge.consume_cursor - 1)
+    if semantic_recovery_source(conn, sid, operation, predecessor).snapshot != original.committed.snapshot:
+        raise AuditIntegrityError("Semantic read input changed its exact recovered consume predecessor")
+    expected, frontier, candidate = _read_consumed_root(conn, sid, operation, predecessor, evidence.reference)
     consumed = _historical_snapshot(conn, sid, operation, cursor=bridge.consume_cursor)
     if (
         consumed.payload_json != encode_continuation_snapshot(expected.model_copy(update={"cursor": consumed.cursor}))
@@ -3173,14 +3212,17 @@ def _read_input_data(conn: Connection, sid: str, operation: str, reference: Cont
     ):
         raise AuditIntegrityError("Semantic read input lost its complete original consumed root")
     _journal_data(conn, sid, operation, cursor=consumed.cursor, tag="checkpoint", payload=_read_bridge_event(bridge))
-    return SemanticAdvisorReadInput(
-        reference,
-        evidence.semantic_result_json,
-        evidence.original_result_sha256,
-        bridge.semantic_effect_key,
-        bridge.owner_effect_key,
-        bridge.commit_checkpoint_id,
-        bridge.commit_cursor,
+    return (
+        SemanticAdvisorReadInput(
+            reference,
+            evidence.semantic_result_json,
+            evidence.original_result_sha256,
+            bridge.semantic_effect_key,
+            bridge.owner_effect_key,
+            bridge.commit_checkpoint_id,
+            bridge.commit_cursor,
+        ),
+        bridge,
     )
 
 
@@ -3358,12 +3400,10 @@ def _returned_iteration_source_data(
     from elspeth.web.sessions.continuation_iteration_return import read_original_iteration_return_on_connection
     from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
-    recovered_source = semantic_recovery_source(conn, sid, operation, selected).snapshot
-    if recovered_source != selected and _semantic_checkpoint_kind_data(conn, sid, operation, recovered_source.cursor) in (
-        "semantic_iteration_whole_stop_ready",
-        "semantic_iteration_owned_stop_ready",
-    ):
-        selected = recovered_source
+    # Establish the applied-iteration domain before following its strict
+    # semantic recovery history. Initial/non-iteration sources are not probes.
+    applied_batch_cut(decode_continuation_snapshot(selected.payload_json).frames)
+    selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
 
     actual = _historical_snapshot(conn, sid, operation, checkpoint_id=selected.checkpoint_id)
     if actual != selected:
@@ -3398,6 +3438,11 @@ def _prove_returned_iteration_descendant(
     selected: StoredContinuationSnapshot,
     original: IterationReturnCommitted,
 ) -> None:
+    from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
+    applied_batch_cut(decode_continuation_snapshot(selected.payload_json).frames)
+    selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
     if selected == original.completed:
         return
     if selected.cursor <= original.completed.cursor:
@@ -3447,12 +3492,12 @@ def _prove_returned_iteration_descendant(
             reference = ContinuationEvidenceRef.model_validate_json(canonical_json(payload["reference"]), strict=True)
         except ValidationError as cause:
             raise AuditIntegrityError("Semantic returned read source replaced its original evidence reference") from cause
-        value = _read_input_data(conn, sid, operation, reference)
+        _value, bridge = _read_input_with_bridge_data(conn, sid, operation, reference)
         # The original Read reader replays its prescribing paid input (which
         # re-enters this proof at an earlier cursor), complete committed result,
         # consume root, immutable bridge and event. The exact current snapshot
         # at that cursor was independently selected above.
-        if value.commit_cursor + 1 != selected.cursor or root.semantic_frontier is None:
+        if bridge.consume_cursor != selected.cursor or root.semantic_frontier is None:
             raise AuditIntegrityError("Semantic returned read source changed its original consume checkpoint")
         frontier = decode_frontier_chunk(_ref(conn, sid, operation, root.semantic_frontier))
         if reference not in frontier.evidence:
@@ -3912,9 +3957,12 @@ def validate_semantic_advisor_source_data_on_connection(
     if frame.provider_effect_key is None:
         raise AuditIntegrityError("Semantic structural source lost its actual original provider effect")
     if frame.phase == "decision_ready":
+        from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
+        original_selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
         if (
             root.active_action_json is None
-            and _semantic_checkpoint_kind_data(conn, sid, operation, selected.cursor) == "semantic_read_committed"
+            and _semantic_checkpoint_kind_data(conn, sid, operation, original_selected.cursor) == "semantic_read_committed"
         ):
             from elspeth.web.sessions.continuation_semantic_actions import read_original_committed_semantic_read_on_connection
 
@@ -3922,7 +3970,7 @@ def validate_semantic_advisor_source_data_on_connection(
                 conn,
                 session_id=session_id,
                 operation_id=operation_id,
-                commit_checkpoint_id=selected.checkpoint_id,
+                commit_checkpoint_id=original_selected.checkpoint_id,
                 semantic_effect_key=frame.provider_effect_key,
             )
             return ()

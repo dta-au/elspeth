@@ -9,11 +9,13 @@ from uuid import UUID, uuid4
 
 import litellm
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
-from elspeth.web.composer.continuation import AdvisorFrame, ToolBatchFrame
+from elspeth.web.composer import continuation_next_action as next_action_module
+from elspeth.web.composer.advisor_output import ContinuationEvidenceRef
+from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame, ToolBatchFrame
 from elspeth.web.composer.continuation_clock import SegmentFit
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_handoff import classify_drain_cut, classify_drain_cut_on_connection
@@ -24,13 +26,17 @@ from elspeth.web.required_sql_outcomes import RequiredSQLReturned
 from elspeth.web.sessions import continuation_driver as driver_module
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
 from elspeth.web.sessions.composer_finalization import _message_with_state_response
+from elspeth.web.sessions.composer_operation_errors import worker_lost_error
 from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite, ComposerOperationFenceLost, ComposerOperationRunning
 from elspeth.web.sessions.continuation import read_chunk
 from elspeth.web.sessions.continuation_semantic_actions import require_semantic_publication_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+from elspeth.web.sessions.models import composer_continuation_effects_table as retained_effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
+from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+from elspeth.web.sessions.models import session_operation_fences_table as fences
 from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
 from elspeth.web.sessions.service import SessionServiceImpl
 from tests.helpers.composer_operations import message_body
@@ -40,17 +46,167 @@ from tests.helpers.continuation_app import (
     effects,
     end_admit,
     install_sdk,
+    observe_original_driver_failures,
     semantic_primary_response,
+    semantic_read_response,
+    semantic_review_response,
+    semantic_stop_response,
     submit_and_settle,
     tool_call,
 )
 from tests.helpers.continuation_inventory import inventory_work
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
+from tests.unit.web.sessions import test_continuation_end_shared_execution as shared_end_fixture
 from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
-from tests.unit.web.sessions.test_continuation_semantic_owned_publication import actual_owned_recovery_case
+from tests.unit.web.sessions.test_continuation_semantic_owned_publication import _ordinary_recovery_stop, actual_owned_recovery_case
 from tests.unit.web.sessions.test_continuation_semantic_publication import actual_semantic_publication_case
 
 operation_store = semantic_fixture.operation_store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ("clean", "blocked"))
+async def test_completed_review_cold_handover_reproves_original_result(operation_store, tmp_path, monkeypatch, outcome):
+    async with shared_end_fixture.actual_shared_end_case(operation_store, tmp_path, monkeypatch, outcome=outcome) as case:
+        engine, repository, authority, _sessions, sid = operation_store
+        original = case["execution"].review
+        running, work, lease = case["running"], case["work"], case["lease"]
+        stored = original.completed
+        names = case["runtime"].env_ref_names
+        original_calls = tuple(case["sdk"])
+        with engine.connect() as conn:
+            request_id = conn.execute(
+                select(semantic_fixture.jobs.c.request_id).where(
+                    semantic_fixture.jobs.c.session_id == str(sid), semantic_fixture.jobs.c.operation_id == running.claim.operation_id
+                )
+            ).scalar_one()
+        original_require = next_action_module.require_completed_end_review_source_on_connection
+        boundary, corrupt_at, observed = "idle", None, []
+
+        def rows():
+            with engine.connect() as conn:
+                return semantic_fixture._rows_on_connection(conn), tuple(
+                    tuple(conn.execute(select(table).order_by(*table.primary_key.columns)).all()) for table in (attempts, segments, fences)
+                )
+
+        def require_original(conn, *, session_id, operation_id, selected):
+            nonlocal corrupt_at
+            if session_id == str(sid) and operation_id == running.claim.operation_id:
+                observed.append(boundary)
+                if corrupt_at == boundary:
+                    corrupt_at = None
+                    key = conn.execute(
+                        select(retained_effects.c.result_chunk_key).where(
+                            retained_effects.c.session_id == session_id,
+                            retained_effects.c.operation_id == operation_id,
+                            retained_effects.c.effect_key == original.owner_effect_key,
+                        )
+                    ).scalar_one()
+                    body = json.loads(read_chunk(conn, session_id=session_id, operation_id=operation_id, key=key))
+                    body["outcome"] = "blocked" if outcome == "clean" else "clean"
+                    encoded = canonical_json(body).encode()
+                    changed = conn.execute(
+                        update(chunks)
+                        .where(chunks.c.session_id == session_id, chunks.c.operation_id == operation_id, chunks.c.chunk_key == key)
+                        .values(payload=encoded, byte_length=len(encoded), sha256=sha256(encoded).hexdigest())
+                    )
+                    assert changed.rowcount == 1
+            return original_require(conn, session_id=session_id, operation_id=operation_id, selected=selected)
+
+        monkeypatch.setattr(next_action_module, "require_completed_end_review_source_on_connection", require_original)
+        try:
+            for recovery_index in range(2):
+                selected = await load_selected_continuation(authority=authority, running=running, selected=stored, required_work=work)
+                assert type(selected.stack.frames[-1]) is EndFrame
+                assert selected.stack.frames[-1].phase == ("publication_ready" if outcome == "clean" else "repair_needed")
+                boundary = "poll"
+                prior = len(observed)
+                assert authority.read_continuation_tool_failure(running, env_ref_names=names) is None
+                assert len(observed) == prior
+                boundary = "classify"
+                with locked_session_transaction(engine, str(sid)) as conn:
+                    assert classify_drain_cut_on_connection(conn, running, selected, env_ref_names=names) == "handover"
+                    before = semantic_fixture._rows_on_connection(conn)
+                    key = conn.execute(
+                        select(retained_effects.c.result_chunk_key).where(
+                            retained_effects.c.session_id == str(sid),
+                            retained_effects.c.operation_id == running.claim.operation_id,
+                            retained_effects.c.effect_key == original.owner_effect_key,
+                        )
+                    ).scalar_one()
+                    savepoint = conn.begin_nested()
+                    try:
+                        body = json.loads(read_chunk(conn, session_id=str(sid), operation_id=running.claim.operation_id, key=key))
+                        body["outcome"] = "blocked" if outcome == "clean" else "clean"
+                        encoded = canonical_json(body).encode()
+                        changed = conn.execute(
+                            update(chunks)
+                            .where(
+                                chunks.c.session_id == str(sid),
+                                chunks.c.operation_id == running.claim.operation_id,
+                                chunks.c.chunk_key == key,
+                            )
+                            .values(payload=encoded, byte_length=len(encoded), sha256=sha256(encoded).hexdigest())
+                        )
+                        assert changed.rowcount == 1
+                        with pytest.raises(AuditIntegrityError):
+                            classify_drain_cut_on_connection(conn, running, selected, env_ref_names=names)
+                    finally:
+                        savepoint.rollback()
+                    assert semantic_fixture._rows_on_connection(conn) == before
+                if recovery_index == 0:
+                    for boundary in ("suspend", "terminal"):
+                        before_failure = rows()
+                        corrupt_at = boundary
+                        with pytest.raises(AuditIntegrityError):
+                            if boundary == "suspend":
+                                repository.suspend_composer_segment(running)
+                            else:
+                                authority.settle_continuation_owner(
+                                    running, outcome=worker_lost_error(request_id=request_id), env_ref_names=names
+                                )
+                        assert corrupt_at is None
+                        assert rows() == before_failure
+                boundary = "suspend"
+                receipt = await lease.consume_continuation_handoff(partial(repository.suspend_composer_segment, running))
+                repository.verify_recovery(receipt)
+                await lease.close()
+                work.coordinator.assert_completed()
+                previous = running
+                (claim,) = authority.claim_segment(limit=1)
+                boundary = "start"
+                if recovery_index == 0:
+                    before_failure = rows()
+                    corrupt_at = boundary
+                    with pytest.raises(AuditIntegrityError):
+                        repository.start_composer_segment(
+                            claim, owner_instance_id=authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"
+                        )
+                    assert corrupt_at is None
+                    assert rows() == before_failure
+                context = repository.start_composer_segment(
+                    claim, owner_instance_id=authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"
+                )
+                running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+                work = inventory_work(running)
+                lease = await ContinuationLeaseAdoption(repository, context, lease_seconds=30, required_work=work.coordinator).join()
+                stored = authority.load_continuation_snapshot(running)
+                assert decode_continuation_snapshot(stored.payload_json) == selected.stack.model_copy(update={"cursor": stored.cursor})
+                assert running.claim.segment_sequence == previous.claim.segment_sequence
+                assert running.claim.ownership_generation == previous.claim.ownership_generation + 1
+                with locked_session_transaction(engine, str(sid)) as conn:
+                    with pytest.raises(ComposerOperationFenceLost):
+                        semantic_sql.read_semantic_advisor_retained_inputs_on_connection(conn, previous, selected=stored)
+                    inputs = semantic_sql.read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=stored)
+                    assert inputs.review is not None
+                    assert inputs.review.completed_checkpoint_id == original.completed.checkpoint_id
+                    assert inputs.review.owner_effect_key == original.owner_effect_key
+            assert tuple(case["sdk"]) == original_calls
+            assert {"classify", "suspend", "start", "terminal"} <= set(observed)
+            assert "poll" not in observed
+        finally:
+            await lease.close()
+            work.coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
@@ -463,3 +619,202 @@ async def test_consumed_paid_stop_handover_reproves_original_source_at_actual_fi
         finally:
             await lease.close()
             work.coordinator.assert_completed()
+
+
+@asynccontextmanager
+async def _actual_completed_source_case(tmp_path, monkeypatch, cut):
+    if cut.startswith("iteration_"):
+        async with _actual_iteration_stop_case(tmp_path, monkeypatch, "clean") as case:
+            harness, sdk, operation, reply = case
+            if cut in ("iteration_read_committed", "iteration_read_applied"):
+                sdk.steps.insert(-1, ("semantic", semantic_read_response))
+            yield harness, sdk, operation, reply
+        return
+    operation = str(uuid4())
+    reply = "The original request is complete."
+    if cut == "ordinary_recovery_stop":
+        script = [
+            (
+                "primary",
+                (
+                    None,
+                    [
+                        {
+                            "id": "original-park",
+                            "type": "function",
+                            "function": {"name": "handoff_to_user", "arguments": canonical_json({"action": "park", "message": reply})},
+                        }
+                    ],
+                ),
+            ),
+            ("semantic", lambda request: _ordinary_recovery_stop(request, reply=reply)),
+        ]
+    else:
+        script = [
+            ("primary", (reply, None)),
+            ("semantic", semantic_read_response),
+            ("semantic", semantic_review_response),
+            ("end", end_admit()),
+            ("semantic", semantic_stop_response),
+        ]
+    sdk = ScriptedSDK(script)
+    install_sdk(monkeypatch, sdk)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        sdk.app_ref.append(harness.app)
+        yield harness, sdk, operation, reply
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cut", "recoveries"),
+    (
+        ("read_committed", 1),
+        ("read_committed", 2),
+        ("iteration_returned", 1),
+        ("iteration_read_committed", 1),
+        ("iteration_read_committed", 2),
+        ("iteration_read_applied", 1),
+        ("ordinary_recovery_stop", 1),
+        ("ordinary_recovery_stop", 2),
+    ),
+)
+async def test_original_driver_restores_completed_sources_before_next_action(tmp_path, monkeypatch, cut, recoveries):
+    async with _actual_completed_source_case(tmp_path, monkeypatch, cut) as (harness, sdk, operation, reply):
+        original_advance, original_fit = driver_module._SegmentDriver.advance, driver_module.admit_action
+        before, after, paid_effects, applied_reads = [], [], [], []
+        forced = 0
+
+        async def observe_advance(driver, stored, selected):
+            if driver.running.claim.operation_id != operation:
+                return await original_advance(driver, stored, selected)
+            if before and not after and driver.running.claim.ownership_generation == before[0][0].ownership_generation + recoveries:
+                after.append(selected)
+                assert driver.phases.runtime is None
+            result = await original_advance(driver, stored, selected)
+            if result is None and (not before or (cut == "iteration_read_committed" and not applied_reads)):
+                following, current = await driver.selected()
+                with harness.app.state.session_engine.connect() as conn:
+                    event = conn.execute(
+                        select(events).where(events.c.operation_id == operation, events.c.sequence == following.cursor)
+                    ).one()
+                    body = json.loads(
+                        read_chunk(conn, session_id=str(harness.session_id), operation_id=operation, key=event.payload_chunk_key)
+                    )
+                if (
+                    cut == "iteration_read_committed"
+                    and before
+                    and event.tag == "checkpoint"
+                    and body.get("kind") == "semantic_read_applied"
+                ):
+                    assert type(current.stack.frames[-1]) is ToolBatchFrame
+                    applied_reads.append(
+                        (following, ContinuationEvidenceRef.model_validate_json(canonical_json(body["reference"]), strict=True))
+                    )
+                reached = event.tag == "checkpoint" and (
+                    (cut == "read_committed" and body.get("kind") == "semantic_read_committed")
+                    or (
+                        cut == "iteration_read_committed"
+                        and body.get("kind") == "semantic_read_committed"
+                        and tuple(type(frame) for frame in current.stack.frames) == (ComposeFrame, ToolBatchFrame, AdvisorFrame)
+                    )
+                    or (cut == "iteration_returned" and body.get("transition") == "iteration_stage" and body.get("stage") == "returned")
+                    or (
+                        cut == "iteration_read_applied"
+                        and body.get("kind") == "semantic_read_applied"
+                        and type(current.stack.frames[-1]) is ToolBatchFrame
+                    )
+                    or (cut == "ordinary_recovery_stop" and body.get("kind") == "semantic_ordinary_recovery_stop_ready")
+                )
+                if reached and not before:
+                    before.append((driver.running.claim, current, following))
+                    paid_effects.extend(effects(harness.app, operation))
+            return result
+
+        def original_cut_handover(*args, **kwargs):
+            nonlocal forced
+            if before and forced < recoveries:
+                forced += 1
+                return SegmentFit.YIELD
+            return original_fit(*args, **kwargs)
+
+        monkeypatch.setattr(driver_module._SegmentDriver, "advance", observe_advance)
+        monkeypatch.setattr(driver_module, "admit_action", original_cut_handover)
+        trace = observe_original_driver_failures(monkeypatch, operation, session_id=harness.session_id)
+        request = (
+            "Name the draft 'Named draft' and finish this request."
+            if cut.startswith("iteration_")
+            else "Park the draft and finish this request."
+            if cut == "ordinary_recovery_stop"
+            else "Explain this pipeline."
+        )
+        try:
+            terminal = await submit_and_settle(harness, message_body(request, operation_id=operation), rounds=720)
+        finally:
+            (tmp_path / f"recovery-{cut}-{recoveries}.json").write_text(json.dumps(trace, sort_keys=True), encoding="utf-8")
+        assert terminal.status == "completed", terminal.error
+        assert terminal.result is not None and terminal.result.message.content.split("\n\n---\n\n")[0] == reply
+        assert len(before) == len(after) == 1 and forced == recoveries
+        assert after[0].stack == before[0][1].stack.model_copy(update={"cursor": after[0].stack.cursor})
+        assert after[0].stack.cursor == before[0][1].stack.cursor + recoveries
+        final_effects = {row.effect_key: row for row in effects(harness.app, operation)}
+        assert all(final_effects[row.effect_key] == row for row in paid_effects)
+        expected = (
+            ["primary", "semantic"]
+            if cut == "ordinary_recovery_stop"
+            else ["primary", "primary", "end", "semantic"]
+            if cut == "iteration_returned"
+            else ["primary", "primary", "end", "semantic", "semantic"]
+            if cut in ("iteration_read_committed", "iteration_read_applied")
+            else ["primary", "semantic", "semantic", "end", "semantic"]
+        )
+        assert sdk.roles == expected and not sdk.steps
+        with harness.app.state.session_engine.connect() as conn:
+            if cut == "iteration_read_committed":
+                assert len(applied_reads) == 1
+                applied, reference = applied_reads[0]
+                _value, bridge = semantic_sql._read_input_with_bridge_data(conn, str(harness.session_id), operation, reference)
+                assert bridge.commit_checkpoint_id == before[0][2].checkpoint_id
+                assert bridge.commit_cursor == before[0][2].cursor
+                assert bridge.consume_cursor == applied.cursor == after[0].stack.cursor + 1
+                assert semantic_sql._returned_iteration_source_data(conn, str(harness.session_id), operation, applied) is not None
+            if cut == "ordinary_recovery_stop":
+                original = semantic_sql._semantic_ordinary_recovery_publication_data(conn, str(harness.session_id), operation, before[0][2])
+                assert original is not None
+                recovered = semantic_sql._historical_snapshot(
+                    conn, str(harness.session_id), operation, checkpoint_id=after[0].checkpoint_id
+                )
+                assert (
+                    semantic_sql._semantic_ordinary_recovery_publication_data(conn, str(harness.session_id), operation, recovered)
+                    == original
+                )
+                for corruption in ("event", "attempt"):
+                    savepoint = conn.begin_nested()
+                    try:
+                        if corruption == "event":
+                            changed = conn.execute(
+                                update(events)
+                                .where(events.c.operation_id == operation, events.c.sequence == recovered.cursor)
+                                .values(tag="checkpoint")
+                            )
+                        else:
+                            changed = conn.execute(
+                                update(attempts)
+                                .where(
+                                    attempts.c.operation_id == operation,
+                                    attempts.c.sequence == before[0][0].segment_sequence,
+                                    attempts.c.generation == before[0][0].ownership_generation,
+                                )
+                                .values(outcome="settled")
+                            )
+                        assert changed.rowcount == 1
+                        with pytest.raises(AuditIntegrityError):
+                            semantic_sql._semantic_ordinary_recovery_publication_data(conn, str(harness.session_id), operation, recovered)
+                    finally:
+                        savepoint.rollback()
+                    assert (
+                        semantic_sql._semantic_ordinary_recovery_publication_data(conn, str(harness.session_id), operation, recovered)
+                        == original
+                    )
+            if cut in ("read_committed", "iteration_read_committed", "iteration_read_applied"):
+                document = json.loads(sdk.requests[-1]["messages"][-1]["content"])
+                assert document["read_results"]

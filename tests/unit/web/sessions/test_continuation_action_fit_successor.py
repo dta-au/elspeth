@@ -436,9 +436,17 @@ async def test_original_elapsed_cooperative_boundary_yields_a_cold_successor(tmp
 
 
 @pytest.mark.asyncio
-async def test_original_healthy_primary_finishes_after_cooperative_boundary_before_stop(tmp_path, monkeypatch):
+async def test_original_healthy_primary_crosses_cooperative_boundary_then_completes(tmp_path, monkeypatch):
     operation_id = str(uuid4())
-    sdk = ScriptedSDK([("primary", ("The original admitted action completes before Stop.", None))])
+    sdk = ScriptedSDK(
+        [
+            ("primary", ("The pipeline explanation is ready for review.", None)),
+            ("semantic", semantic_read_response),
+            ("semantic", semantic_review_response),
+            ("end", end_admit()),
+            ("semantic", semantic_stop_response),
+        ]
+    )
     original_advance = _SegmentDriver.advance
     drivers, healthy_actions = [], []
 
@@ -451,6 +459,8 @@ async def test_original_healthy_primary_finishes_after_cooperative_boundary_befo
     monkeypatch.setattr(_SegmentDriver, "advance", observe_original_action)
 
     async def healthy_provider_crosses_boundary(**kwargs):
+        if healthy_actions:
+            return await sdk(**kwargs)
         assert not sdk.requests and len(drivers) == 1
         driver = drivers[0]
         clock = driver._action_clock
@@ -469,7 +479,6 @@ async def test_original_healthy_primary_finishes_after_cooperative_boundary_befo
         sdk.app_ref.append(harness.app)
         driver_trace = observe_original_driver_failures(monkeypatch, operation_id, session_id=harness.session_id)
         owner_trace = _observe_owner_errors(monkeypatch, operation_id)
-        stopped = _stop_after_committed_primary(monkeypatch, harness, operation_id, sequence=1, generation_at_least=1, count=1)
         terminal = await _settle_with_bounded_failure_state(
             harness,
             message_body("Explain this pipeline.", operation_id=operation_id),
@@ -477,14 +486,33 @@ async def test_original_healthy_primary_finishes_after_cooperative_boundary_befo
             [],
             driver_trace,
             owner_trace,
-            expected_status="failed",
             rounds=720,
         )
-        assert terminal.error is not None and terminal.error.error_type == "request_cancelled"
-        assert len(healthy_actions) == len(stopped) == 1 and sdk.roles == ["primary"] and not sdk.steps
+        assert terminal.status == "completed" and terminal.error is None and terminal.result is not None
+        assert len(healthy_actions) == 1 and sdk.roles == ["primary", "semantic", "semantic", "end", "semantic"] and not sdk.steps
         with harness.app.state.session_engine.connect() as conn:
             (segment,) = conn.execute(select(segments).where(segments.c.operation_id == operation_id)).all()
-        assert (segment.sequence, segment.generation, segment.state) == (1, 1, "settled")
+            recoveries = conn.execute(select(events).where(events.c.operation_id == operation_id, events.c.tag == "recovered")).all()
+            original_attempts = conn.execute(
+                select(attempts).where(attempts.c.operation_id == operation_id).order_by(attempts.c.generation)
+            ).all()
+            for recovery in recoveries:
+                pair = conn.execute(
+                    select(checkpoints)
+                    .where(checkpoints.c.operation_id == operation_id, checkpoints.c.cursor.in_((recovery.sequence - 1, recovery.sequence)))
+                    .order_by(checkpoints.c.cursor)
+                ).all()
+                assert len(pair) == 2
+                before, after = (
+                    decode_continuation_snapshot(
+                        read_chunk(conn, session_id=str(harness.session_id), operation_id=operation_id, key=row.snapshot_chunk_key).decode()
+                    )
+                    for row in pair
+                )
+                assert after == before.model_copy(update={"cursor": after.cursor})
+        assert (segment.sequence, segment.state) == (1, "settled") and segment.generation >= 2
+        assert recoveries and len(original_attempts) == segment.generation
+        assert all(row.outcome == "interrupted" and row.revoked_at is not None for row in original_attempts[:-1])
         primary = tuple(row for row in effects(harness.app, operation_id) if row.effect_key.startswith("provider:0:"))
         assert len(primary) == 1 and primary[0].disposition == "committed" and primary[0].creator_sequence == 1
 

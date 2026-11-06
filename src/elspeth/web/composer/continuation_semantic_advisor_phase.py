@@ -208,8 +208,11 @@ async def _consume_current_decision(phases: ContinuationLivePhases, selected: Se
         if type(action) is ReadContinuationAction:
             # The following real read action receives the original read policy.
             return current
+        from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
+        original = semantic_recovery_source(conn, str(running.claim.session_id), running.claim.operation_id, current).snapshot
         if (
-            _semantic_checkpoint_kind_data(conn, str(running.claim.session_id), running.claim.operation_id, current.cursor)
+            _semantic_checkpoint_kind_data(conn, str(running.claim.session_id), running.claim.operation_id, original.cursor)
             == "semantic_read_committed"
         ):
             return consume_committed_semantic_read_on_connection(conn, running, selected=current, effect_key=effect_key)

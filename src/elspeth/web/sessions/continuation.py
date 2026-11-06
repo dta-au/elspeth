@@ -1301,7 +1301,10 @@ def _selected_segment_action(
 ) -> ContinuationActionPolicy:
     if segment.sequence == 1 and segment.generation == 1:
         return _initial_segment_action(conn, parent=parent, segment=segment, snapshot=snapshot, stack=stack, policy=policy)
-    from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
+    from elspeth.web.composer.continuation_next_action import (
+        next_continuation_action_policy,
+        require_completed_end_review_source_on_connection,
+    )
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
     from elspeth.web.sessions.continuation_checkpoint_end_retry import read_retry_ready_action_source_on_connection
@@ -1333,9 +1336,11 @@ def _selected_segment_action(
     retry_ready = read_retry_ready_action_source_on_connection(
         conn, session_id=parent.session_id, operation_id=parent.operation_id, selected=snapshot
     )
-    return next_continuation_action_policy(
-        selected=SelectedContinuationState(snapshot.checkpoint_id, stack, private), policy=policy, retry_ready=retry_ready
+    selected = SelectedContinuationState(snapshot.checkpoint_id, stack, private)
+    require_completed_end_review_source_on_connection(
+        conn, session_id=parent.session_id, operation_id=parent.operation_id, selected=selected
     )
+    return next_continuation_action_policy(selected=selected, policy=policy, retry_ready=retry_ready)
 
 
 def _retained_successor_action(
@@ -1347,7 +1352,10 @@ def _retained_successor_action(
     next_action_json: str | None,
     policy_sha256: str | None,
 ) -> tuple[str, str]:
-    from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
+    from elspeth.web.composer.continuation_next_action import (
+        next_continuation_action_policy,
+        require_completed_end_review_source_on_connection,
+    )
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
     from elspeth.web.sessions.continuation_checkpoint_end_retry import read_retry_ready_action_source_on_connection
@@ -1370,9 +1378,9 @@ def _retained_successor_action(
     elif expected is None:
         private = load_snapshot_private_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=actual)
         retry_ready = read_retry_ready_action_source_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=actual)
-        expected = next_continuation_action_policy(
-            selected=SelectedContinuationState(actual.checkpoint_id, stack, private), policy=policy, retry_ready=retry_ready
-        )
+        selected = SelectedContinuationState(actual.checkpoint_id, stack, private)
+        require_completed_end_review_source_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=selected)
+        expected = next_continuation_action_policy(selected=selected, policy=policy, retry_ready=retry_ready)
     if policy_sha256 is not None and policy_sha256 != stack.policy_hash:
         raise AuditIntegrityError("successor substituted another retained complete policy")
     if next_action_json is not None:
@@ -1760,6 +1768,7 @@ def validate_lost_continuation_on_connection(conn: Connection, *, session_id: st
     """
     from elspeth.web.composer.continuation_next_action import (
         next_continuation_action_policy,
+        require_completed_end_review_source_on_connection,
         validate_continuation_structure_data_on_connection,
     )
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -1836,7 +1845,7 @@ def validate_lost_continuation_on_connection(conn: Connection, *, session_id: st
                 selected=selected, policy=decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
             )
             return tuple(entry.effect_id for entry in stack.effect_frontier if entry.disposition in ("prepared", "dispatched", "unknown"))
-    return validate_continuation_structure_data_on_connection(
+    ambiguous = validate_continuation_structure_data_on_connection(
         conn,
         session_id=UUID(session_id),
         operation_id=operation_id,
@@ -1845,6 +1854,9 @@ def validate_lost_continuation_on_connection(conn: Connection, *, session_id: st
         selected=selected,
         env_ref_names=names,
     )
+    if not ambiguous:
+        require_completed_end_review_source_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=selected)
+    return ambiguous
 
 
 def settle_segment_on_connection(

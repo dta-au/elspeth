@@ -25,7 +25,6 @@ from elspeth.web.composer.continuation import (
 )
 from elspeth.web.composer.continuation_next_action import (
     handoff_cut_allowance,
-    is_consumed_semantic_stop_cut,
     next_continuation_action_policy,
 )
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
@@ -45,11 +44,17 @@ def classify_drain_cut_on_connection(
     *,
     env_ref_names: frozenset[str],
 ) -> ContinuationDrainDisposition:
-    from elspeth.web.composer.continuation_next_action import validate_continuation_structure_on_connection
+    from elspeth.web.composer.continuation_next_action import (
+        require_completed_end_review_source_on_connection,
+        validate_continuation_structure_on_connection,
+    )
 
     unresolved = validate_continuation_structure_on_connection(conn, running, selected, env_ref_names=env_ref_names)
     if unresolved:
         return "unresolved"
+    require_completed_end_review_source_on_connection(
+        conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, selected=selected
+    )
     return classify_drain_cut(selected)
 
 
@@ -79,7 +84,7 @@ def classify_drain_cut(selected: SelectedContinuationState) -> ContinuationDrain
     live_later_cut = (
         (type(top) is ComposeFrame and top.phase == "action_ready")
         or (type(top) is AdvisorFrame and top.phase in ("response_retained", "decision_ready"))
-        or (type(top) is EndFrame and (top.phase == "review_needed" or is_consumed_semantic_stop_cut(selected)))
+        or (type(top) is EndFrame and top.phase in ("review_needed", "repair_needed", "publication_ready"))
     )
     if handoff_cut_allowance(root, policy) is not None and not live_later_cut:
         raise AuditIntegrityError("drain cut has no landed handoff-lineage owner")

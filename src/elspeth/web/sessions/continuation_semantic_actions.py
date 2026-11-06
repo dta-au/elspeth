@@ -73,6 +73,7 @@ from elspeth.web.sessions.continuation_owner_results import (
 from elspeth.web.sessions.continuation_semantic_advisor import (
     SemanticAdvisorPaidDecisionData,
     SemanticAdvisorProviderOutcome,
+    _advisor,
     _creator_data,
     _current,
     _effect_data,
@@ -742,9 +743,15 @@ def read_committed_semantic_read_on_connection(
     effect_key: str,
 ) -> SemanticReadCommitted:
     """Cold/current reproof of the original result, owner effect and receipt."""
-    _current(conn, running, selected)
+    from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+
+    root = _current(conn, running, selected)
+    frame = _advisor(root)
+    if frame.phase != "decision_ready" or root.active_action_json is not None:
+        raise AuditIntegrityError("committed semantic read requires its actual completed Read cut")
+    original = semantic_recovery_source(conn, str(running.claim.session_id), running.claim.operation_id, selected).snapshot
     return _read_original_committed_semantic_read_data(
-        conn, running.claim.session_id, running.claim.operation_id, selected, effect_key
+        conn, running.claim.session_id, running.claim.operation_id, original, effect_key
     ).committed
 
 

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
+from functools import partial
+from hashlib import sha256
 from uuid import UUID
 
 import litellm
@@ -27,11 +29,16 @@ from elspeth.web.composer.continuation_semantic_advisor_read import execute_sema
 from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
 from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.coordination.quota_authority import _usage_entry_id
 from elspeth.web.sessions import continuation_semantic_actions as action_sql
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
-from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
-from elspeth.web.sessions.continuation import ContinuationCASConflict, load_snapshot, read_chunk
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationCancelledDuringTurn,
+    ComposerOperationFenceLost,
+    ComposerOperationRunning,
+)
+from elspeth.web.sessions.continuation import ComposerSegmentStartObservation, ContinuationCASConflict, load_snapshot, read_chunk
 from elspeth.web.sessions.continuation_owner_results import decode_read_owner_result
 from elspeth.web.sessions.continuation_semantic_actions import (
     install_semantic_action_on_connection,
@@ -47,12 +54,14 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
     read_current_paid_semantic_decision_on_connection,
     read_semantic_advisor_retained_inputs_on_connection,
 )
+from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 from elspeth.web.sessions.models import quota_provider_attempts_table as attempts
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
+from tests.helpers.continuation_inventory import inventory_work
 from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, _reply
 from tests.unit.web.sessions import test_continuation_semantic_publication as publication_fixture
 from tests.unit.web.sessions.test_continuation_semantic_advisor import _rows_on_connection, _run_paid_semantic, _semantic_case
@@ -495,9 +504,50 @@ def _read_alias_answer(request):
     return answer
 
 
+async def _recover_committed_read_owner(case, store, committed, count, owners):
+    """Move this actual committed Read through original suspension and start."""
+    _engine, repository, authority, _sessions, _sid = store
+    recovered = dict(case)
+    selected = committed
+    for _ in range(count):
+        previous = recovered["running"]
+        original_root = decode_continuation_snapshot(selected.payload_json)
+        previous_clock = recovered["sql_deadline"]
+        previous_clock.begin_settlement()
+        receipt = await recovered["lease"].consume_continuation_handoff(partial(repository.suspend_composer_segment, previous))
+        repository.verify_recovery(receipt)
+        await recovered["lease"].close()
+        recovered["work"].coordinator.assert_completed()
+        (claim,) = authority.claim_segment(limit=1)
+        observation = ComposerSegmentStartObservation(claim)
+        context = repository.start_composer_segment(
+            claim, owner_instance_id=authority._owner_instance_id, lease_seconds=30, auth_provider_type="local", observation=observation
+        )
+        running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+        assert observation.committed and observation.policy is not None and observation.hard_expires_at is not None
+        clock = ContinuationSQLDeadlineOwner(
+            running,
+            policy=observation.policy,
+            drain_signal=previous_clock.drain_signal,
+            drain_seconds=previous_clock.drain_seconds,
+            hard_expires_at=observation.hard_expires_at,
+        )
+        work = inventory_work(running, sql_deadline_owner=clock)
+        lease = await ContinuationLeaseAdoption(repository, context, lease_seconds=30, required_work=work.coordinator).join()
+        owners.callback(work.coordinator.assert_completed)
+        owners.push_async_callback(lease.close)
+        selected = authority.load_continuation_snapshot(running)
+        assert decode_continuation_snapshot(selected.payload_json) == original_root.model_copy(update={"cursor": selected.cursor})
+        assert running.claim.segment_sequence == previous.claim.segment_sequence
+        assert running.claim.ownership_generation == previous.claim.ownership_generation + 1
+        recovered.update(running=running, work=work, lease=lease, sql_deadline=clock)
+    return recovered, selected
+
+
 @pytest.mark.asyncio
-async def test_actual_paid_read_installs_prepares_commits_original_and_reproves_cold(operation_store, tmp_path, monkeypatch):
-    async with _semantic_case(operation_store, tmp_path, monkeypatch, timed_read=True) as case:
+@pytest.mark.parametrize("recoveries", (0, 1, 2))
+async def test_actual_paid_read_installs_prepares_commits_original_and_reproves_cold(operation_store, tmp_path, monkeypatch, recoveries):
+    async with _semantic_case(operation_store, tmp_path, monkeypatch, timed_read=True) as case, AsyncExitStack() as owners:
         physical = []
         sid = str(operation_store[4])
         with operation_store[0].connect() as conn:
@@ -610,28 +660,28 @@ async def test_actual_paid_read_installs_prepares_commits_original_and_reproves_
                 read_committed_semantic_read_on_connection(conn, running, selected=executed.committed.snapshot, effect_key=semantic_key)
                 == cold
             )
+        old_running = running
+        case, consume_source = await _recover_committed_read_owner(case, operation_store, executed.committed.snapshot, recoveries, owners)
+        running = case["running"]
         case["sql_deadline"].begin_action(case["sql_deadline"].policy.actions.session_sql, started_at=time.monotonic())
         with locked_session_transaction(operation_store[0], sid) as conn:
             before_consume = _rows_on_connection(conn)
+            if recoveries:
+                with pytest.raises(ComposerOperationFenceLost):
+                    consume_committed_semantic_read_on_connection(conn, old_running, selected=consume_source, effect_key=semantic_key)
+                assert _rows_on_connection(conn) == before_consume
         rollback = RuntimeError("roll back the actual completed read consumption")
         with pytest.raises(RuntimeError) as rolled_back, locked_session_transaction(operation_store[0], sid) as conn:
-            provisional = consume_committed_semantic_read_on_connection(
-                conn, running, selected=executed.committed.snapshot, effect_key=semantic_key
-            )
-            assert provisional.cursor == executed.committed.snapshot.cursor + 1
+            provisional = consume_committed_semantic_read_on_connection(conn, running, selected=consume_source, effect_key=semantic_key)
+            assert provisional.cursor == consume_source.cursor + 1
             assert _rows_on_connection(conn) != before_consume
             raise rollback
         assert rolled_back.value is rollback
         with locked_session_transaction(operation_store[0], sid) as conn:
             assert _rows_on_connection(conn) == before_consume
-            assert load_snapshot(conn, session_id=sid, operation_id=running.claim.operation_id) == executed.committed.snapshot
-            assert (
-                read_committed_semantic_read_on_connection(conn, running, selected=executed.committed.snapshot, effect_key=semantic_key)
-                == cold
-            )
-            consumed = consume_committed_semantic_read_on_connection(
-                conn, running, selected=executed.committed.snapshot, effect_key=semantic_key
-            )
+            assert load_snapshot(conn, session_id=sid, operation_id=running.claim.operation_id) == consume_source
+            assert read_committed_semantic_read_on_connection(conn, running, selected=consume_source, effect_key=semantic_key) == cold
+            consumed = consume_committed_semantic_read_on_connection(conn, running, selected=consume_source, effect_key=semantic_key)
         committed_root = decode_continuation_snapshot(executed.committed.snapshot.payload_json)
         consumed_root = decode_continuation_snapshot(consumed.payload_json)
         assert consumed_root.frames == committed_root.frames[:-1]
@@ -661,6 +711,40 @@ async def test_actual_paid_read_installs_prepares_commits_original_and_reproves_
                 consume_committed_semantic_read_on_connection(conn, running, selected=consumed, effect_key=semantic_key)
             assert _rows_on_connection(conn) == after_consume
             assert read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=consumed) == inputs
+            bridge_key = f"semantic-read-source:{executed.committed.owner_effect_key}"
+            bridge = json.loads(read_chunk(conn, session_id=sid, operation_id=running.claim.operation_id, key=bridge_key))
+            assert bridge["commit_cursor"] == executed.committed.snapshot.cursor
+            assert bridge["consume_cursor"] == consume_source.cursor + 1 == bridge["commit_cursor"] + recoveries + 1
+            for field in ("commit_cursor", "consume_cursor", "original_result_sha256"):
+                savepoint = conn.begin_nested()
+                try:
+                    changed_bridge = dict(bridge)
+                    changed_bridge[field] = "0" * 64 if field == "original_result_sha256" else bridge[field] + 1
+                    encoded = canonical_json(changed_bridge).encode()
+                    changed = conn.execute(
+                        update(chunks)
+                        .where(
+                            chunks.c.session_id == sid,
+                            chunks.c.operation_id == running.claim.operation_id,
+                            chunks.c.chunk_key == bridge_key,
+                        )
+                        .values(payload=encoded, byte_length=len(encoded), sha256=sha256(encoded).hexdigest())
+                    )
+                    assert changed.rowcount == 1
+                    with pytest.raises(AuditIntegrityError):
+                        read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=consumed)
+                finally:
+                    savepoint.rollback()
+                assert _rows_on_connection(conn) == after_consume
+            assert read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=consumed) == inputs
+        with operation_store[0].connect() as conn:
+            assert len(conn.execute(select(attempts).where(attempts.c.session_id == sid)).all()) == prior_attempts + 1
+            assert len(conn.execute(select(usage).where(usage.c.session_id == sid)).all()) == prior_usage + 1
+        assert len(physical) == 1 and case["provider"].cost_budget.snapshot() == budget
+        if recoveries:
+            # The full-app handover control owns the following fresh provider
+            # stage; this SQL control does not reuse the retired provider owner.
+            return
         # A fresh actual phase owner must restore the popped Compose cut;
         # no prior phase runtime or fabricated PRIMARY tool message is supplied.
         case["sql_deadline"].begin_action(case["sql_deadline"].policy.actions.advisor, started_at=time.monotonic())

@@ -749,6 +749,7 @@ class ComposerAsyncOperationAuthority:
             raise TypeError("continuation terminal requires its actual running owner")
         with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
             from elspeth.web.composer.continuation_next_action import (
+                require_completed_end_review_source_on_connection,
                 unpaid_checkpoint_outer_on_connection,
                 validate_continuation_structure_on_connection,
             )
@@ -813,6 +814,10 @@ class ComposerAsyncOperationAuthority:
                 # Exact unpaid EARLY/END keeps the actual original failure. Its
                 # outer effect stays ambiguous and ordinary settlement records
                 # unknown; this never invents a paid or no-SDK result.
+            else:
+                require_completed_end_review_source_on_connection(
+                    conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, selected=selected
+                )
             return settle_composer_operation_on_connection(conn, running, outcome=outcome)
 
     def classify_continuation_owner(
