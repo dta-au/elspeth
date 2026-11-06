@@ -129,5 +129,11 @@ from tests.unit.web.sessions.test_composer_continuation_yield import (
 from tests.unit.web.sessions.test_continuation_checkpoint_end_cold_format_retry import (
     test_cold_malformed_end_closes_h_and_restores_one_original_format_retry as test_cold_malformed_end_closes_h_and_restores_one_original_format_retry,
 )
+from tests.unit.web.sessions.test_continuation_semantic_actions import (
+    test_actual_paid_read_installs_prepares_commits_original_and_reproves_cold as test_actual_paid_read_installs_prepares_commits_original_and_reproves_cold,
+)
+from tests.unit.web.sessions.test_continuation_semantic_handover import (
+    test_completed_review_cold_handover_reproves_original_result as test_completed_review_cold_handover_reproves_original_result,
+)
 
 pytestmark = pytest.mark.testcontainer
