@@ -33,20 +33,22 @@ export const BADGE_BACKGROUNDS = {
   sink: "var(--color-badge-sink-bg)",
 } as const;
 
-// ── Edge colours ─────────────────────────────────────────────────────────────
-
-export const EDGE_COLORS = {
-  normal: "var(--color-text-muted)",
-  error: "var(--color-error)",
-} as const;
-
-export const EDGE_LABEL_COLOR = "var(--color-text-secondary)";
-
 // ── ARGOnite graph roles ─────────────────────────────────────────────────────
 
 export const GRAPH_EDGE_COLOR = "var(--color-graph-edge)";
 export const NODE_BORDER_COLOR = "var(--color-node-border)";
 export const SELECTED_RING_COLOR = "var(--color-selected-ring)";
+
+// ── Edge colours ─────────────────────────────────────────────────────────────
+
+// ARGOnite: ordinary edges read the graph-edge role (3:1 on the graph well);
+// the semantic failure route keeps the error token.
+export const EDGE_COLORS = {
+  normal: GRAPH_EDGE_COLOR,
+  error: "var(--color-error)",
+} as const;
+
+export const EDGE_LABEL_COLOR = "var(--color-text-secondary)";
 
 // ── Validation indicator colours ─────────────────────────────────────────────
 

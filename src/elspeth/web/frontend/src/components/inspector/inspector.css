@@ -185,7 +185,11 @@
    (elspeth-1adf90c933, elspeth-525d335cbc). */
 :root .react-flow.react-flow,
 :root .graph-view-canvas {
-  --xy-background-color-default: var(--color-bg);
+  /* ARGOnite: transparent so the .graph-view-canvas well (fill AND inset
+     track shadow) shows through — an opaque flow background would paint over
+     the recess. Edges therefore sit on --color-well, the surface the design
+     doc's edge/node-border contrast floors were measured against. */
+  --xy-background-color-default: transparent;
   --xy-background-pattern-dots-color-default: var(--color-border-strong);
   --xy-background-pattern-lines-color-default: var(--color-border-strong);
   --xy-background-pattern-cross-color-default: var(--color-border-strong);
@@ -194,13 +198,16 @@
   --xy-controls-button-color-default: var(--color-text);
   --xy-controls-button-color-hover-default: var(--color-text);
   --xy-controls-button-border-color-default: var(--color-border);
-  --xy-controls-box-shadow-default: 0 0 0 1px var(--color-border), var(--shadow-dropdown);
+  /* ARGOnite: the controls are a raised pill group; its boundary is the
+     border on :root .react-flow__controls below, never this shadow. */
+  --xy-controls-box-shadow-default: var(--shadow-pill);
   --xy-minimap-background-color-default: var(--color-surface);
   --xy-minimap-mask-background-color-default: rgba(15, 45, 53, 0.55);
   --xy-minimap-mask-stroke-color-default: var(--color-border-strong);
   --xy-minimap-node-background-color-default: var(--color-text-muted);
   --xy-minimap-node-stroke-color-default: var(--color-border-strong);
-  --xy-edge-stroke-default: var(--color-text-muted);
+  /* ARGOnite: ordinary edges read the graph-edge role (>= 3:1 on the well). */
+  --xy-edge-stroke-default: var(--color-graph-edge);
   --xy-edge-stroke-selected-default: var(--color-focus-ring);
   /* Elevated, not --color-surface: the plate sits on the --color-bg canvas
      three sRGB units away, so it read as a hole punched through the connector
@@ -221,7 +228,7 @@
 [data-theme="light"] .graph-view-canvas {
   --xy-minimap-mask-background-color-default: rgba(15, 45, 53, 0.12);
   --xy-selection-background-color-default: rgba(138, 90, 192, 0.10);
-  /* --xy-controls-box-shadow-default needs no override here: --shadow-dropdown
+  /* --xy-controls-box-shadow-default needs no override here: --shadow-pill
      itself flips at [data-theme="light"] (tokens.css), and this rule already
      references it via var(). */
 }
@@ -238,6 +245,27 @@
 :root .react-flow__controls-button {
   min-width: var(--size-control-compact);
   min-height: var(--size-control-compact);
+}
+
+/* ARGOnite: the zoom/fit/fullscreen stack is one raised pill group. The real
+   1px border carries the group's boundary (>= 3:1, the .btn edge token);
+   --shadow-pill (via --xy-controls-box-shadow-default above) only lifts it.
+   The end buttons round with the group so their fills stay inside its
+   corners — no overflow clip, which would cut the 2px-offset focus ring.
+   Vertical stack only: GraphView renders <Controls> without `horizontal`. */
+:root .react-flow__controls {
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
+}
+
+:root .react-flow__controls-button:first-child {
+  border-top-left-radius: var(--radius-pill);
+  border-top-right-radius: var(--radius-pill);
+}
+
+:root .react-flow__controls-button:last-child {
+  border-bottom-left-radius: var(--radius-pill);
+  border-bottom-right-radius: var(--radius-pill);
 }
 
 /* The Fullscreen control carries a STROKED ui-icon, while @xyflow styles every
@@ -298,9 +326,13 @@
   min-height: 0;
 }
 
+/* ARGOnite: the routes switch (.switch, shared.css) sits on the pane-gutter
+   line, so it registers with the well's left edge below it. */
 .graph-view-toolbar {
   flex: 0 0 auto;
-  padding: var(--space-xs);
+  display: flex;
+  align-items: center;
+  padding: var(--space-xs) var(--space-pane-gutter) 0;
 }
 
 /* Empty canvas (elspeth-1f4b60a492): composes the shared .empty-state
@@ -335,9 +367,20 @@
      SIBLINGS of the role="img" diagram (elspeth-37f6f13132) — anchor to the
      canvas box rather than an arbitrary ancestor. */
   position: relative;
-  width: 100%;
   flex: 1 1 auto;
   min-height: 0;
+  /* ARGOnite: the canvas is a recessed well inset from the pane — well fill,
+     card radius, the inset track shadow. The flow above it is transparent
+     (--xy-background-color-default), so both show through. overflow clips
+     the flow's pane to the rounded corners; the Controls/MiniMap panels sit
+     a full --space-lg inside, so their focus rings are never clipped. No
+     width: 100% — the shell's column stretch fills the width minus the
+     margin. */
+  margin: var(--space-md) var(--space-pane-gutter);
+  border-radius: var(--radius-card);
+  background-color: var(--color-well);
+  box-shadow: var(--shadow-track);
+  overflow: hidden;
 }
 
 .graph-detail-table {
@@ -348,10 +391,32 @@
   font-size: var(--font-size-sm);
 }
 
+/* ARGOnite: Wiring is the pane's footer row — label plus a count pill. The
+   summary keeps its UA display (list-item), so the native open/closed
+   disclosure marker stays. */
 .graph-detail-table summary {
-  padding: var(--space-sm) var(--space-md);
+  padding: var(--space-sm) var(--space-pane-gutter);
   cursor: pointer;
   font-weight: var(--font-weight-semibold);
+}
+
+/* The count as a recessed chip on the track fill (text on track is gated in
+   colorContrast.test.ts). Same 20px pill geometry as the Checks tab badge. */
+.graph-outputs-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 20px;
+  min-height: 20px;
+  margin-inline-start: var(--space-xs);
+  padding: 0 6px;
+  border-radius: var(--radius-pill);
+  background-color: var(--color-track);
+  color: var(--color-text);
+  font-size: var(--font-size-xs);
+  font-variant-numeric: tabular-nums;
+  vertical-align: middle;
 }
 
 .graph-route-controls {
@@ -593,12 +658,12 @@
   overflow: auto;
   padding: var(--space-md);
   border: 1px solid var(--color-border-strong);
-  /* --radius-lg, matching the node cards' corner (GraphView.tsx node style):
-     at --radius-md this panel rounded SHARPER than the 8px cards it floats
-     over, inverting the concentric outer-≥-inner relationship
-     (elspeth-37cc8b5310). Both surfaces now read the same token, so a retune
-     of the card rank reaches the panel too. */
-  border-radius: var(--radius-lg);
+  /* --radius-node, matching the node cards' corner (GraphView.tsx node
+     style): at --radius-md this panel rounded SHARPER than the cards it
+     floats over, inverting the concentric outer-≥-inner relationship
+     (elspeth-37cc8b5310). Both surfaces read the same token, so a retune of
+     the card rank reaches the panel too (ARGOnite: nodes moved to 14px). */
+  border-radius: var(--radius-node);
   background-color: var(--color-surface-paper);
   /* Raw shadow is DELIBERATE (elspeth-6c3223c76e): covered by the
      tokens.css "oversized config panels" carve-out — do not map it onto the
