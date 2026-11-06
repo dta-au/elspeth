@@ -1184,6 +1184,9 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
           ),
         },
         position: { x: 0, y: 0 },
+        // ARGOnite: forced colours drops the box-shadow selection ring, so
+        // selection also carries a class (outline in themes.css).
+        className: isSelected ? "graph-node--selected" : undefined,
         style: {
           backgroundColor: "var(--color-surface-elevated)",
           border: borderStyle,

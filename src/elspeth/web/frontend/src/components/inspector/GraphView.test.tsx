@@ -64,6 +64,7 @@ vi.mock("@xyflow/react", () => ({
           <div
             key={n.id}
             data-testid={`node-${n.id}`}
+            className={n.className}
             style={n.style}
             // jsdom cannot compute a var()-bearing shorthand, and React Flow's
             // real geometry never runs here, so the node's style OBJECT is the
@@ -3669,6 +3670,14 @@ describe("GraphView", () => {
         "0 0 0 2px var(--color-selected-ring), var(--shadow-card)",
       );
       expect(styleOf("other").boxShadow).toBe("var(--shadow-card)");
+      // ARGOnite: forced colours drops the ring, so selection also carries a
+      // class that themes.css turns into a Highlight outline.
+      expect(screen.getByTestId("node-classify")).toHaveClass(
+        "graph-node--selected",
+      );
+      expect(screen.getByTestId("node-other")).not.toHaveClass(
+        "graph-node--selected",
+      );
       expect(styleOf("classify").borderRadius).toBe("var(--radius-node)");
       // The whole point: selecting a node cannot move anything inside it, so
       // its border is byte-identical in width to its unselected neighbour's.
