@@ -42,6 +42,12 @@ export const EDGE_COLORS = {
 
 export const EDGE_LABEL_COLOR = "var(--color-text-secondary)";
 
+// ── ARGOnite graph roles ─────────────────────────────────────────────────────
+
+export const GRAPH_EDGE_COLOR = "var(--color-graph-edge)";
+export const NODE_BORDER_COLOR = "var(--color-node-border)";
+export const SELECTED_RING_COLOR = "var(--color-selected-ring)";
+
 // ── Validation indicator colours ─────────────────────────────────────────────
 
 export const VALIDATION_COLORS = {

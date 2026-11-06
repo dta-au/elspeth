@@ -298,6 +298,29 @@
      none of the downward tiers can express that offset. */
   --shadow-drawer-left: -8px 0 24px rgba(0, 0, 0, 0.24);
 
+  /* ARGOnite: from ARGO (dta-au) client index.css — reuse assumed MIT, see design doc */
+  --color-brand-navy:        #1e3c50;
+  --color-brand-yellow:      #fad673;
+  --color-on-nav:            #e8eef2;
+  --color-on-nav-muted:      #a8e3c4;
+  --color-nav-control:       rgba(255, 255, 255, 0.10);
+  --color-pane-header:       #11282e;
+  --color-well:              #0c2420;
+  --color-track:             #244a42;
+  --color-pill:              #e8eef2;
+  --color-on-pill:           #141d1b;
+  --color-graph-edge:        #5f8a7d;
+  --color-node-border:       #5f8a7d;
+  --color-btn-primary-text:  #13293a;
+  --shadow-card:  0 1px 3px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-pill:  0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 10px rgba(0, 0, 0, 0.3);
+  --shadow-track: inset 0 2px 5px rgba(0, 0, 0, 0.7), inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+  --radius-pane: 20px;
+  --radius-card: 16px;
+  --radius-node: 14px;
+  --size-pane-header: 46px;
+  --space-pane-gutter: 14px;
+
   /* ── Overlay scrim (elspeth-9ae8ee9ac2) ──────────────────────────────────── */
   /* THE page-dimming veil behind every blocking overlay — dialog backdrops,
      the catalog drawer, the command palette. One token so "blocked" always
@@ -529,6 +552,24 @@
   --shadow-dropdown: 0 8px 24px rgba(15, 45, 53, 0.10);
   --shadow-modal:    0 8px 32px rgba(15, 45, 53, 0.14);
   --shadow-drawer-left: -8px 0 24px rgba(15, 45, 53, 0.13);
+
+  /* ARGOnite: from ARGO (dta-au) client index.css — reuse assumed MIT, see design doc */
+  --color-brand-navy:        #1e3c50;
+  --color-brand-yellow:      #fad673;
+  --color-on-nav:            #ffffff;
+  --color-on-nav-muted:      #c8ebd7;
+  --color-nav-control:       rgba(0, 0, 0, 0.20);
+  --color-pane-header:       #ecf6f0;
+  --color-well:              #dcefe4;
+  --color-track:             #cde3d6;
+  --color-pill:              #ffffff;
+  --color-on-pill:           #13293a;
+  --color-graph-edge:        #5f7a6e;
+  --color-node-border:       #6b8a7c;
+  --color-btn-primary-text:  #13293a;
+  --shadow-card:  0 1px 3px rgba(16, 40, 36, 0.1), 0 8px 24px rgba(16, 40, 36, 0.13);
+  --shadow-pill:  0 1px 2px rgba(16, 40, 36, 0.2), 0 4px 10px rgba(16, 40, 36, 0.16);
+  --shadow-track: inset 0 2px 3px rgba(16, 40, 36, 0.22), inset 0 -1px 0 rgba(255, 255, 255, 0.7);
 
   /* ── Overlay scrim (light) — ink-tinted, lighter veil; see the :root note. */
   --color-scrim: rgba(15, 45, 53, 0.35);

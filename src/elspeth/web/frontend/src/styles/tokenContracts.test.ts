@@ -246,3 +246,37 @@ describe("line-height ladder (elspeth-ec5ba7ba21)", () => {
     }
   });
 });
+
+describe("ARGOnite role tokens are theme-paired", () => {
+  const PAIRED_TOKENS = [
+    "--color-brand-navy",
+    "--color-brand-yellow",
+    "--color-on-nav",
+    "--color-on-nav-muted",
+    "--color-nav-control",
+    "--color-pane-header",
+    "--color-well",
+    "--color-track",
+    "--color-pill",
+    "--color-on-pill",
+    "--color-graph-edge",
+    "--color-node-border",
+    "--color-btn-primary-text",
+    "--shadow-card",
+    "--shadow-pill",
+    "--shadow-track",
+  ];
+
+  it("declares every role and material token in both theme blocks", () => {
+    for (const name of PAIRED_TOKENS) {
+      expect(() => rootToken(name), `${name} missing from :root`).not.toThrow();
+      expect(() => lightToken(name), `${name} missing from light theme`).not.toThrow();
+    }
+  });
+
+  it("orders the radii node < card < pane", () => {
+    const px = (name: string): number => Number.parseFloat(rootToken(name));
+    expect(px("--radius-node")).toBeLessThan(px("--radius-card"));
+    expect(px("--radius-card")).toBeLessThan(px("--radius-pane"));
+  });
+});
