@@ -1,4 +1,4 @@
-"""Pure admission for an automatic action-fit successor at a Compose cut.
+"""Pure admission for an automatic successor at a quiescent Compose cut.
 
 The live driver owns the timing observation. This plan grants no SQL authority:
 the successor transaction rechecks the current fence, head, checkpoint,
@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import ComposeFrame
+from elspeth.web.composer.continuation_clock import SegmentFit, admit_action
 from elspeth.web.composer.continuation_next_action import _has_committed_primary, handoff_cut_allowance, next_continuation_action_policy
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
@@ -22,34 +24,47 @@ from elspeth.web.composer.continuation_selection import SelectedContinuationStat
 
 
 @dataclass(frozen=True, slots=True)
-class ActionFitSuccessorPlan:
+class AutomaticSuccessorPlan:
     expected_head: UUID | None
+    reason: Literal["action_fit", "watermark", "quantum"]
 
 
-def plan_action_fit_successor(
+def plan_automatic_successor(
     *,
     selected: SelectedContinuationState,
     policy: ContinuationAdmissionPolicyV4,
     action: ContinuationActionPolicy,
     sequence: int,
     hard_remaining: float,
-) -> ActionFitSuccessorPlan | None:
-    """Allow the proven later Compose lineage only when the next action cannot fit.
+    cooperative_remaining: float,
+) -> AutomaticSuccessorPlan | None:
+    """Yield the proven later Compose lineage at its original admission boundary.
 
-    A cooperative or watermark yield with sufficient hard headroom is not an
-    action-fit failure. The unconsumed first Compose and non-Compose cuts
+    The unconsumed first Compose and non-Compose cuts
     retain same-sequence recovery until their cross-sequence cold owner is
     proved by the live path.
     """
     if type(selected) is not SelectedContinuationState or type(action) is not ContinuationActionPolicy:
-        raise TypeError("action-fit planning requires actual selected DATA and action policy")
+        raise TypeError("automatic successor planning requires actual selected DATA and action policy")
     if type(sequence) is not int or sequence < 1:
-        raise ValueError("action-fit planning requires the current positive sequence")
+        raise ValueError("automatic successor planning requires the current positive sequence")
     if type(hard_remaining) is not float or not math.isfinite(hard_remaining) or hard_remaining < 0:
-        raise ValueError("action-fit planning requires finite nonnegative hard headroom")
-    required = action.total + policy.segment.reserve
-    if not math.isfinite(required) or hard_remaining >= required:
+        raise ValueError("automatic successor planning requires finite nonnegative hard headroom")
+    if type(cooperative_remaining) is not float or not math.isfinite(cooperative_remaining) or cooperative_remaining < 0:
+        raise ValueError("automatic successor planning requires finite nonnegative cooperative headroom")
+    if (
+        admit_action(action, policy.segment, hard_remaining=hard_remaining, cooperative_remaining=cooperative_remaining, fresh=False)
+        is SegmentFit.ADMIT
+    ):
         return None
+    required = action.total + policy.segment.reserve
+    reason: Literal["action_fit", "watermark", "quantum"]
+    if hard_remaining < required:
+        reason = "action_fit"
+    elif hard_remaining <= policy.segment.watermark:
+        reason = "watermark"
+    else:
+        reason = "quantum"
     root = selected.stack
     if len(root.frames) != 1 or type(root.frames[0]) is not ComposeFrame:
         return None
@@ -63,11 +78,11 @@ def plan_action_fit_successor(
     if not _has_committed_primary(root) or handoff_cut_allowance(root, policy) is None:
         return None
     if compose.slice_sequence != sequence:
-        raise AuditIntegrityError("action-fit Compose slice differs from its actual segment")
+        raise AuditIntegrityError("automatic successor Compose slice differs from its actual segment")
     if compose.provider_effect_key is not None or compose.pending_response is not None:
-        raise AuditIntegrityError("action-fit Compose cut retains a provider result")
+        raise AuditIntegrityError("automatic successor Compose cut retains a provider result")
     if any(effect.disposition not in ("committed", "refused") for effect in root.effect_frontier):
-        raise AuditIntegrityError("action-fit Compose cut retains an open effect")
+        raise AuditIntegrityError("automatic successor Compose cut retains an open effect")
     if next_continuation_action_policy(selected=selected, policy=policy) != action:
-        raise AuditIntegrityError("action-fit allowance differs from the selected retained action")
-    return ActionFitSuccessorPlan(expected_head=None if compose.current_state_id is None else UUID(compose.current_state_id))
+        raise AuditIntegrityError("automatic successor allowance differs from the selected retained action")
+    return AutomaticSuccessorPlan(expected_head=None if compose.current_state_id is None else UUID(compose.current_state_id), reason=reason)

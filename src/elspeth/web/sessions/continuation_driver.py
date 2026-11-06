@@ -21,7 +21,7 @@ import structlog
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.web.composer.advisor_output import ReadContinuationAction
 from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame, EndFrame, InitializeFrame
-from elspeth.web.composer.continuation_action_fit_yield import ActionFitSuccessorPlan, plan_action_fit_successor
+from elspeth.web.composer.continuation_action_fit_yield import AutomaticSuccessorPlan, plan_automatic_successor
 from elspeth.web.composer.continuation_checkpoint_early_live import (
     EarlyCheckpointNoSdkTerminal,
     EarlyCheckpointOwedOverflowTerminal,
@@ -1564,8 +1564,8 @@ class _SegmentDriver:
         stored: StoredContinuationSnapshot,
         selected: SelectedContinuationState,
         *,
-        reason: Literal["model_request", "action_fit"],
-        action_fit: ActionFitSuccessorPlan | None = None,
+        reason: Literal["model_request", "action_fit", "watermark", "quantum"],
+        automatic: AutomaticSuccessorPlan | None = None,
     ) -> ContinuationSegmentOutcome:
         """Yield only after the actual phase and watcher cohorts have joined."""
         await self.close_progress(retain_failure=True)
@@ -1574,10 +1574,11 @@ class _SegmentDriver:
         if type(top) is not ComposeFrame or top.phase != "action_ready" or not selected.stack.is_handoff_safe:
             raise AuditIntegrityError("successor yield lost its actual quiescent Compose cut")
         expected_head = None if top.current_state_id is None else UUID(top.current_state_id)
-        if (reason == "model_request" and action_fit is not None) or (
-            reason == "action_fit" and (type(action_fit) is not ActionFitSuccessorPlan or action_fit.expected_head != expected_head)
+        if (reason == "model_request" and automatic is not None) or (
+            reason != "model_request"
+            and (type(automatic) is not AutomaticSuccessorPlan or automatic.expected_head != expected_head or automatic.reason != reason)
         ):
-            raise AuditIntegrityError("successor yield lost its actual action-fit plan")
+            raise AuditIntegrityError("successor yield lost its actual automatic plan")
         repository = self.services.session_service.session_operation_authority
 
         def readback() -> tuple[ComposerSegmentYieldReceipt | None]:
@@ -1747,15 +1748,16 @@ class _SegmentDriver:
                 is SegmentFit.YIELD
             ):
                 if not self._worker_is_draining() and not is_applied_batch_cut(selected):
-                    action_fit = plan_action_fit_successor(
+                    automatic = plan_automatic_successor(
                         selected=selected,
                         policy=policy,
                         action=action,
                         sequence=self.running.claim.segment_sequence,
                         hard_remaining=hard_remaining,
+                        cooperative_remaining=cooperative_remaining,
                     )
-                    if action_fit is not None:
-                        return await self.yield_control(stored, selected, reason="action_fit", action_fit=action_fit)
+                    if automatic is not None:
+                        return await self.yield_control(stored, selected, reason=automatic.reason, automatic=automatic)
                 return await self.dispose()
             if self._worker_is_draining():
                 return await self.dispose()
