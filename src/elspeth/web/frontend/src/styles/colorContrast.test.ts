@@ -288,9 +288,27 @@ describe("disabled button contrast", () => {
     const disabledMatch = /\.btn:disabled,\s*\n\s*\.btn\[aria-disabled="true"\]\s*\{([\s\S]*?)\n\}/.exec(appCss);
     expect(disabledMatch, ".btn:disabled rule must exist with token-based colours").not.toBeNull();
     const body = disabledMatch![1];
-    expect(body).toContain("background-color: var(--color-bg)");
+    // ARGOnite: disabled pills sit in the recessed --color-well, not the page bg.
+    expect(body).toContain("background-color: var(--color-well)");
     expect(body).toContain("color: var(--color-text-muted)");
+    expect(body).toContain("box-shadow: none");
     expect(body).not.toMatch(/opacity:\s*0\.[0-9]+/);
+  });
+
+  // ARGOnite: disabled text is --color-text-muted on --color-well.
+  it("keeps --color-text-muted on --color-well at AA in the dark theme", () => {
+    expect(
+      contrastRatio(extractRootToken("--color-text-muted"), extractRootToken("--color-well")),
+    ).toBeGreaterThanOrEqual(4.5);
+  });
+
+  it("keeps --color-text-muted on --color-well at AA in the light theme", () => {
+    expect(
+      contrastRatio(
+        extractLightThemeToken("--color-text-muted"),
+        extractLightThemeToken("--color-well"),
+      ),
+    ).toBeGreaterThanOrEqual(4.5);
   });
 
 });
