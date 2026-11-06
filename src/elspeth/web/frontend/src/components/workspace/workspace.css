@@ -167,8 +167,8 @@
   grid-column: 1 / -1;
   grid-template-columns: subgrid;
   min-width: 0;
-  border-top: 1px solid var(--color-border, currentcolor);
-  background: var(--color-surface, Canvas);
+  /* ARGOnite: transparent on the canvas, no top rule. Forced colours: Task 9. */
+  background: transparent;
 }
 
 .workspace-action-bar-main {

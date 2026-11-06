@@ -655,8 +655,9 @@
   box-shadow: var(--shadow-track);
 }
 
-/* The textarea lost its own border, so keyboard focus is drawn on the well. */
-.chat-input-row:focus-within {
+/* The textarea lost its own border, so its keyboard focus is drawn on the
+   well. Scoped to the textarea: the buttons carry their own focus rings. */
+.chat-input-row:has(.chat-input-textarea:focus-visible) {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
