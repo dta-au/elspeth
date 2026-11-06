@@ -37,7 +37,7 @@ from elspeth.web.composer.continuation_audit_buffer import (
     validate_recorder_projection,
 )
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData
-from elspeth.web.composer.continuation_codec import PrivateChunk, owned_json, verify_private_chunk
+from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json, verify_private_chunk
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
@@ -296,7 +296,9 @@ def capture_fresh_application_recorder_source(snapshot: RecorderSnapshot, *, env
     _require_source_environment(env_ref_names)
     canonical = recorder_snapshot_json(snapshot)
     if utf8_size(canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
-        return capture_application_recorder_source(snapshot, env_ref_names=env_ref_names)
+        return admit_application_recorder_source(
+            encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical), env_ref_names=env_ref_names
+        )
     chunk, restored = _prospective_recorder_values(snapshot, env_ref_names)
     return ProspectiveApplicationRecorderSource(chunk, restored, env_ref_names)
 
@@ -386,8 +388,14 @@ def application_recorder_chunk(snapshot: RecorderSnapshot, *, recorder_source: A
     Historical or unrelated snapshots retain the normal bounded encoder. Only
     the exact complete prospective source document can defer its capacity cut.
     """
-    if type(recorder_source) is ApplicationRecorderSource and snapshot is recorder_source.snapshot:
-        return recorder_source.chunk
+    if type(recorder_source) is ApplicationRecorderSource:
+        if snapshot is recorder_source.snapshot:
+            return recorder_source.chunk
+        # Observe the current graph's complete projection. Exact equality with
+        # the already admitted bytes needs no second parse or credential scan;
+        # ordinary value equality would conflate distinct JSON field types.
+        if recorder_snapshot_json(snapshot) == recorder_source.chunk.canonical:
+            return recorder_source.chunk
     if type(recorder_source) is ProspectiveApplicationRecorderSource:
         require_application_recorder_source(recorder_source, recorder_source.env_ref_names)
         if recorder_snapshot_json(snapshot) == recorder_source.chunk.canonical:

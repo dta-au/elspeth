@@ -29,8 +29,10 @@ from elspeth.web.composer.provider_thinking import attach_provider_thinking
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, read_chunk
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import chat_messages_table as audit_messages
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.fixtures.identities import grant_test_pipeline_user
@@ -208,6 +210,175 @@ async def twice(store, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_historical_response_wrappers_keep_one_complete_current_proof_and_fresh_next_read(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.sessions import continuation_primary as primary
+    from elspeth.web.sessions import continuation_selection as selection
+    from elspeth.web.sessions.continuation import ContinuationCASConflict
+
+    arguments, runtime, calls = await prepared_runtime(operation_store, tmp_path, monkeypatch)
+    running = arguments["inventory"].running
+    try:
+        result = await publish(operation_store, arguments, runtime)
+        current = await latest(arguments, result.snapshot)
+        selected = current["selected"]
+        original_load = selection.load_snapshot_private_data_on_connection
+        original_verify = primary._verify_committed_primary_response_data_on_connection
+        loads, verified = [], []
+
+        def load(conn, **kwargs):
+            values = original_load(conn, **kwargs)
+            if kwargs["selected"].checkpoint_id == selected.checkpoint_id:
+                loads.append((conn, kwargs))
+            return values
+
+        def verify(conn, **kwargs):
+            verified.append((conn, kwargs))
+            return original_verify(conn, **kwargs)
+
+        monkeypatch.setattr(selection, "load_snapshot_private_data_on_connection", load)
+        monkeypatch.setattr(primary, "_verify_committed_primary_response_data_on_connection", verify)
+        readers = (
+            primary.read_committed_primary_response_on_connection,
+            primary.read_committed_primary_response_for_settlement_on_connection,
+        )
+        before = full_rows(operation_store[0])
+        for reader in readers:
+            loads.clear()
+            with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
+                assert reader(conn, running, selected=selected, reference=result.response.reference) == result.response
+                assert len(loads) == 1 and loads[0][0] is conn
+                assert verified[-1] == (
+                    conn,
+                    {
+                        "session_id": running.claim.session_id,
+                        "operation_id": running.claim.operation_id,
+                        "selected": selected,
+                        "reference": result.response.reference,
+                    },
+                )
+        # The ID-only public DATA reader still owns its independent full prelude.
+        loads.clear()
+        with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
+            assert (
+                primary.read_committed_primary_response_data_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=running.claim.operation_id,
+                    selected=selected,
+                    reference=result.response.reference,
+                )
+                == result.response
+            )
+            assert len(loads) == 1 and loads[0][0] is conn
+        assert len(verified) == 3 and full_rows(operation_store[0]) == before and len(calls) == 1
+
+        changed_root = selected.stack.model_copy(
+            update={"logical": selected.stack.logical.model_copy(update={"request_hash": "changed-current-request"})}
+        )
+        changed = SelectedContinuationState(selected.checkpoint_id, changed_root, selected.chunks)
+        for reader in readers:
+            for supplied in (changed, arguments["selected"]):
+                with (
+                    locked_session_transaction(operation_store[0], str(operation_store[4])) as conn,
+                    pytest.raises(ContinuationCASConflict),
+                ):
+                    reader(conn, running, selected=supplied, reference=result.response.reference)
+        assert len(verified) == 3 and full_rows(operation_store[0]) == before
+
+        # Corrupt an unrequested selected state chunk in a later transaction;
+        # the prior successful read must not lend clearance to this next call.
+        state_ref = selected.stack.frames[0].state
+        assert state_ref != result.response.reference
+        state = next(chunk for chunk in selected.chunks if chunk.reference == state_ref)
+        payload = (state.canonical + " ").encode("utf-8")
+        with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
+            changed_rows = conn.execute(
+                update(chunks)
+                .where(
+                    chunks.c.session_id == str(operation_store[4]),
+                    chunks.c.operation_id == running.claim.operation_id,
+                    chunks.c.chunk_key == f"value:{state_ref.codec}:{state_ref.digest}",
+                )
+                .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
+            )
+            assert changed_rows.rowcount == 1
+        corrupted = full_rows(operation_store[0])
+        for reader in readers:
+            with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn, pytest.raises(AuditIntegrityError):
+                reader(conn, running, selected=selected, reference=result.response.reference)
+        assert len(verified) == 3 and full_rows(operation_store[0]) == corrupted and len(calls) == 1
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cut", ("stop", "expired"))
+async def test_historical_response_ordinary_and_settlement_keep_actual_stop_and_expiry_distinction(
+    operation_store, tmp_path, monkeypatch, cut
+):
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from elspeth.web.coordination.database_clock import database_now
+    from elspeth.web.sessions import continuation_primary as primary
+    from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
+    from elspeth.web.sessions.models import composer_async_operations_table as jobs
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+
+    arguments, runtime, calls = await prepared_runtime(operation_store, tmp_path, monkeypatch)
+    running = arguments["inventory"].running
+    try:
+        result = await publish(operation_store, arguments, runtime)
+        current = await latest(arguments, result.snapshot)
+        selected = current["selected"]
+        with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
+            assert (
+                primary.read_committed_primary_response_on_connection(conn, running, selected=selected, reference=result.response.reference)
+                == result.response
+            )
+            now = database_now(conn)
+            if cut == "stop":
+                changed = conn.execute(
+                    update(jobs).where(jobs.c.operation_id == running.claim.operation_id).values(cancel_requested_at=now)
+                )
+            else:
+                changed = conn.execute(
+                    update(segments)
+                    .where(
+                        segments.c.operation_id == running.claim.operation_id,
+                        segments.c.sequence == running.claim.segment_sequence,
+                    )
+                    .values(
+                        started_at=now - timedelta(seconds=3),
+                        cooperative_at=now - timedelta(seconds=2),
+                        deadline_at=now - timedelta(seconds=1),
+                    )
+                )
+            assert changed.rowcount == 1
+        before = full_rows(operation_store[0])
+        with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
+            with pytest.raises(ComposerOperationCancelledDuringTurn if cut == "stop" else ComposerOperationFenceLost):
+                primary.read_committed_primary_response_on_connection(conn, running, selected=selected, reference=result.response.reference)
+            assert (
+                primary.read_committed_primary_response_for_settlement_on_connection(
+                    conn, running, selected=selected, reference=result.response.reference
+                )
+                == result.response
+            )
+            wrong = replace(running, claim=replace(running.claim, claim_token="wrong-token"))
+            with pytest.raises((AuditIntegrityError, ComposerOperationFenceLost)):
+                primary.read_committed_primary_response_for_settlement_on_connection(
+                    conn, wrong, selected=selected, reference=result.response.reference
+                )
+        assert full_rows(operation_store[0]) == before and len(calls) == 1
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
 async def test_actual_provider_publication_to_latest_capture_preserves_registered_native_source(operation_store, tmp_path, monkeypatch):
     arguments, runtime, calls = await prepared_runtime(operation_store, tmp_path, monkeypatch)
     running = arguments["inventory"].running
@@ -297,7 +468,7 @@ async def test_two_actual_native_providers_replay_exact_old_source_then_refuse_i
 
 
 @pytest.mark.asyncio
-async def test_publication_keeps_current_selected_wire_check_after_original_paid_input_split(operation_store, tmp_path, monkeypatch):
+async def test_v4_publication_rechecks_selected_wire_binding_after_second_sdk(operation_store, tmp_path, monkeypatch):
     arguments, runtime, calls = await prepared_runtime(operation_store, tmp_path, monkeypatch)
     running = arguments["inventory"].running
     try:
@@ -305,14 +476,34 @@ async def test_publication_keeps_current_selected_wire_check_after_original_paid
         current, _cold = await append_actual_native_and_capture(operation_store, arguments, runtime, first)
         current = await select_next_primary_input(operation_store, current)
         next_runtime = await restore_continuation_runtime(**current)
-        actual_publish = current["authority"].publish_continuation_primary
+        actual_completion = litellm.acompletion
         before = []
+        responses = []
+        returned = []
 
-        def corrupt_selected_before_publish(binding, **kwargs):
-            selected = kwargs["selected"]
+        def publication_rows():
+            with operation_store[0].connect() as conn:
+                return (
+                    full_rows(operation_store[0]),
+                    tuple(conn.execute(select(holds).order_by(*holds.primary_key.columns)).all()),
+                    tuple(conn.execute(select(audit_messages).order_by(*audit_messages.primary_key.columns)).all()),
+                )
+
+        async def corrupt_selected_after_sdk(**kwargs):
+            response = await actual_completion(**kwargs)
+            assert len(calls) == 2
+            responses.append(response)
+            selected = current["authority"].load_continuation_snapshot(running)
             frame = decode_continuation_snapshot(selected.payload_json).frames[0]
+            assert frame.phase == "awaiting_response" and frame.pending_response is None
             key = f"value:{frame.messages.codec}:{frame.messages.digest}"
             with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
+                effect = conn.execute(select(effects).where(effects.c.disposition == "dispatched")).one()
+                assert effect.effect_key == frame.provider_effect_key and effect.effect_key != first.effect_key
+                assert effect.result_chunk_key is None and effect.receipt_key is None
+                attempt = conn.execute(select(physical).where(physical.c.attempt_id == effect.provider_attempt_id)).one()
+                hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == attempt.attempt_id)).one()
+                assert hold.state == "active" and attempt.settled_at is None and attempt.ledger_entry_id is None
                 value = json.loads(read_chunk(conn, session_id=str(operation_store[4]), operation_id=running.claim.operation_id, key=key))
                 position = value["current_indexes"][-1]
                 message = json.loads(value["messages_json"][position])
@@ -329,17 +520,29 @@ async def test_publication_keeps_current_selected_wire_check_after_original_paid
                     .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
                 )
                 assert changed.rowcount == 1
-            before.append(full_rows(operation_store[0]))
-            return actual_publish(binding, **kwargs)
+            before.append(publication_rows())
+            return response
 
-        monkeypatch.setattr(current["authority"], "publish_continuation_primary", corrupt_selected_before_publish)
-        with pytest.raises(AuditIntegrityError):
-            await publish(operation_store, current, next_runtime)
-        assert len(calls) == 2 and len(before) == 1
-        assert full_rows(operation_store[0]) == before[0]
+        monkeypatch.setattr(litellm, "acompletion", corrupt_selected_after_sdk)
+        # Updating SQL's own checksum does not change the selected reference.
+        # This exercises fresh binding validation, before wire projection equality.
+        with pytest.raises(AuditIntegrityError, match=r"^private chunk bytes differ from their binding$") as raised:
+            returned.append(await publish(operation_store, current, next_runtime))
+        assert type(raised.value) is AuditIntegrityError and returned == []
+        assert len(calls) == 2 and len(responses) == 1 and len(before) == 1
+        assert publication_rows() == before[0]
         with operation_store[0].connect() as conn:
             unresolved = conn.execute(select(effects).where(effects.c.disposition == "dispatched")).one()
             assert unresolved.result_chunk_key is None and unresolved.receipt_key is None
+            attempt = conn.execute(select(physical).where(physical.c.attempt_id == unresolved.provider_attempt_id)).one()
+            hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == attempt.attempt_id)).one()
+            assert attempt.settled_at is None and attempt.ledger_entry_id is None and hold.state == "active"
+            committed = conn.execute(select(effects).where(effects.c.effect_key == first.effect_key)).one()
+            assert committed.disposition == "committed" and committed.receipt_key == first.outcome.audit_call.call_id
+            assert committed.result_chunk_key == f"value:{first.response.reference.codec}:{first.response.reference.digest}"
+            ledger = conn.execute(select(usage)).one()
+            first_attempt = conn.execute(select(physical).where(physical.c.attempt_id == committed.provider_attempt_id)).one()
+            assert first_attempt.ledger_entry_id == ledger.entry_id and first_attempt.settled_at is not None
         current["required_work"].coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)

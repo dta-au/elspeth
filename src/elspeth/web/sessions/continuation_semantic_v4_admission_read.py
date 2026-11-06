@@ -139,7 +139,7 @@ def require_v4_semantic_admission_data_on_connection(
     if root != expected or admitted.cursor != expected.cursor:
         raise AuditIntegrityError("V4 semantic admitted DATA changed its complete original dispatched root")
     effect = _effect_data(conn, sid, operation, root, effect_key)
-    _descriptor, _invocation, physical_input = _descriptor_data(conn, sid, operation, effect)
+    physical_input = _descriptor_data(conn, sid, operation, effect).physical_input
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
     history = conn.execute(
         select(history_table).where(

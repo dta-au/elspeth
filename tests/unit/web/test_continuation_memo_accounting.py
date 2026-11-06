@@ -61,7 +61,7 @@ def _chunk():
 
 
 def _canonical_chunk_key(chunk):
-    return CanonicalTextEncodingKey(chunk.canonical, codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, chunk.reference)
+    return CanonicalTextEncodingKey(chunk.canonical, codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
 
 
 def _owner():
@@ -920,7 +920,14 @@ def test_actual_family_aliases_accept_hits_and_refuse_extra_real_producer_work(m
 
     with clock.retention_stage_memo_scope() as memo:
         first = inspect()
-        assert inspect() is first and memo.cached_entry_count == 1
+        assert inspect() is first
+        entries = {
+            "snapshot": memo._snapshots,
+            "chunk": memo._canonical_proofs,
+            "credential": memo._credentials,
+            "state": memo._states,
+        }[family]
+        assert len(entries) == 1
     assert not trace.errors and not trace.orphans and len(trace.records) == 2
     assert trace.first_orphan is None
     expected = (
@@ -1095,7 +1102,7 @@ def test_actual_internal_detector_policy_binding_and_mutation_get_distinct_data_
         value["api_key"] = "literal"
         fourth = inspect()
         assert fourth is not None and inspect() is fourth
-        assert memo.cached_entry_count == 4
+        assert len(memo._credentials) == 4
     assert sum(record.attempts["detector_work"] for record in trace.records) == 4
     assert [policy.env_ref_names for record in trace.records for policy in record.actual_policies] == [
         frozenset(),
@@ -1126,7 +1133,7 @@ def test_fallback_records_actual_internal_work_without_touching_later_foreign_pr
         for _ in range(2):
             finding = _SCAN(value, policy=CredentialTraversalPolicy(), surface="observer-control", scanner_role="generic")
             assert finding is not None and finding.category == "credential_field"
-        assert memo.cached_entry_count == 0 and accesses == []
+        assert not memo._credentials and accesses == []
     assert len(trace.records) == 2 and all(record.group is None and record.attempts["detector_work"] == 1 for record in trace.records)
     trace.finish(stages=1, require_snapshot=False, require_population=False)
     trace.assert_complete_coverage()
@@ -2060,8 +2067,8 @@ def _canonical_chunk_charges(chunk, size, *, requests=2, parser_work=1, cold_que
         if chunk.canonical.isascii()
         else (parser_work * ((len(chunk.canonical) + 4095) // 4096), parser_work * size),
         "key_preparation": (
-            4 * requests + 8 * cold_queries,
-            requests * metadata + cold_queries * (2 * size + 128 + metadata),
+            4 * requests + 5 * cold_queries,
+            requests * metadata + cold_queries * (2 * size + 128 + len(str(codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES))),
         ),
     }
 
@@ -3327,7 +3334,16 @@ def test_deferred_canonical_metadata_capture_failure_retains_original_and_refuse
                 raise
             raise BaseExceptionGroup("original operation and observation finalization failed", (primary, finalization)) from None
 
-    sites = accounting._CHUNK_PROOF_METADATA_SITES
+    # A reference-free key executes only text/proof/bound metadata. Keep the
+    # complete eight-site source guard, but require all five actual cold sites.
+    sites = accounting._direct_target_call_sites(
+        accounting._CHUNK_QUERY_CODE,
+        "len",
+        arguments=1,
+        expected=5,
+        operands=("encoded", "digest", "str(key.max_utf8_bytes)"),
+    )
+    assert set(sites) < set(accounting._CHUNK_PROOF_METADATA_SITES)
     assert returned == [None, None]
     assert len(capture_offsets) == len(sites)
     assert all(sum(offset in window for offset in capture_offsets) == 1 for window, _ in sites)
@@ -4044,10 +4060,10 @@ def test_chunk_artifact_actual_complete_attempt_and_postclose_extent_preserve_ea
         record_property("chunk_artifact_native_expected", json.dumps(expected))
 
 
-def test_chunk_artifact_distinct_full_references_and_fresh_stages_keep_separate_work(monkeypatch, request):
+def test_chunk_artifact_distinct_references_share_text_proof_only_within_each_stage(monkeypatch, request):
     payload, chunk = _chunk_artifact_fixture()
     other_payload, other_chunk = _chunk_artifact_fixture("unicode")
-    other = chunk.reference.model_copy(update={"codec": "composer.control.v1"})
+    other = codec.encode_private_chunk(codec="composer.tools.v1", canonical=chunk.canonical).reference
     assert other != chunk.reference
     trace = RetentionMemoTrace(monkeypatch, request, require_chunk_artifacts=True)
     for _ in range(2):
@@ -4057,17 +4073,23 @@ def test_chunk_artifact_distinct_full_references_and_fresh_stages_keep_separate_
             assert _VERIFY(other, chunk.canonical) is None
             assert _VERIFY(other_chunk.reference, other_chunk.canonical) is None
     trace.finish(stages=2, require_snapshot=False, chunk_artifact_budget=True)
+    assert all(record.chunk_binding_returned for record in trace.records)
+    for start in (0, 4):
+        original, copied, different_codec, different_text = trace.records[start : start + 4]
+        assert original.chunk_reference is chunk.reference
+        assert copied.chunk_reference is not chunk.reference and copied.chunk_reference == chunk.reference
+        assert different_codec.chunk_reference is other
+        assert original.key.reference is copied.key.reference is different_codec.key.reference is None
+        assert original.chunk_proof is copied.chunk_proof is different_codec.chunk_proof
+        assert different_text.chunk_proof is not original.chunk_proof
+    assert trace.records[0].chunk_proof is not trace.records[4].chunk_proof
     assert [(row.stage, row.requests, row.work_attempts) for row in trace.chunk_artifact_totals()] == [
-        (1, 2, 1),
+        (1, 3, 1),
         (1, 1, 1),
-        (1, 1, 1),
-        (2, 2, 1),
-        (2, 1, 1),
+        (2, 3, 1),
         (2, 1, 1),
     ]
-    assert all(
-        total.numerator == total.denominator == 2 * len(payload) + len(other_payload) for total in trace.chunk_artifact_stage_totals()
-    )
+    assert all(total.numerator == total.denominator == len(payload) + len(other_payload) for total in trace.chunk_artifact_stage_totals())
 
 
 @pytest.mark.parametrize("extra", ["repeat", "eager"])
@@ -4447,16 +4469,19 @@ def test_chunk_artifact_warm_hit_preserves_source_and_fresh_binding_refusal(monk
             with pytest.raises(AuditIntegrityError, match="private chunk bytes differ from their binding"):
                 _VERIFY(changed, chunk.canonical)
     assert all(record.attempts["length"] == 1 for record in trace.records)
-    assert [record.attempts["utf8"] for record in trace.records] == [2, 0, 0 if change == "canonical" else 2]
-    assert [record.attempts["sha256"] for record in trace.records] == [1, 0, 0 if change == "canonical" else 1]
+    assert [record.attempts["utf8"] for record in trace.records] == [2, 0, 0]
+    assert [record.attempts["sha256"] for record in trace.records] == [1, 0, 0]
     if change == "canonical":
         with pytest.raises(AssertionError, match="chunk artifact provenance invalid"):
             trace.finish(stages=1, require_snapshot=False, chunk_artifact_budget=True)
         assert sum(row.work_attempts for row in trace.chunk_artifact_totals()) == 1
     else:
         trace.finish(stages=1, require_snapshot=False, require_valid_chunk_bindings=False, chunk_artifact_budget=True)
-        assert [row.work_attempts for row in trace.chunk_artifact_totals()] == [1, 1]
-        assert [record.chunk_artifact_attempts for record in trace.records] == [1, 0, 1]
+        assert [row.work_attempts for row in trace.chunk_artifact_totals()] == [1]
+        assert [record.chunk_artifact_attempts for record in trace.records] == [1, 0, 0]
+        assert trace.records[-1].chunk_reference is changed
+        assert trace.records[-1].chunk_proof is trace.records[0].chunk_proof
+        assert [record.chunk_binding_returned for record in trace.records] == [True, True, False]
 
 
 def _catalog_schema_fixture():
@@ -8101,6 +8126,79 @@ def _closed_dml_append(conn, context, operation_id, selected):
 
 def _closed_dml_rows(snapshot):
     return tuple(row for row in _structure_events(snapshot, "sql_return") if row.sql is not None and row.sql.kind in ("insert", "update"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["bounded-reader", "cast-type", "cast-column", "foreign-cast", "foreign-length"])
+async def test_structure_bounded_reader_sqlite_projection_requires_its_actual_source(monkeypatch, request, source):
+    from sqlalchemy import LargeBinary, String, cast, func, select
+    from sqlalchemy.sql import visitors
+    from sqlalchemy.sql.elements import Cast
+
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions.locking import locked_session_transaction
+
+    _require_structure_api()
+    engine = request.getfixturevalue("engine")
+    repository, context, operation_id, _selected, _revision = _closed_dml_seed(engine)
+    changed = []
+
+    def before(_conn, statement, _multiparams, _params, _options):
+        if source not in ("cast-type", "cast-column"):
+            return
+        nodes = {id(node): node for node in visitors.iterate(statement) if type(node) is Cast}
+        for node in nodes.values():
+            if source == "cast-type":
+                node.type = String()
+            else:
+                node.clause = store.chunks.c.codec
+            changed.append(source)
+
+    def work():
+        with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+            assert store.require_continuation_mutation(conn, context) is True
+            if source in ("bounded-reader", "cast-type", "cast-column"):
+                assert (
+                    store.read_bounded_retained_chunk(
+                        conn,
+                        session_id=str(context.fence.session_id),
+                        operation_id=operation_id,
+                        key="missing-bounded-reader-control",
+                        allowance=4096,
+                    )
+                    is None
+                )
+            else:
+                projection = cast(store.chunks.c.payload, LargeBinary)
+                if source == "foreign-length":
+                    projection = func.length(projection)
+                conn.execute(select(projection).where(store.chunks.c.chunk_key == "missing-bounded-reader-control")).all()
+        return source
+
+    try:
+        result, snapshot = await _closed_dml_trial(
+            monkeypatch,
+            request,
+            engine,
+            context,
+            operation_id,
+            work,
+            refused=source != "bounded-reader",
+            listeners=((engine, "before_execute", before, False),),
+        )
+        assert result == source
+        if source == "bounded-reader":
+            projections = [row.sql.tree[0] for row in _structure_selects(snapshot)]
+            bounded = [columns for columns in projections if len(columns) == 5 and columns[3][:2] == ("label", "actual_byte_length")]
+            assert len(bounded) == 1
+            assert bounded[0][3][2][0] == "function"
+            assert bounded[0][3][2][2][0][0] == "cast_binary_payload"
+            assert bounded[0][4][:2] == ("label", "payload") and bounded[0][4][2][0] == "case"
+        else:
+            assert "unsupported_or_unbound_SQL_shape" in snapshot.errors
+            assert changed == ([source] if source in ("cast-type", "cast-column") else [])
+    finally:
+        repository.release(context)
 
 
 @pytest.mark.asyncio

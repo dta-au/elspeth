@@ -112,7 +112,8 @@ def prepare_v4_semantic_complete_on_connection(
     selected = admission.selected
     root = decode_continuation_snapshot(selected.payload_json)
     effect = _effect_data(conn, sid, operation, root, prepared.binding.effect_key)
-    data, physical_input = _original_input_data(conn, sid, operation, root, effect)
+    original_input = _original_input_data(conn, sid, operation, root, effect)
+    data, physical_input = original_input.data, original_input.physical_input
     call = observation.audit_call
     invalid = isinstance(observation, SemanticInvalidResponseObservation)
     expected_status = ComposerLLMCallStatus.MALFORMED_RESPONSE if invalid else ComposerLLMCallStatus.SUCCESS

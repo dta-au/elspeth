@@ -23,7 +23,7 @@ from elspeth.web.composer.continuation_env_inventory import (
 from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases, _require_runtime_source_refresh
 from elspeth.web.composer.continuation_primary import run_continuation_primary
-from elspeth.web.composer.continuation_runtime import _CurrentPhaseRead, restore_continuation_runtime
+from elspeth.web.composer.continuation_runtime import _CurrentPhaseRead, capture_continuation_runtime_owners, restore_continuation_runtime
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
@@ -700,6 +700,191 @@ async def test_actual_v2_tool_phase_preserves_live_paid_objects_and_commits_the_
         assert owner.runtime.graph.batch.calls is primary.outcome.completion.tool_batch.calls
         assert message is registered[0] and message["content"] is serialized
         assert stored_rows(operation_store[0]) == before and len(sdk) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_calls", ("none", "different", "equal"))
+async def test_cold_next_primary_keeps_its_calls_after_actual_batch_retirement(operation_store, tmp_path, monkeypatch, next_calls):
+    from tests.unit.web.composer.test_prompt_guard_admission import _checks
+
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, first, sdk):
+        # The accepted current batch tail commits all calls and P4 together,
+        # then retires its live runtime. Join its actual committed head once.
+        await _advance(owner)
+        assert owner.latest_snapshot is not None and owner.runtime is None
+        selected = await load_selected_continuation(
+            authority=owner.authority, running=running, selected=owner.latest_snapshot, required_work=owner.work
+        )
+        assert post_batch.is_applied_batch_cut(selected)
+        await owner.current(selected)
+        dispatched = await post_batch._retain(owner, selected, "iteration_review_dispatched")
+        captured = await capture_continuation_runtime_owners(
+            dispatched.runtime, selected=dispatched.selected, inventory=dispatched.inventory
+        )
+        advanced = await post_batch._retain(owner, dispatched.selected, "iteration_advanced", captured)
+        runtime = advanced.runtime
+        assert len(advanced.selected.stack.frames) == 1 and advanced.selected.stack.frames[0].phase == "action_ready"
+        assert runtime.graph.batch is not None
+
+        async def completion(**sdk_kwargs):
+            checks = _checks(operation_store[0])
+            assert len(checks) == 2 and all(check["disposition"] == "allow" for check in checks)
+            with operation_store[0].connect() as conn:
+                dispatched_effect = conn.execute(select(effects).where(effects.c.disposition == "dispatched")).one()
+                assert dispatched_effect.owner == "provider" and dispatched_effect.result_chunk_key is None
+            sdk.append(sdk_kwargs)
+            call_ids = () if next_calls == "none" else ("new_read",) if next_calls == "different" else ("first_read", "second_read")
+            calls = [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "get_pipeline_state",
+                        "arguments": canonical_json(encode_semantic_arguments("get_pipeline_state", owner.service._planner_dialect, {})),
+                    },
+                }
+                for call_id in call_ids
+            ]
+            return ModelResponse(
+                model="test/model",
+                choices=[
+                    {
+                        "finish_reason": "tool_calls" if calls else "stop",
+                        "message": {"role": "assistant", "content": "A distinct next paid response.", "tool_calls": calls or None},
+                    }
+                ],
+                usage={"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13, "cost": 0.01},
+            )
+
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        _messages, _tools, delivery, _delivery_input = owner.service._prepare_primary_delivery(
+            messages=runtime.live.llm_messages,
+            tools=runtime.live.tools,
+            recorder=runtime.live.recorder,
+            turn_evidence=runtime.live.turn_evidence,
+            state=runtime.live.state,
+            failed_turn=runtime.live.failed_turn,
+        )
+        with prompt_guard_user_scope(runtime.bindings.message):
+            second = await run_continuation_primary(
+                service=owner.service,
+                authority=owner.authority,
+                selected=runtime.source.selected,
+                producers=runtime.materialization,
+                messages=runtime.live.llm_messages,
+                tools=runtime.live.tools,
+                recorder=runtime.live.recorder,
+                drained=runtime.drained,
+                required_work=owner.work,
+                provider_owner=owner.provider_owner,
+                timeout=runtime.source.policy.actions.primary.total,
+            )
+        if delivery is not None:
+            runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
+        assert second.response.reference != first.response.reference and len(sdk) == 2
+        owner.accept_primary(second)
+        selected = await load_selected_continuation(
+            authority=owner.authority, running=running, selected=second.snapshot, required_work=owner.work
+        )
+        warm, inventory = await owner.current(selected)
+        assert await owner._primary_for_phase(warm, inventory, selected) is second
+        restored = await restore_continuation_runtime(
+            service=owner.service,
+            authority=owner.authority,
+            selected=selected,
+            inventory=inventory,
+            required_work=owner.work,
+            provider_owner=owner.provider_owner,
+        )
+        historical = restored.graph.batch
+        assert historical is not None and restored.graph.applications is not None
+        assert restored.graph.applications.applications[-1].response == first.response.reference
+        assert selected.stack.frames[0].pending_response == second.response.reference
+        assert not any(type(frame) is ToolBatchFrame for frame in selected.stack.frames)
+        if next_calls == "equal":
+            assert historical.calls == second.outcome.completion.tool_batch.calls
+        else:
+            assert historical.calls != second.outcome.completion.tool_batch.calls
+        cold = ContinuationLivePhases(owner.service, owner.authority, owner.work, owner.provider_owner, owner.lease)
+        cold.bind_initial(restored)
+        assert cold.primary is None
+        before = stored_rows(operation_store[0])
+        result = await cold._primary_for_phase(restored, inventory, selected)
+        assert result.response == second.response and result.outcome.completion == second.outcome.completion
+        assert result.outcome.completion.tool_batch.calls is not historical.calls
+        assert result.outcome.audit_call is next(
+            call for call in restored.live.recorder.llm_calls if call.call_id == second.outcome.audit_call.call_id
+        )
+        assert restored.graph.batch is historical
+        assert stored_rows(operation_store[0]) == before and len(sdk) == 2
+        if next_calls != "none":
+            assert all(left is not right for left, right in zip(result.outcome.completion.tool_batch.calls, historical.calls, strict=False))
+            if next_calls == "equal":
+                # Reading retained paid DATA does not admit its reused IDs
+                # for dispatch in a new batch.
+                with pytest.raises(
+                    AuditIntegrityError,
+                    match=r"^Composer tool batch reuses a provider tool-call ID already persisted in this session$",
+                ):
+                    await cold._initialize_batch(selected)
+            else:
+                await cold._initialize_batch(selected)
+                batch = cold.runtime.source.selected.stack.frames[-1]
+                assert type(batch) is ToolBatchFrame and batch.response == second.response.reference
+                assert cold.runtime.graph.batch.calls is result.outcome.completion.tool_batch.calls
+            assert len(sdk) == 2
+    owner.work.coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("none", "missing", "calls"))
+async def test_cold_current_batch_rebinds_actual_atoms_and_refuses_changed_data(operation_store, tmp_path, monkeypatch, change):
+    from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence
+
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, primary, sdk):
+        selected = owner.runtime.source.selected
+        inventory = owner.runtime.materialization.inventory
+        restored = await restore_continuation_runtime(
+            service=owner.service,
+            authority=owner.authority,
+            selected=selected,
+            inventory=inventory,
+            required_work=owner.work,
+            provider_owner=owner.provider_owner,
+        )
+        graph = restored.graph
+        assert graph.batch is not None
+        frame = selected.stack.frames[-1]
+        assert type(frame) is ToolBatchFrame and frame.response == selected.stack.frames[0].pending_response == primary.response.reference
+        if change == "calls":
+            graph = graph.with_batch(replace(graph.batch, calls=tuple(reversed(graph.batch.calls))))
+        elif change == "missing":
+            graph = RestoredTurnEvidence(
+                graph.evidence,
+                graph.messages,
+                graph.recorder,
+                graph.drained,
+                None,
+                graph.applications,
+                graph.selected_audit,
+                graph.selected_dialect,
+            )
+        restored = replace(restored, graph=graph)
+        cold = ContinuationLivePhases(owner.service, owner.authority, owner.work, owner.provider_owner, owner.lease)
+        cold.bind_initial(restored)
+        before = stored_rows(operation_store[0])
+        if change == "none":
+            result = await cold._primary_for_phase(restored, inventory, selected)
+            assert result.response == primary.response
+            assert result.outcome.completion.tool_batch.calls is graph.batch.calls
+            assert all(left is right for left, right in zip(result.outcome.completion.tool_batch.calls, graph.batch.calls, strict=True))
+        else:
+            with pytest.raises(AuditIntegrityError, match="actual restored issued calls"):
+                await cold._primary_for_phase(restored, inventory, selected)
+            assert cold.primary is None
+        assert stored_rows(operation_store[0]) == before and len(sdk) == 1
+        assert owner.primary is primary and owner.runtime.graph.batch.calls is primary.outcome.completion.tool_batch.calls
+    owner.work.coordinator.assert_completed()
 
 
 @pytest.mark.asyncio

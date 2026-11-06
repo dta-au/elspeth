@@ -1,5 +1,6 @@
 """Bound repeated full recorder projections without losing graph/source checks."""
 
+from contextlib import nullcontext
 from dataclasses import replace
 
 import pytest
@@ -11,19 +12,87 @@ from elspeth.web.composer import continuation_batch_data as batch_codec
 from tests.unit.web.composer.test_continuation_active_evidence_graph import _recorder_source_graph
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("memo_used", (False, True))
+async def test_fresh_fitting_capture_renders_original_once_but_keeps_decoder_roundtrip_and_source_credentials(monkeypatch, memo_used):
+    from elspeth.web.composer import continuation_audit_buffer as audit_buffer
+    from elspeth.web.continuation_retention_memo import v4_preparation_memo_scope
+    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+
+    graph, _source = _recorder_source_graph()
+    snapshot = graph.recorder
+    baseline = graph_codec.capture_application_recorder_source(snapshot, env_ref_names=frozenset())
+    original_render = audit_buffer.recorder_snapshot_json
+    original_decode = audit_buffer._decode_recorder_document
+    original_guard = graph_codec.require_no_credential_material
+    rendered, decoded, environments = [], [], []
+
+    def render(value):
+        rendered.append(value)
+        return original_render(value)
+
+    def decode(text):
+        value = original_decode(text)
+        decoded.append(value)
+        return value
+
+    def guard(value, *, surface, env_ref_names, max_string_bytes):
+        environments.append(env_ref_names)
+        return original_guard(value, surface=surface, env_ref_names=env_ref_names, max_string_bytes=max_string_bytes)
+
+    monkeypatch.setattr(graph_codec, "recorder_snapshot_json", render)
+    monkeypatch.setattr(audit_buffer, "recorder_snapshot_json", render)
+    monkeypatch.setattr(audit_buffer, "_decode_recorder_document", decode)
+    monkeypatch.setattr(graph_codec, "require_no_credential_material", guard)
+    with v4_preparation_memo_scope(_advisor_clock()) if memo_used else nullcontext():
+        for names in (frozenset(), frozenset({"CURRENT_NAME"})):
+            result = graph_codec.capture_fresh_application_recorder_source(snapshot, env_ref_names=names)
+            assert type(result) is graph_codec.ApplicationRecorderSource
+            assert result.chunk == baseline.chunk and result.snapshot == baseline.snapshot
+            assert result.snapshot is not snapshot and result.env_ref_names is names
+    assert sum(value is snapshot for value in rendered) == 2
+    assert len(decoded) == (1 if memo_used else 2)
+    assert [value for value in rendered if value is not snapshot] == decoded
+    assert environments == [frozenset(), frozenset({"CURRENT_NAME"})]
+
+
+def test_fresh_fitting_capture_preserves_actual_credential_refusal():
+    from elspeth.web.composer.withheld_replies import WithheldReply
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+
+    graph, _source = _recorder_source_graph()
+    snapshot = replace(
+        graph.recorder,
+        withheld_replies=(*graph.recorder.withheld_replies, WithheldReply("planner_prose_unadmitted", "https://user:password@example.com")),
+    )
+    with pytest.raises(CredentialMaterialRefused) as ordinary:
+        graph_codec.capture_application_recorder_source(snapshot, env_ref_names=frozenset())
+    with pytest.raises(CredentialMaterialRefused) as fresh:
+        graph_codec.capture_fresh_application_recorder_source(snapshot, env_ref_names=frozenset())
+    assert fresh.value.finding == ordinary.value.finding
+    assert str(fresh.value) == str(ordinary.value)
+
+
 @pytest.mark.parametrize("route", ("encode", "decode"))
-def test_graph_reuses_each_unchanged_recorder_source_with_at_most_two_full_projections(monkeypatch, route):
+def test_graph_reprojects_current_recorder_but_reuses_exact_admitted_bytes(monkeypatch, route):
     graph, source = _recorder_source_graph()
     baseline = graph_codec.encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=source)
     original = graph_codec.encode_recorder_snapshot
+    original_projection = graph_codec.recorder_snapshot_json
     observed = []
+    encoded_snapshots = []
 
     def counted(snapshot):
-        observed.append(snapshot)
+        encoded_snapshots.append(snapshot)
         return original(snapshot)
+
+    def projected(snapshot):
+        observed.append(snapshot)
+        return original_projection(snapshot)
 
     with monkeypatch.context() as probe:
         probe.setattr(graph_codec, "encode_recorder_snapshot", counted)
+        probe.setattr(graph_codec, "recorder_snapshot_json", projected)
         if route == "encode":
             encoded = graph_codec.encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=source)
             assert encoded == baseline
@@ -37,6 +106,7 @@ def test_graph_reuses_each_unchanged_recorder_source_with_at_most_two_full_proje
     selected_projections = sum(snapshot is selected_recorder for snapshot in observed)
     assert source_projections == 0, source_projections
     assert 1 <= selected_projections <= 2, selected_projections
+    assert encoded_snapshots == []
 
 
 def test_recorder_source_admits_original_bytes_and_refuses_new_changed_raw_chunk():

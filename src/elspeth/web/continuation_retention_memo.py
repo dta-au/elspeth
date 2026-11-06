@@ -1179,10 +1179,14 @@ class RetentionStageMemo:
         admit(key, data)
         if not retaining:
             return data
-        size = recorder_data_retained_bytes(key, data, producer, limit=self._shared_text_budget_bytes)
+        # Admission has finished. Retain one equal canonical string within
+        # this entry, while preserving the callback's original DATA and key.
+        storage_key = PrivateChunkVerificationKey(key.reference, data.canonical) if data.canonical == key.canonical else key
+        size = recorder_data_retained_bytes(storage_key, data, producer, limit=self._shared_text_budget_bytes)
         if size is None or size > self._shared_text_budget_bytes:
             return data
         entry = _RecorderDataEntry(data, size)
+        cache_key = (producer, storage_key)
         with self._lock:
             if self._closed:
                 return data

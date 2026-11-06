@@ -166,7 +166,8 @@ def settle_v4_semantic_paid_overflow_on_connection(
     source = admission.hold
     identity = admission.tail.identity
     sid, operation = source.session_id, source.operation_id
-    _descriptor, original, physical_input = _descriptor_data(conn, sid, operation, effect)
+    original_input = _descriptor_data(conn, sid, operation, effect)
+    original, physical_input = original_input.data, original_input.physical_input
     if (
         observation.source != capture_provider_audit_source(running.session_operation_context)
         or observation.source_sha256 != stable_hash(original.invocation.model_dump(mode="json"))

@@ -84,7 +84,7 @@ def _read_cold_semantic_paid_incomplete(
     admitted_root = decode_continuation_snapshot(admitted.payload_json)
     frame = admitted_root.frames[-1]
     matches = tuple(item for item in admitted_root.effect_frontier if item.effect_id == effect_key)
-    _descriptor, _invocation, physical_input = _descriptor_data(conn, sid, operation_id, effect)
+    physical_input = _descriptor_data(conn, sid, operation_id, effect).physical_input
     if (
         type(frame) is not AdvisorFrame
         or frame.provider_effect_key != effect_key

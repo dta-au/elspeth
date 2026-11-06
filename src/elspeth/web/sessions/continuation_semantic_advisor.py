@@ -570,15 +570,11 @@ def _effect_data(conn: Connection, sid: str, operation: str, root: ContinuationF
     return row
 
 
-def _descriptor(
-    conn: Connection, running: ComposerOperationRunning, effect: Row[Any]
-) -> tuple[_Input, SemanticAdvisorInvocationData, _PhysicalInput]:
+def _descriptor(conn: Connection, running: ComposerOperationRunning, effect: Row[Any]) -> _SemanticOriginalInput:
     return _descriptor_data(conn, str(running.claim.session_id), running.claim.operation_id, effect)
 
 
-def _descriptor_data(
-    conn: Connection, sid: str, operation: str, effect: Row[Any]
-) -> tuple[_Input, SemanticAdvisorInvocationData, _PhysicalInput]:
+def _descriptor_data(conn: Connection, sid: str, operation: str, effect: Row[Any]) -> _SemanticOriginalInput:
     value = _decode(
         _Input, _blob(conn, sid, operation, f"semantic-provider-input:{effect.input_sha256}", "composer.semantic-provider-input.v1")
     )
@@ -626,7 +622,7 @@ def _descriptor_data(
     data = make_semantic_advisor_invocation(raw)
     physical_input = _decode(_PhysicalInput, value.physical_request_json)
     retained_inputs = _retained_inputs_data(conn, sid, operation, original, checkpoint_id=body.checkpoint_id, cursor=body.cursor)
-    _require_retained_input_document(
+    original_evidence = _require_retained_input_document(
         conn, sid, operation, original, physical_input, retained_inputs, env_ref_names=frozenset(body.env_ref_names)
     )
     if (
@@ -639,7 +635,9 @@ def _descriptor_data(
         or sha256(value.physical_request_json.encode("utf-8")).hexdigest() != effect.input_sha256
     ):
         raise AuditIntegrityError("Semantic physical descriptor changed its complete original preimage")
-    return value, data, physical_input
+    if original_evidence is None:
+        raise AuditIntegrityError("Semantic cold descriptor lost its original admitted evidence")
+    return _SemanticOriginalInput(value, data, physical_input, original_evidence)
 
 
 def _append(
@@ -881,7 +879,7 @@ def admit_v4_semantic_provider_on_connection(
     ):
         raise ContinuationCASConflict("V4 semantic admission lost its one prepared original effect")
     _inflight_source_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root)
-    _stored_descriptor, _invocation, physical_input = _descriptor(conn, running, effect)
+    physical_input = _descriptor(conn, running, effect).physical_input
     requested_model = preflight_v4_requested_model(model)
     if physical_input.options["model"] != requested_model.value:
         raise AuditIntegrityError("V4 semantic model differs from its prepared original physical request")
@@ -996,14 +994,15 @@ def admit_v4_semantic_provider_on_connection(
 
 def _original_input(
     conn: Connection, running: ComposerOperationRunning, root: ContinuationFrameStack, effect: Row[Any]
-) -> tuple[SemanticAdvisorInvocationData, _PhysicalInput]:
+) -> _SemanticOriginalInput:
     return _original_input_data(conn, str(running.claim.session_id), running.claim.operation_id, root, effect)
 
 
 def _original_input_data(
     conn: Connection, sid: str, operation: str, root: ContinuationFrameStack, effect: Row[Any]
-) -> tuple[SemanticAdvisorInvocationData, _PhysicalInput]:
-    _stored, data, physical_input = _descriptor_data(conn, sid, operation, effect)
+) -> _SemanticOriginalInput:
+    original_input = _descriptor_data(conn, sid, operation, effect)
+    data = original_input.data
     frame = root.frames[-1]
     if type(frame) is not AdvisorFrame:
         raise AuditIntegrityError("Semantic outcome lost its actual selected Advisor frame")
@@ -1018,7 +1017,7 @@ def _original_input_data(
         or _ref(conn, sid, operation, frame.review) != encode_continuation_advisor_invocation(data.invocation)
     ):
         raise AuditIntegrityError("Semantic outcome changed its original policy, invocation or logical source")
-    return data, physical_input
+    return original_input
 
 
 def _creator(conn: Connection, running: ComposerOperationRunning, effect: Row[Any]) -> Row[Any]:
@@ -1496,13 +1495,26 @@ def _extended_evidence_data(
 
 
 def _original_evidence_data(
-    conn: Connection, sid: str, operation: str, data: SemanticAdvisorInvocationData
+    conn: Connection,
+    sid: str,
+    operation: str,
+    data: SemanticAdvisorInvocationData,
+    *,
+    original_evidence: _SemanticOriginalEvidence | None = None,
 ) -> tuple[ContinuationFrameStack, AdmittedTurnEvidence]:
     original = decode_continuation_snapshot(data.source.selected_snapshot_json)
+    source_chunks = load_private_chunks(conn, session_id=sid, operation_id=operation, stack=original)
+    if (
+        type(original_evidence) is _SemanticOriginalEvidence
+        and original_evidence.source_snapshot_json == data.source.selected_snapshot_json
+        and original_evidence.admitted.source_chunk == data.source.evidence
+        and original_evidence.admitted.env_ref_names == data.source.env_ref_names
+    ):
+        return original, original_evidence.admitted
     admitted = decode_turn_evidence(
         data.source.evidence,
         env_ref_names=data.source.env_ref_names,
-        source_chunks=load_private_chunks(conn, session_id=sid, operation_id=operation, stack=original),
+        source_chunks=source_chunks,
     )
     return original, admitted
 
@@ -1584,7 +1596,8 @@ def _paid_result_data(
     live session context, quota custody or writer permission.
     """
     effect = _effect_data(conn, sid, operation, root, effect_key)
-    data, physical_input = _original_input_data(conn, sid, operation, root, effect)
+    original_input = _original_input_data(conn, sid, operation, root, effect)
+    data, physical_input = original_input.data, original_input.physical_input
     if effect.result_chunk_key is None or effect.receipt_key is None:
         raise AuditIntegrityError("Semantic cold result requires actual retained paid output")
     manifest_json = _blob(conn, sid, operation, effect.result_chunk_key, "composer.semantic-provider-outcome.v1")
@@ -1624,8 +1637,9 @@ def _paid_result_data(
         raise AuditIntegrityError("Semantic cold result changed its complete original recorder prefix")
     call = captured.llm_calls[-1]
     # This exact recorder was just decoded and its complete prefix proved
-    # above. Fresh evidence/dependency admission remains independent.
-    original, admitted = _original_evidence_data(conn, sid, operation, data)
+    # above. The complete original SQL closure is still read here before the
+    # unexposed document admission can supply this call's original graph.
+    original, admitted = _original_evidence_data(conn, sid, operation, data, original_evidence=original_input.original_evidence)
     extended = _extend_admitted_evidence(data, original, admitted, call, captured)
     evidence = extended.evidence
     if extended.applied_batch is not None and _ref(conn, sid, operation, extended.applied_batch.reference) != extended.applied_batch:
@@ -3293,6 +3307,28 @@ def read_semantic_advisor_retained_inputs_on_connection(
 
 
 @dataclass(frozen=True, slots=True)
+class _SemanticOriginalInput:
+    """Original descriptor and its actual document admission for this SQL call."""
+
+    stored: _Input
+    data: SemanticAdvisorInvocationData
+    physical_input: _PhysicalInput
+    original_evidence: _SemanticOriginalEvidence
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticOriginalEvidence:
+    """Unexposed original admission carried within one synchronous SQL read.
+
+    The graph remains owned by this call. Its consumer still freshly loads
+    the complete hash-addressed closure under the same original snapshot.
+    """
+
+    source_snapshot_json: str
+    admitted: AdmittedTurnEvidence
+
+
+@dataclass(frozen=True, slots=True)
 class _SemanticEvidenceDocument:
     """Immutable projection from this preparation transaction's full proof.
 
@@ -3317,7 +3353,7 @@ def _require_retained_input_document(
     *,
     env_ref_names: frozenset[str],
     evidence_document: _SemanticEvidenceDocument | None = None,
-) -> None:
+) -> _SemanticOriginalEvidence | None:
     if len(physical.messages) != 3 or physical.messages[-1].get("role") != "user":
         raise AuditIntegrityError("Semantic physical input lost its original complete source document")
     text = physical.messages[-1].get("content")
@@ -3331,6 +3367,7 @@ def _require_retained_input_document(
     source_chunks = load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root)
     if evidence_document is not None and type(evidence_document) is not _SemanticEvidenceDocument:
         raise AuditIntegrityError("Semantic document lost its original immutable source projection")
+    admitted = None
     if (
         evidence_document is not None
         and evidence_document.source == evidence_chunk
@@ -3342,9 +3379,8 @@ def _require_retained_input_document(
             raise AuditIntegrityError("Semantic document changed its canonical source projection")
         expected_evidence = projected
     else:
-        expected_evidence = decode_turn_evidence(
-            evidence_chunk, env_ref_names=env_ref_names, source_chunks=source_chunks
-        ).snapshot.model_dump(mode="json", by_alias=True, exclude={"transcript"})
+        admitted = decode_turn_evidence(evidence_chunk, env_ref_names=env_ref_names, source_chunks=source_chunks)
+        expected_evidence = admitted.snapshot.model_dump(mode="json", by_alias=True, exclude={"transcript"})
     expected_document: dict[str, JsonValue] = {
         "source": physical.source.model_dump(mode="json"),
         "frontier": _ref(conn, sid, operation, root.semantic_frontier).canonical if root.semantic_frontier is not None else None,
@@ -3364,6 +3400,9 @@ def _require_retained_input_document(
         expected_document["iteration_return"] = semantic_retained_json(retained.iteration_return.result_json)
     if canonical_json(expected_document) != text:
         raise AuditIntegrityError("Semantic physical input omitted, added or substituted its complete original source/result DATA")
+    if admitted is None:
+        return None
+    return _SemanticOriginalEvidence(encode_continuation_snapshot(root), admitted)
 
 
 def _historical_snapshot(
@@ -3866,7 +3905,7 @@ def _inflight_source_data(
         raise AuditIntegrityError("Semantic in-flight source changed its original selected frame")
     effect = _effect_data(conn, sid, operation, root, frame.provider_effect_key)
     with borrow_v4_preparation_memo_scope():
-        data, _physical = _original_input_data(conn, sid, operation, root, effect)
+        data = _original_input_data(conn, sid, operation, root, effect).data
     _creator_data(conn, sid, operation, effect)
     if effect.disposition not in ("prepared", "dispatched") or any(
         value is not None

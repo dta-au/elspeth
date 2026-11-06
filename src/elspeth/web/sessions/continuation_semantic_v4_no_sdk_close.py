@@ -86,7 +86,7 @@ def close_v4_semantic_no_sdk_on_connection(
         raise AuditIntegrityError("V4 semantic no-SDK closure lost its original admitted head")
     root = decode_continuation_snapshot(selected.payload_json)
     effect = _effect_data(conn, sid, operation, root, effect_key)
-    _data, physical_input = _original_input_data(conn, sid, operation, root, effect)
+    physical_input = _original_input_data(conn, sid, operation, root, effect).physical_input
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
     segment = conn.execute(
         select(segments).where(

@@ -2185,7 +2185,7 @@ def _read_committed_primary_response_data_on_connection(
     reference: PrivateChunkRef,
 ) -> PrivateChunk:
     _require_selected_primary_source(conn, running, selected)
-    return read_committed_primary_response_data_on_connection(
+    return _verify_committed_primary_response_data_on_connection(
         conn,
         session_id=running.claim.session_id,
         operation_id=running.claim.operation_id,

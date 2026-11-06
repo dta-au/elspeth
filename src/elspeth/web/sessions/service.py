@@ -12306,7 +12306,7 @@ class SessionServiceImpl:
                     semantic_effects.c.effect_key == prepared.binding.effect_key,
                 )
             ).one()
-            _stored, source, _physical_input = _descriptor_data(conn, sid, operation, effect)
+            source = _descriptor_data(conn, sid, operation, effect).data
             original = no_sdk_issuer.require_original_v4_response_observation(prepared, admission.selected)
             if original.source != source.invocation or original.request_sha256 != prepared.binding.input_sha256:
                 raise AuditIntegrityError("V4 semantic SQL result changed its original prepared invocation")
@@ -12437,7 +12437,7 @@ class SessionServiceImpl:
                     semantic_effects.c.effect_key == prepared.binding.effect_key,
                 )
             ).one()
-            _stored, source, _physical_input = _descriptor_data(conn, sid, operation, effect)
+            source = _descriptor_data(conn, sid, operation, effect).data
             original = no_sdk_issuer.require_original_v4_incomplete_capture(prepared, admission.selected, incomplete)
             if original.source != source.invocation or original.request_sha256 != prepared.binding.input_sha256:
                 raise AuditIntegrityError("V4 semantic paid-incomplete result changed original invocation")

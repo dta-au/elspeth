@@ -27,6 +27,7 @@ from typing import Final, Literal
 from weakref import ReferenceType, ref
 
 import pytest
+from sqlalchemy import LargeBinary
 from sqlalchemy import event as sql_events
 from sqlalchemy import util as sql_util
 from sqlalchemy.dialects.postgresql.psycopg import PGCompiler_psycopg, PGDialect_psycopg, PGExecutionContext_psycopg
@@ -48,6 +49,7 @@ from sqlalchemy.sql.elements import (
     BindParameter,
     BooleanClauseList,
     Case,
+    Cast,
     ClauseList,
     False_,
     Grouping,
@@ -125,6 +127,8 @@ _CHUNK_QUERY = RetentionStageMemo.canonical_text_proof
 _CHUNK_VALUE = _CHUNK_QUERY
 _CHUNK_REFERENCE = continuation_codec._private_chunk_memo_reference
 _CHUNK_WORK_CODE = _CHUNK_PRODUCER.__code__
+_CHUNK_PARSE_PRODUCER = continuation_codec._require_private_chunk_encoding_canonical
+_CHUNK_PARSE_CODE = _CHUNK_PARSE_PRODUCER.__code__
 _CHUNK_QUERY_CODE = _CHUNK_QUERY.__code__
 _CHUNK_VALUE_CODE = _CHUNK_VALUE.__code__
 _CHUNK_REFERENCE_CODE = _CHUNK_REFERENCE.__code__
@@ -432,11 +436,13 @@ _STRUCTURE_VISITOR_NAMES: Final = (
     "function_argspec",
     "visit_clauselist",
     "visit_octet_length_func",
+    "visit_length_func",
+    "visit_cast",
 )
 # Generic (unregistered) SQL functions the closed read grammar admits, by name.
-# The SQLite reader branch, length(CAST(...)), runs under no structure-observed
-# test, so Cast and length stay outside the grammar until one observes it.
-_STRUCTURE_READ_FUNCTION_NAMES: Final = ("octet_length",)
+# SQLite length(CAST(payload AS BLOB)) is admitted only at the bounded reader
+# source below, with its exact payload column and binary target type.
+_STRUCTURE_READ_FUNCTION_NAMES: Final = ("octet_length", "length")
 _STRUCTURE_COMPILER_MROS = tuple((compiler, compiler.__mro__) for compiler in (SQLiteCompiler, PGCompiler_psycopg))
 _STRUCTURE_COMPILER_OWNERS = tuple(dict.fromkeys(owner for _compiler, mro in _STRUCTURE_COMPILER_MROS for owner in mro))
 _STRUCTURE_VISITOR_GUARDS = tuple(
@@ -484,8 +490,13 @@ _STRUCTURE_STORE_FUNCTIONS = tuple(
         ("put_chunk", stored_continuation.put_chunk, 1),
         ("append_complete_snapshot", stored_continuation.append_complete_snapshot, 3),
         ("load_snapshot", stored_continuation.load_snapshot, 3),
-        ("_insert_chunk_after_admission", stored_continuation._insert_chunk_after_admission, 2),
+        ("_insert_chunk_after_admission", stored_continuation._insert_chunk_after_admission, 1),
+        ("read_bounded_retained_chunk", stored_continuation.read_bounded_retained_chunk, 1),
     )
+)
+_STRUCTURE_BOUND_READ_GLOBALS = tuple(
+    (name, stored_continuation.read_bounded_retained_chunk.__globals__[name])
+    for name in ("select", "cast", "LargeBinary", "case", "func", "chunks")
 )
 _STRUCTURE_STORE_INSTRUCTIONS = tuple(
     tuple(dis.get_instructions(code, show_caches=True)) for _name, _function, code, _globals, _count in _STRUCTURE_STORE_FUNCTIONS
@@ -530,7 +541,7 @@ _STRUCTURE_STORE_CALLS = tuple(
     )
 )
 _STRUCTURE_STORE_ROLES = (
-    (3, 1, Insert, stored_continuation.chunks, "chunk_insert"),
+    (3, 0, Insert, stored_continuation.chunks, "chunk_insert"),
     (1, 0, Insert, stored_continuation.events, "event_insert"),
     (1, 1, Insert, stored_continuation.checkpoints, "checkpoint_insert"),
     (1, 2, Update, stored_continuation.jobs, "head_cas"),
@@ -887,6 +898,7 @@ class _StructureInvocation:
     connection: int | None = None
     statement: int | None = None
     driver_role: str | None = None
+    bounded_reader: bool = False
     suspended: bool = False
     suspensions: int = 0
     resumptions: int = 0
@@ -1157,6 +1169,11 @@ def _structure_sql_sources_current(diagnostic: list[str] | None = None) -> bool:
     for name, function, code, namespace, _count in _STRUCTURE_STORE_FUNCTIONS:
         if stored_continuation.__dict__.get(name) is not function or function.__code__ is not code or function.__globals__ is not namespace:
             return _structure_source_refused(diagnostic, "sql.store_function")
+    if any(
+        stored_continuation.read_bounded_retained_chunk.__globals__.get(name) is not original
+        for name, original in _STRUCTURE_BOUND_READ_GLOBALS
+    ):
+        return _structure_source_refused(diagnostic, "sql.bounded_reader_global")
     for name, function, code, class_name, constructor in _STRUCTURE_STORE_CONSTRUCTORS:
         if (
             stored_continuation.__dict__.get(name) is not function
@@ -1944,6 +1961,16 @@ def _structure_sql_shape(trace, owner: _StructureInvocation, context) -> Structu
                 if type(node.name) is not str:
                     raise ValueError("unsupported label")
                 return ("label", node.name, expression(node.element, depth + 1))
+            if node_type is Cast:
+                if (
+                    not owner.bounded_reader
+                    or type(engine.dialect) is not SQLiteDialect_pysqlite
+                    or node.clause is not stored_continuation.chunks.c.payload
+                    or type(node.type) is not LargeBinary
+                    or node.type.length is not None
+                ):
+                    raise ValueError("unsupported bounded reader cast")
+                return ("cast_binary_payload", expression(node.clause, depth + 1))
             if node_type is sql_functions.Function:
                 function = next(
                     (index for index, known in enumerate(_STRUCTURE_READ_FUNCTION_NAMES) if type(node.name) is str and node.name == known),
@@ -1967,6 +1994,8 @@ def _structure_sql_shape(trace, owner: _StructureInvocation, context) -> Structu
                     or arguments.group_contents is not True
                 ):
                     raise ValueError("unsupported SQL function arguments")
+                if node.name == "length" and (not owner.bounded_reader or type(arguments.clauses[0]) is not Cast):
+                    raise ValueError("unsupported bounded reader length")
                 return ("function", function, tuple(expression(clause, depth + 1) for clause in arguments.clauses))
             if node_type is Case:
                 if node.value is not None or node.else_ is not None or type(node.whens) is not list or not node.whens:
@@ -2936,7 +2965,8 @@ _TITLE_REJECT_SITE = _direct_call_site(_TITLE_SHAPE, "reject_credential_material
 _TITLE_FIND_SITE = _direct_call_site(_TITLE_REJECT, "find_credential_material", arguments=1)
 _SNAPSHOT_SOURCE_SITE = _direct_call_site(_LOAD_SNAPSHOT, "decode_continuation_snapshot", arguments=1, load_op="LOAD_FAST")
 _CHUNK_SOURCE_SITE = _direct_call_site(_LOAD_CHUNKS, "verify_private_chunk", arguments=2)
-_CHUNK_PARSE_SITE = _direct_call_site(_CHUNK_WORK_CODE, "parse_json_strict", arguments=1)
+_CHUNK_PARSE_SITE = _direct_call_site(_CHUNK_PARSE_CODE, "parse_json_strict", arguments=1)
+_CHUNK_CANONICAL_SITE = _direct_call_site(_CHUNK_WORK_CODE, "_require_private_chunk_encoding_canonical", arguments=1)
 _CHUNK_ONLY_PARSE_SITE = _direct_call_site(_CHUNK_ONLY_WORK_CODE, "parse_json_strict", arguments=1)
 _CHUNK_PREPARATION_SIZE_SITE = _direct_call_site(_CHUNK_WORK_CODE, "utf8_size", arguments=2, keywords=("limit",))
 _CATEGORY_SIZE_SITE = _direct_call_site(_CATEGORY_QUERY.__code__, "utf8_size", arguments=3, keywords=("errors", "limit"))
@@ -3047,12 +3077,20 @@ class _ChunkTracePath:
     query_site: tuple[range, int]
     work_site: tuple[range, int]
     key_type: type
+    parse_code: CodeType
     parse_site: tuple[range, int]
 
 
 _CHUNK_TRACE_PATHS = (
     _ChunkTracePath(
-        _CHUNK_QUERY, _CHUNK_VALUE, _CHUNK_PRODUCER, _CHUNK_QUERY_SITE, _CHUNK_WORK_SITE, CanonicalTextEncodingKey, _CHUNK_PARSE_SITE
+        _CHUNK_QUERY,
+        _CHUNK_VALUE,
+        _CHUNK_PRODUCER,
+        _CHUNK_QUERY_SITE,
+        _CHUNK_WORK_SITE,
+        CanonicalTextEncodingKey,
+        _CHUNK_PARSE_CODE,
+        _CHUNK_PARSE_SITE,
     ),
     _ChunkTracePath(
         _CHUNK_ONLY_QUERY,
@@ -3061,6 +3099,7 @@ _CHUNK_TRACE_PATHS = (
         _CHUNK_ONLY_QUERY_SITE,
         _CHUNK_ONLY_WORK_SITE,
         PrivateChunkVerificationKey,
+        _CHUNK_ONLY_WORK_CODE,
         _CHUNK_ONLY_PARSE_SITE,
     ),
 )
@@ -3169,6 +3208,7 @@ class MemoInspection:
     chunk_proof: CanonicalTextProof | None = None
     chunk_proof_encoded: bytes | None = None
     chunk_binding_returned: bool = False
+    chunk_reference: PrivateChunkRef | None = None
 
     @property
     def group(self):
@@ -3426,24 +3466,35 @@ _CONTEXT_POLICY_KEY = _policy_data(_CONTEXT_POLICY)
 assert _CONTEXT_POLICY_KEY is not None, "provider context policy lost its closed shape"
 
 
+def _safe_chunk_reference(reference: object) -> bool:
+    if type(reference) is not PrivateChunkRef:
+        return False
+    try:
+        return type(reference.codec) is str and type(reference.digest) is str and type(reference.byte_length) is int
+    except AttributeError:
+        return False
+
+
+def _chunk_reference_matches(key: object, reference: object) -> bool:
+    return (
+        _safe_chunk_reference(reference)
+        and _safe_key(key)
+        and (type(key) is CanonicalTextEncodingKey or (type(key) is PrivateChunkVerificationKey and key.reference is reference))
+    )
+
+
 def _safe_key(key: object) -> bool:
     if type(key) is SnapshotDecodeKey:
         return type(key.encoded) is str
-    if type(key) in (PrivateChunkVerificationKey, CanonicalTextEncodingKey):
-        if type(key) is CanonicalTextEncodingKey and (type(key.max_utf8_bytes) is not int or key.max_utf8_bytes != _PRIVATE_UTF8_LIMIT):
-            return False
-        reference = key.reference
-        if type(reference) is not PrivateChunkRef or type(key.canonical) is not str:
-            return False
-        try:
-            return all(
-                actual is expected
-                for actual, expected in zip(
-                    (type(reference.codec), type(reference.digest), type(reference.byte_length)), (str, str, int), strict=True
-                )
-            )
-        except AttributeError:
-            return False
+    if type(key) is CanonicalTextEncodingKey:
+        return (
+            type(key.canonical) is str
+            and type(key.max_utf8_bytes) is int
+            and key.max_utf8_bytes == _PRIVATE_UTF8_LIMIT
+            and key.reference is None
+        )
+    if type(key) is PrivateChunkVerificationKey:
+        return type(key.canonical) is str and _safe_chunk_reference(key.reference)
     scan = key.scan if type(key) is StateCredentialStepKey else key
     if type(scan) is not CredentialScanKey or type(scan.content) is not tuple:
         return False
@@ -3665,7 +3716,11 @@ class RetentionMemoTrace:
                             entries.extend(
                                 (producer, key)
                                 for producer, digest_producer, key in memo._canonical_proofs
-                                if key.reference is not None and digest_producer is _SHA256
+                                if producer is _CHUNK_PRODUCER
+                                and digest_producer is _SHA256
+                                and any(
+                                    record.memo is memo and record.producer is producer and record.key == key for record in self.records
+                                )
                             )
                         with self._lock:
                             self.populated[memo] = len(entries)
@@ -4439,6 +4494,19 @@ class RetentionMemoTrace:
                         statement = frame.f_locals.get("statement")
                         owner.statement = id(statement)
                         if role == "sql":
+                            caller = frame.f_back
+                            _name, function, code, namespace, count = _STRUCTURE_STORE_FUNCTIONS[4]
+                            sites = _STRUCTURE_STORE_CALLS[4]
+                            owner.bounded_reader = (
+                                caller is not None
+                                and caller.f_code is code
+                                and caller.f_globals is namespace
+                                and stored_continuation.read_bounded_retained_chunk is function
+                                and function.__code__ is code
+                                and len(sites) == count == 1
+                                and caller.f_lasti in sites[0]
+                                and type(statement) is Select
+                            )
                             owner.store_role = _structure_store_role(frame, statement)
                             if owner.store_role is not None:
                                 owner.store_thread = identity
@@ -5733,6 +5801,8 @@ class RetentionMemoTrace:
                     and path.value is path.query
                     and continuation_codec._private_chunk_canonical_text_bytes is path.producer
                     and path.producer.__code__ is _CHUNK_WORK_CODE
+                    and continuation_codec._require_private_chunk_encoding_canonical is _CHUNK_PARSE_PRODUCER
+                    and _CHUNK_PARSE_PRODUCER.__code__ is _CHUNK_PARSE_CODE
                 )
                 or (
                     path is _CHUNK_TRACE_PATHS[1]
@@ -5788,7 +5858,13 @@ class RetentionMemoTrace:
             return False
         if family == "snapshot":
             return text is high.f_locals.get("encoded") and continuation_codec.SnapshotDecodeKey is SnapshotDecodeKey
-        return text is high.f_locals.get("canonical") and key.reference is high.f_locals.get("reference")
+        record = self._frames.get(id(high))
+        return (
+            record is not None
+            and text is high.f_locals.get("canonical")
+            and record.chunk_reference is high.f_locals.get("reference")
+            and _chunk_reference_matches(key, record.chunk_reference)
+        )
 
     def _snapshot_artifact_event(self, frame: FrameType, event: str, expected_id: int | None) -> None:
         self._artifact_event(
@@ -6267,13 +6343,36 @@ class RetentionMemoTrace:
                 )
             )
 
+    def _chunk_parse_path(self, caller: FrameType | None, text: object) -> _ChunkTracePath | None:
+        if caller is None:
+            return None
+        path = next(
+            (candidate for candidate in _CHUNK_TRACE_PATHS if self._at_site(caller, candidate.parse_code, candidate.parse_site)),
+            None,
+        )
+        if path is _CHUNK_TRACE_PATHS[0]:
+            # Only the byte producer's exact direct helper call belongs to its
+            # full-proof work. The same helper also serves a different producer
+            # in the canonical-only family; it cannot borrow a verifier key.
+            parent = caller.f_back
+            if (
+                parent is None
+                or not self._at_site(parent, _CHUNK_WORK_CODE, _CHUNK_CANONICAL_SITE)
+                or parent.f_globals is not continuation_codec.__dict__
+                or caller.f_globals is not continuation_codec.__dict__
+                or continuation_codec._require_private_chunk_encoding_canonical is not _CHUNK_PARSE_PRODUCER
+                or _CHUNK_PARSE_PRODUCER.__code__ is not _CHUNK_PARSE_CODE
+                or caller.f_locals.get("canonical") is not text
+                or parent.f_locals.get("canonical") is not text
+            ):
+                return None
+        return path
+
     def _defer_chunk_parse(self, frame: FrameType, record: MemoInspection, expected_id: int | None) -> bool:
         caller = frame.f_back
         text = frame.f_locals.get("text")
         key = record.key
-        path = next(
-            (candidate for candidate in _CHUNK_TRACE_PATHS if caller is not None and caller.f_code is candidate.producer.__code__), None
-        )
+        path = self._chunk_parse_path(caller, text)
         if path is None:
             return False
         actual_producer = (
@@ -6283,7 +6382,7 @@ class RetentionMemoTrace:
         )
         if (
             caller is None
-            or not self._at_site(caller, path.producer.__code__, path.parse_site)
+            or not self._at_site(caller, path.parse_code, path.parse_site)
             or caller.f_globals is not continuation_codec.__dict__
             or frame.f_globals is not json_parser.__dict__
             or continuation_codec.parse_json_strict is not _STRICT_PARSE
@@ -6304,7 +6403,8 @@ class RetentionMemoTrace:
                 if (
                     ancestor.f_globals is not continuation_codec.__dict__
                     or ancestor.f_locals.get("canonical") is not text
-                    or ancestor.f_locals.get("reference") is not key.reference
+                    or ancestor.f_locals.get("reference") is not record.chunk_reference
+                    or not _chunk_reference_matches(key, record.chunk_reference)
                 ):
                     return False
                 ordinal = next(index for index, candidate in enumerate(self.records, 1) if candidate is record)
@@ -6343,7 +6443,8 @@ class RetentionMemoTrace:
                 or continuation_codec.parse_json_strict is not _STRICT_PARSE
                 or actual_producer is not path.producer
                 or frame.f_locals.get("canonical") is not key.canonical
-                or frame.f_locals.get("reference") is not key.reference
+                or frame.f_locals.get("reference") is not owner.chunk_reference
+                or not _chunk_reference_matches(key, owner.chunk_reference)
             ):
                 self._byte_error("strict parser has no bound native byte provenance", frame, expected_id, owner)
                 continue
@@ -6436,7 +6537,7 @@ class RetentionMemoTrace:
             return None
         if self._at_site(caller, _LOW_CODE_OBJECTS[0][0], _SNAPSHOT_PARSE_SITE):
             source_code, source_site, variable = _LOAD_SNAPSHOT, _SNAPSHOT_SOURCE_SITE, "encoded"
-        elif any(self._at_site(caller, path.producer.__code__, path.parse_site) for path in _CHUNK_TRACE_PATHS):
+        elif self._chunk_parse_path(caller, text) is not None:
             source_code, source_site, variable = _LOAD_CHUNKS, _CHUNK_SOURCE_SITE, "canonical"
         else:
             # Nested policy/action text has no native UTF-8 buffer at these
@@ -6526,7 +6627,8 @@ class RetentionMemoTrace:
                 for record in reversed(self.records)
                 if record.memo is actual
                 and type(record.key) in (PrivateChunkVerificationKey, CanonicalTextEncodingKey)
-                and record.key.reference is reference
+                and record.chunk_reference is reference
+                and _chunk_reference_matches(record.key, reference)
                 and record.key.canonical is canonical
             ),
             None,
@@ -7157,7 +7259,12 @@ class RetentionMemoTrace:
         if frame.f_lasti not in _CHUNK_SUCCESS_RETURNS or not _safe_key(record.key):
             return
         key = record.key
-        if frame.f_locals.get("reference") is not key.reference or frame.f_locals.get("canonical") is not key.canonical:
+        reference = record.chunk_reference
+        if (
+            not _chunk_reference_matches(key, reference)
+            or frame.f_locals.get("reference") is not reference
+            or frame.f_locals.get("canonical") is not key.canonical
+        ):
             return
         if type(key) is CanonicalTextEncodingKey:
             proof = frame.f_locals.get("proof")
@@ -7167,8 +7274,8 @@ class RetentionMemoTrace:
                 and proof.encoded is record.chunk_proof_encoded
                 and id(proof) == record.chunk_proof_id
                 and record.chunk_proof_buffer == (id(proof.encoded), len(proof.encoded), proof.digest)
-                and frame.f_locals.get("length") == key.reference.byte_length
-                and frame.f_locals.get("digest") == key.reference.digest
+                and frame.f_locals.get("length") == reference.byte_length
+                and frame.f_locals.get("digest") == reference.digest
             ):
                 record.chunk_binding_returned = True
         elif type(key) is PrivateChunkVerificationKey:
@@ -7299,6 +7406,10 @@ class RetentionMemoTrace:
                     self._frames[id(frame)] = inherited
                 else:
                     record = MemoInspection(family, actual)
+                    if code is _CHUNK_REQUEST and frame.f_globals is continuation_codec.__dict__:
+                        reference = frame.f_locals.get("reference")
+                        if _safe_chunk_reference(reference):
+                            record.chunk_reference = reference
                     self.records.append(record)
                     self._frames[id(frame)] = record
                 return
@@ -7609,13 +7720,14 @@ class RetentionMemoTrace:
             )
             owners.add(id(item.owner))
             key = item.owner.key
+            reference = item.owner.chunk_reference
             assert (
                 type(key) in (PrivateChunkVerificationKey, CanonicalTextEncodingKey)
                 and _safe_key(key)
-                and key.reference is not None
-                and id(key.reference) == item.reference
+                and _chunk_reference_matches(key, reference)
+                and id(reference) == item.reference
                 and id(key.canonical) == item.text
-                and key.reference.byte_length == item.byte_length
+                and reference.byte_length == item.byte_length
                 and item.owner.byte_calls["chunk_length"] == 1
                 and item.owner.byte_counts["chunk_length"] == item.byte_length
                 and inspection.owner is item.owner
@@ -7653,9 +7765,9 @@ class RetentionMemoTrace:
                     and type(proof.digest) is str
                     and id(proof) == item.owner.chunk_proof_id
                     and proof.encoded is item.owner.chunk_proof_encoded
-                    and item.owner.chunk_proof_buffer == (id(proof.encoded), item.byte_length, key.reference.digest)
+                    and item.owner.chunk_proof_buffer == (id(proof.encoded), item.byte_length, reference.digest)
                     and len(proof.encoded) == item.byte_length
-                    and proof.digest == key.reference.digest
+                    and proof.digest == reference.digest
                     and item.owner.byte_calls["chunk_digest"] == item.owner.attempts["sha256"]
                     and item.owner.attempts["sha256"]
                     == int(next(record for record in self.records if record.chunk_proof is proof) is item.owner)

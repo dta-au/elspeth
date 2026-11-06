@@ -212,12 +212,19 @@ class ContinuationLivePhases:
             if len(matching) != 1 or matching[0] != audit:
                 raise AuditIntegrityError("cold paid phase changed its actual restored recorder identity")
             completion = retained.outcome.completion
-            data = runtime.graph.batch
-            if data is not None:
-                if completion.tool_batch.calls != data.calls:
+            batches = tuple(frame for frame in selected.stack.frames if type(frame) is ToolBatchFrame)
+            if batches:
+                if (
+                    len(batches) != 1
+                    or batches[0].response != compose[0].pending_response
+                    or batches[0].response != retained.response.reference
+                ):
+                    raise AuditIntegrityError("cold paid phase changed its selected batch response")
+                data = runtime.graph.batch
+                if data is None or completion.tool_batch.calls != data.calls:
                     raise AuditIntegrityError("cold paid phase changed its actual restored issued calls")
-                # Reuse the already restored SDK atoms; only owned carriers
-                # are rebound. Warm phases never take this cold DATA path.
+                # Only the current selected batch supplies its restored SDK
+                # atoms. A retired batch remains historical graph DATA.
                 completion = replace(completion, tool_batch=replace(completion.tool_batch, calls=data.calls))
             self.primary = RetainedPrimaryPhaseData(retained.response, _CallModelOutcome(completion, matching[0]))
         if self.primary.response.reference != compose[0].pending_response:

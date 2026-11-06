@@ -104,7 +104,7 @@ def read_v4_semantic_no_sdk_terminal_on_connection(
         or entries[0].disposition != "dispatched"
     ):
         raise AuditIntegrityError("Semantic no-SDK terminal changed its original admitted Advisor")
-    _descriptor, _invocation, physical_input = _descriptor_data(conn, sid, operation_id, effect)
+    physical_input = _descriptor_data(conn, sid, operation_id, effect).physical_input
     if type(effect.provider_attempt_id) is not str or type(effect.result_chunk_key) is not str or type(effect.receipt_key) is not str:
         raise AuditIntegrityError("Semantic no-SDK terminal lost its physical/receipt identity")
     physical_row = conn.execute(select(physical).where(physical.c.attempt_id == effect.provider_attempt_id)).one_or_none()

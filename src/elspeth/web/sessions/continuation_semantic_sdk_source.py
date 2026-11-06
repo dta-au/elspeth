@@ -50,7 +50,8 @@ def _source_data(
     sid, operation = source.session_id, source.operation_id
     root = decode_continuation_snapshot(admitted.payload_json)
     frame = root.frames[-1]
-    _descriptor, original, physical_input = _descriptor_data(conn, sid, operation, effect)
+    original_input = _descriptor_data(conn, sid, operation, effect)
+    original, physical_input = original_input.data, original_input.physical_input
     principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one()
     creator = conn.execute(
         select(attempts).where(

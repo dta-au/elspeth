@@ -167,7 +167,7 @@ def read_v4_semantic_paid_overflow_terminal_on_connection(
         or matches[0].disposition != "dispatched"
     ):
         raise AuditIntegrityError("Semantic paid overflow changed original admitted result source")
-    _descriptor, _invocation, physical_input = _descriptor_data(conn, sid, operation_id, effect)
+    physical_input = _descriptor_data(conn, sid, operation_id, effect).physical_input
     physical_row = conn.execute(select(physical).where(physical.c.attempt_id == effect.provider_attempt_id)).one_or_none()
     principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one()
     creator = conn.execute(

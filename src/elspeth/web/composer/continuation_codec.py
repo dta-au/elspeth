@@ -123,7 +123,8 @@ def encode_private_chunk(
 
     proof_key = CanonicalTextEncodingKey(canonical, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
     memo = current_retention_stage_memo()
-    if utf8_size(canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+    text_bytes = utf8_size(canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    if text_bytes > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
         # Measure this original text, not a reconstruction by the paid owner.
         # Size alone does not establish canonical/credential admission.
         raise AuditIntegrityError("private chunk exceeds the complete JSON admission bound") from ContinuationMandatoryCaptureOverflow(
@@ -135,12 +136,30 @@ def encode_private_chunk(
                 size_is_exact=True,
             )
         )
-    proof = (
-        memo.canonical_text_proof(proof_key, _private_chunk_canonical_text_bytes, sha256)
-        if memo is not None and type(canonical) is str
-        else None
-    )
-    encoded = proof.encoded if proof is not None else _private_chunk_canonical_text_bytes(proof_key)
+    digest = None
+    if (
+        memo is not None
+        and type(canonical) is str
+        and current_v4_preparation_memo() is not None
+        and sha256 is _TRUSTED_PRIVATE_CHUNK_SHA256
+        and 2 * text_bytes + 64 + len(str(proof_key.max_utf8_bytes)) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    ):
+        # Large text cannot retain its full bytes/SHA proof. Keep only the
+        # encoder's canonical success; bytes, SHA and admission stay fresh.
+        encoded = canonical.encode("utf-8")
+        memo.canonical_text_verification(
+            CanonicalTextVerificationKey(canonical, proof_key.max_utf8_bytes), _require_private_chunk_encoding_canonical
+        )
+        digest = sha256(encoded).hexdigest()
+    else:
+        proof = (
+            memo.canonical_text_proof(proof_key, _private_chunk_canonical_text_bytes, sha256)
+            if memo is not None and type(canonical) is str
+            else None
+        )
+        encoded = proof.encoded if proof is not None else _private_chunk_canonical_text_bytes(proof_key)
+        if proof is not None:
+            digest = proof.digest
     if codec == "composer.state.v1":
         # The state constructor needs a fresh mutable tree. Only the text
         # encoding proof is retained across calls.
@@ -165,7 +184,7 @@ def encode_private_chunk(
     reference = PrivateChunkRef.model_validate(
         {
             "codec": codec,
-            "digest": proof.digest if proof is not None else sha256(encoded).hexdigest(),
+            "digest": digest if digest is not None else sha256(encoded).hexdigest(),
             "byte_length": len(encoded),
         }
     )
@@ -177,10 +196,14 @@ def _private_chunk_canonical_text_bytes(key: CanonicalTextEncodingKey) -> bytes:
     if utf8_size(canonical, limit=key.max_utf8_bytes) > key.max_utf8_bytes:
         raise AuditIntegrityError("private chunk exceeds the complete JSON admission bound")
     encoded = canonical.encode("utf-8")
+    _require_private_chunk_encoding_canonical(canonical)
+    return encoded
+
+
+def _require_private_chunk_encoding_canonical(canonical: str) -> None:
     value, error = parse_json_strict(canonical)
     if error is not None or canonical_json(value) != canonical:
         raise AuditIntegrityError("private chunk must retain canonical strict JSON")
-    return encoded
 
 
 def verify_private_chunk(reference: PrivateChunkRef, canonical: str) -> None:
