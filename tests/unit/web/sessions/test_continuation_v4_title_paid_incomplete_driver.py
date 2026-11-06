@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 
@@ -13,7 +12,7 @@ from sqlalchemy import select
 
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_title_provider import TitlePaidIncompleteResult
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
@@ -41,16 +40,14 @@ from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.sessions import test_continuation_initialization as initialization_cases
 from tests.unit.web.sessions import test_continuation_title_provider as title_cases
-from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver
+from tests.unit.web.sessions.test_continuation_tool_failure import _claimed_driver, _unstarted_driver
 
 operation_store = operations.operation_store
 
 
 @pytest.mark.asyncio
 async def test_v4_title_paid_incomplete_reaches_one_cold_public_507_without_retry(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -94,12 +91,7 @@ async def test_v4_title_paid_incomplete_reaches_one_cold_public_507_without_retr
     lease = await adoption.join()
     provider = ProviderInvocationOwner(service=store[3], required_work=work)
     owner = ContinuationLivePhases(service, authority, work, provider, lease)
-    driver = _actual_failure_driver(store, owner, running, drain_signal=drain_signal)
-    driver.work, driver.provider = work, provider
-    key = (running.claim.session_id, running.claim.operation_id)
-    local_cancel = asyncio.Event()
-    assert key not in driver.worker._local_cancels
-    driver.worker._local_cancels[key] = local_cancel
+    driver = _unstarted_driver(store, owner, running, drain_signal=drain_signal)
     sdk_calls: list[str] = []
     observed: list[TitlePaidIncompleteResult] = []
     prepared_titles = []
@@ -145,7 +137,8 @@ async def test_v4_title_paid_incomplete_reaches_one_cold_public_507_without_retr
     monkeypatch.setattr(driver_module, "run_prepared_title_provider", observe_title)
     monkeypatch.setattr(driver_module._SegmentDriver, "advance", observe_advance)
     try:
-        outcome = await driver.run(None)
+        async with _claimed_driver(driver):
+            outcome = await driver.run(None)
         assert type(outcome) is ContinuationSegmentSettled and outcome.terminal.status == "failed"
         with store[0].connect() as conn:
             parent = conn.execute(
@@ -189,6 +182,4 @@ async def test_v4_title_paid_incomplete_reaches_one_cold_public_507_without_retr
         assert cold.receipt.retryable is False and cold.receipt.provider_returned is True
         work.coordinator.assert_completed()
     finally:
-        await driver.close_progress()
         await lease.close(deadline=driver.worker.drain_deadline)
-        assert driver.worker._local_cancels.pop(key) is local_cancel

@@ -1,4 +1,4 @@
-"""Timing DATA for one live V2 SQL owner; never a mutation capability.
+"""Timing DATA for one live continuation SQL owner; never a mutation capability.
 
 The bridge installs this owner inside its actual SQL worker. The canonical
 transaction owner uses it before advisory/row locks and before each statement.
@@ -18,9 +18,6 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
-    ContinuationAdmissionPolicy,
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
 )
 from elspeth.web.sessions.composer_drain import (
@@ -56,7 +53,7 @@ class ContinuationPreviewResultDeadline:
 
 class ContinuationSQLDeadlineOwner:
     running: ComposerOperationRunning
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4
+    policy: ContinuationAdmissionPolicyV4
     drain_signal: ComposerDrainSignal
     drain_seconds: float
     hard_expires_at: float
@@ -73,20 +70,14 @@ class ContinuationSQLDeadlineOwner:
         self,
         running: ComposerOperationRunning,
         *,
-        policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+        policy: ContinuationAdmissionPolicyV4,
         drain_signal: ComposerDrainSignal,
         drain_seconds: float,
         hard_expires_at: float,
     ) -> None:
         if (
             type(running) is not ComposerOperationRunning
-            or type(policy)
-            not in (
-                ContinuationAdmissionPolicy,
-                ContinuationAdmissionPolicyV2,
-                ContinuationAdmissionPolicyV3,
-                ContinuationAdmissionPolicyV4,
-            )
+            or type(policy) is not ContinuationAdmissionPolicyV4
             or type(drain_signal) is not ComposerDrainSignal
             or type(drain_seconds) not in (float, int)
             or not math.isfinite(drain_seconds)
@@ -94,7 +85,7 @@ class ContinuationSQLDeadlineOwner:
             or type(hard_expires_at) not in (float, int)
             or not math.isfinite(hard_expires_at)
         ):
-            raise AuditIntegrityError("V2 SQL timing lost its actual owner or finite retained bounds")
+            raise AuditIntegrityError("SQL timing lost its actual current owner or finite retained bounds")
         self.running, self.policy, self.drain_signal = running, policy, drain_signal
         self.drain_seconds, self.hard_expires_at = float(drain_seconds), float(hard_expires_at)
         # Reserve the process drain disposition margin even when a statement

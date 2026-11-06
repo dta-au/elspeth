@@ -13,7 +13,6 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import EndFrame
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_end_values import continuation_candidate_id, decode_end_candidate
-from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationReturned
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot, load_snapshot
 from elspeth.web.sessions.continuation_semantic_actions import _require_same_review_transaction, install_semantic_action_on_connection
@@ -70,15 +69,10 @@ async def test_immediate_review_reuse_rejects_corrupt_new_bridge_or_candidate(
             return semantic_fixture._reply(json.dumps(answer))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        issuer, prepared, dispatched = semantic_fixture._begin(operation_store, case)
-        observed = await semantic_fixture._invoke(case, issuer)
-        assert type(observed) is SemanticAdvisorInvocationReturned
+        prepared, retained = await semantic_fixture._run_paid_semantic(case, monkeypatch)
         sid, operation_id = str(operation_store[4]), case["running"].claim.operation_id
         effect_key = prepared.binding.effect_key
         with locked_session_transaction(operation_store[0], sid) as conn:
-            retained = semantic_sql.retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
             installed = install_semantic_action_on_connection(conn, case["running"], selected=retained.snapshot, effect_key=effect_key)
             original_append = semantic_sql.append_complete_snapshot
 

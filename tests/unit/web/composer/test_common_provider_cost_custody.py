@@ -65,14 +65,14 @@ def owned(tmp_path):
         engine.dispose()
 
 
-def _budget(owned, *, calls=75, request_bytes=2097152, completion=16384, cost="5.00", applicable=True, lifecycle=1):
-    policy = CommonProviderCostPolicy(calls, request_bytes, completion, Decimal(cost), 2) if applicable else None
+def _budget(owned, *, calls=75, request_bytes=2097152, completion=16384, cost="5.00"):
+    policy = CommonProviderCostPolicy(calls, request_bytes, completion, Decimal(cost), 2)
     return CommonProviderCostBudget(
         CommonProviderCostSnapshot(
             owned[2].fence.session_id,
             "request",
-            lifecycle,
-            ("legacy_empty_v1" if lifecycle == 1 else "continuation_v2") if applicable else "not_applicable",
+            2,
+            "continuation_v2",
             policy,
         )
     )
@@ -347,12 +347,13 @@ async def test_physical_failed_sdk_keeps_original_outcome_without_cost_refusal(o
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("applicable", [False, True])
+@pytest.mark.parametrize("with_budget", [False, True])
 @pytest.mark.parametrize("with_tools", [False, True])
-async def test_physical_policy_view_preserves_detached_actual_fields_and_key_absence(owned, monkeypatch, applicable, with_tools):
+async def test_physical_policy_view_preserves_detached_actual_fields_and_key_absence(owned, monkeypatch, with_budget, with_tools):
     owner = owned[4]
-    budget = _budget(owned, completion=31, applicable=applicable)
-    owner.bind_cost_budget(budget)
+    budget = _budget(owned, completion=31)
+    if with_budget:
+        owner.bind_cost_budget(budget)
     views = []
     prepare = budget.prepare_request
     messages = [{"role": "user", "content": [{"type": "text", "text": "Complete actual message.", "cache_control": {"type": "ephemeral"}}]}]
@@ -370,15 +371,17 @@ async def test_physical_policy_view_preserves_detached_actual_fields_and_key_abs
         prepare(view)
 
     async def sdk(**kwargs):
-        view = views[0]
-        assert kwargs["messages"] is view["messages"]
+        if with_budget:
+            view = views[0]
+            assert kwargs["messages"] is view["messages"]
         assert kwargs["messages"] == messages and kwargs["messages"] is not messages
         if with_tools:
-            assert kwargs["tools"] is view["tools"]
+            if with_budget:
+                assert kwargs["tools"] is view["tools"]
             assert kwargs["tools"] == tools and kwargs["tools"] is not tools
         else:
             assert "tools" not in kwargs
-        if applicable:
+        if with_budget:
             assert kwargs["max_tokens"] == 31
         else:
             assert "max_tokens" not in kwargs
@@ -390,7 +393,7 @@ async def test_physical_policy_view_preserves_detached_actual_fields_and_key_abs
     if with_tools:
         kwargs["tools"] = tools
     await _physical_call(owner.mint(ProviderInvocationFamily.PRIMARY), BufferingRecorder(), **kwargs)
-    assert len(views) == 1
+    assert len(views) == int(with_budget)
 
 
 @pytest.mark.asyncio
@@ -555,10 +558,7 @@ async def test_protocol_deferred_cancellation_charges_only_after_real_sql_then_p
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("lifecycle", (1, 2))
-async def test_actual_gateway_caller_has_shared_physical_limit_and_admitted_metadata_accountability(
-    owned, tmp_path, monkeypatch, lifecycle
-):
+async def test_actual_gateway_caller_has_shared_physical_limit_and_admitted_metadata_accountability(owned, tmp_path, monkeypatch):
     from litellm import ModelResponse
 
     from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
@@ -566,7 +566,7 @@ async def test_actual_gateway_caller_has_shared_physical_limit_and_admitted_meta
     from tests.unit.web.composer.test_llm_sampling_config import _settings
 
     engine, _, _, coordinator, owner = owned
-    budget = _budget(owned, calls=1, completion=31, lifecycle=lifecycle)
+    budget = _budget(owned, calls=1, completion=31)
     owner.bind_cost_budget(budget)
     settings = _settings(tmp_path, composer_prompt_guard_mode="debug-when-unconfigured")
     gateway = ProviderGateway(model=MODEL, settings=settings, endpoint_base_url=None, endpoint_api_key=None)

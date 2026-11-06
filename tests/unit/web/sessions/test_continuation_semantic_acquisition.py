@@ -8,14 +8,12 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web import app as app_module
 from elspeth.web.composer import continuation_message_families as families
 from elspeth.web.composer import continuation_prompt_producers as producers
 from elspeth.web.composer import continuation_semantic_advisor as semantic_advisor
 from elspeth.web.composer import continuation_semantic_advisor_phase as semantic_phase
 from elspeth.web.composer import tool_batch
 from elspeth.web.composer.continuation_message_family_builders import family_message_wire
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.continuation_retention_memo import current_v4_preparation_memo
 from elspeth.web.sessions import locking
@@ -252,12 +250,6 @@ async def test_real_semantic_builder_uses_registered_worker_and_original_sql_own
         observed.append(("request", runtime.source.selected.checkpoint_id, threading.get_ident(), scope[0]))
         return result
 
-    def policy(settings):
-        result = continuation_policy_v4_from_settings(settings)
-        assert result is not None and result.actions.advisor.preparation == 5.0
-        return result
-
-    monkeypatch.setattr(app_module, "continuation_policy_from_settings", policy)
     monkeypatch.setattr(semantic_phase, "capture_semantic_advisor_source", capture)
     monkeypatch.setattr(semantic_phase, "prepare_semantic_advisor_request", prepare)
     monkeypatch.setattr(semantic_phase.ContinuationLivePhases, "current", current)
@@ -281,6 +273,8 @@ async def test_real_semantic_builder_uses_registered_worker_and_original_sql_own
 
     install_sdk(monkeypatch, checked_sdk)
     async with continuation_app(tmp_path, monkeypatch) as harness:
+        policy = harness.app.state.composer_async_operation_authority._continuation_policy
+        assert policy is not None and policy.actions.advisor.preparation == 5.0
         app_ref.append(harness.app)
         with observe_supported_path(
             monkeypatch,

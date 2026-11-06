@@ -12,7 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from types import CodeType
+from types import CodeType, SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -34,7 +34,12 @@ from elspeth.web.continuation_retention_memo import (
 from elspeth.web.required_executor import RequiredInvocationAborted, RequiredInvocationWitness
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.service import SessionServiceImpl
-from tests.helpers.continuation_end_profile import EndPreparationProfile, EndTextMemoObservation
+from tests.helpers.continuation_end_profile import (
+    EndPreparationProfile,
+    EndTextMemoObservation,
+    _driver_review_observer,
+    driver_end_preparation_profile,
+)
 from tests.helpers.continuation_policy import minimal_continuation_policy
 from tests.unit.web.sessions import test_continuation_checkpoint_end_complete_review as original_review
 
@@ -60,6 +65,104 @@ CPU_MONITOR_EVENTS = (
 # Their callbacks remain separately registered and fire for the original call.
 CPU_ANCILLARY_EVENTS = sys.monitoring.events.C_RETURN | sys.monitoring.events.C_RAISE
 CPU_ACTIVE_EVENTS = sum(CPU_MONITOR_EVENTS) & ~CPU_ANCILLARY_EVENTS
+
+
+def test_driver_end_profile_absent_flag_preserves_original_alias(monkeypatch):
+    from elspeth.web.sessions import continuation_driver as driver
+
+    monkeypatch.delenv("ELSPETH_TEST_DRIVER_END_PROFILE", raising=False)
+    original = driver.review_prescribed_continuation_end
+    with driver_end_preparation_profile(monkeypatch, None, session_id="session", operation_id="operation"):
+        assert driver.review_prescribed_continuation_end is original
+    assert driver.review_prescribed_continuation_end is original
+
+
+def test_driver_end_profile_output_error_cannot_mask_original(monkeypatch, capsys):
+    from elspeth.web.sessions import continuation_driver as driver
+
+    monkeypatch.setenv("ELSPETH_TEST_DRIVER_END_PROFILE", "spans")
+    monkeypatch.setenv("ELSPETH_TEST_DRIVER_END_PROFILE_PATH", str(Path(__file__).resolve().parents[4] / ".scratch/end-control.json"))
+    original = driver.review_prescribed_continuation_end
+    error = RuntimeError("original driver failure")
+    outcomes = []
+
+    def failed_output(profile, path):
+        outcomes.append(profile.case_outcome)
+        raise ValueError("diagnostic serialization failure")
+
+    # Isolate output-error handling; real worker/SQL installation has separate controls.
+    monkeypatch.setattr(EndPreparationProfile, "install", lambda *_args: nullcontext())
+    monkeypatch.setattr(EndPreparationProfile, "flush", failed_output)
+    with (
+        pytest.raises(RuntimeError) as raised,
+        driver_end_preparation_profile(monkeypatch, None, session_id="session", operation_id="operation"),
+    ):
+        assert driver.review_prescribed_continuation_end is not original
+        raise error
+    assert raised.value is error and driver.review_prescribed_continuation_end is original
+    assert outcomes == [{"status": "raised", "error": "RuntimeError"}]
+    assert "END driver profile write failed: ValueError" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (False, True))
+async def test_driver_end_adapter_selects_original_cut_and_forwards_identity(failure):
+    from elspeth.web.composer.continuation import EndFrame, PrivateChunkRef
+
+    # Adapter metadata controls only; these are not issued SQL/runtime owners.
+    reference = PrivateChunkRef(codec="composer.state.v1", digest="a" * 64, byte_length=2)
+    frame = EndFrame(phase="review_needed", state=reference, candidate=reference, publication_binding=None)
+    logical = SimpleNamespace(session_id="session", operation_id="operation")
+    root = SimpleNamespace(logical=logical, frames=(frame,), cursor=29)
+    selected = SimpleNamespace(stack=root)
+    clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+    phases = SimpleNamespace(action_clock=clock)
+    services, result = object(), object()
+    original_error = LookupError("original review failure")
+    calls = []
+    profile = EndPreparationProfile(enabled=True)
+
+    async def original(actual_phases, actual_services, actual_selected):
+        assert actual_phases is phases and actual_services is services and actual_selected is selected
+        calls.append(profile._clock.get())
+        if failure:
+            raise original_error
+        return result
+
+    observed = _driver_review_observer(profile, original, session_id="session", operation_id="operation")
+
+    async def invoke():
+        if failure:
+            with pytest.raises(LookupError) as raised:
+                await observed(phases, services, selected)
+            assert raised.value is original_error
+        else:
+            assert await observed(phases, services, selected) is result
+
+    logical.session_id = "foreign-session"
+    await invoke()
+    logical.session_id = "session"
+    logical.operation_id = "foreign-operation"
+    await invoke()
+    logical.operation_id = "operation"
+    root.frames = (frame.model_copy(update={"phase": "repair_needed"}),)
+    await invoke()
+    root.frames = (object(),)
+    await invoke()
+    root.frames = (frame,)
+    phases.action_clock = None
+    await invoke()
+    phases.action_clock = clock
+    assert not profile._end_clocks and calls == [None] * 5
+    bounds = clock.started_monotonic, clock.preparation_deadline_monotonic, clock.deadline
+    await invoke()
+    assert calls[-1] == id(clock) and profile._end_clocks == {id(clock)}
+    assert bounds == (clock.started_monotonic, clock.preparation_deadline_monotonic, clock.deadline) and not clock._seen
+    entry = next(row for row in profile.records if row["label"] == "driver.original_review_entry")
+    assert entry["entry_lag_ns"] >= 0 and entry["original_start_ns"] == int(clock.started_monotonic * 1_000_000_000)
+    assert entry["cursor"] == 29 and entry["error"] == ("LookupError" if failure else None)
+    await invoke()
+    assert calls[-1] is None  # Only one original Review is selected.
 
 
 def _assert_cpu_monitoring_cleanup():

@@ -29,7 +29,7 @@ from elspeth.web.composer.advisor_output import (
     ReviewContinuationAction,
     parse_continuation_advisor_decision,
 )
-from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
+from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.continuation import (
     AdvisorFrame,
     ComposeFrame,
@@ -44,7 +44,7 @@ from elspeth.web.composer.continuation_advisor import (
     ContinuationAdvisorInvocation,
     encode_continuation_advisor_invocation,
 )
-from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot, encode_recorder_snapshot
+from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     decode_continuation_response,
@@ -52,7 +52,6 @@ from elspeth.web.composer.continuation_codec import (
     decode_frontier_chunk,
     decode_retained_physical_audit_call,
     encode_continuation_snapshot,
-    encode_continuation_text_response,
     encode_frontier_chunk,
     encode_private_chunk,
     verify_private_chunk,
@@ -65,8 +64,6 @@ from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy
 from elspeth.web.composer.continuation_progress import continuation_action_key, decode_prescribed_continuation_action, retain_advisor_action
 from elspeth.web.composer.continuation_provider_outcomes import (
     decode_physical_audit_call,
-    encode_physical_audit_call,
-    require_successful_response_audit,
     require_v4_successful_response_audit,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -79,7 +76,6 @@ from elspeth.web.composer.continuation_semantic_advisor import (
     _SemanticAdvisorOptions,
     semantic_retained_json,
 )
-from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationRaised, SemanticAdvisorInvocationReturned
 from elspeth.web.composer.continuation_semantic_invocation import SemanticAdvisorInvocationData, make_semantic_advisor_invocation
 from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer, SemanticAdvisorNoSdkRefusalPermit
 from elspeth.web.composer.continuation_semantic_source import RawSemanticAdvisorSource
@@ -87,11 +83,7 @@ from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource, provider_attempt_audit_drafts_for_source
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.turn_effects import authored_state_hash
-from elspeth.web.continuation_retention_memo import (
-    RetentionStageMemo,
-    borrow_legacy_advisor_inflight_memo,
-    current_legacy_advisor_preparation_memo,
-)
+from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
     ProviderAttempt,
@@ -157,7 +149,6 @@ from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.time_normalization import restore_utc
 
 if TYPE_CHECKING:
-    from elspeth.web.composer.continuation_clock import ContinuationActionClock
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext
     from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.continuation_iteration_return import IterationReturnCommitted
@@ -364,47 +355,6 @@ def _current(conn: Connection, running: ComposerOperationRunning, selected: Stor
     root = decode_continuation_snapshot(actual.payload_json)
     if (root.logical.session_id, root.logical.operation_id) != (str(running.claim.session_id), running.claim.operation_id):
         raise AuditIntegrityError("Semantic SQL changed its logical owner")
-    return root
-
-
-def _current_original_paid_finish(
-    conn: Connection,
-    prepared: PreparedContinuationProvider,
-    selected: StoredContinuationSnapshot,
-    outcome: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised,
-    issuer: SemanticAdvisorNoSdkIssuer,
-) -> ContinuationFrameStack:
-    """Only the original completed physical owner may finish after Stop/expiry.
-
-    This is not an action admission or an owed-P4 capability. Original minted
-    custody and the sealed actual outcome precede the narrower fenced read;
-    all physical accounting, recorder and complete source checks still run
-    before retention writes.
-    """
-    if type(issuer) is not SemanticAdvisorNoSdkIssuer or issuer.running is not prepared.binding.running:
-        raise AuditIntegrityError("Semantic paid finish requires its original nominal issuer/running owner")
-    issuer.require_original_paid_outcome(prepared, selected, outcome)
-    observed = outcome.observation
-    if not observed.sdk_entered or not observed.recorder_completed or observed.audit_call is None or observed.attempt is None:
-        raise AuditIntegrityError("Semantic paid finish cannot borrow authority from a status-only observation")
-    running = prepared.binding.running
-    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
-    if _owed_continuation_p4_active(conn, running.session_operation_context):
-        raise AuditIntegrityError("Semantic paid finish cannot borrow owed P4 authority")
-    if type(selected) is not StoredContinuationSnapshot:
-        raise AuditIntegrityError("Semantic paid finish requires its exact original selected DATA")
-    actual = require_snapshot_cas(
-        conn,
-        session_id=str(running.claim.session_id),
-        operation_id=running.claim.operation_id,
-        expected_checkpoint_id=selected.checkpoint_id,
-        expected_cursor=selected.cursor,
-    )
-    if actual != selected:
-        raise ContinuationCASConflict("Semantic paid finish substituted its complete original dispatched root")
-    root = decode_continuation_snapshot(actual.payload_json)
-    if (root.logical.session_id, root.logical.operation_id) != (str(running.claim.session_id), running.claim.operation_id):
-        raise AuditIntegrityError("Semantic paid finish changed its exact logical owner")
     return root
 
 
@@ -888,77 +838,6 @@ def prepare_semantic_advisor_on_connection(
         no_sdk_issuer.clock.require_preparation_time()
         no_sdk_issuer.bind_request(request)
         no_sdk_issuer.note_prepared_candidate(result)
-        return result
-
-
-def begin_semantic_advisor_on_connection(
-    conn: Connection, prepared: PreparedContinuationProvider, *, no_sdk_issuer: SemanticAdvisorNoSdkIssuer
-) -> StoredContinuationSnapshot:
-    if (
-        type(prepared) is not PreparedContinuationProvider
-        or type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer
-        or no_sdk_issuer.prepared_candidate is not prepared
-    ):
-        raise AuditIntegrityError("Semantic begin changed its actual prepared result/issuer")
-    binding = prepared.binding
-    root = _current(conn, binding.running, prepared.snapshot)
-    effect = _effect(conn, binding.running, root, binding.effect_key)
-    no_sdk_issuer.require_original_clock()
-    if no_sdk_issuer.clock.policy != decode_continuation_policy(root.admission_policy_json, root.policy_hash).actions.advisor:
-        raise AuditIntegrityError("Semantic begin changed its original admitted action allowance")
-    no_sdk_issuer.clock.require_preparation_time()
-    if (
-        binding.family != 1
-        or binding.input_sha256 != effect.input_sha256
-        or effect.disposition != "prepared"
-        or any(
-            value is not None
-            for value in (
-                effect.result_chunk_key,
-                effect.receipt_key,
-                effect.provider_attempt_id,
-                effect.physical_sequence,
-                effect.physical_generation,
-                effect.requested_model,
-                effect.response_finished_at,
-            )
-        )
-        or (effect.creator_sequence, effect.creator_generation)
-        != (binding.running.claim.segment_sequence, binding.running.claim.ownership_generation)
-    ):
-        raise ContinuationCASConflict("Semantic begin cannot retry unresolved or foreign preparation")
-    preparation_memo = current_legacy_advisor_preparation_memo(no_sdk_issuer.clock)
-    _inflight_source_data(
-        conn,
-        str(binding.running.claim.session_id),
-        binding.running.claim.operation_id,
-        prepared.snapshot,
-        root,
-        preparation_memo=preparation_memo,
-        preparation_clock=no_sdk_issuer.clock if preparation_memo is not None else None,
-    )
-    with conn.begin_nested():
-        conn.execute(
-            update(effects)
-            .where(
-                effects.c.session_id == str(binding.running.claim.session_id),
-                effects.c.operation_id == binding.running.claim.operation_id,
-                effects.c.effect_key == binding.effect_key,
-            )
-            .values(disposition="dispatched")
-        )
-        result = _append(
-            conn,
-            binding.running,
-            prepared.snapshot,
-            root,
-            binding.effect_key,
-            "dispatched",
-            None,
-            ContinuationEvent("may_dispatch", canonical_json({"effect_key": binding.effect_key})),
-        )
-        no_sdk_issuer.clock.require_preparation_time()
-        no_sdk_issuer.note_dispatched_candidate(result)
         return result
 
 
@@ -1662,202 +1541,6 @@ def _outcome_event(value: _Outcome, key: str) -> str:
     )
 
 
-def retain_semantic_advisor_outcome_on_connection(
-    conn: Connection,
-    prepared: PreparedContinuationProvider,
-    *,
-    selected: StoredContinuationSnapshot,
-    outcome: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised,
-    recorder: BufferingRecorder,
-    issuer: SemanticAdvisorNoSdkIssuer,
-) -> SemanticAdvisorProviderResult:
-    if (
-        type(prepared) is not PreparedContinuationProvider
-        or type(outcome) not in (SemanticAdvisorInvocationReturned, SemanticAdvisorInvocationRaised)
-        or type(recorder) is not BufferingRecorder
-    ):
-        raise AuditIntegrityError("Semantic retention requires its original owned physical outcome and recorder")
-    running, binding = prepared.binding.running, prepared.binding
-    root = _current_original_paid_finish(conn, prepared, selected, outcome, issuer)
-    effect = _effect(conn, running, root, binding.effect_key)
-    data, physical_input = _original_input(conn, running, root, effect)
-    observed, call = outcome.observation, outcome.observation.audit_call
-    if (
-        effect.disposition != "dispatched"
-        or _advisor(root).phase != "awaiting_response"
-        or effect.result_chunk_key is not None
-        or effect.provider_attempt_id is not None
-        or effect.receipt_key is not None
-        or (effect.creator_sequence, effect.creator_generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
-        or observed.source != data.invocation
-        or observed.request_sha256 != binding.input_sha256
-        or not observed.sdk_entered
-        or not observed.recorder_completed
-        or observed.attempt is None
-        or call is None
-        or observed.attempt.attempt_id != call.call_id
-        or observed.attempt.started_at != call.started_at
-    ):
-        raise AuditIntegrityError("Semantic retention cannot infer an actual paid outcome from DATA or absence")
-    if type(issuer) is not SemanticAdvisorNoSdkIssuer:
-        raise AuditIntegrityError("Semantic paid retention requires its original nominal issuer")
-    issuer.require_original_paid_outcome(prepared, selected, outcome)
-    _physical_source(conn, running, effect, call, physical_input)
-    kind: SemanticAdvisorProviderOutcome
-    response: PrivateChunk | None = None
-    decision: ContinuationAdvisorDecision | None = None
-    if call.status is ComposerLLMCallStatus.SUCCESS:
-        if (
-            observed.message is None
-            or type(observed.message.content) is not str
-            or observed.provider_metadata is None
-            or observed.decision is None
-        ):
-            raise AuditIntegrityError("Semantic successful outcome lost its original admitted response")
-        policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-        if type(policy) is ContinuationAdmissionPolicyV4:
-            completeness = observed.provider_metadata.v4_completeness
-            if completeness is None:
-                raise AuditIntegrityError("V4 semantic paid retention lost its original complete SDK witness")
-            completeness.require_result(observed.provider_metadata, content=observed.message.content, tool_calls=())
-            require_v4_successful_response_audit(
-                call,
-                observed.provider_metadata,
-                policy=policy,
-                attempt_id=observed.attempt.attempt_id,
-                started_at=call.started_at,
-                finished_at=call.finished_at,
-            )
-        else:
-            require_successful_response_audit(
-                call,
-                observed.provider_metadata,
-                attempt_id=observed.attempt.attempt_id,
-                started_at=call.started_at,
-                finished_at=call.finished_at,
-            )
-        decision = parse_continuation_advisor_decision(observed.message.content, actual_advisor_call_id=_call_id(call))
-        if decision != observed.decision:
-            raise AuditIntegrityError("Semantic decision differs from its one original physical response")
-        response = encode_continuation_text_response(
-            content=observed.message.content, provider_metadata=observed.provider_metadata, audit_call=call
-        )
-        if type(outcome) is SemanticAdvisorInvocationReturned and (
-            outcome.result.response != response or outcome.result.audit_call != call or outcome.result.decision != decision
-        ):
-            raise AuditIntegrityError("Semantic returned sum changed its original physical result")
-        kind = SemanticAdvisorProviderOutcome.SUCCESS
-    elif call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE and call.error_message == "credential_material_rejected":
-        if any(
-            value is not None for value in (observed.message, observed.provider_metadata, observed.decision, observed.tool_calls_present)
-        ):
-            raise AuditIntegrityError("Semantic withheld outcome exposed unadmitted provider fields")
-        kind = SemanticAdvisorProviderOutcome.CREDENTIAL_WITHHELD
-    elif call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE:
-        if observed.decision is not None:
-            raise AuditIntegrityError("Semantic paid invalid result cannot carry an admitted decision")
-        if observed.message is not None and type(observed.message.content) is str and observed.provider_metadata is not None:
-            response = encode_continuation_text_response(
-                content=observed.message.content, provider_metadata=observed.provider_metadata, audit_call=call
-            )
-        kind = SemanticAdvisorProviderOutcome.PAID_INVALID
-    else:
-        raise AuditIntegrityError("Entered semantic timeout/cancellation/unknown result cannot be closed or retried")
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
-    original_parent = _parent(decode_continuation_snapshot(data.source.selected_snapshot_json))
-    previous = decode_recorder_snapshot(_ref(conn, sid, operation, original_parent.audit_buffer))
-    captured = recorder.snapshot_for_continuation(drained=previous.drained)
-    if replace(previous, llm_calls=(*previous.llm_calls, call)) != captured or captured.llm_calls[-1] is not call:
-        raise AuditIntegrityError("Semantic outcome changed its original complete recorder prefix/channels")
-    record = encode_recorder_snapshot(captured)
-    extended = _extended_evidence(conn, running, data, call, record)
-    evidence = extended.evidence
-    from uuid import uuid4
-
-    receipt_key = str(uuid4())
-    manifest = _Outcome(
-        effect_key=binding.effect_key,
-        input_sha256=binding.input_sha256,
-        receipt_key=receipt_key,
-        creator_sequence=effect.creator_sequence,
-        creator_generation=effect.creator_generation,
-        source_checkpoint_id=selected.checkpoint_id,
-        source_cursor=selected.cursor,
-        outcome=kind,
-        audit_call_json=encode_physical_audit_call(call),
-        response=None if response is None else response.reference,
-        recorder=record.reference,
-        decision_json=None if decision is None else canonical_json(decision.model_dump(mode="json")),
-        original_failure_class=None if observed.original_failure is None else type(observed.original_failure).__name__,
-    )
-    manifest_json = _canonical(manifest)
-    result_key = f"semantic-provider-outcome:{sha256(manifest_json.encode('utf-8')).hexdigest()}"
-    disposition: Literal["committed", "refused"] = "committed" if kind is SemanticAdvisorProviderOutcome.SUCCESS else "refused"
-    with conn.begin_nested():
-        for chunk in (
-            record,
-            evidence,
-            *((extended.applied_batch,) if extended.applied_batch is not None else ()),
-            *((response,) if response is not None else ()),
-        ):
-            put_chunk(
-                conn,
-                session_id=sid,
-                operation_id=operation,
-                key=private_chunk_key(chunk),
-                payload=chunk.canonical.encode("utf-8"),
-                codec=chunk.reference.codec,
-            )
-        put_chunk(
-            conn,
-            session_id=sid,
-            operation_id=operation,
-            key=result_key,
-            payload=manifest_json.encode("utf-8"),
-            codec="composer.semantic-provider-outcome.v1",
-        )
-        conn.execute(
-            update(effects)
-            .where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == binding.effect_key)
-            .values(
-                disposition=disposition,
-                receipt_key=receipt_key,
-                result_chunk_key=result_key,
-                provider_attempt_id=call.call_id,
-                physical_sequence=effect.creator_sequence,
-                physical_generation=effect.creator_generation,
-                requested_model=call.model_requested,
-                response_finished_at=call.finished_at,
-            )
-        )
-        parent = _parent(root).model_copy(
-            update={"audit_buffer": record.reference, "evidence": evidence.reference, "advisor_calls": original_parent.advisor_calls + 1}
-        )
-        advisor = _advisor(root).model_copy(
-            update={"phase": "response_retained", "response": None if response is None else response.reference}
-        )
-        result = _append(
-            conn,
-            running,
-            selected,
-            _paid_evidence_root(root, parent, advisor, extended),
-            binding.effect_key,
-            disposition,
-            receipt_key,
-            ContinuationEvent("response_retained", _outcome_event(manifest, result_key)),
-        )
-        return SemanticAdvisorProviderResult(
-            result,
-            binding.effect_key,
-            call,
-            response,
-            record,
-            decision,
-            kind,
-            outcome.error if type(outcome) is SemanticAdvisorInvocationRaised else None,
-        )
-
-
 def _paid_result(
     conn: Connection, running: ComposerOperationRunning, selected: StoredContinuationSnapshot, effect_key: str
 ) -> tuple[SemanticAdvisorProviderResult, SemanticAdvisorInvocationData, ContinuationFrameStack]:
@@ -1938,26 +1621,17 @@ def _paid_result_data(
             raise AuditIntegrityError("Semantic decision requires its genuine original successful physical response")
         decoded = decode_continuation_response(response)
         policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-        if type(policy) is ContinuationAdmissionPolicyV4:
-            from elspeth.web.composer.provider_result_admission import require_retained_v4_provider_metadata_credentials
+        from elspeth.web.composer.provider_result_admission import require_retained_v4_provider_metadata_credentials
 
-            require_retained_v4_provider_metadata_credentials(decoded, surface="composer_advisor_response")
-            require_v4_successful_response_audit(
-                call,
-                decoded.provider_metadata,
-                policy=policy,
-                attempt_id=_call_id(call),
-                started_at=call.started_at,
-                finished_at=call.finished_at,
-            )
-        else:
-            require_successful_response_audit(
-                call,
-                decoded.provider_metadata,
-                attempt_id=_call_id(call),
-                started_at=call.started_at,
-                finished_at=call.finished_at,
-            )
+        require_retained_v4_provider_metadata_credentials(decoded, surface="composer_advisor_response")
+        require_v4_successful_response_audit(
+            call,
+            decoded.provider_metadata,
+            policy=policy,
+            attempt_id=_call_id(call),
+            started_at=call.started_at,
+            finished_at=call.finished_at,
+        )
         if type(decoded.message.content) is not str:
             raise AuditIntegrityError("Semantic decision lost its complete original response text")
         decision = parse_continuation_advisor_decision(decoded.message.content, actual_advisor_call_id=_call_id(call))
@@ -3449,18 +3123,25 @@ def _retained_inputs_from_observation(
     reads = tuple(_read_input_data(conn, sid, operation, reference) for reference in frontier.evidence if reference.source_kind == "read")
     review_input = None
     if original.review is not None:
-        from elspeth.web.sessions.continuation_semantic_review_result import RetainedSemanticReviewResult, encode_semantic_review_result
+        from elspeth.web.sessions.continuation_semantic_review_result import (
+            RetainedSemanticReviewResult,
+            encode_semantic_review_provider_input,
+        )
 
         # This exact nominal DATA was just re-proved from this connection,
         # root and checkpoint. Other calls still perform their own current
         # admissions and original immutable-source reconstruction.
         review = original.review
+        result_json, provider_json = encode_semantic_review_provider_input(
+            RetainedSemanticReviewResult(review.result, review.publication_binding)
+        )
         review_input = SemanticAdvisorReviewInput(
-            encode_semantic_review_result(RetainedSemanticReviewResult(review.result, review.publication_binding)),
+            result_json,
             review.owner_effect_key,
             review.completed.checkpoint_id,
             review.completed.cursor,
             review.outcome,
+            provider_json,
         )
     return_input = None
     if original.iteration_return is not None:
@@ -3549,7 +3230,9 @@ def _require_retained_input_document(
     if retained.reads:
         expected_document["read_results"] = [semantic_retained_json(item.semantic_result_json) for item in retained.reads]
     if retained.review is not None:
-        expected_document["review_result"] = semantic_retained_json(retained.review.result_json)
+        # This view was made with the complete result by this fresh SQL read,
+        # independently of the earlier request builder's retained inputs.
+        expected_document["review_result"] = semantic_retained_json(retained.review.provider_json)
     if retained.iteration_return is not None:
         expected_document["iteration_return"] = semantic_retained_json(retained.iteration_return.result_json)
     if canonical_json(expected_document) != text:
@@ -4047,15 +3730,12 @@ def _inflight_source_data(
     operation: str,
     selected: StoredContinuationSnapshot,
     root: ContinuationFrameStack,
-    *,
-    preparation_memo: RetentionStageMemo | None = None,
-    preparation_clock: ContinuationActionClock | None = None,
 ) -> Row[Any]:
     frame = _advisor(root)
     if frame.phase != "awaiting_response" or frame.provider_effect_key is None or frame.response is not None:
         raise AuditIntegrityError("Semantic in-flight source changed its original selected frame")
     effect = _effect_data(conn, sid, operation, root, frame.provider_effect_key)
-    with borrow_legacy_advisor_inflight_memo(preparation_memo, preparation_clock):
+    with borrow_v4_preparation_memo_scope():
         data, _physical = _original_input_data(conn, sid, operation, root, effect)
     _creator_data(conn, sid, operation, effect)
     if effect.disposition not in ("prepared", "dispatched") or any(
@@ -4063,14 +3743,15 @@ def _inflight_source_data(
         for value in (
             effect.receipt_key,
             effect.result_chunk_key,
-            effect.provider_attempt_id,
-            effect.physical_sequence,
-            effect.physical_generation,
-            effect.requested_model,
             effect.response_finished_at,
         )
     ):
         raise AuditIntegrityError("Semantic in-flight source cannot infer a complete known output")
+    if effect.disposition == "prepared" and any(
+        value is not None
+        for value in (effect.provider_attempt_id, effect.physical_sequence, effect.physical_generation, effect.requested_model)
+    ):
+        raise AuditIntegrityError("Semantic prepared source cannot contain physical admission fields")
     original = _historical_snapshot(conn, sid, operation, checkpoint_id=data.source.checkpoint_id)
     if original.payload_json != data.source.selected_snapshot_json:
         raise AuditIntegrityError("Semantic preparation changed its original complete source checkpoint")
@@ -4099,6 +3780,11 @@ def _inflight_source_data(
     if effect.disposition == "dispatched":
         _journal_data(
             conn, sid, operation, cursor=original.cursor + 2, tag="may_dispatch", payload=canonical_json({"effect_key": effect.effect_key})
+        )
+        from elspeth.web.sessions.continuation_semantic_v4_admission_read import require_v4_semantic_admission_data_on_connection
+
+        require_v4_semantic_admission_data_on_connection(
+            conn, session_id=sid, operation_id=operation, selected=selected, effect_key=effect.effect_key
         )
     return effect
 

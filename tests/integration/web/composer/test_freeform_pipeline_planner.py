@@ -1,52 +1,38 @@
-"""Freeform empty-pipeline requests use the canonical proposal lifecycle."""
+"""Provider-authored pipelines through the current Continuation application route."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import dataclass
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from uuid import uuid4
 
-import litellm
 import pytest
-import structlog
+from litellm import ModelResponse
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
-from elspeth.web.composer.provider_cost import CommonProviderCostBudget
-from elspeth.web.composer.provider_quota import ProviderInvocationOwner
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
-from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
-from elspeth.web.config import WebSettings
-from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import (
-    blobs_table,
-    chat_messages_table,
-    composition_proposals_table,
-    composition_states_table,
-    proposal_events_table,
-    quota_provider_attempts_table,
-    token_usage_ledger_table,
+from elspeth.web.execution.completion_gates import CompletionGateFacts, completion_gates_meta_from_facts
+from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.sessions.models import chat_messages_table, composition_states_table, quota_provider_attempts_table
+from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.composer_operations import message_body
+from tests.helpers.continuation_app import (
+    ScriptedSDK,
+    continuation_app,
+    effects,
+    end_admit,
+    install_sdk,
+    semantic_primary_response,
+    semantic_review_response,
+    semantic_stop_response,
+    submit_and_settle,
+    tool_call,
 )
-from elspeth.web.sessions.protocol import ComposerSessionPreferencesTransition, ComposerTrustMode, CompositionStateData
-from elspeth.web.sessions.routes._helpers import _composer_chat_history
-from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
-from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
-from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits, assert_initial_wire
-from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @dataclass
@@ -82,10 +68,6 @@ class _Response:
     provider: str | None = None
 
 
-def _empty_state() -> CompositionState:
-    return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-
-
 def _pipeline(data_dir: Path, session_id: str) -> dict[str, Any]:
     return {
         "source": {
@@ -114,28 +96,6 @@ def _pipeline(data_dir: Path, session_id: str) -> dict[str, Any]:
             }
         ],
     }
-
-
-def _terminal_response(data_dir: Path, session_id: str) -> _Response:
-    return _Response(
-        choices=[
-            _Choice(
-                message=_Message(
-                    content=None,
-                    tool_calls=[
-                        _ToolCall(
-                            id="freeform-terminal",
-                            function=_Function(
-                                name="set_pipeline",
-                                arguments=json.dumps({"pipeline": _pipeline(data_dir, session_id)}),
-                            ),
-                        )
-                    ],
-                )
-            )
-        ],
-        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-    )
 
 
 def _routing_terminal_response(data_dir: Path, session_id: str, *, condition: str) -> _Response:
@@ -186,769 +146,208 @@ def _routing_terminal_response(data_dir: Path, session_id: str, *, condition: st
     )
 
 
-def _source_files(tmp_path: Path, sid) -> None:
-    source = tmp_path / "blobs" / str(sid) / "input.csv"
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_text("name\nAda\n", encoding="utf-8")
-    (tmp_path / "outputs" / str(sid)).mkdir(parents=True, exist_ok=True)
-
-
-async def _common_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, trust_mode, persisted_base: bool = False):
-    request = "Build a CSV to JSONL pipeline."
-    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
-    await sessions.update_composer_preferences(session.id, trust_mode=trust_mode, density_default="high", actor="test")
-    base = None
-    if persisted_base:
-        base = await sessions.save_composition_state(
-            session.id,
-            CompositionStateData(
-                sources={},
-                nodes=[],
-                edges=[],
-                outputs=[],
-                metadata_={"name": "Untitled Pipeline", "description": ""},
-                is_valid=False,
-            ),
-            provenance="session_seed",
-        )
-        with engine.connect() as conn:
-            seed_before = dict(
-                conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(base.id))).mappings().one()
-            )
-    _source_files(tmp_path, session.id)
-    authored = _pipeline(tmp_path, str(session.id))
-    auto = trust_mode == "auto_commit"
-    candidate = "The draft was saved." if auto else "The proposed pipeline is waiting for approval."
-    steps = [Step("primary", tool_name="set_pipeline", arguments={"pipeline": authored})]
-    if auto:
-        steps.append(Step("early"))
-    steps.extend((Step("primary", content=candidate), Step("end")))
-    script = CommonSDK(request=request, candidate=candidate, steps=tuple(steps), saved=int(auto))
-    script.bind(composer, monkeypatch)
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
-    monkeypatch.setattr(litellm, "acompletion", sdk)
-    result = await composer.compose(
-        request,
-        [],
-        _empty_state(),
-        session_id=str(session.id),
-        current_state_id=None if base is None else str(base.id),
-        user_id="planner-user",
-        user_message_id=str(user.id),
-    )
-    script.assert_done()
-    assert sdk.await_count == len(steps)
-    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
-    assert script.requests[0]["max_tokens"] == composer._settings.composer_planner_max_completion_tokens
-    assert all(request["max_tokens"] <= composer._settings.composer_planner_max_completion_tokens for request in script.requests)
-    calls = assert_actual_audits(engine, script.requests, ("success",) * len(steps), session_id=str(session.id))
-    if base is not None:
-        with engine.connect() as conn:
-            seed_after = dict(
-                conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(base.id))).mappings().one()
-            )
-        assert seed_after == seed_before
-    return engine, sessions, session, user, composer, base, result, script, calls
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("trust_mode", ["auto_commit", "explicit_approve"])
-@pytest.mark.parametrize("persisted_base", [False, True], ids=["absent-base", "present-base"])
-async def test_empty_build_obeys_common_trust_mode_and_exact_base(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    trust_mode: str,
-    persisted_base: bool,
-) -> None:
-    from elspeth.web.composer.authority_hashing import composer_authority_hash
-
-    engine, sessions, session, user, composer, base, result, script, calls = await _common_build(
-        tmp_path, monkeypatch, trust_mode=trust_mode, persisted_base=persisted_base
-    )
-    proposals = await sessions.list_composition_proposals(session.id)
-    assert result.pipeline_commit_intent is None
-    with engine.connect() as conn:
-        states = (
-            conn.execute(
-                select(composition_states_table)
-                .where(composition_states_table.c.session_id == str(session.id))
-                .order_by(composition_states_table.c.version)
-            )
-            .mappings()
-            .all()
-        )
-    if trust_mode == "explicit_approve":
-        (proposal,) = proposals
-        assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
-        assert deep_thaw(proposal.arguments_json) == _pipeline(tmp_path, str(session.id))
-        assert proposal.user_message_id == user.id and proposal.tool_call_id == "common-tool-1"
-        assert proposal.base_state_id == (None if base is None else base.id)
-        metadata = proposal.pipeline_metadata
-        assert metadata is not None
-        assert metadata.base == (
-            {"kind": "absent"}
-            if base is None
-            else {"kind": "present", "state_id": str(base.id), "composition_content_hash": composition_content_hash(_empty_state())}
-        )
-        assert metadata.repair_count == 0
-        assert metadata.skill_hash == proposal.composer_skill_hash == composer._composer_skill_hash
-        assert proposal.composer_model_identifier == script.requests[0]["model"] == composer._settings.composer_model
-        assert proposal.composer_model_version == calls[0]["model_returned"] == "provider/common-v1"
-        assert proposal.composer_provider == composer._availability.provider == "test"
-        assert proposal.tool_arguments_hash == composer_authority_hash(_pipeline(tmp_path, str(session.id)))
-        authority = await sessions.get_authoritative_pipeline_proposal(session_id=session.id, proposal_id=proposal.id)
-        assert authority.row == proposal
-        assert deep_thaw(authority.proposal.pipeline) == _pipeline(tmp_path, str(session.id))
-        assert authority.proposal.draft_hash == metadata.draft_hash
-        assert result.state == _empty_state()
-        assert len(states) == int(base is not None)
-        assert all(state["provenance"] == "session_seed" for state in states)
-        assert script.phases == ["end"]
-    else:
-        from elspeth.web.sessions.converters import state_from_record, state_record_from_row
-        from tests.helpers.advisor_review import parse_advisor_publication_review
-
-        assert proposals == [] and result.state.sources["source"].plugin == "csv"
-        assert result.state.outputs[0].plugin == "json"
-        assert len(states) == int(base is not None) + 1
-        saved = [state for state in states if base is None or state["id"] != str(base.id)]
-        (saved_state,) = saved
-        end_review = parse_advisor_publication_review(script.requests[-1]["messages"][1]["content"])
-        saved_effects = end_review["saved_effects"]
-        assert saved_effects["verification"] == "verified"
-        assert saved_effects["saved_revision_count"] == 1
-        assert saved_effects["latest_committed_state_id"] == saved_state["id"]
-        assert saved_effects["latest_verified_state_id"] == saved_state["id"]
-        with engine.connect() as conn:
-            (tool_row,) = (
-                conn.execute(
-                    select(chat_messages_table).where(
-                        chat_messages_table.c.session_id == str(session.id),
-                        chat_messages_table.c.role == "tool",
-                        chat_messages_table.c.tool_call_id == "common-tool-1",
-                    )
-                )
-                .mappings()
-                .all()
-            )
-            (attempt,) = (
-                conn.execute(
-                    select(quota_provider_attempts_table).where(
-                        quota_provider_attempts_table.c.session_id == str(session.id),
-                        quota_provider_attempts_table.c.attempt_id == calls[0]["call_id"],
-                    )
-                )
-                .mappings()
-                .all()
-            )
-        assert result.persisted_tool_call_turn is True
-        assert result.persisted_assistant_message_id is not None
-        assert tool_row["writer_principal"] == "compose_loop"
-        assert tool_row["parent_assistant_id"] == result.persisted_assistant_message_id
-        assert tool_row["composition_state_id"] == saved_state["id"]
-        assert saved_state["provenance"] == "tool_call"
-        assert saved_state["derived_from_state_id"] == (None if base is None else str(base.id))
-        assert saved_state["creator_operation_id"] == attempt["operation_id"]
-        with engine.connect() as conn:
-            saved_row = conn.execute(
-                select(composition_states_table).where(
-                    composition_states_table.c.session_id == str(session.id),
-                    composition_states_table.c.id == saved_state["id"],
-                )
-            ).one()
-        saved_record = state_record_from_row(saved_row)
-        assert str(saved_record.id) == saved_state["id"] and saved_record.session_id == session.id
-        saved_graph = state_from_record(saved_record)
-        assert saved_graph.version == saved_record.version == saved_state["version"]
-        assert saved_record.version == (1 if base is None else base.version + 1)
-        assert saved_graph.sources["source"].plugin == "csv"
-        assert saved_graph.outputs[0].plugin == "json"
-        assert saved_graph.sources["source"].options["path"] == str(tmp_path / "blobs" / str(session.id) / "input.csv")
-        assert saved_graph.outputs[0].options["path"] == str(tmp_path / "outputs" / str(session.id) / "result.jsonl")
-        stored = saved_graph.to_dict()
-        returned = result.state.to_dict()
-        assert stored["sources"] == returned["sources"]
-        assert stored["nodes"] == returned["nodes"] and stored["edges"] == returned["edges"]
-        assert stored["outputs"] == returned["outputs"] and stored["metadata"] == returned["metadata"]
-        assert script.phases == ["early", "end"]
-
-
-@pytest.mark.asyncio
-async def test_common_llm_call_audit_persists_the_served_endpoint(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The common provider boundary persists its served endpoint on each actual SQL call row."""
-    _engine, _sessions, _session, _user, _composer, _base, _result, script, calls = await _common_build(
-        tmp_path, monkeypatch, trust_mode="explicit_approve"
-    )
-    assert len(calls) == len(script.requests) == 3
-    assert all(call["provider_served"] == "DeepInfra" for call in calls)
-    assert {call["provider_request_id"] for call in calls} == {"common-sdk-1", "common-sdk-2", "common-sdk-3"}
+# Retired: direct compose-loop audit, history, cancellation and timeout tests used
+# the removed entry point; current terminal coverage lives in the driver cohorts.
+# Retired: same-loop object identity asserted the deleted loop's construction
+# contract. Saved-base, prior-message and actual served-endpoint contracts stay.
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("initial_trust_mode", "flipped_trust_mode"),
-    [("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")],
-    ids=["downgrade-mid-plan", "upgrade-mid-plan"],
-)
-async def test_trust_mode_change_during_provider_requires_review(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    initial_trust_mode: ComposerTrustMode,
-    flipped_trust_mode: ComposerTrustMode,
-) -> None:
-    """A preference flip during the common primary provider call requires review.
-
-    Regression for elspeth-01d4c6e683: trust authority was snapshotted before
-    the provider call, so a user switching auto_commit -> explicit_approve
-    mid-call still had the in-flight plan committed automatically. Auto-commit
-    requires the request ceiling AND the preference at staging time to
-    both be auto_commit; any mismatch lands the proposal on the review path.
-    """
-    request = "Build a CSV to JSONL pipeline."
-    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
-    _source_files(tmp_path, session.id)
-    await sessions.update_composer_preferences(
-        session.id,
-        trust_mode=initial_trust_mode,
-        density_default="high",
-        actor="test",
-    )
-    flips: list[ComposerSessionPreferencesTransition] = []
-
-    async def flip() -> None:
-        flips.append(
-            await sessions.update_composer_preferences(
-                session.id,
-                trust_mode=flipped_trust_mode,
-                density_default="high",
-                actor="test",
-            )
-        )
-
-    authored = _pipeline(tmp_path, str(session.id))
-    candidate = "The proposed pipeline is waiting for your review."
-    script = CommonSDK(
-        request=request,
-        candidate=candidate,
-        steps=(
-            Step("primary", tool_name="set_pipeline", arguments={"pipeline": authored}, before_return=flip),
-            Step("primary", content=candidate),
-            Step("end"),
-        ),
-    )
-    script.bind(composer, monkeypatch)
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
-    monkeypatch.setattr(litellm, "acompletion", sdk)
-    result = await composer.compose(
-        request,
-        [],
-        _empty_state(),
-        session_id=str(session.id),
-        current_state_id=None,
-        user_id="planner-user",
-        user_message_id=str(user.id),
-    )
-    script.assert_done()
-    assert sdk.await_count == 3 and script.phases == ["end"]
-    (transition,) = flips
-    assert transition.prior.trust_mode == initial_trust_mode
-    assert transition.current.trust_mode == flipped_trust_mode
-    assert (await sessions.get_composer_preferences(session.id)).trust_mode == flipped_trust_mode
-    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
-    assert result.message.startswith(candidate)
-    assert "for your review" in result.message
-    assert result.pipeline_commit_intent is None and result.state == _empty_state()
-    (proposal,) = await sessions.list_composition_proposals(session.id)
-    assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
-    assert deep_thaw(proposal.arguments_json) == authored
-    assert proposal.user_message_id == user.id and proposal.tool_call_id == "common-tool-1"
-    assert proposal.base_state_id is None and proposal.committed_state_id is None
-    metadata = proposal.pipeline_metadata
-    assert metadata is not None
-    assert metadata.base == {"kind": "absent"} and metadata.repair_count == 0
-    assert metadata.skill_hash == proposal.composer_skill_hash == composer._composer_skill_hash
-    authority = await sessions.get_authoritative_pipeline_proposal(session_id=session.id, proposal_id=proposal.id)
-    assert authority.row == proposal
-    assert deep_thaw(authority.proposal.pipeline) == authored
-    assert authority.proposal.draft_hash == metadata.draft_hash
-    with engine.connect() as conn:
-        assert conn.execute(select(composition_states_table)).all() == []
-        assert conn.execute(select(blobs_table)).all() == []
-    assert_actual_audits(engine, script.requests, ("success",) * 3, session_id=str(session.id))
-
-
-@pytest.mark.asyncio
-async def test_referential_empty_build_projects_authoritative_prior_user_requests(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A referential build turn must not erase the request it refers to."""
-    from elspeth.web.composer.request_history import authoritative_conversation_context
-
-    request = "Build the requested pipeline."
-    original = (
-        "Read transactions.csv, route rows where amount > 500 to high_value, route every other row to standard, and write both as JSONL."
-    )
-    refinement = "Keep an audit trace field in both outputs."
-    engine, sessions, session, first_user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=original)
-    prior = [
-        first_user,
-        await sessions.add_message(session.id, "assistant", "I can prepare that pipeline.", writer_principal="compose_loop"),
-        await sessions.add_message(session.id, "user", refinement, writer_principal="route_user_message"),
-        await sessions.add_message(session.id, "assistant", "Understood.", writer_principal="compose_loop"),
-    ]
-    current = await sessions.add_message(session.id, "user", request, writer_principal="route_user_message")
-    records = [*prior, current]
-    assert len({record.id for record in records}) == 5
-    sequence_numbers = [record.sequence_no for record in records]
-    assert all(number is not None for number in sequence_numbers)
-    assert sequence_numbers == sorted(sequence_numbers)
-    assert len(set(sequence_numbers)) == 5
-    history = _composer_chat_history(prior)
-    context = authoritative_conversation_context(request, history)
-    assert context is not None
-    assert [(item.history_index, item.content) for item in context.prior_user_requests] == [(0, original), (2, refinement)]
-    assert [(item.history_index, item.content) for item in context.prior_assistant_messages] == [
-        (1, "I can prepare that pipeline."),
-        (3, "Understood."),
-    ]
-    assert history[0]["_elspeth_user_message_id"] == str(prior[0].id)
-    assert history[2]["_elspeth_user_message_id"] == str(prior[2].id)
-    _source_files(tmp_path, session.id)
-    await sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
-    authored = _pipeline(tmp_path, str(session.id))
-    (tmp_path / "blobs" / str(session.id) / "input.csv").write_text("name,amount,audit_trace\nAda,600,fixture\n", encoding="utf-8")
-    authored["nodes"] = [
-        {
-            "id": "route_amount",
-            "node_type": "gate",
-            "input": "rows",
-            "condition": "row['amount'] > 500",
-            "routes": {"true": "high_value", "false": "standard"},
-        }
-    ]
-    authored["outputs"] = [
-        {
-            **deepcopy(authored["outputs"][0]),
-            "sink_name": name,
-            "options": {
-                **deepcopy(authored["outputs"][0]["options"]),
-                "path": str(tmp_path / "outputs" / str(session.id) / f"{name}.jsonl"),
-            },
-        }
-        for name in ("high_value", "standard")
-    ]
-    candidate = "The requested routing proposal is waiting for approval."
-    script = CommonSDK(
-        request=request,
-        candidate=candidate,
-        steps=(
-            Step("primary", tool_name="set_pipeline", arguments={"pipeline": authored}),
-            Step("primary", content=candidate),
-            Step("end"),
-        ),
-    )
-    script.bind(composer, monkeypatch)
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
-    monkeypatch.setattr(litellm, "acompletion", sdk)
-    result = await composer.compose(
-        request,
-        history,
-        _empty_state(),
-        session_id=str(session.id),
-        user_id="planner-user",
-        user_message_id=str(current.id),
-    )
-    script.assert_done()
-    assert sdk.await_count == 3 and script.phases == ["end"]
-    for physical_primary in script.requests[:2]:
-        primary = physical_primary["messages"]
-        positions = [
-            next(i for i, row in enumerate(primary) if row["role"] == role and row["content"] == text)
-            for role, text in [
-                ("user", original),
-                ("assistant", "I can prepare that pipeline."),
-                ("user", refinement),
-                ("assistant", "Understood."),
-            ]
-        ]
-        assert positions == sorted(positions)
-        assert len(positions) == len(set(positions)) == 4
-        (current_position,) = [i for i, row in enumerate(primary) if row["role"] == "user" and row["content"] == request]
-        assert current_position > positions[-1]
-    assert context.additional_prior_user_requests_omitted == 0
-    assert [item.content for item in context.prior_user_requests] == [original, refinement]
-    authoritative_requests = json.dumps([item.content for item in context.prior_user_requests])
-    assert "I can prepare that pipeline." not in authoritative_requests
-    assert "Understood." not in authoritative_requests
-    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
-    assert result.state == _empty_state() and result.pipeline_commit_intent is None
-    (proposal,) = await sessions.list_composition_proposals(session.id)
-    assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
-    assert deep_thaw(proposal.arguments_json)["nodes"][0]["condition"] == "row['amount'] > 500"
-    assert deep_thaw(proposal.arguments_json) == authored
-    assert proposal.user_message_id == current.id and proposal.tool_call_id == "common-tool-1"
-    assert proposal.base_state_id is None and proposal.committed_state_id is None
-    metadata = proposal.pipeline_metadata
-    assert metadata is not None
-    assert metadata.base == {"kind": "absent"} and metadata.repair_count == 0
-    assert metadata.skill_hash == proposal.composer_skill_hash == composer._composer_skill_hash
-    authority = await sessions.get_authoritative_pipeline_proposal(session_id=session.id, proposal_id=proposal.id)
-    assert authority.row == proposal
-    assert deep_thaw(authority.proposal.pipeline) == authored
-    assert authority.proposal.draft_hash == metadata.draft_hash
-    with engine.connect() as conn:
-        assert conn.execute(select(composition_states_table)).all() == []
-        assert conn.execute(select(blobs_table)).all() == []
-    assert_actual_audits(engine, script.requests, ("success",) * 3, session_id=str(session.id))
-
-
-# Retired: both cancellation cases drove removed compose-loop entry points, not the live Continuation worker.
-# Retired: the auto-commit P4-failure case used a deleted loop helper, not the live Continuation worker.
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("message", "state"),
+    ("initial_mode", "changed_mode", "persisted_base", "prior_history"),
     [
-        ("What can you help me build?", _empty_state()),
-        (
-            "Add a JSONL output to this pipeline.",
-            CompositionState(
-                source=SourceSpec(
-                    plugin="csv",
-                    on_success="rows",
-                    options={"path": "/tmp/input.csv", "schema": {"mode": "observed"}},
-                    on_validation_failure="discard",
-                ),
-                nodes=(),
-                edges=(),
-                outputs=(),
-                metadata=PipelineMetadata(),
-                version=1,
-            ),
-        ),
+        ("explicit_approve", None, False, False),
+        ("auto_commit", None, False, False),
+        ("auto_commit", "explicit_approve", False, False),
+        ("explicit_approve", "auto_commit", False, False),
+        ("explicit_approve", None, True, False),
+        ("auto_commit", None, True, False),
+        ("explicit_approve", None, False, True),
     ],
-    ids=["empty-informational", "nonempty-incremental"],
+    ids=["explicit", "auto", "downgrade-during-sdk", "upgrade-during-sdk", "explicit-saved-base", "auto-saved-base", "prior-two-users"],
 )
-async def test_empty_and_existing_graph_use_same_actual_common_provider_loop(
+async def test_provider_pipeline_respects_request_ceiling_and_current_trust(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    message: str,
-    state: CompositionState,
+    initial_mode: str,
+    changed_mode: str | None,
+    persisted_base: bool,
+    prior_history: bool,
 ) -> None:
-    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=message)
-    candidate = "I can explain the current draft without changing it."
-    script = CommonSDK(request=message, candidate=candidate, steps=(Step("primary", content=candidate), Step("end")))
-    script.bind(composer, monkeypatch)
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
-    monkeypatch.setattr(litellm, "acompletion", sdk)
-    common = AsyncMock(spec=composer._compose_loop, wraps=composer._compose_loop)
-    monkeypatch.setattr(composer, "_compose_loop", common)
+    """Only unchanged auto-commit authority may publish the provider's graph.
 
-    budget_bindings = []
-    actual_bind = ProviderInvocationOwner.bind_cost_budget
+    Preference changes occur at the actual external SDK boundary, after request
+    admission. The real worker, P4 owner and proposal authority do the staging.
+    """
+    operation_id = str(uuid4())
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        sessions = harness.app.state.session_service
+        prior = [
+            ("user", "Read input.csv and write the rows as JSONL."),
+            ("assistant", "I can prepare that pipeline."),
+            ("user", "Keep every input column in the output."),
+            ("assistant", "Understood."),
+        ]
+        base = None
+        if persisted_base or prior_history:
+            seed = sessions.session_operation_authority.acquire(
+                session_id=harness.session_id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id="current-pipeline-seed",
+                lease_seconds=30,
+            )
+            try:
+                if prior_history:
+                    for role, content in prior:
+                        await sessions.add_message(
+                            harness.session_id,
+                            role,
+                            content,
+                            writer_principal="route_user_message" if role == "user" else "compose_loop",
+                            session_operation_context=seed,
+                        )
+                if persisted_base:
+                    base = await sessions.save_composition_state(
+                        harness.session_id,
+                        CompositionStateData(
+                            metadata_={"name": "Untitled Pipeline", "description": ""},
+                            composer_meta={"completion_gates": completion_gates_meta_from_facts(CompletionGateFacts(None))},
+                        ),
+                        provenance="session_seed",
+                        session_operation_context=seed,
+                    )
+            finally:
+                sessions.session_operation_authority.release(seed)
+        with harness.app.state.session_engine.connect() as conn:
+            seed_rows = (
+                conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(harness.session_id)))
+                .mappings()
+                .all()
+            )
+        blob_dir = tmp_path / "blobs" / str(harness.session_id)
+        blob_dir.mkdir(parents=True, exist_ok=True)
+        (blob_dir / "input.csv").write_text("name\nAda\n", encoding="utf-8")
+        (tmp_path / "outputs" / str(harness.session_id)).mkdir(parents=True, exist_ok=True)
+        await sessions.update_composer_preferences(harness.session_id, trust_mode=initial_mode, density_default="high", actor="test")
+        authored = _pipeline(tmp_path, str(harness.session_id))
+        auto_commit = initial_mode == "auto_commit" and changed_mode is None
 
-    def observe_binding(owner: ProviderInvocationOwner, budget: CommonProviderCostBudget) -> None:
-        actual_bind(owner, budget)
-        budget_bindings.append((owner, budget, budget.snapshot()))
+        def author(app):
+            return "Building the requested pipeline.", [tool_call(app, "current_author", "set_pipeline", authored)]
 
-    monkeypatch.setattr(ProviderInvocationOwner, "bind_cost_budget", observe_binding)
-    before = state.to_dict()
-
-    result = await composer.compose(
-        message,
-        [],
-        state,
-        session_id=str(session.id),
-        user_id="planner-user",
-        user_message_id=str(user.id),
-    )
-    common.assert_awaited_once()
-    script.assert_done()
-    assert sdk.await_count == 2
-    assert result.message.startswith(candidate)
-    assert result.state == state and state.to_dict() == before
-    assert await sessions.list_composition_proposals(session.id) == []
-    assert_initial_wire(script.requests[0], text=message, state=state, session_id=str(session.id))
-    _assert_no_pipeline_side_effects(engine)
-    calls = assert_actual_audits(engine, script.requests, ("success", "success"), session_id=str(session.id))
-
-    ((owner, budget, initial),) = budget_bindings
-    assert type(owner) is ProviderInvocationOwner and type(budget) is CommonProviderCostBudget
-    assert owner.service is sessions and owner.cost_budget is budget
-    assert common.await_args is not None
-    loop_call = common.await_args
-    assert loop_call.args[0] == message and loop_call.args[2] is state
-    assert loop_call.args[3] == str(session.id) and loop_call.args[5] == "planner-user" and loop_call.args[8] == str(user.id)
-    assert loop_call.kwargs["provider_owner"] is owner and loop_call.kwargs["required_work"] is owner.required_work
-    context = loop_call.kwargs["session_operation_context"]
-    assert context is owner.required_work.coordinator.authority.context
-    assert context.operation_kind is SessionOperationKind.COMPOSE and context.fence.session_id == str(session.id)
-    snapshot = budget.snapshot()
-    assert snapshot.session_id == initial.session_id == str(session.id)
-    assert snapshot.request_id == initial.request_id == str(user.id)
-    assert snapshot.lifecycle_version == initial.lifecycle_version == 1
-    assert initial.physical_calls == 0 and initial.charges == ()
-    assert snapshot.policy is initial.policy
-    if not state.sources:
-        assert snapshot.applicability == initial.applicability == "legacy_empty_v1"
-        assert snapshot.policy is not None
-        settings = composer._settings
-        assert snapshot.policy.max_provider_calls == settings.composer_planner_max_provider_calls
-        assert snapshot.policy.max_request_bytes == settings.composer_planner_max_request_bytes
-        assert snapshot.policy.max_completion_tokens == settings.composer_planner_max_completion_tokens
-        assert snapshot.policy.max_cumulative_provider_cost == settings.composer_planner_max_cumulative_provider_cost
-        assert snapshot.policy.repair_budget == settings.composer_planner_repair_budget
-        assert all(request["max_tokens"] <= snapshot.policy.max_completion_tokens for request in script.requests)
-    else:
-        assert snapshot.applicability == initial.applicability == "not_applicable"
-        assert snapshot.policy is None
-    assert snapshot.physical_calls == len(snapshot.charges) == 2
-    assert [charge.call_id for charge in snapshot.charges] == [call["call_id"] for call in calls]
-    assert all(charge.cost == Decimal("0.01") and charge.cost_source == "response_usage.cost" for charge in snapshot.charges)
-    assert all(charge.response_accountable for charge in snapshot.charges)
-    assert snapshot.known_cost == snapshot.validated_cost == Decimal("0.02")
-    assert snapshot.cost_known is True and snapshot.refusal_code is None
-
-    with engine.connect() as conn:
-        attempts = (
-            conn.execute(select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == str(session.id)))
-            .mappings()
-            .all()
+        steps = [("primary", author)]
+        if auto_commit:
+            steps.append(
+                ("early", {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "The draft is coherent.", "note": None})
+            )
+        steps.extend(
+            [
+                ("semantic", semantic_primary_response),
+                ("primary", ("The requested pipeline is ready.", None)),
+                ("semantic", semantic_review_response),
+                ("end", end_admit("The provider's pipeline and reply satisfy the request.")),
+                ("semantic", semantic_stop_response),
+            ]
         )
-        ledger = (
-            conn.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.session_id == str(session.id))).mappings().all()
-        )
-    assert len(attempts) == len(ledger) == 2
-    assert {attempt["attempt_id"] for attempt in attempts} == {call["call_id"] for call in calls}
-    assert len({attempt["ledger_entry_id"] for attempt in attempts}) == 2
-    assert {attempt["ledger_entry_id"] for attempt in attempts} == {entry["entry_id"] for entry in ledger}
-    for attempt in attempts:
-        assert attempt["settled_at"] is not None
-        assert attempt["identity_id"] == "planner-user" and attempt["source"] == "composer"
-        assert attempt["operation_id"] == context.fence.operation_id
-        assert attempt["operation_epoch"] == context.fence.operation_epoch
-        assert attempt["lease_token"] == context.fence.lease_token
-        (entry,) = [entry for entry in ledger if entry["entry_id"] == attempt["ledger_entry_id"]]
-        (call,) = [call for call in calls if call["call_id"] == attempt["attempt_id"]]
-        assert entry["identity_id"] == "planner-user" and entry["source"] == "composer"
-        assert entry["model"] == call["model_returned"]
-        assert entry["prompt_tokens"] == call["prompt_tokens"] == 10
-        assert entry["completion_tokens"] == call["completion_tokens"] == 5
+        sdk = ScriptedSDK(steps, app_ref=[harness.app])
+        transitions = []
 
+        async def complete(**kwargs):
+            if changed_mode is not None and not sdk.requests:
+                transitions.append(
+                    await sessions.update_composer_preferences(
+                        harness.session_id, trust_mode=changed_mode, density_default="high", actor="test"
+                    )
+                )
+            response = await sdk(**kwargs)
+            assert isinstance(response, ModelResponse)
+            return response.model_copy(update={"provider": "DeepInfra", "id": f"current-pipeline-{len(sdk.requests)}"})
 
-@pytest.mark.asyncio
-async def test_common_required_provider_audit_failure_publishes_no_proposal_or_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from elspeth.web.sessions.service import ComposerRequiredAuditPersistenceError
-
-    request = "Build a CSV to JSONL pipeline."
-    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
-    preference_transition = await sessions.update_composer_preferences(
-        session.id, trust_mode="explicit_approve", density_default="high", actor="test"
-    )
-    assert preference_transition.current.trust_mode == "explicit_approve"
-    assert preference_transition.current.density_default == "high"
-    with engine.connect() as conn:
-        events_before = [dict(row) for row in conn.execute(select(proposal_events_table).order_by(proposal_events_table.c.id)).mappings()]
-    (preference_event,) = events_before
-    assert preference_event["event_type"] == "trust_mode.changed"
-    assert preference_event["session_id"] == str(session.id)
-    assert preference_event["proposal_id"] is None
-    assert preference_event["actor"] == "test"
-    assert preference_event["payload"] == {
-        "trust_mode": preference_transition.current.trust_mode,
-        "prior_trust_mode": preference_transition.prior.trust_mode,
-        "density_default": preference_transition.current.density_default,
-    }
-    script = CommonSDK(
-        request=request,
-        candidate="",
-        steps=(Step("primary", tool_name="set_pipeline", arguments={"pipeline": _pipeline(tmp_path, str(session.id))}),),
-    )
-    script.bind(composer, monkeypatch)
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
-    monkeypatch.setattr(litellm, "acompletion", sdk)
-    original = sessions._insert_chat_message
-    sql_failure = SQLAlchemyError("actual required native provider audit failure")
-    fired: list[SQLAlchemyError] = []
-
-    def fail(conn: Any, **kwargs: Any) -> Any:
-        envelopes = kwargs["tool_calls"]
-        if kwargs["role"] == "audit" and envelopes and envelopes[0].get("_kind") == "llm_call_audit":
-            fired.append(sql_failure)
-            raise sql_failure
-        return original(conn, **kwargs)
-
-    monkeypatch.setattr(sessions, "_insert_chat_message", fail)
-    with pytest.raises(ComposerRequiredAuditPersistenceError) as caught:
-        await composer.compose(
-            request,
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="planner-user",
-            user_message_id=str(user.id),
-        )
-
-    assert caught.value.__cause__ is sql_failure
-    assert fired == [sql_failure]
-    assert sdk.await_count == 1 and script.phases == []
-    script.assert_done()
-    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
-    assert await sessions.list_composition_proposals(session.id) == []
-    persisted = await sessions.get_messages(session.id, limit=None)
-    durable_call_kinds = [
-        envelope["_kind"]
-        for row in persisted
-        for envelope in (row.tool_calls or ())
-        if envelope.get("_kind") in {"prompt_guard_audit", "llm_call_audit", "planner_attempt_audit"}
-    ]
-    assert durable_call_kinds == ["prompt_guard_audit"]
-    with engine.connect() as conn:
-        events_after = [dict(row) for row in conn.execute(select(proposal_events_table).order_by(proposal_events_table.c.id)).mappings()]
-        assert events_after == events_before
-        assert conn.execute(select(blobs_table)).all() == []
-        assert conn.execute(select(composition_proposals_table)).all() == []
-        assert conn.execute(select(composition_states_table)).all() == []
-        assert conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "tool")).all() == []
-
-
-async def _recipe_composer_context(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    message: str,
-) -> tuple[Any, SessionServiceImpl, Any, Any, ComposerServiceImpl]:
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="planner-user")
-        grant_test_pipeline_user(conn, identity_id="planner-user")
-    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("planner-user", "Planner", "local")
-    user_message = await sessions.add_message(
-        session.id,
-        "user",
-        message,
-        writer_principal="route_user_message",
-    )
-    settings = WebSettings(
-        data_dir=tmp_path,
-        composer_model="test/planner",
-        composer_boot_probe_enabled=False,
-        composer_prompt_guard_mode="debug-when-unconfigured",
-        composer_max_composition_turns=3,
-        composer_max_discovery_turns=2,
-        composer_timeout_seconds=20.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
-    )
-    composer = ComposerServiceImpl.for_trained_operator(
-        create_catalog_service(),
-        settings,
-        sessions_service=sessions,
-        session_engine=engine,
-    )
-    return engine, sessions, session, user_message, composer
-
-
-@pytest.mark.asyncio
-async def test_freeform_matching_provider_cancellation_persists_once_without_self_cause(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A provider cancellation remains the original exception after its audit commits."""
-    message = "Build a CSV to JSONL pipeline."
-    engine, sessions, session, user_message, composer = await _recipe_composer_context(
-        tmp_path,
-        monkeypatch,
-        message=message,
-    )
-
-    async def cancelling_completion(**_kwargs: Any) -> _Response:
-        raise asyncio.CancelledError("provider cancelled matching freeform planner request")
-
-    monkeypatch.setattr("litellm.acompletion", cancelling_completion)
-
-    with pytest.raises(asyncio.CancelledError) as caught:
-        await composer.compose(
-            message,
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="planner-user",
-            user_message_id=str(user_message.id),
-        )
-
-    assert type(caught.value) is asyncio.CancelledError
-    assert caught.value.args == ("provider cancelled matching freeform planner request",)
-    assert caught.value.__cause__ is None
-    persisted = await sessions.get_messages(session.id, limit=None)
-    audit_calls = [
-        envelope["call"] for row in persisted for envelope in (row.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
-    ]
-    assert len(audit_calls) == 1
-    assert audit_calls[0]["status"] == ComposerLLMCallStatus.CANCELLED.value
-    assert await sessions.list_composition_proposals(session.id) == []
-    _assert_no_pipeline_side_effects(engine)
-
-
-def _assert_no_pipeline_side_effects(engine: Any) -> None:
-    with engine.connect() as conn:
-        assert conn.execute(select(blobs_table)).all() == []
-        assert conn.execute(select(composition_proposals_table)).all() == []
-        assert conn.execute(select(proposal_events_table)).all() == []
-        assert conn.execute(select(composition_states_table)).all() == []
-
-
-@pytest.mark.asyncio
-async def test_freeform_common_provider_timeout_has_no_pipeline_side_effects(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A first physical common provider timeout leaves zero pipeline side effects."""
-    from elspeth.web.composer.protocol import ComposerConvergenceError
-
-    request = "Build the requested pipeline."
-    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
-    original = TimeoutError("bounded physical timeout")
-    script = CommonSDK(request=request, candidate="", steps=(Step("primary", failure=original),))
-    script.bind(composer, monkeypatch)
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
-    monkeypatch.setattr(litellm, "acompletion", sdk)
-    common = AsyncMock(spec=composer._compose_loop, wraps=composer._compose_loop)
-    monkeypatch.setattr(composer, "_compose_loop", common)
-
-    with pytest.raises(ComposerConvergenceError) as caught:
-        await composer.compose(
-            request,
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="planner-user",
-            user_message_id=str(user.id),
-        )
-
-    assert caught.value.budget_exhausted == "timeout" and caught.value.max_turns == 0
-    common.assert_awaited_once()
-    script.assert_done()
-    assert sdk.await_count == 1 and script.phases == []
-    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
-    assert_actual_audits(engine, script.requests, ("timeout",), session_id=str(session.id))
-    assert await sessions.list_composition_proposals(session.id) == []
-    _assert_no_pipeline_side_effects(engine)
+        install_sdk(monkeypatch, complete)
+        request = "Build the requested pipeline." if prior_history else "Build a CSV to JSONL pipeline."
+        body = message_body(request, operation_id=operation_id)
+        body["state_id"] = None if base is None else str(base.id)
+        terminal = await submit_and_settle(harness, body, rounds=720)
+        assert terminal.status == "completed", terminal.error
+        assert terminal.result is not None
+        assert sdk.roles == [role for role, _payload in steps] and not sdk.steps
+        if prior_history:
+            for physical_primary in (item for item in sdk.requests if item["role"] == "primary"):
+                messages = physical_primary["messages"]
+                positions = [
+                    next(i for i, item in enumerate(messages) if item["role"] == role and item["content"] == content)
+                    for role, content in prior
+                ]
+                assert positions == sorted(set(positions)) and len(positions) == 4
+                (current_position,) = [i for i, item in enumerate(messages) if item["role"] == "user" and item["content"] == request]
+                assert current_position > positions[-1]
+        if changed_mode is None:
+            assert transitions == []
+        else:
+            (transition,) = transitions
+            assert transition.prior.trust_mode == initial_mode
+            assert transition.current.trust_mode == changed_mode
+        assert (await sessions.get_composer_preferences(harness.session_id)).trust_mode == (changed_mode or initial_mode)
+        proposals = await sessions.list_composition_proposals(harness.session_id)
+        with harness.app.state.session_engine.connect() as conn:
+            states = (
+                conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(harness.session_id)))
+                .mappings()
+                .all()
+            )
+            attempts = (
+                conn.execute(
+                    select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == str(harness.session_id))
+                )
+                .mappings()
+                .all()
+            )
+            audit_rows = conn.execute(
+                select(chat_messages_table).where(
+                    chat_messages_table.c.session_id == str(harness.session_id), chat_messages_table.c.role == "audit"
+                )
+            ).all()
+        calls = [envelope["call"] for row in audit_rows for envelope in (row.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"]
+        assert len(calls) == len(sdk.requests)
+        assert all(call["provider_served"] == "DeepInfra" for call in calls)
+        assert {call["provider_request_id"] for call in calls} == {f"current-pipeline-{index}" for index in range(1, len(sdk.requests) + 1)}
+        if base is not None:
+            assert [row for row in states if row["id"] == str(base.id)] == seed_rows
+        new_states = [row for row in states if base is None or row["id"] != str(base.id)]
+        assert len(attempts) == len(sdk.requests)
+        assert len({row["attempt_id"] for row in attempts}) == len(attempts)
+        assert all(row["settled_at"] is not None and row["ledger_entry_id"] is not None for row in attempts)
+        retained = effects(harness.app, operation_id)
+        assert any(row.owner == "tool_dispatch" and row.disposition == "committed" for row in retained)
+        assert any(row.effect_key.endswith(":p4") and row.disposition == "committed" for row in retained)
+        if auto_commit:
+            assert proposals == [] and not terminal.result.proposals
+            (state,) = new_states
+            assert state["provenance"] == "tool_call" and state["derived_from_state_id"] == (None if base is None else str(base.id))
+            assert state["creator_operation_id"] == operation_id
+            assert terminal.result.state is not None
+            assert terminal.result.state.sources["source"].plugin == "csv"
+            assert terminal.result.state.outputs[0].plugin == "json"
+        else:
+            assert new_states == []
+            (proposal,) = proposals
+            assert len(terminal.result.proposals) == 1
+            assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
+            assert proposal.tool_call_id == "current_author"
+            assert proposal.base_state_id == (None if base is None else base.id) and proposal.committed_state_id is None
+            assert deep_thaw(proposal.arguments_json) == authored
+            metadata = proposal.pipeline_metadata
+            expected_base = (
+                {"kind": "absent"}
+                if base is None
+                else {
+                    "kind": "present",
+                    "state_id": str(base.id),
+                    "composition_content_hash": composition_content_hash(state_from_record(base)),
+                }
+            )
+            assert metadata is not None and metadata.base == expected_base
+            authority = await sessions.get_authoritative_pipeline_proposal(session_id=harness.session_id, proposal_id=proposal.id)
+            assert authority.row == proposal
+            assert deep_thaw(authority.proposal.pipeline) == authored
+            assert authority.proposal.draft_hash == metadata.draft_hash

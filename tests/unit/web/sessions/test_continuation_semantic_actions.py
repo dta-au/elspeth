@@ -45,7 +45,6 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
     consume_committed_semantic_read_on_connection,
     read_current_paid_semantic_decision_on_connection,
     read_semantic_advisor_retained_inputs_on_connection,
-    retain_semantic_advisor_outcome_on_connection,
 )
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
@@ -55,7 +54,7 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as attempt
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, _reply
 from tests.unit.web.sessions import test_continuation_semantic_publication as publication_fixture
-from tests.unit.web.sessions.test_continuation_semantic_advisor import _begin, _invoke, _rows_on_connection, _semantic_case
+from tests.unit.web.sessions.test_continuation_semantic_advisor import _rows_on_connection, _run_paid_semantic, _semantic_case
 from tests.unit.web.sessions.test_continuation_semantic_advisor import operation_store as _operation_store
 
 operation_store = _operation_store
@@ -84,13 +83,8 @@ async def _paid_install_case(store, tmp_path, monkeypatch, kind):
             return _reply(json.dumps(answer))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        issuer, prepared, dispatched = _begin(store, case)
-        observed = await _invoke(case, issuer)
-        assert len(sdk) == 1 and observed.result.audit_call.provider_cost == 0.01
-        with locked_session_transaction(store[0], str(store[4])) as conn:
-            paid = retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
+        prepared, paid = await _run_paid_semantic(case, monkeypatch)
+        assert len(sdk) == 1 and paid.audit_call.provider_cost == 0.01
         yield case, paid.snapshot, prepared.binding.effect_key
         assert len(sdk) == 1
 
@@ -280,18 +274,13 @@ async def test_actual_paid_read_installs_prepares_commits_original_and_reproves_
             return _reply(json.dumps(_read_answer(case["request"])))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        issuer, prepared, dispatched = _begin(operation_store, case)
-        observed = await _invoke(case, issuer)
-        assert observed.result.decision is not None
-        action = observed.result.decision.prescribed_action
+        prepared, retained = await _run_paid_semantic(case, monkeypatch)
+        assert retained.decision is not None
+        action = retained.decision.prescribed_action
         assert action is not None and action.kind == "read_tool"
-        assert len(physical) == 1 and observed.result.audit_call.provider_cost == 0.01
+        assert len(physical) == 1 and retained.audit_call.provider_cost == 0.01
         running = case["running"]
         semantic_key = prepared.binding.effect_key
-        with locked_session_transaction(operation_store[0], sid) as conn:
-            retained = retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
         with locked_session_transaction(operation_store[0], sid) as conn:
             admission = read_semantic_action_admission_on_connection(conn, running, selected=retained.snapshot, effect_key=semantic_key)
             assert admission.action == action
@@ -331,7 +320,7 @@ async def test_actual_paid_read_installs_prepares_commits_original_and_reproves_
             required_work=case["work"],
         )
         assert executed.result.success and executed.committed.original_result.tool_name == "get_plugin_schema"
-        assert executed.committed.original_result.prescribing_provider_call_id == observed.result.audit_call.call_id
+        assert executed.committed.original_result.prescribing_provider_call_id == retained.audit_call.call_id
         assert executed.committed.owner_effect_key == prepared_admission.owner_effect_key
         assert executed.committed.receipt.owner_receipt_id == prepared_admission.owner_effect_key
         assert executed.committed.receipt.disposition == "committed"
@@ -357,7 +346,7 @@ async def test_actual_paid_read_installs_prepares_commits_original_and_reproves_
                 read_committed_semantic_read_on_connection(
                     conn, running, selected=executed.committed.snapshot, effect_key=semantic_key + ":foreign"
                 )
-            ledger_entry_id = _usage_entry_id(session_id=sid, source="composer", run_id=None, call_id=observed.result.audit_call.call_id)
+            ledger_entry_id = _usage_entry_id(session_id=sid, source="composer", run_id=None, call_id=retained.audit_call.call_id)
             savepoint = conn.begin_nested()
             try:
                 changed = conn.execute(update(usage).where(usage.c.entry_id == ledger_entry_id).values(prompt_tokens=999))
@@ -424,7 +413,7 @@ async def test_actual_paid_read_installs_prepares_commits_original_and_reproves_
             )
             assert original.committed == executed.committed
             assert original.admission.action == action
-            assert original.admission.paid.audit_call == observed.result.audit_call
+            assert original.admission.paid.audit_call == retained.audit_call
             inputs = read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=consumed)
             (read_input,) = inputs.reads
             assert read_input.owner_effect_key == executed.committed.owner_effect_key
@@ -497,20 +486,15 @@ async def test_paid_read_canonicalizes_new_obligation_alias_through_effect_recei
             return _reply(json.dumps(_read_alias_answer(case["request"])))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        issuer, prepared, dispatched = _begin(operation_store, case)
-        observed = await _invoke(case, issuer)
-        assert observed.result.decision is not None
-        raw_action = observed.result.decision.prescribed_action
+        prepared, retained = await _run_paid_semantic(case, monkeypatch)
+        assert retained.decision is not None
+        raw_action = retained.decision.prescribed_action
         assert raw_action is not None and raw_action.kind == "read_tool"
         assert raw_action.obligation_ids == ("inspect-csv-source",)
-        assert len(physical) == 1 and observed.result.audit_call.provider_cost == 0.01
+        assert len(physical) == 1 and retained.audit_call.provider_cost == 0.01
         sid = str(operation_store[4])
         running = case["running"]
         semantic_key = prepared.binding.effect_key
-        with locked_session_transaction(operation_store[0], sid) as conn:
-            retained = retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
         with locked_session_transaction(operation_store[0], sid) as conn:
             admitted = read_semantic_action_admission_on_connection(conn, running, selected=retained.snapshot, effect_key=semantic_key)
             assert admitted.action is not None and admitted.action.obligation_ids[0].startswith("obligation:")
@@ -546,7 +530,7 @@ async def test_paid_read_canonicalizes_new_obligation_alias_through_effect_recei
         assert executed.result.success
         assert executed.committed.receipt.action_key == admitted.action_key
         assert executed.committed.owner_effect_key == prepared_action.owner_effect_key
-        assert executed.committed.original_result.prescribing_provider_call_id == observed.result.audit_call.call_id
+        assert executed.committed.original_result.prescribing_provider_call_id == retained.audit_call.call_id
         with locked_session_transaction(operation_store[0], sid) as conn:
             cold = read_committed_semantic_read_on_connection(conn, running, selected=executed.committed.snapshot, effect_key=semantic_key)
             assert cold == executed.committed
@@ -573,14 +557,9 @@ async def test_paid_whole_stop_refuses_incomplete_original_request_coverage(oper
             return _reply(json.dumps(answer))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        issuer, prepared, dispatched = _begin(operation_store, case)
-        observed = await _invoke(case, issuer)
-        assert observed.result.decision is not None and observed.result.decision.decision == "STOP_CONFIRMED"
+        prepared, retained = await _run_paid_semantic(case, monkeypatch)
+        assert retained.decision is not None and retained.decision.decision == "STOP_CONFIRMED"
         sid = str(operation_store[4])
-        with locked_session_transaction(operation_store[0], sid) as conn:
-            retained = retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
         with locked_session_transaction(operation_store[0], sid) as conn:
             paid = read_current_paid_semantic_decision_on_connection(
                 conn, case["running"], selected=retained.snapshot, effect_key=prepared.binding.effect_key
@@ -591,4 +570,4 @@ async def test_paid_whole_stop_refuses_incomplete_original_request_coverage(oper
                 install_semantic_action_on_connection(
                     conn, case["running"], selected=retained.snapshot, effect_key=prepared.binding.effect_key
                 )
-        assert len(physical) == 1 and observed.result.audit_call.provider_cost == 0.01
+        assert len(physical) == 1 and retained.audit_call.provider_cost == 0.01

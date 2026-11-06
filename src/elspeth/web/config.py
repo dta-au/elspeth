@@ -389,8 +389,8 @@ class WebSettings(BaseModel):
         ),
     )
     composer_timeout_seconds: float = Field(..., gt=0)
-    # Existing direct-planner and legacy v1 limits also bind newly admitted
-    # Continuation v2 PRIMARY/Advisor calls for one logical Compose request.
+    # Planner limits bind current Continuation PRIMARY/Advisor calls for one
+    # logical Compose request.
     # TITLE has independent accounting and does not consume this budget.
     # The repair value remains a supported-configuration sentinel: only 2 is
     # admitted, and it does not reset or size the common repair counter.
@@ -457,7 +457,7 @@ class WebSettings(BaseModel):
         description=(
             "Maximum actual retained chunk payload bytes for one new Composer logical operation, "
             "including historical and off-head keys. Defaults to 16 MiB. Explicit null disables "
-            "fresh V3/V4 policy construction; it does not mean unlimited storage. "
+            "fresh policy construction; it does not mean unlimited storage. "
             "Separate private-document and evidence limits still apply."
         ),
     )

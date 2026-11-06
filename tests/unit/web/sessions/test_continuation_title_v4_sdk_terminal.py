@@ -13,7 +13,7 @@ from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import continuation_title_provider as driver
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.provider_sdk_terminal import require_sdk_terminal_failure
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions import _auto_title
@@ -30,23 +30,20 @@ from elspeth.web.sessions.models import token_usage_ledger_table as ledger
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.sessions import test_continuation_initialization as initialization_cases
-from tests.unit.web.sessions.test_continuation_title_provider import raw_reply
-from tests.unit.web.sessions.test_continuation_v3_title_paid_tail_preflight import _historical_prepared_title, _title_owner
+from tests.unit.web.sessions.test_continuation_title_provider import _title_owner, raw_reply, title_case
 
 operation_store = operations.operation_store
 
 
 async def _v4_title_input(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
     )
     monkeypatch.setattr(initialization_cases, "minimal_continuation_policy", lambda: policy)
     store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
-    running, _composer, work, prepared, _guard_requests = await _historical_prepared_title(store, policy, tmp_path, monkeypatch)
+    running, _composer, work, prepared, _guard_requests = await title_case(store, tmp_path, monkeypatch)
     with store[0].connect() as conn:
         original_title = conn.execute(select(sessions.c.title).where(sessions.c.id == str(store[4]))).scalar_one()
     return store, running, prepared, _title_owner(store, work, prepared), original_title

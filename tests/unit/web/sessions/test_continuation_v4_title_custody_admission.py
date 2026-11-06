@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_title_no_sdk import TitleNoSdkIssuer
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -21,7 +21,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.sessions import test_continuation_initialization as initialization_cases
-from tests.unit.web.sessions.test_continuation_v3_title_paid_tail_preflight import _historical_prepared_title
+from tests.unit.web.sessions.test_continuation_title_provider import title_case
 
 operation_store = operations.operation_store
 
@@ -32,16 +32,14 @@ if TYPE_CHECKING:
 
 
 async def _prepared_custody(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
     )
     monkeypatch.setattr(initialization_cases, "minimal_continuation_policy", lambda: policy)
     store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
-    running, _composer, work, prepared, _guard = await _historical_prepared_title(store, policy, tmp_path, monkeypatch)
+    running, _composer, work, prepared, _guard = await title_case(store, tmp_path, monkeypatch)
     custody = ProviderInvocationOwner(service=store[3], required_work=work).mint(ProviderInvocationFamily.TITLE)
     custody.bind_continuation_title(prepared)
     issuer = TitleNoSdkIssuer(prepared)

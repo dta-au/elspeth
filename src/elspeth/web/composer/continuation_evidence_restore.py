@@ -55,9 +55,12 @@ def read_turn_evidence_on_connection(
     *,
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
+    _prior_evidence: AdmittedTurnEvidence | None = None,
 ) -> AdmittedTurnEvidence:
     names = _require_ordinary_evidence_read_on_connection(conn, running, selected=selected, inventory=inventory)
-    snapshot = read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=names)
+    snapshot = read_selected_turn_evidence_graph_on_connection(
+        conn, running, selected=selected, names=names, _prior_evidence=_prior_evidence
+    )
     if snapshot.snapshot.application_entry is not None:
         from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection
 
@@ -107,6 +110,7 @@ def read_selected_turn_evidence_graph_on_connection(
     *,
     selected: SelectedContinuationState,
     names: frozenset[str],
+    _prior_evidence: AdmittedTurnEvidence | None = None,
 ) -> AdmittedTurnEvidence:
     """Validate selected evidence DATA after the caller proves current admission."""
     principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(running.claim.session_id))).one()
@@ -118,6 +122,7 @@ def read_selected_turn_evidence_graph_on_connection(
         operation_id=running.claim.operation_id,
         selected=selected,
         names=names,
+        _prior_evidence=_prior_evidence,
     )
 
 
@@ -128,6 +133,7 @@ def read_selected_turn_evidence_graph_data_on_connection(
     operation_id: str,
     selected: SelectedContinuationState,
     names: frozenset[str],
+    _prior_evidence: AdmittedTurnEvidence | None = None,
 ) -> AdmittedTurnEvidence:
     """Immutable graph/principal DATA after a separate locked admission proof.
 
@@ -156,7 +162,12 @@ def read_selected_turn_evidence_graph_data_on_connection(
         verify_private_chunk(reference, candidates[0].canonical)
         return candidates[0]
 
-    admitted = decode_turn_evidence(actual_chunk(frame.evidence), env_ref_names=names, source_chunks=selected.chunks)
+    evidence_chunk = actual_chunk(frame.evidence)
+    admitted = (
+        decode_turn_evidence(evidence_chunk, env_ref_names=names, source_chunks=selected.chunks)
+        if _prior_evidence is None
+        else AdmittedTurnEvidence(evidence_chunk, env_ref_names=names, source_chunks=selected.chunks, _prior_evidence=_prior_evidence)
+    )
     snapshot = admitted.snapshot
     if snapshot.logical != root.logical:
         raise AuditIntegrityError("cold evidence changed its complete logical binding")

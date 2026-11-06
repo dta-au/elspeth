@@ -15,7 +15,6 @@ from sqlalchemy import select, update
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
-from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.coordination.database_clock import database_now
@@ -46,12 +45,12 @@ from tests.helpers.continuation_app import observe_original_driver_failures
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.sessions import test_continuation_classifier_primary as classifier_fixture
 from tests.unit.web.sessions import test_continuation_live_phases as phase_fixture
-from tests.unit.web.sessions.test_continuation_classifier_primary import _invoke
-from tests.unit.web.sessions.test_continuation_classifier_primary_v4_paid import _v4_applied_case, _v4_classifier_case
+from tests.unit.web.sessions.test_continuation_classifier_primary import _applied_case, _invoke
+from tests.unit.web.sessions.test_continuation_classifier_primary_v4_paid import _v4_classifier_case
 from tests.unit.web.sessions.test_continuation_classifier_primary_v4_paid import operation_store as _operation_store
+from tests.unit.web.sessions.test_continuation_primary_result import primary_input
 from tests.unit.web.sessions.test_continuation_primary_v4_incomplete import _invoke as invoke_primary
-from tests.unit.web.sessions.test_continuation_primary_v4_live import _v4_primary_input
-from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver
+from tests.unit.web.sessions.test_continuation_tool_failure import _claimed_driver, _unstarted_driver
 
 operation_store = _operation_store
 
@@ -316,7 +315,8 @@ async def test_classifier_cold_sdk_source_rejects_legacy_recipe_and_foreign_mode
 
 @pytest.mark.asyncio
 async def test_primary_sdk_producer_label_cannot_replace_original_classifier_source(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
+    kwargs, produced, recorder, _requests = await primary_input(store, tmp_path, monkeypatch)
 
     async def completion(**_arguments):
         raise OpenAIError("original ordinary PRIMARY failure")
@@ -385,17 +385,22 @@ async def test_actual_driver_releases_classifier_sdk_terminal_without_downstream
 
     monkeypatch.setattr(classifier_fixture.initialization, "inventory_work", timed_work)
     monkeypatch.setattr(phase_fixture, "initialized_primary_input", capped_input)
-    async with _v4_applied_case(operation_store, tmp_path, monkeypatch) as (owner, running, _selected, _inventory, _captured, prior_sdk):
+    async with _applied_case(operation_store, tmp_path, monkeypatch, primary_preparation_probe_15s=True) as (
+        owner,
+        running,
+        _selected,
+        _inventory,
+        _captured,
+        prior_sdk,
+    ):
         store = (operation_store[0], operation_store[1], owner.authority, operation_store[3], operation_store[4])
         clock = owner.work.coordinator.sql_deadline_owner
         assert type(clock) is ContinuationSQLDeadlineOwner
         # The preparation fixture has an actual warm runtime with its own
-        # progress sink. Give the real driver a fresh phase owner; start_progress
+        # progress sink. The real driver constructs its own cold phase owner; start_progress
         # must bind its real sink before the retained applied-P4 runtime restores.
-        cold = ContinuationLivePhases(owner.service, owner.authority, owner.work, owner.provider_owner, owner.lease)
-        assert cold.runtime is None
-        driver = _actual_failure_driver(store, cold, running, drain_signal=clock.drain_signal)
-        driver.work, driver.provider = cold.work, cold.provider_owner
+        driver = _unstarted_driver(store, owner, running, drain_signal=clock.drain_signal)
+        assert driver.phases.runtime is None
         assert owner.service._max_composition_turns == 1
         # Establish the real unpaid fold through its shared producer before
         # testing a separately admitted classifier action. This fixture setup
@@ -405,15 +410,11 @@ async def test_actual_driver_releases_classifier_sdk_terminal_without_downstream
         with store[0].connect() as conn:
             ready_stage = read_iteration_stage_on_connection(conn, running, selected=ready)
         assert ready_stage is not None and ready_stage.stage == "classify_ready"
-        assert ready.cursor == _selected.stack.cursor + 1 and cold.runtime is None
+        assert ready.cursor == _selected.stack.cursor + 1 and driver.phases.runtime is None
         ready_selected = await load_selected_continuation(
             authority=owner.authority, running=running, selected=ready, required_work=owner.work
         )
         assert applied_batch_cut(ready_selected.stack.frames)[1].response == applied_batch_cut(_selected.stack.frames)[1].response
-        key = running.claim.session_id, running.claim.operation_id
-        cancellation = asyncio.Event()
-        assert key not in driver.worker._local_cancels
-        driver.worker._local_cancels[key] = cancellation
         calls = []
 
         async def completion(**_arguments):
@@ -429,7 +430,7 @@ async def test_actual_driver_releases_classifier_sdk_terminal_without_downstream
                 )
             )
         monkeypatch.setattr(litellm, "acompletion", completion)
-        try:
+        async with _claimed_driver(driver):
             # Observe the first original phase error at its actual caller,
             # before any public terminal projection can erase that traceback.
             with monkeypatch.context() as observation_patch:
@@ -478,6 +479,3 @@ async def test_actual_driver_releases_classifier_sdk_terminal_without_downstream
             assert physical.settled_at is not None and physical.ledger_entry_id is not None
             assert calls == [1] and len(prior_sdk) == 1
             owner.work.coordinator.assert_completed()
-        finally:
-            await driver.close_progress()
-            assert driver.worker._local_cancels.pop(key) is cancellation

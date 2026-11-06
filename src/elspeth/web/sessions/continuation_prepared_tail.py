@@ -1,4 +1,4 @@
-"""Exact transaction-local capacity admission for a complete prepared V3 tail.
+"""Exact transaction-local capacity admission for a complete prepared V4 tail.
 
 This owner admits bytes, not tool execution. The caller still proves the
 original provider call and every actual SQL issue/publication source. A scope
@@ -17,7 +17,6 @@ from sqlalchemy.engine import RootTransaction
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -125,7 +124,7 @@ def admit_prepared_complete_tail_on_connection(
         raise AuditIntegrityError("prepared complete tail requires its original active transaction")
     root = decode_continuation_snapshot(original.payload_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    if type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4:
+    if type(policy) is not ContinuationAdmissionPolicyV4:
         raise AuditIntegrityError("prepared complete tail requires its original bounded policy")
     sid, operation = root.logical.session_id, root.logical.operation_id
     if load_snapshot(conn, session_id=sid, operation_id=operation) != original:

@@ -244,7 +244,7 @@ async def test_actual_ordinary_primary_recovery_requires_paid_stop_and_cold_sour
         ]
     )
     install_sdk(monkeypatch, sdk)
-    actual_scope = semantic_phase.legacy_advisor_preparation_memo_scope
+    actual_scope = semantic_phase.v4_preparation_memo_scope
     actual_sdk = litellm.acompletion
     carriers = []
     sdk_calls = 0
@@ -262,7 +262,7 @@ async def test_actual_ordinary_primary_recovery_requires_paid_stop_and_cold_sour
             assert len(carriers) == 1 and not carriers[0].active
         return await actual_sdk(**options)
 
-    monkeypatch.setattr(semantic_phase, "legacy_advisor_preparation_memo_scope", observed_scope)
+    monkeypatch.setattr(semantic_phase, "v4_preparation_memo_scope", observed_scope)
     monkeypatch.setattr(litellm, "acompletion", observed_sdk)
     async with continuation_app(tmp_path, monkeypatch) as harness:
         with monkeypatch.context() as diagnostic_patch:

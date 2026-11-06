@@ -7,7 +7,6 @@ the existing Composer owner harness and actual provider publication/cold source.
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import cast
 
 import litellm
 import pytest
@@ -19,7 +18,7 @@ from elspeth.contracts.prompt_guard import PROMPT_GUARD_THINKING_PARTS_KEY, deta
 from elspeth.web.composer.bounded_json import PROVIDER_ARTIFACT_UNAVAILABLE
 from elspeth.web.composer.continuation_codec import decode_continuation_response
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_provider_outcomes import (
     require_successful_response_audit,
     require_v4_successful_response_audit,
@@ -29,7 +28,7 @@ from elspeth.web.composer.provider_result_admission import project_v4_provider_d
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.continuation import private_chunk_key
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
-from tests.helpers.continuation_policy import continuation_test_settings, minimal_continuation_policy
+from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_v4_provider_result_admission import _admit, _response
 from tests.unit.web.sessions import test_continuation_cold_restore as cold_restore
 from tests.unit.web.sessions import test_continuation_message_families as native
@@ -40,9 +39,7 @@ _REASONING = "r" * 100_000
 
 
 def v4_policy():
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert type(policy) is ContinuationAdmissionPolicyV4
     return policy
 
@@ -117,17 +114,8 @@ def test_equal_diagnostic_projection_cannot_authorize_changed_original_metadata(
         metadata.v4_completeness.require_metadata(changed)
 
 
-def test_v4_comparison_refuses_legacy_policy_instead_of_selecting_projection():
-    metadata, call = original_and_audit()
-    with pytest.raises(AuditIntegrityError, match="explicit admitted policy"):
-        require_v4_successful_response_audit(
-            call,
-            metadata,
-            policy=cast(ContinuationAdmissionPolicyV4, minimal_continuation_policy()),
-            attempt_id=call.call_id,
-            started_at=call.started_at,
-            finished_at=call.finished_at,
-        )
+# Retired the legacy-policy projection control: obsolete policy models are no
+# longer constructible; current decoder tests refuse their raw schema tags.
 
 
 @pytest.mark.asyncio

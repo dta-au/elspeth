@@ -34,6 +34,7 @@ from tests.helpers.continuation_app import (
     submit_and_settle,
     tool_call,
 )
+from tests.helpers.continuation_end_profile import driver_end_preparation_profile
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
 
 
@@ -41,6 +42,7 @@ def _observe_original_driver(monkeypatch, operation):
     """Payload-free delegation until the actual first live failure is known."""
     observations = []
     original_advance, original_settle = _SegmentDriver.advance, _SegmentDriver.settle
+    original_run = _SegmentDriver.run
     original_cancel = ContinuationLivePhases.cancel_business
 
     def failure_data(error):
@@ -84,6 +86,17 @@ def _observe_original_driver(monkeypatch, operation):
             )
         return await original_settle(driver, record, original, expired_failure=expired_failure)
 
+    async def run(driver, adoption_failure):
+        if driver.running.claim.operation_id != operation:
+            return await original_run(driver, adoption_failure)
+        observed = {"boundary": "driver.run"}
+        observations.append(observed)
+        try:
+            return await original_run(driver, adoption_failure)
+        except BaseException as error:
+            observed["error"] = failure_data(error)
+            raise
+
     def cancel(phases, reason):
         if phases.work.running is not None and phases.work.running.claim.operation_id == operation:
             observations.append({"boundary": "cancel_business", "reason": reason.reason.value})
@@ -91,6 +104,7 @@ def _observe_original_driver(monkeypatch, operation):
 
     monkeypatch.setattr(_SegmentDriver, "advance", advance)
     monkeypatch.setattr(_SegmentDriver, "settle", settle)
+    monkeypatch.setattr(_SegmentDriver, "run", run)
     monkeypatch.setattr(ContinuationLivePhases, "cancel_business", cancel)
     return observations
 
@@ -188,6 +202,26 @@ async def test_actual_driver_runs_paid_semantic_advisor_before_prescribed_primar
 
 @pytest.mark.asyncio
 async def test_actual_driver_read_result_reaches_next_advisor_then_real_review_and_whole_stop(tmp_path, monkeypatch):
+    from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
+
+    original_document_check = semantic_sql._require_retained_input_document
+    review_documents = []
+
+    def observe_document(conn, sid, operation, root, physical_input, retained, *, env_ref_names, evidence_document=None):
+        original_document_check(
+            conn,
+            sid,
+            operation,
+            root,
+            physical_input,
+            retained,
+            env_ref_names=env_ref_names,
+            evidence_document=evidence_document,
+        )
+        if retained.review is not None and not review_documents:
+            review_documents.append((sid, operation, root, physical_input, retained, env_ref_names))
+
+    monkeypatch.setattr(semantic_sql, "_require_retained_input_document", observe_document)
     operation = str(uuid4())
     sdk = ScriptedSDK(
         [
@@ -201,9 +235,16 @@ async def test_actual_driver_read_result_reaches_next_advisor_then_real_review_a
     install_sdk(monkeypatch, sdk)
     observations = _observe_original_driver(monkeypatch, operation)
     async with continuation_app(tmp_path, monkeypatch) as harness:
-        result = await submit_and_settle(
-            harness, message_body("Inspect the current pipeline and explain what it contains.", operation_id=operation)
-        )
+        try:
+            with driver_end_preparation_profile(
+                monkeypatch, harness.app.state.session_engine, session_id=harness.session_id, operation_id=operation
+            ):
+                result = await submit_and_settle(
+                    harness, message_body("Inspect the current pipeline and explain what it contains.", operation_id=operation)
+                )
+        except BaseException:
+            print("K7 original read driver observations: " + canonical_json(observations))
+            raise
         if result.status != "completed":
             print("K7 original read driver observations: " + canonical_json(observations))
         assert result.status == "completed", result.error
@@ -245,3 +286,54 @@ async def test_actual_driver_read_result_reaches_next_advisor_then_real_review_a
             "advisor",
             "advisor",
         ]
+        assert len(review_documents) == 1
+        sid, actual_operation, root, physical_input, retained, env_ref_names = review_documents[0]
+        assert actual_operation == operation and retained.review is not None
+        original_document = json.loads(physical_input.messages[-1]["content"])
+        full_review = json.loads(retained.review.result_json)
+        assert full_review["llm_calls"] and original_document["review_result"]["llm_calls"]
+        assert any(call["private_request"] is not None for call in full_review["llm_calls"])
+        assert all("private_request" not in call for call in original_document["review_result"]["llm_calls"])
+        # Exercise the actual SQL document comparator after the original action
+        # clock. These are its real admitted arguments, not invented authority.
+        from elspeth.web.sessions import continuation_semantic_review_result as review_codec
+
+        original_review_decoder = review_codec.decode_semantic_review_result
+        repeated_review_decodes = []
+
+        def observe_review_decode(encoded):
+            repeated_review_decodes.append(encoded)
+            return original_review_decoder(encoded)
+
+        monkeypatch.setattr(review_codec, "decode_semantic_review_result", observe_review_decode)
+        # Calibrate the observer against the real complete cold source.
+        assert review_codec.decode_semantic_review_result(retained.review.result_json).result.llm_calls
+        assert json.loads(retained.review.provider_json) == original_document["review_result"]
+        assert repeated_review_decodes == [retained.review.result_json]
+        repeated_review_decodes.clear()
+        with harness.app.state.session_engine.connect() as conn:
+            original_document_check(conn, sid, operation, root, physical_input, retained, env_ref_names=env_ref_names)
+            for alteration in ("message", "publication_binding", "omission", "private_request"):
+                changed_document = json.loads(physical_input.messages[-1]["content"])
+                changed_review = changed_document["review_result"]
+                if alteration == "message":
+                    changed_review["message"] += " A result the original owner never returned."
+                elif alteration == "publication_binding":
+                    assert changed_review["publication_binding"] != "0" * 64
+                    changed_review["publication_binding"] = "0" * 64
+                elif alteration == "omission":
+                    del changed_review["runtime_preflight"]
+                else:
+                    changed_review["llm_calls"][0]["private_request"] = full_review["llm_calls"][0]["private_request"]
+                changed_input = physical_input.model_copy(
+                    update={
+                        "messages": (
+                            *physical_input.messages[:-1],
+                            {**physical_input.messages[-1], "content": canonical_json(changed_document)},
+                        )
+                    }
+                )
+                with pytest.raises(AuditIntegrityError, match="complete original source/result DATA"):
+                    original_document_check(conn, sid, operation, root, changed_input, retained, env_ref_names=env_ref_names)
+            assert tuple(conn.execute(select(physical).where(physical.c.session_id == sid)).all()) == attempts
+        assert repeated_review_decodes == []

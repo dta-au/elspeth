@@ -31,9 +31,6 @@ from elspeth.web.composer.continuation import (
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
-    ContinuationAdmissionPolicy,
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -496,21 +493,12 @@ class ComposerAsyncOperationAuthority:
         *,
         owner_instance_id: str,
         claim_lease_seconds: int,
-        continuation_policy: ContinuationAdmissionPolicy
-        | ContinuationAdmissionPolicyV2
-        | ContinuationAdmissionPolicyV3
-        | ContinuationAdmissionPolicyV4
-        | None = None,
+        continuation_policy: ContinuationAdmissionPolicyV4 | None = None,
     ) -> None:
         """``continuation_policy`` is required to admit; read-only owners may omit it."""
         if engine.dialect.name not in ("sqlite", "postgresql") or not owner_instance_id.strip() or not 5 <= claim_lease_seconds <= 600:
             raise ValueError("invalid composer operation authority configuration")
-        if continuation_policy is not None and type(continuation_policy) not in (
-            ContinuationAdmissionPolicy,
-            ContinuationAdmissionPolicyV2,
-            ContinuationAdmissionPolicyV3,
-            ContinuationAdmissionPolicyV4,
-        ):
+        if continuation_policy is not None and type(continuation_policy) is not ContinuationAdmissionPolicyV4:
             raise TypeError("continuation policy must be its owned complete admission policy")
         self._engine = engine
         self._owner_instance_id = owner_instance_id
@@ -659,16 +647,8 @@ class ComposerAsyncOperationAuthority:
                             status="queued",
                             request_hash=request_hash,
                             continuation_policy_version=retained_policy.schema_version,
-                            continuation_policy_sha256=(
-                                retained_policy.policy_hash
-                                if isinstance(retained_policy, (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4))
-                                else None
-                            ),
-                            continuation_retained_payload_limit_bytes=(
-                                retained_policy.max_retained_payload_bytes
-                                if isinstance(retained_policy, (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4))
-                                else None
-                            ),
+                            continuation_policy_sha256=retained_policy.policy_hash,
+                            continuation_retained_payload_limit_bytes=retained_policy.max_retained_payload_bytes,
                             actor_user_id=actor_user_id,
                             request_id=request_id,
                             base_state_id=str(base_state_id) if base_state_id else None,
@@ -769,7 +749,7 @@ class ComposerAsyncOperationAuthority:
             raise TypeError("continuation terminal requires its actual running owner")
         with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
             from elspeth.web.composer.continuation_next_action import (
-                unpaid_early_outer_on_connection,
+                unpaid_checkpoint_outer_on_connection,
                 validate_continuation_structure_on_connection,
             )
             from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -818,7 +798,7 @@ class ComposerAsyncOperationAuthority:
                 if parent.cancel_requested_at is not None:
                     outcome = request_cancelled_error(request_id=parent.request_id)
                 elif (
-                    unpaid_early_outer_on_connection(
+                    unpaid_checkpoint_outer_on_connection(
                         conn,
                         session_id=running.claim.session_id,
                         operation_id=running.claim.operation_id,
@@ -830,7 +810,7 @@ class ComposerAsyncOperationAuthority:
                     is None
                 ):
                     outcome = worker_lost_error(request_id=parent.request_id)
-                # Exact unpaid EARLY keeps the actual original failure. Its
+                # Exact unpaid EARLY/END keeps the actual original failure. Its
                 # outer effect stays ambiguous and ordinary settlement records
                 # unknown; this never invents a paid or no-SDK result.
             return settle_composer_operation_on_connection(conn, running, outcome=outcome)
@@ -1061,6 +1041,7 @@ class ComposerAsyncOperationAuthority:
         selected: SelectedContinuationState,
         inventory: CurrentContinuationEnvInventory,
         retention_memo: RetentionStageMemo | None = None,
+        _prior_evidence: AdmittedTurnEvidence | None = None,
     ) -> ContinuationRuntimeSource:
         from elspeth.web.composer.continuation import AdvisorFrame
         from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -1083,7 +1064,7 @@ class ComposerAsyncOperationAuthority:
                 # reproves its original outcome/decision and refuses unresolved
                 # prepared/begun work before the ordinary runtime DATA read.
                 return read_semantic_advisor_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
-            return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+            return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory, _prior_evidence=_prior_evidence)
 
     def read_continuation_tool_failure(
         self, running: ComposerOperationRunning, *, env_ref_names: frozenset[str]
@@ -1768,11 +1749,11 @@ class ComposerAsyncOperationAuthority:
                     raise ComposerOperationFenceLost(
                         session_id=UUID(hint.session_id), operation_id=hint.operation_id, attempt=row.parent_attempt + 1
                     )
-                from elspeth.web.sessions.continuation import require_v3_unpaid_terminal_reserve_on_connection
+                from elspeth.web.sessions.continuation import require_unpaid_terminal_reserve_on_connection
 
-                # Validate the V3 terminal reserve under the final claimed
+                # Validate the terminal reserve under the final claimed
                 # parent. Refusal must roll back its token and attempt too.
-                require_v3_unpaid_terminal_reserve_on_connection(conn, session_id=str(hint.session_id), operation_id=hint.operation_id)
+                require_unpaid_terminal_reserve_on_connection(conn, session_id=str(hint.session_id), operation_id=hint.operation_id)
                 claimed.append(
                     ComposerOperationClaim(
                         session_id=UUID(hint.session_id),

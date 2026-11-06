@@ -16,7 +16,7 @@ from elspeth.web.composer._compose_loop_carriers import (
 from elspeth.web.composer.continuation import (
     AdvisorFrame,
     ContinuationFrameStack,
-    ContinuationProviderCostPolicy,
+    ContinuationProviderCostPolicyV2,
     InitializeFrame,
     LogicalRequestBinding,
     MutationCeilingSnapshot,
@@ -33,13 +33,8 @@ from elspeth.web.composer.continuation_codec import (
     require_continuation_request_admission,
     snapshot_after_provider_response,
 )
-from elspeth.web.composer.continuation_policy import (
-    ContinuationActionBounds,
-    ContinuationActionPolicy,
-    ContinuationAdmissionPolicy,
-    ContinuationSegmentPolicy,
-)
 from elspeth.web.credential_guard import CredentialMaterialRefused
+from tests.helpers.continuation_policy import minimal_continuation_policy
 
 
 def completion():
@@ -77,30 +72,7 @@ def test_initializer_scans_full_large_original_before_private_retention():
 
 
 def stack_for(top):
-    action = ContinuationActionPolicy(
-        preparation=1.0,
-        guard=2.0,
-        quota=3.0,
-        physical=4.0,
-        retention=5.0,
-    )
-    policy = ContinuationAdmissionPolicy(
-        segment=ContinuationSegmentPolicy(
-            nominal=300.0,
-            watermark=120.0,
-            quantum=180.0,
-            reserve=30.0,
-        ),
-        actions=ContinuationActionBounds(
-            primary=action,
-            advisor=action,
-            title=action,
-            read=action,
-            session_sql=action,
-            blob=action,
-            external=action,
-        ),
-    )
+    policy = minimal_continuation_policy()
     return ContinuationFrameStack(
         logical=LogicalRequestBinding(
             session_id="00000000-0000-4000-8000-000000000001",
@@ -115,9 +87,11 @@ def stack_for(top):
             request_id="original",
             initial_trust_mode="auto_commit",
         ),
-        provider_cost_policy=ContinuationProviderCostPolicy(
-            applicability="not_applicable",
+        provider_cost_policy=ContinuationProviderCostPolicyV2(
+            applicability="continuation_v2",
+            lifecycle_version=2,
             accounting_owner="physical_audit_and_token_ledger",
+            admission_policy_hash=policy.policy_hash,
         ),
         policy_hash=policy.policy_hash,
         admission_policy_json=canonical_json(policy.model_dump(mode="json")),

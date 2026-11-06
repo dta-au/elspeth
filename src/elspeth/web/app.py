@@ -2321,6 +2321,7 @@ def _create_app(
         owner_instance_id=session_service.session_operation_owner_instance_id,
         claim_lease_seconds=settings.composer_async_claim_lease_seconds,
         # Each admitted operation retains its own copy of the policy.
+        # The sole current policy builder; null disables fresh admission.
         continuation_policy=continuation_policy_from_settings(settings),
     )
     app.state.composer_async_operation_authority = composer_async_authority

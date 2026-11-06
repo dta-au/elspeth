@@ -16,21 +16,23 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import detach_prompt_guard_messages
 from elspeth.web.composer import continuation_title_provider as driver
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+from elspeth.web.composer.continuation_title_provider import TitleNoSdkTerminalResult
 from elspeth.web.composer.continuation_title_values import decode_title_provider_result
 from elspeth.web.composer.provider_audit_source import audit_drafts_json
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostSnapshot
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
-from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import continuation_title_provider as sql_owner
-from elspeth.web.sessions.composer_operations import ComposerOperationFenceLost, ComposerOperationRunning
+from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import ContinuationCASConflict
+from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import sessions_table as sessions
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
@@ -102,6 +104,35 @@ def sql_rows(store):
             tuple(conn.execute(select(usage)).all()),
             tuple(conn.execute(select(messages).where(messages.c.session_id == str(store[4])).order_by(messages.c.sequence_no)).all()),
         )
+
+
+def _title_owner(store, work, prepared):
+    root = decode_continuation_snapshot(prepared.selected.payload_json)
+    owner = ProviderInvocationOwner(service=store[3], required_work=work)
+    owner.bind_cost_budget(
+        CommonProviderCostBudget(
+            CommonProviderCostSnapshot(str(store[4]), root.logical.original_user_message_id, 2, "not_applicable", None)
+        )
+    )
+    return owner
+
+
+def decode_current_title_result(service, running, current):
+    settlement = current.settlement
+    assert settlement.inventory is not None
+    with locked_session_transaction(service._require_sessions_service()._engine, str(running.claim.session_id)) as conn:
+        proof = sql_owner._verified_v4_title_stored_source_on_connection(
+            conn,
+            session_id=running.claim.session_id,
+            operation_id=running.claim.operation_id,
+            sequence=None,
+            generation=None,
+            selected=current.selected,
+            names=settlement.inventory.names,
+            title_reference=settlement.result.reference,
+        )
+        assert proof is not None
+        return decode_title_provider_result(settlement.result, env_ref_names=settlement.inventory.names, stored_v4_source=proof)
 
 
 def observer(monkeypatch, *, build_inputs=None):
@@ -207,7 +238,7 @@ async def test_actual_title_success_retains_original_full_response_and_single_ac
         assert calls[0].private_request is contexts[0]
         current = await driver.read_current_title_result(service=service, running=running, required_work=work)
         assert current.settled and current.settlement.result == result.result
-        decoded = decode_title_provider_result(result.result, env_ref_names=current.settlement.inventory.names)
+        decoded = decode_current_title_result(service, running, current)
         assert decoded.completion.message.content == content
         assert decoded.completion.provider_metadata.reasoning_content == "Keep the original café topic."
         assert decoded.audit_call == calls[0]
@@ -269,20 +300,10 @@ async def test_actual_title_success_retains_original_full_response_and_single_ac
 
 
 @pytest.mark.asyncio
-async def test_retained_title_before_financial_settlement_reclaims_original_source_without_second_sdk(
-    operation_store, tmp_path, monkeypatch
-):
+async def test_settled_title_reclaims_original_source_without_second_sdk(operation_store, tmp_path, monkeypatch):
     running, service, work, prepared, guard_requests = await title_case(operation_store, tmp_path, monkeypatch)
     calls = observer(monkeypatch)
-    reached, resume = asyncio.Event(), asyncio.Event()
-    original_finish = type(operation_store[3]).finish_provider_attempt
     sdk = []
-
-    async def pause_before_original(self, **kwargs):
-        if kwargs["session_operation_context"] is running.session_operation_context:
-            reached.set()
-            await resume.wait()
-        return await original_finish(self, **kwargs)
 
     async def completion(**kwargs):
         _assert_required_guard_admitted(
@@ -295,21 +316,17 @@ async def test_retained_title_before_financial_settlement_reclaims_original_sour
         sdk.append(kwargs)
         return raw_reply(kwargs["model"])
 
-    monkeypatch.setattr(type(operation_store[3]), "finish_provider_attempt", pause_before_original)
     monkeypatch.setattr(litellm, "acompletion", completion)
-    task = asyncio.create_task(
-        driver.run_prepared_title_provider(
-            prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
-        )
-    )
     current_running = None
     released = False
     try:
-        await asyncio.wait_for(reached.wait(), timeout=10)
+        await driver.run_prepared_title_provider(
+            prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
+        )
         retained = await driver.read_current_title_result(service=service, running=running, required_work=work)
-        assert not retained.settled and retained.settlement.audit_call == calls[0]
-        assert len(sdk) == 1 and not sql_rows(operation_store)[1]
-        source = decode_title_provider_result(retained.settlement.result, env_ref_names=retained.settlement.inventory.names).source
+        assert retained.settled and retained.settlement.audit_call == calls[0]
+        assert len(sdk) == len(sql_rows(operation_store)[1]) == 1
+        source = decode_current_title_result(service, running, retained).source
         operation_store[1].release(running.session_operation_context)
         released = True
         current = new_owners(operation_store)
@@ -327,34 +344,29 @@ async def test_retained_title_before_financial_settlement_reclaims_original_sour
         )
         current_running = ComposerOperationRunning(claim=claim, session_operation_context=context)
         fresh_work = inventory_work(current_running)
-        await actual_title_update(current, current_running, fresh_work, "Renamed While Accounting Owed")
+        await actual_title_update(current, current_running, fresh_work, "Renamed After Atomic Settlement")
         # Reuse the same ordinary configured Composer owner against the same store;
         # no retained runtime context is relabeled into fresh authority.
         before = recovery_rows(engine)
         observed = await driver.read_current_title_result(service=service, running=current_running, required_work=fresh_work)
-        assert recovery_rows(engine) == before and not observed.settled
+        assert recovery_rows(engine) == before and observed.settled
         assert observed.settlement.audit_call == calls[0]
         finished = await driver.settle_current_title_result(service=service, running=current_running, required_work=fresh_work)
         assert finished.settled and len(sdk) == 1
-        decoded = decode_title_provider_result(finished.settlement.result, env_ref_names=finished.settlement.inventory.names)
+        decoded = decode_current_title_result(service, current_running, finished)
         assert decoded.source == source and decoded.source.operation_id != context.fence.operation_id
         assert decoded.audit_call.call_id == calls[0].call_id
         rows, ledger, _messages = sql_rows(current)
         assert len(rows) == len(ledger) == 1
         assert rows[0].operation_id == source.operation_id and rows[0].operation_epoch == source.operation_epoch
         with engine.connect() as conn:
-            assert conn.execute(select(sessions.c.title).where(sessions.c.id == str(sid))).scalar_one() == "Renamed While Accounting Owed"
+            assert conn.execute(select(sessions.c.title).where(sessions.c.id == str(sid))).scalar_one() == "Renamed After Atomic Settlement"
         untouched = recovery_rows(engine)
         assert (await driver.settle_current_title_result(service=service, running=current_running, required_work=fresh_work)).settled
         assert recovery_rows(engine) == untouched
         fresh_work.coordinator.assert_completed()
     finally:
-        resume.set()
-        if released:
-            with pytest.raises((SessionOperationFenceLost, ComposerOperationFenceLost, AuditIntegrityError, BaseExceptionGroup)):
-                await task
-        else:
-            await task
+        if not released:
             operation_store[1].release(running.session_operation_context)
         work.coordinator.assert_completed()
         if current_running is not None:
@@ -409,7 +421,7 @@ async def _exercise_title_result_sql_failure(operation_store, tmp_path, monkeypa
     baseline_at_received = []
     surplus_at_received = []
 
-    def fail_received(conn, running, selected, following, descriptor, stage):
+    def fail_received(conn, running, selected, following, descriptor, stage, **kwargs):
         if stage == "received":
             assert len(calls) == 1
             limits, metadata_characters = _title_sql_uncached_limits(running, prepared, calls[0])
@@ -443,7 +455,7 @@ async def _exercise_title_result_sql_failure(operation_store, tmp_path, monkeypa
                 ]
                 surplus_at_received.append(surplus)
             raise marker
-        return original_append(conn, running, selected, following, descriptor, stage)
+        return original_append(conn, running, selected, following, descriptor, stage, **kwargs)
 
     async def completion(**kwargs):
         before_retention.append(operation_store[2].load_continuation_snapshot(running))
@@ -477,7 +489,10 @@ async def _exercise_title_result_sql_failure(operation_store, tmp_path, monkeypa
             effect = conn.execute(select(effects).where(effects.c.effect_key == "provider:3:0")).one()
             assert effect.disposition == "dispatched" and effect.receipt_key is None and effect.result_chunk_key is None
         rows, ledger, _messages = sql_rows(operation_store)
-        assert len(rows) == len(ledger) == 1 and rows[0].settled_at is not None
+        assert len(rows) == 1 and not ledger and rows[0].settled_at is None
+        with operation_store[0].connect() as conn:
+            hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == rows[0].attempt_id)).one()
+            assert hold.state == "active"
         before = recovery_rows(operation_store[0])
         with pytest.raises(AuditIntegrityError, match="unresolved"):
             await driver.read_current_title_result(service=service, running=running, required_work=work)
@@ -500,7 +515,7 @@ async def _exercise_title_result_sql_failure(operation_store, tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_title_original_retention_sql_error_rolls_back_chunk_event_root_and_still_settles_actual_call(
+async def test_title_original_retention_sql_error_rolls_back_atomic_result_and_preserves_original_hold(
     operation_store, tmp_path, monkeypatch, request, record_property
 ):
     await _exercise_title_result_sql_failure(operation_store, tmp_path, monkeypatch, request, record_property, surplus_metadata=False)
@@ -533,10 +548,11 @@ async def test_title_current_source_rejects_changed_complete_retained_cohort_wit
             bad = replace(bad, audit_drafts=bad.audit_drafts[:-1])
         elif mutation == "context":
             bad = replace(bad, selected=prepared.selected)
+        decoded = decode_current_title_result(service, running, good) if mutation == "source" else None
         before = recovery_rows(operation_store[0])
         with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
             if mutation == "source":
-                decoded = decode_title_provider_result(bad.result, env_ref_names=bad.inventory.names)
+                assert decoded is not None
                 admitted = sql_owner.admit_title_audit_source_on_connection(
                     conn, running.session_operation_context, bad, names=bad.inventory.names
                 )
@@ -609,34 +625,28 @@ async def test_original_warm_title_interface_still_updates_once_and_returns_none
 
 
 @pytest.mark.asyncio
-async def test_title_accounting_failure_rolls_back_complete_audit_ledger_and_root_then_replays_without_sdk(
-    operation_store, tmp_path, monkeypatch
-):
+async def test_title_accounting_failure_rolls_back_atomic_result_audit_ledger_and_hold(operation_store, tmp_path, monkeypatch):
     running, service, work, prepared, _requests = await title_case(operation_store, tmp_path, monkeypatch)
     original_append = sql_owner._append
-    original_finish = type(operation_store[3]).finish_provider_attempt
+    original_complete = type(operation_store[3]).complete_v4_title_result_sync
     marker = RuntimeError("original TITLE accounting root failure")
-    sdk = []
-    accounting_baselines = []
+    sdk, baselines = [], []
 
-    def fail_settled(conn, running, selected, following, descriptor, stage):
+    def fail_settled(conn, running, selected, following, descriptor, stage, **kwargs):
         if stage == "settled":
             raise marker
-        return original_append(conn, running, selected, following, descriptor, stage)
+        return original_append(conn, running, selected, following, descriptor, stage, **kwargs)
+
+    def observe_complete(self, **kwargs):
+        baselines.append(recovery_rows(operation_store[0]))
+        return original_complete(self, **kwargs)
 
     async def completion(**kwargs):
         sdk.append(kwargs)
         return raw_reply(kwargs["model"])
 
-    async def observe_accounting(self, **kwargs):
-        assert self is operation_store[3]
-        # The real guard, attempt and retained-response commits precede this
-        # accounting transaction. Preserve all of them in the unfiltered oracle.
-        accounting_baselines.append(recovery_rows(operation_store[0]))
-        return await original_finish(self, **kwargs)
-
     monkeypatch.setattr(sql_owner, "_append", fail_settled)
-    monkeypatch.setattr(type(operation_store[3]), "finish_provider_attempt", observe_accounting)
+    monkeypatch.setattr(type(operation_store[3]), "complete_v4_title_result_sync", observe_complete)
     monkeypatch.setattr(litellm, "acompletion", completion)
     try:
         with pytest.raises(BaseException) as caught:
@@ -644,30 +654,25 @@ async def test_title_accounting_failure_rolls_back_complete_audit_ledger_and_roo
                 prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
             )
         assert caught.value is marker or caught.value.__cause__ is marker
-        assert len(accounting_baselines) == 1
-        assert recovery_rows(operation_store[0]) == accounting_baselines[0]
+        assert len(baselines) == len(sdk) == 1
+        assert recovery_rows(operation_store[0]) == baselines[0]
         rows, ledger, _saved = sql_rows(operation_store)
         assert len(rows) == 1 and rows[0].settled_at is None and not ledger
-        pending = await driver.read_current_title_result(service=service, running=running, required_work=work)
-        assert not pending.settled and pending.settlement.result.reference.codec == "composer.title-provider-result.v1"
+        with operation_store[0].connect() as conn:
+            hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == rows[0].attempt_id)).one()
+            assert hold.state == "active"
+        with pytest.raises(AuditIntegrityError, match="unresolved"):
+            await driver.read_current_title_result(service=service, running=running, required_work=work)
+        assert len(sdk) == 1
         work.coordinator.assert_completed()
-        monkeypatch.setattr(sql_owner, "_append", original_append)
-        monkeypatch.setattr(type(operation_store[3]), "finish_provider_attempt", original_finish)
-        replay_work = inventory_work(running)
-        complete = await driver.settle_current_title_result(service=service, running=running, required_work=replay_work)
-        assert complete.settled and len(sdk) == 1
-        assert len(sql_rows(operation_store)[1]) == 1
-        replay_work.coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ("cancel", "error"))
-async def test_title_original_physical_failure_settles_once_and_unresolved_cut_never_retries_sdk(
-    operation_store, tmp_path, monkeypatch, failure
-):
-    running, service, work, prepared, _requests = await title_case(operation_store, tmp_path, monkeypatch)
+async def test_title_original_physical_failure_closes_original_terminal_without_retry(operation_store, tmp_path, monkeypatch, failure):
+    running, _service, work, prepared, _requests = await title_case(operation_store, tmp_path, monkeypatch)
     original = asyncio.CancelledError("original SDK cancellation") if failure == "cancel" else RuntimeError("original SDK failure")
     sdk = []
 
@@ -676,32 +681,26 @@ async def test_title_original_physical_failure_settles_once_and_unresolved_cut_n
         raise original
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    calls = observer(monkeypatch)
     try:
-        with pytest.raises(BaseException) as caught:
-            await driver.run_prepared_title_provider(
-                prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
-            )
-        assert caught.value is original
-        assert len(calls) == len(sdk) == 1
-        assert calls[0].private_request == capture_provider_context(
-            messages=detach_prompt_guard_messages(prepared.request.audit_messages)[0], tools=None
+        result = await driver.run_prepared_title_provider(
+            prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
         )
-        assert calls[0].status.value == ("cancelled" if failure == "cancel" else "api_error")
+        if failure == "cancel":
+            assert type(result) is SdkTerminalResult and result.deferred_cancellations == (original,)
+        else:
+            assert type(result) is SdkTerminalFailure and result.original is original
+        assert len(sdk) == 1 and result.verified.hold_state == "consumed"
+        assert result.verified.receipt.retryable is False
         rows, ledger, _saved = sql_rows(operation_store)
-        assert len(rows) == len(ledger) == 1
-        assert rows[0].settled_at is not None
-        before = recovery_rows(operation_store[0])
-        with pytest.raises(AuditIntegrityError, match="unresolved"):
-            await driver.read_current_title_result(service=service, running=running, required_work=work)
-        assert recovery_rows(operation_store[0]) == before and len(sdk) == 1
+        assert len(rows) == len(ledger) == 1 and rows[0].settled_at is not None
+        assert rows[0].attempt_id == result.verified.provider_attempt_id
         work.coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)
 
 
 @pytest.mark.asyncio
-async def test_title_real_quota_refusal_retains_preparation_but_never_physically_dispatches(operation_store, tmp_path, monkeypatch):
+async def test_title_real_role_refusal_closes_unpaid_terminal_without_sdk(operation_store, tmp_path, monkeypatch):
     running, _service, work, prepared, _requests = await title_case(operation_store, tmp_path, monkeypatch)
     from elspeth.web.sessions.models import identity_roles_table
 
@@ -720,32 +719,31 @@ async def test_title_real_quota_refusal_retains_preparation_but_never_physically
 
     monkeypatch.setattr(litellm, "acompletion", completion)
     try:
-        assert (
-            await driver.run_prepared_title_provider(
-                prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
-            )
-            is None
+        result = await driver.run_prepared_title_provider(
+            prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
         )
+        assert type(result) is TitleNoSdkTerminalResult
         assert not sdk and not sql_rows(operation_store)[0]
-        assert operation_store[2].load_continuation_snapshot(running) == prepared.selected
+        assert operation_store[2].load_continuation_snapshot(running) != prepared.selected
         work.coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)
 
 
 @pytest.mark.asyncio
-async def test_title_two_current_writers_have_one_accounting_commit(operation_store, tmp_path, monkeypatch):
+async def test_title_two_current_writers_have_one_atomic_result_commit(operation_store, tmp_path, monkeypatch):
     running, service, work, prepared, _requests = await title_case(operation_store, tmp_path, monkeypatch)
-    reached, resume = asyncio.Event(), asyncio.Event()
-    original_finish = type(operation_store[3]).finish_provider_attempt
+    reached, resume = Event(), Event()
+    original_complete = type(operation_store[3]).complete_v4_title_result_sync
+    arguments = []
 
-    async def pause(self, **kwargs):
-        if kwargs["required_work"].key.authority is work.coordinator.authority:
-            reached.set()
-            await resume.wait()
-        return await original_finish(self, **kwargs)
+    def pause(self, **kwargs):
+        arguments.append(kwargs)
+        reached.set()
+        assert resume.wait(timeout=10)
+        return original_complete(self, **kwargs)
 
-    monkeypatch.setattr(type(operation_store[3]), "finish_provider_attempt", pause)
+    monkeypatch.setattr(type(operation_store[3]), "complete_v4_title_result_sync", pause)
     monkeypatch.setattr(litellm, "acompletion", lambda **kwargs: asyncio.sleep(0, result=raw_reply(kwargs["model"])))
     task = asyncio.create_task(
         driver.run_prepared_title_provider(
@@ -753,76 +751,59 @@ async def test_title_two_current_writers_have_one_accounting_commit(operation_st
         )
     )
     try:
-        await asyncio.wait_for(reached.wait(), timeout=10)
-        first_work, second_work = inventory_work(running), inventory_work(running)
-        first = await driver.read_current_title_result(service=service, running=running, required_work=first_work)
-        second = await driver.read_current_title_result(service=service, running=running, required_work=second_work)
-
-        async def finish(current, binding):
-            from elspeth.web.required_work import RequiredWorkSource
-
-            ticket = binding.coordinator.reserve(
-                RequiredWorkSource.TITLE_PROVIDER_SETTLEMENT_SQL,
-                transition_ordinal=binding.transition_ordinal,
-                semantic_ordinal=6,
-                recurrence_ordinal=0,
-            )
-            return await operation_store[3].finish_provider_attempt(
-                session_operation_context=running.session_operation_context,
-                call=current.settlement.audit_call,
-                required_work=ticket,
-                continuation_title=current.settlement,
-            )
-
-        outcomes = await asyncio.gather(finish(first, first_work), finish(second, second_work), return_exceptions=True)
-        assert sum(outcome is None for outcome in outcomes) == 1
-        assert sum(isinstance(outcome, ContinuationCASConflict) for outcome in outcomes) == 1
-        assert len(sql_rows(operation_store)[1]) == 1
-        first_work.coordinator.assert_completed()
-        second_work.coordinator.assert_completed()
+        assert await asyncio.to_thread(reached.wait, 10)
+        assert len(arguments) == 1
+        # Both actual writers receive the very same issued physical result,
+        # admission and owner; no replacement custody or permit is constructed.
+        result = await asyncio.to_thread(original_complete, operation_store[3], **arguments[0])
+        assert result.result == arguments[0]["captured"].chunk
+        before = recovery_rows(operation_store[0])
+        resume.set()
+        with pytest.raises((AuditIntegrityError, ContinuationCASConflict)):
+            await task
+        assert recovery_rows(operation_store[0]) == before
+        assert len(sql_rows(operation_store)[0]) == len(sql_rows(operation_store)[1]) == 1
+        assert (await driver.read_current_title_result(service=service, running=running, required_work=work)).settled
+        work.coordinator.assert_completed()
     finally:
         resume.set()
-        with pytest.raises(ContinuationCASConflict):
+        if not task.done():
             await task
-        work.coordinator.assert_completed()
         operation_store[1].release(running.session_operation_context)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", (False, True))
-async def test_title_post_retention_refresh_failure_keeps_original_and_closes_registered_work_before_replay(
-    operation_store, tmp_path, monkeypatch, cancel
-):
-    from elspeth.web.required_work import RequiredWorkSource
-
+async def test_title_post_commit_handoff_failure_keeps_original_and_complete_result(operation_store, tmp_path, monkeypatch, cancel):
     running, service, work, prepared, _requests = await title_case(operation_store, tmp_path, monkeypatch)
-    original_refresh = driver.refresh_current_title_settlement
-    marker = asyncio.CancelledError("original source read cancellation") if cancel else AuditIntegrityError("original source read refusal")
-    read_results = []
+    original_complete = type(operation_store[3]).complete_v4_title_result_sync
+    marker = (
+        asyncio.CancelledError("original source handoff cancellation") if cancel else AuditIntegrityError("original source handoff refusal")
+    )
+    committed = []
 
-    async def fail_after_real_current_read(custody):
-        result = await original_refresh(custody)
-        read_results.append(result)
+    def fail_after_real_commit(self, **kwargs):
+        result = original_complete(self, **kwargs)
+        committed.append(result)
         raise marker
 
-    monkeypatch.setattr(driver, "refresh_current_title_settlement", fail_after_real_current_read)
+    monkeypatch.setattr(type(operation_store[3]), "complete_v4_title_result_sync", fail_after_real_commit)
     monkeypatch.setattr(litellm, "acompletion", lambda **kwargs: asyncio.sleep(0, result=raw_reply(kwargs["model"])))
     try:
         with pytest.raises(BaseException) as caught:
             await driver.run_prepared_title_provider(
                 prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
             )
-        assert caught.value is marker and len(read_results) == 1
-        assert not [
-            ticket for ticket in work.coordinator._tickets.values() if ticket.key.source is RequiredWorkSource.TITLE_PROVIDER_SETTLEMENT_SQL
-        ]
+        assert caught.value is marker or caught.value.__cause__ is marker
+        assert len(committed) == 1
         work.coordinator.assert_completed()
         rows, ledger, _saved = sql_rows(operation_store)
-        assert len(rows) == 1 and not ledger and rows[0].settled_at is None
-        monkeypatch.setattr(driver, "refresh_current_title_settlement", original_refresh)
+        assert len(rows) == len(ledger) == 1 and rows[0].settled_at is not None
+        before = recovery_rows(operation_store[0])
         replay = inventory_work(running)
-        assert (await driver.settle_current_title_result(service=service, running=running, required_work=replay)).settled
-        assert len(sql_rows(operation_store)[1]) == 1
+        current = await driver.settle_current_title_result(service=service, running=running, required_work=replay)
+        assert current.settled and current.settlement.result == committed[0].result
+        assert recovery_rows(operation_store[0]) == before
         replay.coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)
@@ -847,7 +828,7 @@ async def test_title_new_dispatch_rechecks_actual_title_eligibility_without_bles
     running, _service, work, prepared, _requests = await title_case(operation_store, tmp_path, monkeypatch)
     await actual_title_update(operation_store, running, work, "Current Owner Renamed This")
     sdk = []
-    original_admit = type(operation_store[3]).begin_continuation_title_attempt
+    original_admit = type(operation_store[3]).begin_v4_continuation_title_attempt
     owner_snapshots = []
 
     async def inspect_actual_admission(self, **kwargs):
@@ -859,7 +840,7 @@ async def test_title_new_dispatch_rechecks_actual_title_eligibility_without_bles
             owner_snapshots.append((before, after))
             assert after == before
 
-    monkeypatch.setattr(type(operation_store[3]), "begin_continuation_title_attempt", inspect_actual_admission)
+    monkeypatch.setattr(type(operation_store[3]), "begin_v4_continuation_title_attempt", inspect_actual_admission)
 
     async def completion(**kwargs):
         sdk.append(kwargs)
@@ -904,12 +885,10 @@ async def test_title_quota_clock_post_return_expiry_disposes_only_actual_known_u
     monkeypatch.setattr(ProviderCallCustody, "admit", complete_then_block)
     monkeypatch.setattr(litellm, "acompletion", completion)
     try:
-        assert (
-            await driver.run_prepared_title_provider(
-                prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
-            )
-            is None
+        result = await driver.run_prepared_title_provider(
+            prepared=prepared, invocation_owner=ProviderInvocationOwner(service=operation_store[3], required_work=work)
         )
+        assert type(result) is TitleNoSdkTerminalResult
         assert len(admitted) == 1 and not sdk
         rows, ledger, saved = sql_rows(operation_store)
         assert len(rows) == len(ledger) == 1 and rows[0].settled_at is not None
@@ -928,8 +907,8 @@ async def test_title_cancellation_during_real_response_retention_joins_commit_an
     calls = observer(monkeypatch)
     sdk = []
 
-    def pause_received(conn, running, selected, following, descriptor, stage):
-        result = original_append(conn, running, selected, following, descriptor, stage)
+    def pause_received(conn, running, selected, following, descriptor, stage, **kwargs):
+        result = original_append(conn, running, selected, following, descriptor, stage, **kwargs)
         if stage == "received":
             reached.set()
             assert resume.wait(timeout=10)

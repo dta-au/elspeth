@@ -29,7 +29,6 @@ from elspeth.web.composer.continuation_codec import (
     encode_private_chunk,
 )
 from elspeth.web.composer.continuation_limits import (
-    CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES,
     CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
     CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES,
 )
@@ -49,14 +48,10 @@ from elspeth.web.continuation_retention_memo import (
     RetentionStageMemo,
     SnapshotDecodeKey,
     StateCredentialStepKey,
-    borrow_legacy_advisor_inflight_memo,
     borrow_v4_preparation_memo_scope,
-    current_legacy_advisor_preparation_memo,
     current_retention_stage_memo,
     current_v4_preparation_memo,
-    finish_legacy_advisor_preparation_memo,
     finish_v4_preparation_memo,
-    legacy_advisor_preparation_memo_scope,
     prepare_retention_sql_callable,
     retention_stage_memo_scope,
     v4_preparation_memo_scope,
@@ -192,49 +187,9 @@ def test_canonical_sha_proofs_are_exact_and_share_one_existing_byte_budget() -> 
 
 
 @pytest.mark.asyncio
-async def test_legacy_advisor_wider_shared_text_pool_keeps_individual_and_default_limits() -> None:
+async def test_v4_preparation_keeps_individual_text_entry_limits() -> None:
     clock = _advisor_clock()
     bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
-    retained_bound = CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES
-    proof_weight = 250_000 * 2 + 64 + len(str(bound))
-    fits = retained_bound // proof_weight
-    assert fits == 10 and fits * proof_weight <= retained_bound < (fits + 1) * proof_weight
-    keys = [CanonicalTextEncodingKey(chr(ord("a") + index) * 250_000, bound) for index in range(fits + 2)]
-    calls: list[str] = []
-
-    def encode(key: CanonicalTextEncodingKey) -> bytes:
-        calls.append(key.canonical[:1])
-        return key.canonical.encode("utf-8")
-
-    with legacy_advisor_preparation_memo_scope(clock) as parent:
-        for key in keys[:fits]:
-            parent.canonical_text_proof(key, encode, hashlib.sha256)
-        assert len(parent._canonical_proofs) == fits
-        assert parent._canonical_proof_bytes == fits * proof_weight
-        for key in keys[:fits]:
-            parent.canonical_text_proof(key, encode, hashlib.sha256)
-        assert len(calls) == fits
-        parent.canonical_text_proof(keys[fits], encode, hashlib.sha256)
-        assert len(parent._canonical_proofs) == fits
-        assert (encode, hashlib.sha256, keys[0]) not in parent._canonical_proofs
-        parent.canonical_text_proof(keys[fits + 1], encode, hashlib.sha256)
-        assert (encode, hashlib.sha256, keys[1]) not in parent._canonical_proofs
-        assert parent._canonical_proof_bytes <= retained_bound
-        with borrow_legacy_advisor_inflight_memo(parent, clock):
-            child = current_retention_stage_memo()
-            assert child is not None and child is not parent
-            child.canonical_text_proof(keys[0], encode, hashlib.sha256)
-            assert not child._canonical_proofs and len(parent._canonical_proofs) == fits
-        assert not child.active
-    assert parent.cached_entry_count == 0
-
-    with retention_stage_memo_scope() as default:
-        for key in keys[:fits]:
-            default.canonical_text_proof(key, encode, hashlib.sha256)
-        assert len(default._canonical_proofs) == bound // proof_weight == 2
-        assert default._canonical_proof_bytes <= bound
-        assert (encode, hashlib.sha256, keys[0]) not in default._canonical_proofs
-
     oversized = CanonicalTextEncodingKey("x" * 600_000, bound)
     block_text = "z" * (bound - 63)
     block = RecorderBlockHashKey(hashlib.sha256(block_text.encode()).hexdigest(), block_text)
@@ -248,7 +203,7 @@ async def test_legacy_advisor_wider_shared_text_pool_keeps_individual_and_defaul
         oversized_calls.append("block")
         assert hashlib.sha256(key.canonical.encode()).hexdigest() == key.expected_digest
 
-    with legacy_advisor_preparation_memo_scope(_advisor_clock()) as parent:
+    with v4_preparation_memo_scope(clock) as parent:
         for _ in range(2):
             parent.canonical_text_proof(oversized, oversized_encode, hashlib.sha256)
             parent.recorder_block_hash(block, verify_block)
@@ -679,181 +634,6 @@ async def test_deferred_cancellation_joins_worker_before_scope_closes_and_preser
     finally:
         release.set()
         await async_workers.shutdown_async_workers()
-
-
-@pytest.mark.asyncio
-async def test_legacy_advisor_four_fresh_sql_cuts_share_only_exact_immutable_text() -> None:
-    clock = _advisor_clock()
-    worker_only = ContextVar("legacy-advisor-sql-cut", default="fresh")
-    calls = {"text": 0, "block": 0, "request": 0, "snapshot": 0, "chunk": 0, "scan": 0, "state": 0}
-    text = '{"whole":"input"}'
-    text_key = CanonicalTextEncodingKey(text, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
-    block_key = RecorderBlockHashKey(hashlib.sha256(text.encode()).hexdigest(), text)
-    request_key = RecorderRequestTextKey(text, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
-    snapshot_key = _snapshot_key()
-    chunk = encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}')
-    chunk_key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
-    scan_key = _scan_key()
-    state_key = StateCredentialStepKey(scan_key)
-
-    def encode(key: CanonicalTextEncodingKey) -> bytes:
-        calls["text"] += 1
-        return key.canonical.encode()
-
-    def verify_block(key: RecorderBlockHashKey) -> None:
-        calls["block"] += 1
-        assert hashlib.sha256(key.canonical.encode()).hexdigest() == key.expected_digest
-
-    def prepare_request(_key: RecorderRequestTextKey) -> RecorderRequestTextProof:
-        calls["request"] += 1
-        return RecorderRequestTextProof("{}", ())
-
-    def decode(_encoded: str) -> ContinuationFrameStack:
-        calls["snapshot"] += 1
-        return initial_stack()
-
-    def verify_chunk(_canonical: str) -> None:
-        calls["chunk"] += 1
-
-    def scan(key: CredentialScanKey) -> CredentialMaterialFinding | None:
-        calls["scan"] += 1
-        return _scan(key)
-
-    def scan_state(key: StateCredentialStepKey) -> CredentialMaterialFinding | None:
-        calls["state"] += 1
-        return _scan(key.scan)
-
-    with legacy_advisor_preparation_memo_scope(clock) as memo:
-
-        def sql_cut(ordinal: int) -> int:
-            assert worker_only.get() == "fresh"
-            assert current_legacy_advisor_preparation_memo(clock) is memo
-            if ordinal == 4:
-                with borrow_legacy_advisor_inflight_memo(memo, clock):
-                    child = current_retention_stage_memo()
-                    assert child is not None and child is not memo
-                    assert current_legacy_advisor_preparation_memo(clock) is None
-            worker_only.set(f"cut-{ordinal}")
-            assert memo.canonical_text_proof(text_key, encode, hashlib.sha256).digest == block_key.expected_digest
-            memo.recorder_block_hash(block_key, verify_block)
-            assert memo.recorder_request_text(request_key, prepare_request) == RecorderRequestTextProof("{}", ())
-            memo.snapshot(snapshot_key, decode)
-            memo.private_chunk(chunk_key, verify_chunk)
-            memo.credential(scan_key, scan)
-            memo.state_credentials(state_key, scan_state)
-            return ordinal
-
-        for ordinal in range(1, 5):
-            outcome = await async_workers.run_required_sql_finish_once(publication_ticket(), lambda ordinal=ordinal: sql_cut(ordinal))
-            assert isinstance(outcome, RequiredSQLReturned) and outcome.value == ordinal
-        assert calls == {"text": 1, "block": 1, "request": 1, "snapshot": 4, "chunk": 4, "scan": 4, "state": 4}
-        assert memo.cached_entry_count == 3
-        clock.finish_preparation()
-        finish_legacy_advisor_preparation_memo(clock)
-        assert current_retention_stage_memo() is None and memo.cached_entry_count == 0
-        assert not memo.active
-    assert current_retention_stage_memo() is None
-
-
-@pytest.mark.asyncio
-async def test_legacy_advisor_nested_cut_has_fresh_full_local_proofs() -> None:
-    clock = _advisor_clock()
-    calls = {"text": 0, "snapshot": 0, "chunk": 0, "scan": 0, "state": 0}
-    text_key = CanonicalTextEncodingKey('{"whole":"same"}', 100)
-    snapshot_key = _snapshot_key()
-    chunk = encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}')
-    chunk_key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
-    scan_key = _scan_key()
-    state_key = StateCredentialStepKey(scan_key)
-    children: list[RetentionStageMemo] = []
-
-    def encode(key: CanonicalTextEncodingKey) -> bytes:
-        calls["text"] += 1
-        return key.canonical.encode()
-
-    def decode(_encoded: str) -> ContinuationFrameStack:
-        calls["snapshot"] += 1
-        return initial_stack()
-
-    def verify_chunk(_canonical: str) -> None:
-        calls["chunk"] += 1
-
-    def scan(key: CredentialScanKey) -> CredentialMaterialFinding | None:
-        calls["scan"] += 1
-        return _scan(key)
-
-    def scan_state(key: StateCredentialStepKey) -> CredentialMaterialFinding | None:
-        calls["state"] += 1
-        return _scan(key.scan)
-
-    with legacy_advisor_preparation_memo_scope(clock) as parent:
-        for _cut in range(2):
-            with borrow_legacy_advisor_inflight_memo(parent, clock):
-                child = current_retention_stage_memo()
-                assert child is not None and child is not parent
-                children.append(child)
-                for _repeat in range(2):
-                    child.canonical_text_proof(text_key, encode, hashlib.sha256)
-                    child.snapshot(snapshot_key, decode)
-                    child.private_chunk(chunk_key, verify_chunk)
-                    child.credential(scan_key, scan)
-                    child.state_credentials(state_key, scan_state)
-                assert child.cached_entry_count > 0
-                assert parent.cached_entry_count == 1
-            assert current_retention_stage_memo() is parent and not child.active
-        assert calls == {"text": 1, "snapshot": 2, "chunk": 2, "scan": 2, "state": 2}
-        assert children[0] is not children[1] and all(item.cached_entry_count == 0 for item in children)
-    assert parent.cached_entry_count == 0 and current_retention_stage_memo() is None
-
-
-@pytest.mark.asyncio
-async def test_legacy_advisor_text_identity_nested_borrow_and_late_close() -> None:
-    clock, foreign_clock = _advisor_clock(), _advisor_clock()
-    calls: list[tuple[str, str]] = []
-
-    def encode(key: CanonicalTextEncodingKey) -> bytes:
-        calls.append(("encode", key.canonical))
-        return key.canonical.encode()
-
-    def other_encode(key: CanonicalTextEncodingKey) -> bytes:
-        calls.append(("other", key.canonical))
-        return key.canonical.encode()
-
-    first = CanonicalTextEncodingKey("whole", 100)
-    changed = CanonicalTextEncodingKey("changed", 100)
-    reference = encode_private_chunk(codec="composer.messages.v1", canonical='{"safe":true}').reference
-    referred = replace(first, reference=reference)
-    entered, release = threading.Event(), threading.Event()
-
-    def delayed(key: CanonicalTextEncodingKey) -> bytes:
-        entered.set()
-        assert release.wait(5)
-        return key.canonical.encode()
-
-    with legacy_advisor_preparation_memo_scope(clock) as memo:
-        assert memo.canonical_text_proof(first, encode, hashlib.sha256) is memo.canonical_text_proof(first, encode, hashlib.sha256)
-        memo.canonical_text_proof(changed, encode, hashlib.sha256)
-        memo.canonical_text_proof(referred, encode, hashlib.sha256)
-        memo.canonical_text_proof(first, other_encode, hashlib.sha256)
-        assert calls == [("encode", "whole"), ("encode", "changed"), ("encode", "whole"), ("other", "whole")]
-        with retention_stage_memo_scope() as unrelated:
-            with pytest.raises(AuditIntegrityError, match="foreign preparation memo"), borrow_legacy_advisor_inflight_memo(memo, clock):
-                pass
-            assert unrelated is current_retention_stage_memo()
-        with pytest.raises(AuditIntegrityError, match="original action clock"):
-            current_legacy_advisor_preparation_memo(foreign_clock)
-        with borrow_legacy_advisor_inflight_memo(memo, clock):
-            child = current_retention_stage_memo()
-            assert child is not None and child is not memo
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(child.canonical_text_encoding, CanonicalTextEncodingKey("late", 100), delayed)
-                assert entered.wait(5)
-                memo.close()
-                release.set()
-                assert future.result(timeout=5) == b"late"
-            assert child.active and child.cached_entry_count == 0
-        assert memo.cached_entry_count == 0 and current_retention_stage_memo() is None
-    assert not memo.active and not child.active
 
 
 @pytest.mark.asyncio
@@ -1494,11 +1274,7 @@ async def test_evidence_reference_results_borrow_only_original_v4_parent() -> No
         ordinary.evidence_references(key, produce)
         ordinary.evidence_references(key, produce)
         assert ordinary.cached_entry_count == 0
-    with legacy_advisor_preparation_memo_scope(_advisor_clock()) as legacy:
-        legacy.evidence_references(key, produce)
-        legacy.evidence_references(key, produce)
-        assert legacy.cached_entry_count == 0
-    assert calls == 4
+    assert calls == 2
     clock = _advisor_clock()
     with v4_preparation_memo_scope(clock) as parent:
         for _ in range(2):
@@ -1506,15 +1282,15 @@ async def test_evidence_reference_results_borrow_only_original_v4_parent() -> No
                 child.evidence_references(key, produce)
                 assert child.cached_entry_count == 0 and parent.cached_entry_count == 1
             assert not child.active and parent.active
-        assert calls == 5
+        assert calls == 3
         clock.finish_preparation()
         finish_v4_preparation_memo(clock)
         assert parent.cached_entry_count == parent._evidence_reference_bytes == 0
         parent.evidence_references(key, produce)
-        assert calls == 6 and parent.cached_entry_count == 0
+        assert calls == 4 and parent.cached_entry_count == 0
     with v4_preparation_memo_scope(_advisor_clock()) as other:
         other.evidence_references(key, produce)
-        assert calls == 7
+        assert calls == 5
 
 
 @pytest.mark.asyncio
@@ -1674,7 +1450,7 @@ async def test_evidence_reference_close_during_borrowed_miss_cannot_publish() ->
 
 
 @pytest.mark.asyncio
-async def test_semantic_inflight_none_borrows_v4_text_but_keeps_fresh_local_proofs() -> None:
+async def test_semantic_preparation_borrows_v4_text_but_keeps_fresh_local_proofs() -> None:
     clock = _advisor_clock()
     key = _evidence_key()
     changed_reference = replace(key, reference=key.reference.model_copy(update={"digest": "1" * 64}))
@@ -1694,7 +1470,7 @@ async def test_semantic_inflight_none_borrows_v4_text_but_keeps_fresh_local_proo
 
         def actual_cut() -> int:
             assert current_v4_preparation_memo(clock) is parent
-            with borrow_legacy_advisor_inflight_memo(None, None):
+            with borrow_v4_preparation_memo_scope():
                 child = current_retention_stage_memo()
                 assert child is not None and child is not parent
                 assert current_v4_preparation_memo(clock) is parent
@@ -1714,7 +1490,7 @@ async def test_semantic_inflight_none_borrows_v4_text_but_keeps_fresh_local_proo
         assert local_calls == [key.canonical, key.canonical]
         assert parent.cached_entry_count == 3
     assert not parent.active and parent.cached_entry_count == 0
-    with borrow_legacy_advisor_inflight_memo(None, None):
+    with borrow_v4_preparation_memo_scope():
         ordinary = current_retention_stage_memo()
         assert ordinary is not None and current_v4_preparation_memo() is None
         ordinary.evidence_references(key, references)
@@ -1730,7 +1506,7 @@ async def test_semantic_inflight_v4_parent_closure_preserves_original_outcome(ex
     marker = asyncio.CancelledError("original cancellation") if exit_kind == "cancel" else RuntimeError("original failure")
     observed: BaseException | None = None
     try:
-        with v4_preparation_memo_scope(clock) as parent, borrow_legacy_advisor_inflight_memo(None, None):
+        with v4_preparation_memo_scope(clock) as parent, borrow_v4_preparation_memo_scope():
             child = current_retention_stage_memo()
             assert child is not None and current_v4_preparation_memo(clock) is parent
             child.canonical_text_proof(CanonicalTextEncodingKey("{}", 100), _semantic_text_bytes, hashlib.sha256)
@@ -1775,7 +1551,7 @@ async def test_semantic_inflight_v4_late_result_cannot_repopulate_finished_paren
         return (key.reference,)
 
     with v4_preparation_memo_scope(clock) as parent:
-        with borrow_legacy_advisor_inflight_memo(None, None), ThreadPoolExecutor(max_workers=1) as executor:
+        with borrow_v4_preparation_memo_scope(), ThreadPoolExecutor(max_workers=1) as executor:
             child = current_retention_stage_memo()
             assert child is not None
             future = executor.submit(child.evidence_references, key, delayed)

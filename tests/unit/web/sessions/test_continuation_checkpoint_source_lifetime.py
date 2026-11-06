@@ -26,7 +26,7 @@ from elspeth.web.composer import continuation_checkpoint_observation as observat
 from elspeth.web.composer import continuation_checkpoint_projection as early_projection
 from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveAdvanced
 from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointCompleteReview
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions import continuation_checkpoint_early_owed_overflow as early_completion
 from elspeth.web.sessions import continuation_checkpoint_early_return as early_return
@@ -224,7 +224,7 @@ async def test_original_projection_sql_error_keeps_then_releases_actual_source(o
 async def _run_end(store, tmp_path, *, blocked: bool) -> Probes:
     probes = []
     with pytest.MonkeyPatch.context() as patch:
-        policy = continuation_policy_v4_from_settings(
+        policy = continuation_policy_from_settings(
             continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
         )
         assert policy is not None

@@ -19,14 +19,14 @@ def policy(**changes):
     return replace(CommonProviderCostPolicy(75, 2 * 1024 * 1024, 16384, Decimal("5.00"), 2), **changes)
 
 
-def owner(*, amount="5.00", calls=0, charges=(), code=None, applicable=True, lifecycle=1):
+def owner(*, amount="5.00", calls=0, charges=(), code=None):
     return CommonProviderCostBudget(
         CommonProviderCostSnapshot(
             "session",
             "request",
-            lifecycle,
-            "legacy_empty_v1" if applicable else "not_applicable",
-            policy(max_cumulative_provider_cost=Decimal(amount)) if applicable else None,
+            2,
+            "continuation_v2",
+            policy(max_cumulative_provider_cost=Decimal(amount)),
             calls,
             charges,
             code,
@@ -83,20 +83,9 @@ def test_unknown_is_not_zero_and_is_sticky_across_cold_owner():
         cold.require_dispatch()
 
 
-def test_v2_retains_unknown_without_activating_legacy_cap():
-    budget = owner(
-        applicable=False,
-        lifecycle=2,
-        calls=1,
-        charges=(CommonProviderCostCharge("actual", None, "not_available"),),
-        code="COST_UNAVAILABLE",
-    )
-    budget.require_output()
-    budget.require_end_headroom()
-    budget.require_dispatch()
-    assert budget.snapshot().cost_known is False
-    with pytest.raises(ValueError, match="cannot activate"):
-        owner(lifecycle=2)
+def test_current_budget_keeps_original_logical_binding():
+    budget = owner()
+    budget.validate_binding(session_id="session", request_id="request", lifecycle_version=2)
     with pytest.raises(AuditIntegrityError, match="lifecycle"):
         budget.validate_binding(session_id="session", request_id="request", lifecycle_version=1)
 
@@ -133,7 +122,7 @@ def test_request_limit_measures_utf8_bytes_and_preserves_lower_advisor_limit():
     size = len(canonical_json(request).encode("utf-8"))
     for limit, refused in ((size, False), (size - 1, True)):
         budget = CommonProviderCostBudget(
-            CommonProviderCostSnapshot("session", "request", 1, "legacy_empty_v1", policy(max_request_bytes=limit))
+            CommonProviderCostSnapshot("session", "request", 2, "continuation_v2", policy(max_request_bytes=limit))
         )
         wire = {**request, "max_tokens": 100}
         if refused:
@@ -155,7 +144,7 @@ def test_request_view_retains_message_and_tool_values_and_leaves_absent_tools_ab
     ):
         size = len(canonical_json(expected_wire).encode("utf-8"))
         budget = CommonProviderCostBudget(
-            CommonProviderCostSnapshot("session", "request", 1, "legacy_empty_v1", policy(max_request_bytes=size))
+            CommonProviderCostSnapshot("session", "request", 2, "continuation_v2", policy(max_request_bytes=size))
         )
         budget.prepare_request(request)
         assert request["messages"] is messages
@@ -169,15 +158,15 @@ def test_request_view_retains_message_and_tool_values_and_leaves_absent_tools_ab
 @pytest.mark.parametrize("allowance", (True, 0, 1.0))
 def test_request_view_rejects_nonpositive_or_nonexact_completion_allowance(allowance: object):
     request = {"messages": [], "max_tokens": allowance}
-    budget = CommonProviderCostBudget(CommonProviderCostSnapshot("session", "request", 1, "legacy_empty_v1", policy()))
+    budget = CommonProviderCostBudget(CommonProviderCostSnapshot("session", "request", 2, "continuation_v2", policy()))
 
     with pytest.raises(AuditIntegrityError, match="invalid owned completion allowance"):
         budget.prepare_request(request)
     assert request["max_tokens"] is allowance
 
 
-def test_nondefault_legacy_repair_configuration_refuses_before_dispatch():
-    budget = CommonProviderCostBudget(CommonProviderCostSnapshot("session", "request", 1, "legacy_empty_v1", policy(repair_budget=3)))
+def test_nondefault_repair_configuration_refuses_before_dispatch():
+    budget = CommonProviderCostBudget(CommonProviderCostSnapshot("session", "request", 2, "continuation_v2", policy(repair_budget=3)))
     with pytest.raises(CommonProviderCostRefused, match="REPAIR_POLICY_UNSUPPORTED"):
         budget.require_dispatch()
     assert budget.snapshot().physical_calls == 0
@@ -205,7 +194,7 @@ def test_settled_call_is_charged_once_and_failed_attempt_does_not_count_as_valid
 
 
 def test_dispatch_counts_physical_call_and_refuses_output_until_settled():
-    budget = CommonProviderCostBudget(CommonProviderCostSnapshot("session", "request", 1, "legacy_empty_v1", policy(max_provider_calls=1)))
+    budget = CommonProviderCostBudget(CommonProviderCostSnapshot("session", "request", 2, "continuation_v2", policy(max_provider_calls=1)))
 
     budget.dispatched()
     assert budget.snapshot().physical_calls == 1
@@ -267,56 +256,14 @@ def test_accountable_unknown_cost_and_over_limit_response_refuse():
         excessive.require_output()
 
 
-def test_capture_keeps_existing_graph_and_v2_outside_legacy_policy(tmp_path):
-    from elspeth.web.composer.provider_cost import capture_common_provider_cost
-    from elspeth.web.config import WebSettings
-
-    settings = WebSettings(
-        data_dir=tmp_path,
-        composer_model="test/planner",
-        composer_boot_probe_enabled=False,
-        composer_max_composition_turns=3,
-        composer_max_discovery_turns=2,
-        composer_timeout_seconds=20.0,
-        composer_rate_limit_per_minute=10,
-        composer_planner_repair_budget=3,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    for lifecycle, empty in ((1, False), (2, False), (2, True)):
-        budget = capture_common_provider_cost(
-            session_id="session",
-            request_id="request",
-            lifecycle_version=lifecycle,
-            initially_empty=empty,
-            settings=settings,
-        )
-        assert budget.snapshot().policy is None
-        assert budget.snapshot().applicability == "not_applicable"
-        budget.require_dispatch()
-    legacy = capture_common_provider_cost(
-        session_id="session",
-        request_id="request",
-        lifecycle_version=1,
-        initially_empty=True,
-        settings=settings,
-    )
-    assert legacy.snapshot().applicability == "legacy_empty_v1"
-    with pytest.raises(CommonProviderCostRefused, match="REPAIR_POLICY_UNSUPPORTED"):
-        legacy.require_dispatch()
+# Retired capture_common_provider_cost's empty-V1/non-applicable positives:
+# current request budgets come from admitted Continuation policy and SQL usage.
 
 
 @pytest.mark.parametrize(
     "invalid_lifecycle",
-    (pytest.param(True, id="bool-is-not-an-exact-int"), pytest.param(1.0, id="float-is-not-an-exact-int")),
+    (pytest.param(True, id="bool-is-not-an-exact-int"), pytest.param(2.0, id="float-is-not-an-exact-int"), 1),
 )
-def test_capture_rejects_non_exact_lifecycle_without_coercion(closed_local_settings, invalid_lifecycle: object):
-    from elspeth.web.composer.provider_cost import capture_common_provider_cost
-
+def test_snapshot_rejects_unsupported_lifecycle_without_coercion(invalid_lifecycle: object):
     with pytest.raises(ValueError, match="unsupported immutable lifecycle"):
-        capture_common_provider_cost(
-            session_id="session",
-            request_id="request",
-            lifecycle_version=invalid_lifecycle,
-            initially_empty=True,
-            settings=closed_local_settings,
-        )
+        CommonProviderCostSnapshot("session", "request", invalid_lifecycle, "continuation_v2", policy())

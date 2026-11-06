@@ -9,7 +9,7 @@ import pytest
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import EffectFrontierEntry
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt
 from elspeth.web.sessions.continuation_paid_overflow import (
@@ -33,7 +33,7 @@ _ATTEMPT = "00000000-0000-4000-8000-000000000005"
 
 
 def _source() -> tuple[StoredContinuationSnapshot, PaidOverflowIdentity]:
-    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=20000))
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=20000))
     assert policy is not None
     base = initial_stack()
     frame = base.frames[0].model_copy(update={"ingress_phase": "title_pending", "title_attempt_id": _ATTEMPT})

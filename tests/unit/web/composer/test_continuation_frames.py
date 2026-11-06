@@ -4,9 +4,10 @@ from uuid import UUID
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.continuation import (
     ContinuationFrameStack,
-    ContinuationProviderCostPolicy,
+    ContinuationProviderCostPolicyV2,
     EffectFrontierEntry,
     InitializeFrame,
     LogicalRequestBinding,
@@ -18,7 +19,7 @@ from elspeth.web.composer.continuation_codec import (
     decode_continuation_snapshot,
     encode_continuation_snapshot,
 )
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from tests.helpers.continuation_policy import continuation_test_settings, minimal_continuation_policy
 
 
@@ -38,10 +39,11 @@ def initial_stack():
             request_id="original",
             initial_trust_mode="auto_commit",
         ),
-        provider_cost_policy=ContinuationProviderCostPolicy(
-            applicability="not_applicable",
+        provider_cost_policy=ContinuationProviderCostPolicyV2(
+            applicability="continuation_v2",
             lifecycle_version=2,
             accounting_owner="physical_audit_and_token_ledger",
+            admission_policy_hash=policy.policy_hash,
         ),
         policy_hash=policy.policy_hash,
         admission_policy_json=policy.model_dump_json(),
@@ -77,18 +79,16 @@ def test_unknown_dispatch_is_not_a_handoff_boundary():
     assert not stack.model_copy(update={"pending_settlement_ids": ("attempt:1",)}).is_handoff_safe
 
 
-def test_paid_overflow_frontier_is_v4_only_and_never_handoff_safe():
+def test_paid_overflow_frontier_is_retained_and_never_handoff_safe():
     original = initial_stack()
     overflow = EffectFrontierEntry(effect_id="provider:3:0", disposition="paid_overflow", receipt_id="paid-overflow:receipt")
-    with pytest.raises(AuditIntegrityError):
-        decode_continuation_snapshot(encode_continuation_snapshot(original.model_copy(update={"effect_frontier": (overflow,)})))
-
-    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=4096))
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=4096))
     assert policy is not None
     v4 = original.model_copy(
         update={
             "policy_hash": policy.policy_hash,
             "admission_policy_json": policy.model_dump_json(),
+            "provider_cost_policy": original.provider_cost_policy.model_copy(update={"admission_policy_hash": policy.policy_hash}),
             "effect_frontier": (overflow,),
         }
     )
@@ -97,24 +97,41 @@ def test_paid_overflow_frontier_is_v4_only_and_never_handoff_safe():
     assert not restored.is_handoff_safe
 
 
-def test_paid_incomplete_frontier_is_v4_only_and_never_handoff_safe():
+def test_paid_incomplete_frontier_is_retained_and_never_handoff_safe():
     original = initial_stack()
     incomplete = EffectFrontierEntry(effect_id="provider:3:0", disposition="paid_incomplete", receipt_id="paid-incomplete:receipt")
-    with pytest.raises(AuditIntegrityError):
-        decode_continuation_snapshot(encode_continuation_snapshot(original.model_copy(update={"effect_frontier": (incomplete,)})))
-
-    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=4096))
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=4096))
     assert policy is not None
     v4 = original.model_copy(
         update={
             "policy_hash": policy.policy_hash,
             "admission_policy_json": policy.model_dump_json(),
+            "provider_cost_policy": original.provider_cost_policy.model_copy(update={"admission_policy_hash": policy.policy_hash}),
             "effect_frontier": (incomplete,),
         }
     )
     restored = decode_continuation_snapshot(encode_continuation_snapshot(v4))
     assert restored.effect_frontier == (incomplete,)
     assert not restored.is_handoff_safe
+
+
+@pytest.mark.parametrize(
+    "version", ("composer.continuation.policy.v1", "composer.continuation.policy.v2", "composer.continuation.policy.v3")
+)
+def test_snapshot_refuses_retired_admission_policy_versions(version):
+    original = initial_stack()
+    policy = json.loads(original.admission_policy_json)
+    policy["schema_version"] = version
+    policy_hash = stable_hash(policy)
+    changed = original.model_copy(
+        update={
+            "admission_policy_json": canonical_json(policy),
+            "policy_hash": policy_hash,
+            "provider_cost_policy": original.provider_cost_policy.model_copy(update={"admission_policy_hash": policy_hash}),
+        }
+    )
+    with pytest.raises(AuditIntegrityError, match="unsupported schema version"):
+        decode_continuation_snapshot(encode_continuation_snapshot(changed))
 
 
 @pytest.mark.parametrize("field,value", [("schema_version", "future"), ("cursor", True), ("extra", "ignored")])
@@ -167,13 +184,14 @@ def test_reserved_id_and_initializer_are_bound_before_ingress():
 def test_v2_provider_policy_is_explicit_and_survives_cold_codec():
     original = initial_stack()
     restored = decode_continuation_snapshot(encode_continuation_snapshot(original))
-    assert restored.provider_cost_policy.applicability == "not_applicable"
+    assert restored.provider_cost_policy.applicability == "continuation_v2"
     assert restored.provider_cost_policy.lifecycle_version == 2
     assert restored.provider_cost_policy.accounting_owner == "physical_audit_and_token_ledger"
+    assert restored.provider_cost_policy.admission_policy_hash == restored.policy_hash
     assert restored.provider_cost_policy == original.provider_cost_policy
 
 
-@pytest.mark.parametrize("mutation", ["missing", "legacy", "lifecycle", "invented_total"])
+@pytest.mark.parametrize("mutation", ["missing", "legacy", "lifecycle", "admission_hash", "invented_total"])
 def test_v2_policy_codec_refuses_scope_substitution(mutation):
     data = json.loads(encode_continuation_snapshot(initial_stack()))
     if mutation == "missing":
@@ -182,6 +200,9 @@ def test_v2_policy_codec_refuses_scope_substitution(mutation):
         data["provider_cost_policy"]["applicability"] = "legacy_empty_v1"
     elif mutation == "lifecycle":
         data["provider_cost_policy"]["lifecycle_version"] = 1
+    elif mutation == "admission_hash":
+        assert data["provider_cost_policy"]["admission_policy_hash"] != "f" * 64
+        data["provider_cost_policy"]["admission_policy_hash"] = "f" * 64
     else:
         data["provider_cost_policy"]["total_cost"] = "0"
     with pytest.raises(AuditIntegrityError, match="owned codec"):

@@ -28,7 +28,7 @@ from elspeth.web.composer.continuation_codec import (
 )
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_semantic_advisor_phase import (
     SemanticAdvisorNoSdkTerminal,
     SemanticAdvisorPaidIncompleteTerminal,
@@ -64,6 +64,7 @@ from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, 
 from tests.unit.web.sessions import test_continuation_initialization as initialization_fixture
 from tests.unit.web.sessions import test_continuation_primary_v4_live as primary_fixture
 from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
+from tests.unit.web.sessions.test_continuation_primary_result import primary_input
 from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST
 from tests.unit.web.sessions.test_continuation_semantic_advisor import _semantic_case
 from tests.unit.web.sessions.test_continuation_semantic_advisor import operation_store as _operation_store
@@ -72,9 +73,7 @@ operation_store = _operation_store
 
 
 def _v4_store(store, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -169,7 +168,8 @@ async def test_v4_original_admission_checks_quota_at_entry_and_after_sql(
     timely = deadline_observation in {"active_quota", "after_preparation"}
     async with AsyncExitStack() as stack:
         if family == "primary":
-            kwargs, produced, recorder, store = await primary_fixture._v4_primary_input(operation_store, tmp_path, monkeypatch)
+            store = operation_store
+            kwargs, produced, recorder, _requests = await primary_input(store, tmp_path, monkeypatch)
             work = kwargs["required_work"]
             original_admit = primary_sql.admit_v4_primary_provider_on_connection
             original_service = SessionServiceImpl.begin_v4_continuation_primary_attempt
@@ -445,6 +445,47 @@ async def test_v4_semantic_pre_sdk_failure_closes_original_zero_use_and_cold_ter
         assert len(entries) == 1 and entries[0].prompt_tokens == entries[0].completion_tokens == 0
         assert case["request"].options["model"] == plan.requested_model == effect.requested_model == entries[0].model
         assert cold.provider_attempt_id == admission.attempt.attempt_id == physical.attempt_id
+
+        # Mutate coherent retained receipt bytes at the actual cold reader,
+        # after the original H/zero-use settlement has completed. The storage
+        # digest and length stay valid so each intended codec/binding check runs.
+        for field, replacement, message in (
+            ("schema_version", "composer.semantic-no-sdk-refusal.v9", "closed versioned codec"),
+            ("receipt_key", effect.receipt_key + ":foreign", "original refusal receipt"),
+        ):
+            changed_receipt = json.loads(receipt_json)
+            changed_receipt[field] = replacement
+            changed_payload = canonical_json(changed_receipt).encode("utf-8")
+            with store[0].begin() as conn:
+                before = semantic_fixture._rows_on_connection(conn)
+                savepoint = conn.begin_nested()
+                try:
+                    changed = conn.execute(
+                        update(chunks)
+                        .where(
+                            chunks.c.session_id == sid,
+                            chunks.c.operation_id == operation,
+                            chunks.c.chunk_key == effect.result_chunk_key,
+                        )
+                        .values(payload=changed_payload, sha256=sha256(changed_payload).hexdigest(), byte_length=len(changed_payload))
+                    )
+                    assert changed.rowcount == 1
+                    damaged = semantic_fixture._rows_on_connection(conn)
+                    with pytest.raises(AuditIntegrityError, match=message):
+                        read_v4_semantic_no_sdk_terminal_on_connection(
+                            conn, session_id=running.claim.session_id, operation_id=operation, effect_key=effect.effect_key
+                        )
+                    assert semantic_fixture._rows_on_connection(conn) == damaged and not sdk
+                finally:
+                    savepoint.rollback()
+                assert semantic_fixture._rows_on_connection(conn) == before
+                assert (
+                    read_v4_semantic_no_sdk_terminal_on_connection(
+                        conn, session_id=running.claim.session_id, operation_id=operation, effect_key=effect.effect_key
+                    )
+                    == cold
+                )
+                assert not sdk
 
         def reconstruct(tail_plan, retained_receipt=receipt_json):
             return reconstruct_semantic_no_sdk_tail_batch(

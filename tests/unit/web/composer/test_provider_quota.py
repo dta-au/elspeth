@@ -624,7 +624,7 @@ async def test_actual_common_roles_share_one_settled_cost_policy(
     owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
     budget = CommonProviderCostBudget(
         CommonProviderCostSnapshot(
-            str(session.id), "original-user-message", 1, "legacy_empty_v1", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
+            str(session.id), "original-user-message", 2, "continuation_v2", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
         )
     )
     owner.bind_cost_budget(budget)
@@ -709,7 +709,7 @@ def test_common_settled_response_exact_boundaries(cost, tokens, expected):
 
     budget = CommonProviderCostBudget(
         CommonProviderCostSnapshot(
-            "session", "request", 1, "legacy_empty_v1", CommonProviderCostPolicy(1, 2097152, 16384, Decimal("5.00"), 2)
+            "session", "request", 2, "continuation_v2", CommonProviderCostPolicy(1, 2097152, 16384, Decimal("5.00"), 2)
         )
     )
     budget.dispatched()
@@ -771,7 +771,7 @@ async def test_failed_sdk_unknown_keeps_original_outcome_and_end_unknown(
     owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
     budget = CommonProviderCostBudget(
         CommonProviderCostSnapshot(
-            str(session.id), "original-user-message", 1, "legacy_empty_v1", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
+            str(session.id), "original-user-message", 2, "continuation_v2", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
         )
     )
     owner.bind_cost_budget(budget)
@@ -871,7 +871,7 @@ async def test_cost_charge_does_not_precede_failed_required_settlement(tmp_path:
     owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
     budget = CommonProviderCostBudget(
         CommonProviderCostSnapshot(
-            str(session.id), "request", 1, "legacy_empty_v1", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
+            str(session.id), "request", 2, "continuation_v2", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
         )
     )
     owner.bind_cost_budget(budget)
@@ -1043,7 +1043,7 @@ async def test_provider_body_and_cost_refusal_follow_actual_settlement(
     owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
     budget = CommonProviderCostBudget(
         CommonProviderCostSnapshot(
-            str(session.id), "request", 1, "legacy_empty_v1", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("0.005"), 2)
+            str(session.id), "request", 2, "continuation_v2", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("0.005"), 2)
         )
     )
     owner.bind_cost_budget(budget)

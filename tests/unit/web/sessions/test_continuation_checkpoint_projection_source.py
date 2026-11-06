@@ -17,7 +17,7 @@ from elspeth.contracts.prompt_guard import (
 )
 from elspeth.web.composer.continuation_checkpoint_projection import _require_detached_source
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_runtime import restore_checkpoint_projection_runtime
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from tests.helpers.continuation_policy import continuation_test_settings
@@ -29,9 +29,7 @@ operation_store = test_composer_operation_authority.operation_store
 
 
 async def _projection_case(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy

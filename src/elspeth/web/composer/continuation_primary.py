@@ -11,7 +11,7 @@ import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, cast
+from typing import Any
 
 from sqlalchemy import Connection
 from sqlalchemy.exc import SQLAlchemyError
@@ -31,8 +31,6 @@ from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
 from elspeth.web.composer.continuation_evidence import decode_turn_evidence
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -46,7 +44,6 @@ from elspeth.web.composer.continuation_prompt_producers import CurrentContinuati
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.continuation_tool_batch import _state_from_tool_json
-from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.provider_cost import (
     CommonProviderCostBudget,
     CommonProviderCostRefused,
@@ -73,8 +70,6 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     PreparedContinuationProvider,
     StoredContinuationSnapshot,
-    V3UnboundedTailRefusal,
-    refuse_v3_retained_tail_before_paid,
 )
 from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
 from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
@@ -144,7 +139,6 @@ def _project[T](
                 StoredContinuationSnapshot,
                 PrimaryProviderResult,
                 PrimaryPaidOverflowTerminal,
-                V3UnboundedTailRefusal,
             ):
                 raise AuditIntegrityError("primary SQL returned an unfamiliar owned result")
             value = outcome.value
@@ -382,13 +376,13 @@ def _pre_sdk_failure(
 
 
 async def _read_primary_candidate(
-    *, authority: ComposerAsyncOperationAuthority, required_work: RequiredWorkBinding, issuer: PrimaryNoSdkIssuer, begin: bool
-) -> tuple[PreparedContinuationProvider | StoredContinuationSnapshot | None, tuple[asyncio.CancelledError, ...]]:
+    *, authority: ComposerAsyncOperationAuthority, required_work: RequiredWorkBinding, issuer: PrimaryNoSdkIssuer
+) -> tuple[PreparedContinuationProvider | None, tuple[asyncio.CancelledError, ...]]:
     sql, projection = required_work.reserve_pair(RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION)
     try:
         outcome = await run_required_sql_finish_once(
             sql,
-            authority.read_continuation_primary_begin_outcome if begin else authority.read_continuation_primary_prepare_outcome,
+            authority.read_continuation_primary_prepare_outcome,
             issuer,
         )
     except BaseException:
@@ -399,14 +393,14 @@ async def _read_primary_candidate(
         sql,
         projection,
         outcome,
-        expected=StoredContinuationSnapshot if begin else PreparedContinuationProvider,
+        expected=PreparedContinuationProvider,
         allow_none=True,
     )
     if failure is not None:
         if deferred:
             raise BaseExceptionGroup("PRIMARY source readback and original cancellations", [failure, *deferred])
         raise failure
-    if result is not None and not isinstance(result, (PreparedContinuationProvider, StoredContinuationSnapshot)):
+    if result is not None and type(result) is not PreparedContinuationProvider:
         raise AuditIntegrityError("PRIMARY source readback returned a foreign candidate")
     return result, deferred
 
@@ -414,7 +408,7 @@ async def _read_primary_candidate(
 def _current_cost_budget(
     conn: Connection,
     selected: SelectedContinuationState,
-    policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+    policy: ContinuationAdmissionPolicyV4,
     existing: CommonProviderCostBudget | None,
 ) -> CommonProviderCostBudget:
     source = read_continuation_cost_snapshot_on_connection(conn, selected.stack)
@@ -466,7 +460,6 @@ def _freeze_input(
         budget: CommonProviderCostBudget | None,
         *,
         action_json: str | None,
-        reprove_after: bool,
     ) -> PreparedPrimaryInvocation:
         frame = selected.stack.frames[-1]
         if type(frame) is not ComposeFrame or frame.phase != "action_ready" or frame.pending_response is not None:
@@ -499,29 +492,15 @@ def _freeze_input(
             physical_messages.append(primary_action_wire_message(action_json))
         # The SQL worker does not carry the async prompt ContextVar. The
         # current bootstrap owns the original authenticated human input.
-        try:
-            request = service._provider_gateway.prepare_continuation_primary(
-                physical_messages, tools, user_prompt=current_inputs.values.message, cost_budget=budget
-            )
-        except ComposerContextUnsupported:
-            if reprove_after:
-                producers._require_current()
-            raise
-        if reprove_after:
-            producers._require_current()
+        request = service._provider_gateway.prepare_continuation_primary(
+            physical_messages, tools, user_prompt=current_inputs.values.message, cost_budget=budget
+        )
         provider_input = request.provider_input
         return PreparedPrimaryInvocation(
             request, provider_input.evidence.messages, provider_input.tools if provider_input.tools is not None else (), budget
         )
 
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
-    if type(policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
-        cost_policy = cast("ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4", policy)
-    else:
-        if selected.stack.active_action_json is not None:
-            raise AuditIntegrityError("legacy PRIMARY cannot consume a current prescribed action")
-        current_inputs = producers._require_current()
-        return prepared_from_current(current_inputs, cost_budget, action_json=None, reprove_after=True)
     # This one fresh lock/memo brackets the current producer proof, full SQL
     # cost replay, and local input freeze. It closes before any DML or SDK.
     with (
@@ -529,13 +508,13 @@ def _freeze_input(
         retention_stage_memo_scope(),
     ):
         current_inputs = producers._require_current_on_connection(conn)
-        current_budget = _current_cost_budget(conn, selected, cost_policy, cost_budget)
+        current_budget = _current_cost_budget(conn, selected, policy, cost_budget)
         action_json = None
         if selected.stack.active_action_json is not None:
             from elspeth.web.sessions.continuation_semantic_advisor import require_current_prescribed_primary_action_on_connection
 
             action_json = require_current_prescribed_primary_action_on_connection(conn, producers.inventory.running, selected.stack)
-        return prepared_from_current(current_inputs, current_budget, action_json=action_json, reprove_after=False)
+        return prepared_from_current(current_inputs, current_budget, action_json=action_json)
 
 
 async def _run_v4_primary_after_prepared(
@@ -727,7 +706,6 @@ async def run_continuation_primary(
     | PrimarySdkTerminal
     | SdkTerminalFailure
     | PrimaryNoSdkRefusalReceipt
-    | V3UnboundedTailRefusal
 ):
     _require_owners(authority, required_work)
     running = required_work.running
@@ -749,11 +727,6 @@ async def run_continuation_primary(
     started = time.monotonic()
     clock = ContinuationActionClock(policy.actions.primary)
     budget = provider_owner.cost_budget
-    if (
-        type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
-        and budget is not None
-    ):
-        raise AuditIntegrityError("legacy Continuation policy cannot activate a current cost allowance")
     if timeout > policy.actions.primary.total:
         raise AuditIntegrityError("primary invocation cannot renew its retained action allowance")
     deadline = started + timeout
@@ -764,28 +737,6 @@ async def run_continuation_primary(
         deadline = min(deadline, started + deadline_owner.remaining_dispatch(monotonic_now=started))
     if deadline <= started:
         raise TimeoutError("primary action exhausted its original allowance before input preparation")
-    if type(policy) is ContinuationAdmissionPolicyV3:
-        if deadline_owner is not None:
-            deadline_owner.begin_settlement()
-        sql, projection = required_work.reserve_pair(
-            RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
-        )
-        try:
-            outcome = await run_required_sql_finish_once(
-                sql,
-                refuse_v3_retained_tail_before_paid,
-                authority,
-                running,
-                selected=selected,
-                inventory=producers.inventory,
-            )
-        except BaseException:
-            projection.complete_without_submission()
-            raise
-        refusal = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_STATE_SQL, outcome)
-        if type(refusal) is not V3UnboundedTailRefusal:
-            raise AuditIntegrityError("V3 retained-tail refusal lost its actual terminal owner")
-        return refusal
     sql, projection = required_work.reserve_pair(RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION)
     try:
         captured = await run_required_sql_finish_once(
@@ -807,17 +758,14 @@ async def run_continuation_primary(
     invocation = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_READ_SQL, captured)
     if type(invocation) is not PreparedPrimaryInvocation:
         raise AuditIntegrityError("primary input preparation lost its actual request")
-    if type(policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
-        if type(invocation.cost_budget) is not CommonProviderCostBudget:
-            raise AuditIntegrityError("PRIMARY input lost its original cost owner")
-        if budget is None:
-            provider_owner.bind_cost_budget(invocation.cost_budget)
-        elif invocation.cost_budget is not budget:
-            raise AuditIntegrityError("PRIMARY input replaced its original cost owner")
-        if provider_owner.cost_budget is not invocation.cost_budget:
-            raise AuditIntegrityError("PRIMARY could not bind its original cost owner")
+    if type(invocation.cost_budget) is not CommonProviderCostBudget:
+        raise AuditIntegrityError("PRIMARY input lost its original cost owner")
+    if budget is None:
+        provider_owner.bind_cost_budget(invocation.cost_budget)
     elif invocation.cost_budget is not budget:
-        raise AuditIntegrityError("legacy PRIMARY input changed its cost applicability")
+        raise AuditIntegrityError("PRIMARY input replaced its original cost owner")
+    if provider_owner.cost_budget is not invocation.cost_budget:
+        raise AuditIntegrityError("PRIMARY could not bind its original cost owner")
     if time.monotonic() >= deadline:
         raise TimeoutError("primary action allowance expired during actual input preparation")
     issuer = PrimaryNoSdkIssuer(
@@ -847,9 +795,7 @@ async def run_continuation_primary(
     except BaseException as error:
         projection.complete_without_submission()
         if issuer.prepared_candidate is not None:
-            reconciled, read_deferred = await _read_primary_candidate(
-                authority=authority, required_work=required_work, issuer=issuer, begin=False
-            )
+            reconciled, read_deferred = await _read_primary_candidate(authority=authority, required_work=required_work, issuer=issuer)
             failure = _pre_sdk_failure(error, preparing=True)
             if reconciled is not None and failure is not None:
                 return await _finish_primary_no_sdk(
@@ -869,9 +815,7 @@ async def run_continuation_primary(
         )
         issuer.bind_prepared(prepared_outcome.value)
     elif type(prepared_outcome) is RequiredSQLRaised and issuer.prepared_candidate is not None:
-        reconciled, read_deferred = await _read_primary_candidate(
-            authority=authority, required_work=required_work, issuer=issuer, begin=False
-        )
+        reconciled, read_deferred = await _read_primary_candidate(authority=authority, required_work=required_work, issuer=issuer)
         failure = _pre_sdk_failure(prepared_outcome.error, preparing=True)
         if reconciled is not None and failure is not None:
             projection.complete_without_submission()
@@ -917,99 +861,6 @@ async def run_continuation_primary(
             reason=PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED,
             original_failure=error,
         )
-    if type(policy) is ContinuationAdmissionPolicyV4:
-        try:
-            clock.finish_preparation()
-        except TimeoutError as error:
-            return await _finish_primary_no_sdk(
-                authority=authority,
-                required_work=required_work,
-                issuer=issuer,
-                reason=PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED,
-                original_failure=error,
-            )
-        return await _run_v4_primary_after_prepared(
-            service=service,
-            authority=authority,
-            selected=selected,
-            prepared=prepared,
-            invocation=invocation,
-            recorder=recorder,
-            drained=drained,
-            required_work=required_work,
-            provider_owner=provider_owner,
-            issuer=issuer,
-            clock=clock,
-            deadline=deadline,
-            env_ref_names=producers.inventory.names,
-            on_sdk_entry=on_sdk_entry,
-        )
-    sql, projection = required_work.reserve_pair(
-        RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
-    )
-    try:
-        dispatch_outcome = await run_required_sql_finish_once(sql, authority.begin_continuation_primary, prepared, no_sdk_issuer=issuer)
-    except BaseException as error:
-        projection.complete_without_submission()
-        if issuer.dispatched_candidate is not None:
-            reconciled, read_deferred = await _read_primary_candidate(
-                authority=authority, required_work=required_work, issuer=issuer, begin=True
-            )
-            failure = _pre_sdk_failure(error, preparing=True)
-            if reconciled is not None and failure is not None:
-                return await _finish_primary_no_sdk(
-                    authority=authority,
-                    required_work=required_work,
-                    issuer=issuer,
-                    reason=failure[0],
-                    original_failure=failure[1],
-                    original_cancellations=(*failure[2], *read_deferred),
-                )
-            if read_deferred:
-                raise BaseExceptionGroup("PRIMARY begin and readback cancellations", [error, *read_deferred]) from None
-        raise
-    if type(dispatch_outcome) is RequiredSQLReturned:
-        required_work.coordinator.validate_continuation_sql_outcome(
-            ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_STATE_SQL, actual_outcome=dispatch_outcome
-        )
-        issuer.bind_dispatched(dispatch_outcome.value)
-    elif type(dispatch_outcome) is RequiredSQLRaised and issuer.dispatched_candidate is not None:
-        reconciled, read_deferred = await _read_primary_candidate(
-            authority=authority, required_work=required_work, issuer=issuer, begin=True
-        )
-        failure = _pre_sdk_failure(dispatch_outcome.error, preparing=True)
-        if reconciled is not None and failure is not None:
-            projection.complete_without_submission()
-            return await _finish_primary_no_sdk(
-                authority=authority,
-                required_work=required_work,
-                issuer=issuer,
-                reason=failure[0],
-                original_failure=failure[1],
-                original_cancellations=(*failure[2], *dispatch_outcome.deferred_cancellations, *read_deferred),
-            )
-        if read_deferred:
-            projection.complete_without_submission()
-            raise BaseExceptionGroup(
-                "PRIMARY begin and readback cancellations",
-                [dispatch_outcome.error, *dispatch_outcome.deferred_cancellations, *read_deferred],
-            )
-    try:
-        dispatched = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_STATE_SQL, dispatch_outcome)
-    except BaseException as error:
-        failure = _pre_sdk_failure(error, preparing=True)
-        if issuer.can_refuse() and failure is not None:
-            return await _finish_primary_no_sdk(
-                authority=authority,
-                required_work=required_work,
-                issuer=issuer,
-                reason=failure[0],
-                original_failure=failure[1],
-                original_cancellations=failure[2],
-            )
-        raise
-    if type(dispatched) is not StoredContinuationSnapshot:
-        raise AuditIntegrityError("primary dispatch intent lost its actual complete root")
     try:
         clock.finish_preparation()
     except TimeoutError as error:
@@ -1020,75 +871,22 @@ async def run_continuation_primary(
             reason=PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED,
             original_failure=error,
         )
-    try:
-        custody = provider_owner.mint(ProviderInvocationFamily.PRIMARY)
-        custody.bind_continuation_primary_clock(clock)
-        custody.bind_primary_no_sdk_issuer(issuer)
-        frame = selected.stack.frames[-1]
-        if type(frame) is not ComposeFrame:
-            raise AuditIntegrityError("primary dispatch lost its actual compose state")
-        # The original current-message owner supplies this decoder's admission.
-        by_ref = {chunk.reference: chunk for chunk in selected.chunks}
-        state = _state_from_tool_json(by_ref[frame.state].canonical, env_ref_names=producers.inventory.names)
-        now = time.monotonic()
-        remaining = deadline - now
-        if deadline_owner is not None:
-            remaining = min(remaining, deadline_owner.remaining_dispatch(monotonic_now=now))
-        if remaining <= 0:
-            raise TimeoutError("primary action allowance expired before actual provider entry")
-        provider_input = invocation.request.provider_input
-        service._provider_gateway.verify_input(provider_input)
-        if canonical_json(invocation.messages) != canonical_json(provider_input.evidence.messages) or canonical_json(
-            invocation.tools
-        ) != canonical_json(provider_input.tools if provider_input.tools is not None else ()):
-            raise AuditIntegrityError("Primary invocation changed its original admitted wire snapshot")
-        actual = await service._provider_gateway._call_llm_outcome_with_audit(
-            provider_input.evidence.messages,
-            provider_input.tools if provider_input.tools is not None else [],
-            timeout=remaining,
-            recorder=recorder,
-            provider_custody=custody,
-            credential_state=state,
-            continuation_input_sha256=invocation.request.input_sha256,
-            prepared_input=provider_input,
-            on_sdk_entry=on_sdk_entry,
-        )
-    except BaseException as error:
-        failure = _pre_sdk_failure(error, preparing=False)
-        if failure is not None and issuer.can_refuse():
-            return await _finish_primary_no_sdk(
-                authority=authority,
-                required_work=required_work,
-                issuer=issuer,
-                reason=failure[0],
-                original_failure=failure[1],
-                original_cancellations=failure[2],
-            )
-        raise
-    snapshot = recorder.snapshot_for_continuation(drained=drained)
-    sql, projection = required_work.reserve_pair(
-        RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+    return await _run_v4_primary_after_prepared(
+        service=service,
+        authority=authority,
+        selected=selected,
+        prepared=prepared,
+        invocation=invocation,
+        recorder=recorder,
+        drained=drained,
+        required_work=required_work,
+        provider_owner=provider_owner,
+        issuer=issuer,
+        clock=clock,
+        deadline=deadline,
+        env_ref_names=producers.inventory.names,
+        on_sdk_entry=on_sdk_entry,
     )
-    try:
-        published = await clock.run(
-            "retention",
-            lambda: run_required_sql_finish_once(
-                sql,
-                authority.publish_continuation_primary,
-                prepared.binding,
-                selected=dispatched,
-                outcome=actual,
-                recorder=snapshot,
-                env_ref_names=producers.inventory.names,
-            ),
-        )
-    except BaseException:
-        projection.complete_without_submission()
-        raise
-    result = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_STATE_SQL, published)
-    if type(result) is not PrimaryProviderResult:
-        raise AuditIntegrityError("primary publication lost its actual complete result")
-    return result
 
 
 async def read_continuation_primary(

@@ -14,12 +14,9 @@ from sqlalchemy import select, update
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.bounded_json import PROVIDER_ARTIFACT_UNAVAILABLE
 from elspeth.web.composer.continuation_codec import decode_continuation_response, decode_continuation_snapshot
-from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_provider_outcomes import require_v4_successful_response_audit
-from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
-from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.database_clock import database_now
@@ -48,47 +45,15 @@ from elspeth.web.sessions.time_normalization import restore_utc
 from tests.helpers.continuation_policy import classifier_15s_probe_settings, continuation_test_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.sessions import test_continuation_classifier_primary as classifier_fixture
-from tests.unit.web.sessions import test_continuation_cold_restore as cold_fixture
-from tests.unit.web.sessions import test_continuation_initialization as initialization_fixture
-from tests.unit.web.sessions import test_continuation_live_phases as phase_fixture
-from tests.unit.web.sessions import test_continuation_v4_metadata_live as metadata_fixture
-from tests.unit.web.sessions.test_continuation_classifier_primary import _classifier_case, _invoke
+from tests.unit.web.sessions.test_continuation_classifier_primary import _applied_case, _classifier_case, _invoke
 
 operation_store = operations.operation_store
 
 
 @asynccontextmanager
-async def _v4_applied_case(store, tmp_path, monkeypatch, *, retained_payload_bytes=16 * 1_048_576):
-    """Real bounded V4 set_metadata → P4, then restore the applied classifier source."""
-    async with metadata_fixture._v4_tool_case(
-        store,
-        tmp_path,
-        monkeypatch,
-        tool="set_metadata",
-        primary_preparation_probe_15s=True,
-        retained_payload_bytes=retained_payload_bytes,
-    ) as (
-        current_store,
-        owner,
-        running,
-        sdk,
-    ):
-        await phase_fixture._advance(owner)
-        stored = owner.latest_snapshot
-        assert stored is not None and owner.finished_batch is None
-        selected = await load_selected_continuation(authority=owner.authority, running=running, selected=stored, required_work=owner.work)
-        cold = ContinuationLivePhases(owner.service, owner.authority, owner.work, owner.provider_owner, owner.lease)
-        runtime, inventory = await cold.current(selected)
-        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
-        assert current_store[0] is store[0] and len(sdk) == 1
-        yield cold, running, selected, inventory, captured, sdk
-    owner.work.coordinator.assert_completed()
-
-
-@asynccontextmanager
 async def _v4_applied_timed_case(store, tmp_path, monkeypatch):
     """Genuine applied V4 P4 with original SQL deadline, before classifier action."""
-    policy = continuation_policy_v4_from_settings(
+    policy = continuation_policy_from_settings(
         classifier_15s_probe_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
     )
     assert policy is not None
@@ -125,7 +90,7 @@ async def _v4_applied_timed_case(store, tmp_path, monkeypatch):
         return actual_work(running, sql_deadline_owner=owner)
 
     monkeypatch.setattr(initialization, "inventory_work", timed_work)
-    async with _v4_applied_case(v4_store, tmp_path, monkeypatch) as case:
+    async with _applied_case(v4_store, tmp_path, monkeypatch, primary_preparation_probe_15s=True) as case:
         owner, _running, _selected, _inventory, _captured, _sdk = case
         assert type(owner.work.coordinator.sql_deadline_owner) is ContinuationSQLDeadlineOwner
         assert owner.lease.required_work is owner.work.coordinator
@@ -134,25 +99,12 @@ async def _v4_applied_timed_case(store, tmp_path, monkeypatch):
 
 @asynccontextmanager
 async def _v4_classifier_case(store, tmp_path, monkeypatch, *, retained_payload_bytes=16 * 1_048_576):
-    policy = continuation_policy_v4_from_settings(
-        classifier_15s_probe_settings(composer_continuation_max_retained_payload_bytes=retained_payload_bytes)
-    )
-    assert policy is not None
-    assert policy.actions.primary.preparation == 15.0
-    authority = ComposerAsyncOperationAuthority(
-        store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
-    )
-    monkeypatch.setattr(initialization_fixture, "minimal_continuation_policy", lambda: policy)
-    monkeypatch.setattr(cold_fixture, "minimal_continuation_policy", lambda: policy)
-
-    def applied_case(current_store, current_tmp_path, current_monkeypatch):
-        return _v4_applied_case(current_store, current_tmp_path, current_monkeypatch, retained_payload_bytes=retained_payload_bytes)
-
-    monkeypatch.setattr(classifier_fixture, "_applied_case", applied_case)
-    v4_store = (store[0], store[1], authority, store[3], store[4])
-    async with _classifier_case(v4_store, tmp_path, monkeypatch) as case:
-        assert type(case[3].runtime.source.policy) is type(policy)
-        yield v4_store, case
+    async with _classifier_case(
+        store, tmp_path, monkeypatch, retained_payload_bytes=retained_payload_bytes, primary_preparation_probe_15s=True
+    ) as case:
+        phases = case[0]
+        current_store = (store[0], store[1], phases.authority, store[3], store[4])
+        yield current_store, case
 
 
 def _reply(content: str) -> ModelResponse:

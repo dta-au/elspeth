@@ -895,8 +895,6 @@ def read_end_format_retry_phase_on_connection(
     from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
-    if contract.version != "composer.continuation.policy.v4" or contract.allowance is None:
-        return None
     marker_snapshot = semantic_recovery_source(conn, session_id, operation_id, selected).snapshot
     row = conn.execute(
         select(events.c.tag, events.c.payload_chunk_key).where(

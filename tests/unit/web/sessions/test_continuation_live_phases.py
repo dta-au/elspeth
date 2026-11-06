@@ -1,4 +1,4 @@
-"""Actual V2 paid response → tool → owed Stop prefix source controls."""
+"""Actual current paid response → tool → owed Stop prefix source controls."""
 
 from contextlib import asynccontextmanager, suppress
 from dataclasses import FrozenInstanceError, replace

@@ -13,7 +13,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _AdmittedToolBatch
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_title_values import capture_title_provider_result, decode_title_provider_result
 from elspeth.web.composer.llm_response_parsing import admit_v4_provider_result
 from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
@@ -44,7 +44,7 @@ from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_continuation_title_values import title_result_inputs
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.sessions import test_continuation_initialization as initialization_cases
-from tests.unit.web.sessions.test_continuation_v3_title_paid_tail_preflight import _historical_prepared_title
+from tests.unit.web.sessions.test_continuation_title_provider import title_case
 
 operation_store = operations.operation_store
 
@@ -84,16 +84,14 @@ def _issued_title_completion(attempt_id: str, *, reasoning: str = "Retained reas
 
 @pytest.mark.asyncio
 async def test_v4_title_complete_result_commits_received_settled_ledger_and_hold_once(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
     )
     monkeypatch.setattr(initialization_cases, "minimal_continuation_policy", lambda: policy)
     store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
-    running, _composer_service, _work, prepared, _guard_requests = await _historical_prepared_title(store, policy, tmp_path, monkeypatch)
+    running, _composer_service, _work, prepared, _guard_requests = await title_case(store, tmp_path, monkeypatch)
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     with locked_session_transaction(store[0], sid) as conn:
         admission = admit_v4_title_provider_on_connection(conn, store[3], prepared, model=prepared.request.kwargs["model"])
@@ -205,14 +203,14 @@ async def test_v4_title_complete_result_commits_received_settled_ledger_and_hold
 @pytest.mark.asyncio
 async def test_v4_title_complete_result_exceeding_aggregate_cap_settles_honest_terminal(operation_store, tmp_path, monkeypatch):
     allowance = 64 * 1024
-    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
     )
     monkeypatch.setattr(initialization_cases, "minimal_continuation_policy", lambda: policy)
     store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
-    running, _composer_service, _work, prepared, _guard_requests = await _historical_prepared_title(store, policy, tmp_path, monkeypatch)
+    running, _composer_service, _work, prepared, _guard_requests = await title_case(store, tmp_path, monkeypatch)
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     with locked_session_transaction(store[0], sid) as conn:
         admission = admit_v4_title_provider_on_connection(conn, store[3], prepared, model=prepared.request.kwargs["model"])

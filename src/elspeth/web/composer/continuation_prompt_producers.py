@@ -234,11 +234,14 @@ def _read_current_input_evidence(
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
     finish_read: ContinuationFinishRead | None = None,
+    _prior_evidence: AdmittedTurnEvidence | None = None,
 ) -> AdmittedTurnEvidence:
     # This real reader proves ordinary current claim/lease/CAS, private custody,
     # original actor/request/base and transcript/evidence/recorder links.
     if finish_read is None:
-        evidence = read_turn_evidence_on_connection(conn, inventory.running, selected=selected, inventory=inventory)
+        evidence = read_turn_evidence_on_connection(
+            conn, inventory.running, selected=selected, inventory=inventory, _prior_evidence=_prior_evidence
+        )
     else:
         from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
 
@@ -255,8 +258,11 @@ def _read_current_inputs(
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
     finish_read: ContinuationFinishRead | None = None,
+    _prior_evidence: AdmittedTurnEvidence | None = None,
 ) -> _CurrentProducerInputs:
-    evidence = _read_current_input_evidence(conn, selected=selected, inventory=inventory, finish_read=finish_read)
+    evidence = _read_current_input_evidence(
+        conn, selected=selected, inventory=inventory, finish_read=finish_read, _prior_evidence=_prior_evidence
+    )
     return _inputs_from_current_evidence_on_connection(conn, selected=selected, inventory=inventory, evidence=evidence)
 
 
@@ -1219,7 +1225,6 @@ class CurrentContinuationMessageProducers:
         from elspeth.web.composer.continuation_metadata_preparation import PreparedMetadataToolCall
         from elspeth.web.composer.continuation_pipeline_preparation import PreparedPipelineToolCall
         from elspeth.web.composer.continuation_policy import (
-            ContinuationAdmissionPolicyV3,
             ContinuationAdmissionPolicyV4,
             decode_continuation_policy,
         )
@@ -1245,8 +1250,7 @@ class CurrentContinuationMessageProducers:
         top = selected.stack.frames[-1]
         policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
         if (
-            type(policy) not in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
-            or (tool_name == "set_pipeline" and type(policy) is not ContinuationAdmissionPolicyV4)
+            type(policy) is not ContinuationAdmissionPolicyV4
             or type(top) is not ToolBatchFrame
             or top.phase != "tool_ready"
             or top.accumulator.codec != "composer.coupled-batch-data.v1"

@@ -1029,45 +1029,33 @@ class ProviderCallCustody:
                         )
                     )
                 else:
-                    from elspeth.web.sessions.continuation_title_provider import TitleProviderAdmission, V4TitleProviderAdmission
+                    from elspeth.web.sessions.continuation_title_provider import V4TitleProviderAdmission
                     from elspeth.web.sessions.service import SessionServiceImpl
 
                     title_service = self.service
                     title_prepared = self.continuation_title
-                    if type(title_service) is not SessionServiceImpl:
-                        raise AuditIntegrityError("TITLE admission requires its actual sessions owner")
+                    if type(title_service) is not SessionServiceImpl or self._title_no_sdk_issuer is None:
+                        raise AuditIntegrityError("TITLE admission requires its actual sessions and no-SDK owners")
                     if title_prepared is None:
                         raise AuditIntegrityError("TITLE admission lost its original prepared producer")
-                    title_admitted: TitleProviderAdmission | V4TitleProviderAdmission
-                    if self._title_no_sdk_issuer is not None:
-                        title_projected = await self._v4_admission_result(
-                            title_service.begin_v4_continuation_title_attempt(
-                                prepared=title_prepared, requested_model=model, required_work=sql
-                            ),
-                            admission_projection=projection,
-                            readback=lambda read_sql: title_service.read_v4_continuation_title_admission(
-                                prepared=title_prepared, required_work=read_sql
-                            ),
-                        )
-                        title_admitted = title_projected.admitted
-                        cancellations = title_projected.deferred_cancellations
-                        cold_recovered = title_projected.cold_recovered
-                        recovered_failure = title_projected.original_failure
-                    else:
-                        legacy_title_admitted, cancellations = await self._join(
-                            title_service.begin_continuation_title_attempt(
-                                prepared=title_prepared, requested_model=model, required_work=sql
-                            )
-                        )
-                        title_admitted = legacy_title_admitted
-                    if type(title_admitted) not in (TitleProviderAdmission, V4TitleProviderAdmission):
-                        raise AuditIntegrityError("TITLE admission lost its exact physical/source result")
-                    if self._title_no_sdk_issuer is not None and type(title_admitted) is not V4TitleProviderAdmission:
+                    title_projected = await self._v4_admission_result(
+                        title_service.begin_v4_continuation_title_attempt(
+                            prepared=title_prepared, requested_model=model, required_work=sql
+                        ),
+                        admission_projection=projection,
+                        readback=lambda read_sql: title_service.read_v4_continuation_title_admission(
+                            prepared=title_prepared, required_work=read_sql
+                        ),
+                    )
+                    title_admitted = title_projected.admitted
+                    cancellations = title_projected.deferred_cancellations
+                    cold_recovered = title_projected.cold_recovered
+                    recovered_failure = title_projected.original_failure
+                    if type(title_admitted) is not V4TitleProviderAdmission:
                         raise AuditIntegrityError("V4 TITLE admission lost its original held physical result")
                     attempt = title_admitted.attempt
                     self.continuation_title_selected = title_admitted.selected
-                    if type(title_admitted) is V4TitleProviderAdmission:
-                        self.continuation_title_v4_admission = title_admitted
+                    self.continuation_title_v4_admission = title_admitted
             except BaseException:
                 if sql.complete and not projection.complete:
                     projection.complete_without_submission()
@@ -1645,13 +1633,15 @@ class ProviderCallCustody:
         from elspeth.web.composer.continuation_semantic_observation import (
             SemanticCompleteResponseObservation,
             SemanticIncompleteResponseObservation,
+            SemanticInvalidResponseObservation,
         )
         from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
         from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
 
         finalizer = self._continuation_semantic_v4_finalizer
         if (
-            type(observation) not in (SemanticCompleteResponseObservation, SemanticIncompleteResponseObservation)
+            type(observation)
+            not in (SemanticCompleteResponseObservation, SemanticIncompleteResponseObservation, SemanticInvalidResponseObservation)
             or finalizer is None
             or self.continuation_semantic_v4 is None
             or self.continuation_semantic_v4_admission is None
@@ -1659,9 +1649,13 @@ class ProviderCallCustody:
             or self.attempt is None
             or not self._sdk_entered
             or self.call is None
-            or self.call.status is not ComposerLLMCallStatus.SUCCESS
+            or (type(observation) is SemanticCompleteResponseObservation and self.call.status is not ComposerLLMCallStatus.SUCCESS)
+            or (
+                type(observation) is SemanticInvalidResponseObservation and self.call.status is not ComposerLLMCallStatus.MALFORMED_RESPONSE
+            )
+            or self.call.status not in (ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.MALFORMED_RESPONSE)
         ):
-            raise AuditIntegrityError("V4 semantic finalization requires its one actual paid success and original audit")
+            raise AuditIntegrityError("V4 semantic finalization requires its one actual returned response and original audit")
         sql, projection = self.required_work.reserve_pair(
             RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
         )
@@ -1687,7 +1681,9 @@ class ProviderCallCustody:
         self._continuation_semantic_v4_sql_committed = True
         if type(result) not in (SemanticAdvisorProviderResult, VerifiedSemanticPaidOverflowTerminal):
             raise AuditIntegrityError("V4 semantic finalizer returned a foreign paid outcome")
-        self._continuation_semantic_v4_terminal = type(result) is VerifiedSemanticPaidOverflowTerminal
+        self._continuation_semantic_v4_terminal = type(result) is VerifiedSemanticPaidOverflowTerminal or (
+            type(result) is SemanticAdvisorProviderResult and result.original_error is not None
+        )
         projection.begin_projection()
         projection.complete_owned()
         if self._cost_budget is not None:
@@ -1727,16 +1723,8 @@ class ProviderCallCustody:
             return
         if not self._sdk_entered or self.call is None:
             raise AuditIntegrityError("Required provider attempt lacks complete terminal audit")
-        current_title: TitleAuditSettlementRequest | None = None
-        if self.continuation_title_result is not None:
-            from elspeth.web.composer.continuation_title_provider import refresh_current_title_settlement
-            from elspeth.web.sessions.service import SessionServiceImpl
-
-            if type(self.service) is not SessionServiceImpl:
-                raise AuditIntegrityError("TITLE settlement requires its actual sessions writer")
-            # Current reads may refuse or be cancelled. Do not allocate the
-            # accounting receipt until it can be handed to the real finisher.
-            current_title = await refresh_current_title_settlement(self)
+        if self.continuation_title is not None:
+            raise AuditIntegrityError("Continuation TITLE settlement requires its original V4 admission")
         binding = self.required_work
         projection: RequiredWorkTicket | None = None
         if binding.role is RequiredWorkRole.TITLE:
@@ -1752,27 +1740,13 @@ class ProviderCallCustody:
                 RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
             )
         try:
-            if self.continuation_title_result is None:
-                _, cancellations = await self._join(
-                    self.service.finish_provider_attempt(
-                        session_operation_context=self.context,
-                        call=self.call,
-                        required_work=sql,
-                    )
+            _, cancellations = await self._join(
+                self.service.finish_provider_attempt(
+                    session_operation_context=self.context,
+                    call=self.call,
+                    required_work=sql,
                 )
-            else:
-                from elspeth.web.sessions.service import SessionServiceImpl
-
-                if type(self.service) is not SessionServiceImpl or current_title is None:
-                    raise AuditIntegrityError("TITLE settlement lost its actual current source result")
-                _, cancellations = await self._join(
-                    self.service.finish_provider_attempt(
-                        session_operation_context=self.context,
-                        call=current_title.audit_call,
-                        required_work=sql,
-                        continuation_title=current_title,
-                    )
-                )
+            )
         except BaseException:
             if projection is not None and sql.complete:
                 projection.complete_without_submission()

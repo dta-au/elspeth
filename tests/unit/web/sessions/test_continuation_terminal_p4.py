@@ -8,7 +8,8 @@ No failed batch, constructed receipt, or decoded DATA supplies write authority.
 import asyncio
 import json
 import threading
-from contextlib import asynccontextmanager, contextmanager
+import time
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import replace
 
 import litellm
@@ -21,9 +22,10 @@ from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation import ComposeFrame
-from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_limits import CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_prepared_p4 import prepared_p4_members
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
@@ -33,17 +35,19 @@ from elspeth.web.composer.continuation_terminal_p4_data import (
     terminal_p4_input_key,
 )
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.coordination.contracts import SessionOperationFenceLost, SessionOperationLeaseDisposition
+from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
+from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
-from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationFenceLost
-from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot
+from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationFenceLost, ComposerOperationRunning
 from elspeth.web.sessions.continuation_driver import ContinuationSegmentSettled
 from elspeth.web.sessions.continuation_p4 import (
     read_lost_terminal_p4_on_connection,
@@ -52,6 +56,7 @@ from elspeth.web.sessions.continuation_p4 import (
 )
 from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4, StoredP4Application, StoredTerminalP4Application
 from elspeth.web.sessions.continuation_recovery_candidates import list_recoverable_segments
+from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
@@ -67,6 +72,7 @@ from elspeth.web.sessions.models import sessions_table as sessions_rows
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.models import user_secrets_table as secret_rows
 from elspeth.web.sessions.service import ComposerP4SQLCompletionUnknown, ComposerTerminalSQLCompletionUnknown
+from tests.helpers.continuation_inventory import inventory_work
 from tests.unit.web.composer._helpers import _persisted_tool_responses
 from tests.unit.web.composer.test_service_failure_dispatch import _issued_review_case, _refuse_service, _review_call, _service_error
 from tests.unit.web.composer.test_service_failure_publication import _exception_nodes, _finish_issued_batch
@@ -74,7 +80,7 @@ from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_
 from tests.unit.web.sessions import test_continuation_initialization as initialization_fixtures
 from tests.unit.web.sessions.test_continuation_live_phases import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_p4_product import _contains_identity
-from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
+from tests.unit.web.sessions.test_continuation_primary_result import handover_to_next_primary, stored_rows
 from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver, _install_original_deadline
 
 operation_store = _operation_store
@@ -162,6 +168,7 @@ def _require_publication(
     expected_calls=("pending_review",),
     provider_calls=1,
     prior_sql=(),
+    prior_coordinator=None,
 ):
     assert len(entered) == 1 and len(sdk) == provider_calls
     assert owner.failure_custody.original is original and original.__cause__ is cause
@@ -176,7 +183,17 @@ def _require_publication(
     assert phase.committed_outcome.audit_outcome is observation.candidate
     assert phase.application_sql is None
     sql = tuple(ticket for ticket in owner.work.coordinator.tickets if ticket.key.source is RequiredWorkSource.COMPOSE_CHECKPOINT_SQL)
-    assert len(sql) == len(prior_sql) + 1 and sql[:-1] == prior_sql
+    if prior_coordinator is None:
+        assert len(sql) == len(prior_sql) + 1 and sql[:-1] == prior_sql
+    else:
+        assert prior_coordinator is not owner.work.coordinator
+        prior_coordinator.assert_completed()
+        assert (
+            tuple(ticket for ticket in prior_coordinator.tickets if ticket.key.source is RequiredWorkSource.COMPOSE_CHECKPOINT_SQL)
+            == prior_sql
+        )
+        assert prior_sql and all(ticket.complete for ticket in prior_sql)
+        assert len(sql) == 1 and all(ticket not in sql for ticket in prior_sql)
     assert all(ticket.complete for ticket in sql) and sql[-1]._finish_once_handoff is phase.physical
     if retained_error is None:
         assert observed is original, "the same service original must survive successful terminal publication"
@@ -570,8 +587,12 @@ async def _terminal_with_prior_effect(store, tmp_path, monkeypatch, *, history, 
     earlier = ("earlier_completed", "set_metadata", {"patch": {"name": "Actual earlier completion"}})
     calls = (earlier, _review_call()) if history == "completed_tool" else (earlier,)
     assert history in ("completed_tool", "prior_application")
-    async with _issued_review_case(store, tmp_path, monkeypatch, calls=calls) as (owner, running, sdk):
+    if history == "prior_application":
+        _install_original_deadline(store, monkeypatch)
+    async with AsyncExitStack() as lifetime:
+        owner, running, sdk = await lifetime.enter_async_context(_issued_review_case(store, tmp_path, monkeypatch, calls=calls))
         prior_sql = ()
+        prior_coordinator = None
         prior_effect_key = None
         if history == "prior_application":
             assert await _finish_issued_batch(owner) is None
@@ -597,35 +618,40 @@ async def _terminal_with_prior_effect(store, tmp_path, monkeypatch, *, history, 
             assert paid.result_chunk_key == f"value:{compose.pending_response.codec}:{compose.pending_response.digest}"
             assert root.pending_settlement_ids == root.pending_owner_results == ()
             assert root.active_action_json is root.active_action_source is None
-            # Match the existing post_p4_primary_input fixture: select the next
-            # ordinary phase input after REAL P4 publication/application. This
-            # is not a claim about the iteration driver, nor a fabricated P4.
-            # Unlike that fixture's prebuilt input, this genuine paid PRIMARY
-            # still has its consumed response locator on the Compose frame.
-            # Keep the paid SQL effect and journal; only the next input's active
-            # provider slots are empty, as _primary_frame/prepare_primary require.
-            next_compose = compose.model_copy(
-                update={
-                    "phase": "action_ready",
-                    "pending_response": None,
-                    "provider_effect_key": None,
-                    "provider_input_sha256": None,
-                }
+            prior_coordinator = owner.work.coordinator
+            previous_running = running
+            _handover, ready, paid_roles = await handover_to_next_primary(store, owner, running, monkeypatch, expected_roles=("semantic",))
+            assert paid_roles == ("semantic",)
+            (claim,) = owner.authority.claim_segment(limit=1)
+            assert claim.operation_id == running.claim.operation_id
+            assert claim.ownership_generation == running.claim.ownership_generation + 1
+            context = store[1].start_composer_segment(
+                claim, owner_instance_id=owner.authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"
             )
-            ready = root.model_copy(update={"frames": (next_compose,)})
-            with locked_session_transaction(store[0], str(running.claim.session_id)) as conn:
-                head = append_complete_snapshot(
-                    conn,
-                    session_id=str(running.claim.session_id),
-                    operation_id=running.claim.operation_id,
-                    expected_checkpoint_id=head.checkpoint_id,
-                    expected_cursor=head.cursor,
-                    snapshot_json=encode_continuation_snapshot(ready),
-                    event_batch=(ContinuationEvent("checkpoint", '{"fixture":"terminal test next primary input after actual P4"}'),),
-                    handoff=False,
-                )
-            following = ContinuationLivePhases(owner.service, owner.authority, owner.work, owner.provider_owner, owner.lease)
-            selected = await load_selected_continuation(authority=owner.authority, running=running, selected=head, required_work=owner.work)
+            running = ComposerOperationRunning(claim, context)
+            started = time.monotonic()
+            timing = owner.authority.read_continuation_timing(running)
+            head = owner.authority.load_continuation_snapshot(running)
+            current_root = decode_continuation_snapshot(head.payload_json)
+            assert current_root == ready.stack.model_copy(update={"cursor": head.cursor})
+            sql_deadline = ContinuationSQLDeadlineOwner(
+                running,
+                policy=decode_continuation_policy(current_root.admission_policy_json, current_root.policy_hash),
+                drain_signal=ComposerDrainSignal(),
+                drain_seconds=10,
+                hard_expires_at=started + timing.hard_remaining_seconds,
+            )
+            work = inventory_work(running, sql_deadline_owner=sql_deadline)
+            lease = await ContinuationLeaseAdoption(store[1], context, lease_seconds=30, required_work=work.coordinator).join()
+            lifetime.push_async_callback(lease.close)
+            following = ContinuationLivePhases(
+                owner.service, owner.authority, work, ProviderInvocationOwner(service=store[3], required_work=work), lease
+            )
+            selected = await load_selected_continuation(authority=owner.authority, running=running, selected=head, required_work=work)
+            with store[0].connect() as conn:
+                unchanged_paid = conn.execute(select(effects).where(*_effect_where(previous_running, compose.provider_effect_key))).one()
+            assert tuple(unchanged_paid) == tuple(paid)
+            owner = following
             runtime, _inventory = await following.current(selected)
             assert runtime.graph.applications is not None
             assert runtime.graph.applications.applications == prior.application.bundle.entry.applications
@@ -657,7 +683,7 @@ async def _terminal_with_prior_effect(store, tmp_path, monkeypatch, *, history, 
                             },
                         }
                     ],
-                    usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                    usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
                 )
 
             monkeypatch.setattr(litellm, "acompletion", second_primary)
@@ -735,6 +761,7 @@ async def _terminal_with_prior_effect(store, tmp_path, monkeypatch, *, history, 
             expected_calls=("earlier_completed", "pending_review"),
             provider_calls=2 if history == "prior_application" else 1,
             prior_sql=prior_sql,
+            prior_coordinator=prior_coordinator,
         )
         if close_before_data_inspection:
             # The prerequisite's extra immutable inspections do not own more

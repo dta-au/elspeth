@@ -364,6 +364,17 @@ def _require_evidence_metadata(snapshot: TurnEvidenceFields, *, env_ref_names: f
         require_no_credential_material(locator.effect_key, surface="composer_continuation_effect_locator", env_ref_names=env_ref_names)
 
 
+def _decode_evidence_snapshot(source: PrivateChunk) -> TurnEvidenceSnapshot:
+    """Decode the verified source's closed schema without retaining graph owners."""
+    try:
+        snapshot = TurnEvidenceSnapshot.model_validate_json(source.canonical)
+    except (ValidationError, ValueError, TypeError) as exc:
+        raise AuditIntegrityError("evidence chunk violates its closed owned codec") from exc
+    if canonical_json_native_strings(snapshot.model_dump(mode="json")) != source.canonical:
+        raise AuditIntegrityError("evidence chunk changed fields during its owned decode")
+    return snapshot
+
+
 @dataclass(frozen=True, slots=True, init=False, eq=False)
 class AdmittedTurnEvidence:
     """Source-admitted DATA for one fixed reconstruction, never current authority.
@@ -388,9 +399,12 @@ class AdmittedTurnEvidence:
         env_ref_names: frozenset[str],
         mandatory_retention: bool = False,
         source_chunks: tuple[PrivateChunk, ...] = (),
+        _prior_evidence: AdmittedTurnEvidence | None = None,
     ) -> None:
         if type(env_ref_names) is not frozenset or any(type(name) is not str for name in env_ref_names):
             raise TypeError("evidence admission requires its closed environment-name set")
+        if _prior_evidence is not None and (type(_prior_evidence) is not AdmittedTurnEvidence or type(source) is not PrivateChunk):
+            raise TypeError("repeated evidence decode requires its actual prior admission and fresh source chunk")
         if type(source) is PrivateChunk:
             if source.reference.codec != "composer.evidence.v2":
                 raise AuditIntegrityError("evidence chunk has the wrong codec")
@@ -401,12 +415,14 @@ class AdmittedTurnEvidence:
             verify_private_chunk(source.reference, source.canonical)
             # The original verifier proved strict canonical JSON. The owned
             # model below separately requires its complete object schema.
-            try:
-                snapshot = TurnEvidenceSnapshot.model_validate_json(source.canonical)
-            except (ValidationError, ValueError, TypeError) as exc:
-                raise AuditIntegrityError("evidence chunk violates its closed owned codec") from exc
-            if canonical_json_native_strings(snapshot.model_dump(mode="json")) != source.canonical:
-                raise AuditIntegrityError("evidence chunk changed fields during its owned decode")
+            # Only the prior immutable schema value is reusable on complete
+            # source equality. Dependencies, semantics and graph custody below
+            # are reconstructed for this admission, even after a match.
+            snapshot = (
+                _prior_evidence.snapshot
+                if _prior_evidence is not None and source == _prior_evidence.source_chunk
+                else _decode_evidence_snapshot(source)
+            )
         elif type(source) is TurnEvidenceSnapshot:
             snapshot = source
         else:

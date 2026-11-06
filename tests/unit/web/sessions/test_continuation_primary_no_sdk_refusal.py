@@ -8,7 +8,7 @@ import asyncio
 import json
 import threading
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from hashlib import sha256
 from uuid import uuid4
 
@@ -33,7 +33,6 @@ from elspeth.web.sessions import continuation_primary as primary_sql
 from elspeth.web.sessions import service as sessions_source
 from elspeth.web.sessions.continuation import (
     PreparedContinuationProvider,
-    StoredContinuationSnapshot,
     load_snapshot,
     private_chunk_key,
     put_chunk,
@@ -48,7 +47,7 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as physica
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.helpers.continuation_app import observe_original_driver_failures
 from tests.unit.web.composer.test_prompt_guard_admission import _GuardClient
-from tests.unit.web.sessions.test_continuation_primary_v4_live import _v4_primary_input
+from tests.unit.web.sessions.test_continuation_primary_result import primary_input
 from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST
 from tests.unit.web.sessions.test_continuation_runtime_provider_history import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_runtime_provider_history import prepared_runtime, publish
@@ -170,10 +169,17 @@ def _require_atomic_no_sdk_refusal(engine, authority, running, prepared, *, stop
     assert effect["effect_key"] == prepared.binding.effect_key and effect["input_sha256"] == prepared.binding.input_sha256
     assert effect["disposition"] == "refused", "a proven no-SDK expiry must durably close its exact original effect"
     assert effect["receipt_key"] and effect["result_chunk_key"]
-    assert all(
-        effect[field] is None
-        for field in ("provider_attempt_id", "physical_sequence", "physical_generation", "requested_model", "response_finished_at")
-    )
+    assert effect["response_finished_at"] is None
+    if undispatched is None:
+        assert all(
+            effect[field] is None for field in ("provider_attempt_id", "physical_sequence", "physical_generation", "requested_model")
+        )
+    else:
+        assert effect["provider_attempt_id"] == undispatched[0].attempt_id
+        assert effect["requested_model"] == undispatched[1]
+        with engine.connect() as conn:
+            hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == undispatched[0].attempt_id)).one()
+        assert hold.state == "consumed"
     assert (effect["creator_sequence"], effect["creator_generation"]) == (
         running.claim.segment_sequence,
         running.claim.ownership_generation,
@@ -213,9 +219,7 @@ def _require_atomic_no_sdk_refusal(engine, authority, running, prepared, *, stop
 @pytest.mark.parametrize(
     "window,stop",
     (
-        pytest.param("prepared_return", False, id="after-prepared-before-begin"),
-        pytest.param("inside_begin", False, id="inside-begin-before-commit"),
-        pytest.param("dispatch_return", False, id="after-dispatch-before-sdk"),
+        pytest.param("prepared_return", False, id="after-prepared-before-admission"),
         pytest.param("prepared_return", True, id="public-stop-wins"),
     ),
 )
@@ -226,8 +230,8 @@ async def test_original_preparation_expiry_closes_no_sdk_effect_atomically(opera
     authority = arguments["authority"]
     expiry = _OriginalPreparationExpiry()
     expiry.capture(monkeypatch, runtime.source.policy.actions.primary)
-    actual_finish, actual_append = primary_source.run_required_sql_finish_once, primary_sql.append_complete_snapshot
-    prepared, dispatched = [], []
+    actual_finish = primary_source.run_required_sql_finish_once
+    prepared = []
 
     def request_stop():
         stopped = authority.request_owner_cancel(
@@ -246,21 +250,9 @@ async def test_original_preparation_expiry_closes_no_sdk_effect_atomically(opera
                 request_stop()
             if window == "prepared_return":
                 await expiry.wait()
-        if operation == authority.begin_continuation_primary and type(outcome) is RequiredSQLReturned:
-            assert type(outcome.value) is StoredContinuationSnapshot
-            dispatched.append(outcome.value)
-            if window == "dispatch_return":
-                await expiry.wait()
         return outcome
 
-    def append(conn, **kwargs):
-        stored = actual_append(conn, **kwargs)
-        if window == "inside_begin" and any(event.tag == "may_dispatch" for event in kwargs["event_batch"]):
-            expiry.wait_in_transaction()
-        return stored
-
     monkeypatch.setattr(primary_source, "run_required_sql_finish_once", finish)
-    monkeypatch.setattr(primary_sql, "append_complete_snapshot", append)
     try:
         # Allow only the original expiry/cancellation; unexpected failures
         # propagate with their real traceback before durable assertions.
@@ -270,8 +262,7 @@ async def test_original_preparation_expiry_closes_no_sdk_effect_atomically(opera
         assert expiry.triggered, "the intended original-clock expiry window must execute"
         rows = _require_atomic_no_sdk_refusal(operation_store[0], authority, running, prepared[0], stop=stop)
         committed_dispatches = [event for event in rows["events"] if event["tag"] == "may_dispatch"]
-        assert len(committed_dispatches) == (1 if window == "dispatch_return" else 0)
-        assert len(dispatched) == (1 if window == "dispatch_return" else 0)
+        assert committed_dispatches == []
         arguments["required_work"].coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)
@@ -300,10 +291,13 @@ async def test_actual_sdk_entry_cannot_be_relabelled_as_no_sdk_from_absent_respo
     monkeypatch.setattr(ProviderCallCustody, "mark_sdk_entered", mark)
     monkeypatch.setattr(litellm, "acompletion", sdk)
     try:
-        with pytest.raises(BaseException) as caught:
-            await publish(operation_store, arguments, runtime)
+        from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal
+
+        result = await publish(operation_store, arguments, runtime)
+        assert type(result) is PrimarySdkTerminal
+        assert result.receipt.sdk_entered and not result.receipt.sdk_result_observed
         assert expiry.triggered and len(marked) == len(entered) == 1
-        assert _contains_original(caught.value, original)
+        assert result.receipt.observation == "provider_timeout"
         rows = _rows(operation_store[0], running)
         assert len(rows["physical"]) == 1
         assert len(rows["effect"]) == 1 and rows["effect"][0]["disposition"] != "refused"
@@ -314,17 +308,17 @@ async def test_actual_sdk_entry_cannot_be_relabelled_as_no_sdk_from_absent_respo
 
 
 @pytest.mark.asyncio
-async def test_committed_begin_deferred_cancellation_retains_no_sdk_issuer_handle(operation_store, tmp_path, monkeypatch):
+async def test_committed_preparation_deferred_cancellation_retains_no_sdk_issuer_handle(operation_store, tmp_path, monkeypatch):
     arguments, runtime, sdk = await prepared_runtime(operation_store, tmp_path, monkeypatch)
     running = arguments["required_work"].running
     assert running is not None
     authority = arguments["authority"]
-    actual_begin, actual_finish = authority.begin_continuation_primary, primary_source.run_required_sql_finish_once
+    actual_prepare, actual_finish = authority.prepare_provider_action, primary_source.run_required_sql_finish_once
     entered, release = threading.Event(), threading.Event()
     prepared, committed, deferred = [], [], []
 
-    def begin(*args, **kwargs):
-        result = actual_begin(*args, **kwargs)
+    def prepare(*args, **kwargs):
+        result = actual_prepare(*args, **kwargs)
         committed.append(result)
         entered.set()
         assert release.wait(timeout=20), "the controller must release the actual committed SQL outcome"
@@ -335,11 +329,11 @@ async def test_committed_begin_deferred_cancellation_retains_no_sdk_issuer_handl
         if type(outcome) is RequiredSQLReturned:
             if type(outcome.value) is PreparedContinuationProvider:
                 prepared.append(outcome.value)
-            elif operation == authority.begin_continuation_primary:
+            if operation == authority.prepare_provider_action:
                 deferred.extend(outcome.deferred_cancellations)
         return outcome
 
-    monkeypatch.setattr(authority, "begin_continuation_primary", begin)
+    monkeypatch.setattr(authority, "prepare_provider_action", prepare)
     monkeypatch.setattr(primary_source, "run_required_sql_finish_once", finish)
     task = asyncio.create_task(publish(operation_store, arguments, runtime))
     try:
@@ -363,7 +357,7 @@ async def test_committed_begin_deferred_cancellation_retains_no_sdk_issuer_handl
         assert len(prepared) == len(committed) == 1 and deferred, "observe the real finish-once cancellation outcome"
         assert sdk == []
         rows = _require_atomic_no_sdk_refusal(operation_store[0], authority, running, prepared[0], stop=True)
-        assert len([event for event in rows["events"] if event["tag"] == "may_dispatch"]) == 1
+        assert not [event for event in rows["events"] if event["tag"] == "may_dispatch"]
         arguments["required_work"].coordinator.assert_completed()
     finally:
         release.set()
@@ -514,20 +508,21 @@ async def _actual_admitted_primary(operation_store, tmp_path, monkeypatch, *, di
     running = arguments["required_work"].running
     assert running is not None
     admitted, release_admission = asyncio.Event(), asyncio.Event()
-    settled, release_settlement = asyncio.Event(), asyncio.Event()
-    prepared, admissions, originals, deferred, gateway_errors = [], [], [], [], []
+    settled, release_settlement = asyncio.Event(), threading.Event()
+    prepared, admissions, originals, deferred, writes = [], [], [], [], []
     actual_admit = ProviderCallCustody.admit
-    actual_cancel = sessions_source.SessionServiceImpl.cancel_undispatched_provider_attempt
-    actual_before_sdk = ProviderCallCustody.cancel_before_sdk
-    actual_finish, actual_classify = primary_source.run_required_sql_finish_once, primary_source._pre_sdk_failure
-    original = OperationalError("undispatched disposition unavailable", {}, RuntimeError("injected disposition failure"))
+    actual_cancel = sessions_source.SessionServiceImpl.cancel_v4_continuation_primary_unentered
+    actual_writer = primary_sql.refuse_v4_primary_unentered_on_connection
+    actual_transaction = sessions_source.SessionServiceImpl._session_process_locked_begin
+    actual_finish = primary_source.run_required_sql_finish_once
+    loop = asyncio.get_running_loop()
+    original = OperationalError("composite disposition unavailable", {}, RuntimeError("injected disposition failure"))
     faults = []
 
     async def admit(custody, *, model):
         await actual_admit(custody, model=model)
         assert custody.context is running.session_operation_context
-        assert type(custody.service) is sessions_source.SessionServiceImpl
-        assert type(custody.attempt) is ProviderAttempt
+        assert custody.continuation_primary_v4_admission is not None
         admissions.append((custody.attempt, model))
         admitted.set()
         try:
@@ -536,27 +531,31 @@ async def _actual_admitted_primary(operation_store, tmp_path, monkeypatch, *, di
             originals.append(error)
             raise
 
-    async def cancel(service, **kwargs):
-        assert kwargs["session_operation_context"] is running.session_operation_context
-        assert kwargs["attempt_id"] == admissions[0][0].attempt_id
-        await actual_cancel(service, **kwargs)
-        if disposition == "unknown-after-commit":
+    def writer(conn, **values):
+        assert values["admission"].attempt.attempt_id == admissions[0][0].attempt_id
+        writes.append(values["permit"])
+        if disposition == "failed-before-write":
             faults.append(original)
             raise original
-        settled.set()
-        await release_settlement.wait()
+        result = actual_writer(conn, **values)
+        if disposition == "settled":
+            loop.call_soon_threadsafe(settled.set)
+            assert release_settlement.wait(timeout=20)
+        return result
 
-    def fail_sql(_conn, **kwargs):
-        assert kwargs["attempt_id"] == admissions[0][0].attempt_id
-        faults.append(original)
-        # Raise inside the actual admitted SQL worker so its real required
-        # ticket is completed as raised; no projection/outcome is fabricated.
-        raise original
+    @contextmanager
+    def transaction(service, *args, **kwargs):
+        before = len(writes)
+        with actual_transaction(service, *args, **kwargs) as conn:
+            yield conn
+        if disposition == "unknown-after-commit" and len(writes) > before and not faults:
+            faults.append(original)
+            raise original
 
-    async def before_sdk(custody, *, model):
-        cancellations = await actual_before_sdk(custody, model=model)
-        deferred.extend(cancellations)
-        return cancellations
+    async def cancel(service, **values):
+        outcome = await actual_cancel(service, **values)
+        deferred.extend(outcome.deferred_cancellations)
+        return outcome
 
     async def finish(ticket, operation, *args, **kwargs):
         outcome = await actual_finish(ticket, operation, *args, **kwargs)
@@ -564,17 +563,11 @@ async def _actual_admitted_primary(operation_store, tmp_path, monkeypatch, *, di
             prepared.append(outcome.value)
         return outcome
 
-    def classify(error, *, preparing):
-        gateway_errors.append(error)
-        return actual_classify(error, preparing=preparing)
-
     monkeypatch.setattr(ProviderCallCustody, "admit", admit)
-    monkeypatch.setattr(ProviderCallCustody, "cancel_before_sdk", before_sdk)
-    monkeypatch.setattr(sessions_source.SessionServiceImpl, "cancel_undispatched_provider_attempt", cancel)
-    if disposition == "failed-before-write":
-        monkeypatch.setattr(sessions_source, "cancel_undispatched_provider_attempt_on_connection", fail_sql)
+    monkeypatch.setattr(primary_sql, "refuse_v4_primary_unentered_on_connection", writer)
+    monkeypatch.setattr(sessions_source.SessionServiceImpl, "_session_process_locked_begin", transaction)
+    monkeypatch.setattr(sessions_source.SessionServiceImpl, "cancel_v4_continuation_primary_unentered", cancel)
     monkeypatch.setattr(primary_source, "run_required_sql_finish_once", finish)
-    monkeypatch.setattr(primary_source, "_pre_sdk_failure", classify)
     task = asyncio.create_task(publish(operation_store, arguments, runtime))
     try:
         async with asyncio.timeout(10):
@@ -586,18 +579,19 @@ async def _actual_admitted_primary(operation_store, tmp_path, monkeypatch, *, di
         yield {
             "arguments": arguments,
             "actor_user_id": runtime.bindings.user_id,
+            "env_ref_names": runtime.env_ref_names,
             "running": running,
             "task": task,
             "prepared": prepared[0],
             "admission": admissions[0],
             "originals": originals,
             "deferred": deferred,
-            "gateway_errors": gateway_errors,
             "settled": settled,
             "release_settlement": release_settlement,
             "faults": faults,
             "failure": original,
             "sdk": sdk,
+            "writes": writes,
         }
     finally:
         release_admission.set()
@@ -633,10 +627,7 @@ async def test_admitted_no_sdk_group_keeps_both_original_cancellations_and_zero_
         first, second = case["originals"][0], case["deferred"][0]
         assert first is not second and task.cancelling() == 2
         assert receipt.deferred_cancellations == (first, second)
-        assert len(case["gateway_errors"]) == 1
-        group = case["gateway_errors"][0]
-        assert isinstance(group, BaseExceptionGroup)
-        assert _contains_original(group, first) and _contains_original(group, second)
+        assert len(case["writes"]) == 1
         assert case["sdk"] == [] and case["faults"] == []
         _require_atomic_no_sdk_refusal(
             operation_store[0],
@@ -654,37 +645,43 @@ async def test_admitted_no_sdk_group_keeps_both_original_cancellations_and_zero_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("disposition", ("failed-before-write", "unknown-after-commit"))
-async def test_failed_or_unknown_undispatched_disposition_cannot_issue_no_sdk_receipt(operation_store, tmp_path, monkeypatch, disposition):
+async def test_composite_no_sdk_failure_refuses_or_recovers_actual_committed_receipt(operation_store, tmp_path, monkeypatch, disposition):
     async with _actual_admitted_primary(operation_store, tmp_path, monkeypatch, disposition=disposition) as case:
         task = case["task"]
         assert task.cancel("original-unsettled-cancellation")
-        with pytest.raises(BaseExceptionGroup) as caught:
-            await asyncio.wait_for(asyncio.shield(task), timeout=10)
-        assert len(case["originals"]) == 1 and case["deferred"] == []
-        assert _contains_original(caught.value, case["originals"][0])
-        assert _contains_original(caught.value, case["failure"])
-        assert case["faults"] == [case["failure"]] and case["sdk"] == []
-        rows = _rows(operation_store[0], case["running"])
-        assert len(rows["effect"]) == len(rows["physical"]) == 1
-        effect = rows["effect"][0]
-        assert effect["disposition"] == "dispatched" and effect["receipt_key"] is effect["result_chunk_key"] is None
-        assert not [event for event in rows["events"] if event["tag"] in ("effect_refused", "settled")]
-        assert not [row for row in rows["chunks"] if row["codec"] == "composer.primary-no-sdk-refusal.v1"]
         if disposition == "failed-before-write":
+            with pytest.raises(OperationalError) as caught:
+                await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            assert caught.value is case["failure"]
+            assert len(case["writes"]) == len(case["faults"]) == 2
+            rows = _rows(operation_store[0], case["running"])
+            assert len(rows["effect"]) == len(rows["physical"]) == 1
+            effect = rows["effect"][0]
+            assert effect["disposition"] == "dispatched" and effect["receipt_key"] is effect["result_chunk_key"] is None
             assert rows["physical"][0]["settled_at"] is None and rows["usage"] == []
+            assert not [event for event in rows["events"] if event["tag"] in ("effect_refused", "settled")]
             with operation_store[0].connect() as conn:
-                assert (
-                    conn.execute(
-                        select(messages.c.id).where(messages.c.id == _undispatched_cancellation_event_id(case["admission"][0].attempt_id))
-                    ).all()
-                    == []
-                )
+                hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == case["admission"][0].attempt_id)).one()
+                assert hold.state == "active"
+                assert _cold_no_sdk_receipt(conn, case["running"], case["prepared"].binding.effect_key) is None
         else:
-            # Even durable zero-use rows do not fabricate the lost live
-            # disposition acknowledgement or grant a refusal capability.
-            _require_zero_use_cancellation(operation_store[0], case["running"], rows, *case["admission"])
-        with operation_store[0].connect() as conn:
-            assert _cold_no_sdk_receipt(conn, case["running"], case["prepared"].binding.effect_key) is None
+            receipt = await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            assert type(receipt) is primary_sql.PrimaryNoSdkRefusalReceipt
+            assert len(case["writes"]) == len(case["faults"]) == 1
+            assert receipt.deferred_cancellations == tuple(case["originals"])
+            _require_atomic_no_sdk_refusal(
+                operation_store[0],
+                case["arguments"]["authority"],
+                case["running"],
+                case["prepared"],
+                stop=False,
+                undispatched=case["admission"],
+                cancelled=True,
+            )
+            with operation_store[0].connect() as conn:
+                assert _cold_no_sdk_receipt(conn, case["running"], case["prepared"].binding.effect_key) == receipt
+        assert len(case["originals"]) == 1 and case["sdk"] == []
+        assert all(error is case["failure"] for error in case["faults"])
         case["arguments"]["required_work"].coordinator.assert_completed()
 
 
@@ -708,7 +705,8 @@ async def _run_v4_guard_case(kwargs, produced, recorder, store):
 
 @pytest.mark.asyncio
 async def test_v4_guard_refusal_closes_pre_h_with_original_audit_and_no_physical_attempt(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     running = kwargs["inventory"].running
     assert running is not None
     guard = _GuardClient(PromptGuardDecision("blocked", "policy_blocked"))
@@ -746,7 +744,8 @@ async def test_v4_guard_refusal_closes_pre_h_with_original_audit_and_no_physical
 @pytest.mark.asyncio
 @pytest.mark.parametrize("refuse", (True, False), ids=("handled-integrity", "successful-sdk"))
 async def test_original_observer_preserves_actual_v4_integrity_refusal_after_admission(operation_store, tmp_path, monkeypatch, refuse):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     running = kwargs["inventory"].running
     original_error = AuditIntegrityError("PRIVATE_V4_NO_SDK_DIAGNOSTIC_MARKER")
     original_dispatch, original_reserve = ProviderCallCustody.require_cost_dispatch, PrimaryNoSdkIssuer.reserve_v4_refusal
@@ -814,7 +813,8 @@ async def test_original_observer_preserves_actual_v4_integrity_refusal_after_adm
 
 @pytest.mark.asyncio
 async def test_v4_admitted_h_cannot_relabel_later_guard_error_as_no_sdk_refusal(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     running = kwargs["inventory"].running
     assert running is not None
     forged = PromptGuardRefused(decision=PromptGuardDecision("blocked", "policy_blocked"), audit_id=str(uuid4()))

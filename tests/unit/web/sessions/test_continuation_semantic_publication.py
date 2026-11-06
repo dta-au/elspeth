@@ -19,7 +19,6 @@ from elspeth.web.composer.continuation_env_inventory import materialize_continua
 from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.continuation_semantic_advisor import prepare_semantic_advisor_request
-from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationRaised
 from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
 from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
@@ -35,7 +34,6 @@ from elspeth.web.sessions.continuation_semantic_actions import (
 from elspeth.web.sessions.continuation_semantic_advisor import (
     consume_semantic_advisor_whole_stop_on_connection,
     read_semantic_advisor_retained_inputs_on_connection,
-    retain_semantic_advisor_outcome_on_connection,
 )
 from elspeth.web.sessions.continuation_semantic_review_result import retain_semantic_review_result_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -151,44 +149,42 @@ async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
         monkeypatch.setattr(transport, "handle_async_request", count_actual_azure_request)
         stop_case = {
             **case,
+            "lease": case["phases"].lease,
             "runtime": runtime,
             "recorder": runtime.live.recorder,
             "invocation": invocation,
             "request": request,
             "clock": ContinuationActionClock(runtime.source.policy.actions.advisor),
         }
-        issuer, prepared, dispatched = semantic_fixture._begin(store, stop_case)
-        observed = await semantic_fixture._invoke(stop_case, issuer)
-        if type(observed) is SemanticAdvisorInvocationRaised:
+        try:
+            prepared, paid = await semantic_fixture._run_paid_semantic(stop_case, monkeypatch)
+        except Exception as error:
             # A real pre-SDK failure is diagnostic evidence, never an original
             # paid outcome. Preserve it instead of masking it with the paid
             # retention owner's provenance refusal below.
-            observed.error.add_note(f"actual Stop SDK entries before original failure: {len(stop_sdk)}")
-            if type(observed.error) is PromptGuardRefused:
+            error.add_note(f"actual Stop SDK entries before original failure: {len(stop_sdk)}")
+            if type(error) is PromptGuardRefused:
                 try:
-                    checks = [check for check in _checks(store[0]) if check["audit_id"] == observed.error.audit_id]
+                    checks = [check for check in _checks(store[0]) if check["audit_id"] == error.audit_id]
                 except Exception as probe_error:
                     checks = []
-                    observed.error.add_note(f"actual Stop guard audit lookup failed: {type(probe_error).__name__}")
-                observed.error.add_note(
-                    f"actual Stop guard refusal: disposition={observed.error.disposition}; "
-                    f"http_status={observed.error.http_status}; audit_id={observed.error.audit_id}; "
+                    error.add_note(f"actual Stop guard audit lookup failed: {type(probe_error).__name__}")
+                error.add_note(
+                    f"actual Stop guard refusal: disposition={error.disposition}; "
+                    f"http_status={error.http_status}; audit_id={error.audit_id}; "
                     f"matching_audit_checks={len(checks)}"
                 )
-                observed.error.add_note(
+                error.add_note(
                     "actual Stop guard audit (reason, role, mode, adapter, request_hash, disposition): "
                     f"{[(check['reason'], check['role'], check['mode'], check['adapter'], check['request_hash'], check['disposition']) for check in checks]}"
                 )
-                observed.error.add_note(
+                error.add_note(
                     "actual guard inputs (role, supported, user characters, documents, largest document characters): "
                     f"{guard_inputs}; message 2 (trusted indexes, part count, top part index/inspection characters/prefixed unit characters/untrusted): "
                     f"{guard_part_lengths}; Azure mock requests: {len(azure_requests)}"
                 )
-            raise observed.error
+            raise
         with locked_session_transaction(store[0], sid) as conn:
-            paid = retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=runtime.live.recorder, issuer=issuer
-            )
             installed = install_semantic_action_on_connection(conn, running, selected=paid.snapshot, effect_key=prepared.binding.effect_key)
             consumed = consume_semantic_advisor_whole_stop_on_connection(
                 conn, running, selected=installed, effect_key=prepared.binding.effect_key

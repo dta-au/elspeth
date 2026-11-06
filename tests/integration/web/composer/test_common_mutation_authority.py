@@ -5,19 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
-from typing import Annotated, Any
-from unittest.mock import AsyncMock
+from typing import Annotated
 from uuid import UUID, uuid4
 
-import litellm
 import pytest
 from fastapi import Depends, Request
 from sqlalchemy import select
 
 from elspeth.contracts.blobs import BlobDeletionPlan, BlobRecord, BlobReplacementPlan
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user, require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer import tool_batch as tool_batch_module
@@ -25,7 +23,8 @@ from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, Ad
 from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf, encode_message_shelf
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
-from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerMutationAuthorityRevoked
+from elspeth.web.composer.protocol import ComposerMutationAuthorityRevoked
+from elspeth.web.execution.completion_gates import CompletionGateFacts, completion_gates_meta_from_facts
 from elspeth.web.sessions.models import (
     blob_deletion_cleanups_table,
     blob_replacement_cleanups_table,
@@ -39,225 +38,20 @@ from elspeth.web.sessions.models import (
     token_usage_ledger_table,
 )
 from elspeth.web.sessions.protocol import CompositionStateData
-from tests.helpers.advisor_review import parse_advisor_publication_review
-from tests.helpers.composer_operations import message_body, running_operation_async, running_operation_sync, settle_sync
-from tests.helpers.continuation_app import continuation_app
-from tests.integration.web.composer.test_freeform_pipeline_planner import _pipeline
-from tests.integration.web.composer.test_freeform_planner_failure_translation import (
-    _build_app,
-    _Choice,
-    _Function,
-    _llm_audit_rows,
-    _Message,
-    _Response,
-    _ToolCall,
-    _valid_pipeline_completion,
+from tests.helpers.composer_operations import message_body
+from tests.helpers.continuation_app import (
+    PRIMARY_MODEL,
+    ScriptedSDK,
+    continuation_app,
+    end_admit,
+    install_sdk,
+    semantic_primary_response,
+    semantic_review_response,
+    semantic_stop_response,
+    submit_and_settle,
+    tool_call,
 )
-
-
-def _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count, mixed_order=None, downgrade=False, late_p4=False):
-    async def run():
-        async with continuation_app(tmp_path, monkeypatch) as harness, harness.client() as client:
-            await _exercise_request_live(tmp_path, monkeypatch, harness, client, upgrade, mutation_count, mixed_order, downgrade, late_p4)
-
-    asyncio.run(run())
-
-
-async def _exercise_request_live(tmp_path, monkeypatch, harness, client, upgrade, mutation_count, mixed_order, downgrade, late_p4):
-    """Exercise initial and current authority through the actual held SDK call."""
-    holder: dict[str, str] = {}
-    authored = _valid_pipeline_completion(tmp_path, holder)
-    entered, release = asyncio.Event(), asyncio.Event()
-    p4_entered, p4_release = asyncio.Event(), asyncio.Event()
-    requests: list[dict[str, Any]] = []
-    primaries = 0
-
-    async def sdk(**kwargs):
-        nonlocal primaries
-        requests.append(deepcopy(kwargs))
-        ordinal = len(requests)
-        assert ordinal <= (5 if mixed_order else 4), "the SDK script is finite"
-        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01}
-        if "response_format" in kwargs:
-            verdict = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
-            if primaries >= 2:
-                verdict["publication_verdict"] = "ADMIT"
-            return _Response([_Choice(_Message(json.dumps(verdict)))], usage, model=kwargs["model"], id=f"a1-advisor-{ordinal}")
-        primaries += 1
-        if primaries == 1:
-            assert "set_pipeline" in {tool["function"]["name"] for tool in kwargs["tools"]}
-            entered.set()
-            await asyncio.wait_for(release.wait(), timeout=10)
-            response = await authored(**kwargs)
-            original = response.choices[0].message.tool_calls[0]
-            calls = []
-            for index in range(mutation_count):
-                call = deepcopy(original)
-                call.id = f"a1-governed-{index}"
-                call.function.name = "set_pipeline"
-                calls.append(call)
-            response.choices[0].message.tool_calls = calls
-            if mixed_order:
-                by_name = {"set_pipeline": calls[0], "list_sources": _ToolCall("a1-discovery", _Function("list_sources", "{}"))}
-                response.choices[0].message.tool_calls = [by_name[name] for name in mixed_order]
-            response.id = "a1-primary-mutations"
-            response.model = kwargs["model"]
-            return response
-        if mixed_order and primaries == 2:
-            return _Response(
-                [_Choice(_Message(None, [_ToolCall("a1-second-batch", _Function("get_pipeline_state", "{}"))]))],
-                usage,
-                model=kwargs["model"],
-                id="a1-primary-inspect",
-            )
-        assert primaries == (3 if mixed_order else 2)
-        return _Response(
-            [_Choice(_Message("The requested pipeline update is ready for review."))], usage, model=kwargs["model"], id="a1-primary-reply"
-        )
-
-    monkeypatch.setattr(litellm, "acompletion", sdk)
-    engine = harness.app.state.session_engine
-    _sessions = harness.app.state.session_service
-    owner_failures: list[BaseException] = []
-    worker = harness.app.state.composer_async_worker
-    job_finished = worker._job_finished
-
-    def capture_job_failure(key, task):
-        if not task.cancelled() and (failure := task.exception()) is not None:
-            owner_failures.append(failure)
-        job_finished(key, task)
-
-    monkeypatch.setattr(worker, "_job_finished", capture_job_failure)
-    actual_p4 = _sessions.persist_compose_turn_async
-
-    async def held_p4(**kwargs):
-        if late_p4:
-            assert any(row.composition_state_payload is not None for row in kwargs["redacted_tool_rows"])
-            p4_entered.set()
-            await asyncio.wait_for(p4_release.wait(), timeout=10)
-        return await actual_p4(**kwargs)
-
-    monkeypatch.setattr(_sessions, "persist_compose_turn_async", held_p4)
-    observed = _observe_authority(monkeypatch, harness.app.state.composer_service) if mixed_order else None
-    holder["id"] = str(harness.session_id)
-    session_id = holder["id"]
-    preferences_path = f"/api/sessions/{session_id}/composer/preferences"
-    prefs = await client.get(preferences_path)
-    assert prefs.status_code == 200, prefs.text
-    density = prefs.json()["density_default"]
-    initial_mode = "auto_commit" if mixed_order or downgrade or late_p4 else "explicit_approve"
-    initial = await client.patch(preferences_path, json={"trust_mode": initial_mode, "density_default": density})
-    assert initial.status_code == 200, initial.text
-    assert initial.json()["trust_mode"] == initial_mode
-    source_dir = tmp_path / "blobs" / session_id
-    source_dir.mkdir(parents=True, exist_ok=True)
-    (source_dir / "input.csv").write_text("name\nAlice\n", encoding="utf-8")
-    (tmp_path / "outputs" / session_id).mkdir(parents=True, exist_ok=True)
-
-    async def observe(http, operation):
-        try:
-            try:
-                await asyncio.wait_for(entered.wait(), timeout=10)
-            except TimeoutError as error:
-                if owner_failures:
-
-                    def leaves(failure: BaseException) -> list[str]:
-                        if isinstance(failure, BaseExceptionGroup):
-                            return [leaf for child in failure.exceptions for leaf in leaves(child)]
-                        return [f"{type(failure).__name__}: {str(failure).splitlines()[0]}"]
-
-                    raise AssertionError(f"Current worker failed before first PRIMARY: {leaves(owner_failures[0])}") from error
-                raise
-            held = await http.get(preferences_path)
-            assert held.status_code == 200 and held.json()["trust_mode"] == initial_mode, held.text
-            if upgrade or downgrade:
-                current_mode = "explicit_approve" if downgrade else "auto_commit"
-                changed = await http.patch(preferences_path, json={"trust_mode": current_mode, "density_default": density})
-                assert changed.status_code == 200, changed.text
-                assert changed.json()["trust_mode"] == current_mode
-            release.set()
-            if late_p4:
-                await asyncio.wait_for(p4_entered.wait(), timeout=10)
-                changed = await http.patch(preferences_path, json={"trust_mode": "explicit_approve", "density_default": density})
-                assert changed.status_code == 200, changed.text
-                assert changed.json()["trust_mode"] == "explicit_approve"
-                p4_release.set()
-            await operation.drive
-            final = await http.get(operation.poll_path)
-            assert final.status_code == 200, final.text
-            return final.json()
-        finally:
-            release.set()
-            p4_release.set()
-
-    async with running_operation_async(
-        client,
-        harness.app,
-        path=f"/api/sessions/{session_id}/messages",
-        body=message_body("Build a CSV to JSON pipeline from input.csv.", state_id=None),
-    ) as operation:
-        terminal = await observe(client, operation)
-    with engine.connect() as conn:
-        states = list(conn.execute(select(composition_states_table)).mappings())
-        proposals = list(conn.execute(select(composition_proposals_table)).mappings())
-        ledger = list(conn.execute(select(token_usage_ledger_table)).mappings())
-        attempts = list(conn.execute(select(quota_provider_attempts_table)).mappings())
-        users = list(conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "user")).mappings())
-    audits = [row.tool_calls[0]["call"] for row in _llm_audit_rows(engine)]
-    facts = {
-        "upgrade": upgrade,
-        "downgrade": downgrade,
-        "late_p4": late_p4,
-        "mutation_count": mutation_count,
-        "terminal": terminal,
-        "states": len(states),
-        "proposals": len(proposals),
-        "physical_requests": len(requests),
-        "llm_audits": len(audits),
-        "ledger": len(ledger),
-        "attempts": len(attempts),
-        "user_message_ids": [row["id"] for row in users],
-    }
-    print("A1_AUTHORITY_FACTS=" + json.dumps(facts, sort_keys=True))
-    # Verify custody and positive evidence before the missing-authority assertion.
-    assert len(users) == 1
-    assert len(requests) == len(audits) == len(ledger) == len(attempts)
-    assert all(call["provider_cost"] == 0.01 for call in audits)
-    assert len({call["call_id"] for call in audits}) == len(audits)
-    if mixed_order:
-        assert terminal["status"] == "completed", terminal
-        assert terminal["result"]["state"] is not None and proposals == []
-        ceiling, evidence = observed["loop"][0]
-        assert ceiling.request_id == evidence.request_id == users[0]["id"]
-        assert ceiling.session_id == session_id
-        assert len(observed["loop"]) == 1 and len(observed["p4"]) == 2
-        assert all(item == ceiling for item in observed["p4"])
-        assert observed["candidate"] == [ceiling]
-        names = [name for name, _ in observed["worker"]]
-        assert names == [*mixed_order, "get_pipeline_state"]
-        for (name, selected), context in zip(observed["worker"], observed["contexts"], strict=True):
-            expected = ceiling if name == "set_pipeline" else None
-            assert selected == expected
-            assert context.mutation_ceiling == expected
-        assert all(item == ceiling for item in observed["batches"])
-        assert len(observed["batches"]) == 2
-    elif late_p4:
-        assert p4_entered.is_set(), "the real P4 candidate boundary must be reached"
-        assert terminal["status"] == "failed", terminal
-        assert terminal["error"]["http_status"] == 409, terminal
-        assert terminal["error"]["error_type"] == "composer_mutation_authority_revoked", terminal
-        assert len(requests) == 2, "completed PRIMARY/EARLY remain; no later PRIMARY/END"
-        assert states == [] and proposals == []
-    elif mutation_count == 11:
-        assert terminal["status"] == "failed", "the original explicit request must retain its proposal cap"
-        assert terminal["error"]["http_status"] == 422, terminal
-        assert len(requests) == 1
-        assert states == [] and proposals == [], "over-cap review batch cannot publish effects"
-    else:
-        assert terminal["status"] == "completed", terminal
-        assert states == [], "the request must obey both initial and current review restrictions"
-        assert len(proposals) == 1
-        assert proposals[0]["status"] == "pending"
+from tests.integration.web.composer.test_freeform_pipeline_planner import _pipeline
 
 
 def _observe_authority(monkeypatch, composer):
@@ -301,53 +95,7 @@ def _observe_authority(monkeypatch, composer):
     return observed
 
 
-@pytest.mark.parametrize(
-    "upgrade,mutation_count",
-    [
-        pytest.param(False, 11, id="stable-explicit-cap-control"),
-        pytest.param(True, 1, id="upgrade-must-still-propose"),
-        pytest.param(True, 11, id="upgrade-must-retain-proposal-cap"),
-    ],
-)
-def test_initial_explicit_authority_is_not_widened(tmp_path, monkeypatch, upgrade, mutation_count):
-    _exercise_request(tmp_path, monkeypatch, upgrade, mutation_count)
-
-
-def test_initial_auto_authority_obeys_current_explicit_review(tmp_path, monkeypatch):
-    _exercise_request(tmp_path, monkeypatch, False, 1, downgrade=True)
-
-
-def test_late_p4_downgrade_refuses_actual_graph_publication(tmp_path, monkeypatch):
-    _exercise_request(tmp_path, monkeypatch, False, 1, late_p4=True)
-
-
-@pytest.mark.parametrize("order", [("set_pipeline", "list_sources"), ("list_sources", "set_pipeline")])
-def test_mixed_batch_forwards_each_selected_automatic_authority(tmp_path, monkeypatch, order):
-    _exercise_request(tmp_path, monkeypatch, False, 1, mixed_order=order)
-
-
-def mutation_response(*, pipeline, ordinal):
-    return _Response(
-        choices=[
-            _Choice(
-                _Message(
-                    None,
-                    [
-                        _ToolCall(
-                            f"authority-set-pipeline-{ordinal}",
-                            _Function("set_pipeline", json.dumps({"pipeline": pipeline})),
-                        )
-                    ],
-                )
-            )
-        ],
-        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-        model="provider/common-authority",
-        id=f"authority-response-{ordinal}",
-    )
-
-
-def run_authority_case(
+async def run_authority_case(
     tmp_path,
     monkeypatch,
     *,
@@ -364,385 +112,355 @@ def run_authority_case(
     create_ack_loss=False,
     rootless_mixed=False,
     observed=None,
+    mixed_order=None,
 ):
-    entered, release = threading.Event(), threading.Event()
-    requests, phases = [], []
-    current_phase = None
-    primary_count = 0
-    selected_ceilings, lost_acks = [], []
-    pipeline = None
-    request_text = "Build a CSV to JSONL pipeline."
-    expected_auto = (initial == "auto_commit" and (final == "auto_commit" or barrier == "p4_locked")) and not blob_only
-    candidate_reply = (
-        "The blob was saved." if blob_only else "The draft was saved." if expected_auto else "The proposal is waiting for approval."
-    )
-    mutation_ordinal = 2 if discovery_first else 1
-
-    async def complete(**kwargs):
-        nonlocal primary_count
-        requests.append(deepcopy(kwargs))
-        if kwargs["model"] == "test/planner":
-            primary_count += 1
-            assert primary_count <= mutation_ordinal + 1, "Unexpected extra primary call"
-            names = {entry["function"]["name"] for entry in kwargs["tools"]}
-            assert "set_pipeline" in names and "emit_pipeline_proposal" not in names
-            if discovery_first and primary_count == 1:
-                return _Response(
-                    choices=[
-                        _Choice(
-                            _Message(
-                                None,
-                                [
-                                    _ToolCall(
-                                        "authority-discovery-1",
-                                        _Function(
-                                            "get_plugin_schema",
-                                            json.dumps(
-                                                {
-                                                    "plugin_type": "source",
-                                                    "name": "csv",
-                                                }
-                                            ),
-                                        ),
-                                    )
-                                ],
-                            )
-                        )
-                    ],
-                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-                    id="authority-discovery-response",
-                )
-            if primary_count == mutation_ordinal:
-                if barrier in {"provider", "second_provider"}:
-                    entered.set()
-                    assert await asyncio.to_thread(release.wait, 15)
-                assert pipeline is not None
-                if blob_only:
-                    return _Response(
-                        choices=[
-                            _Choice(
-                                _Message(
-                                    None,
-                                    [
-                                        _ToolCall(
-                                            "authority-create-blob-1",
-                                            _Function(
-                                                "create_blob",
-                                                json.dumps(
-                                                    {
-                                                        "filename": "immediate.csv",
-                                                        "mime_type": "text/csv",
-                                                        "content": "value\n42\n",
-                                                        "description": "Actual provider-created data",
-                                                    }
-                                                ),
-                                            ),
-                                        )
-                                    ],
-                                )
-                            )
-                        ],
-                        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-                        id="authority-create-response",
-                    )
-                result = mutation_response(pipeline=pipeline, ordinal=mutation_ordinal)
-                if rootless_mixed:
-                    inline_pipeline = deepcopy(pipeline)
-                    inline_pipeline["source"]["options"].pop("path")
-                    inline_pipeline["source"]["inline_blob"] = {
-                        "filename": "refused.csv",
-                        "mime_type": "text/csv",
-                        "content": "value\n43\n",
-                    }
-                    result.choices[0].message.tool_calls.extend(
-                        [
-                            _ToolCall("authority-inline-refused", _Function("set_pipeline", json.dumps({"pipeline": inline_pipeline}))),
-                            _ToolCall("authority-never-dispatch", _Function("list_sources", "{}")),
-                        ]
-                    )
-                if batch_count > 1:
-                    result.choices[0].message.tool_calls = [
-                        _ToolCall(f"authority-set-pipeline-{n}", _Function("set_pipeline", json.dumps({"pipeline": pipeline})))
-                        for n in range(1, batch_count + 1)
-                    ]
-                return result
-            return _Response(
-                choices=[_Choice(_Message(candidate_reply))],
-                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-                id="authority-primary-2",
-            )
-        assert kwargs["model"] == composer._settings.composer_advisor_model
-        assert current_phase in {"early", "end"}
-        assert phases.count(current_phase) == 1, "Unexpected repeated checkpoint"
-        assert kwargs.get("tools") is None and "response_format" in kwargs
-        payload = {
-            "verdict": "CLEAN",
-            "category": "other",
-            "steps": [],
-            "findings": "The supplied evidence supports the stated draft outcome.",
-            "note": None,
-        }
-        if current_phase == "end":
-            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
-            assert review["current_request"] == request_text
-            assert review["candidate_reply"] == candidate_reply
-            assert review["saved_effects"]["saved_revision_count"] == (1 if expected_auto else 0)
-            payload["publication_verdict"] = "ADMIT"
-        return _Response(
-            choices=[_Choice(_Message(json.dumps(payload)))],
-            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-            model=kwargs["model"],
-            id=f"authority-{current_phase}",
-        )
-
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=complete)
-    client, engine, sessions = _build_app(tmp_path, monkeypatch, sdk)
-    composer = client.app.state.composer_service
-    sid = client.post("/api/sessions", json={"title": "Authority race"}).json()["id"]
-    if observed is not None:
-        observed.update(sessions=sessions, sid=sid)
-    pipeline = _pipeline(tmp_path, sid)
-    if inline:
-        pipeline["source"] = {
-            "plugin": "csv",
-            "on_success": "rows",
-            "options": {"schema": {"mode": "observed"}},
-            "on_validation_failure": "discard",
-            "inline_blob": {
+    """Reach the selected authority boundary in the actual current worker."""
+    async with continuation_app(tmp_path, monkeypatch) as harness, harness.client() as client:
+        app, sid = harness.app, str(harness.session_id)
+        engine, sessions = app.state.session_engine, app.state.session_service
+        composer = app.state.composer_service
+        if mixed_order:
+            assert observed is not None
+            observed["authority"] = _observe_authority(monkeypatch, composer)
+        if observed is not None:
+            observed.update(sessions=sessions, sid=sid)
+        pipeline = _pipeline(tmp_path, sid)
+        if inline:
+            pipeline["source"]["options"].pop("path")
+            pipeline["source"]["inline_blob"] = {
                 "filename": "candidate.csv",
                 "mime_type": "text/csv",
                 "content": "value\n42\n",
                 "description": "Provider inline source",
-            },
-        }
-    input_path = tmp_path / "blobs" / sid / "input.csv"
-    input_path.parent.mkdir(parents=True, exist_ok=True)
-    input_path.write_text("name\nAda\n", encoding="utf-8")
-    (tmp_path / "outputs" / sid).mkdir(parents=True, exist_ok=True)
-    # Existing graph fixtures are explicitly session_seed input. This write
-    # is not attributed to the request under test or to a provider response.
-    base_record = None
-    if nonempty:
-        base_record = asyncio.run(
-            sessions.save_composition_state(
-                UUID(sid),
-                CompositionStateData(
-                    sources={"source": deepcopy(pipeline["source"])},
-                    nodes=[],
-                    edges=[],
-                    outputs=[{**deepcopy(pipeline["outputs"][0]), "name": "rows"}],
-                    metadata_={"name": "Existing fixture", "description": ""},
-                    is_valid=True,
-                ),
-                provenance="session_seed",
+            }
+        input_path = tmp_path / "blobs" / sid / "input.csv"
+        input_path.parent.mkdir(parents=True, exist_ok=True)
+        input_path.write_text("name\nAda\n", encoding="utf-8")
+        (tmp_path / "outputs" / sid).mkdir(parents=True, exist_ok=True)
+        base_record = None
+        user = None
+        request_text = "Build a CSV to JSONL pipeline."
+        if nonempty or recompose:
+            seed = sessions.session_operation_authority.acquire(
+                session_id=harness.session_id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id="authority-fixture-seed",
+                lease_seconds=30,
             )
+            try:
+                if nonempty:
+                    base_record = await sessions.save_composition_state(
+                        harness.session_id,
+                        CompositionStateData(
+                            sources={"source": deepcopy(pipeline["source"])},
+                            nodes=[],
+                            edges=[],
+                            outputs=[{**deepcopy(pipeline["outputs"][0]), "name": "rows"}],
+                            metadata_={"name": "Existing fixture", "description": ""},
+                            is_valid=True,
+                            composer_meta={"completion_gates": completion_gates_meta_from_facts(CompletionGateFacts(None))},
+                        ),
+                        provenance="session_seed",
+                        session_operation_context=seed,
+                    )
+                if recompose:
+                    user = await sessions.add_message(
+                        harness.session_id, "user", request_text, writer_principal="route_user_message", session_operation_context=seed
+                    )
+            finally:
+                sessions.session_operation_authority.release(seed)
+        with engine.connect() as conn:
+            baseline = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).mappings().all()
+        operation_id = str(uuid4())
+        body = message_body(request_text, operation_id=operation_id, state_id=None if base_record is None else str(base_record.id))
+        route = "messages"
+        if recompose:
+            assert user is not None
+            body = {"operation_id": operation_id, "state_id": body["state_id"], "expected_user_message_id": str(user.id)}
+            route = "recompose"
+        preference_path = f"/api/sessions/{sid}/composer/preferences"
+
+        async def change_mode(mode):
+            response = await client.patch(preference_path, json={"trust_mode": mode, "density_default": "high"})
+            assert response.status_code == 200, response.text
+            assert response.json()["trust_mode"] == mode
+
+        await change_mode(initial)
+        entered, release = threading.Event(), threading.Event()
+        selected_ceilings, lost_acks = [], []
+        mutation_ordinal = 2 if discovery_first else 1
+        expected_auto = initial == "auto_commit" and (final == "auto_commit" or barrier == "p4_locked") and not blob_only
+        refused = barrier in {"tool", "p4"} and final == "explicit_approve" and not blob_only
+        candidate = (
+            "The blob was saved." if blob_only else "The draft was saved." if expected_auto else "The proposal is waiting for approval."
         )
-    with engine.connect() as connection:
-        baseline_rows = (
-            connection.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).mappings().all()
-        )
-    body = {"content": request_text, "operation_id": str(uuid4()), "state_id": str(base_record.id) if base_record is not None else None}
-    path = f"/api/sessions/{sid}/messages"
-    if recompose:
-        user = asyncio.run(sessions.add_message(UUID(sid), "user", request_text, writer_principal="route_user_message"))
-        body = {"operation_id": body["operation_id"], "state_id": body["state_id"], "expected_user_message_id": str(user.id)}
-        path = f"/api/sessions/{sid}/recompose"
 
-    def change_mode(mode):
-        response = client.patch(f"/api/sessions/{sid}/composer/preferences", json={"trust_mode": mode, "density_default": "high"})
-        assert response.status_code == 200, response.text
-        assert response.json()["trust_mode"] == mode
+        def author(app):
+            if blob_only:
+                return None, [
+                    tool_call(
+                        app,
+                        "authority-create-blob-1",
+                        "create_blob",
+                        {
+                            "filename": "immediate.csv",
+                            "mime_type": "text/csv",
+                            "content": "value\n42\n",
+                            "description": "Provider-created data",
+                        },
+                    )
+                ]
+            calls = [tool_call(app, f"authority-set-pipeline-{n}", "set_pipeline", pipeline) for n in range(1, batch_count + 1)]
+            if discovery_first:
+                calls[0]["id"] = "authority-set-pipeline-2"
+            if rootless_mixed:
+                other = deepcopy(pipeline)
+                other["source"]["options"].pop("path")
+                other["source"]["inline_blob"] = {"filename": "refused.csv", "mime_type": "text/csv", "content": "value\n43\n"}
+                calls.extend(
+                    [
+                        tool_call(app, "authority-inline-refused", "set_pipeline", other),
+                        tool_call(app, "authority-never-dispatch", "list_sources", {}),
+                    ]
+                )
+            if mixed_order:
+                by_name = {"set_pipeline": calls[0], "list_sources": tool_call(app, "authority-discovery", "list_sources", {})}
+                calls = [by_name[name] for name in mixed_order]
+            return None, calls
 
-    change_mode(initial)
-    original_checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
+        steps = []
+        if discovery_first:
+            steps.extend(
+                [
+                    (
+                        "primary",
+                        lambda app: (
+                            None,
+                            [tool_call(app, "authority-discovery-1", "get_plugin_schema", {"plugin_type": "source", "name": "csv"})],
+                        ),
+                    ),
+                    ("semantic", semantic_primary_response),
+                ]
+            )
+        steps.append(("primary", author))
+        if not refused and batch_count <= 10:
+            if expected_auto and not nonempty:
+                steps.append(
+                    ("early", {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "The draft is coherent.", "note": None})
+                )
+            if mixed_order:
+                steps.extend(
+                    [
+                        ("semantic", semantic_primary_response),
+                        ("primary", lambda app: (None, [tool_call(app, "authority-second-batch", "get_pipeline_state", {})])),
+                    ]
+                )
+            steps.extend(
+                [
+                    ("semantic", semantic_primary_response),
+                    ("primary", (candidate, None)),
+                    ("semantic", semantic_review_response),
+                    ("end", end_admit()),
+                    ("semantic", semantic_stop_response),
+                ]
+            )
+        sdk = ScriptedSDK(steps, app_ref=[app])
+        primary_count = 0
 
-    async def observe_checkpoint(**kwargs):
-        nonlocal current_phase
-        current_phase = kwargs["phase"]
-        phases.append(current_phase)
-        return await original_checkpoint(**kwargs)
+        async def complete(**kwargs):
+            nonlocal primary_count
+            if kwargs["model"] == PRIMARY_MODEL:
+                primary_count += 1
+                if primary_count == mutation_ordinal and barrier in {"provider", "second_provider"}:
+                    entered.set()
+                    assert await asyncio.to_thread(release.wait, 30)
+            return await sdk(**kwargs)
 
-    monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", observe_checkpoint)
-    original_p4 = sessions.persist_compose_turn_async
+        install_sdk(monkeypatch, complete)
+        original_p4 = sessions.persist_continuation_compose_turn
 
-    async def held_p4(**kwargs):
-        if observed is not None:
-            observed["sql_input"] = kwargs
-        if barrier == "p4":
-            assert any(row.composition_state_payload is not None for row in kwargs["redacted_tool_rows"])
-            entered.set()
-            assert await asyncio.to_thread(release.wait, 15)
-        return await original_p4(**kwargs)
+        async def held_p4(**kwargs):
+            if observed is not None:
+                observed["sql_input"] = kwargs
+            if barrier == "p4":
+                assert any(row.composition_state_payload is not None for row in kwargs["redacted_tool_rows"])
+                entered.set()
+                assert await asyncio.to_thread(release.wait, 30)
+            return await original_p4(**kwargs)
 
-    monkeypatch.setattr(sessions, "persist_compose_turn_async", held_p4)
-    original_execute = tool_batch_module.execute_tool
+        monkeypatch.setattr(sessions, "persist_continuation_compose_turn", held_p4)
+        actual_execute = tool_batch_module.execute_tool
 
-    def held_tool(*args, **kwargs):
-        selected_ceilings.append(kwargs.get("mutation_ceiling"))
-        if barrier == "tool" and (not rootless_mixed or len(selected_ceilings) == 2):
-            assert args[0] == ("create_blob" if blob_only else "set_pipeline")
-            entered.set()
-            assert release.wait(15)
-        return original_execute(*args, **kwargs)
+        def held_tool(*args, **kwargs):
+            selected_ceilings.append(kwargs.get("mutation_ceiling"))
+            if barrier == "tool" and (not rootless_mixed or len(selected_ceilings) == 2):
+                assert args[0] == ("create_blob" if blob_only else "set_pipeline")
+                entered.set()
+                assert release.wait(30)
+            return actual_execute(*args, **kwargs)
 
-    monkeypatch.setattr(tool_batch_module, "execute_tool", held_tool)
-    original_insert = sessions._insert_composition_checkpoint
+        monkeypatch.setattr(tool_batch_module, "execute_tool", held_tool)
+        actual_insert = sessions._insert_composition_checkpoint
 
-    def held_insert(*args, **kwargs):
-        if barrier == "p4_locked":
-            entered.set()
-            assert release.wait(15)
-        return original_insert(*args, **kwargs)
+        def held_insert(*args, **kwargs):
+            if barrier == "p4_locked":
+                entered.set()
+                assert release.wait(30)
+            return actual_insert(*args, **kwargs)
 
-    monkeypatch.setattr(sessions, "_insert_composition_checkpoint", held_insert)
-    preference_attempted = threading.Event()
+        monkeypatch.setattr(sessions, "_insert_composition_checkpoint", held_insert)
+        preference_attempted = asyncio.Event()
 
-    async def observe_pipeline_admission(
-        request: Request,
-        user: Annotated[UserIdentity, Depends(get_current_user)],
-    ):
-        if barrier == "p4_locked" and request.method == "PATCH" and request.url.path.endswith("/composer/preferences"):
-            assert entered.is_set() and not release.is_set()
-            preference_attempted.set()
-        return await require_pipeline_user(request, user)
+        async def observe_pipeline_admission(request: Request, user: Annotated[UserIdentity, Depends(get_current_user)]):
+            if barrier == "p4_locked" and request.method == "PATCH" and request.url.path.endswith("/composer/preferences"):
+                assert entered.is_set() and not release.is_set()
+                preference_attempted.set()
+            return await require_pipeline_user(request, user)
 
-    client.app.dependency_overrides[require_pipeline_user] = observe_pipeline_admission
-    repository = sessions.session_operation_authority
-    actual_mutate = repository.mutate
+        app.dependency_overrides[require_pipeline_user] = observe_pipeline_admission
+        repository = sessions.session_operation_authority
+        actual_mutate = repository.mutate
 
-    def lose_committed_create_ack(context, callback, *, auto_mutation=None):
-        value = actual_mutate(context, callback, auto_mutation=auto_mutation)
-        if create_ack_loss and not lost_acks and type(value) is BlobRecord and value.status == "ready":
-            assert selected_ceilings and auto_mutation is selected_ceilings[-1]
-            lost_acks.append(value)
-            raise ConnectionError("actual activated inline-create acknowledgement lost")
-        return value
+        def lose_create_ack(context, callback, *, auto_mutation=None):
+            value = actual_mutate(context, callback, auto_mutation=auto_mutation)
+            if create_ack_loss and not lost_acks and type(value) is BlobRecord and value.status == "ready":
+                assert selected_ceilings and auto_mutation is selected_ceilings[-1]
+                lost_acks.append(value)
+                raise ConnectionError("actual activated inline-create acknowledgement lost")
+            return value
 
-    monkeypatch.setattr(repository, "mutate", lose_committed_create_ack)
-    original_cap = composer._enforce_tool_call_cap
+        monkeypatch.setattr(repository, "mutate", lose_create_ack)
+        actual_cap = tool_batch_module._pending_proposal_cap_error
 
-    def observe_cap(**kwargs):
-        try:
-            return original_cap(**kwargs)
-        except ComposerConvergenceError as error:
+        def cap(observed_count, **kwargs):
+            error = actual_cap(observed_count, **kwargs)
             if cap_errors is not None:
                 cap_errors.append(error)
-            raise
+            return error
 
-    monkeypatch.setattr(composer, "_enforce_tool_call_cap", observe_cap)
-    original_module_p4 = composer._persist_turn_audit
+        monkeypatch.setattr(tool_batch_module, "_pending_proposal_cap_error", cap)
+        actual_module_p4 = composer._persist_turn_audit
 
-    async def observe_module_p4(**kwargs):
-        if observed is not None:
-            observed["module_input"] = kwargs
-        result = await original_module_p4(**kwargs)
-        if observed is not None:
-            observed["module_output"] = result
-        return result
+        async def module_p4(**kwargs):
+            if observed is not None:
+                observed["module_input"] = kwargs
+            value = await actual_module_p4(**kwargs)
+            if observed is not None:
+                observed["module_output"] = value
+            return value
 
-    monkeypatch.setattr(composer, "_persist_turn_audit", observe_module_p4)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        # The version-1 header arm is retired; the sole current operation route owns this request.
-        pending = executor.submit(settle_sync, client, client.app, path=path, body=body)
+        monkeypatch.setattr(composer, "_persist_turn_audit", module_p4)
+        pending = asyncio.create_task(submit_and_settle(harness, body, route=route, rounds=720))
+        change = None
         try:
-            assert entered.wait(15), "Actual selected owner was never reached"
+            assert await asyncio.to_thread(entered.wait, 60), "Actual selected authority boundary was never reached"
             if barrier == "p4_locked":
-                preference_change = executor.submit(change_mode, final)
-                assert preference_attempted.wait(15)
-                assert not preference_change.done()
+                change = asyncio.create_task(change_mode(final))
+                await asyncio.wait_for(preference_attempted.wait(), 30)
+                assert not change.done()
                 release.set()
-                preference_change.result(timeout=15)
+                await change
             else:
-                change_mode(final)
+                await change_mode(final)
         finally:
             release.set()
-        settled = pending.result(timeout=30)
-    with engine.connect() as conn:
-        states = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).mappings().all()
-        proposals = (
-            conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.session_id == sid)).mappings().all()
-        )
-        chat = (
-            conn.execute(
-                select(chat_messages_table).where(chat_messages_table.c.session_id == sid).order_by(chat_messages_table.c.sequence_no)
+            if change is not None and not change.done():
+                await change
+        terminal = await pending
+        assert sdk.roles == [role for role, _payload in steps] and not sdk.steps
+        phases = [role for role in sdk.roles if role in {"early", "end"}]
+        with engine.connect() as conn:
+            states = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).mappings().all()
+            proposals = (
+                conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.session_id == sid)).mappings().all()
             )
-            .mappings()
-            .all()
-        )
-        operation = (
-            conn.execute(select(composer_async_operations_table).where(composer_async_operations_table.c.session_id == sid))
-            .mappings()
-            .one()
-        )
-        assert operation["operation_id"] == body["operation_id"]
-        blobs = conn.execute(select(blobs_table).where(blobs_table.c.session_id == sid)).mappings().all()
-        rejections = conn.execute(
-            select(composition_rejection_events_table).where(composition_rejection_events_table.c.session_id == sid)
-        ).all()
-        journals = tuple(
-            tuple(conn.execute(select(table).where(table.c.session_id == sid)).all())
-            for table in (blob_deletion_cleanups_table, blob_replacement_cleanups_table)
-        )
-    old_ids = {row["id"] for row in baseline_rows}
-    assert [row for row in states if row["id"] in old_ids] == baseline_rows
-    states = [row for row in states if row["id"] not in old_ids]
-    # These are actual SDK invocations: bind each physical provider response to
-    # its durable call receipt and independently authenticated request sidecar.
-    calls = [
-        row["tool_calls"][0]["call"]
-        for row in chat
-        if row["role"] == "audit" and row["tool_calls"] and row["tool_calls"][0].get("_kind") == "llm_call_audit"
-    ]
-    assert len(calls) == sdk.await_count
-    assert len({call["call_id"] for call in calls}) == len(calls)
-    assert all(call["status"] == "success" for call in calls)
-    private = [
-        ComposerDiagnosticEvidence.from_envelope(
-            row["tool_calls"][0], expected_session_id=sid, expected_operation_id=operation["session_operation_id"]
-        )
-        for row in chat
-        if row["role"] == "audit" and row["tool_calls"] and row["tool_calls"][0].get("_kind") == "composer_diagnostic_evidence"
-    ]
-    requests_by_id = {item.tool_call_id: item for item in private if item.status == "provider_request"}
-    assert set(requests_by_id) == {call["call_id"] for call in calls}
-    assert all(item.operation_epoch == operation["session_operation_epoch"] for item in private)
-    for call in calls:
-        evidence = requests_by_id[call["call_id"]]
-        assert evidence.arguments.content is not None
-        request = json.loads(evidence.arguments.content)
-        assert request["capture_boundary"] and request["messages"]
-    if inline or blob_only:
-        expected_blobs = int(blob_only or barrier == "p4" or expected_auto)
-        assert len(blobs) == expected_blobs
-        for blob in blobs:
-            assert blob["status"] == "ready"
-            assert Path(blob["storage_path"]).read_bytes() == b"value\n42\n"
-    assert bool(lost_acks) is create_ack_loss
-    assert journals == ((), ())
-    if barrier in {"tool", "p4"} and not blob_only:
-        assert rejections == [], "An unseen refusal must not invent planner-feedback provenance"
-    return settled, states, proposals, chat, phases, primary_count, sdk.await_count
+            chat = (
+                conn.execute(
+                    select(chat_messages_table).where(chat_messages_table.c.session_id == sid).order_by(chat_messages_table.c.sequence_no)
+                )
+                .mappings()
+                .all()
+            )
+            blobs = conn.execute(select(blobs_table).where(blobs_table.c.session_id == sid)).mappings().all()
+            rejections = conn.execute(
+                select(composition_rejection_events_table).where(composition_rejection_events_table.c.session_id == sid)
+            ).all()
+            attempts = (
+                conn.execute(select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == sid))
+                .mappings()
+                .all()
+            )
+            ledger = conn.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.session_id == sid)).mappings().all()
+            journals = tuple(
+                tuple(conn.execute(select(table).where(table.c.session_id == sid)).all())
+                for table in (blob_deletion_cleanups_table, blob_replacement_cleanups_table)
+            )
+        old_ids = {row["id"] for row in baseline}
+        assert [row for row in states if row["id"] in old_ids] == baseline
+        states = [row for row in states if row["id"] not in old_ids]
+        calls = [
+            row["tool_calls"][0]["call"]
+            for row in chat
+            if row["role"] == "audit" and row["tool_calls"] and row["tool_calls"][0].get("_kind") == "llm_call_audit"
+        ]
+        assert len(calls) == len(sdk.requests) == len(attempts) == len(ledger)
+        assert {call["call_id"] for call in calls} == {row["attempt_id"] for row in attempts}
+        assert {row["ledger_entry_id"] for row in attempts} == {row["entry_id"] for row in ledger}
+        assert all(row["settled_at"] is not None for row in attempts)
+        assert all(call["status"] == "success" for call in calls)
+        with engine.connect() as conn:
+            operation = (
+                conn.execute(
+                    select(composer_async_operations_table).where(
+                        composer_async_operations_table.c.session_id == sid,
+                        composer_async_operations_table.c.operation_id == operation_id,
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        private = [
+            ComposerDiagnosticEvidence.from_envelope(
+                row["tool_calls"][0], expected_session_id=sid, expected_operation_id=operation["session_operation_id"]
+            )
+            for row in chat
+            if row["role"] == "audit" and row["tool_calls"] and row["tool_calls"][0].get("_kind") == "composer_diagnostic_evidence"
+        ]
+        requests_by_id = {item.tool_call_id: item for item in private if item.status == "provider_request"}
+        assert set(requests_by_id) == {call["call_id"] for call in calls}
+        assert all(item.operation_epoch == operation["session_operation_epoch"] for item in private)
+        for evidence in requests_by_id.values():
+            assert evidence.arguments.content is not None
+            request = json.loads(evidence.arguments.content)
+            assert request["capture_boundary"] and request["messages"]
+        if inline or blob_only:
+            assert len(blobs) == int(blob_only or barrier == "p4" or expected_auto)
+            for blob in blobs:
+                assert blob["status"] == "ready" and Path(blob["storage_path"]).read_bytes() == b"value\n42\n"
+        assert bool(lost_acks) is create_ack_loss
+        assert journals == ((), ())
+        if barrier in {"tool", "p4"} and not blob_only:
+            assert rejections == []
+        return terminal, states, proposals, chat, phases, primary_count, len(sdk.requests)
 
 
 def _assert_actual_graph_publications(result, states, chat, applied):
-    """Distinguish P4's checkpoint from the existing route's final projection."""
-    assert [row["provenance"] for row in states] == (["tool_call", "post_compose"] if applied else [])
+    """Current P4 publishes one checkpoint; the final route does not duplicate it."""
+    assert [row["provenance"] for row in states] == (["tool_call"] if applied else [])
     if not applied:
         return
-    checkpoint, final = states
-    assert final["version"] == checkpoint["version"] + 1
-    for field in ("source", "sources", "nodes", "edges", "outputs", "metadata_"):
-        assert final[field] == checkpoint[field]
+    (checkpoint,) = states
     tool = next(row for row in chat if row["role"] == "tool" and row["tool_call_id"] == "authority-set-pipeline-1")
     assert tool["composition_state_id"] == checkpoint["id"]
-    assert result["state"]["id"] == final["id"]
-    assert result["message"]["composition_state_id"] == final["id"]
+    assert result["state"]["id"] == checkpoint["id"]
+    assert result["message"]["composition_state_id"] == checkpoint["id"]
+    assert result["message"]["role"] == "assistant"
     assert result["message"]["id"] == chat[-1]["id"]
     assert result["message"]["segments"][-1]["kind"] == "trusted_system_notice"
     assert "covers 1 saved draft revisions" in result["message"]["segments"][-1]["content"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "initial,final,applied",
     [
@@ -752,23 +470,25 @@ def _assert_actual_graph_publications(result, states, chat, applied):
         ("explicit_approve", "auto_commit", False),
     ],
 )
-def test_held_primary_preserves_initial_and_current_authority(tmp_path, monkeypatch, initial, final, applied):
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
+async def test_held_primary_preserves_initial_and_current_authority(tmp_path, monkeypatch, initial, final, applied):
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
         tmp_path, monkeypatch, initial=initial, final=final, barrier="provider"
     )
-    assert settled.final.status_code == 200, settled.final.text
-    result = settled.result()
+    assert settled.status == "completed", settled.error
+    assert settled.result is not None
+    result = settled.result.model_dump(mode="json")
     _assert_actual_graph_publications(result, states, chat, applied)
     assert len(proposals) == int(not applied)
     assert all(row["status"] == "pending" for row in proposals)
     assert primary == 2
     assert phases == (["early", "end"] if applied else ["end"])
-    assert physical == (4 if applied else 3)
+    assert physical == (7 if applied else 6)
     tools = [row for row in chat if row["role"] == "tool"]
     assert [row["tool_call_id"] for row in tools] == ["authority-set-pipeline-1"]
     assert tools[0]["composition_state_id"] == (states[0]["id"] if applied else None)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("nonempty,recompose", [(True, False), (False, True), (True, True)])
 @pytest.mark.parametrize(
     "initial,final,applied",
@@ -779,7 +499,7 @@ def test_held_primary_preserves_initial_and_current_authority(tmp_path, monkeypa
         ("explicit_approve", "auto_commit", False),
     ],
 )
-def test_same_authority_for_existing_graph_and_recompose(
+async def test_same_authority_for_existing_graph_and_recompose(
     tmp_path,
     monkeypatch,
     nonempty,
@@ -788,17 +508,18 @@ def test_same_authority_for_existing_graph_and_recompose(
     final,
     applied,
 ):
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
         tmp_path, monkeypatch, initial=initial, final=final, barrier="provider", nonempty=nonempty, recompose=recompose
     )
-    result = settled.result()
+    assert settled.result is not None
+    result = settled.result.model_dump(mode="json")
     assert result["message"]["role"] == "assistant"
     _assert_actual_graph_publications(result, states, chat, applied)
     assert len(proposals) == int(not applied)
     assert all(row["status"] == "pending" for row in proposals)
     early = applied and not nonempty
     assert phases == (["early", "end"] if early else ["end"])
-    assert primary == 2 and physical == 2 + len(phases)
+    assert primary == 2 and physical == 5 + len(phases)
     tool = next(row for row in chat if row["role"] == "tool")
     assert tool["tool_call_id"] == "authority-set-pipeline-1"
     if applied:
@@ -820,16 +541,18 @@ def _assert_revoked_graph_replays_as_refusal(event):
     assert "selected_result_authority_revoked" in event["visible_event_availability"]
 
 
-def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monkeypatch):
     observed = {}
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
         tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4", observed=observed
     )
     assert states == [] and proposals == []
-    status, body = settled.error()
+    assert settled.error is not None
+    status, body = settled.error.http_status, settled.error.body
     assert status == 409, body
     assert body["detail"]["error_type"] == "composer_mutation_authority_revoked"
-    assert primary == 1 and phases == ["early"] and physical == 2
+    assert primary == physical == 1 and phases == []
     tools = [row for row in chat if row["role"] == "tool"]
     assert len(tools) == 1 and tools[0]["tool_call_id"] == "authority-set-pipeline-1"
     assert tools[0]["composition_state_id"] is None
@@ -840,7 +563,7 @@ def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monke
     assert assistant["content"] == ""
     assert (
         len([row for row in chat if row["role"] == "audit" and row["tool_calls"] and row["tool_calls"][0].get("_kind") == "llm_call_audit"])
-        == 2
+        == 1
     )
     # A later Advisor rebuilds history from these rows; the revoked graph must
     # replay as the recorded refusal, never as the success the model first saw.
@@ -848,10 +571,10 @@ def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monke
     user = next(row for row in chat if row["role"] == "user")
     history = AdvisorTranscriptHistory.from_records(
         session_id=sid,
-        actor_user_id="alice",
+        actor_user_id="continuation-user",
         current_request_id=str(user["id"]),
         request=user["content"],
-        records=asyncio.run(sessions.get_messages(UUID(sid))),
+        records=await sessions.get_messages(UUID(sid)),
     )
     owner = AdvisorTranscriptOwner(request=user["content"], history=history)
     _assert_revoked_graph_replays_as_refusal(_revoked_graph_history_event(owner.snapshot().provider_json))
@@ -859,44 +582,49 @@ def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monke
     cold, _ = AdvisorTranscriptOwner.for_continuation(
         decode_message_shelf(PrivateChunk(chunk.reference, chunk.canonical)),
         session_id=sid,
-        actor_user_id="alice",
+        actor_user_id="continuation-user",
         request_id=str(user["id"]),
         request=user["content"],
     )
     _assert_revoked_graph_replays_as_refusal(_revoked_graph_history_event(cold.snapshot().provider_json))
 
 
-def test_graph_commit_precedes_later_preference_revocation(tmp_path, monkeypatch):
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
+@pytest.mark.asyncio
+async def test_graph_commit_precedes_later_preference_revocation(tmp_path, monkeypatch):
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
         tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4_locked"
     )
-    assert settled.final.status_code == 200, settled.final.text
-    result = settled.result()
+    assert settled.status == "completed", settled.error
+    assert settled.result is not None
+    result = settled.result.model_dump(mode="json")
     _assert_actual_graph_publications(result, states, chat, True)
     assert proposals == []
-    assert primary == 2 and physical == 4 and phases == ["early", "end"]
+    assert primary == 2 and physical == 7 and phases == ["early", "end"]
     tool = next(row for row in chat if row["role"] == "tool")
     assert tool["composition_state_id"] == states[0]["id"]
     assert json.loads(tool["content"])["success"] is True
 
 
-def test_upgrade_between_iterations_does_not_reauthorize(tmp_path, monkeypatch):
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
+@pytest.mark.asyncio
+async def test_upgrade_between_iterations_does_not_reauthorize(tmp_path, monkeypatch):
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
         tmp_path, monkeypatch, initial="explicit_approve", final="auto_commit", barrier="second_provider", discovery_first=True
     )
-    assert settled.final.status_code == 200, settled.final.text
-    settled.result()
+    assert settled.status == "completed" and settled.result is not None, settled.error
     assert states == [] and len(proposals) == 1 and proposals[0]["status"] == "pending"
-    assert phases == ["end"] and primary == 3 and physical == 4
+    assert phases == ["end"] and primary == 3 and physical == 8
     assert [row["tool_call_id"] for row in chat if row["role"] == "tool"] == ["authority-discovery-1", "authority-set-pipeline-2"]
 
 
-def test_upgraded_request_still_uses_pending_proposal_cap(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_mode", ["explicit_approve", "auto_commit"])
+async def test_upgraded_request_still_uses_pending_proposal_cap(tmp_path, monkeypatch, final_mode):
     cap_errors = []
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
-        tmp_path, monkeypatch, initial="explicit_approve", final="auto_commit", barrier="provider", batch_count=11, cap_errors=cap_errors
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
+        tmp_path, monkeypatch, initial="explicit_approve", final=final_mode, barrier="provider", batch_count=11, cap_errors=cap_errors
     )
-    status, body = settled.error()
+    assert settled.error is not None
+    status, body = settled.error.http_status, settled.error.body
     assert status == 422, body
     detail = body["detail"]
     assert detail["reason"] == "convergence_composition_budget"
@@ -908,18 +636,20 @@ def test_upgraded_request_still_uses_pending_proposal_cap(tmp_path, monkeypatch)
     assert primary == physical == 1 and phases == []
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "barrier,physical,phases",
     [
         ("tool", 1, []),
-        ("p4", 2, ["early"]),
+        ("p4", 1, []),
     ],
 )
-def test_inline_source_respects_custody_and_retains_actual_prefix(tmp_path, monkeypatch, barrier, physical, phases):
-    settled, states, proposals, chat, actual_phases, primary, actual_physical = run_authority_case(
+async def test_inline_source_respects_custody_and_retains_actual_prefix(tmp_path, monkeypatch, barrier, physical, phases):
+    settled, states, proposals, chat, actual_phases, primary, actual_physical = await run_authority_case(
         tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier=barrier, inline=True
     )
-    status, body = settled.error()
+    assert settled.error is not None
+    status, body = settled.error.http_status, settled.error.body
     assert status == 409, body
     assert states == [] and proposals == []
     assert primary == 1 and actual_physical == physical and actual_phases == phases
@@ -928,39 +658,43 @@ def test_inline_source_respects_custody_and_retains_actual_prefix(tmp_path, monk
     assert json.loads(tools[0]["content"])["success"] is False
 
 
-def test_create_blob_remains_immediate_after_downgrade(tmp_path, monkeypatch):
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
+@pytest.mark.asyncio
+async def test_create_blob_remains_immediate_after_downgrade(tmp_path, monkeypatch):
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
         tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="tool", blob_only=True
     )
-    assert settled.final.status_code == 200, settled.final.text
-    settled.result()
+    assert settled.status == "completed" and settled.result is not None, settled.error
     assert states == [] and proposals == []
-    assert primary == 2 and physical == 3 and phases == ["end"]
+    assert primary == 2 and physical == 6 and phases == ["end"]
     tools = [row for row in chat if row["role"] == "tool"]
     assert [row["tool_call_id"] for row in tools] == ["authority-create-blob-1"]
     assert json.loads(tools[0]["content"])["success"] is True
 
 
-def test_activated_inline_create_reconciles_lost_ack_before_p4_refusal(tmp_path, monkeypatch):
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
+@pytest.mark.asyncio
+async def test_activated_inline_create_reconciles_lost_ack_before_p4_refusal(tmp_path, monkeypatch):
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
         tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4", inline=True, create_ack_loss=True
     )
-    assert settled.error()[0] == 409
+    assert settled.status == "failed" and settled.error is not None
+    assert settled.error.http_status == 409
     assert states == proposals == []
-    assert primary == 1 and physical == 2 and phases == ["early"]
+    assert primary == physical == 1 and phases == []
     tool = next(row for row in chat if row["role"] == "tool")
     assert tool["composition_state_id"] is None
     payload = json.loads(tool["content"])
     assert payload["success"] is False and payload["validation"]["errors"][0]["error_code"] == "auto_mutation_revoked"
 
 
-def test_rootless_mixed_refusal_skips_early_and_refuses_earlier_candidate(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_rootless_mixed_refusal_skips_early_and_refuses_earlier_candidate(tmp_path, monkeypatch):
     observed = {}
-    settled, states, proposals, chat, phases, primary, physical = run_authority_case(
+    settled, states, proposals, chat, phases, primary, physical = await run_authority_case(
         tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="tool", rootless_mixed=True, observed=observed
     )
     assert states == proposals == []
-    assert settled.error()[0] == 409
+    assert settled.status == "failed" and settled.error is not None
+    assert settled.error.http_status == 409
     assert phases == [] and primary == physical == 1
     tools = [row for row in chat if row["role"] == "tool"]
     assert [row["tool_call_id"] for row in tools] == ["authority-set-pipeline-1", "authority-inline-refused"]
@@ -981,482 +715,419 @@ def test_rootless_mixed_refusal_skips_early_and_refuses_earlier_candidate(tmp_pa
     assert json.loads(tools[1]["content"])["version"] == observed["module_input"]["tool_outcomes"][1].response.updated_state.version
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool", ["update_blob", "delete_blob"])
 @pytest.mark.parametrize("final_mode,ack_loss", [("auto_commit", False), ("explicit_approve", False), ("auto_commit", True)])
-def test_approval_governed_blob_custody_refuses_late_downgrade(tmp_path, monkeypatch, tool, final_mode, ack_loss):
-    entered, release = threading.Event(), threading.Event()
-    primary_count = 0
-    physical, phases, executed = [], [], []
-    created = {}
-    phase = None
-    selected_ceilings, lost_acks = [], []
+async def test_approval_governed_blob_custody_refuses_late_downgrade(tmp_path, monkeypatch, tool, final_mode, ack_loss):
+    async with continuation_app(tmp_path, monkeypatch) as harness, harness.client() as client:
+        app, sid = harness.app, str(harness.session_id)
+        engine, sessions = app.state.session_engine, app.state.session_service
+        entered, release = threading.Event(), threading.Event()
+        created, executed, selected_ceilings, lost_acks, returned_ids = {}, [], [], [], []
+        operation_id = str(uuid4())
 
-    async def complete(**kwargs):
-        nonlocal primary_count
-        physical.append(deepcopy(kwargs))
-        if kwargs["model"] == "test/planner":
-            primary_count += 1
-            assert primary_count <= 3, "Blob custody triggered an extra primary request"
-            if primary_count == 1:
-                message = _Message(
-                    None,
-                    [
-                        _ToolCall(
-                            "blob-create-actual",
-                            _Function(
-                                "create_blob",
-                                json.dumps(
-                                    {
-                                        "filename": "owned.csv",
-                                        "mime_type": "text/csv",
-                                        "content": "value\n42\n",
-                                        "description": "Provider-created custody control",
-                                    }
-                                ),
-                            ),
-                        )
-                    ],
+        def create(app):
+            return None, [
+                tool_call(
+                    app,
+                    "blob-create-actual",
+                    "create_blob",
+                    {
+                        "filename": "owned.csv",
+                        "mime_type": "text/csv",
+                        "content": "value\n42\n",
+                        "description": "Provider-created custody control",
+                    },
                 )
-            elif primary_count == 2:
-                arguments = {"blob_id": created["blob_id"]}
-                if tool == "update_blob":
-                    arguments["content"] = "value\n43\n"
-                message = _Message(None, [_ToolCall("blob-change-actual", _Function(tool, json.dumps(arguments)))])
-            else:
-                assert final_mode == "auto_commit"
-                message = _Message("The requested blob change is saved.")
-            return _Response(
-                choices=[_Choice(message)],
-                usage={
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
-                    "total_tokens": 15,
-                    "cost": 0.01,
-                },
-                model=kwargs["model"],
-                id=f"blob-primary-{primary_count}",
+            ]
+
+        def change(app):
+            arguments = {"blob_id": created["blob_id"]}
+            if tool == "update_blob":
+                arguments["content"] = "value\n43\n"
+            return None, [tool_call(app, "blob-change-actual", tool, arguments)]
+
+        steps = [("primary", create), ("semantic", semantic_primary_response), ("primary", change)]
+        if final_mode == "auto_commit":
+            steps.extend(
+                [
+                    ("semantic", semantic_primary_response),
+                    ("primary", ("The requested blob change is saved.", None)),
+                    ("semantic", semantic_review_response),
+                    ("end", end_admit()),
+                    ("semantic", semantic_stop_response),
+                ]
             )
-        assert kwargs["model"] == composer._settings.composer_advisor_model
-        assert phase == "end" and phases == ["end"]
-        assert final_mode == "auto_commit"
-        assert kwargs.get("tools") is None and "response_format" in kwargs
-        return _Response(
-            choices=[
-                _Choice(
-                    _Message(
-                        json.dumps(
-                            {
-                                "verdict": "CLEAN",
-                                "category": "other",
-                                "steps": [],
-                                "findings": "",
-                                "note": None,
-                                "publication_verdict": "ADMIT",
-                            }
-                        )
-                    )
+        sdk = ScriptedSDK(steps, app_ref=[app])
+
+        async def complete(**kwargs):
+            response = await sdk(**kwargs)
+            returned_ids.append(response.id)
+            return response
+
+        install_sdk(monkeypatch, complete)
+        preference_path = f"/api/sessions/{sid}/composer/preferences"
+        initial = await client.patch(preference_path, json={"trust_mode": "auto_commit", "density_default": "high"})
+        assert initial.status_code == 200
+        actual_execute = tool_batch_module.execute_tool
+
+        def execute(name, *args, **kwargs):
+            executed.append(name)
+            if name == tool:
+                selected_ceilings.append(kwargs["mutation_ceiling"])
+                entered.set()
+                assert release.wait(30)
+            result = actual_execute(name, *args, **kwargs)
+            if name == "create_blob":
+                assert result.success
+                created["blob_id"] = result.data["blob_id"]
+            return result
+
+        monkeypatch.setattr(tool_batch_module, "execute_tool", execute)
+        repository = sessions.session_operation_authority
+        actual_mutate = repository.mutate
+
+        def lose_change_ack(context, callback, *, auto_mutation=None):
+            value = actual_mutate(context, callback, auto_mutation=auto_mutation)
+            selected = (tool == "update_blob" and type(value) is BlobReplacementPlan and value.phase == "purge_pending") or (
+                tool == "delete_blob" and type(value) is BlobDeletionPlan and value.phase == "purge_pending"
+            )
+            if ack_loss and selected and not lost_acks:
+                assert selected_ceilings and auto_mutation is selected_ceilings[-1]
+                lost_acks.append(value)
+                raise ConnectionError("actual activated blob-change acknowledgement lost")
+            return value
+
+        monkeypatch.setattr(repository, "mutate", lose_change_ack)
+
+        def journals():
+            with engine.connect() as conn:
+                return tuple(
+                    tuple(conn.execute(select(table).where(table.c.session_id == sid).order_by(*table.primary_key.columns)).all())
+                    for table in (blob_deletion_cleanups_table, blob_replacement_cleanups_table)
                 )
-            ],
-            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-            model=kwargs["model"],
-            id="blob-end-1",
-        )
 
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=complete)
-    client, engine, sessions = _build_app(tmp_path, monkeypatch, sdk)
-    composer = client.app.state.composer_service
-    sid = client.post("/api/sessions", json={"title": "Actual blob custody"}).json()["id"]
-
-    def journals():
-        with engine.connect() as connection:
-            return tuple(
-                tuple(connection.execute(select(table).where(table.c.session_id == sid).order_by(*table.primary_key.columns)).all())
-                for table in (blob_deletion_cleanups_table, blob_replacement_cleanups_table)
+        pending = asyncio.create_task(
+            submit_and_settle(
+                harness, message_body("Create the CSV then apply the requested blob change.", operation_id=operation_id), rounds=720
             )
-
-    response = client.patch(f"/api/sessions/{sid}/composer/preferences", json={"trust_mode": "auto_commit", "density_default": "high"})
-    assert response.status_code == 200
-    original_execute = tool_batch_module.execute_tool
-
-    def execute(name, *args, **kwargs):
-        executed.append(name)
-        if name == tool:
-            selected_ceilings.append(kwargs["mutation_ceiling"])
-            entered.set()
-            assert release.wait(15)
-        result = original_execute(name, *args, **kwargs)
-        if name == "create_blob":
-            assert result.success
-            created["blob_id"] = result.data["blob_id"]
-        return result
-
-    original_checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
-
-    async def checkpoint(**kwargs):
-        nonlocal phase
-        phase = kwargs["phase"]
-        phases.append(phase)
-        return await original_checkpoint(**kwargs)
-
-    monkeypatch.setattr(tool_batch_module, "execute_tool", execute)
-    monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", checkpoint)
-    repository = sessions.session_operation_authority
-    actual_mutate = repository.mutate
-
-    def lose_committed_change_ack(context, callback, *, auto_mutation=None):
-        value = actual_mutate(context, callback, auto_mutation=auto_mutation)
-        selected = (tool == "update_blob" and type(value) is BlobReplacementPlan and value.phase == "purge_pending") or (
-            tool == "delete_blob" and type(value) is BlobDeletionPlan and value.phase == "purge_pending"
-        )
-        if ack_loss and selected and not lost_acks:
-            assert selected_ceilings and auto_mutation is selected_ceilings[-1]
-            lost_acks.append(value)
-            raise ConnectionError("actual activated blob-change acknowledgement lost")
-        return value
-
-    monkeypatch.setattr(repository, "mutate", lose_committed_change_ack)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        task = executor.submit(
-            settle_sync,
-            client,
-            client.app,
-            path=f"/api/sessions/{sid}/messages",
-            body={
-                "content": "Create the CSV then apply the requested blob change.",
-                "state_id": None,
-                "operation_id": str(uuid4()),
-            },
         )
         try:
-            assert entered.wait(15), "Real blob change was never dispatched"
-            with engine.connect() as connection:
-                before = connection.execute(select(blobs_table).where(blobs_table.c.id == created["blob_id"])).mappings().one()
+            assert await asyncio.to_thread(entered.wait, 90), "Real blob change was never dispatched"
+            with engine.connect() as conn:
+                before = conn.execute(select(blobs_table).where(blobs_table.c.id == created["blob_id"])).mappings().one()
             original_bytes = Path(before["storage_path"]).read_bytes()
             before_journals = journals()
             assert original_bytes == b"value\n42\n"
-            response = client.patch(f"/api/sessions/{sid}/composer/preferences", json={"trust_mode": final_mode, "density_default": "high"})
+            response = await client.patch(preference_path, json={"trust_mode": final_mode, "density_default": "high"})
             assert response.status_code == 200
         finally:
             release.set()
-        settled = task.result(timeout=30)
-    with engine.connect() as connection:
-        after = connection.execute(select(blobs_table).where(blobs_table.c.id == created["blob_id"])).mappings().one_or_none()
-        states = connection.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).all()
-        proposals = connection.execute(select(composition_proposals_table).where(composition_proposals_table.c.session_id == sid)).all()
-        chat = (
-            connection.execute(
-                select(chat_messages_table).where(chat_messages_table.c.session_id == sid).order_by(chat_messages_table.c.sequence_no)
+        terminal = await pending
+        assert sdk.roles == [role for role, _payload in steps] and not sdk.steps
+        with engine.connect() as conn:
+            after = conn.execute(select(blobs_table).where(blobs_table.c.id == created["blob_id"])).mappings().one_or_none()
+            states = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).all()
+            proposals = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.session_id == sid)).all()
+            chat = (
+                conn.execute(
+                    select(chat_messages_table).where(chat_messages_table.c.session_id == sid).order_by(chat_messages_table.c.sequence_no)
+                )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
-        )
-    assert states == proposals == []
-    assert executed == ["create_blob", tool]
-    assert sdk.await_count == len(physical)
-    audit_calls = [envelope["call"] for row in chat for envelope in row["tool_calls"] or () if envelope.get("_kind") == "llm_call_audit"]
-    assert len(audit_calls) == len(physical)
-    assert len({call["call_id"] for call in audit_calls}) == len(physical)
-    tools = [row for row in chat if row["role"] == "tool"]
-    assert [row["tool_call_id"] for row in tools] == ["blob-create-actual", "blob-change-actual"]
-    assert all(row["composition_state_id"] is None for row in tools)
-    assert bool(lost_acks) is ack_loss
-    if final_mode == "explicit_approve":
-        assert after == before
-        assert journals() == before_journals
-        assert Path(before["storage_path"]).read_bytes() == original_bytes
-        status, body = settled.error()
-        assert status == 409 and body["detail"]["error_type"] == "composer_mutation_authority_revoked"
-        assert primary_count == len(physical) == 2 and phases == []
-        assert "auto_mutation_revoked" in tools[-1]["content"]
-    else:
-        assert settled.result()
-        assert primary_count == 3 and phases == ["end"] and len(physical) == 4
-        assert journals() == ((), ())
-        if tool == "update_blob":
-            assert after is not None and after["status"] == "ready"
-            assert after["content_hash"] != before["content_hash"]
-            assert Path(after["storage_path"]).read_bytes() == b"value\n43\n"
+            attempts = (
+                conn.execute(select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == sid))
+                .mappings()
+                .all()
+            )
+            ledger = conn.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.session_id == sid)).mappings().all()
+        assert states == proposals == []
+        assert executed == ["create_blob", tool]
+        audits = [envelope["call"] for row in chat for envelope in row["tool_calls"] or () if envelope.get("_kind") == "llm_call_audit"]
+        assert len(audits) == len(sdk.requests) == len(attempts) == len(ledger)
+        assert {row["provider_request_id"] for row in audits} == set(returned_ids)
+        assert {row["call_id"] for row in audits} == {row["attempt_id"] for row in attempts}
+        assert {row["ledger_entry_id"] for row in attempts} == {row["entry_id"] for row in ledger}
+        assert all(row["settled_at"] is not None for row in attempts)
+        tools = [row for row in chat if row["role"] == "tool"]
+        assert [row["tool_call_id"] for row in tools] == ["blob-create-actual", "blob-change-actual"]
+        assert all(row["composition_state_id"] is None for row in tools)
+        assert bool(lost_acks) is ack_loss
+        if final_mode == "explicit_approve":
+            assert after == before and journals() == before_journals
+            assert Path(before["storage_path"]).read_bytes() == original_bytes
+            assert terminal.status == "failed" and terminal.error is not None
+            assert terminal.error.http_status == 409 and terminal.error.error_type == "composer_mutation_authority_revoked"
+            assert "auto_mutation_revoked" in tools[-1]["content"]
         else:
-            assert after is None
-            assert not Path(before["storage_path"]).exists()
+            assert terminal.status == "completed" and terminal.result is not None, terminal.error
+            assert journals() == ((), ())
+            if tool == "update_blob":
+                assert after is not None and after["status"] == "ready"
+                assert after["content_hash"] != before["content_hash"]
+                assert Path(after["storage_path"]).read_bytes() == b"value\n43\n"
+            else:
+                assert after is None and not Path(before["storage_path"]).exists()
 
 
-def test_sticky_refusal_selects_entire_mixed_cohort_and_preserves_prior_checkpoint(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_sticky_refusal_selects_entire_mixed_cohort_and_preserves_prior_checkpoint(tmp_path, monkeypatch):
     from elspeth.contracts.composer_mutation import ComposerAutoMutationRefused
     from elspeth.web.composer.visible_tool_event import VisibleToolEvent
-
-    holder, created = {}, {}
-    authored = _valid_pipeline_completion(tmp_path, holder)
-    worker_entered, worker_release = threading.Event(), threading.Event()
-    p4_entered, p4_release = asyncio.Event(), asyncio.Event()
-    requests, phases, executed, batches, p4_inputs, p4_outcomes, refusals, public_errors, module_outcomes = (
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-    )
-    raw_candidate = "PRIVATE second-batch graph candidate prose"
-    primary_count = 0
-    usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01}
-
-    def create_call(call_id, value):
-        return _ToolCall(
-            call_id,
-            _Function("create_blob", json.dumps({"filename": f"{call_id}.csv", "mime_type": "text/csv", "content": f"value\n{value}\n"})),
-        )
-
-    async def complete(**kwargs):
-        nonlocal primary_count
-        requests.append(deepcopy(kwargs))
-        assert len(requests) <= 3, "Refusal must stop later PRIMARY, EARLY and END dispatch"
-        if "response_format" in kwargs:
-            assert phases == ["early"] and primary_count == 1
-            return _Response(
-                [_Choice(_Message(json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None})))],
-                usage,
-                id="sticky-early",
-            )
-        primary_count += 1
-        if primary_count == 1:
-            response = await authored(**kwargs)
-            response.choices[0].message.tool_calls[0].function.name = "set_pipeline"
-            response.choices[0].message.tool_calls[0].id = "sticky-prefix-graph"
-            response.choices[0].message.tool_calls.insert(0, create_call("sticky-prefix-blob", 42))
-            response.id = "sticky-primary-1"
-            return response
-        assert primary_count == 2 and "sticky-prefix-blob" in created
-        calls = [
-            _ToolCall("sticky-graph-a", _Function("set_metadata", json.dumps({"patch": {"name": "PRIVATE candidate A"}}))),
-            create_call("sticky-independent-blob", 99),
-            _ToolCall("sticky-graph-b", _Function("set_metadata", json.dumps({"patch": {"name": "PRIVATE candidate B"}}))),
-            _ToolCall(
-                "sticky-refused-update",
-                _Function("update_blob", json.dumps({"blob_id": created["sticky-prefix-blob"], "content": "value\n43\n"})),
-            ),
-            _ToolCall("sticky-never-dispatch", _Function("list_sources", "{}")),
-        ]
-        return _Response([_Choice(_Message(raw_candidate, calls))], usage, id="sticky-primary-2")
-
-    sdk = AsyncMock(spec=litellm.acompletion, side_effect=complete)
-    client, engine, sessions = _build_app(tmp_path, monkeypatch, sdk)
-    composer = client.app.state.composer_service
-    sid = client.post("/api/sessions", json={"title": "Sticky real mixed cohort"}).json()["id"]
-    holder["id"] = sid
-    directory = tmp_path / "blobs" / sid
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "input.csv").write_text("name\nAda\n", encoding="utf-8")
-    (tmp_path / "outputs" / sid).mkdir(parents=True, exist_ok=True)
-    preference_path = f"/api/sessions/{sid}/composer/preferences"
-    assert client.patch(preference_path, json={"trust_mode": "auto_commit", "density_default": "high"}).status_code == 200
     from elspeth.web.sessions import continuation_driver
 
-    actual_execute, actual_batch = tool_batch_module.execute_tool, tool_batch_module._initialize_continuation_batch_live
-    actual_p4, actual_iteration = sessions.persist_compose_turn_async, continuation_driver.advance_continuation_iteration
-    actual_module_p4 = composer._persist_turn_audit
-    actual_checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
+    async with continuation_app(tmp_path, monkeypatch) as harness, harness.client() as client:
+        app, sid = harness.app, str(harness.session_id)
+        engine, sessions, composer = app.state.session_engine, app.state.session_service, app.state.composer_service
+        created = {}
+        worker_entered, worker_release = threading.Event(), threading.Event()
+        p4_entered, p4_release = asyncio.Event(), asyncio.Event()
+        executed, batches, p4_inputs, refusals, public_errors, module_outcomes, returned_ids = [], [], [], [], [], [], []
+        raw_candidate = "PRIVATE second-batch graph candidate prose"
+        operation_id = str(uuid4())
+        directory = tmp_path / "blobs" / sid
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "input.csv").write_text("name\nAda\n", encoding="utf-8")
+        (tmp_path / "outputs" / sid).mkdir(parents=True, exist_ok=True)
+        preference_path = f"/api/sessions/{sid}/composer/preferences"
+        initial = await client.patch(preference_path, json={"trust_mode": "auto_commit", "density_default": "high"})
+        assert initial.status_code == 200
 
-    def execute(name, arguments, *args, **kwargs):
-        executed.append((name, kwargs["mutation_ceiling"]))
-        if name == "update_blob":
-            worker_entered.set()
-            assert worker_release.wait(15)
+        def create_call(app, call_id, value):
+            return tool_call(
+                app, call_id, "create_blob", {"filename": f"{call_id}.csv", "mime_type": "text/csv", "content": f"value\n{value}\n"}
+            )
+
+        def prefix_author(app):
+            return None, [
+                create_call(app, "sticky-prefix-blob", 42),
+                tool_call(app, "sticky-prefix-graph", "set_pipeline", _pipeline(tmp_path, sid)),
+            ]
+
+        def mixed_author(app):
+            assert "sticky-prefix-blob" in created
+            return raw_candidate, [
+                tool_call(app, "sticky-graph-a", "set_metadata", {"patch": {"name": "PRIVATE candidate A"}}),
+                create_call(app, "sticky-independent-blob", 99),
+                tool_call(app, "sticky-graph-b", "set_metadata", {"patch": {"name": "PRIVATE candidate B"}}),
+                tool_call(
+                    app, "sticky-refused-update", "update_blob", {"blob_id": created["sticky-prefix-blob"], "content": "value\n43\n"}
+                ),
+                tool_call(app, "sticky-never-dispatch", "list_sources", {}),
+            ]
+
+        steps = [
+            ("primary", prefix_author),
+            ("early", {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "The first draft is coherent.", "note": None}),
+            ("semantic", semantic_primary_response),
+            ("primary", mixed_author),
+        ]
+        sdk = ScriptedSDK(steps, app_ref=[app])
+
+        async def complete(**kwargs):
+            response = await sdk(**kwargs)
+            returned_ids.append(response.id)
+            return response
+
+        install_sdk(monkeypatch, complete)
+        actual_execute, actual_batch = tool_batch_module.execute_tool, tool_batch_module._initialize_continuation_batch_live
+        actual_p4, actual_iteration = sessions.persist_continuation_compose_turn, continuation_driver.advance_continuation_iteration
+        actual_module_p4 = composer._persist_turn_audit
+
+        def execute(name, arguments, *args, **kwargs):
+            executed.append((name, kwargs["mutation_ceiling"]))
+            if name == "update_blob":
+                worker_entered.set()
+                assert worker_release.wait(30)
+            try:
+                result = actual_execute(name, arguments, *args, **kwargs)
+            except ComposerAutoMutationRefused as error:
+                refusals.append(error.revocation)
+                raise
+            if name == "create_blob":
+                assert result.success
+                created["sticky-prefix-blob" if len(created) == 0 else "sticky-independent-blob"] = result.data["blob_id"]
+            return result
+
+        async def batch(**kwargs):
+            batches.append((kwargs["acc"].state, kwargs["ctx"].mutation_ceiling))
+            return await actual_batch(**kwargs)
+
+        async def p4(**kwargs):
+            p4_inputs.append(kwargs)
+            if len(p4_inputs) == 2:
+                assert kwargs["authority_revocation"] == refusals[0]
+                p4_entered.set()
+                await asyncio.wait_for(p4_release.wait(), 30)
+            return await actual_p4(**kwargs)
+
+        async def iteration(*args, **kwargs):
+            try:
+                return await actual_iteration(*args, **kwargs)
+            except ComposerMutationAuthorityRevoked as error:
+                public_errors.append(error)
+                raise
+
+        async def module_p4(**kwargs):
+            result = await actual_module_p4(**kwargs)
+            module_outcomes.append(result)
+            return result
+
+        monkeypatch.setattr(tool_batch_module, "execute_tool", execute)
+        monkeypatch.setattr(tool_batch_module, "_initialize_continuation_batch_live", batch)
+        monkeypatch.setattr(sessions, "persist_continuation_compose_turn", p4)
+        monkeypatch.setattr(continuation_driver, "advance_continuation_iteration", iteration)
+        monkeypatch.setattr(composer, "_persist_turn_audit", module_p4)
+        pending = asyncio.create_task(
+            submit_and_settle(
+                harness, message_body("Build the CSV draft then apply the requested changes.", operation_id=operation_id), rounds=720
+            )
+        )
         try:
-            result = actual_execute(name, arguments, *args, **kwargs)
-        except ComposerAutoMutationRefused as error:
-            refusals.append(error.revocation)
-            raise
-        if name == "create_blob":
-            assert result.success
-            created["sticky-prefix-blob" if len(created) == 0 else "sticky-independent-blob"] = result.data["blob_id"]
-        return result
-
-    async def batch(**kwargs):
-        batches.append((kwargs["acc"].state, kwargs["ctx"].mutation_ceiling))
-        return await actual_batch(**kwargs)
-
-    async def p4(**kwargs):
-        p4_inputs.append(kwargs)
-        if len(p4_inputs) == 2:
-            assert kwargs["authority_revocation"] == refusals[0]
-            p4_entered.set()
-            await asyncio.wait_for(p4_release.wait(), 15)
-        result = await actual_p4(**kwargs)
-        p4_outcomes.append(result)
-        return result
-
-    async def iteration(*args, **kwargs):
-        try:
-            return await actual_iteration(*args, **kwargs)
-        except ComposerMutationAuthorityRevoked as error:
-            public_errors.append(error)
-            raise
-
-    async def module_p4(**kwargs):
-        result = await actual_module_p4(**kwargs)
-        module_outcomes.append(result)
-        return result
-
-    async def checkpoint(**kwargs):
-        phases.append(kwargs["phase"])
-        return await actual_checkpoint(**kwargs)
-
-    monkeypatch.setattr(tool_batch_module, "execute_tool", execute)
-    monkeypatch.setattr(tool_batch_module, "_initialize_continuation_batch_live", batch)
-    monkeypatch.setattr(sessions, "persist_compose_turn_async", p4)
-    monkeypatch.setattr(continuation_driver, "advance_continuation_iteration", iteration)
-    monkeypatch.setattr(composer, "_persist_turn_audit", module_p4)
-    monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", checkpoint)
-    prefix = []
-
-    async def observe(http, operation):
-        try:
-            assert await asyncio.to_thread(worker_entered.wait, 15)
-            with engine.connect() as connection:
-                prefix.extend(
-                    connection.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).mappings()
-                )
+            assert await asyncio.to_thread(worker_entered.wait, 120)
+            with engine.connect() as conn:
+                prefix = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).mappings().all()
             assert len(prefix) == 1 and prefix[0]["provenance"] == "tool_call"
-            response = await http.patch(preference_path, json={"trust_mode": "explicit_approve", "density_default": "high"})
+            response = await client.patch(preference_path, json={"trust_mode": "explicit_approve", "density_default": "high"})
             assert response.status_code == 200 and response.json()["trust_mode"] == "explicit_approve"
             worker_release.set()
-            await asyncio.wait_for(p4_entered.wait(), 15)
-            response = await http.patch(preference_path, json={"trust_mode": "auto_commit", "density_default": "high"})
+            await asyncio.wait_for(p4_entered.wait(), 60)
+            response = await client.patch(preference_path, json={"trust_mode": "auto_commit", "density_default": "high"})
             assert response.status_code == 200 and response.json()["trust_mode"] == "auto_commit"
             p4_release.set()
-            await operation.drive
-            response = await http.get(operation.poll_path)
-            assert response.status_code == 200
-            return response.json()
         finally:
             worker_release.set()
             p4_release.set()
-
-    terminal = running_operation_sync(
-        client,
-        client.app,
-        path=f"/api/sessions/{sid}/messages",
-        body=message_body("Build the CSV draft then apply the requested changes."),
-        observe=observe,
-    )
-    with engine.connect() as connection:
-        states = connection.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).mappings().all()
-        chat = (
-            connection.execute(
-                select(chat_messages_table).where(chat_messages_table.c.session_id == sid).order_by(chat_messages_table.c.sequence_no)
+        terminal = await pending
+        assert sdk.roles == [role for role, _payload in steps] and not sdk.steps
+        with engine.connect() as conn:
+            states = conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == sid)).mappings().all()
+            chat = (
+                conn.execute(
+                    select(chat_messages_table).where(chat_messages_table.c.session_id == sid).order_by(chat_messages_table.c.sequence_no)
+                )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
-        )
-        blobs = connection.execute(select(blobs_table).where(blobs_table.c.session_id == sid)).mappings().all()
-        proposals = connection.execute(select(composition_proposals_table).where(composition_proposals_table.c.session_id == sid)).all()
-        rejections = connection.execute(
-            select(composition_rejection_events_table).where(composition_rejection_events_table.c.session_id == sid)
-        ).all()
-        attempts = (
-            connection.execute(select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == sid))
-            .mappings()
-            .all()
-        )
-        ledger = connection.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.session_id == sid)).mappings().all()
-        journals = tuple(
-            tuple(connection.execute(select(table).where(table.c.session_id == sid)).all())
-            for table in (blob_deletion_cleanups_table, blob_replacement_cleanups_table)
-        )
-    assert states == prefix and proposals == rejections == [] and journals == ((), ())
-    assert terminal["status"] == "failed" and terminal["error"]["http_status"] == 409
-    assert terminal["error"]["error_type"] == "composer_mutation_authority_revoked"
-    assert "PRIVATE" not in json.dumps(terminal)
-    history = client.get(f"/api/sessions/{sid}/operations", params={"operation_id": terminal["operation_id"]})
-    assert history.status_code == 200
-    (failure_outcome,) = history.json()["items"]
-    assert failure_outcome["saved_revisions"] == {
-        "attribution": "fenced",
-        "count": 1,
-        "latest_state_id": prefix[0]["id"],
-        "latest_version": prefix[0]["version"],
-    }
-    assert failure_outcome["error_type"] == "composer_mutation_authority_revoked"
-    assert phases == ["early"] and primary_count == 2 and sdk.await_count == len(requests) == 3
-    calls = [row.tool_calls[0]["call"] for row in _llm_audit_rows(engine)]
-    assert len(calls) == len(attempts) == len(ledger) == 3
-    assert {call["call_id"] for call in calls} == {row["attempt_id"] for row in attempts}
-    assert {row["ledger_entry_id"] for row in attempts} == {row["entry_id"] for row in ledger}
-    assert {call["provider_request_id"] for call in calls} == {"sticky-primary-1", "sticky-primary-2", "sticky-early"}
-    assert all(call["provider_cost"] == 0.01 and call["prompt_tokens"] == 10 and call["completion_tokens"] == 5 for call in calls)
-    assert len(batches) == len(p4_inputs) == len(p4_outcomes) == 2
-    ceiling = batches[0][1]
-    assert batches[1][1] == ceiling and refusals[0].ceiling == ceiling
-    assert p4_outcomes[1].authority_revocation == refusals[0]
-    assert public_errors[0].revocation == refusals[0] and public_errors[0].partial_state == batches[1][0]
-    assert p4_outcomes[1].current_state_id == prefix[0]["id"] and p4_outcomes[1].checkpoint_disposition == "no_new_checkpoint"
-    assert p4_outcomes[1].published_assistant_content == ""
-    assert module_outcomes[1].audit_outcome is p4_outcomes[1]
-    assert module_outcomes[1].redacted_tool_rows is p4_outcomes[1].published_tool_rows
-    assert module_outcomes[1].persisted_assistant_content == p4_outcomes[1].published_assistant_content
-    assert module_outcomes[1].authority_revocation == refusals[0]
-    assert module_outcomes[1].persisted_assistant_matches_current_dispatch is False
-    expected_tools = ["create_blob", "set_pipeline", "set_metadata", "create_blob", "set_metadata", "update_blob"]
-    assert [name for name, _ in executed] == expected_tools
-    assert all(selected == (None if name == "create_blob" else ceiling) for name, selected in executed)
-    tools = [row for row in chat if row["role"] == "tool"]
-    assert len(tools) == 6 and "sticky-never-dispatch" not in {row["tool_call_id"] for row in tools}
-    inputs = p4_inputs[1]
-    assert [row.tool_call_id for row in inputs["redacted_tool_rows"]] == [
-        "sticky-graph-a",
-        "sticky-independent-blob",
-        "sticky-graph-b",
-        "sticky-refused-update",
-    ]
-    parent = next(row for row in chat if row["id"] == tools[-1]["parent_assistant_id"])
-    assert parent["content"] == "" and parent["raw_content"] == raw_candidate
-    for original, alternative, saved in zip(inputs["redacted_tool_rows"], inputs["revoked_tool_rows"], tools[2:], strict=True):
-        assert saved["content"] == alternative.content and saved["composition_state_id"] is None
-        if original.composition_state_payload is None:
-            assert alternative is original
-        else:
-            payload = json.loads(saved["content"])
-            assert payload["success"] is False and payload["version"] == batches[1][0].version
-            assert payload["validation"]["errors"][0]["error_code"] == "auto_mutation_revoked"
-            assert alternative.composition_state_payload is None
-            assert alternative.visible_event == original.visible_event.with_authority_revocation(alternative.content)
-        assert VisibleToolEvent.from_envelope(saved["tool_calls"][0]) == alternative.visible_event.with_parent(parent["id"])
-    expected_private = {evidence.tool_call_id: evidence for evidence in inputs["private_tool_evidence"]}
-    actual_private = {
-        item.tool_call_id: item
-        for row in chat
-        if row["role"] == "audit"
-        for envelope in row["tool_calls"] or ()
-        if envelope.get("_kind") == "composer_diagnostic_evidence"
-        for item in [
-            ComposerDiagnosticEvidence.from_envelope(
-                envelope, expected_session_id=sid, expected_operation_id=inputs["session_operation_context"].fence.operation_id
+            blobs = conn.execute(select(blobs_table).where(blobs_table.c.session_id == sid)).mappings().all()
+            proposals = conn.execute(select(composition_proposals_table).where(composition_proposals_table.c.session_id == sid)).all()
+            rejections = conn.execute(
+                select(composition_rejection_events_table).where(composition_rejection_events_table.c.session_id == sid)
+            ).all()
+            attempts = (
+                conn.execute(select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == sid))
+                .mappings()
+                .all()
             )
+            ledger = conn.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.session_id == sid)).mappings().all()
+            journals = tuple(
+                tuple(conn.execute(select(table).where(table.c.session_id == sid)).all())
+                for table in (blob_deletion_cleanups_table, blob_replacement_cleanups_table)
+            )
+        assert states == prefix and proposals == rejections == [] and journals == ((), ())
+        assert terminal.status == "failed" and terminal.error is not None
+        assert terminal.error.http_status == 409 and terminal.error.error_type == "composer_mutation_authority_revoked"
+        assert "PRIVATE" not in terminal.model_dump_json()
+        history = await client.get(f"/api/sessions/{sid}/operations", params={"operation_id": operation_id})
+        assert history.status_code == 200
+        (failure_outcome,) = history.json()["items"]
+        assert failure_outcome["saved_revisions"] == {
+            "attribution": "fenced",
+            "count": 1,
+            "latest_state_id": prefix[0]["id"],
+            "latest_version": prefix[0]["version"],
+        }
+        assert failure_outcome["error_type"] == "composer_mutation_authority_revoked"
+        calls = [
+            row["tool_calls"][0]["call"]
+            for row in chat
+            if row["role"] == "audit" and row["tool_calls"] and row["tool_calls"][0].get("_kind") == "llm_call_audit"
         ]
-        if item.tool_call_id in expected_private
-    }
-    assert actual_private == expected_private
-    assert {row["id"] for row in blobs} == set(created.values())
-    assert all(row["status"] == "ready" for row in blobs)
-    assert {Path(row["storage_path"]).read_bytes() for row in blobs} == {b"value\n42\n", b"value\n99\n"}
-    print(
-        "STICKY_MIXED_FACTS="
-        + json.dumps(
-            {
-                "states": len(states),
-                "tools": len(tools),
-                "blobs": len(blobs),
-                "physical": len(requests),
-                "audits": len(calls),
-                "attempts": len(attempts),
-                "ledger": len(ledger),
-                "executed": expected_tools,
-                "saved_revisions": failure_outcome["saved_revisions"],
-            },
-            sort_keys=True,
-        )
+        assert len(calls) == len(attempts) == len(ledger) == len(sdk.requests)
+        assert {call["call_id"] for call in calls} == {row["attempt_id"] for row in attempts}
+        assert {row["ledger_entry_id"] for row in attempts} == {row["entry_id"] for row in ledger}
+        assert {call["provider_request_id"] for call in calls} == set(returned_ids)
+        assert all(call["provider_cost"] == 0.01 and call["prompt_tokens"] == 7 and call["completion_tokens"] == 3 for call in calls)
+        assert all(row["settled_at"] is not None for row in attempts)
+        assert len(batches) == len(p4_inputs) == len(module_outcomes) == 2
+        p4_outcomes = [item.audit_outcome for item in module_outcomes]
+        ceiling = batches[0][1]
+        assert batches[1][1] == ceiling and refusals[0].ceiling == ceiling
+        assert p4_outcomes[1].authority_revocation == refusals[0]
+        assert public_errors[0].revocation == refusals[0] and public_errors[0].partial_state == batches[1][0]
+        assert p4_outcomes[1].current_state_id == prefix[0]["id"] and p4_outcomes[1].checkpoint_disposition == "no_new_checkpoint"
+        assert p4_outcomes[1].published_assistant_content == ""
+        assert module_outcomes[1].redacted_tool_rows is p4_outcomes[1].published_tool_rows
+        assert module_outcomes[1].persisted_assistant_content == p4_outcomes[1].published_assistant_content
+        assert module_outcomes[1].authority_revocation == refusals[0]
+        assert module_outcomes[1].persisted_assistant_matches_current_dispatch is False
+        expected_tools = ["create_blob", "set_pipeline", "set_metadata", "create_blob", "set_metadata", "update_blob"]
+        assert [name for name, _ in executed] == expected_tools
+        assert all(selected == (None if name == "create_blob" else ceiling) for name, selected in executed)
+        tools = [row for row in chat if row["role"] == "tool"]
+        assert len(tools) == 6 and "sticky-never-dispatch" not in {row["tool_call_id"] for row in tools}
+        inputs = p4_inputs[1]
+        assert [row.tool_call_id for row in inputs["redacted_tool_rows"]] == [
+            "sticky-graph-a",
+            "sticky-independent-blob",
+            "sticky-graph-b",
+            "sticky-refused-update",
+        ]
+        parent = next(row for row in chat if row["id"] == tools[-1]["parent_assistant_id"])
+        assert parent["content"] == "" and parent["raw_content"] == raw_candidate
+        for original, alternative, saved in zip(inputs["redacted_tool_rows"], inputs["revoked_tool_rows"], tools[2:], strict=True):
+            assert saved["content"] == alternative.content and saved["composition_state_id"] is None
+            if original.composition_state_payload is None:
+                assert alternative is original
+            else:
+                payload = json.loads(saved["content"])
+                assert payload["success"] is False and payload["version"] == batches[1][0].version
+                assert payload["validation"]["errors"][0]["error_code"] == "auto_mutation_revoked"
+                assert alternative.composition_state_payload is None
+                assert alternative.visible_event == original.visible_event.with_authority_revocation(alternative.content)
+            assert VisibleToolEvent.from_envelope(saved["tool_calls"][0]) == alternative.visible_event.with_parent(parent["id"])
+        expected_private = {evidence.tool_call_id: evidence for evidence in inputs["private_tool_evidence"]}
+        actual_private = {
+            item.tool_call_id: item
+            for row in chat
+            if row["role"] == "audit"
+            for envelope in row["tool_calls"] or ()
+            if envelope.get("_kind") == "composer_diagnostic_evidence"
+            for item in [
+                ComposerDiagnosticEvidence.from_envelope(
+                    envelope, expected_session_id=sid, expected_operation_id=inputs["session_operation_context"].fence.operation_id
+                )
+            ]
+            if item.tool_call_id in expected_private
+        }
+        assert actual_private == expected_private
+        assert {row["id"] for row in blobs} == set(created.values())
+        assert all(row["status"] == "ready" for row in blobs)
+        assert {Path(row["storage_path"]).read_bytes() for row in blobs} == {b"value\n42\n", b"value\n99\n"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", [("set_pipeline", "list_sources"), ("list_sources", "set_pipeline")])
+async def test_mixed_batch_forwards_each_selected_automatic_authority(tmp_path, monkeypatch, order):
+    observed = {}
+    terminal, states, proposals, chat, phases, primary, physical = await run_authority_case(
+        tmp_path, monkeypatch, initial="auto_commit", final="auto_commit", barrier="provider", mixed_order=order, observed=observed
     )
+    assert terminal.status == "completed" and terminal.result is not None, terminal.error
+    assert proposals == [] and len(states) == 1
+    assert phases == ["early", "end"] and primary == 3 and physical == 9
+    authority = observed["authority"]
+    users = [row for row in chat if row["role"] == "user"]
+    (user,) = users
+    ceiling, evidence = authority["loop"][0]
+    assert ceiling.request_id == evidence.request_id == user["id"]
+    assert ceiling.session_id == observed["sid"]
+    assert len(authority["loop"]) == 1 and len(authority["p4"]) == 2
+    assert all(item == ceiling for item in authority["p4"])
+    assert authority["candidate"] == [ceiling]
+    assert [name for name, _ in authority["worker"]] == [*order, "get_pipeline_state"]
+    for (name, selected), context in zip(authority["worker"], authority["contexts"], strict=True):
+        expected = ceiling if name == "set_pipeline" else None
+        assert selected == expected and context.mutation_ceiling == expected
+    assert len(authority["batches"]) == 2 and all(item == ceiling for item in authority["batches"])

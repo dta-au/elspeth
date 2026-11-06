@@ -28,9 +28,6 @@ from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode
 from elspeth.web.composer.continuation_end_values import decode_end_candidate
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
-    ContinuationAdmissionPolicy,
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -45,7 +42,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_iteration_return import IterationStageData
 
 
-def unpaid_early_outer_on_connection(
+def unpaid_checkpoint_outer_on_connection(
     conn: Connection,
     *,
     session_id: UUID,
@@ -55,7 +52,7 @@ def unpaid_early_outer_on_connection(
     selected: SelectedContinuationState,
     env_ref_names: frozenset[str],
 ) -> str | None:
-    """Read the exact prebind EARLY outer after full structural admission.
+    """Read the exact unpaid EARLY/END outer after full structural admission.
 
     This is SQL DATA, not a caller clearance. Both callers use the same locked
     transaction as complete structural proof; paid children keep their owners.
@@ -63,8 +60,10 @@ def unpaid_early_outer_on_connection(
     """
     from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
     from elspeth.web.sessions.continuation import _has_active_terminal_hold, load_snapshot
-    from elspeth.web.sessions.continuation_checkpoint_paid import read_unpaid_early_prepared_source_on_connection
-    from elspeth.web.sessions.continuation_iteration_return import read_iteration_stage_data_on_connection
+    from elspeth.web.sessions.continuation_checkpoint_paid import (
+        _initial_phase_source,
+        read_unpaid_checkpoint_prepared_source_on_connection,
+    )
     from elspeth.web.sessions.models import composer_continuation_effects_table as effects
     from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
     from elspeth.web.sessions.models import quota_provider_attempts_table as physical
@@ -72,22 +71,27 @@ def unpaid_early_outer_on_connection(
 
     root = selected.stack
     top = root.frames[-1]
-    if (
-        type(top) is not ToolBatchFrame
-        or top.phase != "result_retained"
-        or top.accumulator.codec != "composer.applied-p4-batch.v2"
-        or type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is not ContinuationAdmissionPolicyV4
-    ):
+    if type(top) is ToolBatchFrame:
+        if top.phase != "result_retained" or top.accumulator.codec != "composer.applied-p4-batch.v2":
+            return None
+    elif type(top) is not EndFrame or top.phase != "review_needed" or len(root.frames) != 2:
         return None
-    candidate = f"advance-early:{top.response.digest}"
-    if tuple(item.effect_id for item in root.effect_frontier if item.disposition in ("prepared", "dispatched", "unknown")) != (candidate,):
+    ambiguous = tuple(item.effect_id for item in root.effect_frontier if item.disposition in ("prepared", "dispatched", "unknown"))
+    if len(ambiguous) != 1:
+        return None
+    candidate = ambiguous[0]
+    if type(top) is ToolBatchFrame and candidate != f"advance-early:{top.response.digest}" and not candidate.startswith("iteration-end:"):
+        # Cheap unrelated-owner discrimination only; the actual phase, event,
+        # complete root and SQL inventory below determine eligibility.
+        return None
+    if type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is not ContinuationAdmissionPolicyV4:
         return None
     stored = load_snapshot(conn, session_id=str(session_id), operation_id=operation_id)
     if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(root):
-        raise AuditIntegrityError("unpaid EARLY changed its actual selected parent")
+        raise AuditIntegrityError("unpaid checkpoint changed its actual selected parent")
     if sequence is None or generation is None:
         return None
-    prepared = read_unpaid_early_prepared_source_on_connection(
+    prepared_phase = read_unpaid_checkpoint_prepared_source_on_connection(
         conn,
         session_id=session_id,
         operation_id=operation_id,
@@ -96,26 +100,44 @@ def unpaid_early_outer_on_connection(
         generation=generation,
         env_ref_names=env_ref_names,
     )
-    origin = stored if prepared is None else prepared.source
-    stage = read_iteration_stage_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=origin)
-    if stage is None or stage.stage not in ("early_dispatched", "early_retry_ready"):
-        return None
-    key = stage.early_effect_key
+    if prepared_phase is None:
+        origin = stored
+        phase = _initial_phase_source(conn, session_id=session_id, operation_id=operation_id, selected=stored)
+        if phase is None:
+            return None
+    else:
+        prepared, phase = prepared_phase
+        origin = prepared.source
+    if phase.phase == "early":
+        from elspeth.web.sessions.continuation_iteration_return import read_iteration_stage_data_on_connection
+
+        stage = read_iteration_stage_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=origin)
+        if stage is None or stage.stage not in ("early_dispatched", "early_retry_ready"):
+            raise AuditIntegrityError("unpaid EARLY lost its original iteration stage")
+        if not stage.early_required or (stage.creator_sequence, stage.creator_generation) != (sequence, generation):
+            raise AuditIntegrityError("unpaid EARLY changed its required phase or original creator")
+    key = phase.outer_effect_key
     if (
-        not stage.early_required
-        or (stage.creator_sequence, stage.creator_generation) != (sequence, generation)
+        (type(top) is EndFrame and (phase.phase != "end" or phase.kind != "end_review"))
+        or (type(top) is ToolBatchFrame and phase.kind not in ("iteration_early", "iteration_end"))
         or root.pending_owner_results
         or root.pending_settlement_ids
         or key != candidate
         or _has_active_terminal_hold(conn, session_id=str(session_id), operation_id=operation_id)
     ):
-        raise AuditIntegrityError("unpaid EARLY lost its original sole outer and empty paid custody")
+        raise AuditIntegrityError("unpaid checkpoint lost its original sole outer and empty paid custody")
     current_effects = conn.execute(
         select(effects).where(effects.c.session_id == str(session_id), effects.c.operation_id == operation_id)
     ).all()
     outer = tuple(row for row in current_effects if row.effect_key == key)
-    if len(outer) != 1 or outer[0].disposition != "dispatched" or outer[0].receipt_key is not None or outer[0].result_chunk_key is not None:
-        raise AuditIntegrityError("unpaid EARLY changed its original dispatched outer")
+    if (
+        len(outer) != 1
+        or outer[0].disposition != "dispatched"
+        or outer[0].receipt_key is not None
+        or outer[0].result_chunk_key is not None
+        or (outer[0].creator_sequence, outer[0].creator_generation) != (sequence, generation)
+    ):
+        raise AuditIntegrityError("unpaid checkpoint changed its original dispatched outer or creator")
     # Previous PRIMARY calls are real paid work. Bind the complete physical
     # inventory to the logical operation's original fences and settled effects;
     # an orphan attempt cannot disappear merely because it lacks an effect link.
@@ -142,7 +164,7 @@ def unpaid_early_outer_on_connection(
     bound = tuple(row for row in current_effects if row.provider_attempt_id is not None)
     by_attempt = {row.provider_attempt_id: row for row in bound}
     if {row.attempt_id for row in actual} != set(by_attempt) or len(actual) != len(bound) or len(by_attempt) != len(bound):
-        raise AuditIntegrityError("unpaid EARLY lost its complete prior physical inventory")
+        raise AuditIntegrityError("unpaid checkpoint lost its complete prior physical inventory")
     for attempt in actual:
         linked = by_attempt[attempt.attempt_id]
         if (
@@ -155,7 +177,7 @@ def unpaid_early_outer_on_connection(
             or (attempt.usage_identity, attempt.usage_session, attempt.usage_source, attempt.usage_run)
             != (attempt.identity_id, attempt.session_id, attempt.source, attempt.run_id)
         ):
-            raise AuditIntegrityError("unpaid EARLY contains an unsettled or foreign prior physical call")
+            raise AuditIntegrityError("unpaid checkpoint contains an unsettled or foreign prior physical call")
     return key
 
 
@@ -396,31 +418,26 @@ def validate_continuation_structure_data_on_connection(
             # is current. The outer D remains open by design; the next owner
             # may restore its original gate, but this read grants no SDK use.
             return ()
-        from elspeth.web.composer.continuation_end_effects import end_effect_key
         from elspeth.web.composer.continuation_end_transitions import END_EFFECT_OWNER
 
         compose_root = root.frames[0]
         if type(compose_root) is not ComposeFrame or compose_root.pending_response is None:
             raise AuditIntegrityError("structural admission lost the END review's paid PRIMARY response")
-        key = end_effect_key(compose_root.pending_response)
-        if root.active_action_source is not None:
-            from elspeth.web.sessions.continuation_semantic_actions import read_original_dispatched_semantic_review_on_connection
-
-            admission = read_original_dispatched_semantic_review_on_connection(
-                conn,
-                session_id=session_id,
-                operation_id=operation_id,
-                dispatch_checkpoint_id=stored.checkpoint_id,
-                semantic_effect_key=root.active_action_source.effect_key,
-            )
-            if admission.owner_effect_key is None:
-                raise AuditIntegrityError("structural END source lost its original prescribed Review effect")
-            key = admission.owner_effect_key
-        review = tuple(row for row in actual if row.effect_key == key)
+        unpaid_end = unpaid_checkpoint_outer_on_connection(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            sequence=sequence,
+            generation=generation,
+            selected=selected,
+            env_ref_names=env_ref_names,
+        )
+        review = tuple(row for row in actual if row.effect_key == unpaid_end)
         if (
-            len(root.frames) != 2
+            unpaid_end is None
+            or len(root.frames) != 2
             or top.phase != "review_needed"
-            or ambiguous != (key,)
+            or ambiguous != (unpaid_end,)
             or tool_unresolved
             or root.pending_owner_results
             or root.pending_settlement_ids
@@ -430,8 +447,8 @@ def validate_continuation_structure_data_on_connection(
             or review[0].result_chunk_key is not None
         ):
             raise AuditIntegrityError("structural admission lost the closed in-flight END review shape")
-        # The review made provider calls whose outcome is not durably known.
-        # It is settled as unknown, never re-run by a new owner.
+        # The logical outer is unresolved, but no physical child is owed.
+        # Generic failure records unknown without inventing provider cost.
         return ambiguous
     if (
         type(top) is ToolBatchFrame
@@ -440,7 +457,7 @@ def validate_continuation_structure_data_on_connection(
         and ambiguous
         and not tool_unresolved
     ):
-        early = unpaid_early_outer_on_connection(
+        checkpoint = unpaid_checkpoint_outer_on_connection(
             conn,
             session_id=session_id,
             operation_id=operation_id,
@@ -449,8 +466,8 @@ def validate_continuation_structure_data_on_connection(
             selected=selected,
             env_ref_names=env_ref_names,
         )
-        if early is not None:
-            return (early,)
+        if checkpoint is not None:
+            return (checkpoint,)
         from elspeth.web.composer.continuation_iteration_transitions import (
             ITERATION_EFFECT_OWNER,
             advance_effect_key,
@@ -583,7 +600,7 @@ def _require_quiescent_handoff_cut(root: ContinuationFrameStack) -> None:
 
 def handoff_cut_allowance(
     root: ContinuationFrameStack,
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+    policy: ContinuationAdmissionPolicyV4,
 ) -> ContinuationActionPolicy | None:
     """Size the handoff-safe cuts no recovery owner produces; None for every other cut.
 
@@ -654,7 +671,7 @@ def iteration_stage_action_policy(
     *,
     selected: StoredContinuationSnapshot,
     stage: IterationStageData | None,
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+    policy: ContinuationAdmissionPolicyV4,
 ) -> ContinuationActionPolicy:
     """Size an original source stage; this DATA grants no paid execution."""
     from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
@@ -662,12 +679,7 @@ def iteration_stage_action_policy(
     from elspeth.web.sessions.continuation import StoredContinuationSnapshot
     from elspeth.web.sessions.continuation_iteration_return import IterationStageData
 
-    if type(selected) is not StoredContinuationSnapshot or type(policy) not in (
-        ContinuationAdmissionPolicy,
-        ContinuationAdmissionPolicyV2,
-        ContinuationAdmissionPolicyV3,
-        ContinuationAdmissionPolicyV4,
-    ):
+    if type(selected) is not StoredContinuationSnapshot or type(policy) is not ContinuationAdmissionPolicyV4:
         raise TypeError("iteration allowance requires its nominal selected source and original policy")
     root = decode_continuation_snapshot(selected.payload_json)
     applied_batch_cut(root.frames)
@@ -692,15 +704,10 @@ def iteration_stage_action_policy(
 def next_continuation_action_policy(
     *,
     selected: SelectedContinuationState,
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+    policy: ContinuationAdmissionPolicyV4,
     retry_ready: VerifiedEndFormatRetry | None = None,
 ) -> ContinuationActionPolicy:
-    if type(selected) is not SelectedContinuationState or type(policy) not in (
-        ContinuationAdmissionPolicy,
-        ContinuationAdmissionPolicyV2,
-        ContinuationAdmissionPolicyV3,
-        ContinuationAdmissionPolicyV4,
-    ):
+    if type(selected) is not SelectedContinuationState or type(policy) is not ContinuationAdmissionPolicyV4:
         raise TypeError("next allowance requires its actual selected DATA and retained policy")
     selected.__post_init__()
     root = selected.stack

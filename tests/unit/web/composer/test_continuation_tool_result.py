@@ -44,7 +44,6 @@ from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.continuation_retention_memo import (
     RetentionStageMemo,
     borrow_v4_preparation_memo_scope,
-    legacy_advisor_preparation_memo_scope,
     retention_stage_memo_scope,
     v4_preparation_memo_scope,
 )
@@ -223,15 +222,9 @@ async def test_v4_tool_canonical_proof_crosses_sql_children_with_fresh_parses_an
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scope", ("none", "ordinary", "legacy"))
-async def test_tool_canonical_memo_does_not_change_non_v4_single_parse(scope):
-    context = (
-        nullcontext()
-        if scope == "none"
-        else retention_stage_memo_scope()
-        if scope == "ordinary"
-        else legacy_advisor_preparation_memo_scope(_tool_clock())
-    )
+@pytest.mark.parametrize("scope", ("none", "ordinary"))
+async def test_tool_canonical_memo_keeps_single_parse_without_preparation_parent(scope):
+    context = nullcontext() if scope == "none" else retention_stage_memo_scope()
     with context:
         for _ in range(2):
             assert _canonical_calls(lambda: tool_batch._read_json_value('{"value":1}')) == ({"value": 1}, {"parse": 1, "render": 1})

@@ -32,7 +32,6 @@ from elspeth.web.composer.continuation_evidence_application_data import (
 )
 from elspeth.web.composer.continuation_evidence_restore import restore_turn_evidence
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
-from elspeth.web.composer.continuation_p4_application_restore import apply_selected_p4_to_cold_evidence
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_primary import read_continuation_primary, run_continuation_primary
 from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalReason
@@ -40,7 +39,7 @@ from elspeth.web.composer.continuation_prompt_producers import load_current_mess
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash, continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
-from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostPolicy, CommonProviderCostSnapshot
+from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostSnapshot
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
@@ -48,9 +47,6 @@ from elspeth.web.sessions import continuation_primary as primary_sql
 from elspeth.web.sessions.composer_operations import ComposerOperationFenceLost, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
-    ContinuationEvent,
-    PreparedContinuationProvider,
-    append_complete_snapshot,
     private_chunk_key,
 )
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -72,7 +68,6 @@ from tests.helpers.continuation_inventory import inventory_advisor, inventory_wo
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
 from tests.unit.web.coordination import test_composer_operation_authority
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
-from tests.unit.web.sessions.test_continuation_owed_evidence import committed_evidence_case
 from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST, producer_case
 
 operation_store = test_composer_operation_authority.operation_store
@@ -221,58 +216,174 @@ async def initialized_primary_input(
     return runtime, work, requests
 
 
-async def post_p4_primary_input(store, tmp_path, monkeypatch):
-    """Actual persisted/applied joint graph, at the next ordinary phase input."""
-    kwargs, _produced, _recorder, requests = await primary_input(store, tmp_path, monkeypatch)
-    running = kwargs["inventory"].running
-    restored = await restore_turn_evidence(**kwargs)
-    kwargs["required_work"].coordinator.assert_completed()
-    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30)
-    assert renewed is running.session_operation_context
-    running, pending, owed, joint_snapshot, _commit = await committed_evidence_case(
-        store, graph=True, joint=True, current=(running, kwargs["selected"], kwargs["inventory"], restored)
-    )
-    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30)
-    assert renewed is running.session_operation_context
-    work = inventory_work(running)
-    application = await apply_selected_p4_to_cold_evidence(authority=store[2], selected=pending, inventory=owed, required_work=work)
-    work.coordinator.assert_completed()
-    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30)
-    assert renewed is running.session_operation_context
-    head = application.stored.snapshot
-    root = decode_continuation_snapshot(head.payload_json)
-    compose = root.frames[0]
-    assert type(compose) is ComposeFrame and application.restored.applications is not None
-    # This provider-owner fixture begins after real P4 application. Only the
-    # ordinary phase input is selected here; no writer/receipt/history is faked.
-    ready = root.model_copy(update={"frames": (compose.model_copy(update={"phase": "action_ready"}),)})
-    with locked_session_transaction(store[0], str(store[4])) as conn:
-        head = append_complete_snapshot(
-            conn,
-            session_id=str(store[4]),
-            operation_id=running.claim.operation_id,
-            expected_checkpoint_id=head.checkpoint_id,
-            expected_cursor=head.cursor,
-            snapshot_json=encode_continuation_snapshot(ready),
-            event_batch=(ContinuationEvent("checkpoint", '{"fixture":"ordinary next primary input after actual P4 application"}'),),
-            handoff=False,
+async def handover_to_next_primary(store, owner, running, monkeypatch, *, expected_roles):
+    """Use original driver admission through its real next PRIMARY handover."""
+    from elspeth.web.sessions.continuation_driver import ContinuationSegmentHandedOver, _SegmentDriver
+    from tests.unit.web.sessions.test_continuation_tool_failure import _claimed_driver, _unstarted_driver
+
+    timing = owner.work.coordinator.sql_deadline_owner
+    assert timing is not None
+    driver = _unstarted_driver(store, owner, running, drain_signal=timing.drain_signal)
+    actual_advance = _SegmentDriver.advance
+    roles, ready_cuts = [], []
+
+    async def completion(**request):
+        assert "tools" not in request, "later authoring must wait for the original handover"
+        schema = request["response_format"]["json_schema"]["schema"]
+        if "verdict" in schema["properties"]:
+            roles.append("early")
+            assert roles == list(expected_roles[: len(roles)])
+            reply = {
+                "verdict": "CLEAN",
+                "category": "other",
+                "steps": [],
+                "findings": "The provider's actual draft is coherent.",
+                "note": None,
+            }
+        else:
+            roles.append("semantic")
+            assert roles == list(expected_roles[: len(roles)])
+            assert schema["properties"]["schema_version"]["const"] == "composer.continuation-decision.v1"
+            retained = json.loads(request["messages"][-1]["content"])
+            source, frontier = retained["source"], retained["frontier"]
+            if type(frontier) is str:
+                frontier = json.loads(frontier)
+            obligations = [item["obligation_id"] for item in frontier["obligations"] if item["status"] == "open"]
+            assert obligations and source["kind"] == "semantic"
+            premise = source["premise"]
+            reply = {
+                "schema_version": "composer.continuation-decision.v1",
+                "decision": "CONTINUE",
+                "scope": "whole_request",
+                "obligation_ids": obligations,
+                "obligations": [],
+                "evidence": [],
+                "reason": "Explain the original retained authoring result.",
+                "remaining_actionable_ids": obligations,
+                "prescribed_action": {
+                    "kind": "primary_turn",
+                    "obligation_ids": obligations,
+                    "evidence_ids": [],
+                    "input_hash": premise["input_hash"],
+                    "graph_hash": frontier["graph_hash"],
+                    "policy_hash": premise["policy_hash"],
+                    "tool_manifest_hash": premise["tool_manifest_hash"],
+                    "instruction": "Explain the actual retained pipeline.",
+                },
+            }
+        return ModelResponse(
+            model=request["model"],
+            choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(reply), "tool_calls": None}}],
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
         )
-    work = inventory_work(running)
-    selected = await load_selected_continuation(authority=store[2], running=running, selected=head, required_work=work)
-    inventory = await materialize_continuation_env_inventory(
-        advisor=inventory_advisor(store[3]), authority=store[2], selected=selected, required_work=work
+
+    async def observe_advance(current, stored, selected):
+        result = await actual_advance(current, stored, selected)
+        if current is driver and result is None:
+            _following, after = await current.selected()
+            if type(after.stack.frames[-1]) is ComposeFrame and after.stack.frames[-1].phase == "action_ready":
+                assert after.stack.active_action_json is not None
+                assert roles == list(expected_roles) and not ready_cuts
+                ready_cuts.append(after)
+                timing.drain_signal.request()
+        return result
+
+    with monkeypatch.context() as capture:
+        capture.setattr(_SegmentDriver, "advance", observe_advance)
+        capture.setattr(litellm, "acompletion", completion)
+        async with _claimed_driver(driver):
+            handover = await driver.run(None)
+    assert type(handover) is ContinuationSegmentHandedOver and len(ready_cuts) == 1
+    store[1].verify_recovery(handover.receipt)
+    assert roles == list(expected_roles)
+    owner.work.coordinator.assert_completed()
+    return handover, ready_cuts[0], tuple(roles)
+
+
+async def post_p4_primary_input(store, tmp_path, monkeypatch):
+    """Reach later PRIMARY through the original driver and a real handover."""
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from tests.integration.web.composer.test_freeform_pipeline_planner import _pipeline
+    from tests.unit.web.sessions.test_continuation_live_phases import _phase_case
+    from tests.unit.web.sessions.test_continuation_tool_failure import _install_original_deadline
+
+    _install_original_deadline(store, monkeypatch)
+    blob = tmp_path / "blobs" / str(store[4])
+    blob.mkdir(parents=True, exist_ok=True)
+    (blob / "input.csv").write_text("name\nAda\n", encoding="utf-8")
+    (tmp_path / "outputs" / str(store[4])).mkdir(parents=True, exist_ok=True)
+    await store[3].update_composer_preferences(store[4], trust_mode="auto_commit", density_default="high", actor="test")
+    joint, roles, ready_cuts = [], [], []
+    actual_prepare = ContinuationLiveP4.prepare
+
+    async with _phase_case(
+        store,
+        tmp_path,
+        monkeypatch,
+        tool_call=("joint_authoring", "set_pipeline", _pipeline(tmp_path, str(store[4]))),
+    ) as (owner, running, _primary, primary_sdk):
+        operation_id = running.claim.operation_id
+        request_text = owner.runtime.bindings.message
+
+        async def observe_prepared(p4, prepared):
+            result = await actual_prepare(p4, prepared)
+            if p4.inventory.running.claim.operation_id == operation_id:
+                captured = p4.captured
+                assert captured is not None and not joint
+                compose = captured.stack.frames[0]
+                evidence = decode_turn_evidence(
+                    next(chunk for chunk in captured.chunks if chunk.reference == compose.evidence),
+                    env_ref_names=p4.inventory.names,
+                    source_chunks=captured.chunks,
+                )
+                assert evidence.snapshot.joint_graph_json is not None
+                joint.append(evidence)
+            return result
+
+        with monkeypatch.context() as capture:
+            capture.setattr(ContinuationLiveP4, "prepare", observe_prepared)
+            _handover, ready, roles = await handover_to_next_primary(store, owner, running, capture, expected_roles=("early", "semantic"))
+        ready_cuts.append(ready)
+        assert len(primary_sdk) == len(ready_cuts) == len(joint) == 1
+        assert roles == ("early", "semantic")
+        service = owner.service
+    owner.work.coordinator.assert_completed()
+
+    (claim,) = store[2].claim_segment(limit=1)
+    assert claim.operation_id == operation_id and claim.ownership_generation == running.claim.ownership_generation + 1
+    context = store[1].start_composer_segment(
+        claim, owner_instance_id=store[2]._owner_instance_id, lease_seconds=30, auth_provider_type="local"
     )
-    work.coordinator.assert_completed()
-    kwargs = {**kwargs, "selected": selected, "inventory": inventory, "required_work": inventory_work(running)}
-    shelf = decode_message_shelf(next(chunk for chunk in selected.chunks if chunk.reference == ready.frames[0].transcript))
+    current = ComposerOperationRunning(claim, context)
+    work = inventory_work(current)
+    head = store[2].load_continuation_snapshot(current)
+    selected = await load_selected_continuation(authority=store[2], running=current, selected=head, required_work=work)
+    assert selected.stack == ready_cuts[0].stack.model_copy(update={"cursor": head.cursor})
+    inventory = await materialize_continuation_env_inventory(
+        advisor=service._advisor_checkpoint, authority=store[2], selected=selected, required_work=work
+    )
+    kwargs = {"service": service, "authority": store[2], "selected": selected, "inventory": inventory, "required_work": work}
+    restored = await restore_turn_evidence(**kwargs)
+    compose = selected.stack.frames[0]
+    shelf = decode_message_shelf(next(chunk for chunk in selected.chunks if chunk.reference == compose.transcript))
     produced = await load_current_message_producers(**kwargs, retained_shelf=shelf)
-    assert produced.messages is not None
+    assert produced.messages is not None and compose.tools is not None
+    tools = json.loads(next(chunk for chunk in selected.chunks if chunk.reference == compose.tools).canonical)
+    settings, requests = _required_guard_settings(tmp_path, monkeypatch)
+    service._provider_gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
+    work.coordinator.assert_completed()
     return (
-        {**kwargs, "prior_joint_snapshot": joint_snapshot},
+        {
+            **kwargs,
+            "required_work": inventory_work(current),
+            "prior_joint_snapshot": joint[0],
+            "primary_tools": tools,
+            "primary_user_prompt": request_text,
+        },
         produced,
-        application.restored.recorder,
+        restored.recorder,
         requests,
-        application.restored.drained,
+        restored.drained,
     )
 
 
@@ -284,9 +395,7 @@ async def publish_actual(
     failure=None,
     post_p4=False,
     applicable_cost=True,
-    prebind_cost=True,
     sdk_delay=0.0,
-    expect_timeout=False,
 ):
     if post_p4:
         kwargs, produced, recorder, requests, drained = await post_p4_primary_input(store, tmp_path, monkeypatch)
@@ -296,13 +405,29 @@ async def publish_actual(
     running = kwargs["inventory"].running
     engine = store[0]
     physical_calls = []
+    user_prompt = kwargs["primary_user_prompt"] if post_p4 else REQUEST
 
     async def completion(**sdk_kwargs):
-        _assert_required_guard_admitted(engine, running.session_operation_context, requests, role="composer", user_prompt=REQUEST)
+        _assert_required_guard_admitted(
+            engine,
+            running.session_operation_context,
+            requests,
+            role="composer",
+            user_prompt=user_prompt,
+            **({"current_context": running.session_operation_context} if post_p4 else {}),
+        )
         physical_calls.append(sdk_kwargs)
         # The intent must have committed before the actual SDK entry.
         with engine.connect() as conn:
-            effect = conn.execute(select(effects).where(effects.c.owner == "provider")).one()
+            effect = conn.execute(
+                select(effects).where(
+                    effects.c.session_id == str(running.claim.session_id),
+                    effects.c.operation_id == running.claim.operation_id,
+                    effects.c.owner == "provider",
+                    effects.c.input_sha256 == continuation_provider_input_hash(sdk_kwargs),
+                    effects.c.disposition == "dispatched",
+                )
+            ).one()
         assert effect.disposition == "dispatched" and effect.result_chunk_key is None
         if sdk_delay:
             await asyncio.sleep(sdk_delay)
@@ -320,56 +445,27 @@ async def publish_actual(
     monkeypatch.setattr(litellm, "acompletion", completion)
     work = kwargs["required_work"]
     provider = ProviderInvocationOwner(service=store[3], required_work=work)
-    if applicable_cost and prebind_cost:
-        stack = kwargs["selected"].stack
-        policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash).provider_cost
-        budget = CommonProviderCostBudget(
-            CommonProviderCostSnapshot(
-                stack.logical.session_id,
-                stack.logical.original_user_message_id,
-                2,
-                "continuation_v2",
-                CommonProviderCostPolicy(
-                    max_provider_calls=policy.max_provider_calls,
-                    max_request_bytes=policy.max_request_bytes,
-                    max_completion_tokens=policy.max_completion_tokens,
-                    max_cumulative_provider_cost=Decimal(policy.max_cumulative_provider_cost),
-                    repair_budget=policy.repair_budget,
-                ),
-            )
-        )
-        provider.bind_cost_budget(budget)
     args = {
         "service": kwargs["service"],
         "authority": kwargs["authority"],
         "selected": kwargs["selected"],
         "producers": produced.producers,
         "messages": list(produced.messages),
-        "tools": [],
+        "tools": kwargs["primary_tools"] if post_p4 else [],
         "recorder": recorder,
         "drained": drained,
         "required_work": work,
         "provider_owner": provider,
         "timeout": 5,
     }
-    with prompt_guard_user_scope(REQUEST):
-        if expect_timeout:
-            with pytest.raises(TimeoutError):
-                await run_continuation_primary(**args)
-            result = None
-        elif failure is None:
-            result = await run_continuation_primary(**args)
-        else:
-            with pytest.raises(type(failure)) as caught:
-                await run_continuation_primary(**args)
-            assert caught.value is failure
-            result = None
+    with prompt_guard_user_scope(user_prompt):
+        result = await run_continuation_primary(**args)
     work.coordinator.assert_completed()
     return kwargs, produced, recorder, physical_calls, result
 
 
 @pytest.mark.asyncio
-async def test_primary_uses_admitted_v2_cost_owner_for_actual_sdk_and_settlement(operation_store, tmp_path, monkeypatch):
+async def test_primary_uses_current_sql_cost_owner_for_actual_sdk_and_settlement(operation_store, tmp_path, monkeypatch):
     from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
 
     kwargs, _produced, recorder, physical_calls, result = await publish_actual(operation_store, tmp_path, monkeypatch, applicable_cost=True)
@@ -413,9 +509,7 @@ async def test_primary_cold_sql_bootstrap_keeps_paid_cost_and_refuses_call_cap_b
     )
     store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
     monkeypatch.setattr(test_continuation_cold_restore, "minimal_continuation_policy", lambda: admitted)
-    kwargs, produced, recorder, physical_calls, result = await publish_actual(
-        store, tmp_path, monkeypatch, applicable_cost=True, prebind_cost=False
-    )
+    kwargs, produced, recorder, physical_calls, result = await publish_actual(store, tmp_path, monkeypatch, applicable_cost=True)
     try:
         assert result is not None
         assert len(physical_calls) == 1
@@ -510,10 +604,13 @@ async def test_primary_physical_stage_expires_during_actual_sdk_before_total_act
     store = (operation_store[0], operation_store[1], authority, operation_store[3], operation_store[4])
     monkeypatch.setattr(test_continuation_cold_restore, "minimal_continuation_policy", lambda: admitted)
     kwargs, _produced, _recorder, physical_calls, result = await publish_actual(
-        store, tmp_path, monkeypatch, applicable_cost=True, sdk_delay=0.2, expect_timeout=True
+        store, tmp_path, monkeypatch, applicable_cost=True, sdk_delay=0.2
     )
     try:
-        assert result is None
+        from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal
+
+        assert type(result) is PrimarySdkTerminal
+        assert result.receipt.sdk_entered and not result.receipt.sdk_result_observed
         assert len(physical_calls) == 1
         with operation_store[0].connect() as conn:
             attempt = conn.execute(select(physical)).one()
@@ -521,8 +618,8 @@ async def test_primary_physical_stage_expires_during_actual_sdk_before_total_act
             effect = conn.execute(select(effects).where(effects.c.owner == "provider")).one()
         assert attempt.settled_at is not None
         assert attempt.ledger_entry_id == ledger.entry_id
-        assert effect.disposition == "dispatched"
-        assert effect.provider_attempt_id is None
+        assert effect.disposition == "sdk_terminal"
+        assert effect.provider_attempt_id == attempt.attempt_id
     finally:
         store[1].release(kwargs["inventory"].running.session_operation_context)
 
@@ -562,45 +659,38 @@ async def test_primary_publishes_actual_original_response_audit_ledger_and_compl
 
 @pytest.mark.asyncio
 async def test_primary_publication_preserves_recorder_prefix_and_rolls_back_all_result_bytes(operation_store, tmp_path, monkeypatch):
-    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from elspeth.web.sessions import continuation_primary_paid_overflow_finalization as finalization
     from elspeth.web.sessions.continuation import load_snapshot
-    from elspeth.web.sessions.continuation_primary import publish_primary_provider_on_connection
-    from elspeth.web.sessions.locking import locked_session_transaction
 
+    actual_publish = finalization.publish_primary_provider_on_connection
     checked = []
 
-    def observe(self, binding, *, selected, outcome, recorder, env_ref_names=frozenset()):
-        with locked_session_transaction(self._engine, str(binding.running.claim.session_id)) as conn:
+    def observe(conn, binding, *, selected, outcome, recorder, env_ref_names=frozenset(), **options):
+        def actual_rows():
+            return tuple(tuple(conn.execute(select(table).order_by(*table.primary_key.columns)).all()) for table in (effects, chunks))
 
-            def actual_rows():
-                return tuple(tuple(conn.execute(select(table).order_by(*table.primary_key.columns)).all()) for table in (effects, chunks))
+        before = actual_rows()
+        positive = conn.begin_nested()
+        original = actual_publish(
+            conn, binding, selected=selected, outcome=outcome, recorder=recorder, env_ref_names=env_ref_names, **options
+        )
+        assert original.outcome is outcome and original.buffer is recorder
+        assert original.snapshot == load_snapshot(
+            conn, session_id=str(binding.running.claim.session_id), operation_id=binding.running.claim.operation_id
+        )
+        positive.rollback()
+        assert actual_rows() == before
+        assert recorder.withheld_replies
+        changed = replace(recorder, withheld_replies=())
+        negative = conn.begin_nested()
+        with pytest.raises(AuditIntegrityError, match="complete original recorder prefix"):
+            actual_publish(conn, binding, selected=selected, outcome=outcome, recorder=changed, env_ref_names=env_ref_names, **options)
+        negative.rollback()
+        assert actual_rows() == before
+        checked.append(outcome.audit_call)
+        return actual_publish(conn, binding, selected=selected, outcome=outcome, recorder=recorder, env_ref_names=env_ref_names, **options)
 
-            before = actual_rows()
-            positive = conn.begin_nested()
-            original = publish_primary_provider_on_connection(
-                conn, binding, selected=selected, outcome=outcome, recorder=recorder, env_ref_names=env_ref_names
-            )
-            assert original.outcome is outcome and original.buffer is recorder
-            assert original.snapshot == load_snapshot(
-                conn, session_id=str(binding.running.claim.session_id), operation_id=binding.running.claim.operation_id
-            )
-            positive.rollback()
-            assert actual_rows() == before
-            assert recorder.withheld_replies
-            changed = replace(recorder, withheld_replies=())
-            negative = conn.begin_nested()
-            with pytest.raises(AuditIntegrityError, match="complete original recorder prefix"):
-                publish_primary_provider_on_connection(
-                    conn, binding, selected=selected, outcome=outcome, recorder=changed, env_ref_names=env_ref_names
-                )
-            negative.rollback()
-            assert actual_rows() == before
-            checked.append(outcome.audit_call)
-            return publish_primary_provider_on_connection(
-                conn, binding, selected=selected, outcome=outcome, recorder=recorder, env_ref_names=env_ref_names
-            )
-
-    monkeypatch.setattr(ComposerAsyncOperationAuthority, "publish_continuation_primary", observe)
+    monkeypatch.setattr(finalization, "publish_primary_provider_on_connection", observe)
     kwargs, _produced, recorder, sdk, result = await publish_actual(operation_store, tmp_path, monkeypatch)
     try:
         assert result is not None and checked == [result.outcome.audit_call]
@@ -940,73 +1030,32 @@ async def test_primary_input_refuses_changed_selected_message_after_actual_compl
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", (False, True))
-async def test_failed_or_cancelled_primary_remains_unresolved_and_cannot_retry(operation_store, tmp_path, monkeypatch, cancel):
-    error = asyncio.CancelledError("actual SDK cancellation") if cancel else ValueError("actual SDK failure")
+async def test_failed_or_cancelled_primary_closes_original_sdk_terminal(operation_store, tmp_path, monkeypatch, cancel):
+    from openai import OpenAIError
+
+    from elspeth.web.sessions.continuation_primary_sdk_terminal import read_v4_primary_sdk_terminal_verified_on_connection
+    from elspeth.web.sessions.continuation_sdk_terminal_result import PrimarySdkTerminal
+
+    error = asyncio.CancelledError("actual SDK cancellation") if cancel else OpenAIError("actual SDK failure")
     kwargs, _produced, recorder, sdk, result = await publish_actual(operation_store, tmp_path, monkeypatch, failure=error)
     running = kwargs["inventory"].running
-    released = False
     try:
-        assert result is None and len(sdk) == len(recorder.llm_calls) == 1
-        head = kwargs["authority"].load_continuation_snapshot(running)
-        frame = decode_continuation_snapshot(head.payload_json).frames[-1]
-        work = inventory_work(running)
-        selected = await load_selected_continuation(authority=kwargs["authority"], running=running, selected=head, required_work=work)
-        work.coordinator.assert_completed()
+        assert type(result) is PrimarySdkTerminal and len(sdk) == len(recorder.llm_calls) == 1
+        assert result.receipt.sdk_entered and not result.receipt.sdk_result_observed
+        assert result.receipt.retryable is False
+        assert result.deferred_cancellations == ((error,) if cancel else ())
         before = stored_rows(operation_store[0])
-        with pytest.raises(ContinuationCASConflict, match="cannot retry"):
-            kwargs["authority"].read_continuation_primary(
-                running,
-                selected=selected,
-                checkpoint_id=head.checkpoint_id,
-                cursor=head.cursor,
-                effect_key=frame.provider_effect_key,
-                input_sha256=frame.provider_input_sha256,
-            )
-        assert stored_rows(operation_store[0]) == before and len(sdk) == 1
-        operation_store[1].release(running.session_operation_context)
-        released = True
-        before = stored_rows(operation_store[0])
-        with pytest.raises(AuditIntegrityError):
-            new_owners(operation_store)[1].recover_composer_segment(
-                session_id=operation_store[4],
+        with operation_store[0].connect() as conn:
+            cold = read_v4_primary_sdk_terminal_verified_on_connection(
+                conn,
+                session_id=running.claim.session_id,
                 operation_id=running.claim.operation_id,
-                expected_generation=running.claim.ownership_generation,
-                actor_user_id="alice",
-                auth_provider_type="local",
+                effect_key=result.receipt.identity.effect_key,
             )
+            parent = conn.execute(select(jobs).where(jobs.c.operation_id == running.claim.operation_id)).one()
+        assert cold is not None and cold.receipt == result.receipt and cold.terminal == result.snapshot
+        assert parent.status == "failed"
         assert stored_rows(operation_store[0]) == before and len(sdk) == 1
-    finally:
-        if not released:
-            operation_store[1].release(running.session_operation_context)
-
-
-@pytest.mark.asyncio
-async def test_prepared_primary_intent_cannot_dispatch_twice_or_escape_its_actual_owner(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, _recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
-    authority = kwargs["authority"]
-    running = kwargs["inventory"].running
-    try:
-        request = kwargs["service"]._provider_gateway.prepare_continuation_primary(list(produced.messages), [])
-        selected = kwargs["selected"]
-        prepared = authority.prepare_provider_action(
-            running,
-            family=0,
-            input_sha256=request.input_sha256,
-            snapshot_json=encode_continuation_snapshot(selected.stack),
-            expected_checkpoint_id=selected.checkpoint_id,
-            expected_cursor=selected.stack.cursor,
-            primary_input_json=continuation_provider_input_json(request.kwargs),
-        )
-        dispatch = authority.begin_continuation_primary(prepared)
-        # A new checkpoint cannot turn an old dispatch into a new SDK right.
-        before = stored_rows(operation_store[0])
-        with pytest.raises(ContinuationCASConflict):
-            authority.begin_continuation_primary(PreparedContinuationProvider(prepared.binding, dispatch))
-        assert stored_rows(operation_store[0]) == before
-        foreign = replace(prepared.binding, running=replace(running, claim=replace(running.claim, attempt=running.claim.attempt + 1)))
-        with pytest.raises(AuditIntegrityError):
-            authority.begin_continuation_primary(PreparedContinuationProvider(foreign, dispatch))
-        assert stored_rows(operation_store[0]) == before
     finally:
         operation_store[1].release(running.session_operation_context)
 
@@ -1321,8 +1370,7 @@ async def test_primary_cold_read_binds_complete_supplied_selection_after_real_po
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dispatched", (False, True), ids=("prepared", "dispatched"))
-async def test_primary_structural_premise_refuses_result_on_real_unresolved_intent(operation_store, tmp_path, monkeypatch, dispatched):
+async def test_primary_structural_premise_refuses_result_on_real_prepared_intent(operation_store, tmp_path, monkeypatch):
     from elspeth.web.sessions.composer_operation_errors import worker_lost_error
 
     runtime, work, _requests = await initialized_primary_input(operation_store, tmp_path, monkeypatch)
@@ -1342,8 +1390,6 @@ async def test_primary_structural_premise_refuses_result_on_real_unresolved_inte
             expected_cursor=selected.stack.cursor,
             primary_input_json=continuation_provider_input_json(request.kwargs),
         )
-        if dispatched:
-            authority.begin_continuation_primary(prepared)
         # The exact native producer first establishes a valid unresolved cut.
         assert authority.classify_continuation_owner(running, env_ref_names=runtime.env_ref_names) == "unresolved"
         with operation_store[0].begin() as conn:
@@ -1362,3 +1408,32 @@ async def test_primary_structural_premise_refuses_result_on_real_unresolved_inte
         assert current is not None and current.status == "running"
     finally:
         operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_primary_structural_premise_refuses_result_on_actual_v4_admission(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.sessions.composer_operation_errors import worker_lost_error
+    from tests.unit.web.sessions.test_continuation_primary_no_sdk_refusal import _actual_admitted_primary
+
+    async with _actual_admitted_primary(operation_store, tmp_path, monkeypatch, disposition="settled") as case:
+        running = case["running"]
+        authority = case["arguments"]["authority"]
+        prepared = case["prepared"]
+        names = case["env_ref_names"]
+        assert case["admission"][0].attempt_id and case["sdk"] == []
+        assert authority.classify_continuation_owner(running, env_ref_names=names) == "unresolved"
+        with operation_store[0].begin() as conn:
+            conn.execute(
+                update(effects)
+                .where(effects.c.effect_key == prepared.binding.effect_key)
+                .values(result_chunk_key=f"provider-input:{prepared.binding.input_sha256}")
+            )
+        malformed = stored_rows(operation_store[0])
+        with pytest.raises(AuditIntegrityError, match="contradictory result"):
+            authority.classify_continuation_owner(running, env_ref_names=names)
+        with pytest.raises(AuditIntegrityError, match="contradictory result"):
+            authority.settle_continuation_owner(running, outcome=worker_lost_error(request_id=None), env_ref_names=names)
+        assert stored_rows(operation_store[0]) == malformed and case["sdk"] == []
+        with operation_store[0].begin() as conn:
+            conn.execute(update(effects).where(effects.c.effect_key == prepared.binding.effect_key).values(result_chunk_key=None))
+        assert authority.classify_continuation_owner(running, env_ref_names=names) == "unresolved"

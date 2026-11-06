@@ -318,7 +318,7 @@ def encode_semantic_review_result(value: RetainedSemanticReviewResult) -> str:
         repair_turns_used=result.repair_turns_used,
         publication_binding=value.publication_binding,
     )
-    encoded = canonical_json(wire.model_dump(mode="json"))
+    encoded = canonical_json(wire.model_dump(mode="json", warnings="error", fallback=owned_json))
     if decode_semantic_review_result(encoded) != value:
         raise AuditIntegrityError("semantic review result changed in its complete cold encoding")
     return encoded
@@ -331,7 +331,7 @@ def decode_semantic_review_result(encoded: str) -> RetainedSemanticReviewResult:
         wire = _ReviewResultWire.model_validate_json(encoded, strict=True)
     except ValidationError as error:
         raise AuditIntegrityError("semantic review result lost its closed original fields") from error
-    if canonical_json(wire.model_dump(mode="json")) != encoded:
+    if canonical_json(wire.model_dump(mode="json", warnings="error", fallback=owned_json)) != encoded:
         raise AuditIntegrityError("semantic review result changed its canonical original bytes")
     raw_state, parse_error = parse_json_strict(wire.state_json)
     if parse_error is not None or type(raw_state) is not dict or canonical_json(raw_state) != wire.state_json:
@@ -360,6 +360,21 @@ def decode_semantic_review_result(encoded: str) -> RetainedSemanticReviewResult:
         repair_turns_used=wire.repair_turns_used,
     )
     return RetainedSemanticReviewResult(result=result, publication_binding=wire.publication_binding)
+
+
+def encode_semantic_review_provider_input(value: RetainedSemanticReviewResult) -> tuple[str, str]:
+    """Carry complete stored DATA and its provider view from one cold proof.
+
+    Historical private contexts and diagnostics remain in the full retained
+    codec. Both consumers receive the same immutable public sidecar view;
+    the final SQL reader independently proves its own original Review.
+    """
+    encoded = encode_semantic_review_result(value)
+    document, error = parse_json_strict(encoded)
+    if error is not None or type(document) is not dict:
+        raise AuditIntegrityError("semantic Review provider projection lost its complete result document")
+    document["llm_calls"] = [call.to_dict() for call in value.result.llm_calls]
+    return encoded, canonical_json(document)
 
 
 def retain_semantic_review_result_on_connection(

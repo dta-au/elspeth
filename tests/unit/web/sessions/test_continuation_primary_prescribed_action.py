@@ -40,7 +40,6 @@ from elspeth.web.sessions.continuation_selection import load_snapshot_private_da
 from elspeth.web.sessions.continuation_semantic_advisor import (
     consume_semantic_advisor_primary_on_connection,
     install_semantic_advisor_decision_on_connection,
-    retain_semantic_advisor_outcome_on_connection,
 )
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
@@ -50,7 +49,7 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as physica
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, _reply
 from tests.unit.web.sessions.test_continuation_primary_result import publish_actual
-from tests.unit.web.sessions.test_continuation_semantic_advisor import _begin, _invoke, _semantic_case
+from tests.unit.web.sessions.test_continuation_semantic_advisor import _run_paid_semantic, _semantic_case
 from tests.unit.web.sessions.test_continuation_semantic_advisor import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_semantic_v4_live import _phases, _v4_store
 
@@ -173,15 +172,10 @@ async def test_paid_primary_prescription_reaches_one_physical_request_and_cold_r
             return _reply(json.dumps(_answer(case["request"])))
 
         monkeypatch.setattr(litellm, "acompletion", advisor_completion)
-        issuer, prepared, dispatched = _begin(operation_store, case)
-        observed = await _invoke(case, issuer)
-        assert observed.result.decision is not None
-        action = observed.result.decision.prescribed_action
+        prepared, retained = await _run_paid_semantic(case, monkeypatch)
+        assert retained.decision is not None
+        action = retained.decision.prescribed_action
         assert action is not None and action.kind == "primary_turn"
-        with locked_session_transaction(operation_store[0], sid) as conn:
-            retained = retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
         with locked_session_transaction(operation_store[0], sid) as conn:
             installed = install_semantic_advisor_decision_on_connection(
                 conn, running, selected=retained.snapshot, effect_key=prepared.binding.effect_key
@@ -247,7 +241,7 @@ async def test_paid_primary_prescription_reaches_one_physical_request_and_cold_r
         assert len(ledger) == 2 and result.outcome.audit_call.call_id is not None
         assert charged is not None
         assert {charge.call_id for charge in charged.charges} == {
-            observed.result.audit_call.call_id,
+            retained.audit_call.call_id,
             result.outcome.audit_call.call_id,
         }
         cold_selected = await load_selected_continuation(

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_policy_settings import _FIRST_SEGMENT_SESSION_SQL_ACTIONS, continuation_policy_from_settings
 from elspeth.web.config import WebSettings
 from elspeth.web.continuation_settings import ContinuationActionBoundsSettings, ContinuationLocalStageSettings
@@ -68,13 +68,15 @@ def classifier_15s_probe_settings(**overrides: Any) -> WebSettings:
     return continuation_test_settings(**{**overrides, "composer_continuation_action_bounds": probe_bounds})
 
 
-def minimal_continuation_policy(**setting_overrides: Any) -> ContinuationAdmissionPolicy:
-    return continuation_policy_from_settings(continuation_test_settings(**setting_overrides))
+def minimal_continuation_policy(**setting_overrides: Any) -> ContinuationAdmissionPolicyV4:
+    policy = continuation_policy_from_settings(continuation_test_settings(**setting_overrides))
+    assert policy is not None, "fixture requires enabled current admission"
+    return policy
 
 
 def observed_sql_trial_policy(
     *, physical_seconds: float | None = None, title_retention_seconds: float | None = None
-) -> ContinuationAdmissionPolicy:
+) -> ContinuationAdmissionPolicyV4:
     """The production policy with session-SQL retention widened for observer trials.
 
     Built through the same settings mapping and validators as production. The

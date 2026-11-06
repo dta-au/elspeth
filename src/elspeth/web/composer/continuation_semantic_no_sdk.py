@@ -10,14 +10,17 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
-from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import is_lower_sha256_hex
+from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
+from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage, _AdmittedLLMProviderMetadata, _AdmittedToolCall
+from elspeth.web.composer.advisor_output import ContinuationAdvisorDecision
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
+from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
 from elspeth.web.coordination.quota_authority import ProviderAttempt
 from elspeth.web.required_work import RequiredWorkBinding
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
@@ -28,10 +31,10 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_semantic_advisor_outcome import (
         SemanticAdvisorInvocationObservation,
         SemanticAdvisorInvocationRaised,
-        SemanticAdvisorInvocationReturned,
         SemanticAdvisorInvocationV4Finalized,
         _SemanticAdvisorInvocationCapture,
     )
+    from elspeth.web.composer.continuation_semantic_observation import SemanticProviderResponseObservation
     from elspeth.web.composer.provider_quota import ProviderCallCustody, V4ReturnedIncompleteFinalization
     from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
     from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
@@ -106,8 +109,9 @@ class SemanticAdvisorNoSdkIssuer:
         self._capture: _SemanticAdvisorInvocationCapture | None = None
         self._body_observation: SemanticAdvisorInvocationObservation | None = None
         self._result: SemanticAdvisorResult | None = None
-        self._outcome: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised | None = None
+        self._outcome: SemanticAdvisorInvocationRaised | None = None
         self._v4_finalized: SemanticAdvisorInvocationV4Finalized | None = None
+        self._v4_response: SemanticProviderResponseObservation | None = None
 
     @property
     def prepared_candidate(self) -> PreparedContinuationProvider | None:
@@ -186,39 +190,107 @@ class SemanticAdvisorNoSdkIssuer:
                 raise AuditIntegrityError("Semantic issuer lost its original returned result")
             self._result = result
 
-    def seal_original_outcome(
-        self, capture: _SemanticAdvisorInvocationCapture, outcome: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised
-    ) -> None:
-        from elspeth.web.composer.continuation_semantic_advisor_outcome import (
-            SemanticAdvisorInvocationRaised,
-            SemanticAdvisorInvocationReturned,
+    def note_original_v4_response_observation(self, observation: SemanticProviderResponseObservation) -> None:
+        """Bind the classifier's actual emitted DATA before its original finalizer."""
+        from elspeth.web.composer.continuation_semantic_observation import (
+            SemanticCompleteResponseObservation,
+            SemanticIncompleteResponseObservation,
+            SemanticInvalidResponseObservation,
         )
 
         with self._lock:
             original = self._body_observation
+            if original is None or self._v4_response is not None or self._state != "sdk_entered":
+                raise AuditIntegrityError("Semantic response classification lost its one original paid capture")
+            self._require_original_response_body(original)
+            if type(observation) is SemanticCompleteResponseObservation or type(observation) is SemanticInvalidResponseObservation:
+                if (
+                    observation.source is not original.source
+                    or observation.request_sha256 != original.request_sha256
+                    or observation.attempt is not original.attempt
+                    or observation.message is not original.message
+                    or observation.provider_metadata is not original.provider_metadata
+                    or observation.audit_call is not original.audit_call
+                ):
+                    raise AuditIntegrityError("Semantic response classification substituted its original paid DATA")
+                if type(observation) is SemanticCompleteResponseObservation:
+                    if original.original_failure is not None or observation.decision is not original.decision:
+                        raise AuditIntegrityError("Semantic complete classification changed its original decision")
+                elif type(observation) is SemanticInvalidResponseObservation and (
+                    observation.original_failure is not original.original_failure or original.original_failure is None
+                ):
+                    raise AuditIntegrityError("Semantic invalid classification changed its original malformed failure")
+            elif type(observation) is SemanticIncompleteResponseObservation:
+                if (
+                    observation.source_sha256 != stable_hash(original.source.model_dump(mode="json"))
+                    or observation.request_sha256 != original.request_sha256
+                    or original.attempt is None
+                    or observation.attempt_id != original.attempt.attempt_id
+                ):
+                    raise AuditIntegrityError("Semantic overflow classification changed its original paid source")
+            else:
+                raise AuditIntegrityError("Semantic response classification requires its actual emitted DATA")
+            self._v4_response = observation
+
+    def _require_original_response_body(self, original: SemanticAdvisorInvocationObservation) -> None:
+        """Distinguish complete SDK semantic output from arbitrary post-SDK faults."""
+        if (
+            original.audit_call is not self._captured_call
+            or original.original_failure is not self._original_failure
+            or not original.sdk_entered
+            or not original.recorder_completed
+            or type(original.audit_call) is not ComposerLLMCall
+            or type(original.message) is not _AdmittedAssistantMessage
+            or type(original.provider_metadata) is not _AdmittedLLMProviderMetadata
+            or type(original.admitted_tool_calls) is not tuple
+            or any(type(item) is not _AdmittedToolCall for item in original.admitted_tool_calls)
+            or original.tool_calls_present is not bool(original.admitted_tool_calls)
+            or original.provider_metadata.v4_completeness is None
+        ):
+            raise AuditIntegrityError("Semantic response lost its original complete SDK body")
+        original.provider_metadata.v4_completeness.require_result(
+            original.provider_metadata, content=original.message.content, tool_calls=original.admitted_tool_calls
+        )
+        if original.original_failure is None:
+            if (
+                type(original.decision) is not ContinuationAdvisorDecision
+                or original.audit_call.status is not ComposerLLMCallStatus.SUCCESS
+                or original.admitted_tool_calls
+            ):
+                raise AuditIntegrityError("Semantic successful response lost its original decision/audit")
+        elif (
+            type(original.original_failure) is not _MalformedLLMResponseError
+            or original.decision is not None
+            or original.audit_call.status is not ComposerLLMCallStatus.MALFORMED_RESPONSE
+        ):
+            raise AuditIntegrityError("Semantic invalid response requires its original malformed semantic body")
+
+    def seal_original_outcome(self, capture: _SemanticAdvisorInvocationCapture, outcome: SemanticAdvisorInvocationRaised) -> None:
+        from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationRaised
+
+        with self._lock:
+            if type(outcome) is not SemanticAdvisorInvocationRaised:
+                raise AuditIntegrityError("Semantic outcome lost its actual raised observation")
+            original = self._body_observation
             if capture is not self._capture or original is None:
-                if type(outcome) is SemanticAdvisorInvocationRaised:
-                    # An error before original custody/capture completion is
-                    # still diagnostic DATA; it cannot authorize retention.
-                    return
-                raise AuditIntegrityError("Semantic returned outcome lacks its original physical capture")
+                # An error before original custody/capture completion is
+                # still diagnostic DATA; it cannot authorize retention.
+                return
             observed = outcome.observation
             if self._outcome is not None or observed != original:
                 raise AuditIntegrityError("Semantic outcome changed its original admitted response bytes or decision")
-            if type(outcome) is SemanticAdvisorInvocationReturned:
-                if outcome.result is not self._result or original.original_failure is not None or observed.original_failure is not None:
-                    raise AuditIntegrityError("Semantic returned wrapper changed its original result/failure")
-            elif type(outcome) is SemanticAdvisorInvocationRaised:
-                expected_failure = original.original_failure if original.original_failure is not None else outcome.error
-                if observed.original_failure is not expected_failure:
-                    raise AuditIntegrityError("Semantic raised wrapper changed its original physical/outward failure")
-            else:
-                raise AuditIntegrityError("Semantic outcome lost its actual returned/raised sum")
+            expected_failure = original.original_failure if original.original_failure is not None else outcome.error
+            if observed.original_failure is not expected_failure:
+                raise AuditIntegrityError("Semantic raised wrapper changed its original physical/outward failure")
             self._outcome = outcome
 
     def seal_v4_finalization(self, capture: _SemanticAdvisorInvocationCapture, finalized: SemanticAdvisorInvocationV4Finalized) -> None:
         from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationV4Finalized
-        from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
+        from elspeth.web.composer.continuation_semantic_observation import (
+            SemanticCompleteResponseObservation,
+            SemanticInvalidResponseObservation,
+        )
+        from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderOutcome, SemanticAdvisorProviderResult
         from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
 
         with self._lock:
@@ -235,19 +307,38 @@ class SemanticAdvisorNoSdkIssuer:
                 or self._attempt_id is None
                 or self._captured_call is None
                 or original.audit_call is not self._captured_call
-                or original.original_failure is not None
+                or finalized.observation.original_failure is not original.original_failure
+                or self._v4_response is None
             ):
                 raise AuditIntegrityError("V4 semantic finalization changed its one original paid capture")
+            self._require_original_response_body(original)
             result = finalized.finalization.result
             if type(result) is SemanticAdvisorProviderResult:
                 if (
-                    self._result is None
-                    or result.audit_call != self._captured_call
+                    result.audit_call != self._captured_call
                     or result.decision != original.decision
-                    or result.response != self._result.response
                     or result.effect_key != self._prepared.binding.effect_key
                 ):
                     raise AuditIntegrityError("V4 semantic complete finalization changed its original result")
+                if original.original_failure is None:
+                    if (
+                        self._result is None
+                        or type(self._v4_response) is not SemanticCompleteResponseObservation
+                        or result.outcome is not SemanticAdvisorProviderOutcome.SUCCESS
+                        or result.original_error is not None
+                        or result.response != self._result.response
+                        or result.response != self._v4_response.response
+                    ):
+                        raise AuditIntegrityError("V4 semantic successful finalization changed its original response")
+                elif (
+                    self._result is not None
+                    or type(self._v4_response) is not SemanticInvalidResponseObservation
+                    or result.outcome is not SemanticAdvisorProviderOutcome.PAID_INVALID
+                    or result.original_error is not original.original_failure
+                    or result.response != self._v4_response.response
+                    or result.response is None
+                ):
+                    raise AuditIntegrityError("V4 semantic invalid finalization changed its original malformed response")
             elif type(result) is VerifiedSemanticPaidOverflowTerminal:
                 if (
                     self._result is not None
@@ -307,21 +398,14 @@ class SemanticAdvisorNoSdkIssuer:
         with self._lock:
             self.require_original_clock()
             prepared = self._prepared
-            v4_prepared = (
-                prepared is not None
-                and self._dispatched is None
-                and type(
-                    decode_continuation_policy(
-                        decode_continuation_snapshot(prepared.snapshot.payload_json).admission_policy_json,
-                        decode_continuation_snapshot(prepared.snapshot.payload_json).policy_hash,
-                    )
-                )
-                is ContinuationAdmissionPolicyV4
-            )
+            if prepared is None:
+                raise AuditIntegrityError("Semantic issuer requires its actual original ADVISOR custody")
+            root = decode_continuation_snapshot(prepared.snapshot.payload_json)
+            policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
             if (
                 self._state != "open"
-                or prepared is None
-                or (self._dispatched is None and not v4_prepared)
+                or self._dispatched is not None
+                or type(policy) is not ContinuationAdmissionPolicyV4
                 or self._custody is not None
                 or type(custody) is not ProviderCallCustody
                 or custody.family is not ProviderInvocationFamily.ADVISOR
@@ -384,24 +468,6 @@ class SemanticAdvisorNoSdkIssuer:
                 raise AuditIntegrityError("Semantic issuer lost its one original paid audit before settlement")
             self._captured_call = call
 
-    def require_original_paid_outcome(
-        self,
-        prepared: PreparedContinuationProvider,
-        selected: StoredContinuationSnapshot,
-        outcome: SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised,
-    ) -> None:
-        with self._lock:
-            if (
-                self._state != "sdk_entered"
-                or prepared is not self._prepared
-                or selected is not self._dispatched
-                or outcome is not self._outcome
-                or outcome.observation.audit_call is not self._captured_call
-                or self._captured_call is None
-                or self._captured_call.call_id != self._attempt_id
-            ):
-                raise AuditIntegrityError("Semantic paid retention requires its original effect, minted custody and complete outcome")
-
     def require_original_v4_response_observation(
         self,
         prepared: PreparedContinuationProvider,
@@ -409,7 +475,7 @@ class SemanticAdvisorNoSdkIssuer:
     ) -> SemanticAdvisorInvocationObservation:
         """Return the original captured paid DATA before V4 SQL settlement.
 
-        V4 must classify the complete response before the legacy returned/raised
+        Classify the complete response before its finalized or raised
         wrapper can be sealed. The caller must still rederive the immutable SQL
         source and quota attempt in its original locked transaction.
         """
@@ -426,14 +492,15 @@ class SemanticAdvisorNoSdkIssuer:
                 or original is None
                 or not original.sdk_entered
                 or not original.recorder_completed
-                or original.original_failure is not None
                 or original.audit_call is not self._captured_call
+                or self._v4_response is None
                 or self._captured_call is None
                 or original.attempt is None
                 or original.attempt.attempt_id != self._attempt_id
                 or self._captured_call.call_id != self._attempt_id
             ):
-                raise AuditIntegrityError("V4 semantic response lost its one original successful paid capture")
+                raise AuditIntegrityError("V4 semantic response lost its one original classified paid capture")
+            self._require_original_response_body(original)
             return original
 
     def require_original_v4_incomplete_capture(

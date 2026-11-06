@@ -154,12 +154,12 @@ environment credentials and remote service access.
 
 - **No defensive programming** against our own code. Access typed fields directly (`obj.field`), not defensively (`getattr(obj, "field", None)`). See [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the trust-boundary rationale.
 - **Three-tier trust model.** Handle errors differently based on data origin: crash on audit data corruption, quarantine bad user data, validate external API responses at the boundary.
-- **Consider backwards compatibility from 0.8.5 onward.** Compatibility layers
-  and deprecation paths are permitted when justified by supported interfaces,
-  data or workflows; perpetual support for historical versions is not promised.
-  State the supported boundary and preserve existing preserve/refuse contracts
-  unless a separate change is approved. Remove obsolete and commented-out code;
-  this policy alone does not authorize migrations, resets or downgrades.
+- **No backwards compatibility before 1.0.0.** Remove obsolete adapters,
+  fallbacks and upgrade machinery that exist only to support historical
+  contracts. Preserve stored records, evidence and backups, and explicitly
+  refuse unsupported formats. A versioned codec or helper still used by the
+  current contract remains current. This policy does not authorize migrations,
+  resets, deletion of stored data or downgrades.
 - **Test through production code paths.** Integration tests must use `ExecutionGraph.from_plugin_instances()` and `instantiate_plugins_from_config()`, not manually constructed objects.
 
 ## Writing Tests

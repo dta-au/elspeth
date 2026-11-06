@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -19,6 +20,80 @@ from typing import Any
 from weakref import WeakKeyDictionary
 
 from sqlalchemy import Engine, event
+
+
+def _driver_review_observer(profile, original, *, session_id, operation_id):
+    from elspeth.web.composer.continuation import EndFrame
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
+
+    @wraps(original)
+    async def observed(phases, services, selected):
+        root = selected.stack
+        clock = phases.action_clock
+        if (
+            root.logical.session_id != str(session_id)
+            or root.logical.operation_id != operation_id
+            or type(root.frames[-1]) is not EndFrame
+            or root.frames[-1].phase != "review_needed"
+            or type(clock) is not ContinuationActionClock
+            or clock._seen
+            or profile._end_clocks
+        ):
+            return await original(phases, services, selected)
+        with (
+            profile.end_entry(clock),
+            profile.span(
+                "driver.original_review_entry",
+                cursor=root.cursor,
+                original_start_ns=int(clock.started_monotonic * 1_000_000_000),
+                entry_lag_ns=time.monotonic_ns() - int(clock.started_monotonic * 1_000_000_000),
+                preparation_deadline=clock.preparation_deadline_monotonic,
+            ),
+        ):
+            return await original(phases, services, selected)
+
+    return observed
+
+
+@contextmanager
+def driver_end_preparation_profile(monkeypatch, engine, *, session_id, operation_id):
+    """Opt-in existing collector around the original driver's prescribed Review."""
+    mode = os.environ.get("ELSPETH_TEST_DRIVER_END_PROFILE")
+    if mode is None:
+        yield
+        return
+    assert mode in {"spans", "cpu"}, "END driver profile must be spans or cpu"
+    root = Path(__file__).resolve().parents[2]
+    output = Path(os.environ.get("ELSPETH_TEST_DRIVER_END_PROFILE_PATH", ".claude/lanes/end-driver-profile/profile.json"))
+    if not output.is_absolute():
+        output = root / output
+    output = output.resolve()
+    assert output.is_relative_to(root), "END diagnostic output must remain inside this project"
+    from elspeth.web.sessions import continuation_driver as driver
+
+    profile = EndPreparationProfile(enabled=True, cpu_profile=mode == "cpu", cpu_selection="all_workers")
+    try:
+        with profile.install(monkeypatch, engine), monkeypatch.context() as owned:
+            owned.setattr(
+                driver,
+                "review_prescribed_continuation_end",
+                _driver_review_observer(
+                    profile, driver.review_prescribed_continuation_end, session_id=session_id, operation_id=operation_id
+                ),
+            )
+            yield
+    except BaseException as original:
+        profile.case_outcome = {"status": "raised", "error": type(original).__name__}
+        raise
+    else:
+        profile.case_outcome = {"status": "returned"}
+    finally:
+        try:
+            failure = profile.flush(output)
+        except Exception as output_error:
+            failure = output_error
+        if failure is not None:
+            print("END driver profile write failed: " + type(failure).__name__)
 
 
 class EndTextMemoObservation:

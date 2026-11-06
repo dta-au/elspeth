@@ -32,7 +32,6 @@ from elspeth.web.composer.continuation_codec import (
 )
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -51,7 +50,7 @@ from elspeth.web.coordination.quota_authority import ProviderAttempt, begin_prov
 from elspeth.web.required_work import RequiredWorkBinding
 from elspeth.web.sessions._auto_title import PreparedAutoTitleRequest, prepare_auto_title_request
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
-from elspeth.web.sessions.composer_operations import ComposerOperationClaim, ComposerOperationError, ComposerOperationRunning
+from elspeth.web.sessions.composer_operations import ComposerOperationClaim, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
     ContinuationEvent,
@@ -167,12 +166,6 @@ class PreparedTitleProvider:
 
 
 @dataclass(frozen=True, slots=True)
-class TitleProviderAdmission:
-    attempt: ProviderAttempt
-    selected: StoredContinuationSnapshot
-
-
-@dataclass(frozen=True, slots=True)
 class V4TitleProviderAdmission:
     attempt: ProviderAttempt
     selected: StoredContinuationSnapshot
@@ -180,23 +173,6 @@ class V4TitleProviderAdmission:
     tail: TitlePaidOverflowTailPlan
     incomplete_tail: TitlePaidIncompleteTailPlan
     no_sdk_tail: TitleNoSdkTailPlan
-
-
-class TitleNoSdkRefusal(ContinuationValue):
-    schema_version: Literal["composer.title-no-sdk-refusal.v1"] = "composer.title-no-sdk-refusal.v1"
-    session_id: str
-    operation_id: str
-    effect_key: Literal["provider:3:0"]
-    input_sha256: str
-    creator_sequence: int
-    creator_generation: int
-    claim_attempt: int
-    operation_epoch: int
-    source_checkpoint_id: str
-    source_cursor: int
-    receipt_key: str
-    reason: Literal["retained_tail_unbounded"]
-    public_error_json: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -973,365 +949,6 @@ def validate_unclaimed_title_recovery_data_on_connection(
         )
 
 
-def _title_no_sdk_event(data: TitleNoSdkRefusal, result_chunk_key: str) -> str:
-    return canonical_json(
-        {
-            "version": 1,
-            "effect_key": data.effect_key,
-            "input_sha256": data.input_sha256,
-            "receipt_key": data.receipt_key,
-            "result_chunk_key": result_chunk_key,
-            "source_disposition": "prepared",
-        }
-    )
-
-
-def refuse_v3_title_unbounded_on_connection(conn: Connection, prepared: PreparedTitleProvider) -> TitleNoSdkRefusal:
-    """Settle one original prepared V3 TITLE without creating a physical attempt."""
-    from elspeth.web.coordination.composer_operation_authority import _select_failure_on_connection, settle_composer_operation_on_connection
-    from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
-
-    if type(prepared) is not PreparedTitleProvider:
-        raise AuditIntegrityError("TITLE no-SDK refusal requires its actual prepared owner")
-    running, selected = prepared.running, prepared.selected
-    _current(conn, running, selected)
-    root = decode_continuation_snapshot(selected.payload_json)
-    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
-    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
-    if (
-        type(policy) is not ContinuationAdmissionPolicyV3
-        or parent.continuation_policy_version != policy.schema_version
-        or parent.continuation_policy_sha256 != policy.policy_hash
-        or parent.continuation_retained_payload_limit_bytes != policy.max_retained_payload_bytes
-        or parent.status != "running"
-    ):
-        raise AuditIntegrityError("TITLE no-SDK refusal lacks its original persisted V3 admission")
-    frame = _frame(selected)
-    descriptor, ref, stage, _source = _source_chain(conn, running, selected, names=prepared.names)
-    effect = conn.execute(
-        select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == "provider:3:0")
-    ).one()
-    if (
-        stage != "prepared"
-        or ref != prepared.input.reference
-        or descriptor != _descriptor(prepared.input)
-        or title_input_descriptor(prepared.composer, prepared.request, prepared_input=prepared.provider_input) != prepared.input
-        or frame.provider_effect_key != effect.effect_key
-        or frame.provider_input_sha256 != effect.input_sha256
-        or frame.title_attempt_id is not None
-        or frame.title_response is not None
-        or effect.disposition != "prepared"
-        or effect.input_sha256 != descriptor.input_sha256
-        or (effect.creator_sequence, effect.creator_generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
-        or any(
-            value is not None
-            for value in (
-                effect.provider_attempt_id,
-                effect.physical_sequence,
-                effect.physical_generation,
-                effect.requested_model,
-                effect.response_finished_at,
-                effect.receipt_key,
-                effect.result_chunk_key,
-            )
-        )
-    ):
-        raise AuditIntegrityError("TITLE no-SDK refusal lost its unentered original preparation")
-    public_error = project_composer_operation_error(
-        AuditIntegrityError("V3 TITLE paid result has no proven finite retained tail"), request_id=parent.request_id
-    )
-    selected_error = _select_failure_on_connection(parent, public_error, authoritative_failure=False)
-    data = TitleNoSdkRefusal(
-        session_id=sid,
-        operation_id=operation,
-        effect_key="provider:3:0",
-        input_sha256=effect.input_sha256,
-        creator_sequence=effect.creator_sequence,
-        creator_generation=effect.creator_generation,
-        claim_attempt=running.claim.attempt,
-        operation_epoch=running.session_operation_context.fence.operation_epoch,
-        source_checkpoint_id=selected.checkpoint_id,
-        source_cursor=selected.cursor,
-        receipt_key=f"title:no-sdk:{effect.input_sha256}",
-        reason="retained_tail_unbounded",
-        public_error_json=canonical_json(selected_error.model_dump(mode="json")),
-    )
-    chunk = encode_private_chunk(codec="composer.title-no-sdk-refusal.v1", canonical=canonical_json(data.model_dump(mode="json")))
-    result_chunk_key = private_chunk_key(chunk)
-    put_chunk(
-        conn,
-        session_id=sid,
-        operation_id=operation,
-        key=result_chunk_key,
-        payload=chunk.canonical.encode("utf-8"),
-        codec=chunk.reference.codec,
-    )
-    changed = conn.execute(
-        update(effects)
-        .where(
-            effects.c.session_id == sid,
-            effects.c.operation_id == operation,
-            effects.c.effect_key == data.effect_key,
-            effects.c.disposition == "prepared",
-            effects.c.provider_attempt_id.is_(None),
-            effects.c.receipt_key.is_(None),
-            effects.c.result_chunk_key.is_(None),
-        )
-        .values(disposition="refused", receipt_key=data.receipt_key, result_chunk_key=result_chunk_key)
-    )
-    if changed.rowcount != 1:
-        raise ContinuationCASConflict("TITLE no-SDK refusal lost its exact prepared effect")
-    encoded = _effect_snapshot(
-        encode_continuation_snapshot(root), effect_key=data.effect_key, disposition="refused", receipt_id=data.receipt_key
-    )
-    refused = append_complete_snapshot(
-        conn,
-        session_id=sid,
-        operation_id=operation,
-        expected_checkpoint_id=selected.checkpoint_id,
-        expected_cursor=selected.cursor,
-        snapshot_json=encoded,
-        event_batch=(ContinuationEvent("effect_refused", _title_no_sdk_event(data, result_chunk_key)),),
-        handoff=False,
-    )
-    terminal = settle_composer_operation_on_connection(conn, running, outcome=selected_error, authoritative_failure=True)
-    if terminal.status != "failed" or terminal.journal_cursor != refused.cursor + 1:
-        raise AuditIntegrityError("TITLE no-SDK terminal did not atomically follow its refusal")
-    return data
-
-
-def read_v3_title_no_sdk_refusal_on_connection(
-    conn: Connection, *, session_id: UUID, operation_id: str, expected_prepared: PreparedTitleProvider | None = None
-) -> TitleNoSdkRefusal | None:
-    """Cold proof of the complete, unentered TITLE refusal and failed parent."""
-    sid = str(session_id)
-    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one_or_none()
-    if parent is None or parent.status != "failed":
-        return None
-    terminal = load_snapshot(conn, session_id=sid, operation_id=operation_id)
-    root = decode_continuation_snapshot(terminal.payload_json)
-    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    if type(policy) is not ContinuationAdmissionPolicyV3:
-        return None
-    frame = _frame(terminal)
-    effect = conn.execute(
-        select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation_id, effects.c.effect_key == "provider:3:0")
-    ).one_or_none()
-    if effect is None or effect.disposition != "refused":
-        return None
-    if (
-        effect.owner != "provider"
-        or effect.action_json is not None
-        or effect.committed_state_ids_json is not None
-        or effect.graph_sha256 is not None
-        or frame.provider_effect_key != effect.effect_key
-        or frame.provider_input_sha256 != effect.input_sha256
-        or frame.title_attempt_id is not None
-        or frame.title_response is not None
-        or effect.receipt_key is None
-        or effect.result_chunk_key is None
-        or any(
-            value is not None
-            for value in (
-                effect.provider_attempt_id,
-                effect.physical_sequence,
-                effect.physical_generation,
-                effect.requested_model,
-                effect.response_finished_at,
-            )
-        )
-    ):
-        raise AuditIntegrityError("TITLE no-SDK receipt contradicts its terminal effect")
-    all_effects = conn.execute(
-        select(effects.c.effect_key).where(effects.c.session_id == sid, effects.c.operation_id == operation_id)
-    ).all()
-    family_rows = conn.execute(
-        select(ordinals.c.family, ordinals.c.next_ordinal).where(ordinals.c.session_id == sid, ordinals.c.operation_id == operation_id)
-    ).all()
-    if tuple(row.effect_key for row in all_effects) != ("provider:3:0",) or tuple(
-        (row.family, row.next_ordinal) for row in family_rows
-    ) != ((3, 1),):
-        raise AuditIntegrityError("TITLE no-SDK receipt changed its unique original provider cohort")
-    codec = conn.execute(
-        select(chunks.c.codec).where(
-            chunks.c.session_id == sid, chunks.c.operation_id == operation_id, chunks.c.chunk_key == effect.result_chunk_key
-        )
-    ).scalar_one_or_none()
-    if codec != "composer.title-no-sdk-refusal.v1":
-        raise AuditIntegrityError("TITLE no-SDK receipt lost its exact result codec")
-    try:
-        canonical = read_chunk(conn, session_id=sid, operation_id=operation_id, key=effect.result_chunk_key).decode(
-            "utf-8", errors="strict"
-        )
-        data = TitleNoSdkRefusal.model_validate_json(canonical, strict=True)
-        failure = ComposerOperationError.model_validate_json(data.public_error_json, strict=True)
-    except (UnicodeDecodeError, ValidationError, ValueError) as error:
-        raise AuditIntegrityError("TITLE no-SDK receipt violates its closed result") from error
-    expected_chunk = encode_private_chunk(codec=codec, canonical=canonical)
-    if (
-        canonical != canonical_json(data.model_dump(mode="json"))
-        or private_chunk_key(expected_chunk) != effect.result_chunk_key
-        or (data.session_id, data.operation_id, data.effect_key, data.input_sha256)
-        != (sid, operation_id, effect.effect_key, effect.input_sha256)
-        or (data.creator_sequence, data.creator_generation) != (effect.creator_sequence, effect.creator_generation)
-        or (data.claim_attempt, data.operation_epoch) != (parent.attempt, parent.session_operation_epoch)
-        or data.receipt_key != effect.receipt_key
-        or data.public_error_json != canonical_json(failure.model_dump(mode="json"))
-        or parent.result_json != data.public_error_json
-        or parent.failure_code != failure.failure_code
-        or parent.settled_by != "owner_terminal"
-        or terminal.cursor != data.source_cursor + 2
-    ):
-        raise AuditIntegrityError("TITLE no-SDK receipt changed its original terminal identity")
-    source = conn.execute(
-        select(checkpoints).where(
-            checkpoints.c.session_id == sid,
-            checkpoints.c.operation_id == operation_id,
-            checkpoints.c.checkpoint_id == data.source_checkpoint_id,
-            checkpoints.c.cursor == data.source_cursor,
-        )
-    ).one_or_none()
-    refusal = conn.execute(
-        select(checkpoints).where(
-            checkpoints.c.session_id == sid, checkpoints.c.operation_id == operation_id, checkpoints.c.cursor == data.source_cursor + 1
-        )
-    ).one_or_none()
-    refused_event = conn.execute(
-        select(events).where(events.c.session_id == sid, events.c.operation_id == operation_id, events.c.sequence == data.source_cursor + 1)
-    ).one_or_none()
-    settled_event = conn.execute(
-        select(events).where(events.c.session_id == sid, events.c.operation_id == operation_id, events.c.sequence == terminal.cursor)
-    ).one_or_none()
-    source_event = conn.execute(
-        select(events).where(events.c.session_id == sid, events.c.operation_id == operation_id, events.c.sequence == data.source_cursor)
-    ).one_or_none()
-    if source is None or refusal is None or source_event is None or refused_event is None or settled_event is None:
-        raise AuditIntegrityError("TITLE no-SDK receipt lost its source/refusal/terminal journal")
-    try:
-        source_payload = read_chunk(conn, session_id=sid, operation_id=operation_id, key=source.snapshot_chunk_key).decode(
-            "utf-8", errors="strict"
-        )
-        source_root = decode_continuation_snapshot(source_payload)
-        refused_root = decode_continuation_snapshot(
-            read_chunk(conn, session_id=sid, operation_id=operation_id, key=refusal.snapshot_chunk_key).decode("utf-8", errors="strict")
-        )
-    except UnicodeDecodeError as error:
-        raise AuditIntegrityError("TITLE no-SDK journal lost strict snapshot bytes") from error
-    if source_event.tag != "checkpoint":
-        raise AuditIntegrityError("TITLE no-SDK source lost its original preparation event")
-    try:
-        source_event_text = read_chunk(conn, session_id=sid, operation_id=operation_id, key=source_event.payload_chunk_key).decode(
-            "utf-8", errors="strict"
-        )
-    except UnicodeDecodeError as error:
-        raise AuditIntegrityError("TITLE no-SDK source event is not strict UTF-8") from error
-    source_value, parse_error = parse_json_strict(source_event_text)
-    if parse_error is not None or type(source_value) is not dict or set(source_value) != {"owner", "transition"}:
-        raise AuditIntegrityError("TITLE no-SDK source lost its closed preparation event")
-    try:
-        transition = TitleTransition.model_validate_json(canonical_json(source_value["transition"]), strict=True)
-    except ValidationError as error:
-        raise AuditIntegrityError("TITLE no-SDK preparation event violates its original shape") from error
-    if (
-        source_event_text != _event(transition)
-        or transition.stage != "prepared"
-        or transition.predecessor_cursor + 1 != data.source_cursor
-        or (transition.creator_sequence, transition.creator_generation) != (effect.creator_sequence, effect.creator_generation)
-    ):
-        raise AuditIntegrityError("TITLE no-SDK receipt changed its original preparation transition")
-    descriptor = _descriptor(_chunk_data(conn, session_id, operation_id, transition.input))
-    predecessor = _pretitle_checkpoint_at_cursor(conn, session_id=sid, operation_id=operation_id, cursor=transition.predecessor_cursor)
-    if predecessor.checkpoint_id != transition.predecessor_checkpoint_id:
-        raise AuditIntegrityError("TITLE no-SDK receipt changed its original publication predecessor")
-    before = decode_continuation_snapshot(predecessor.payload_json)
-    before_frame = before.frames[0]
-    if (
-        type(before_frame) is not InitializeFrame
-        or before_frame.bootstrap is None
-        or before_frame.provider_effect_key is not None
-        or before_frame.title_attempt_id is not None
-        or before_frame.title_response is not None
-        or before.effect_frontier
-        or before.pending_settlement_ids
-        or descriptor.input_sha256 != effect.input_sha256
-    ):
-        raise AuditIntegrityError("TITLE no-SDK receipt lost its original provider-free predecessor")
-    from elspeth.web.sessions.continuation_bootstrap_source import require_pretitle_publication_data_on_connection
-
-    require_pretitle_publication_data_on_connection(
-        conn,
-        session_id=session_id,
-        operation_id=operation_id,
-        sequence=effect.creator_sequence,
-        selected=predecessor,
-        chunk=_chunk_data(conn, session_id, operation_id, before_frame.bootstrap),
-        generation=effect.creator_generation,
-    )
-    prepared_root = before.model_copy(
-        update={
-            "frames": (
-                before_frame.model_copy(update={"provider_effect_key": "provider:3:0", "provider_input_sha256": descriptor.input_sha256}),
-            )
-        }
-    )
-    expected_source = decode_continuation_snapshot(
-        _effect_snapshot(encode_continuation_snapshot(prepared_root), effect_key="provider:3:0", disposition="prepared", receipt_id=None)
-    ).model_copy(update={"cursor": data.source_cursor})
-    prepared_frontier = tuple(item for item in source_root.effect_frontier if item.effect_id == effect.effect_key)
-    refused_frontier = tuple(item for item in root.effect_frontier if item.effect_id == effect.effect_key)
-    if (
-        source.kind != "transition"
-        or refusal.kind != "transition"
-        or source_root.cursor != data.source_cursor
-        or len(prepared_frontier) != 1
-        or (prepared_frontier[0].disposition, prepared_frontier[0].receipt_id) != ("prepared", None)
-        or len(refused_frontier) != 1
-        or (refused_frontier[0].disposition, refused_frontier[0].receipt_id) != ("refused", data.receipt_key)
-        or refused_root.cursor != data.source_cursor + 1
-        or refused_root.effect_frontier != root.effect_frontier
-        or refused_root.model_copy(update={"cursor": root.cursor}) != root
-        or source_root.model_copy(update={"effect_frontier": root.effect_frontier, "cursor": root.cursor}) != root
-        or source_root != expected_source
-        or refused_event.tag != "effect_refused"
-        or read_chunk(conn, session_id=sid, operation_id=operation_id, key=refused_event.payload_chunk_key)
-        != _title_no_sdk_event(data, effect.result_chunk_key).encode("utf-8")
-        or settled_event.tag != "settled"
-        or read_chunk(conn, session_id=sid, operation_id=operation_id, key=settled_event.payload_chunk_key)
-        != canonical_json(
-            {
-                "version": 1,
-                "sequence": data.creator_sequence,
-                "generation": data.creator_generation,
-                "status": "failed",
-                "failure_code": failure.failure_code,
-            }
-        ).encode("utf-8")
-    ):
-        raise AuditIntegrityError("TITLE no-SDK journal does not prove one refused source")
-    if expected_prepared is not None and (
-        type(expected_prepared) is not PreparedTitleProvider
-        or expected_prepared.selected != StoredContinuationSnapshot(source_payload, source.cursor, source.checkpoint_id)
-        or expected_prepared.running.claim.session_id != session_id
-        or expected_prepared.running.claim.operation_id != operation_id
-        or (expected_prepared.running.claim.segment_sequence, expected_prepared.running.claim.ownership_generation)
-        != (data.creator_sequence, data.creator_generation)
-        or expected_prepared.running.claim.attempt != data.claim_attempt
-        or expected_prepared.running.session_operation_context.fence.operation_epoch != data.operation_epoch
-        or _descriptor(expected_prepared.input).input_sha256 != data.input_sha256
-        or title_input_descriptor(expected_prepared.composer, expected_prepared.request, prepared_input=expected_prepared.provider_input)
-        != expected_prepared.input
-    ):
-        raise AuditIntegrityError("TITLE no-SDK replay changed its original prepared invocation")
-    fences = select(attempts.c.session_operation_id).where(attempts.c.session_id == sid, attempts.c.operation_id == operation_id)
-    if (
-        conn.execute(select(physical.c.attempt_id).where(physical.c.session_id == sid, physical.c.operation_id.in_(fences))).first()
-        is not None
-    ):
-        raise AuditIntegrityError("TITLE no-SDK refusal has a physical provider attempt")
-    return data
-
-
 def _require_title_admission_source(
     conn: Connection, service: SessionServiceImpl, prepared: PreparedTitleProvider, *, model: str
 ) -> tuple[PrivateChunkRef, Row[Any]]:
@@ -1368,52 +985,6 @@ def _require_title_admission_source(
     ):
         raise AuditIntegrityError("TITLE refuses foreign or already dispatched provider preparation")
     return ref, effect
-
-
-def admit_title_provider_on_connection(
-    conn: Connection, service: SessionServiceImpl, prepared: PreparedTitleProvider, *, model: str
-) -> TitleProviderAdmission:
-    ref, _effect = _require_title_admission_source(conn, service, prepared, model=model)
-    running, selected = prepared.running, prepared.selected
-    root = decode_continuation_snapshot(selected.payload_json)
-    if type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is ContinuationAdmissionPolicyV4:
-        raise AuditIntegrityError("V4 TITLE requires the guarded terminal-tail admission owner")
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
-    _timing(conn, running, selected)
-    attempt = begin_provider_attempt_on_connection(
-        conn,
-        session_operation_context=running.session_operation_context,
-        source="auto_title",
-        policy=service._chargeable_admission_policy,
-        run_id=None,
-    )
-    conn.execute(
-        update(effects)
-        .where(
-            effects.c.session_id == sid,
-            effects.c.operation_id == operation,
-            effects.c.effect_key == "provider:3:0",
-            effects.c.disposition == "prepared",
-        )
-        .values(
-            disposition="dispatched",
-            provider_attempt_id=attempt.attempt_id,
-            physical_sequence=running.claim.segment_sequence,
-            physical_generation=running.claim.ownership_generation,
-            requested_model=model,
-        )
-    )
-    root = decode_continuation_snapshot(selected.payload_json)
-    frame = _frame(selected)
-    following = root.model_copy(update={"frames": (frame.model_copy(update={"title_attempt_id": attempt.attempt_id}),)})
-    encoded = _effect_snapshot(
-        encode_continuation_snapshot(following),
-        effect_key="provider:3:0",
-        disposition="dispatched",
-        receipt_id=None,
-        add_attempt_id=attempt.attempt_id,
-    )
-    return TitleProviderAdmission(attempt, _append(conn, running, selected, encoded, ref, "admitted"))
 
 
 def admit_v4_title_provider_on_connection(
@@ -1704,11 +1275,8 @@ def retain_title_response_on_connection(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == "provider:3:0")
     ).one()
     root = decode_continuation_snapshot(selected.payload_json)
-    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    original_v4_completion = captured.completion if type(policy) is ContinuationAdmissionPolicyV4 else None
-    if original_v4_completion is None and captured.completion.provider_metadata.v4_completeness is not None:
-        raise AuditIntegrityError("TITLE legacy response cannot claim a V4 source-issued return")
-    result = decode_title_provider_result(captured.chunk, env_ref_names=names, original_v4_completion=original_v4_completion)
+    decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    result = decode_title_provider_result(captured.chunk, env_ref_names=names, original_v4_completion=captured.completion)
     if result.completion.tool_batch.calls:
         raise AuditIntegrityError("TITLE response cannot introduce an unrequested tool batch")
     _require_physical(conn, running, effect, result.audit_call, result.source, descriptor)

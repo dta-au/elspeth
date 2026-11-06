@@ -34,7 +34,6 @@ from elspeth.contracts.credential_material import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_limits import (
-    CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES,
     CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
     CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES,
 )
@@ -254,46 +253,33 @@ class RetentionStageMemo:
     Each key includes the actual producer identity as well as complete inputs.
     """
 
-    _legacy_advisor_owner: ContinuationActionClock | None
     _v4_preparation_owner: ContinuationActionClock | None
     _text_parent: RetentionStageMemo | None
 
     def __init__(
         self,
         *,
-        legacy_advisor_owner: ContinuationActionClock | None = None,
         v4_preparation_owner: ContinuationActionClock | None = None,
         text_parent: RetentionStageMemo | None = None,
     ) -> None:
-        if legacy_advisor_owner is not None:
-            from elspeth.web.composer.continuation_clock import ContinuationActionClock
-
-            if type(legacy_advisor_owner) is not ContinuationActionClock:
-                raise TypeError("Legacy Advisor memo requires its exact action clock")
         if v4_preparation_owner is not None:
             from elspeth.web.composer.continuation_clock import ContinuationActionClock
 
-            if type(v4_preparation_owner) is not ContinuationActionClock or legacy_advisor_owner is not None:
+            if type(v4_preparation_owner) is not ContinuationActionClock:
                 raise TypeError("V4 preparation memo requires its exact distinct action clock")
         if text_parent is not None and (
             type(text_parent) is not RetentionStageMemo
-            or (text_parent._legacy_advisor_owner is None and text_parent._v4_preparation_owner is None)
+            or text_parent._v4_preparation_owner is None
             or not text_parent.active
-            or legacy_advisor_owner is not None
             or v4_preparation_owner is not None
         ):
             raise AuditIntegrityError("Nested Advisor memo requires one active text-only preparation owner")
-        self._legacy_advisor_owner = legacy_advisor_owner
         self._v4_preparation_owner = v4_preparation_owner
         self._text_parent = text_parent
         self._shared_text_budget_bytes = (
-            CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES
-            if legacy_advisor_owner is not None
-            else (
-                CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES
-                if v4_preparation_owner is not None
-                else CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
-            )
+            CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES
+            if v4_preparation_owner is not None
+            else CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
         )
         self._lock = Lock()
         self._closed = False
@@ -398,7 +384,7 @@ class RetentionStageMemo:
         if type(key) is not SnapshotDecodeKey:
             raise TypeError("Snapshot memo requires its exact key")
         _require_function_producer(producer)
-        if self._legacy_advisor_owner is not None or self._v4_preparation_owner is not None:
+        if self._v4_preparation_owner is not None:
             return _snapshot_value(key, producer)
         return self._lookup(self._snapshots, (producer, key), lambda: _snapshot_value(key, producer))
 
@@ -406,16 +392,12 @@ class RetentionStageMemo:
         if type(key) is not PrivateChunkVerificationKey:
             raise TypeError("Chunk memo requires its exact key")
         _require_function_producer(producer)
-        if self._legacy_advisor_owner is not None or self._v4_preparation_owner is not None:
+        if self._v4_preparation_owner is not None:
             return _chunk_value(key, producer)
         self._lookup(self._chunks, (producer, key), lambda: _chunk_value(key, producer))
 
     def canonical_text_encoding(self, key: CanonicalTextEncodingKey, producer: Callable[[CanonicalTextEncodingKey], bytes]) -> bytes:
         """Retain only one immutable exact-text proof, never its parsed graph."""
-        with self._lock:
-            parent = self._text_parent if not self._closed else None
-        if parent is not None and parent._legacy_advisor_owner is not None:
-            return parent.canonical_text_encoding(key, producer)
         if (
             type(key) is not CanonicalTextEncodingKey
             or type(key.canonical) is not str
@@ -774,10 +756,6 @@ class RetentionStageMemo:
         self, key: RecorderRequestTextKey, producer: Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None]
     ) -> RecorderRequestTextProof | None:
         """Retain one immutable prepared-request projection under its complete byte budget."""
-        with self._lock:
-            parent = self._text_parent if not self._closed else None
-        if parent is not None and parent._legacy_advisor_owner is not None:
-            return parent.recorder_request_text(key, producer)
         if (
             type(key) is not RecorderRequestTextKey
             or type(key.canonical) is not str
@@ -975,7 +953,7 @@ class RetentionStageMemo:
 
     @property
     def caches_credential_inputs(self) -> bool:
-        return self._legacy_advisor_owner is None and self._v4_preparation_owner is None
+        return self._v4_preparation_owner is None
 
     def credential(
         self, key: CredentialScanKey, producer: Callable[[CredentialScanKey], CredentialMaterialFinding | None]
@@ -983,7 +961,7 @@ class RetentionStageMemo:
         if type(key) is not CredentialScanKey:
             raise TypeError("Credential memo requires its exact key")
         _require_function_producer(producer)
-        if self._legacy_advisor_owner is not None or self._v4_preparation_owner is not None:
+        if self._v4_preparation_owner is not None:
             return _finding_value(producer(key))
         return self._lookup(self._credentials, (producer, key), lambda: _finding_value(producer(key)))
 
@@ -993,7 +971,7 @@ class RetentionStageMemo:
         if type(key) is not StateCredentialStepKey:
             raise TypeError("State memo requires its exact key")
         _require_function_producer(producer)
-        if self._legacy_advisor_owner is not None or self._v4_preparation_owner is not None:
+        if self._v4_preparation_owner is not None:
             return _finding_value(producer(key))
         return self._lookup(self._states, (producer, key), lambda: _finding_value(producer(key)))
 
@@ -1076,59 +1054,6 @@ def finish_v4_preparation_memo(clock: ContinuationActionClock) -> None:
     memo = current_v4_preparation_memo(clock)
     if memo is not None:
         memo.close()
-
-
-@contextmanager
-def legacy_advisor_preparation_memo_scope(clock: ContinuationActionClock) -> Iterator[RetentionStageMemo]:
-    """Share only immutable text proofs across one legacy Advisor preparation."""
-    if current_retention_stage_memo() is not None:
-        raise AuditIntegrityError("Legacy Advisor preparation cannot borrow an unrelated memo")
-    memo = RetentionStageMemo(legacy_advisor_owner=clock)
-    token = _RETENTION_STAGE_MEMO.set(memo)
-    try:
-        yield memo
-    finally:
-        memo.close()
-        _RETENTION_STAGE_MEMO.reset(token)
-
-
-def current_legacy_advisor_preparation_memo(clock: ContinuationActionClock) -> RetentionStageMemo | None:
-    memo = current_retention_stage_memo()
-    if memo is None or memo._legacy_advisor_owner is None:
-        return None
-    if memo._legacy_advisor_owner is not clock:
-        raise AuditIntegrityError("Legacy Advisor preparation changed its original action clock")
-    return memo
-
-
-def finish_legacy_advisor_preparation_memo(clock: ContinuationActionClock) -> None:
-    """Seal the optional legacy carrier at the existing pre-SDK clock cut."""
-    memo = current_legacy_advisor_preparation_memo(clock)
-    if memo is not None:
-        memo.close()
-
-
-@contextmanager
-def borrow_legacy_advisor_inflight_memo(memo: RetentionStageMemo | None, clock: ContinuationActionClock | None) -> Iterator[None]:
-    """Keep one fresh full SQL proof while borrowing pure preparation DATA."""
-    if memo is None:
-        with borrow_v4_preparation_memo_scope():
-            yield
-        return
-    if (
-        type(memo) is not RetentionStageMemo
-        or clock is None
-        or memo._legacy_advisor_owner is not clock
-        or current_legacy_advisor_preparation_memo(clock) is not memo
-    ):
-        raise AuditIntegrityError("Semantic in-flight proof cannot borrow a foreign preparation memo")
-    child = RetentionStageMemo(text_parent=memo)
-    token = _RETENTION_STAGE_MEMO.set(child)
-    try:
-        yield
-    finally:
-        child.close()
-        _RETENTION_STAGE_MEMO.reset(token)
 
 
 @contextmanager

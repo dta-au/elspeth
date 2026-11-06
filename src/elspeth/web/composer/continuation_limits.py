@@ -15,7 +15,6 @@ CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES = 1_048_576
 CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES = 1_048_576
 # An action-local RAM cap for immutable Advisor text proofs, not an admission
 # limit for an individual document or evidence pair.
-CONTINUATION_LEGACY_ADVISOR_TEXT_MEMO_MAX_RETAINED_BYTES = 5_242_880
 # Transient V4 preparation text has its own memory budget, independent of
 # private-document admission and each individual retained proof's bound.
 CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES = 32 * 1_048_576

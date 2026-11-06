@@ -12,7 +12,6 @@ from elspeth.web.composer import continuation_primary as primary_composer
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
 from elspeth.web.composer.bounded_json import PROVIDER_ARTIFACT_UNAVAILABLE
 from elspeth.web.composer.continuation_codec import decode_continuation_response
-from elspeth.web.composer.continuation_primary_observation import observe_primary_provider_result
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.sessions.continuation import private_chunk_key
 from elspeth.web.sessions.continuation_primary import (
@@ -23,8 +22,8 @@ from elspeth.web.sessions.continuation_primary import (
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from tests.helpers.continuation_inventory import inventory_work
 from tests.unit.web.sessions import test_continuation_primary_v4_live
+from tests.unit.web.sessions.test_continuation_primary_result import primary_input
 from tests.unit.web.sessions.test_continuation_primary_v4_incomplete import _invoke
-from tests.unit.web.sessions.test_continuation_primary_v4_live import _v4_primary_input
 
 operation_store = test_continuation_primary_v4_live.operation_store
 _REASONING = "r" * 100_000
@@ -50,7 +49,8 @@ def _response():
 
 @pytest.mark.asyncio
 async def test_actual_v4_original_reasoning_survives_observer_sql_and_both_cold_readers(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     sdk = []
     observed = []
     observer = primary_composer.observe_v4_primary_provider_result
@@ -61,9 +61,6 @@ async def test_actual_v4_original_reasoning_survives_observer_sql_and_both_cold_
 
     def observe(**values):
         observed.append(values["outcome"])
-        # The exact same actual source fails the unchanged legacy comparator.
-        with pytest.raises(AuditIntegrityError, match="native audit"):
-            observe_primary_provider_result(**values)
         return observer(**values)
 
     monkeypatch.setattr(litellm, "acompletion", completion)
@@ -125,7 +122,8 @@ async def test_actual_v4_original_reasoning_survives_observer_sql_and_both_cold_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", ("original", "bounded_audit"))
 async def test_actual_v4_primary_rejects_changed_original_or_diagnostic_audit_before_sql(operation_store, tmp_path, monkeypatch, changed):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     observer = primary_composer.observe_v4_primary_provider_result
     sdk = []
 

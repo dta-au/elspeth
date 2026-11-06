@@ -16,7 +16,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
@@ -61,7 +61,7 @@ operation_store = _operation_store
 async def _warm_progress_owned_metadata_case(store, tmp_path, monkeypatch):
     """Keep the actual tool/P4 owner and start its driver progress before runtime binding."""
     settings = classifier_15s_probe_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    policy = continuation_policy_v4_from_settings(settings)
+    policy = continuation_policy_from_settings(settings)
     assert policy is not None and policy.actions.primary.preparation == 15.0
     authority = ComposerAsyncOperationAuthority(
         store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy

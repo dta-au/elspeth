@@ -22,10 +22,11 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
 )
 from elspeth.web.composer.continuation_checkpoint_end_producer import build_checkpoint_end_input
 from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
 from elspeth.web.composer.continuation_selection import load_selected_continuation
@@ -56,9 +57,7 @@ operation_store = test_composer_operation_authority.operation_store
 
 @pytest.mark.asyncio
 async def test_actual_v4_end_review_has_one_unpaid_phase_source_before_child_admission(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -135,7 +134,10 @@ async def test_actual_v4_end_review_has_one_unpaid_phase_source_before_child_adm
             assert source is not None
             assert source.phase == "end" and source.kind == "end_review"
             assert source.current == stored and source.source == stored
-            assert current.checkpoint_id == stored.checkpoint_id
+            assert current.selected.checkpoint_id == stored.checkpoint_id
+            assert current.runtime is phases.runtime
+            assert current.runtime.source.selected is current.selected
+            assert current.lease is lease and not current.lease.closed
             root = decode_continuation_snapshot(stored.payload_json)
             assert root.pending_settlement_ids == ()
             assert [
@@ -180,9 +182,7 @@ async def test_actual_v4_end_review_has_one_unpaid_phase_source_before_child_adm
 
 @pytest.mark.asyncio
 async def test_actual_v4_end_gate_input_is_issued_and_prepared_before_physical_attempt(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -281,10 +281,93 @@ async def test_actual_v4_end_gate_input_is_issued_and_prepared_before_physical_a
             captured = await capture_continuation_runtime_owners(
                 phase_owner.runtime, selected=phase_owner.selected, inventory=phase_owner.inventory
             )
-            build_checkpoint_end_input(phase_owner=phase_owner, gate_locals=gate_locals, captured=captured)
+            from elspeth.web.composer import continuation_checkpoint_end_input as input_module
+            from elspeth.web.sessions import continuation_checkpoint_paid as paid_module
+
+            issued_input = build_checkpoint_end_input(phase_owner=phase_owner, gate_locals=gate_locals, captured=captured)
+            expected = input_module.decode_checkpoint_end_input(issued_input.chunk, env_ref_names=phase_owner.runtime.env_ref_names)
+            changed_chunk = input_module.encode_checkpoint_end_input(
+                expected.model_copy(update={"max_passes": expected.max_passes + 1}), env_ref_names=phase_owner.runtime.env_ref_names
+            )
+            assert input_module.decode_checkpoint_end_input(changed_chunk, env_ref_names=phase_owner.runtime.env_ref_names) != expected
+            original_decode = input_module.decode_checkpoint_end_input
+            decoded_chunks = []
+
+            def observed_decode(chunk, *, env_ref_names):
+                decoded_chunks.append(chunk)
+                return original_decode(chunk, env_ref_names=env_ref_names)
+
+            with monkeypatch.context() as input_observer:
+                input_observer.setattr(input_module, "decode_checkpoint_end_input", observed_decode)
+                chunk, snapshot, names = input_module._require_original_checkpoint_end_data(
+                    issued_input, phase_source=phase_owner.phase_source, captured=captured
+                )
+                assert chunk is issued_input.chunk
+                assert snapshot == expected
+                assert names == phase_owner.runtime.env_ref_names
+                assert decoded_chunks == [issued_input.chunk]
+                for foreign_input, foreign_capture in (
+                    (replace(issued_input), captured),
+                    (replace(issued_input, chunk=replace(issued_input.chunk)), captured),
+                    (replace(issued_input, chunk=changed_chunk), captured),
+                    (replace(issued_input, chunk=replace(issued_input.chunk, canonical="{}")), captured),
+                    (issued_input, replace(captured)),
+                ):
+                    with pytest.raises(AuditIntegrityError, match="original pre-call capture producer"):
+                        input_module._require_original_checkpoint_end_data(
+                            foreign_input, phase_source=phase_owner.phase_source, captured=foreign_capture
+                        )
+                assert decoded_chunks == [issued_input.chunk]
+                assert input_module.require_original_checkpoint_end_snapshot(
+                    issued_input, phase_source=phase_owner.phase_source, captured=captured
+                ) == (chunk, expected)
+                assert (
+                    input_module.require_original_checkpoint_end_env_names(
+                        issued_input, phase_source=phase_owner.phase_source, captured=captured
+                    )
+                    == names
+                )
+                assert (
+                    input_module.require_original_checkpoint_end_input(
+                        issued_input, phase_source=phase_owner.phase_source, captured=captured
+                    )
+                    is chunk
+                )
+                assert decoded_chunks == [issued_input.chunk] * 4
+
+            def corrupted_decode(chunk, *, env_ref_names):
+                # Forward to the real codec with damaged bytes at its input
+                # seam; do not manufacture a registry entry or an exception.
+                return original_decode(replace(chunk, canonical="{}"), env_ref_names=env_ref_names)
+
+            with monkeypatch.context() as corrupt_input:
+                corrupt_input.setattr(input_module, "decode_checkpoint_end_input", corrupted_decode)
+                with pytest.raises(AuditIntegrityError):
+                    input_module._require_original_checkpoint_end_data(
+                        issued_input, phase_source=phase_owner.phase_source, captured=captured
+                    )
             with pytest.raises(AuditIntegrityError, match="original"):
                 build_checkpoint_end_input(phase_owner=phase_owner, gate_locals=replace(gate_locals), captured=captured)
-            source = await prepare_checkpoint_end_physical_source(phase_owner=phase_owner, gate_locals=gate_locals)
+            original_data = paid_module._require_original_checkpoint_end_data
+            sql_admissions = []
+
+            def observed_data(result, *, phase_source, captured):
+                before = len(decoded_chunks)
+                admitted = original_data(result, phase_source=phase_source, captured=captured)
+                assert len(decoded_chunks) == before + 1
+                assert admitted[0] is result.chunk
+                sql_admissions.append(admitted)
+                return admitted
+
+            with monkeypatch.context() as sql_observer:
+                sql_observer.setattr(input_module, "decode_checkpoint_end_input", observed_decode)
+                sql_observer.setattr(paid_module, "_require_original_checkpoint_end_data", observed_data)
+                source = await prepare_checkpoint_end_physical_source(phase_owner=phase_owner, gate_locals=gate_locals)
+            assert len(sql_admissions) == 1
+            assert sql_admissions[0][0] is source.end_input.chunk
+            assert sql_admissions[0][2] == phase_owner.runtime.env_ref_names
+            assert source.clock is end_clock and phase_owner.phases.action_clock is end_clock
+            assert source.clock.policy is entered.source.policy.actions.advisor
             physical_module.require_checkpoint_end_detached_source(source)
             original_detached_state = source.detached.live.state
             source.detached.live.state = replace(original_detached_state, version=original_detached_state.version + 1)
@@ -326,7 +409,18 @@ async def test_actual_v4_end_gate_input_is_issued_and_prepared_before_physical_a
         monkeypatch.setattr(phases.service._advisor_checkpoint, "_run_advisor_checkpoint", intercept_original_end_gate)
         with locked_session_transaction(store[0], str(store[4])) as conn:
             physical_before = tuple(conn.execute(select(physical.c.attempt_id).where(physical.c.session_id == str(store[4]))).scalars())
+        # This phase-level fixture installs its first END action exactly as
+        # the shared current END fixture does. It never resets a live clock.
+        assert phases.action_clock is None
+        end_clock = ContinuationActionClock(entered.source.policy.actions.advisor)
+        deadline = work.coordinator.sql_deadline_owner
+        if deadline is not None:
+            assert deadline.running is running
+            deadline.begin_action(end_clock.policy, started_at=end_clock.started_monotonic)
+            deadline.require_action_clock(end_clock)
+        phases.bind_action_clock(end_clock)
         terminal_result = await execute_continuation_end_review(phases, entered_selected)
+        assert phases.action_clock is end_clock
         assert type(terminal_result) is EndCheckpointUnboundRefusalTerminal
         terminal = terminal_result.verified
         assert len(prepared_sources) == len(original_sources) == len(issued_permits) == 1

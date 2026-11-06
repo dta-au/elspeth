@@ -16,9 +16,6 @@ from elspeth.web.composer.continuation import ComposeFrame
 from elspeth.web.composer.continuation_next_action import _has_committed_primary, handoff_cut_allowance, next_continuation_action_policy
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
-    ContinuationAdmissionPolicy,
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -32,7 +29,7 @@ class ActionFitSuccessorPlan:
 def plan_action_fit_successor(
     *,
     selected: SelectedContinuationState,
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+    policy: ContinuationAdmissionPolicyV4,
     action: ContinuationActionPolicy,
     sequence: int,
     hard_remaining: float,

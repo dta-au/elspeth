@@ -1,4 +1,4 @@
-"""Dormant V4 admission and cold accounting use the existing cost wire."""
+"""Current V4 admission and cold accounting use the existing cost wire."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from elspeth.web.composer.continuation import ContinuationProviderCostPolicyV2, 
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings, continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.provider_cost import continuation_common_cost_policy
@@ -35,9 +35,7 @@ operation_store = operations.operation_store
 
 
 def _v4() -> ContinuationAdmissionPolicyV4:
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     return policy
 
@@ -65,11 +63,12 @@ def test_v4_seed_and_next_allowance_bind_exact_costed_policy() -> None:
     assert type(root.provider_cost_policy) is ContinuationProviderCostPolicyV2
     assert root.provider_cost_policy.applicability == "continuation_v2"
     assert root.provider_cost_policy.admission_policy_hash == root.policy_hash == policy.policy_hash
-    v2 = continuation_policy_from_settings(continuation_test_settings())
-    assert continuation_common_cost_policy(policy) == continuation_common_cost_policy(v2)
+    default_policy = continuation_policy_from_settings(continuation_test_settings())
+    assert default_policy is not None
+    assert continuation_common_cost_policy(policy) == continuation_common_cost_policy(default_policy)
     selected = SelectedContinuationState("selected-v4", root, ())
     assert next_continuation_action_policy(selected=selected, policy=policy) == policy.actions.session_sql
-    changed = continuation_policy_v4_from_settings(
+    changed = continuation_policy_from_settings(
         continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576 + 1)
     )
     assert changed is not None

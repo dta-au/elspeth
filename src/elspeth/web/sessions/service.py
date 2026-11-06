@@ -195,7 +195,6 @@ from elspeth.web.sessions.continuation_title_provider import (
     AdmittedTitleAuditSource,
     PreparedTitleProvider,
     TitleAuditSettlementRequest,
-    TitleProviderAdmission,
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.dead_site_supersession import supersede_dead_site_pending_interpretation_events
@@ -1940,7 +1939,6 @@ class SessionServiceImpl:
     ) -> PreparedComposeTurnPublication:
         """Plan one pure metadata publication under its original locked cut."""
         from elspeth.web.composer.continuation_policy import (
-            ContinuationAdmissionPolicyV3,
             ContinuationAdmissionPolicyV4,
             decode_continuation_policy,
         )
@@ -1967,7 +1965,7 @@ class SessionServiceImpl:
         if original_selected.stack.active_action_json is not None or original_selected.stack.active_action_source is not None:
             raise MetadataPublicationUnavailable("prepared metadata publication cannot consume an active semantic action")
         policy = decode_continuation_policy(original_selected.stack.admission_policy_json, original_selected.stack.policy_hash)
-        if type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4:
+        if type(policy) is not ContinuationAdmissionPolicyV4:
             raise AuditIntegrityError("prepared metadata publication requires its original bounded policy")
         return self._prepare_metadata_publication_rows(
             conn,
@@ -8450,58 +8448,6 @@ class SessionServiceImpl:
                 await self._run_sync(_record_refusal)
             raise
 
-    async def begin_continuation_title_attempt(
-        self,
-        *,
-        prepared: PreparedTitleProvider,
-        requested_model: str,
-        required_work: RequiredWorkTicket,
-    ) -> TitleProviderAdmission | V4TitleProviderAdmission:
-        from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
-        from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
-        from elspeth.web.sessions.continuation_title_provider import (
-            PreparedTitleProvider,
-            admit_title_provider_on_connection,
-            admit_v4_title_provider_on_connection,
-        )
-
-        if type(prepared) is not PreparedTitleProvider:
-            _refuse_required_sql(required_work, AuditIntegrityError("TITLE admission requires its actual prepared producer"))
-        context = prepared.running.session_operation_context
-        _validate_required_sql_ticket(
-            required_work, sources=(RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL,), session_id=context.fence.session_id, context=context
-        )
-
-        def _sync() -> TitleProviderAdmission | V4TitleProviderAdmission | _ProviderAdmissionRefused:
-            try:
-                with (
-                    self._session_process_locked_begin(context.fence.session_id) as conn,
-                    self._session_write_lock(conn, context.fence.session_id),
-                ):
-                    self._require_session_operation_context_on_connection(
-                        conn,
-                        context,
-                        session_id=context.fence.session_id,
-                        expected_kind=SessionOperationKind.COMPOSE,
-                        now=database_now(conn),
-                    )
-                    root = decode_continuation_snapshot(prepared.selected.payload_json)
-                    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-                    if type(policy) is ContinuationAdmissionPolicyV4:
-                        return admit_v4_title_provider_on_connection(conn, self, prepared, model=requested_model)
-                    return admit_title_provider_on_connection(conn, self, prepared, model=requested_model)
-            except ChargeableAdmissionRefused as refusal:
-                try:
-                    self._record_provider_attempt_quota_refusal_sync(context, "auto_title", refusal)
-                except BaseException as recorder_error:
-                    raise BaseExceptionGroup("provider admission refusal recording failed", [refusal, recorder_error]) from None
-                return _ProviderAdmissionRefused(refusal)
-
-        outcome = await run_required_sql_in_worker(required_work, _sync)
-        if isinstance(outcome, _ProviderAdmissionRefused):
-            raise outcome.refusal
-        return outcome
-
     async def begin_v4_continuation_title_attempt(
         self,
         *,
@@ -12290,6 +12236,7 @@ class SessionServiceImpl:
         from elspeth.web.composer.continuation_semantic_observation import (
             SemanticCompleteResponseObservation,
             SemanticIncompleteResponseObservation,
+            SemanticInvalidResponseObservation,
             observe_semantic_provider_response,
             observe_semantic_retained_tail_overflow,
         )
@@ -12319,7 +12266,8 @@ class SessionServiceImpl:
         if (
             type(prepared) is not PreparedContinuationProvider
             or type(admission) is not V4SemanticProviderAdmission
-            or type(observation) not in (SemanticCompleteResponseObservation, SemanticIncompleteResponseObservation)
+            or type(observation)
+            not in (SemanticCompleteResponseObservation, SemanticIncompleteResponseObservation, SemanticInvalidResponseObservation)
             or type(recorder) is not BufferingRecorder
             or type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer
             or no_sdk_issuer.running is not prepared.binding.running
@@ -12410,7 +12358,7 @@ class SessionServiceImpl:
                     physical_row=physical,
                     parent=parent,
                 )
-            if complete is None or type(observation) is not SemanticCompleteResponseObservation:
+            if complete is None or not isinstance(observation, (SemanticCompleteResponseObservation, SemanticInvalidResponseObservation)):
                 raise AuditIntegrityError("V4 semantic complete result lost its exact original paid response")
             self._write_audit_cohort_on_connection(
                 conn,

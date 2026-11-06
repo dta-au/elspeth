@@ -12,7 +12,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation import EffectFrontierEntry
 from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkRefusalReason
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_checkpoint_no_sdk_tail import build_checkpoint_no_sdk_tail_batch
 from elspeth.web.sessions.continuation_checkpoint_paid_incomplete_tail import build_checkpoint_paid_incomplete_tail_batch
@@ -43,7 +43,7 @@ _CHILD = "provider:1:0"
 
 
 def _source(*, cursor: int = 1) -> tuple[StoredContinuationSnapshot, PaidOverflowIdentity]:
-    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=20000))
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=20000))
     assert policy is not None
     base = initial_stack()
     root = base.model_copy(

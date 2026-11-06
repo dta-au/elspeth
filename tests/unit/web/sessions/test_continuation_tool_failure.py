@@ -3316,7 +3316,8 @@ async def test_actual_advisor_timeout_is_retained_feedback_without_primary_termi
         assert len(sdk) == 2
 
 
-def _actual_failure_driver(store, owner, running, *, drain_signal=None):
+def _unstarted_driver(store, owner, running, *, drain_signal=None):
+    """Construct the original cold driver from its existing claim and lease."""
     import threading
 
     from starlette.applications import Starlette
@@ -3359,8 +3360,50 @@ def _actual_failure_driver(store, owner, running, *, drain_signal=None):
         drain_signal=drain_signal,
     )
     driver = _SegmentDriver(worker, services, running, owner.lease)
+    return driver
+
+
+def _actual_failure_driver(store, owner, running, *, drain_signal=None):
+    """Primitive failure/disposal seam; attached live owners are not run-ready."""
+    driver = _unstarted_driver(store, owner, running, drain_signal=drain_signal)
     driver.phases = owner
     return driver
+
+
+@asynccontextmanager
+async def _claimed_driver(driver):
+    """Own runnable claim cancellation/progress around an awaited original run.
+
+    The caller supplies an existing claimed lease and awaits driver.run inside
+    this context. The run joins its stage and operation watchers before exit;
+    this boundary then closes progress and removes only its own cancel slot.
+    """
+    import asyncio
+
+    assert driver.phases.runtime is None
+    assert driver.phases.work is driver.work and driver.phases.provider_owner is driver.provider
+    key = (driver.running.claim.session_id, driver.running.claim.operation_id)
+    local_cancel = asyncio.Event()
+    assert key not in driver.worker._local_cancels
+    driver.worker._local_cancels[key] = local_cancel
+    body_error = None
+    try:
+        yield driver
+    except BaseException as error:
+        body_error = error
+        raise
+    finally:
+        try:
+            try:
+                await driver.close_progress()
+            except BaseException as cleanup_error:
+                combined = driver.join_failure(cleanup_error) if body_error is None else driver.join_failure(body_error, cleanup_error)
+                if combined is cleanup_error:
+                    raise
+                raise combined from None
+        finally:
+            assert driver.worker._local_cancels[key] is local_cancel
+            del driver.worker._local_cancels[key]
 
 
 @asynccontextmanager
@@ -3727,9 +3770,10 @@ async def test_actual_cold_failed_prefix_finishes_p4_and_terminal_under_new_owne
             cold = ContinuationLivePhases(
                 service, authority, work, ProviderInvocationOwner(service=cold_store[3], required_work=work), lease
             )
-            driver = _actual_failure_driver(cold_store, cold, running)
+            driver = _unstarted_driver(cold_store, cold, running)
             assert driver.phases.runtime is None and driver.phases.failure_custody is None
-            result = await driver.run(None)
+            async with _claimed_driver(driver):
+                result = await driver.run(None)
             assert result.terminal.status == "failed" and driver._committed_failure is not None
             assert driver._committed_failure.observation.source.applied
             assert driver.phases.failure_custody is None

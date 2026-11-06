@@ -37,7 +37,6 @@ from elspeth.web.composer.continuation_codec import (
 )
 from elspeth.web.composer.continuation_end_effects import semantic_end_effect_key
 from elspeth.web.composer.continuation_end_values import EndContinuationCandidate, decode_end_candidate, encode_end_candidate
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, decode_continuation_policy
 from elspeth.web.composer.continuation_progress import (
     ActionExecutionReceipt,
     canonicalize_continuation_obligations,
@@ -214,12 +213,6 @@ def _admit_paid(conn: Connection, paid: SemanticAdvisorPaidDecisionData) -> Sema
             or continuation_tool_support(action.tool_name, arguments) != "read"
         ):
             raise AuditIntegrityError("semantic read action lacks its actual read-only registry owner")
-        # V3's aggregate byte allowance is not a bound on the complete result
-        # of a selected read tool. Until that producer has an original finite
-        # tail contract, admission must refuse before dispatch.
-        policy = decode_continuation_policy(paid.paid_root.admission_policy_json, paid.paid_root.policy_hash)
-        if type(policy) is ContinuationAdmissionPolicyV3:
-            raise AuditIntegrityError("V3 semantic read has no proven complete result bound")
     if type(action) is ReviewContinuationAction and (
         action.candidate_ref != evidence.coverage.candidate_ref
         or action.evidence_binding != evidence.coverage.evidence_binding

@@ -1,8 +1,4 @@
-"""Detached metadata DATA from actual retained historical V3 custody.
-
-These controls do not establish a fresh V3 paid admission or a committed tool
-tail. They prove the preparation graph stays separate until its SQL owner acts.
-"""
+"""Detached metadata DATA from the current policy's actual paid PRIMARY."""
 
 import asyncio
 import time
@@ -37,23 +33,23 @@ from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.required_work import RequiredWorkSource, required_failure_leaves
 from tests.unit.web.coordination import test_composer_operation_authority
-from tests.unit.web.sessions.test_continuation_v3_tool_historical_refusal import _rows
-from tests.unit.web.sessions.test_continuation_v3_tool_refusal_driver import _historical_driver
+from tests.unit.web.sessions.test_continuation_ingress import recovery_rows
+from tests.unit.web.sessions.test_continuation_v4_metadata_live import _v4_tool_case
 
 operation_store = test_composer_operation_authority.operation_store
 
 
-async def _detached_inputs(driver, selected):
-    original, inventory = await driver.phases.current(selected)
+async def _detached_inputs(owner, selected):
+    original, inventory = await owner.current(selected)
     assert original.graph.batch is not None
-    cold_provider = ProviderInvocationOwner(service=driver.services.session_service, required_work=driver.work)
-    cold = ContinuationLivePhases(driver.service, driver.authority, driver.work, cold_provider, driver.lease)
+    cold_provider = ProviderInvocationOwner(service=owner.service._require_sessions_service(), required_work=owner.work)
+    cold = ContinuationLivePhases(owner.service, owner.authority, owner.work, cold_provider, owner.lease)
     detached = await restore_metadata_preparation_runtime(
-        service=driver.service,
-        authority=driver.authority,
+        service=owner.service,
+        authority=owner.authority,
         selected=selected,
         inventory=inventory,
-        required_work=driver.work,
+        required_work=owner.work,
         provider_owner=cold_provider,
     )
     cold.runtime = detached
@@ -70,16 +66,16 @@ async def _detached_inputs(driver, selected):
 
 @pytest.mark.asyncio
 async def test_metadata_preparation_finishes_once_without_changing_original_or_sql(operation_store, tmp_path, monkeypatch):
-    async with _historical_driver(operation_store, tmp_path, monkeypatch, tool_name="set_metadata") as (driver, values):
-        store, _policy, running, selected, _inventory, *_ = values
-        original, detached, arguments = await _detached_inputs(driver, selected)
+    async with _v4_tool_case(operation_store, tmp_path, monkeypatch) as (store, owner, _running, _sdk):
+        selected = owner.runtime.source.selected
+        original, detached, arguments = await _detached_inputs(owner, selected)
         data = original.graph.batch
         assert data is not None
         source_batch = encode_coupled_batch_data(batch=data.batch, accumulator=data.accumulator, calls=data.calls)
         source_recorder = original.live.recorder.snapshot_for_continuation(drained=original.drained)
         source_anchor = original.live.anti_anchor.snapshot_for_continuation()
         source_state = original.live.state
-        before = _rows(store[0], str(store[4]), running.claim.operation_id)
+        before = recovery_rows(store[0])
         computed = []
         actual = preparation.prepare_set_metadata_result_value
 
@@ -131,16 +127,16 @@ async def test_metadata_preparation_finishes_once_without_changing_original_or_s
         assert encode_coupled_batch_data(batch=data.batch, accumulator=data.accumulator, calls=data.calls) == source_batch
         assert original.live.recorder.snapshot_for_continuation(drained=original.drained) == source_recorder
         assert original.live.anti_anchor.snapshot_for_continuation() == source_anchor
-        assert _rows(store[0], str(store[4]), running.claim.operation_id) == before
+        assert recovery_rows(store[0]) == before
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alias", ("batch", "recorder", "messages", "anti_anchor"))
 async def test_metadata_preparation_rejects_original_mutable_owner(operation_store, tmp_path, monkeypatch, alias):
-    async with _historical_driver(operation_store, tmp_path, monkeypatch, tool_name="set_metadata") as (driver, values):
-        store, _policy, running, selected, *_ = values
-        original, detached, arguments = await _detached_inputs(driver, selected)
-        before = _rows(store[0], str(store[4]), running.claim.operation_id)
+    async with _v4_tool_case(operation_store, tmp_path, monkeypatch) as (store, owner, _running, _sdk):
+        selected = owner.runtime.source.selected
+        original, detached, arguments = await _detached_inputs(owner, selected)
+        before = recovery_rows(store[0])
         if alias == "batch":
             arguments["runtime"] = replace(detached, graph=detached.graph.with_batch(original.graph.batch))
         elif alias == "recorder":
@@ -151,14 +147,14 @@ async def test_metadata_preparation_rejects_original_mutable_owner(operation_sto
             arguments["runtime"] = replace(detached, live=replace(detached.live, anti_anchor=original.live.anti_anchor))
         with pytest.raises(AuditIntegrityError, match="original mutable owner"):
             await prepare_metadata_tool_call(**arguments)
-        assert _rows(store[0], str(store[4]), running.claim.operation_id) == before
+        assert recovery_rows(store[0]) == before
 
 
 @pytest.mark.asyncio
 async def test_metadata_preparation_refuses_explicit_approval_before_prepare(operation_store, tmp_path, monkeypatch):
-    async with _historical_driver(operation_store, tmp_path, monkeypatch, tool_name="set_metadata") as (driver, values):
-        _store, _policy, _running, selected, *_ = values
-        _original, detached, arguments = await _detached_inputs(driver, selected)
+    async with _v4_tool_case(operation_store, tmp_path, monkeypatch) as (_store, owner, _running, _sdk):
+        selected = owner.runtime.source.selected
+        _original, detached, arguments = await _detached_inputs(owner, selected)
         build_context = preparation.build_runtime_tool_batch_context
 
         async def explicit_context(*args, **kwargs):
@@ -174,9 +170,9 @@ async def test_metadata_preparation_refuses_explicit_approval_before_prepare(ope
 
 @pytest.mark.asyncio
 async def test_metadata_completion_rejects_changed_prepared_graph_without_computation(operation_store, tmp_path, monkeypatch):
-    async with _historical_driver(operation_store, tmp_path, monkeypatch, tool_name="set_metadata") as (driver, values):
-        _store, _policy, _running, selected, *_ = values
-        _original, _detached, arguments = await _detached_inputs(driver, selected)
+    async with _v4_tool_case(operation_store, tmp_path, monkeypatch) as (_store, owner, _running, _sdk):
+        selected = owner.runtime.source.selected
+        _original, _detached, arguments = await _detached_inputs(owner, selected)
         prepared = await prepare_metadata_tool_call(**arguments)
         prepared.call.arguments["patch"] = {"name": "different than retained preparation"}
 
@@ -191,11 +187,11 @@ async def test_metadata_completion_rejects_changed_prepared_graph_without_comput
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ("identity", "started_ns", "actor", "portable_elapsed"))
 async def test_metadata_completion_rejects_changed_original_audit_before_computation(operation_store, tmp_path, monkeypatch, change):
-    async with _historical_driver(operation_store, tmp_path, monkeypatch, tool_name="set_metadata") as (driver, values):
-        store, _policy, running, selected, *_ = values
-        _original, detached, arguments = await _detached_inputs(driver, selected)
+    async with _v4_tool_case(operation_store, tmp_path, monkeypatch) as (store, owner, _running, _sdk):
+        selected = owner.runtime.source.selected
+        _original, detached, arguments = await _detached_inputs(owner, selected)
         prepared = await prepare_metadata_tool_call(**arguments)
-        before = _rows(store[0], str(running.claim.session_id), running.claim.operation_id)
+        before = recovery_rows(store[0])
         recorder_before = detached.live.recorder.snapshot_for_continuation(drained=detached.drained)
         if change == "identity":
             prepared.call.audit = replace(prepared.original_audit)
@@ -224,15 +220,15 @@ async def test_metadata_completion_rejects_changed_original_audit_before_computa
         with pytest.raises(AuditIntegrityError, match="original detached prepared graph"):
             await complete_prepared_metadata_tool(prepared)
         assert detached.live.recorder.snapshot_for_continuation(drained=detached.drained) == recorder_before
-        assert _rows(store[0], str(running.claim.session_id), running.claim.operation_id) == before
+        assert recovery_rows(store[0]) == before
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reject_read", (None, 1, 2))
 async def test_metadata_restore_keeps_shared_disclosure_and_original_source_reads(operation_store, tmp_path, monkeypatch, reject_read):
-    async with _historical_driver(operation_store, tmp_path, monkeypatch, tool_name="set_metadata") as (driver, values):
-        store, _policy, running, selected, *_ = values
-        original, inventory = await driver.phases.current(selected)
+    async with _v4_tool_case(operation_store, tmp_path, monkeypatch) as (store, driver, running, _sdk):
+        selected = driver.runtime.source.selected
+        original, inventory = await driver.current(selected)
         sid = str(running.claim.session_id)
         shared = driver.service._schema_disclosure
         # Distinctive existing in-memory guidance is intentionally absent from
@@ -241,7 +237,7 @@ async def test_metadata_restore_keeps_shared_disclosure_and_original_source_read
         shared.mark_plugin_schema_loaded("another-session", "source", "shared-other-session")
         before = shared.schemas_loaded_for_session(sid)
         other_before = shared.schemas_loaded_for_session("another-session")
-        sql_before = _rows(store[0], sid, running.claim.operation_id)
+        sql_before = recovery_rows(store[0])
         reads = []
         read_source = type(driver.authority).read_continuation_runtime
 
@@ -253,7 +249,7 @@ async def test_metadata_restore_keeps_shared_disclosure_and_original_source_read
             return result
 
         monkeypatch.setattr(type(driver.authority), "read_continuation_runtime", observe_source)
-        provider = ProviderInvocationOwner(service=driver.services.session_service, required_work=driver.work)
+        provider = ProviderInvocationOwner(service=store[3], required_work=driver.work)
         if reject_read is not None:
             with pytest.raises(AuditIntegrityError, match="controlled original metadata source read refusal"):
                 await restore_metadata_preparation_runtime(
@@ -278,7 +274,7 @@ async def test_metadata_restore_keeps_shared_disclosure_and_original_source_read
             assert detached.source.selected is selected
             assert detached.detached_disclosure is not None and detached.detached_disclosure is not shared
             assert detached.detached_disclosure.schemas_loaded_for_session(sid) == frozenset(original.source.iteration.disclosure.schemas)
-            ctx = await build_runtime_tool_batch_context(detached, cancellation_requested=driver.phases.cancellation_requested)
+            ctx = await build_runtime_tool_batch_context(detached, cancellation_requested=driver.cancellation_requested)
             assert ctx.schema_disclosure is detached.detached_disclosure
             detached.detached_disclosure.mark_plugin_schema_loaded(sid, "transform", "detached-only-metadata-preparation")
             captured = await capture_continuation_runtime_owners(detached, selected=selected, inventory=inventory)
@@ -294,7 +290,7 @@ async def test_metadata_restore_keeps_shared_disclosure_and_original_source_read
         )
         assert shared.schemas_loaded_for_session(sid) == before
         assert shared.schemas_loaded_for_session("another-session") == other_before
-        assert _rows(store[0], sid, running.claim.operation_id) == sql_before
+        assert recovery_rows(store[0]) == sql_before
 
 
 @pytest.mark.asyncio
@@ -315,8 +311,8 @@ async def test_metadata_restore_keeps_shared_disclosure_and_original_source_read
 async def test_metadata_capture_keeps_size_refusal_clean_and_source_failures_honest(
     operation_store, tmp_path, monkeypatch, boundary, reject_read
 ):
-    async with _historical_driver(operation_store, tmp_path, monkeypatch, tool_name="set_metadata") as (driver, values):
-        store, _policy, running, selected, *_ = values
+    async with _v4_tool_case(operation_store, tmp_path, monkeypatch) as (store, driver, running, _sdk):
+        selected = driver.runtime.source.selected
         _original, detached, _arguments = await _detached_inputs(driver, selected)
         inventory = detached.materialization.inventory
         sid = str(running.claim.session_id)
@@ -328,7 +324,7 @@ async def test_metadata_capture_keeps_size_refusal_clean_and_source_failures_hon
         assert detached.detached_disclosure is not None
         detached.detached_disclosure.mark_plugin_schema_loaded(sid, "transform", "private-capture-marker")
         private_before = detached.detached_disclosure.schemas_loaded_for_session(sid)
-        sql_before = _rows(store[0], sid, running.claim.operation_id)
+        sql_before = recovery_rows(store[0])
         coordinator = driver.work.coordinator
         tickets_before = coordinator.tickets
         reads = []
@@ -414,7 +410,7 @@ async def test_metadata_capture_keeps_size_refusal_clean_and_source_failures_hon
         assert shared.schemas_loaded_for_session(sid) == shared_before
         assert shared.schemas_loaded_for_session("another-session") == other_before
         assert detached.detached_disclosure.schemas_loaded_for_session(sid) == private_before
-        assert _rows(store[0], sid, running.claim.operation_id) == sql_before
+        assert recovery_rows(store[0]) == sql_before
 
 
 def test_metadata_generated_private_codec_rejects_malformed_tail_before_size_refusal():

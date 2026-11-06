@@ -11,7 +11,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.sessions.continuation_retained_capacity import (
     ContinuationRetainedCapacityExceeded,
     ProspectiveContinuationChunk,
@@ -45,7 +45,7 @@ _ORIGINAL_SNAPSHOT = b"{}"
 
 def _seed_original(conn, sid: str, operation_id: str, *, allowance: int) -> ProviderTerminalHoldSource:
     now = datetime.now(UTC)
-    admitted = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
+    admitted = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
     assert admitted is not None
     conn.execute(
         insert(jobs).values(

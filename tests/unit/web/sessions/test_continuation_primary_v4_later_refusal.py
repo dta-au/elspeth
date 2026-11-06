@@ -10,10 +10,9 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web import app as app_module
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_iteration_transitions import ITERATION_EFFECT_OWNER
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.sessions.continuation import load_snapshot, read_chunk
 from elspeth.web.sessions.continuation_driver import _SegmentDriver
@@ -40,14 +39,6 @@ from tests.helpers.continuation_app import (
 
 @pytest.mark.asyncio
 async def test_later_primary_zero_use_refusal_cold_proves_complete_historical_frontier(tmp_path, monkeypatch):
-    def v4_policy(settings):
-        policy = continuation_policy_v4_from_settings(settings)
-        assert policy is not None
-        return policy
-
-    # Bind the real fresh-operation factory before app construction. All
-    # subsequent issuance, transitions, provider custody and SQL are original.
-    monkeypatch.setattr(app_module, "continuation_policy_from_settings", v4_policy)
     sdk = ScriptedSDK(
         [
             ("primary", lambda app: ("Inspecting the current state.", [tool_call(app, "prior_read", "get_pipeline_state", {})])),
@@ -85,6 +76,7 @@ async def test_later_primary_zero_use_refusal_cold_proves_complete_historical_fr
             with engine.connect() as conn:
                 selected = load_snapshot(conn, session_id=sid, operation_id=operation_id)
                 root = decode_continuation_snapshot(selected.payload_json)
+                assert type(decode_continuation_policy(root.admission_policy_json, root.policy_hash)) is ContinuationAdmissionPolicyV4
                 prior = history(conn, admission.hold.effect_key)
                 advance = conn.execute(
                     select(effects).where(

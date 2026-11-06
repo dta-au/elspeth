@@ -15,7 +15,7 @@ from sqlalchemy import select
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.provider_sdk_terminal import require_sdk_terminal_failure
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -42,7 +42,7 @@ from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.sessions import test_continuation_initialization as initialization_cases
 from tests.unit.web.sessions.test_continuation_primary_result import initialized_primary_input
-from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver
+from tests.unit.web.sessions.test_continuation_tool_failure import _claimed_driver, _unstarted_driver
 
 operation_store = operations.operation_store
 
@@ -52,9 +52,7 @@ operation_store = operations.operation_store
 async def test_actual_driver_cold_verifies_sdk_failure_without_retry_or_terminal_overwrite(
     operation_store, tmp_path, monkeypatch, audit_companion
 ):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -89,12 +87,8 @@ async def test_actual_driver_cold_verifies_sdk_failure_without_retry_or_terminal
     ).join()
     provider = ProviderInvocationOwner(service=store[3], required_work=work)
     phases = ContinuationLivePhases(runtime.materialization.service, authority, work, provider, lease)
-    driver = _actual_failure_driver(store, phases, running, drain_signal=drain)
-    driver.work, driver.provider = work, provider
+    driver = _unstarted_driver(store, phases, running, drain_signal=drain)
     key = (running.claim.session_id, running.claim.operation_id)
-    cancel = asyncio.Event()
-    assert key not in driver.worker._local_cancels
-    driver.worker._local_cancels[key] = cancel
     sdk_calls = []
     sdk_failure = OpenAIError("private SDK failure must not become public evidence")
     audit_failure = AuditIntegrityError("owned audit constructor failure")
@@ -132,16 +126,23 @@ async def test_actual_driver_cold_verifies_sdk_failure_without_retry_or_terminal
     try:
         if audit_companion:
             with pytest.raises(BaseExceptionGroup) as caught:
-                await driver.run(None)
+                async with _claimed_driver(driver):
+                    assert type(driver.worker._local_cancels[key]) is asyncio.Event
+                    await driver.run(None)
             assert len(failures) == len(releases) == 1
             assert caught.value is failures[0].original
             assert caught.value.exceptions == (sdk_failure, audit_failure)
             terminal = releases[0]
         else:
-            outcome = await driver.run(None)
+            async with _claimed_driver(driver):
+                assert type(driver.worker._local_cancels[key]) is asyncio.Event
+                outcome = await driver.run(None)
             assert type(outcome) is ContinuationSegmentSettled and outcome.terminal.status == "failed"
             assert releases == [outcome.terminal] and not failures
             terminal = outcome.terminal
+        assert key not in driver.worker._local_cancels
+        assert driver.progress_owner is not None and driver.progress_owner.unregistered
+        assert not driver.progress_owner.contained_pending and driver.progress_owner.cleanup_failure is None
         sid, operation = str(running.claim.session_id), running.claim.operation_id
         with store[0].connect() as conn:
             parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
@@ -167,6 +168,4 @@ async def test_actual_driver_cold_verifies_sdk_failure_without_retry_or_terminal
             assert errors.subgroup(lambda error: error is audit_failure) is not None
         work.coordinator.assert_completed()
     finally:
-        await driver.close_progress()
         await lease.close(deadline=driver.worker.drain_deadline)
-        assert driver.worker._local_cancels.pop(key) is cancel

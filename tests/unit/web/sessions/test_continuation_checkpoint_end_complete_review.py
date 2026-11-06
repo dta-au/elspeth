@@ -10,7 +10,7 @@ from sqlalchemy import select, update
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointCompleteReview
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_cost import read_continuation_cost_snapshot_on_connection
@@ -32,9 +32,7 @@ operation_store = shared_fixture.operation_store
 
 @pytest.mark.asyncio
 async def test_actual_v4_paid_end_review_retains_blocked_action_without_early_publication(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -105,9 +103,7 @@ async def test_actual_v4_paid_end_review_retains_blocked_action_without_early_pu
 async def test_actual_paid_end_review_refuses_order_only_completed_frontier_corruption(operation_store, tmp_path, monkeypatch):
     from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -209,9 +205,7 @@ async def test_actual_clean_empty_review_keeps_warm_and_cold_projection_truthful
     from elspeth.web.execution.schemas import ValidationResult
     from tests.unit.web.sessions.test_continuation_v4_pipeline_live import _uploaded_source
 
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy

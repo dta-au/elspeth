@@ -1,8 +1,7 @@
-"""Semantic physical-call contract; these are not live K-7 worker proofs.
+"""Current semantic phase contracts from a real paid PRIMARY and refused tool.
 
-Use the existing real fenced Advisor/required Azure guard fixture and replace
-only external SDK I/O. Historical source refs below are DATA, not current SQL
-source clearance; the phase/source integration remains a separate obligation.
+Provider calls use original V4 preparation, admission and completion owners.
+Altered-frontier tests exercise request/guard DATA only, never SQL admission.
 """
 
 from __future__ import annotations
@@ -24,32 +23,119 @@ from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS
-from elspeth.web.composer import provider_gateway
-from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.continuation_advisor import ContinuationAdvisorInvocation, ContinuationAdvisorPremise, nearest_compose_frame
+from elspeth.web.composer import prompt_guard, provider_gateway
+from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import (
     decode_continuation_response,
     decode_retained_physical_audit_call,
+    encode_continuation_snapshot,
     encode_frontier_chunk,
     encode_private_chunk,
 )
-from elspeth.web.composer.continuation_progress import initial_continuation_frontier
-from elspeth.web.composer.continuation_semantic_advisor import prepare_semantic_advisor_request, run_semantic_advisor
+from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.continuation_semantic_advisor import SemanticAdvisorReviewInput, prepare_semantic_advisor_request
+from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
+from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+from elspeth.web.sessions.continuation_semantic_advisor import read_semantic_advisor_retained_inputs_on_connection
+from elspeth.web.sessions.continuation_semantic_review_result import (
+    RetainedSemanticReviewResult,
+    decode_semantic_review_result,
+    encode_semantic_review_provider_input,
+)
 from tests.unit.web.composer.test_advisor_invocation_outcome import operation_store as _operation_store
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
-from tests.unit.web.sessions.test_continuation_tool_failure import _advance, _advisor_case
+from tests.unit.web.sessions.test_continuation_tool_failure import _advisor_case
 from tests.unit.web.sessions.test_token_usage_adapters import _ledger
 
 operation_store = _operation_store
+
+
+@asynccontextmanager
+async def _semantic_entry(store, tmp_path, monkeypatch):
+    """Run the real post-batch driver, hand over before semantic, then reclaim."""
+    from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+    from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
+    from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+    from elspeth.web.sessions.continuation_driver import ContinuationSegmentHandedOver, _SegmentDriver
+    from tests.unit.web.sessions import test_continuation_composition_initialization as initialization
+    from tests.unit.web.sessions.test_continuation_tool_failure import _claimed_driver, _install_original_deadline, _unstarted_driver
+
+    _install_original_deadline(store, monkeypatch)
+    async with _advisor_case(
+        store,
+        tmp_path,
+        monkeypatch,
+        tool_name="get_plugin_schema",
+        tool_arguments={"plugin_type": "source", "name": "K7_REFUSED_PLUGIN"},
+    ) as (owner, running, paid):
+        timing = owner.work.coordinator.sql_deadline_owner
+        assert timing is not None
+        driver = _unstarted_driver(store, owner, running, drain_signal=timing.drain_signal)
+        actual_advance = _SegmentDriver.advance
+        ready_cuts = []
+
+        async def no_prelude_sdk(**_request):
+            raise AssertionError("refused discovery prelude must stop before its first semantic SDK call")
+
+        async def observe_advance(current, stored, selected):
+            result = await actual_advance(current, stored, selected)
+            if current is driver and result is None:
+                following, after = await current.selected()
+                stage = await current.iteration_stage(following, after)
+                top = after.stack.frames[-1]
+                returned = type(top) is ToolBatchFrame and stage is not None and stage.stage == "returned"
+                advanced = type(top) is ComposeFrame and top.phase == "action_ready" and after.stack.active_action_json is None
+                if returned or advanced:
+                    assert not ready_cuts
+                    if type(top) is ComposeFrame:
+                        assert top.iteration is not None
+                    ready_cuts.append(after)
+                    timing.drain_signal.request()
+            return result
+
+        with monkeypatch.context() as capture:
+            capture.setattr(_SegmentDriver, "advance", observe_advance)
+            capture.setattr(litellm, "acompletion", no_prelude_sdk)
+            async with _claimed_driver(driver):
+                handover = await driver.run(None)
+        assert type(handover) is ContinuationSegmentHandedOver and len(ready_cuts) == 1
+        store[1].verify_recovery(handover.receipt)
+        service = owner.service
+    owner.work.coordinator.assert_completed()
+
+    (claim,) = store[2].claim_segment(limit=1)
+    assert claim.operation_id == running.claim.operation_id
+    assert claim.ownership_generation == running.claim.ownership_generation + 1
+    context = store[1].start_composer_segment(
+        claim, owner_instance_id=store[2]._owner_instance_id, lease_seconds=30, auth_provider_type="local"
+    )
+    current = ComposerOperationRunning(claim, context)
+    work = initialization.inventory_work(current)
+    lease = await ContinuationLeaseAdoption(store[1], context, lease_seconds=30, required_work=work.coordinator).join()
+    try:
+        provider = ProviderInvocationOwner(service=store[3], required_work=work)
+        phases = ContinuationLivePhases(service, store[2], work, provider, lease)
+        head = store[2].load_continuation_snapshot(current)
+        selected = await load_selected_continuation(authority=store[2], running=current, selected=head, required_work=work)
+        assert selected.stack == ready_cuts[0].stack.model_copy(update={"cursor": head.cursor})
+        await phases.current(selected)
+        yield phases, current, paid
+    finally:
+        await lease.close()
+        work.coordinator.assert_completed()
 
 
 @asynccontextmanager
@@ -92,15 +178,8 @@ async def _case(store, tmp_path, monkeypatch, *, cost_limits=None):
         return actual_setattr(*args, **kwargs)
 
     actual_setattr(monkeypatch, "setattr", set_external_boundary)
-    async with _advisor_case(
-        store,
-        tmp_path,
-        monkeypatch,
-        tool_name="get_plugin_schema",
-        tool_arguments={"plugin_type": "source", "name": "K7_REFUSED_PLUGIN"},
-    ) as (phases, running, paid):
+    async with _semantic_entry(store, tmp_path, monkeypatch) as (phases, running, paid):
         preparing_fixture = False
-        await _advance(phases)
         runtime = phases.runtime
         assert runtime is not None
         state = runtime.live.state
@@ -109,27 +188,13 @@ async def _case(store, tmp_path, monkeypatch, *, cost_limits=None):
         context = running.session_operation_context
         coordinator = phases.work.coordinator
         user = runtime.bindings.message
-        frame = nearest_compose_frame(runtime.source.selected.stack)
-        frontier = initial_continuation_frontier(
-            request=user, original_message_id=runtime.source.evidence.request_id, graph_hash=composition_content_hash(state)
-        )
-        source = ContinuationAdvisorInvocation(
-            kind="semantic",
-            state=frame.state,
-            evidence=frame.evidence,
-            transcript=frame.transcript,
-            iteration=frame.iteration,
-            coverage_binding=stable_hash({"request": user, "graph": frontier.graph_hash}),
-            manual_arguments_json=None,
-            manual_tool_call_id=None,
-            candidate="The current draft still needs work.",
-            premise=ContinuationAdvisorPremise(
-                input_hash=stable_hash({"request": user}),
-                policy_hash=runtime.source.selected.stack.policy_hash,
-                tool_manifest_hash=stable_hash(runtime.live.tools),
-                frontier=encode_frontier_chunk(frontier).reference,
-            ),
-        )
+        invocation = make_semantic_advisor_invocation(capture_semantic_advisor_source(runtime))
+        frontier, source = invocation.frontier, invocation.invocation
+        assert source.iteration is not None
+        selected = runtime.source.selected
+        stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
+        with store[0].connect() as conn:
+            retained_inputs = read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=stored)
         inputs = {
             "owner": advisor,
             "provider_owner": provider,
@@ -140,13 +205,20 @@ async def _case(store, tmp_path, monkeypatch, *, cost_limits=None):
             "user_message": user,
             "runtime": runtime,
             "env_ref_names": runtime.env_ref_names,
+            "retained_inputs": retained_inputs,
         }
         baseline = {"ledger": len(_ledger(store[0])), "checks": len(_checks(store[0])), "paid": len(paid)}
+        baseline["phases"] = phases
+        baseline["recorder"] = len(runtime.live.recorder.llm_calls)
         assert baseline["paid"] == 1
-        assert runtime.graph.batch is not None
-        outcome = runtime.graph.batch.batch.tool_outcomes[-1]
-        assert outcome.call.function.name == "get_plugin_schema"
-        assert outcome.error_class is not None or (type(outcome.response) is ToolResult and outcome.response.success is False)
+        (refused,) = [
+            item
+            for item in runtime.live.recorder.invocations
+            if item.tool_name == "get_plugin_schema" and json.loads(item.arguments_canonical)["name"] == "K7_REFUSED_PLUGIN"
+        ]
+        assert refused.error_class is not None or (
+            refused.result_canonical is not None and json.loads(refused.result_canonical)["success"] is False
+        )
         tool_message = next(message for message in runtime.live.llm_messages if message.get("tool_call_id") == "actual_advisor")
         baseline["tool_feedback"] = json.loads(tool_message["content"])
         assert _contains_json_value([tool_message], baseline["tool_feedback"])
@@ -161,6 +233,50 @@ async def _case(store, tmp_path, monkeypatch, *, cost_limits=None):
 
         monkeypatch.setattr(provider, "mint", mint)
         yield inputs, provider, context, coordinator, baseline, custodies
+
+
+async def _observe_case(phases, monkeypatch):
+    """Observe one actual V4 phase, preserving its returned terminal or error."""
+    from elspeth.web.composer import continuation_semantic_advisor_phase as phase
+
+    runtime = phases.runtime
+    assert runtime is not None
+    clock = ContinuationActionClock(runtime.source.policy.actions.advisor)
+    phases.bind_action_clock(clock)
+    deadline = phases.work.coordinator.sql_deadline_owner
+    if deadline is not None:
+        deadline.begin_action(clock.policy, started_at=clock.started_monotonic)
+    actual = phase.observe_semantic_advisor_invocation
+    observations = []
+
+    async def observe(request, **kwargs):
+        outcome = await actual(request, **kwargs)
+        observations.append((outcome, request))
+        return outcome
+
+    terminal = error = None
+    with monkeypatch.context() as capture:
+        capture.setattr(phase, "observe_semantic_advisor_invocation", observe)
+        try:
+            terminal = await phase.run_continuation_semantic_advisor(phases, runtime.source.selected)
+        except BaseException as original:
+            error = original
+    if not observations:
+        assert error is not None
+        raise error
+    assert len(observations) == 1
+    outcome, request = observations[0]
+    return outcome, terminal, error, request
+
+
+async def _run_case(phases, monkeypatch):
+    from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationV4Finalized
+
+    outcome, terminal, error, _request = await _observe_case(phases, monkeypatch)
+    if error is not None:
+        raise error
+    assert terminal is None and type(outcome) is SemanticAdvisorInvocationV4Finalized
+    return outcome.finalization.result
 
 
 def _contains_json_value(value, expected):
@@ -224,9 +340,27 @@ def _inputs_with_frontier_description(inputs, description: str):
     return {**inputs, "source": rebound, "frontier": changed}
 
 
+def _guard_data(request):
+    """Exercise guard rendering DATA without claiming current SQL admission."""
+    prepared = request.prepared
+    assert prepared.mount is not None
+    evidence = prepared.evidence
+    return prompt_guard._request(
+        policy_fingerprint=prepared.mount.client.policy_fingerprint,
+        role="advisor",
+        messages=evidence.messages,
+        tools=(),
+        user_prompt=prepared.genuine_user,
+        trusted_message_indexes=evidence.trusted_message_indexes,
+        content_parts=evidence.content_parts,
+        tool_argument_parts=evidence.tool_argument_parts,
+        thinking_parts=evidence.thinking_parts,
+    )
+
+
 @pytest.mark.asyncio
-async def test_semantic_frontier_wrapper_partitions_without_changing_paid_wire_or_hash(operation_store, tmp_path, monkeypatch):
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, _custodies):
+async def test_semantic_frontier_wrapper_partitions_without_changing_prepared_wire_or_hash(operation_store, tmp_path, monkeypatch):
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, baseline, _custodies):
         original_frontier = inputs["frontier"]
         original_text = original_frontier.obligations[0].description
         wrapper_overhead = len(encode_frontier_chunk(original_frontier).canonical) - len(original_text)
@@ -244,50 +378,122 @@ async def test_semantic_frontier_wrapper_partitions_without_changing_paid_wire_o
         assert "".join(part.text for part in parts) == retained
         assert sum(part.inspection_text == description for part in parts) == 1
         request.verify()
-        dispatched = []
-
-        async def completion(**kwargs):
-            dispatched.append(kwargs)
-            return _reply(json.dumps(_answer(request)))
-
-        monkeypatch.setattr(litellm, "acompletion", completion)
-        await run_semantic_advisor(request, provider_owner=provider, recorder=BufferingRecorder(), timeout=5)
-        assert len(dispatched) == 1 and dispatched[0]["messages"][-1]["content"] == retained
+        guarded, supported = _guard_data(request)
+        assert supported and guarded.role == "advisor"
         assert request.request_sha256 == original_request_sha256
-        checks = _checks(operation_store[0])
-        assert len(checks) == baseline["checks"] + 1 and checks[-1]["disposition"] == "allow"
+        assert len(_checks(operation_store[0])) == baseline["checks"]
+        assert len(_ledger(operation_store[0])) == baseline["ledger"]
         coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
-async def test_semantic_frontier_indivisible_scalar_above_limit_refuses_without_paid_call(operation_store, tmp_path, monkeypatch):
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, custodies):
+async def test_semantic_frontier_indivisible_scalar_above_limit_is_unsupported_guard_data(operation_store, tmp_path, monkeypatch):
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, baseline, custodies):
         description = "u" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1)
         request = prepare_semantic_advisor_request(**_inputs_with_frontier_description(inputs, description))
         parts = request.prepared.evidence.content_parts[-1]
         assert parts is not None and sum(part.inspection_text == description for part in parts) == 1
-        sdk = []
-
-        async def completion(**kwargs):
-            sdk.append(kwargs)
-            return _reply(json.dumps(_answer(request)))
-
-        monkeypatch.setattr(litellm, "acompletion", completion)
-        with pytest.raises(PromptGuardRefused) as refused:
-            await run_semantic_advisor(request, provider_owner=provider, recorder=BufferingRecorder(), timeout=5)
-        assert refused.value.http_status == 422 and refused.value.disposition == "unavailable"
-        assert sdk == [] and custodies[0].attempt is None
+        _guarded, supported = _guard_data(request)
+        assert supported is False and custodies == []
         assert len(_ledger(operation_store[0])) == baseline["ledger"]
-        checks = _checks(operation_store[0])
-        assert len(checks) == baseline["checks"] + 1
-        assert (checks[-1]["disposition"], checks[-1]["reason"]) == ("unavailable", "unsupported_input")
+        assert len(_checks(operation_store[0])) == baseline["checks"]
+        coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oversized_public_message", [False, True], ids=["private-context-excluded", "public-message-still-bounded"])
+async def test_semantic_review_provider_view_excludes_private_context_without_relaxing_guard_data(
+    operation_store, tmp_path, monkeypatch, oversized_public_message
+):
+    """Build actual Review DATA without claiming that a guard grants SQL authority."""
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, baseline, custodies):
+        private_text = "PRIVATE_REVIEW_CONTEXT " + "x" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1)
+        private_context = capture_provider_context(messages=[{"role": "user", "content": private_text}], tools=None)
+        assert private_context.disposition == "retained" and private_context.canonical is not None
+        assert len(private_context.canonical) > PROMPT_GUARD_MAX_TEXT_CHARACTERS
+        recorder = inputs["runtime"].live.recorder
+        assert recorder.llm_calls and recorder.invocations
+        original_call = recorder.llm_calls[-1]
+        call = replace(original_call, private_request=private_context)
+        assert call.to_dict() == original_call.to_dict()
+        message = "Review needs another authoring step."
+        if oversized_public_message:
+            message = "r" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1)
+        retained_review = RetainedSemanticReviewResult(
+            ComposerResult(
+                message=message,
+                state=inputs["state"],
+                llm_calls=(call,),
+                tool_invocations=tuple(recorder.invocations),
+            ),
+            publication_binding=None,
+        )
+        encoded, provider_json = encode_semantic_review_provider_input(retained_review)
+        assert decode_semantic_review_result(encoded) == retained_review
+        assert private_text in encoded
+        retained_inputs = inputs["retained_inputs"]
+        assert retained_inputs is not None
+        changed_inputs = {
+            **inputs,
+            "retained_inputs": replace(
+                retained_inputs,
+                review=SemanticAdvisorReviewInput(
+                    result_json=encoded,
+                    owner_effect_key="end:review:guard-data-control",
+                    completed_checkpoint_id=retained_inputs.checkpoint_id,
+                    completed_cursor=retained_inputs.cursor,
+                    outcome="blocked",
+                    provider_json=provider_json,
+                ),
+                iteration_return=None,
+            ),
+        }
+        # Only the request builder and guard rendering consume this input. It
+        # deliberately has no SQL Review commit or authority-producing call.
+        from elspeth.web.sessions import continuation_semantic_review_result as review_codec
+
+        original_decoder = review_codec.decode_semantic_review_result
+        repeated_decodes = []
+
+        def observe_decode(value):
+            repeated_decodes.append(value)
+            return original_decoder(value)
+
+        monkeypatch.setattr(review_codec, "decode_semantic_review_result", observe_decode)
+        assert review_codec.decode_semantic_review_result(encoded) == retained_review
+        assert repeated_decodes == [encoded]
+        repeated_decodes.clear()
+        request = prepare_semantic_advisor_request(**changed_inputs)
+        assert repeated_decodes == []
+        request.verify()
+        document_text = request.prepared.evidence.messages[-1]["content"]
+        assert type(document_text) is str
+        document = json.loads(document_text)
+        expected = json.loads(encoded)
+        expected["llm_calls"] = [call.to_dict()]
+        assert document["review_result"] == expected
+        assert document["review_result"]["tool_invocations"] == json.loads(encoded)["tool_invocations"]
+        (public_call,) = document["review_result"]["llm_calls"]
+        assert public_call["call_id"] == original_call.call_id
+        assert public_call["status"] == original_call.status.value
+        assert {"private_request", "private_diagnostics", "private_failure"}.isdisjoint(public_call)
+        assert "PRIVATE_REVIEW_CONTEXT" not in document_text
+        assert document["review_result"]["message"] == message
+        guarded, supported = _guard_data(request)
+        assert guarded.role == "advisor" and supported is (not oversized_public_message)
+        if oversized_public_message:
+            parts = request.prepared.evidence.content_parts[-1]
+            assert parts is not None and sum(part.inspection_text == message for part in parts) == 1
+        assert custodies == []
+        assert len(_checks(operation_store[0])) == baseline["checks"]
+        assert len(_ledger(operation_store[0])) == baseline["ledger"]
         coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("router", [False, True])
 async def test_semantic_call_uses_real_guard_quota_audit_and_exact_schema(operation_store, tmp_path, monkeypatch, router):
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, baseline, custodies):
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, baseline, custodies):
         if router:
             monkeypatch.setattr(inputs["owner"], "_advisor_endpoint_base_url", "https://openrouter.ai/api/v1")
         original = prepare_semantic_advisor_request(**inputs)
@@ -296,8 +502,8 @@ async def test_semantic_call_uses_real_guard_quota_audit_and_exact_schema(operat
         assert request.request_sha256 == original.request_sha256
         assert deep_thaw(request.options) == deep_thaw(original.options)
         request.verify()
-        recorder = BufferingRecorder()
-        physical, dispatched = [], []
+        recorder = inputs["runtime"].live.recorder
+        physical = []
 
         async def completion(**kwargs):
             checks = _checks(operation_store[0])
@@ -323,13 +529,10 @@ async def test_semantic_call_uses_real_guard_quota_audit_and_exact_schema(operat
             return _reply(json.dumps(_answer(request)))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        result = await run_semantic_advisor(
-            request, provider_owner=provider, recorder=recorder, timeout=5, on_provider_dispatch=lambda: dispatched.append(True)
-        )
-        assert len(physical) == len(dispatched) == len(recorder.llm_calls) == 1
+        result = await _run_case(baseline["phases"], monkeypatch)
+        assert len(physical) == 1 and len(recorder.llm_calls) == baseline["recorder"] + 1
         assert len(_ledger(operation_store[0])) == baseline["ledger"] + 1
-        assert result.source is request.source and result.request_sha256 == request.request_sha256
-        assert result.audit_call is recorder.llm_calls[0]
+        assert result.audit_call == recorder.llm_calls[-1]
         assert result.decision.decision_id == result.audit_call.call_id == physical[0].attempt_id
         assert result.audit_call.status is ComposerLLMCallStatus.SUCCESS
         assert custodies[0].attempt is custodies[0].call is None
@@ -340,7 +543,7 @@ async def test_semantic_call_uses_real_guard_quota_audit_and_exact_schema(operat
 
 @pytest.mark.asyncio
 async def test_semantic_result_retains_exact_original_response_and_physical_audit(operation_store, tmp_path, monkeypatch):
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, _custodies):
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, baseline, _custodies):
         request = prepare_semantic_advisor_request(**inputs)
         original = "\n" + json.dumps(_answer(request), indent=2, ensure_ascii=False) + "\n"
 
@@ -348,14 +551,14 @@ async def test_semantic_result_retains_exact_original_response_and_physical_audi
             return _reply(original)
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        recorder = BufferingRecorder()
-        result = await run_semantic_advisor(request, provider_owner=provider, recorder=recorder, timeout=5)
+        recorder = inputs["runtime"].live.recorder
+        result = await _run_case(baseline["phases"], monkeypatch)
         assert result.response.reference.codec == "composer.response.v1"
         retained = decode_continuation_response(result.response)
         assert retained.message.content == original
         assert json.loads(original).get("decision_id") is None
         assert decode_retained_physical_audit_call(result.response) == result.audit_call
-        assert result.audit_call is recorder.llm_calls[0]
+        assert result.audit_call == recorder.llm_calls[-1]
         assert len(_ledger(operation_store[0])) == baseline["ledger"] + 1
         coordinator.assert_completed()
 
@@ -365,18 +568,27 @@ async def test_semantic_result_retains_exact_original_response_and_physical_audi
     "body", ["not JSON", '{"schema_version":"composer.continuation-decision.v1","decision":"CONTINUE","decision":"STOP_CONFIRMED"}']
 )
 async def test_invalid_semantic_decision_is_malformed_actual_audit(operation_store, tmp_path, monkeypatch, body):
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, custodies):
-        request = prepare_semantic_advisor_request(**inputs)
-        recorder = BufferingRecorder()
+    from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationV4Finalized
+    from elspeth.web.composer.continuation_semantic_advisor_phase import SemanticAdvisorPaidInvalidTerminal
+
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, baseline, custodies):
+        recorder = inputs["runtime"].live.recorder
 
         async def completion(**kwargs):
             return _reply(body)
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        with pytest.raises(_MalformedLLMResponseError):
-            await run_semantic_advisor(request, provider_owner=provider, recorder=recorder, timeout=5)
-        assert len(recorder.llm_calls) == 1 and len(_ledger(operation_store[0])) == baseline["ledger"] + 1
-        assert recorder.llm_calls[0].status is ComposerLLMCallStatus.MALFORMED_RESPONSE
+        outcome, terminal, error, _request = await _observe_case(baseline["phases"], monkeypatch)
+        assert type(outcome) is SemanticAdvisorInvocationV4Finalized and error is None
+        assert type(terminal) is SemanticAdvisorPaidInvalidTerminal
+        paid = outcome.finalization.result
+        assert terminal.paid is paid and paid.outcome == "paid_invalid"
+        assert isinstance(paid.original_error, _MalformedLLMResponseError)
+        assert terminal.original_error is paid.original_error is outcome.observation.original_failure
+        assert paid.decision is None and decode_continuation_response(paid.response).message.content == body
+        assert len(recorder.llm_calls) == baseline["recorder"] + 1
+        assert len(_ledger(operation_store[0])) == baseline["ledger"] + 1
+        assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.MALFORMED_RESPONSE
         assert custodies[0].attempt is custodies[0].call is None
         coordinator.assert_completed()
 
@@ -397,7 +609,7 @@ async def test_semantic_advisor_preserves_actual_cost_cap_and_completion_clip(op
         before = budget.snapshot()
         assert before.policy.max_provider_calls == 2 and before.policy.max_completion_tokens == 23
         request = prepare_semantic_advisor_request(**inputs)
-        recorder, physical = BufferingRecorder(), []
+        recorder, physical = inputs["runtime"].live.recorder, []
 
         async def completion(**kwargs):
             physical.append(kwargs)
@@ -405,24 +617,26 @@ async def test_semantic_advisor_preserves_actual_cost_cap_and_completion_clip(op
             return _reply(json.dumps(_answer(request)))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        result = await run_semantic_advisor(request, provider_owner=provider, recorder=recorder, timeout=5)
+        result = await _run_case(baseline["phases"], monkeypatch)
         assert result.audit_call.max_completion_tokens_requested == 23
         assert result.audit_call.provider_cost == 0.01
         assert budget.snapshot().physical_calls == before.physical_calls + 1
         assert len(budget.snapshot().charges) == len(before.charges) + 1
         assert budget.snapshot().charges[-1].response_accountable is True
         with pytest.raises(CommonProviderCostRefused, match="PROVIDER_CALLS_EXHAUSTED"):
-            await run_semantic_advisor(prepare_semantic_advisor_request(**inputs), provider_owner=provider, recorder=recorder, timeout=5)
-        assert len(physical) == len(recorder.llm_calls) == 1
+            budget.require_dispatch()
+        assert len(physical) == 1 and len(recorder.llm_calls) == baseline["recorder"] + 1
         assert len(_ledger(operation_store[0])) == baseline["ledger"] + 1
         coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
 async def test_semantic_cancellation_keeps_original_and_one_cancelled_audit(operation_store, tmp_path, monkeypatch):
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, custodies):
-        request = prepare_semantic_advisor_request(**inputs)
-        recorder, entered, pending, originals = BufferingRecorder(), asyncio.Event(), asyncio.Event(), []
+    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
+    from tests.unit.web.composer.test_continuation_semantic_advisor_outcome import _contains_original
+
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, baseline, custodies):
+        recorder, entered, pending, originals = inputs["runtime"].live.recorder, asyncio.Event(), asyncio.Event(), []
 
         async def completion(**kwargs):
             entered.set()
@@ -433,17 +647,25 @@ async def test_semantic_cancellation_keeps_original_and_one_cancelled_audit(oper
                 raise
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        task = asyncio.create_task(run_semantic_advisor(request, provider_owner=provider, recorder=recorder, timeout=5))
+        task = asyncio.create_task(_observe_case(baseline["phases"], monkeypatch))
         await asyncio.wait_for(entered.wait(), timeout=5)
         task.cancel("original semantic cancellation")
-        with pytest.raises(asyncio.CancelledError) as caught:
-            await task
+        outcome, terminal, error, _request = await task
         # wait_for cancels its separate SDK child; retain the owner's actual
         # original cancellation, rather than requiring both Tasks' objects to
         # have the same identity.
-        assert len(originals) == 1 and caught.value.args == ("original semantic cancellation",) and task.cancelling() == 1
-        assert len(recorder.llm_calls) == 1 and len(_ledger(operation_store[0])) == baseline["ledger"] + 1
-        assert recorder.llm_calls[0].status is ComposerLLMCallStatus.CANCELLED
+        assert len(originals) == 1 and task.cancelling() == 1
+        assert isinstance(outcome.observation.original_failure, asyncio.CancelledError)
+        assert outcome.observation.original_failure.args == ("original semantic cancellation",)
+        assert error is None and type(terminal) in (SdkTerminalResult, SdkTerminalFailure)
+        if type(terminal) is SdkTerminalFailure:
+            assert terminal.original is outcome.error and _contains_original(outcome.error, outcome.observation.original_failure)
+        else:
+            assert outcome.error.__cause__ is outcome.observation.original_failure
+        assert terminal.verified.hold_state == "consumed"
+        assert terminal.verified.provider_attempt_id == outcome.observation.attempt.attempt_id
+        assert len(recorder.llm_calls) == baseline["recorder"] + 1 and len(_ledger(operation_store[0])) == baseline["ledger"] + 1
+        assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.CANCELLED
         assert custodies[0].attempt is custodies[0].call is None
         coordinator.assert_completed()
 
@@ -518,9 +740,8 @@ async def test_semantic_advisor_refuses_distinct_actual_service_before_quota_or_
         monkeypatch.setattr(litellm, "acompletion", completion)
         try:
             foreign = ProviderInvocationOwner(service=foreign_service, required_work=provider.required_work)
-            changed = replace(request, provider_owner=foreign)
             with pytest.raises(AuditIntegrityError, match="another exact service"):
-                await run_semantic_advisor(changed, provider_owner=foreign, recorder=BufferingRecorder(), timeout=5)
+                inputs["owner"]._new_advisor_custody(foreign)
             assert calls == [] and custodies == []
             assert len(_ledger(operation_store[0])) == baseline["ledger"]
             assert len(_checks(operation_store[0])) == baseline["checks"]
@@ -531,7 +752,7 @@ async def test_semantic_advisor_refuses_distinct_actual_service_before_quota_or_
 
 @pytest.mark.asyncio
 async def test_semantic_guard_refusal_keeps_original_owned_audit_without_sdk_or_attachment(operation_store, tmp_path, monkeypatch):
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, _context, coordinator, baseline, custodies):
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, baseline, custodies):
         owner = inputs["owner"]
         configuration = owner._settings.composer_advisor_prompt_guard
         assert configuration is not None
@@ -569,12 +790,12 @@ async def test_semantic_guard_refusal_keeps_original_owned_audit_without_sdk_or_
 
         monkeypatch.setattr(provider_gateway, "enforce_prompt_guard", observe_guard)
         monkeypatch.setattr(litellm, "acompletion", completion)
-        recorder = BufferingRecorder()
+        recorder = inputs["runtime"].live.recorder
         with pytest.raises(PromptGuardRefused) as caught:
-            await run_semantic_advisor(request, provider_owner=provider, recorder=recorder, timeout=5)
+            await _run_case(baseline["phases"], monkeypatch)
         assert len(originals) == 1 and caught.value is originals[0]
         assert guard_requests and caught.value.disposition == "blocked"
-        assert caught.value.llm_calls == () and recorder.llm_calls == ()
+        assert caught.value.llm_calls == () and len(recorder.llm_calls) == baseline["recorder"]
         assert sdk == [] and custodies[0].attempt is None
         checks = _checks(operation_store[0])
         assert len(checks) == baseline["checks"] + 1

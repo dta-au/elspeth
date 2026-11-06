@@ -23,9 +23,6 @@ from elspeth.web.composer.continuation_env_inventory import (
 from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, TurnEvidenceSnapshot
 from elspeth.web.composer.continuation_iteration import ContinuationIterationSnapshot, decode_continuation_iteration
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicy,
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -48,14 +45,16 @@ class ContinuationRuntimeSource:
     original: ContinuationBootstrapValues
     iteration: ContinuationIterationSnapshot
     evidence: TurnEvidenceSnapshot
-    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4
-    cost_snapshot: CommonProviderCostSnapshot | None
+    policy: ContinuationAdmissionPolicyV4
+    cost_snapshot: CommonProviderCostSnapshot
     timing: ContinuationTimingObservation
     admitted_evidence: AdmittedTurnEvidence = field(compare=False)
     attachments: ContinuationAttachmentHistory
     evidence_env_ref_names: frozenset[str] = field(init=False)
 
     def __post_init__(self) -> None:
+        if type(self.policy) is not ContinuationAdmissionPolicyV4 or type(self.cost_snapshot) is not CommonProviderCostSnapshot:
+            raise AuditIntegrityError("runtime source requires its current V4 policy and complete cost source")
         if type(self.admitted_evidence) is not AdmittedTurnEvidence or self.admitted_evidence.snapshot is not self.evidence:
             raise AuditIntegrityError("runtime source changed its resolved original evidence cohort")
         if type(self.attachments) is not ContinuationAttachmentHistory or (self.attachments.session_id, self.attachments.operation_id) != (
@@ -82,6 +81,7 @@ def read_runtime_source_on_connection(
     *,
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
+    _prior_evidence: AdmittedTurnEvidence | None = None,
 ) -> ContinuationRuntimeSource:
     if (
         type(running) is not ComposerOperationRunning
@@ -112,7 +112,7 @@ def read_runtime_source_on_connection(
     # checks. A pending attachment is proved by the actual attachment SQL owner
     # inside this current evidence boundary before its original graph restores.
     # No historical authorization class or second bootstrap grant.
-    inputs = _read_current_inputs(conn, selected=selected, inventory=inventory)
+    inputs = _read_current_inputs(conn, selected=selected, inventory=inventory, _prior_evidence=_prior_evidence)
     return _runtime_source_from_inputs_on_connection(conn, running, selected=selected, inventory=inventory, inputs=inputs)
 
 
@@ -186,13 +186,7 @@ def _runtime_source_from_inputs_on_connection(
     if iteration.producer_inputs != inputs.producer_inputs:
         raise AuditIntegrityError("runtime iteration differs from its actual current message inputs")
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
-    pending_end_names = (
-        inventory.names
-        if type(policy) is ContinuationAdmissionPolicyV4
-        and type(selected.stack.frames[-1]) is EndFrame
-        and selected.stack.pending_settlement_ids
-        else None
-    )
+    pending_end_names = inventory.names if type(selected.stack.frames[-1]) is EndFrame and selected.stack.pending_settlement_ids else None
     cost_snapshot = read_continuation_cost_snapshot_on_connection(conn, selected.stack, pending_end_owed_names=pending_end_names)
     segment = conn.execute(
         select(segments).where(

@@ -20,9 +20,8 @@ from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.continuation import ComposeFrame, EndFrame, PrivateChunkRef, ToolBatchFrame
 from elspeth.web.composer.continuation_checkpoint_end_input import (
     CapturedCheckpointEndInput,
+    _require_original_checkpoint_end_data,
     decode_checkpoint_end_input,
-    require_original_checkpoint_end_env_names,
-    require_original_checkpoint_end_snapshot,
 )
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_end_effects import end_effect_key
@@ -313,12 +312,10 @@ def prepare_v4_checkpoint_source_on_connection(
             raise AuditIntegrityError("END checkpoint cannot borrow an EARLY request input")
         if type(prepared.end_input) is not CapturedCheckpointEndInput:
             raise AuditIntegrityError("END checkpoint preparation lacks its original complete gate input")
-        end_input, gate = require_original_checkpoint_end_snapshot(
+        end_input, gate, names = _require_original_checkpoint_end_data(
             prepared.end_input, phase_source=phase, captured=prepared.captured_before
         )
-        end_env_ref_names = tuple(
-            sorted(require_original_checkpoint_end_env_names(prepared.end_input, phase_source=phase, captured=prepared.captured_before))
-        )
+        end_env_ref_names = tuple(sorted(names))
         if gate.pass_index != prepared.pass_index:
             raise AuditIntegrityError("END checkpoint preparation changed its original pass/retry source")
         if len(phase.completed_children) > 1 or gate.retry_ordinal != (1 if phase.completed_children else 0):
@@ -605,7 +602,7 @@ def require_prepared_checkpoint_source_data_on_connection(
     return early_data
 
 
-def read_unpaid_early_prepared_source_on_connection(
+def read_unpaid_checkpoint_prepared_source_on_connection(
     conn: Connection,
     *,
     session_id: UUID,
@@ -614,11 +611,11 @@ def read_unpaid_early_prepared_source_on_connection(
     sequence: int,
     generation: int,
     env_ref_names: frozenset[str],
-) -> CheckpointPreparedSource | None:
-    """Read the actual EARLY prepared-event bridge without provider authority."""
+) -> tuple[CheckpointPreparedSource, CheckpointPhaseSource] | None:
+    """Read one actual EARLY/END prepared bridge and its original phase DATA."""
     sid = str(session_id)
     if load_snapshot(conn, session_id=sid, operation_id=operation_id) != selected:
-        raise AuditIntegrityError("unpaid EARLY preparation changed its current selected head")
+        raise AuditIntegrityError("unpaid checkpoint preparation changed its current selected head")
     tag, text = _event_text(conn, sid, operation_id, selected.cursor)
     event, error = parse_json_strict(text)
     if (
@@ -627,9 +624,11 @@ def read_unpaid_early_prepared_source_on_connection(
         or type(event) is not dict
         or event.get("owner") != "composer_checkpoint_source"
         or event.get("stage") != "source_prepared"
-        or event.get("phase") != "early"
     ):
         return None
+    if event.get("phase") not in ("early", "end"):
+        raise AuditIntegrityError("unpaid checkpoint preparation has a foreign phase")
+    early = event["phase"] == "early"
     if (
         set(event)
         != {
@@ -648,19 +647,30 @@ def read_unpaid_early_prepared_source_on_connection(
             "end_input_sha256",
             "end_env_ref_names",
             "captured_root_sha256",
-            "early_input_chunk_key",
-            "early_input_sha256",
         }
-        or event["version"] != 2
-        or event["kind"] != "iteration_early"
+        | ({"early_input_chunk_key", "early_input_sha256"} if early else set())
+        or event["version"] != (2 if early else 1)
+        or event["kind"] not in (("iteration_early",) if early else ("iteration_end", "end_review"))
+        or type(event["pass_index"]) is not int
+        or event["pass_index"] < 0
+        or (early and event["pass_index"] != 0)
         or type(event["source_checkpoint_id"]) is not str
         or type(event["source_cursor"]) is not int
         or type(event["outer_effect_key"]) is not str
-        or type(event["early_input_sha256"]) is not str
-        or not is_lower_sha256_hex(event["early_input_sha256"])
-        or event["early_input_chunk_key"] != f"value:composer.checkpoint-early-input.v1:{event['early_input_sha256']}"
+        or type(event["end_env_ref_names"]) is not list
+        or any(type(name) is not str or not name for name in event["end_env_ref_names"])
+        or event["end_env_ref_names"] != sorted(set(event["end_env_ref_names"]))
+        or (early and event["end_env_ref_names"] != [])
+        or (not early and event["end_env_ref_names"] != sorted(env_ref_names))
     ):
-        raise AuditIntegrityError("unpaid EARLY lost its complete prepared-source event")
+        raise AuditIntegrityError("unpaid checkpoint lost its complete prepared-source event")
+    input_key = event["early_input_chunk_key"] if early else event["end_input_chunk_key"]
+    input_digest = event["early_input_sha256"] if early else event["end_input_sha256"]
+    codec: Literal["composer.checkpoint-early-input.v1", "composer.checkpoint-end-input.v1"] = (
+        "composer.checkpoint-early-input.v1" if early else "composer.checkpoint-end-input.v1"
+    )
+    if type(input_digest) is not str or not is_lower_sha256_hex(input_digest) or input_key != f"value:{codec}:{input_digest}":
+        raise AuditIntegrityError("unpaid checkpoint preparation changed its original input reference")
     original_row = conn.execute(
         select(checkpoints).where(
             checkpoints.c.session_id == sid,
@@ -669,7 +679,7 @@ def read_unpaid_early_prepared_source_on_connection(
         )
     ).one_or_none()
     if original_row is None or original_row.cursor != event["source_cursor"]:
-        raise AuditIntegrityError("unpaid EARLY preparation lost its actual original checkpoint")
+        raise AuditIntegrityError("unpaid checkpoint preparation lost its actual original checkpoint")
     origin = StoredContinuationSnapshot(
         read_chunk(conn, session_id=sid, operation_id=operation_id, key=original_row.snapshot_chunk_key).decode("utf-8", errors="strict"),
         original_row.cursor,
@@ -679,25 +689,35 @@ def read_unpaid_early_prepared_source_on_connection(
         select(chunks.c.codec, chunks.c.byte_length).where(
             chunks.c.session_id == sid,
             chunks.c.operation_id == operation_id,
-            chunks.c.chunk_key == event["early_input_chunk_key"],
+            chunks.c.chunk_key == input_key,
         )
     ).one_or_none()
-    if chunk is None or chunk.codec != "composer.checkpoint-early-input.v1":
-        raise AuditIntegrityError("unpaid EARLY preparation lost its retained original input")
-    reference = PrivateChunkRef(
-        codec="composer.checkpoint-early-input.v1", digest=event["early_input_sha256"], byte_length=chunk.byte_length
-    )
-    source = CheckpointPreparedSource(origin, selected, "early", "iteration_early", event["outer_effect_key"], 0, None, (), reference)
+    if chunk is None or chunk.codec != codec:
+        raise AuditIntegrityError("unpaid checkpoint preparation lost its retained original input")
+    reference = PrivateChunkRef(codec=codec, digest=input_digest, byte_length=chunk.byte_length)
+    if early:
+        source = CheckpointPreparedSource(origin, selected, "early", "iteration_early", event["outer_effect_key"], 0, None, (), reference)
+    else:
+        source = CheckpointPreparedSource(
+            origin,
+            selected,
+            "end",
+            "iteration_end" if event["kind"] == "iteration_end" else "end_review",
+            event["outer_effect_key"],
+            event["pass_index"],
+            reference,
+            tuple(event["end_env_ref_names"]),
+        )
     phase = _initial_phase_source(conn, session_id=session_id, operation_id=operation_id, selected=origin)
     if (
         phase is None
-        or phase.phase != "early"
-        or phase.kind != "iteration_early"
+        or phase.phase != source.phase
+        or phase.kind != source.kind
         or phase.current != origin
         or phase.outer_effect_key != source.outer_effect_key
         or len(phase.completed_children) not in (0, 1)
     ):
-        raise AuditIntegrityError("unpaid EARLY preparation lost its original stage or exact retry child")
+        raise AuditIntegrityError("unpaid checkpoint preparation lost its original phase or exact retry child")
     early_data = require_prepared_checkpoint_source_data_on_connection(
         conn,
         source=source,
@@ -707,14 +727,14 @@ def read_unpaid_early_prepared_source_on_connection(
         generation=generation,
         retry_ordinal=len(phase.completed_children),
     )
-    if (
+    if early and (
         early_data is None
         or early_data.env_ref_names != tuple(sorted(env_ref_names))
         or early_data.retry_ordinal != len(phase.completed_children)
     ):
         raise AuditIntegrityError("unpaid EARLY preparation changed its actual environment or retry lineage")
     _effect_inventory(conn, sid, operation_id, selected)
-    return source
+    return source, phase
 
 
 def admit_v4_checkpoint_provider_on_connection(

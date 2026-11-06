@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage, _AdmittedLLMProviderMetadata
+from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage, _AdmittedLLMProviderMetadata, _AdmittedToolCall
 from elspeth.web.composer.advisor_output import ContinuationAdvisorDecision
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation_advisor import ContinuationAdvisorInvocation
@@ -23,7 +23,7 @@ from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
 from elspeth.web.required_work import RequiredWorkTicket
 
 if TYPE_CHECKING:
-    from elspeth.web.composer.continuation_semantic_advisor import PreparedSemanticAdvisorRequest, SemanticAdvisorResult
+    from elspeth.web.composer.continuation_semantic_advisor import PreparedSemanticAdvisorRequest
     from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
     from elspeth.web.composer.continuation_semantic_observation import SemanticProviderResponseObservation
     from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
@@ -43,6 +43,7 @@ class SemanticAdvisorInvocationObservation:
     provider_metadata: _AdmittedLLMProviderMetadata | None
     # Raw SDK tool objects are not admitted or retained by this observer.
     tool_calls_present: bool | None
+    admitted_tool_calls: tuple[_AdmittedToolCall, ...] | None
     decision: ContinuationAdvisorDecision | None
     attempt: ProviderAttempt | None
     audit_call: ComposerLLMCall | None
@@ -51,12 +52,6 @@ class SemanticAdvisorInvocationObservation:
     # The body failure precedes audit/settlement. When no body failed, the
     # observer preserves the actual outward error here as well as on Raised.
     original_failure: BaseException | None = field(repr=False, compare=False)
-
-
-@dataclass(frozen=True, slots=True)
-class SemanticAdvisorInvocationReturned:
-    result: SemanticAdvisorResult
-    observation: SemanticAdvisorInvocationObservation
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +74,7 @@ class _SemanticAdvisorInvocationCapture:
     message: _AdmittedAssistantMessage | None = None
     provider_metadata: _AdmittedLLMProviderMetadata | None = None
     tool_calls_present: bool | None = None
+    admitted_tool_calls: tuple[_AdmittedToolCall, ...] | None = None
     decision: ContinuationAdvisorDecision | None = None
     attempt: ProviderAttempt | None = None
     audit_call: ComposerLLMCall | None = None
@@ -93,6 +89,7 @@ class _SemanticAdvisorInvocationCapture:
             message=self.message,
             provider_metadata=self.provider_metadata,
             tool_calls_present=self.tool_calls_present,
+            admitted_tool_calls=self.admitted_tool_calls,
             decision=self.decision,
             attempt=self.attempt,
             audit_call=self.audit_call,
@@ -109,34 +106,33 @@ async def observe_semantic_advisor_invocation(
     recorder: BufferingRecorder,
     timeout: float,
     on_provider_dispatch: Callable[[], None] | None = None,
-    no_sdk_issuer: SemanticAdvisorNoSdkIssuer | None = None,
-    v4_prepared: PreparedContinuationProvider | None = None,
-    v4_env_ref_names: frozenset[str] | None = None,
+    no_sdk_issuer: SemanticAdvisorNoSdkIssuer,
+    v4_prepared: PreparedContinuationProvider,
+    v4_env_ref_names: frozenset[str],
     v4_finalizer: Callable[
         [SemanticProviderResponseObservation, RequiredWorkTicket],
         Awaitable[RequiredSQLFinishOnce[SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal]],
-    ]
-    | None = None,
+    ],
     v4_incomplete_finalizer: Callable[
         [V4ProviderResultIncomplete, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]]
-    ]
-    | None = None,
-    v4_sdk_finalizer: Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]]
-    | None = None,
-) -> SemanticAdvisorInvocationReturned | SemanticAdvisorInvocationRaised | SemanticAdvisorInvocationV4Finalized:
+    ],
+    v4_sdk_finalizer: Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]],
+) -> SemanticAdvisorInvocationRaised | SemanticAdvisorInvocationV4Finalized:
     """Observe one original throwing invocation, including paid invalid output.
 
     A raised outcome preserves the original body error separately from the
     actual outward error, which may include required audit/settlement or
     deferred cancellation failures. Catching it does not clear cancellation.
-    The existing throwing invocation remains unchanged for its callers.
+    A finalized paid-invalid result retains its original malformed body error.
     """
     from elspeth.web.composer.continuation_semantic_advisor import PreparedSemanticAdvisorRequest, run_semantic_advisor
+    from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
 
     if (
         type(request) is not PreparedSemanticAdvisorRequest
         or type(provider_owner) is not ProviderInvocationOwner
         or type(recorder) is not BufferingRecorder
+        or type(no_sdk_issuer) is not SemanticAdvisorNoSdkIssuer
     ):
         raise TypeError("Semantic Advisor observation requires its actual live owners")
     capture = _SemanticAdvisorInvocationCapture(request.source, request.request_sha256)
@@ -159,35 +155,18 @@ async def observe_semantic_advisor_invocation(
         if capture.original_failure is None:
             capture.original_failure = error
         raised = SemanticAdvisorInvocationRaised(capture.snapshot(), error)
-        if no_sdk_issuer is not None:
-            no_sdk_issuer.seal_original_outcome(capture, raised)
+        no_sdk_issuer.seal_original_outcome(capture, raised)
         return raised
-    if isinstance(result, SemanticV4Finalization):
-        if (
-            capture.source is not request.source
-            or capture.request_sha256 != request.request_sha256
-            or not capture.sdk_entered
-            or not capture.recorder_completed
-            or capture.audit_call is None
-            or capture.decision is None
-            or capture.attempt is None
-            or capture.original_failure is not None
-        ):
-            raise AuditIntegrityError("V4 semantic finalization lost its original successful physical observation")
-        finalized = SemanticAdvisorInvocationV4Finalized(result, capture.snapshot())
-        if no_sdk_issuer is None:
-            raise AuditIntegrityError("V4 semantic finalization lost its original no-SDK issuer")
-        no_sdk_issuer.seal_v4_finalization(capture, finalized)
-        return finalized
     if (
-        result.source is not capture.source
-        or result.request_sha256 != capture.request_sha256
-        or result.decision is not capture.decision
-        or result.audit_call is not capture.audit_call
+        type(result) is not SemanticV4Finalization
+        or capture.source is not request.source
+        or capture.request_sha256 != request.request_sha256
+        or not capture.sdk_entered
         or not capture.recorder_completed
+        or capture.audit_call is None
+        or capture.attempt is None
     ):
-        raise AuditIntegrityError("Semantic Advisor observation lost its original successful result")
-    returned = SemanticAdvisorInvocationReturned(result, capture.snapshot())
-    if no_sdk_issuer is not None:
-        no_sdk_issuer.seal_original_outcome(capture, returned)
-    return returned
+        raise AuditIntegrityError("V4 semantic finalization lost its original paid physical observation")
+    finalized = SemanticAdvisorInvocationV4Finalized(result, capture.snapshot())
+    no_sdk_issuer.seal_v4_finalization(capture, finalized)
+    return finalized

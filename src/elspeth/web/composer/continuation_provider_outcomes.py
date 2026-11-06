@@ -65,12 +65,43 @@ def require_successful_response_audit(
     started_at: datetime,
     finished_at: datetime,
 ) -> None:
+    if type(call) is not ComposerLLMCall or call.status is not ComposerLLMCallStatus.SUCCESS:
+        raise AuditIntegrityError("received response lacks its original successful audit")
+    _require_response_audit_fields(call, metadata, attempt_id=attempt_id, started_at=started_at, finished_at=finished_at)
+
+
+def require_malformed_response_audit(
+    call: ComposerLLMCall,
+    metadata: _AdmittedLLMProviderMetadata,
+    *,
+    attempt_id: str,
+    started_at: datetime,
+    finished_at: datetime,
+) -> None:
+    """Match a captured invalid decision to its actual unsuccessful paid audit."""
+    if (
+        type(call) is not ComposerLLMCall
+        or call.status is not ComposerLLMCallStatus.MALFORMED_RESPONSE
+        or call.error_class != "_MalformedLLMResponseError"
+        or call.error_message != "malformed_response"
+    ):
+        raise AuditIntegrityError("invalid semantic response lacks its original malformed audit")
+    _require_response_audit_fields(call, metadata, attempt_id=attempt_id, started_at=started_at, finished_at=finished_at)
+
+
+def _require_response_audit_fields(
+    call: ComposerLLMCall,
+    metadata: _AdmittedLLMProviderMetadata,
+    *,
+    attempt_id: str,
+    started_at: datetime,
+    finished_at: datetime,
+) -> None:
     if type(call) is not ComposerLLMCall or type(metadata) is not _AdmittedLLMProviderMetadata:
         raise AuditIntegrityError("received response lacks its actual complete nominal audit/metadata")
     usage = metadata.usage
     if (
-        call.status is not ComposerLLMCallStatus.SUCCESS
-        or call.call_id != attempt_id
+        call.call_id != attempt_id
         or call.started_at != started_at
         or call.finished_at != finished_at
         or (call.model_returned, call.provider_request_id, call.finish_reason, call.provider_served)

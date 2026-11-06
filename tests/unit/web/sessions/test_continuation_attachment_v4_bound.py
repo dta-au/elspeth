@@ -11,7 +11,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_attachment_read import read_current_attachment
 from elspeth.web.composer.continuation_codec import encode_private_chunk
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v3_from_settings, continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.continuation_attachment_v4_bound import (
     V4AttachmentReadBound,
@@ -29,9 +29,9 @@ from tests.unit.web.sessions.test_continuation_attachment_read import read_case
 operation_store = operations.operation_store
 
 
-async def _case(operation_store, monkeypatch, raw, *, legacy=False):
+async def _case(operation_store, monkeypatch, raw):
     settings = continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    policy = continuation_policy_v3_from_settings(settings) if legacy else continuation_policy_v4_from_settings(settings)
+    policy = continuation_policy_from_settings(settings)
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -58,11 +58,10 @@ def _bound(store, kwargs, *, tool_name=None, arguments_json=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("legacy", (False, True), ids=("v4", "v3"))
 @pytest.mark.parametrize("tool", ("get_blob_content", "read_attachment"))
-async def test_original_selector_presence_preserves_v3_content_and_v4_bound_bytes(operation_store, monkeypatch, legacy, tool):
+async def test_original_selector_presence_preserves_content_and_bound_bytes(operation_store, monkeypatch, tool):
     raw = 'Original "quoted" content and é🙂'.encode()
-    store, kwargs, _path, _actors = await _case(operation_store, monkeypatch, raw, legacy=legacy)
+    store, kwargs, _path, _actors = await _case(operation_store, monkeypatch, raw)
     kwargs["tool_name"] = tool
     blob_id = kwargs["arguments"]["blob_id"]
     variants = [{"blob_id": blob_id}, {"blob_id": blob_id, "expected_content_hash": None}]
@@ -77,10 +76,9 @@ async def test_original_selector_presence_preserves_v3_content_and_v4_bound_byte
     for arguments in variants:
         kwargs["arguments"] = arguments
         expected = canonical_json(arguments)
-        if not legacy:
-            bound = _bound(store, kwargs)
-            assert type(bound) is V4AttachmentReadBound
-            assert bound.arguments_json == expected
+        bound = _bound(store, kwargs)
+        assert type(bound) is V4AttachmentReadBound
+        assert bound.arguments_json == expected
         actual = await read_current_attachment(**kwargs)
         assert actual.result.success and actual.result.updated_state is kwargs["state"]
         assert actual.result.data is not None and actual.result.data["content"] == raw.decode()

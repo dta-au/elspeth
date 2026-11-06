@@ -10,12 +10,10 @@ from sqlalchemy import select
 from elspeth.web.composer import continuation_primary as primary_module
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors
 from elspeth.web.composer.continuation_codec import measure_continuation_response_size
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_provider_outcomes import measure_physical_audit_call_size
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationOwner
-from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, PrimaryPaidOverflowTerminal, PrimaryProviderResult
 from elspeth.web.sessions.continuation_primary_paid_overflow_terminal import read_v4_primary_paid_overflow_terminal_on_connection
 from elspeth.web.sessions.continuation_retained_capacity import _live_provider_hold_bytes, load_continuation_read_contract
@@ -24,32 +22,17 @@ from elspeth.web.sessions.models import composer_continuation_effects_table as e
 from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
-from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.coordination import test_composer_operation_authority
-from tests.unit.web.sessions import test_continuation_cold_restore as cold_restore
 from tests.unit.web.sessions.test_continuation_primary_result import primary_input
 from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST
 
 operation_store = test_composer_operation_authority.operation_store
 
 
-async def _v4_primary_input(store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
-    assert policy is not None
-    authority = ComposerAsyncOperationAuthority(
-        store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
-    )
-    monkeypatch.setattr(cold_restore, "minimal_continuation_policy", lambda: policy)
-    v4_store = (store[0], store[1], authority, store[3], store[4])
-    kwargs, produced, recorder, _requests = await primary_input(v4_store, tmp_path, monkeypatch)
-    return kwargs, produced, recorder, v4_store
-
-
 @pytest.mark.asyncio
 async def test_v4_primary_complete_is_one_admitted_physical_audit_ledger_and_consumed_hold(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     running = kwargs["inventory"].running
     sdk = []
 
@@ -100,7 +83,8 @@ async def test_v4_primary_complete_is_one_admitted_physical_audit_ledger_and_con
 
 @pytest.mark.asyncio
 async def test_v4_primary_unentered_attempt_cancels_zero_use_and_closes_h_without_sdk(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     sdk = []
 
     async def completion(**_sdk_kwargs):
@@ -145,7 +129,8 @@ async def test_v4_primary_unentered_attempt_cancels_zero_use_and_closes_h_withou
 
 @pytest.mark.asyncio
 async def test_v4_primary_oversized_actual_response_is_one_cold_paid_terminal_without_retry(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     running = kwargs["inventory"].running
     sdk = []
     measured = []

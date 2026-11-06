@@ -11,10 +11,16 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
 from elspeth.web.coordination.quota_authority import ProviderAttempt
-from elspeth.web.sessions.continuation import PreparedContinuationProvider, load_snapshot
+from elspeth.web.sessions.continuation import PreparedContinuationProvider, StoredContinuationSnapshot, _effect_snapshot, load_snapshot
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
 from elspeth.web.sessions.continuation_retained_capacity import _require_historical_hold_source, _require_hold_fields
-from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission, _descriptor_data, _effect_data
+from elspeth.web.sessions.continuation_semantic_advisor import (
+    V4SemanticProviderAdmission,
+    _advisor,
+    _descriptor_data,
+    _effect_data,
+    _historical_snapshot,
+)
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_tail import (
     prepare_semantic_paid_incomplete_tail_plan,
 )
@@ -52,14 +58,9 @@ def read_v4_semantic_admission_on_connection(
     candidate = issuer.original_v4_dispatched_candidate(prepared)
     if candidate is None:
         raise AuditIntegrityError("V4 semantic cold admission lacks its in-transaction original head candidate")
-    contract = _require_historical_hold_source(conn, source)
-    hold = _require_hold_fields(conn, source=source, contract=contract)
-    admitted = load_snapshot(conn, session_id=sid, operation_id=operation)
-    if admitted != candidate:
-        raise AuditIntegrityError("V4 semantic cold admission changed its original head bytes or cursor")
-    root = decode_continuation_snapshot(admitted.payload_json)
-    effect = _effect_data(conn, sid, operation, root, effect_key)
-    _descriptor, _invocation, physical_input = _descriptor_data(conn, sid, operation, effect)
+    result = require_v4_semantic_admission_data_on_connection(
+        conn, session_id=sid, operation_id=operation, selected=candidate, effect_key=effect_key
+    )
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
     segment = conn.execute(
         select(segments).where(
@@ -74,25 +75,8 @@ def read_v4_semantic_admission_on_connection(
             history_table.c.generation == source.creator_generation,
         )
     ).one()
-    if type(effect.provider_attempt_id) is not str:
-        raise AuditIntegrityError("V4 semantic cold admission lost original physical attempt locator")
-    attempt_row = conn.execute(select(physical).where(physical.c.attempt_id == effect.provider_attempt_id)).one_or_none()
-    principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one()
     if (
-        effect_row is None
-        or effect != effect_row
-        or effect.disposition != "dispatched"
-        or effect.owner != "provider"
-        or effect.input_sha256 != binding.input_sha256
-        or effect.requested_model != physical_input.options["model"]
-        or effect.receipt_key is not None
-        or effect.result_chunk_key is not None
-        or effect.response_finished_at is not None
-        or effect.creator_sequence != source.creator_sequence
-        or effect.creator_generation != source.creator_generation
-        or hold.state != "active"
-        or hold.provider_attempt_id != effect.provider_attempt_id
-        or source.source_checkpoint_id != prepared.snapshot.checkpoint_id
+        source.source_checkpoint_id != prepared.snapshot.checkpoint_id
         or source.source_cursor != prepared.snapshot.cursor
         or source.source_snapshot_sha256 != sha256(prepared.snapshot.payload_json.encode("utf-8")).hexdigest()
         or source.source_input_sha256 != binding.input_sha256
@@ -103,12 +87,89 @@ def read_v4_semantic_admission_on_connection(
         or parent.current_segment_sequence != source.creator_sequence
         or parent.ownership_generation != source.creator_generation
         or parent.attempt != source.claim_attempt
-        or parent.checkpoint_id != admitted.checkpoint_id
-        or parent.journal_cursor != admitted.cursor
         or segment.state != "running"
         or segment.generation != source.creator_generation
-        or history.claim_attempt != source.claim_attempt
         or history.revoked_at is not None
+    ):
+        raise AuditIntegrityError("V4 semantic cold admission changed its original prepared source or claim")
+    return result
+
+
+def require_v4_semantic_admission_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    selected: StoredContinuationSnapshot,
+    effect_key: str,
+) -> V4SemanticProviderAdmission:
+    """Prove persisted admitted DATA, without SDK entry, retry or live issuer authority."""
+    sid, operation = session_id, operation_id
+    source = _stored_hold_source(conn, session_id=sid, operation_id=operation, effect_key=effect_key)
+    if source is None:
+        raise AuditIntegrityError("V4 semantic dispatched source lacks its original H")
+    contract = _require_historical_hold_source(conn, source)
+    hold = _require_hold_fields(conn, source=source, contract=contract)
+    admitted = load_snapshot(conn, session_id=sid, operation_id=operation)
+    if admitted != selected:
+        raise AuditIntegrityError("V4 semantic cold admission changed its original head bytes or cursor")
+    prepared = _historical_snapshot(conn, sid, operation, checkpoint_id=source.source_checkpoint_id)
+    if (
+        prepared.cursor != source.source_cursor
+        or sha256(prepared.payload_json.encode("utf-8")).hexdigest() != source.source_snapshot_sha256
+    ):
+        raise AuditIntegrityError("V4 semantic admitted DATA changed its original prepared snapshot")
+    root = decode_continuation_snapshot(admitted.payload_json)
+    prepared_root = decode_continuation_snapshot(prepared.payload_json)
+    frame = _advisor(prepared_root)
+    prepared_effects = tuple(item for item in prepared_root.effect_frontier if item.effect_id == effect_key)
+    if (
+        frame.phase != "awaiting_response"
+        or frame.provider_effect_key != effect_key
+        or frame.provider_input_sha256 != source.source_input_sha256
+        or frame.response is not None
+        or len(prepared_effects) != 1
+        or prepared_effects[0].disposition != "prepared"
+        or prepared_effects[0].receipt_id is not None
+    ):
+        raise AuditIntegrityError("V4 semantic admitted DATA lost its original prepared Advisor effect")
+    expected = decode_continuation_snapshot(
+        _effect_snapshot(prepared.payload_json, effect_key=effect_key, disposition="dispatched", receipt_id=None)
+    ).model_copy(update={"cursor": prepared.cursor + 1})
+    if root != expected or admitted.cursor != expected.cursor:
+        raise AuditIntegrityError("V4 semantic admitted DATA changed its complete original dispatched root")
+    effect = _effect_data(conn, sid, operation, root, effect_key)
+    _descriptor, _invocation, physical_input = _descriptor_data(conn, sid, operation, effect)
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
+    history = conn.execute(
+        select(history_table).where(
+            history_table.c.session_id == sid,
+            history_table.c.operation_id == operation,
+            history_table.c.sequence == source.creator_sequence,
+            history_table.c.generation == source.creator_generation,
+        )
+    ).one()
+    if type(effect.provider_attempt_id) is not str:
+        raise AuditIntegrityError("V4 semantic cold admission lost original physical attempt locator")
+    attempt_row = conn.execute(select(physical).where(physical.c.attempt_id == effect.provider_attempt_id)).one_or_none()
+    principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one()
+    if (
+        effect.disposition != "dispatched"
+        or effect.owner != "provider"
+        or effect.input_sha256 != source.source_input_sha256
+        or effect.requested_model != physical_input.options["model"]
+        or effect.receipt_key is not None
+        or effect.result_chunk_key is not None
+        or effect.response_finished_at is not None
+        or effect.creator_sequence != source.creator_sequence
+        or effect.creator_generation != source.creator_generation
+        or effect.physical_sequence != source.creator_sequence
+        or effect.physical_generation != source.creator_generation
+        or hold.state != "active"
+        or hold.provider_attempt_id != effect.provider_attempt_id
+        or parent.checkpoint_id != admitted.checkpoint_id
+        or parent.journal_cursor != admitted.cursor
+        or history.claim_attempt != source.claim_attempt
         or attempt_row is None
         or (attempt_row.session_id, attempt_row.source, attempt_row.run_id, attempt_row.operation_id, attempt_row.operation_epoch)
         != (sid, "composer", None, source.session_operation_id, source.session_operation_epoch)
@@ -128,7 +189,7 @@ def read_v4_semantic_admission_on_connection(
         event_row is None
         or event_row.tag != "may_dispatch"
         or event_row.payload_chunk_key != f"event:{admitted.cursor}"
-        or admitted.cursor != prepared.snapshot.cursor + 1
+        or admitted.cursor != prepared.cursor + 1
     ):
         raise AuditIntegrityError("V4 semantic cold admission lost its exact may-dispatch event")
     from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import _bounded_bytes
@@ -149,9 +210,9 @@ def read_v4_semantic_admission_on_connection(
         source_cursor=source.source_cursor,
         source_snapshot_sha256=source.source_snapshot_sha256,
     )
-    paid_tail = prepare_semantic_paid_overflow_tail_plan(identity=identity, admitted=candidate, creator_sequence=source.creator_sequence)
+    paid_tail = prepare_semantic_paid_overflow_tail_plan(identity=identity, admitted=admitted, creator_sequence=source.creator_sequence)
     no_sdk_tail = prepare_semantic_no_sdk_tail_plan(
-        admitted=candidate,
+        admitted=admitted,
         attempt_id=effect.provider_attempt_id,
         requested_model=effect.requested_model,
         input_sha256=effect.input_sha256,
@@ -160,7 +221,7 @@ def read_v4_semantic_admission_on_connection(
         creator_generation=source.creator_generation,
     )
     incomplete_tail = prepare_semantic_paid_incomplete_tail_plan(
-        identity=paid_tail.identity, admitted=candidate, creator_sequence=source.creator_sequence
+        identity=paid_tail.identity, admitted=admitted, creator_sequence=source.creator_sequence
     )
     from elspeth.web.sessions.continuation_semantic_terminal_reservation import semantic_sdk_terminal_reservation
 
@@ -170,4 +231,4 @@ def read_v4_semantic_admission_on_connection(
     if source.reserved_bytes != reserved or source.fallback_contract_sha256 != combined_hash:
         raise AuditIntegrityError("V4 semantic cold admission changed its original combined fallback")
     attempt = ProviderAttempt(effect.provider_attempt_id, restore_utc(attempt_row.started_at))
-    return V4SemanticProviderAdmission(attempt, candidate, source, paid_tail, incomplete_tail, no_sdk_tail)
+    return V4SemanticProviderAdmission(attempt, admitted, source, paid_tail, incomplete_tail, no_sdk_tail)

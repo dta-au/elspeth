@@ -1,26 +1,15 @@
-"""Request-owned legacy Web bounds and actual common provider accounting."""
+"""Request-owned current Continuation bounds and actual provider accounting."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
-from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
-    ContinuationAdmissionPolicyV4,
-)
-
-if TYPE_CHECKING:
-    from elspeth.web.composer.protocol import ComposerSettings
-
-
-def _is_supported_lifecycle(value: object) -> bool:
-    return type(value) is int and value in (1, 2)
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 
 
 class CommonProviderCostRequest(TypedDict):
@@ -50,7 +39,7 @@ class CommonProviderCostPolicy:
     def __post_init__(self) -> None:
         for value in (self.max_provider_calls, self.max_request_bytes, self.max_completion_tokens):
             if type(value) is not int or value < 1:
-                raise ValueError("legacy provider limits require positive exact integers")
+                raise ValueError("provider limits require positive exact integers")
         if type(self.repair_budget) is not int or self.repair_budget < 0:
             raise ValueError("repair budget requires a nonnegative exact integer")
         maximum_cost = self.max_cumulative_provider_cost
@@ -80,9 +69,9 @@ class CommonProviderCostCharge:
 class CommonProviderCostSnapshot:
     session_id: str
     request_id: str
-    lifecycle_version: Literal[1, 2]
-    applicability: Literal["legacy_empty_v1", "continuation_v2", "not_applicable"]
-    policy: CommonProviderCostPolicy | None
+    lifecycle_version: Literal[2]
+    applicability: Literal["continuation_v2"]
+    policy: CommonProviderCostPolicy
     physical_calls: int = 0
     charges: tuple[CommonProviderCostCharge, ...] = ()
     refusal_code: str | None = None
@@ -90,20 +79,12 @@ class CommonProviderCostSnapshot:
     def __post_init__(self) -> None:
         if not self.session_id or not self.request_id:
             raise ValueError("cost snapshot requires original logical identity")
-        if not _is_supported_lifecycle(self.lifecycle_version):
+        if type(self.lifecycle_version) is not int or self.lifecycle_version != 2:
             raise ValueError("unsupported immutable lifecycle")
-        if self.applicability not in ("legacy_empty_v1", "continuation_v2", "not_applicable"):
+        if self.applicability != "continuation_v2":
             raise ValueError("unsupported policy applicability")
-        eligible = self.applicability != "not_applicable"
-        if eligible:
-            if type(self.policy) is not CommonProviderCostPolicy:
-                raise ValueError("policy applicability lost its exact policy")
-        elif self.policy is not None:
-            raise ValueError("not-applicable policy cannot carry foreign limits")
-        if eligible and self.lifecycle_version != 1 and self.applicability == "legacy_empty_v1":
-            raise ValueError("legacy planner policy cannot activate on v2")
-        if self.applicability == "continuation_v2" and self.lifecycle_version != 2:
-            raise ValueError("Continuation policy requires lifecycle v2")
+        if type(self.policy) is not CommonProviderCostPolicy:
+            raise ValueError("policy applicability lost its exact policy")
         if type(self.physical_calls) is not int or self.physical_calls < 0:
             raise ValueError("physical call count is invalid")
         if type(self.charges) is not tuple or any(type(c) is not CommonProviderCostCharge for c in self.charges):
@@ -150,13 +131,11 @@ class CommonProviderCostBudget:
 
     def require_supported_configuration(self) -> None:
         p = self._snapshot.policy
-        if p is not None and p.repair_budget != 2:
+        if p.repair_budget != 2:
             raise CommonProviderCostRefused("REPAIR_POLICY_UNSUPPORTED")
 
     def require_output(self) -> None:
         s = self._snapshot
-        if s.policy is None:
-            return
         if s.physical_calls != len(s.charges):
             raise AuditIntegrityError("provider output lacks settled actual calls")
         code = s.refusal_code
@@ -171,23 +150,21 @@ class CommonProviderCostBudget:
     def require_end_headroom(self) -> None:
         self.require_output()
         s = self._snapshot
-        if s.policy is not None and not s.cost_known:
+        if not s.cost_known:
             raise CommonProviderCostRefused("COST_UNAVAILABLE")
-        if s.policy is not None and s.validated_cost >= s.policy.max_cumulative_provider_cost:
+        if s.validated_cost >= s.policy.max_cumulative_provider_cost:
             raise CommonProviderCostRefused("COST_CAP_EXCEEDED")
 
     def require_dispatch(self) -> None:
         self.require_supported_configuration()
         self.require_output()
         s = self._snapshot
-        if s.policy is not None and s.physical_calls >= s.policy.max_provider_calls:
+        if s.physical_calls >= s.policy.max_provider_calls:
             raise CommonProviderCostRefused("PROVIDER_CALLS_EXHAUSTED")
 
     def prepare_request(self, kwargs: CommonProviderCostRequest) -> None:
         self.require_dispatch()
         p = self._snapshot.policy
-        if p is None:
-            return
         wire = {"messages": kwargs["messages"], "tools": kwargs["tools"] if "tools" in kwargs else []}
         if len(canonical_json(wire).encode("utf-8")) > p.max_request_bytes:
             raise CommonProviderCostRefused("REQUEST_BYTES_EXHAUSTED")
@@ -213,22 +190,22 @@ class CommonProviderCostBudget:
         if code is None and response_accountable:
             if cost is None:
                 code = "COST_UNAVAILABLE"
-            elif s.policy is not None and call.completion_tokens is None:
+            elif call.completion_tokens is None:
                 code = "MALFORMED_RESPONSE"
-            elif s.policy is not None and call.completion_tokens is not None and call.completion_tokens > s.policy.max_completion_tokens:
+            elif call.completion_tokens is not None and call.completion_tokens > s.policy.max_completion_tokens:
                 code = "COMPLETION_TOKENS_EXCEEDED"
-            elif s.policy is not None and s.validated_cost + cost > s.policy.max_cumulative_provider_cost:
+            elif s.validated_cost + cost > s.policy.max_cumulative_provider_cost:
                 code = "COST_CAP_EXCEEDED"
-            elif s.policy is not None and call.finish_reason == "length":
+            elif call.finish_reason == "length":
                 code = "RESPONSE_TRUNCATED"
         self._snapshot = replace(s, charges=charges, refusal_code=code)
 
 
 def continuation_common_cost_policy(
-    policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+    policy: ContinuationAdmissionPolicyV4,
 ) -> CommonProviderCostPolicy:
     """Materialize the existing ledger policy from one hashed admission."""
-    if type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
+    if type(policy) is not ContinuationAdmissionPolicyV4:
         raise AuditIntegrityError("Continuation cost limits require their exact admitted costed policy")
     admitted = policy.provider_cost
     return CommonProviderCostPolicy(
@@ -238,26 +215,3 @@ def continuation_common_cost_policy(
         admitted.max_cumulative_provider_cost,
         admitted.repair_budget,
     )
-
-
-def capture_common_provider_cost(
-    *,
-    session_id: str,
-    request_id: str,
-    lifecycle_version: Literal[1, 2],
-    initially_empty: bool,
-    settings: ComposerSettings,
-) -> CommonProviderCostBudget:
-    """Capture the supported legacy policy once for this logical request."""
-    if lifecycle_version == 1 and initially_empty:
-        policy = CommonProviderCostPolicy(
-            max_provider_calls=settings.composer_planner_max_provider_calls,
-            max_request_bytes=settings.composer_planner_max_request_bytes,
-            max_completion_tokens=settings.composer_planner_max_completion_tokens,
-            max_cumulative_provider_cost=settings.composer_planner_max_cumulative_provider_cost,
-            repair_budget=settings.composer_planner_repair_budget,
-        )
-        snapshot = CommonProviderCostSnapshot(session_id, request_id, lifecycle_version, "legacy_empty_v1", policy)
-    else:
-        snapshot = CommonProviderCostSnapshot(session_id, request_id, lifecycle_version, "not_applicable", None)
-    return CommonProviderCostBudget(snapshot)

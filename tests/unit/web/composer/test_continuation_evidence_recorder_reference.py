@@ -26,6 +26,69 @@ from tests.unit.web.sessions.test_continuation_live_phases import operation_stor
 operation_store = _operation_store
 
 
+def test_repeated_evidence_decode_reuses_only_exact_snapshot_and_restores_distinct_owners(monkeypatch):
+    from elspeth.web.composer import continuation_evidence as evidence_module
+
+    owner, messages, recorder, logical, _ = rich_evidence()
+    first = snapshot(owner, messages, recorder, logical)
+    source = encode_turn_evidence(first)
+    equal_text = source.canonical.encode().decode()
+    assert equal_text == source.canonical and equal_text is not source.canonical
+    equal_source = replace(source, canonical=equal_text)
+    decoded = []
+    actual_decode = evidence_module._decode_evidence_snapshot
+
+    def observe(chunk):
+        decoded.append(chunk)
+        return actual_decode(chunk)
+
+    monkeypatch.setattr(evidence_module, "_decode_evidence_snapshot", observe)
+    ordinary = decode_turn_evidence(equal_source, env_ref_names=frozenset(), source_chunks=first.dependency_chunks)
+    assert decoded == [equal_source]
+    repeated = evidence_module.AdmittedTurnEvidence(
+        equal_source, env_ref_names=frozenset(), source_chunks=first.dependency_chunks, _prior_evidence=ordinary
+    )
+    assert decoded == [equal_source]
+    assert repeated is not ordinary and repeated.snapshot is ordinary.snapshot
+    assert repeated.source_chunk is equal_source
+    assert repeated._graph_lock is not ordinary._graph_lock
+    first_graph = _restore_current_evidence(ordinary, context=CONTEXT)
+    second_graph = _restore_current_evidence(repeated, context=CONTEXT)
+    assert first_graph.evidence is not second_graph.evidence
+    assert first_graph.recorder is not second_graph.recorder
+    assert first_graph.messages is not second_graph.messages
+    assert first_graph.messages == second_graph.messages
+    first_graph.messages[-1]["content"] = "changed independent live owner"
+    assert first_graph.messages != second_graph.messages
+    with pytest.raises(AuditIntegrityError, match="transferred"):
+        ordinary.take_graph()
+    with pytest.raises(AuditIntegrityError, match="transferred"):
+        repeated.take_graph()
+
+    changed_recorder, drained = BufferingRecorder.for_continuation(decode_recorder_snapshot(first.recorder_chunk))
+    changed_recorder.record_withheld_reply("planner_prose_unadmitted", "another actual retained reply")
+    changed_audit = encode_recorder_snapshot(changed_recorder.snapshot_for_continuation(drained=drained))
+    changed_value = first.snapshot.model_copy(update={"recorder": changed_audit.reference})
+    changed = admit_turn_evidence(changed_value, env_ref_names=frozenset(), source_chunks=(changed_audit,))
+    changed_source = encode_turn_evidence(changed)
+    before = len(decoded)
+    fresh = evidence_module.AdmittedTurnEvidence(
+        changed_source, env_ref_names=frozenset(), source_chunks=(changed_audit,), _prior_evidence=ordinary
+    )
+    assert decoded[before:] == [changed_source]
+    assert fresh.snapshot == changed.snapshot and fresh.snapshot is not ordinary.snapshot
+    assert fresh.recorder_chunk is changed_audit
+    for damaged in (
+        replace(equal_source, canonical="{}"),
+        replace(equal_source, reference=equal_source.reference.model_copy(update={"byte_length": equal_source.reference.byte_length + 1})),
+        replace(equal_source, reference=equal_source.reference.model_copy(update={"codec": "composer.state.v1"})),
+    ):
+        with pytest.raises(AuditIntegrityError):
+            evidence_module.AdmittedTurnEvidence(
+                damaged, env_ref_names=frozenset(), source_chunks=first.dependency_chunks, _prior_evidence=ordinary
+            )
+
+
 def _pair_candidate(*, over=0, credential=False):
     """Real captured fields and audit; tune only the new actual recorder bytes.
 
@@ -125,6 +188,11 @@ def test_planted_credentials_refuse_on_every_read_after_the_clean_source_was_rea
             decode_turn_evidence(planted_source, env_ref_names=frozenset(), source_chunks=(planted_audit,))
         transcript_refusals.append((caught.value.surface, caught.value.finding))
     assert len(set(transcript_refusals)) == 1
+    from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
+
+    with pytest.raises(CredentialMaterialRefused) as repeated_refusal:
+        AdmittedTurnEvidence(planted_source, env_ref_names=frozenset(), source_chunks=(planted_audit,), _prior_evidence=positive)
+    assert (repeated_refusal.value.surface, repeated_refusal.value.finding) == transcript_refusals[0]
 
     secret = "postgresql://user:secret@host/db"  # secret-scan: allow-this-line
     payload = json.loads(audit.canonical)
@@ -187,6 +255,10 @@ def test_recorder_dependency_refuses_after_actual_positive(fault):
         sources = (replace(audit, canonical=audit.canonical[:-1] + " "),)
     with pytest.raises(AuditIntegrityError):
         decode_turn_evidence(evidence, env_ref_names=frozenset(), source_chunks=sources)
+    from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
+
+    with pytest.raises(AuditIntegrityError):
+        AdmittedTurnEvidence(evidence, env_ref_names=frozenset(), source_chunks=sources, _prior_evidence=positive)
 
 
 @pytest.mark.asyncio

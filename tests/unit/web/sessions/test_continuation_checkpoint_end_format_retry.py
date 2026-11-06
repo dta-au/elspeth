@@ -24,7 +24,7 @@ from elspeth.web.composer.continuation_checkpoint_end_usable import complete_v4_
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import PromptGuardMount
@@ -54,9 +54,7 @@ operation_store = test_composer_operation_authority.operation_store
 @pytest.mark.parametrize("second_malformed", [False, True], ids=("usable-second", "malformed-second"))
 @pytest.mark.asyncio
 async def test_actual_end_format_retry_settles_first_before_exact_second_call(operation_store, tmp_path, monkeypatch, second_malformed):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy

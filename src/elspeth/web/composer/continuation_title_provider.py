@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
@@ -16,13 +16,10 @@ from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import _read_current_env_names, materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_initialization import _registered, _sessions
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV3,
-    ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.continuation_title_no_sdk import TitleNoSdkIssuer, TitleNoSdkRefusalReason
-from elspeth.web.composer.continuation_title_values import capture_title_provider_result
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.provider_audit_source import provider_attempt_audit_drafts
 from elspeth.web.composer.provider_cost import CommonProviderCostRefused
@@ -44,9 +41,7 @@ from elspeth.web.sessions.auto_title_outcome import _AutoTitleCapture
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     StoredContinuationSnapshot,
-    V3UnboundedTailRefusal,
     load_snapshot,
-    refuse_v3_retained_tail_before_paid,
 )
 from elspeth.web.sessions.continuation_sdk_tail import SdkTerminalFamily
 from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult, VerifiedSdkTerminal
@@ -55,14 +50,10 @@ from elspeth.web.sessions.continuation_title_provider import (
     CurrentTitleResult,
     PreparedTitleProvider,
     TitleAuditSettlementRequest,
-    TitleNoSdkRefusal,
     _current,
     prepare_title_provider_on_connection,
     read_title_result_on_connection,
-    read_v3_title_no_sdk_refusal_on_connection,
-    refuse_v3_title_unbounded_on_connection,
     require_title_creator,
-    retain_title_response_on_connection,
 )
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.schemas import SendMessageRequest
@@ -194,7 +185,7 @@ async def prepare_current_title_provider(
     authority: ComposerAsyncOperationAuthority,
     selected: StoredContinuationSnapshot,
     required_work: RequiredWorkBinding,
-) -> PreparedTitleProvider | V3UnboundedTailRefusal:
+) -> PreparedTitleProvider:
     running = _running(required_work)
     if (
         type(service) is not ComposerServiceImpl
@@ -210,13 +201,6 @@ async def prepare_current_title_provider(
     inventory = await materialize_continuation_env_inventory(
         advisor=service._advisor_checkpoint, authority=authority, selected=current, required_work=required_work
     )
-    if type(policy) is ContinuationAdmissionPolicyV3:
-        return await _registered(
-            work=required_work,
-            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-            operation=lambda: refuse_v3_retained_tail_before_paid(authority, running, selected=current, inventory=inventory),
-            expected=V3UnboundedTailRefusal,
-        )
 
     def prepare() -> PreparedTitleProvider:
         with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
@@ -249,31 +233,11 @@ async def run_prepared_title_provider(
     if invocation_owner.required_work is not prepared.work or invocation_owner.service is not _sessions(prepared.composer):
         raise AuditIntegrityError("TITLE execution changed its actual original work/service")
     root = decode_continuation_snapshot(prepared.selected.payload_json)
-    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    if type(policy) is ContinuationAdmissionPolicyV3:
-
-        def refuse_unbounded() -> TitleNoSdkRefusal:
-            with locked_session_transaction(prepared.authority._engine, str(prepared.running.claim.session_id)) as conn:
-                cold = read_v3_title_no_sdk_refusal_on_connection(
-                    conn,
-                    session_id=prepared.running.claim.session_id,
-                    operation_id=prepared.running.claim.operation_id,
-                    expected_prepared=prepared,
-                )
-                if cold is not None:
-                    return cold
-                return refuse_v3_title_unbounded_on_connection(conn, prepared)
-
-        await _registered(
-            work=prepared.work, source=RequiredWorkSource.CONTINUATION_STATE_SQL, operation=refuse_unbounded, expected=TitleNoSdkRefusal
-        )
-        return None
+    decode_continuation_policy(root.admission_policy_json, root.policy_hash)
     custody = invocation_owner.mint(ProviderInvocationFamily.TITLE)
     custody.bind_continuation_title(prepared)
-    no_sdk_issuer: TitleNoSdkIssuer | None = None
-    if type(policy) is ContinuationAdmissionPolicyV4:
-        no_sdk_issuer = TitleNoSdkIssuer(prepared)
-        custody.bind_title_no_sdk_issuer(no_sdk_issuer)
+    no_sdk_issuer = TitleNoSdkIssuer(prepared)
+    custody.bind_title_no_sdk_issuer(no_sdk_issuer)
     settings = prepared.composer._settings
     request = prepared.request
     from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
@@ -292,40 +256,37 @@ async def run_prepared_title_provider(
             return original_request.content
 
     user = await _registered(work=prepared.work, source=RequiredWorkSource.CONTINUATION_READ_SQL, operation=original_user, expected=str)
-    if type(policy) is ContinuationAdmissionPolicyV4:
-        from elspeth.web.sessions.continuation_title_provider import V4TitleProviderAdmission
+    from elspeth.web.sessions.continuation_title_provider import V4TitleProviderAdmission
 
-        async def finish_returned_incomplete(
-            incomplete: V4ProviderResultIncomplete, sql: RequiredWorkTicket
-        ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
-            admission = custody.continuation_title_v4_admission
-            if type(incomplete) is not V4ProviderResultIncomplete or type(admission) is not V4TitleProviderAdmission:
-                raise AuditIntegrityError("V4 TITLE returned-incomplete finalizer lost its original paid admission")
-            names = await current_title_names(service=prepared.composer, running=prepared.running, work=prepared.work)
-            return await run_required_sql_finish_once(
-                sql,
-                _sessions(prepared.composer).settle_v4_title_paid_incomplete_sync,
-                prepared=prepared,
-                admission=admission,
-                incomplete=incomplete,
-                custody=custody,
-                names=names,
-            )
+    async def finish_returned_incomplete(
+        incomplete: V4ProviderResultIncomplete, sql: RequiredWorkTicket
+    ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+        admission = custody.continuation_title_v4_admission
+        if type(incomplete) is not V4ProviderResultIncomplete or type(admission) is not V4TitleProviderAdmission:
+            raise AuditIntegrityError("V4 TITLE returned-incomplete finalizer lost its original paid admission")
+        names = await current_title_names(service=prepared.composer, running=prepared.running, work=prepared.work)
+        return await run_required_sql_finish_once(
+            sql,
+            _sessions(prepared.composer).settle_v4_title_paid_incomplete_sync,
+            prepared=prepared,
+            admission=admission,
+            incomplete=incomplete,
+            custody=custody,
+            names=names,
+        )
 
-        custody.bind_v4_returned_incomplete_finalizer(finish_returned_incomplete)
+    custody.bind_v4_returned_incomplete_finalizer(finish_returned_incomplete)
 
-        async def finish_sdk(observation: V4SdkFailureObservation, sql: RequiredWorkTicket) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
-            owner = prepared.work.coordinator.sql_deadline_owner
-            if owner is not None:
-                owner.begin_settlement()
-            outcome = await _sessions(prepared.composer).finalize_v4_sdk_terminal(
-                observation=observation, custody=custody, required_work=sql
-            )
-            prepared.work.coordinator.validate_provider_settlement_sql_outcome(ticket=sql, actual_outcome=outcome)
-            return outcome
+    async def finish_sdk(observation: V4SdkFailureObservation, sql: RequiredWorkTicket) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+        owner = prepared.work.coordinator.sql_deadline_owner
+        if owner is not None:
+            owner.begin_settlement()
+        outcome = await _sessions(prepared.composer).finalize_v4_sdk_terminal(observation=observation, custody=custody, required_work=sql)
+        prepared.work.coordinator.validate_provider_settlement_sql_outcome(ticket=sql, actual_outcome=outcome)
+        return outcome
 
-        custody.bind_v4_sdk_finalizer(finish_sdk)
-    capture = _AutoTitleCapture() if type(policy) is ContinuationAdmissionPolicyV4 else None
+    custody.bind_v4_sdk_finalizer(finish_sdk)
+    capture = _AutoTitleCapture()
     try:
         await _maybe_auto_title_session_required(
             service=_sessions(prepared.composer),
@@ -350,20 +311,17 @@ async def run_prepared_title_provider(
         finalized = control.finalization
         return SdkTerminalResult(finalized.verified, SdkTerminalFamily.TITLE, finalized.deferred_cancellations)
     except V4ProviderResultIncomplete as incomplete:
-        if type(policy) is not ContinuationAdmissionPolicyV4:
-            raise
         result = await custody.finalize_v4_returned_incomplete(incomplete)
         return TitlePaidIncompleteResult(result.verified, result.deferred_cancellations)
     except BaseException as original:
         exceptional = capture_sdk_terminal_failure(original, custody=custody)
         if exceptional is not None:
             return exceptional
-        if no_sdk_issuer is not None:
-            terminal = await _close_v4_title_no_sdk(prepared=prepared, custody=custody, issuer=no_sdk_issuer, error=original)
-            if terminal is not None:
-                return terminal
+        terminal = await _close_v4_title_no_sdk(prepared=prepared, custody=custody, issuer=no_sdk_issuer, error=original)
+        if terminal is not None:
+            return terminal
         raise
-    if capture is not None and capture.handled_error is not None and no_sdk_issuer is not None:
+    if capture.handled_error is not None:
         exceptional = capture_sdk_terminal_failure(capture.handled_error, custody=custody)
         if exceptional is not None:
             return exceptional
@@ -411,10 +369,7 @@ async def retain_current_title_success(custody: ProviderCallCustody, completion:
     prepared = custody.continuation_title
     if type(prepared) is not PreparedTitleProvider:
         raise AuditIntegrityError("TITLE retention lost its original action clock")
-    if custody.continuation_title_v4_admission is not None:
-        await prepared.clock.run("retention", lambda: _retain_current_title_v4_once(custody, completion))
-        return
-    await prepared.clock.run("retention", lambda: _retain_current_title_success_once(custody, completion))
+    await prepared.clock.run("retention", lambda: _retain_current_title_v4_once(custody, completion))
 
 
 async def _retain_current_title_v4_once(custody: ProviderCallCustody, completion: _AdmittedLLMCompletion) -> None:
@@ -513,82 +468,6 @@ async def _retain_current_title_v4_once(custody: ProviderCallCustody, completion
         raise BaseExceptionGroup("V4 TITLE retention original outcomes", errors)
 
 
-async def _retain_current_title_success_once(custody: ProviderCallCustody, completion: _AdmittedLLMCompletion) -> None:
-    prepared = custody.continuation_title
-    if type(prepared) is not PreparedTitleProvider or custody.call is None or custody.attempt is None:
-        raise AuditIntegrityError("TITLE retained result requires its actual original physical producer")
-    names = await current_title_names(service=prepared.composer, running=prepared.running, work=prepared.work)
-    if custody.continuation_title_selected != names.selected:
-        raise AuditIntegrityError("TITLE response lost its exact physical admission root")
-    root = decode_continuation_snapshot(names.selected.payload_json)
-    from elspeth.web.sessions.continuation_title_provider import _descriptor
-
-    creator_sequence, creator_generation = require_title_creator(prepared.running)
-    captured = capture_title_provider_result(
-        logical=root.logical,
-        actor_user_id=prepared.actor_user_id,
-        effect_key="provider:3:0",
-        input_sha256=_descriptor(prepared.input).input_sha256,
-        creator_sequence=creator_sequence,
-        creator_generation=creator_generation,
-        completion=completion,
-        audit_call=custody.call,
-        context=custody.context,
-        audit_drafts=provider_attempt_audit_drafts(custody.call, custody.context),
-        env_ref_names=names.names,
-    )
-
-    def retain() -> TitleAuditSettlementRequest:
-        with locked_session_transaction(prepared.authority._engine, str(prepared.running.claim.session_id)) as conn:
-            names.require(conn)
-            return retain_title_response_on_connection(conn, prepared, selected=names.selected, captured=captured, names=names.names)
-
-    async def retain_once() -> None:
-        sql, projection = prepared.work.reserve_pair(
-            RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
-        )
-        try:
-            outcome = await run_required_sql_finish_once(sql, retain)
-        except BaseException:
-            projection.complete_without_submission()
-            raise
-        try:
-            prepared.work.coordinator.validate_continuation_sql_outcome(
-                ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_STATE_SQL, actual_outcome=outcome
-            )
-        except BaseException:
-            projection.complete_without_submission()
-            raise
-        errors: list[BaseException] = []
-        if type(outcome) is RequiredSQLRaised:
-            projection.complete_without_submission()
-            errors.append(outcome.error)
-        elif type(outcome) is RequiredSQLReturned:
-            projection.begin_projection()
-            try:
-                if type(outcome.value) is not TitleAuditSettlementRequest:
-                    raise AuditIntegrityError("TITLE retention lost its committed original result")
-                # Install the committed locator before any original cancellation
-                # is delivered to the original provider scope's one finisher.
-                custody.continuation_title_result = outcome.value
-                custody.continuation_title_selected = outcome.value.selected
-            except BaseException as error:
-                projection.complete_owned(error)
-                errors.append(error)
-            else:
-                projection.complete_owned()
-        else:
-            projection.complete_without_submission()
-            raise AuditIntegrityError("TITLE retention returned no owned SQL result")
-        errors.extend(cancellation for cancellation in outcome.deferred_cancellations if all(cancellation is not error for error in errors))
-        if len(errors) == 1:
-            raise errors[0]
-        if errors:
-            raise BaseExceptionGroup("TITLE retention original outcomes", errors)
-
-    await retain_once()
-
-
 async def read_current_title_result(
     *, service: ComposerServiceImpl, running: ComposerOperationRunning, required_work: RequiredWorkBinding
 ) -> CurrentTitleResult:
@@ -604,34 +483,10 @@ async def read_current_title_result(
     )
 
 
-async def refresh_current_title_settlement(custody: ProviderCallCustody) -> TitleAuditSettlementRequest:
-    prepared, original = custody.continuation_title, custody.continuation_title_result
-    if type(prepared) is not PreparedTitleProvider or type(original) is not TitleAuditSettlementRequest:
-        raise AuditIntegrityError("TITLE settlement lost its actual retained producer")
-    current = await read_current_title_result(service=prepared.composer, running=prepared.running, required_work=prepared.work)
-    if current.settlement.result != original.result or current.settlement.audit_call != original.audit_call:
-        raise AuditIntegrityError("TITLE settlement changed its actual original response/audit")
-    # Preserve the warm original object/cohort after complete actual SQL readmission.
-    return replace(current.settlement, audit_call=original.audit_call, audit_drafts=original.audit_drafts)
-
-
 async def settle_current_title_result(
     *, service: ComposerServiceImpl, running: ComposerOperationRunning, required_work: RequiredWorkBinding
 ) -> CurrentTitleResult:
     current = await read_current_title_result(service=service, running=running, required_work=required_work)
-    if current.settled:
-        return current
-    sql = required_work.coordinator.reserve(
-        RequiredWorkSource.TITLE_PROVIDER_SETTLEMENT_SQL,
-        transition_ordinal=required_work.transition_ordinal,
-        semantic_ordinal=6,
-        recurrence_ordinal=0,
-    )
-    # Same original finisher/audit inserter/ledger, now using the fresh writer.
-    await _sessions(service).finish_provider_attempt(
-        session_operation_context=running.session_operation_context,
-        call=current.settlement.audit_call,
-        required_work=sql,
-        continuation_title=current.settlement,
-    )
-    return await read_current_title_result(service=service, running=running, required_work=required_work)
+    if not current.settled:
+        raise AuditIntegrityError("Continuation TITLE requires its original atomic V4 settlement")
+    return current

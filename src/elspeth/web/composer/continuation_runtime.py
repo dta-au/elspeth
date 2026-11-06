@@ -255,39 +255,29 @@ def _restore_live(
     finish_read: ContinuationFinishRead | None = None,
     detached_disclosure: SchemaDisclosureTracker | None = None,
 ) -> RestoredContinuationRuntime:
-    from elspeth.web.composer.continuation_policy import (
-        ContinuationAdmissionPolicyV2,
-        ContinuationAdmissionPolicyV3,
-        ContinuationAdmissionPolicyV4,
-    )
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
     from elspeth.web.composer.provider_cost import CommonProviderCostBudget, continuation_common_cost_policy
     from elspeth.web.composer.service import _chat_ingress_inputs_for_compose
 
     cost_source = source.cost_snapshot
     pending_cost_budget: CommonProviderCostBudget | None = None
-    if cost_source is None:
-        if provider_owner.cost_budget is not None:
-            raise AuditIntegrityError("legacy runtime gained a current cost owner")
-    else:
-        if isinstance(source.policy, (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)):
-            cost_policy = source.policy
-        else:
-            raise AuditIntegrityError("runtime cost source lacks admitted v2 policy")
-        cost_source_owner = CommonProviderCostBudget(cost_source)
-        cost_source_owner.validate_binding(
-            session_id=selected.stack.logical.session_id,
-            request_id=selected.stack.logical.original_user_message_id,
-            lifecycle_version=2,
-        )
-        if cost_source.applicability != "continuation_v2" or cost_source.policy != continuation_common_cost_policy(cost_policy):
-            raise AuditIntegrityError("runtime cost source changed immutable admitted limits")
-        if provider_owner.cost_budget is None:
-            # Construction below needs only local DATA. Bind a new budget only
-            # after the final source proof so a failed restore leaves its
-            # reusable provider owner untouched.
-            pending_cost_budget = cost_source_owner
-        elif provider_owner.cost_budget.snapshot() != cost_source:
-            raise AuditIntegrityError("warm Continuation cost owner differs from complete durable accounting")
+    if type(source.policy) is not ContinuationAdmissionPolicyV4:
+        raise AuditIntegrityError("runtime cost source lacks its current V4 policy")
+    cost_source_owner = CommonProviderCostBudget(cost_source)
+    cost_source_owner.validate_binding(
+        session_id=selected.stack.logical.session_id,
+        request_id=selected.stack.logical.original_user_message_id,
+        lifecycle_version=2,
+    )
+    if cost_source.applicability != "continuation_v2" or cost_source.policy != continuation_common_cost_policy(source.policy):
+        raise AuditIntegrityError("runtime cost source changed immutable admitted limits")
+    if provider_owner.cost_budget is None:
+        # Construction below needs only local DATA. Bind a new budget only
+        # after the final source proof so a failed restore leaves its
+        # reusable provider owner untouched.
+        pending_cost_budget = cost_source_owner
+    elif provider_owner.cost_budget.snapshot() != cost_source:
+        raise AuditIntegrityError("warm Continuation cost owner differs from complete durable accounting")
 
     _index, frame = _compose(selected)
     names = inventory.names
@@ -409,7 +399,9 @@ def _restore_live(
     # A later read can only shorten admission; never use its newer remaining
     # observation to renew the monotonic anchor or original logical budgets.
     if finish_read is None:
-        final_source = authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
+        final_source = authority.read_continuation_runtime(
+            inventory.running, selected=selected, inventory=inventory, _prior_evidence=source.admitted_evidence
+        )
     else:
         finish_read.require_selection(selected, inventory)
         final_source = finish_read.read_runtime(authority)
@@ -1027,17 +1019,14 @@ async def capture_metadata_preparation_runtime(
 ) -> CapturedContinuationRuntime | None:
     """Capture prospective metadata DATA with a clean, size-only refusal result."""
     from elspeth.web.composer.continuation_limits import ContinuationDocumentTooLarge
-    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
     from elspeth.web.composer.protocol import ComposerContextUnsupported
 
     if (
         type(runtime) is not RestoredContinuationRuntime
         or type(runtime.detached_disclosure) is not SchemaDisclosureTracker
         or runtime.detached_disclosure is runtime.materialization.service._schema_disclosure
-        or (
-            type(runtime.source.policy) is not ContinuationAdmissionPolicyV3
-            and type(runtime.source.policy) is not ContinuationAdmissionPolicyV4
-        )
+        or type(runtime.source.policy) is not ContinuationAdmissionPolicyV4
     ):
         raise AuditIntegrityError("metadata capture requires its original detached bounded runtime")
     work = runtime.bindings.required_work

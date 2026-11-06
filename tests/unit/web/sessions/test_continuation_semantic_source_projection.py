@@ -6,25 +6,139 @@ import json
 from dataclasses import replace
 from uuid import uuid4
 
+import litellm
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web import app as app_module
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
+from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_events_table as events
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
+from elspeth.web.sessions.models import quota_provider_attempts_table as attempts
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.helpers.composer_operations import message_body
 from tests.helpers.continuation_app import ScriptedSDK, continuation_app, install_sdk, observe_supported_path, submit_and_settle, tool_call
+from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, _reply
 from tests.unit.web.sessions import test_continuation_semantic_advisor as semantic_fixture
 from tests.unit.web.sessions.test_continuation_semantic_advisor import _issuer, _prepare, _rows, _rows_on_connection, _semantic_case
 from tests.unit.web.sessions.test_continuation_semantic_v4_live import _v4_store
 
 operation_store = semantic_fixture.operation_store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", (None, "cursor", "root", "hash", "attempt", "missing_hold", "mixed_fields"))
+async def test_actual_admitted_semantic_inflight_data_never_remints_issuer_and_refuses_corruption(
+    operation_store, tmp_path, monkeypatch, fault
+):
+    """Inspect the actual begin transaction, then restore it before the original SDK call."""
+    store = _v4_store(operation_store, monkeypatch)
+    async with _semantic_case(store, tmp_path, monkeypatch) as case:
+        original_admit = semantic_sql.admit_v4_semantic_provider_on_connection
+        observed, sdk, remints = [], [], []
+
+        def forbidden_remint(self, *args, **kwargs):
+            remints.append((args, kwargs))
+            raise AssertionError("A structural DATA read must not create a live no-SDK issuer")
+
+        def admit(conn, *args, **kwargs):
+            admission = original_admit(conn, *args, **kwargs)
+            selected = admission.selected
+            root = decode_continuation_snapshot(selected.payload_json)
+            running = case["running"]
+            sid, operation = str(running.claim.session_id), running.claim.operation_id
+            frame = root.frames[-1]
+            assert type(frame) is AdvisorFrame
+            effect_key = frame.provider_effect_key
+            assert effect_key is not None and frame.phase == "awaiting_response"
+            before = _rows_on_connection(conn)
+            assert sdk == []
+
+            def structural(current):
+                return semantic_sql.validate_semantic_advisor_source_data_on_connection(
+                    conn, session_id=running.claim.session_id, operation_id=operation, selected=current
+                )
+
+            with monkeypatch.context() as reader_only:
+                reader_only.setattr(SemanticAdvisorNoSdkIssuer, "__init__", forbidden_remint)
+                assert structural(selected) == (effect_key,)
+                assert _rows_on_connection(conn) == before
+                if fault is not None:
+                    savepoint = conn.begin_nested()
+                    try:
+                        current = selected
+                        if fault == "cursor":
+                            current = replace(selected, cursor=selected.cursor + 1)
+                        elif fault == "root":
+                            compose = root.frames[0]
+                            assert type(compose) is ComposeFrame
+                            changed_compose = compose.model_copy(update={"advisor_calls": compose.advisor_calls + 1})
+                            changed_root = root.model_copy(update={"frames": (changed_compose, *root.frames[1:])})
+                            current = replace(selected, payload_json=encode_continuation_snapshot(changed_root))
+                            assert decode_continuation_snapshot(current.payload_json) == changed_root
+                            assert current.checkpoint_id == selected.checkpoint_id and current.cursor == selected.cursor
+                            assert changed_root.cursor == root.cursor and current.payload_json != selected.payload_json
+                        elif fault == "missing_hold":
+                            changed = conn.execute(
+                                delete(holds).where(
+                                    holds.c.session_id == sid, holds.c.operation_id == operation, holds.c.effect_key == effect_key
+                                )
+                            )
+                            assert changed.rowcount == 1
+                        elif fault == "attempt":
+                            changed = conn.execute(
+                                update(attempts)
+                                .where(attempts.c.attempt_id == admission.attempt.attempt_id)
+                                .values(lease_token="changed-original-attempt-lease")
+                            )
+                            assert changed.rowcount == 1
+                        else:
+                            values = {"input_sha256": "0" * 64} if fault == "hash" else {"receipt_key": "unexpected-inflight-receipt"}
+                            changed = conn.execute(
+                                update(effects)
+                                .where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == effect_key)
+                                .values(**values)
+                            )
+                            assert changed.rowcount == 1
+                        damaged = _rows_on_connection(conn)
+                        message = "Semantic structural source substituted its complete checkpoint" if fault in ("root", "cursor") else None
+                        with pytest.raises(AuditIntegrityError, match=message):
+                            structural(current)
+                        assert _rows_on_connection(conn) == damaged
+                    finally:
+                        savepoint.rollback()
+                    assert _rows_on_connection(conn) == before
+                    assert structural(selected) == (effect_key,)
+                    assert _rows_on_connection(conn) == before
+                assert remints == []
+            observed.append(admission)
+            return admission
+
+        async def completion(**kwargs):
+            assert len(observed) == 1
+            sdk.append(kwargs["model"])
+            return _reply(json.dumps(_answer(case["request"])))
+
+        monkeypatch.setattr(semantic_sql, "admit_v4_semantic_provider_on_connection", admit)
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        prepared, paid = await semantic_fixture._run_paid_semantic(case, monkeypatch)
+        assert len(observed) == len(sdk) == 1 and remints == []
+        assert observed[0].selected.cursor < paid.snapshot.cursor
+        with store[0].connect() as conn:
+            effect = conn.execute(select(effects).where(effects.c.effect_key == prepared.binding.effect_key)).one()
+            hold = conn.execute(select(holds).where(holds.c.effect_key == prepared.binding.effect_key)).one()
+            attempt = conn.execute(select(attempts).where(attempts.c.attempt_id == effect.provider_attempt_id)).one()
+            ledger = conn.execute(select(usage).where(usage.c.session_id == str(store[4]))).one()
+        assert effect.provider_attempt_id == observed[0].attempt.attempt_id
+        assert hold.state == "consumed" and attempt.ledger_entry_id == ledger.entry_id
+        assert attempt.settled_at is not None
 
 
 @pytest.mark.asyncio
@@ -321,12 +435,6 @@ async def test_real_mutation_selector_reproves_history_before_frontier_append_an
     class SelectionRollbackProbe(Exception):
         pass
 
-    def policy(settings):
-        actual = continuation_policy_v4_from_settings(settings)
-        assert actual is not None and actual.actions.advisor.preparation == 5.0
-        return actual
-
-    monkeypatch.setattr(app_module, "continuation_policy_from_settings", policy)
     operation = str(uuid4())
     reached, full_reads = [], []
     original_select = phase.select_semantic_advisor_graph_and_inputs_on_connection
@@ -375,6 +483,8 @@ async def test_real_mutation_selector_reproves_history_before_frontier_append_an
     monkeypatch.setattr(semantic_sql, "read_runtime_source_on_connection", read)
     monkeypatch.setattr(phase, "select_semantic_advisor_graph_and_inputs_on_connection", selector)
     async with continuation_app(tmp_path, monkeypatch) as harness:
+        policy = harness.app.state.composer_async_operation_authority._continuation_policy
+        assert policy is not None and policy.actions.advisor.preparation == 5.0
         blob = tmp_path / "blobs" / str(harness.session_id)
         blob.mkdir(parents=True, exist_ok=True)
         (blob / "input.csv").write_text("name\nAda\n", encoding="utf-8")

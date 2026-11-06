@@ -10,7 +10,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import EffectFrontierEntry
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt, maximum_paid_incomplete_receipt_bytes
 from elspeth.web.sessions.continuation_paid_overflow import (
@@ -35,9 +35,7 @@ _INPUT_SHA256 = sha256(b"primary-tail-structural-input").hexdigest()
 
 
 def _source():
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     base = initial_stack()
     frame = _compose(
@@ -177,19 +175,6 @@ def test_incomplete_tail_schema_drift_refuses_before_reservation(monkeypatch):
     admitted, identity = _source()
     with pytest.raises(AuditIntegrityError, match="bound no longer covers"):
         prepare_primary_paid_incomplete_tail_plan(identity=identity, admitted=admitted, creator_sequence=1)
-
-
-def test_incomplete_tail_cannot_reinterpret_a_legacy_policy():
-    admitted, identity = _source()
-    legacy = initial_stack()
-    root = decode_continuation_snapshot(admitted.payload_json).model_copy(
-        update={"policy_hash": legacy.policy_hash, "admission_policy_json": legacy.admission_policy_json}
-    )
-    stored = replace(admitted, payload_json=encode_continuation_snapshot(root))
-    with pytest.raises(AuditIntegrityError, match="original source"):
-        prepare_primary_paid_incomplete_tail_plan(
-            identity=identity.model_copy(update={"policy_sha256": legacy.policy_hash}), admitted=stored, creator_sequence=1
-        )
 
 
 def test_incomplete_tail_shared_usage_bound_drift_refuses_before_reservation(monkeypatch):

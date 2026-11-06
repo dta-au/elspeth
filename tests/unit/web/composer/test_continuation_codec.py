@@ -1,7 +1,6 @@
 import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 
 import pytest
 
@@ -13,9 +12,7 @@ from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import encode_private_chunk, verify_private_chunk
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy
 from elspeth.web.continuation_retention_memo import (
-    borrow_legacy_advisor_inflight_memo,
     borrow_v4_preparation_memo_scope,
-    legacy_advisor_preparation_memo_scope,
     retention_stage_memo_scope,
     v4_preparation_memo_scope,
 )
@@ -621,8 +618,7 @@ async def test_v4_canonical_only_oversize_recomputes_and_malformed_refusal_prece
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("legacy", (False, True), ids=("ordinary", "legacy"))
-async def test_large_canonical_fallback_keeps_ordinary_and_legacy_proofs_child_local(monkeypatch, legacy):
+async def test_large_canonical_fallback_keeps_ordinary_proofs_child_local(monkeypatch):
     canonical = canonical_json({"text": "x" * 600_000})
     chunk = encode_private_chunk(codec="composer.messages.v1", canonical=canonical)
     original = codec._verify_private_chunk_canonical
@@ -633,12 +629,8 @@ async def test_large_canonical_fallback_keeps_ordinary_and_legacy_proofs_child_l
         return original(text)
 
     monkeypatch.setattr(codec, "_verify_private_chunk_canonical", verify)
-    clock = _canonical_only_clock()
-    with legacy_advisor_preparation_memo_scope(clock) if legacy else nullcontext(None) as parent:
-        for _ in range(2):
-            with borrow_legacy_advisor_inflight_memo(parent, clock) if legacy else retention_stage_memo_scope():
-                verify_private_chunk(chunk.reference, canonical)
-                verify_private_chunk(chunk.reference, canonical)
-        assert calls == [len(canonical)] * 2
-        if parent is not None:
-            assert not parent._canonical_verifications and parent.cached_entry_count == 0
+    for _ in range(2):
+        with retention_stage_memo_scope():
+            verify_private_chunk(chunk.reference, canonical)
+            verify_private_chunk(chunk.reference, canonical)
+    assert calls == [len(canonical)] * 2

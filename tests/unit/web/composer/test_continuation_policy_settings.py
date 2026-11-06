@@ -14,10 +14,8 @@ from pydantic import SecretStr, ValidationError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.continuation_policy import (
-    CONTINUATION_POLICY_SCHEMA_VERSION,
-    CONTINUATION_POLICY_SCHEMA_VERSION_V2,
-    ContinuationAdmissionPolicy,
-    ContinuationAdmissionPolicyV2,
+    CONTINUATION_POLICY_SCHEMA_VERSION_V4,
+    ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
@@ -46,7 +44,7 @@ def _enabled(**overrides: Any) -> WebSettings:
     return continuation_test_settings(**overrides)
 
 
-def _policy(**overrides: Any) -> ContinuationAdmissionPolicyV2:
+def _policy(**overrides: Any) -> ContinuationAdmissionPolicyV4:
     policy = continuation_policy_from_settings(_enabled(**overrides))
     assert policy is not None
     return policy
@@ -61,7 +59,7 @@ def _bounds_with(role: str, stage: str, value: float) -> dict[str, Any]:
 def test_production_policy_from_settings_round_trips_and_is_versioned() -> None:
     policy = _policy()
     encoded = policy.model_dump_json()
-    assert json.loads(encoded)["schema_version"] == CONTINUATION_POLICY_SCHEMA_VERSION_V2 == "composer.continuation.policy.v2"
+    assert json.loads(encoded)["schema_version"] == CONTINUATION_POLICY_SCHEMA_VERSION_V4 == "composer.continuation.policy.v4"
     assert decode_continuation_policy(encoded, policy.policy_hash) == policy
 
 
@@ -175,10 +173,10 @@ def test_action_bounds_read_from_one_json_environment_object(monkeypatch: pytest
         pytest.param(lambda value: value.pop("schema_version"), "lost its schema version", id="missing-version"),
         pytest.param(
             lambda value: value.__setitem__("schema_version", "composer.continuation.policy.v0"),
-            "unknown schema version",
+            "unsupported schema version",
             id="unknown-version",
         ),
-        pytest.param(lambda value: value.__setitem__("schema_version", ["v1"]), "unknown schema version", id="non-string-version"),
+        pytest.param(lambda value: value.__setitem__("schema_version", ["v1"]), "unsupported schema version", id="non-string-version"),
         pytest.param(lambda value: value["segment"].__setitem__("added", 1.0), "complete owned contract", id="added-field"),
         pytest.param(lambda value: value["segment"].pop("reserve"), "complete owned contract", id="removed-field"),
     ),
@@ -192,14 +190,9 @@ def test_policy_decode_refuses_missing_unknown_added_and_removed_fields(mutate: 
         decode_continuation_policy(canonical_json(value), stable_hash(value))
 
 
-def test_v1_policy_golden_bytes_and_hash_are_pinned() -> None:
-    historical = _policy(composer_continuation_action_bounds=_bounds_with("primary", "preparation", 5.0))
-    policy = ContinuationAdmissionPolicy(segment=historical.segment, actions=historical.actions)
-    assert policy.schema_version == CONTINUATION_POLICY_SCHEMA_VERSION
-    # Pinned historical V1 bytes remain readable after new admission defaults
-    # change; they are not reconstructed from the current PRIMARY default.
-    assert policy.model_dump_json() == _GOLDEN_V1_ENCODING
-    assert policy.policy_hash == "803319d4e1e6e84da9d4e609dd5743c2b6a88bde6433b9f09f38252a65f325c1"
+def test_preserved_v1_golden_bytes_are_explicitly_unsupported() -> None:
+    with pytest.raises(AuditIntegrityError, match="unsupported schema version"):
+        decode_continuation_policy(_GOLDEN_V1_ENCODING, "803319d4e1e6e84da9d4e609dd5743c2b6a88bde6433b9f09f38252a65f325c1")
 
 
 def test_first_segment_must_fit_title_initialization_and_the_first_primary() -> None:
@@ -228,13 +221,15 @@ def test_fixture_is_the_production_policy() -> None:
 
 def test_fixture_construction_path_is_the_settings_mapping() -> None:
     assert continuation_policy_from_settings(continuation_test_settings()) == minimal_continuation_policy()
-    assert type(minimal_continuation_policy()) is ContinuationAdmissionPolicyV2
+    assert type(minimal_continuation_policy()) is ContinuationAdmissionPolicyV4
 
 
-def test_app_wires_the_settings_policy_into_the_composer_authority(tmp_path: Any) -> None:
+@pytest.mark.parametrize("allowance", (16 * 1_048_576, None))
+def test_app_wires_the_settings_policy_into_the_composer_authority(tmp_path: Any, allowance: int | None) -> None:
     from elspeth.web.app import create_app
 
     settings = continuation_test_settings(
+        composer_continuation_max_retained_payload_bytes=allowance,
         data_dir=tmp_path,
         landscape_url=f"sqlite:///{tmp_path}/runs/audit.db",
         payload_store_path=tmp_path / "payloads",
@@ -244,6 +239,11 @@ def test_app_wires_the_settings_policy_into_the_composer_authority(tmp_path: Any
     app = create_app(settings=settings)
     try:
         retained = app.state.composer_async_operation_authority._continuation_policy
-        assert retained is not None and retained == continuation_policy_from_settings(settings)
+        assert retained == continuation_policy_from_settings(settings)
+        if allowance is None:
+            assert retained is None
+        else:
+            assert type(retained) is ContinuationAdmissionPolicyV4
+            assert retained.max_retained_payload_bytes == allowance
     finally:
         app.state.session_engine.dispose()

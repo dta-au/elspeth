@@ -429,26 +429,34 @@ def capture_checkpoint_end_input(
     return result
 
 
-def require_original_checkpoint_end_input(
+def _require_original_checkpoint_end_data(
     result: CapturedCheckpointEndInput, *, phase_source: CheckpointPhaseSource, captured: CapturedContinuationRuntime
-) -> PrivateChunk:
+) -> tuple[PrivateChunk, CheckpointEndInputSnapshot, frozenset[str]]:
+    """Admit one original input and return its actual lexical DATA together."""
     source = _original_input(result)
     if source.phase_source != phase_source or source.captured is not captured or source.chunk is not result.chunk:
         raise AuditIntegrityError("END input requires its original pre-call capture producer")
-    decode_checkpoint_end_input(result.chunk, env_ref_names=source.runtime.env_ref_names)
-    return result.chunk
+    names = source.runtime.env_ref_names
+    snapshot = decode_checkpoint_end_input(result.chunk, env_ref_names=names)
+    return result.chunk, snapshot, names
+
+
+def require_original_checkpoint_end_input(
+    result: CapturedCheckpointEndInput, *, phase_source: CheckpointPhaseSource, captured: CapturedContinuationRuntime
+) -> PrivateChunk:
+    chunk, _snapshot, _names = _require_original_checkpoint_end_data(result, phase_source=phase_source, captured=captured)
+    return chunk
 
 
 def require_original_checkpoint_end_snapshot(
     result: CapturedCheckpointEndInput, *, phase_source: CheckpointPhaseSource, captured: CapturedContinuationRuntime
 ) -> tuple[PrivateChunk, CheckpointEndInputSnapshot]:
-    chunk = require_original_checkpoint_end_input(result, phase_source=phase_source, captured=captured)
-    source = _original_input(result)
-    return chunk, decode_checkpoint_end_input(chunk, env_ref_names=source.runtime.env_ref_names)
+    chunk, snapshot, _names = _require_original_checkpoint_end_data(result, phase_source=phase_source, captured=captured)
+    return chunk, snapshot
 
 
 def require_original_checkpoint_end_env_names(
     result: CapturedCheckpointEndInput, *, phase_source: CheckpointPhaseSource, captured: CapturedContinuationRuntime
 ) -> frozenset[str]:
-    require_original_checkpoint_end_input(result, phase_source=phase_source, captured=captured)
-    return _original_input(result).runtime.env_ref_names
+    _chunk, _snapshot, names = _require_original_checkpoint_end_data(result, phase_source=phase_source, captured=captured)
+    return names

@@ -15,6 +15,46 @@ operation_store = runtime_cases.operation_store
 
 
 @pytest.mark.asyncio
+async def test_restore_final_read_reuses_only_prior_snapshot_with_fresh_source_admission(operation_store, monkeypatch):
+    from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
+
+    arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
+    running = arguments["inventory"].running
+    authority = arguments["authority"]
+    original_read = authority.read_continuation_runtime
+    reads = []
+
+    def observed_read(*args, **kwargs):
+        result = original_read(*args, **kwargs)
+        reads.append((kwargs.get("_prior_evidence"), result))
+        return result
+
+    monkeypatch.setattr(authority, "read_continuation_runtime", observed_read)
+    try:
+        restored = await restore_continuation_runtime(**arguments)
+        repeated = [(prior, result) for prior, result in reads if prior is not None]
+        assert len(repeated) == 1
+        prior, final_source = repeated[0]
+        assert prior is restored.source.admitted_evidence
+        assert final_source is not restored.source
+        assert final_source.admitted_evidence is not prior
+        assert final_source.evidence is prior.snapshot
+        assert final_source.admitted_evidence._graph_lock is not prior._graph_lock
+        assert len(reads) >= 2
+        with pytest.raises(AuditIntegrityError, match="runtime read requires its actual current and selected owners"):
+            await asyncio.to_thread(
+                original_read,
+                replace(running),
+                selected=arguments["selected"],
+                inventory=arguments["inventory"],
+                _prior_evidence=prior,
+            )
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
 async def test_runtime_source_retains_its_actual_validated_evidence_and_rejects_another_running_owner(operation_store, monkeypatch):
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
     running = arguments["inventory"].running

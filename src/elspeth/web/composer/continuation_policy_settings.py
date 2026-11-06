@@ -12,9 +12,6 @@ from typing import Final
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionBounds,
     ContinuationActionPolicy,
-    ContinuationAdmissionPolicy,
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     ContinuationAdmittedCostPolicy,
     ContinuationSegmentPolicy,
@@ -57,16 +54,21 @@ def _local_action(stages: ContinuationLocalStageSettings) -> ContinuationActionP
     )
 
 
-def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicyV2:
-    """The complete validated Continuation admission policy."""
+def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicyV4 | None:
+    """Build the current policy; explicit null disables fresh admission."""
     if type(settings) is not WebSettings:
         raise TypeError("continuation policy requires the owned WebSettings")
+    limit = settings.composer_continuation_max_retained_payload_bytes
+    if limit is None:
+        return None
     bounds = settings.composer_continuation_action_bounds
     primary_guard = _guard_seconds(settings.composer_prompt_guard)
     advisor_guard_settings = settings.composer_advisor_prompt_guard
     advisor_guard = _guard_seconds(advisor_guard_settings if advisor_guard_settings is not None else settings.composer_prompt_guard)
     advisor = bounds.advisor
-    policy = ContinuationAdmissionPolicyV2(
+    policy = ContinuationAdmissionPolicyV4(
+        max_retained_payload_bytes=limit,
+        paid_provider_overflow_disposition="terminal_paid_overflow",
         segment=ContinuationSegmentPolicy(
             nominal=settings.composer_continuation_segment_nominal_seconds,
             watermark=settings.composer_continuation_watermark_seconds,
@@ -100,48 +102,6 @@ def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmi
     return policy
 
 
-def continuation_policy_v3_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicyV3 | None:
-    """Build a new-operation policy with the configured aggregate allowance.
-
-    Explicit ``None`` disables new V3 policy construction. Stored V1/V2 operations
-    retain their original policy; the application/authority join decides how
-    to project this condition publicly before new irreversible work.
-    """
-    if type(settings) is not WebSettings:
-        raise TypeError("continuation policy requires the owned WebSettings")
-    limit = settings.composer_continuation_max_retained_payload_bytes
-    if limit is None:
-        return None
-    costed = continuation_policy_from_settings(settings)
-    return ContinuationAdmissionPolicyV3(
-        segment=costed.segment,
-        actions=costed.actions,
-        provider_cost=costed.provider_cost,
-        max_retained_payload_bytes=limit,
-    )
-
-
-def continuation_policy_v4_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicyV4 | None:
-    """Prepare a paid-overflow policy; leave admission to its owner.
-
-    Explicit ``None`` disables new V4 policy construction. This builder
-    neither changes the default V2 path nor activates V4.
-    """
-    if type(settings) is not WebSettings:
-        raise TypeError("continuation policy requires the owned WebSettings")
-    limit = settings.composer_continuation_max_retained_payload_bytes
-    if limit is None:
-        return None
-    costed = continuation_policy_from_settings(settings)
-    return ContinuationAdmissionPolicyV4(
-        segment=costed.segment,
-        actions=costed.actions,
-        provider_cost=costed.provider_cost,
-        max_retained_payload_bytes=limit,
-        paid_provider_overflow_disposition="terminal_paid_overflow",
-    )
-
-
 # The admitted first segment runs, before the first PRIMARY call, one ingress
 # initialization, the TITLE call, its application and the composition
 # initialization (three session-SQL actions and one TITLE action). Landed
@@ -151,7 +111,7 @@ def continuation_policy_v4_from_settings(settings: WebSettings) -> ContinuationA
 _FIRST_SEGMENT_SESSION_SQL_ACTIONS: Final = 3
 
 
-def _require_first_segment_fits_its_chain(policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2) -> None:
+def _require_first_segment_fits_its_chain(policy: ContinuationAdmissionPolicyV4) -> None:
     actions = policy.actions
     chain = actions.title.total + _FIRST_SEGMENT_SESSION_SQL_ACTIONS * actions.session_sql.total
     required = actions.primary.total + policy.segment.reserve + chain

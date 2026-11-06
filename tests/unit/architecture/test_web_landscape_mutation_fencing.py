@@ -2530,15 +2530,7 @@ def _non_landscape_scalar_attribute_read(node: ast.Attribute, resolver: _Resolve
     if not (arithmetic or formatted):
         return False
 
-    policy_owners = frozenset(
-        "elspeth.web.composer.continuation_policy." + name
-        for name in (
-            "ContinuationAdmissionPolicy",
-            "ContinuationAdmissionPolicyV2",
-            "ContinuationAdmissionPolicyV3",
-            "ContinuationAdmissionPolicyV4",
-        )
-    )
+    policy_owners = frozenset({"elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV4"})
 
     def annotation_owners(annotation: ast.expr, source: _Resolver, use: ast.AST) -> frozenset[str] | None:
         if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
@@ -17321,12 +17313,13 @@ def test_reserve_sql_deadline_requires_positive_nominal_claim_and_original_read_
     ],
 )
 def test_reserve_recompose_return_receipt_refuses_capability_and_callback_substitution(path, original, replacement):
+    root = _repo_root()
     paths = (
         "src/elspeth/web/composer/continuation_initialization.py",
         "src/elspeth/web/composer/continuation_clock.py",
         "src/elspeth/web/sessions/continuation_recompose_source.py",
     )
-    units = tuple(_read_source(candidate) for candidate in paths)
+    units = tuple(_read_source(root / candidate, anchor=root) for candidate in paths)
     failures, receipt = _reserve_recompose_initialization_receipt(units)
     assert failures == [] and receipt is not None
     assert len(receipt["returns"]) == 1 and len(receipt["lambdas"]) == 2
@@ -17466,9 +17459,10 @@ def test_classifier_terminal_reserve_receipt_rejects_changed_custody(original, r
 
 
 def test_reserve_recompose_receipt_does_not_admit_other_returned_or_stored_capabilities():
+    root = _repo_root()
     path = "src/elspeth/web/composer/continuation_initialization.py"
     units = tuple(
-        _read_source(candidate)
+        _read_source(root / candidate, anchor=root)
         for candidate in (
             path,
             "src/elspeth/web/composer/continuation_clock.py",
@@ -17570,17 +17564,17 @@ class ComposerOperationRunning:
         """
 class ContinuationSQLDeadlineOwner:
     def __init__(self, running: ComposerOperationRunning, *,
-                 policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4,
+                 policy: ContinuationAdmissionPolicyV4,
                  drain_signal: ComposerDrainSignal, drain_seconds: float, hard_expires_at: float) -> None:
         if (type(running) is not ComposerOperationRunning
-            or type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
+            or type(policy) is not ContinuationAdmissionPolicyV4
             or type(drain_signal) is not ComposerDrainSignal
             or type(drain_seconds) not in (float, int)
             or not math.isfinite(drain_seconds)
             or drain_seconds <= COMPOSER_DRAIN_FINISH_RESERVE_SECONDS
             or type(hard_expires_at) not in (float, int)
             or not math.isfinite(hard_expires_at)):
-            raise AuditIntegrityError("V2 SQL timing lost its actual owner or finite retained bounds")
+            raise AuditIntegrityError("SQL timing lost its actual current owner or finite retained bounds")
         self.running, self.policy, self.drain_signal = running, policy, drain_signal
         self.drain_seconds, self.hard_expires_at = float(drain_seconds), float(hard_expires_at)
         self.drain_finish_reserve_seconds = COMPOSER_DRAIN_FINISH_RESERVE_SECONDS
@@ -17886,9 +17880,6 @@ def sql_deadline_owner(self) -> ContinuationSQLDeadlineOwner | None:
             {
                 "ComposerOperationRunning": "elspeth.web.sessions.composer_operations.ComposerOperationRunning",
                 "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
-                "ContinuationAdmissionPolicy": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicy",
-                "ContinuationAdmissionPolicyV2": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV2",
-                "ContinuationAdmissionPolicyV3": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV3",
                 "ContinuationAdmissionPolicyV4": "elspeth.web.composer.continuation_policy.ContinuationAdmissionPolicyV4",
                 "ContinuationActionClock": "elspeth.web.composer.continuation_clock.ContinuationActionClock",
                 "ContinuationActionPolicy": "elspeth.web.composer.continuation_policy.ContinuationActionPolicy",
@@ -33456,25 +33447,24 @@ def test_reserve_scalar_collision_requires_a_source_owned_scalar_read(annotation
 @pytest.mark.parametrize(
     ("annotation", "statement", "admitted"),
     (
-        ("P1 | P2", "return VALUE + 1.0", True),
-        ("P1 | P2 | P3 | P4", 'return f"{VALUE:g} s"', True),
-        ("P4 | (P3 | P2) | P1", "return 1.0 + VALUE", True),
-        ("P1 | Unknown", "return VALUE + 1.0", False),
-        ("P1 | None", "return VALUE + 1.0", False),
-        ("P1 | Foreign", "return VALUE + 1.0", False),
-        ("P1 | P2", "return VALUE()", False),
-        ("P1 | P2", "return VALUE", False),
-        ("P1 | P2", "callback = VALUE\nreturn callback()", False),
-        ("P1 | P2", "ROOT = foreign\nreturn VALUE + 1.0", False),
-        ("P1 | P2", "POLICY.segment = foreign\nreturn VALUE + 1.0", False),
+        ("P4", "return VALUE + 1.0", True),
+        ("P4", 'return f"{VALUE:g} s"', True),
+        ("P4", "return 1.0 + VALUE", True),
+        ("P4 | Unknown", "return VALUE + 1.0", False),
+        ("P4 | None", "return VALUE + 1.0", False),
+        ("P4 | Foreign", "return VALUE + 1.0", False),
+        ("P4", "return VALUE()", False),
+        ("P4", "return VALUE", False),
+        ("P4", "callback = VALUE\nreturn callback()", False),
+        ("P4", "ROOT = foreign\nreturn VALUE + 1.0", False),
+        ("P4", "POLICY.segment = foreign\nreturn VALUE + 1.0", False),
     ),
 )
 def test_reserve_scalar_policy_unions_require_every_owned_arm(receiver_kind, annotation, statement, admitted):
-    policy = _read_source("src/elspeth/web/composer/continuation_policy.py")
+    root = _repo_root()
+    policy = _read_source(root / "src/elspeth/web/composer/continuation_policy.py", anchor=root)
     prefix = (
-        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy as P1, "
-        "ContinuationAdmissionPolicyV2 as P2, ContinuationAdmissionPolicyV3 as P3, "
-        "ContinuationAdmissionPolicyV4 as P4, ContinuationSegmentPolicy\n"
+        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4 as P4, ContinuationSegmentPolicy\n"
         "class Foreign:\n    segment: ContinuationSegmentPolicy\n"
     )
     selected = "selected" if receiver_kind == "parameter" else "self.policy"
@@ -33494,24 +33484,20 @@ def test_reserve_scalar_policy_unions_require_every_owned_arm(receiver_kind, ann
     assert all(_non_landscape_scalar_attribute_read(node, _resolver_for_unit(unit), proof) is admitted for node in reads)
 
 
-@pytest.mark.parametrize(
-    "policy_name",
-    ("ContinuationAdmissionPolicy", "ContinuationAdmissionPolicyV2", "ContinuationAdmissionPolicyV3", "ContinuationAdmissionPolicyV4"),
-)
 @pytest.mark.parametrize("replacement", ("segment: Unknown", "segment = foreign", "def segment(self):\n        return foreign"))
-def test_reserve_scalar_policy_union_refuses_one_changed_live_arm(policy_name, replacement):
-    policy = _read_source("src/elspeth/web/composer/continuation_policy.py")
+def test_reserve_scalar_policy_union_refuses_one_changed_live_arm(replacement):
+    root = _repo_root()
+    policy = _read_source(root / "src/elspeth/web/composer/continuation_policy.py", anchor=root)
     unit = _parse_source(
         "src/elspeth/web/reserve_union_control.py",
-        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, "
-        "ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4\n"
-        "def probe(selected: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4):\n"
+        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4\n"
+        "def probe(selected: ContinuationAdmissionPolicyV4):\n"
         "    return selected.segment.reserve + 1.0\n",
     )
     [read] = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Attribute) and node.attr == "reserve"]
     assert _non_landscape_scalar_attribute_read(read, _resolver_for_unit(unit), _AuthorityProof((policy, unit)))
     changed_tree = copy.deepcopy(policy.tree)
-    owner = next(node for node in changed_tree.body if isinstance(node, ast.ClassDef) and node.name == policy_name)
+    owner = next(node for node in changed_tree.body if isinstance(node, ast.ClassDef) and node.name == "ContinuationAdmissionPolicyV4")
     [field] = [
         node for node in owner.body if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "segment"
     ]
@@ -33535,11 +33521,12 @@ def test_reserve_scalar_policy_union_refuses_one_changed_live_arm(policy_name, r
     ),
 )
 def test_reserve_scalar_policy_union_allows_only_disjoint_declared_self_writes(statement, admitted):
-    policy = _read_source("src/elspeth/web/composer/continuation_policy.py")
+    root = _repo_root()
+    policy = _read_source(root / "src/elspeth/web/composer/continuation_policy.py", anchor=root)
     source = (
-        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV4\n"
+        "from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4\n"
         "class Owner:\n"
-        "    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV4\n"
+        "    policy: ContinuationAdmissionPolicyV4\n"
         "    elapsed: float\n"
         "    def probe(self):\n" + textwrap.indent(statement, "        ") + "\n        return self.policy.segment.reserve + 1.0\n"
     )
@@ -33549,9 +33536,10 @@ def test_reserve_scalar_policy_union_allows_only_disjoint_declared_self_writes(s
 
 
 def test_reserve_scalar_policy_unions_cover_actual_policy_settings_and_sql_deadline():
-    policy = _read_source("src/elspeth/web/composer/continuation_policy.py")
-    settings = _read_source("src/elspeth/web/composer/continuation_policy_settings.py")
-    deadline = _read_source("src/elspeth/web/sessions/continuation_sql_deadline.py")
+    root = _repo_root()
+    policy = _read_source(root / "src/elspeth/web/composer/continuation_policy.py", anchor=root)
+    settings = _read_source(root / "src/elspeth/web/composer/continuation_policy_settings.py", anchor=root)
+    deadline = _read_source(root / "src/elspeth/web/sessions/continuation_sql_deadline.py", anchor=root)
     units = (policy, settings, deadline)
     proof = _AuthorityProof(units)
     for unit, symbol, expected in (

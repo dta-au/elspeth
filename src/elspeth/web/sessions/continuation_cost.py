@@ -21,8 +21,6 @@ from elspeth.web.composer.continuation import (
     PrivateChunkRef,
 )
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -226,15 +224,11 @@ def _require_undispatched_cancellation(conn: Connection, attempt: Row[Any], sour
 
 def read_continuation_cost_snapshot_on_connection(
     conn: Connection, stack: ContinuationFrameStack, *, pending_end_owed_names: frozenset[str] | None = None
-) -> CommonProviderCostSnapshot | None:
+) -> CommonProviderCostSnapshot:
     """Read all physical fences for one original logical operation, in audit order."""
     if type(stack) is not ContinuationFrameStack:
         raise AuditIntegrityError("Continuation cost source requires its actual selected root")
     policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
-    if not isinstance(policy, (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)):
-        if type(stack.provider_cost_policy) is not ContinuationProviderCostPolicyV2:
-            return None
-        raise AuditIntegrityError("legacy Continuation policy gained a current cost owner")
     if (
         type(stack.provider_cost_policy) is not ContinuationProviderCostPolicyV2
         or stack.provider_cost_policy.admission_policy_hash != policy.policy_hash

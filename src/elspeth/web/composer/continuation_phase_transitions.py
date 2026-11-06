@@ -25,7 +25,6 @@ from elspeth.web.composer.continuation_batch_data import (
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -53,7 +52,7 @@ from elspeth.web.sessions.continuation_primary import (
     read_committed_primary_response_for_settlement_on_connection,
     read_committed_primary_response_on_connection,
 )
-from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, refuse_v3_tool_no_execution_on_connection
+from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, refuse_tool_no_execution_on_connection
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_preview_observation import PreviewSourceData
@@ -71,14 +70,14 @@ type BatchTransition = Literal[
 ]
 
 
-def refuse_v3_tool_before_dispatch(
+def refuse_tool_before_dispatch(
     authority: ComposerAsyncOperationAuthority,
     running: ComposerOperationRunning,
     *,
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
 ) -> ToolNoExecutionRefusal:
-    """The V3 tool-ready terminal before preparation, issue or execution."""
+    """The current tool-ready terminal before preparation, issue or execution."""
     if (
         type(authority) is not ComposerAsyncOperationAuthority
         or type(running) is not ComposerOperationRunning
@@ -86,9 +85,9 @@ def refuse_v3_tool_before_dispatch(
         or type(inventory) is not CurrentContinuationEnvInventory
         or inventory.running is not running
     ):
-        raise AuditIntegrityError("V3 tool pre-dispatch refusal lost its actual owners")
+        raise AuditIntegrityError("Tool pre-dispatch refusal lost its actual owners")
     with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
-        return refuse_v3_tool_no_execution_on_connection(conn, running, selected=selected, inventory=inventory)
+        return refuse_tool_no_execution_on_connection(conn, running, selected=selected, inventory=inventory)
 
 
 class ToolIssueSource(ContinuationValue):
@@ -791,7 +790,7 @@ def retain_batch_transition(
         if (
             preview_source is None
             and transition in ("tool_issued", "attachment_prepared", "attachment_reprepared")
-            and type(bounded_policy) in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
+            and type(bounded_policy) is ContinuationAdmissionPolicyV4
         ):
             raise AuditIntegrityError("bounded tool issue requires a complete finite result envelope before dispatch")
         response = (

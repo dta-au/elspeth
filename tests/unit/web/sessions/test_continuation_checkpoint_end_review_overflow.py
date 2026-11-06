@@ -9,7 +9,7 @@ from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_checkpoint_end_dispositions import EndCheckpointPaidOverflowTerminal
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.continuation_checkpoint_end_complete_action import (
     require_original_end_outer_creator_after_paid_overflow_on_connection,
@@ -31,7 +31,7 @@ operation_store = shared_fixture.operation_store
 
 @pytest.mark.asyncio
 async def test_actual_paid_semantic_review_end_overflow_retains_historical_dispatched_source(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=5_000_000))
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=5_000_000))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy

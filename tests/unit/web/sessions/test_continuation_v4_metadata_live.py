@@ -14,13 +14,13 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import EffectFrontierEntry, ToolBatchFrame
 from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, capture_continuation_runtime_owners
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.tool_batch import ContinuationCallState, _prepare_continuation_call_live
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cut
-from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, read_v3_tool_no_execution_refusal_on_connection
+from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, read_tool_no_execution_refusal_on_connection
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composition_states_table as states
@@ -53,7 +53,7 @@ async def _v4_tool_case(
 
     settings_factory = classifier_15s_probe_settings if primary_preparation_probe_15s else continuation_test_settings
     settings = settings_factory(composer_continuation_max_retained_payload_bytes=retained_payload_bytes)
-    policy = continuation_policy_v4_from_settings(settings)
+    policy = continuation_policy_from_settings(settings)
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -185,7 +185,7 @@ async def test_actual_v4_unsupported_tool_is_unissued_cold_terminal(operation_st
         receipt = await owner._execute_one(selected)
         assert type(receipt) is ToolNoExecutionRefusal
         with store[0].connect() as conn:
-            cold = read_v3_tool_no_execution_refusal_on_connection(
+            cold = read_tool_no_execution_refusal_on_connection(
                 conn,
                 session_id=store[4],
                 operation_id=running.claim.operation_id,

@@ -19,8 +19,8 @@ from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_handoff import classify_drain_cut, classify_drain_cut_on_connection
 from elspeth.web.composer.continuation_progress import decode_continuation_frontier
 from elspeth.web.composer.continuation_selection import load_selected_continuation
-from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationReturned
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
+from elspeth.web.required_sql_outcomes import RequiredSQLReturned
 from elspeth.web.sessions import continuation_driver as driver_module
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
 from elspeth.web.sessions.composer_finalization import _message_with_state_response
@@ -32,6 +32,7 @@ from elspeth.web.sessions.models import composer_continuation_chunks_table as ch
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
+from elspeth.web.sessions.service import SessionServiceImpl
 from tests.helpers.composer_operations import message_body
 from tests.helpers.continuation_app import (
     ScriptedSDK,
@@ -62,7 +63,6 @@ async def test_semantic_drain_refuses_unresolved_and_pending_original_work(opera
             return semantic_fixture._reply(json.dumps(semantic_fixture._answer(case["request"])))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        issuer, prepared, dispatched = semantic_fixture._begin(operation_store, case)
 
         async def selected_at(stored):
             return await load_selected_continuation(
@@ -72,22 +72,27 @@ async def test_semantic_drain_refuses_unresolved_and_pending_original_work(opera
                 required_work=case["work"],
             )
 
-        awaiting = await selected_at(dispatched)
-        assert type(awaiting.stack.frames[-1]) is AdvisorFrame
-        assert awaiting.stack.frames[-1].phase == "awaiting_response"
-        before = semantic_fixture._rows(operation_store[0])
-        with pytest.raises(AuditIntegrityError, match="cannot replay unresolved"):
-            classify_drain_cut(awaiting)
-        assert semantic_fixture._rows(operation_store[0]) == before and not calls
+        original_admission = SessionServiceImpl.begin_v4_continuation_semantic_attempt
+        awaiting_cuts = []
 
-        # Finish the actual original invocation; refusal above grants neither
-        # a synthetic settlement nor replacement provider custody.
-        observed = await semantic_fixture._invoke(case, issuer)
-        assert type(observed) is SemanticAdvisorInvocationReturned and len(calls) == 1
-        with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
-            retained = semantic_sql.retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
+        async def observe_admission(self, **values):
+            delivered = await original_admission(self, **values)
+            assert type(delivered) is RequiredSQLReturned
+            admission = delivered.value
+            assert type(admission) is semantic_sql.V4SemanticProviderAdmission
+            awaiting = await selected_at(admission.selected)
+            assert type(awaiting.stack.frames[-1]) is AdvisorFrame
+            assert awaiting.stack.frames[-1].phase == "awaiting_response"
+            before = semantic_fixture._rows(operation_store[0])
+            with pytest.raises(AuditIntegrityError, match="cannot replay unresolved"):
+                classify_drain_cut(awaiting)
+            assert semantic_fixture._rows(operation_store[0]) == before and not calls
+            awaiting_cuts.append(awaiting)
+            return delivered
+
+        monkeypatch.setattr(SessionServiceImpl, "begin_v4_continuation_semantic_attempt", observe_admission)
+        prepared, retained = await semantic_fixture._run_paid_semantic(case, monkeypatch)
+        assert len(awaiting_cuts) == len(calls) == 1
         current = await selected_at(retained.snapshot)
         for phase in ("response_retained", "decision_ready"):
             if phase == "decision_ready":
@@ -101,7 +106,7 @@ async def test_semantic_drain_refuses_unresolved_and_pending_original_work(opera
             before = semantic_fixture._rows(operation_store[0])
             changed = replace(
                 current,
-                stack=current.stack.model_copy(update={"pending_settlement_ids": (observed.result.audit_call.call_id,)}),
+                stack=current.stack.model_copy(update={"pending_settlement_ids": (retained.audit_call.call_id,)}),
             )
             with pytest.raises(AuditIntegrityError):
                 classify_drain_cut(changed)
@@ -131,15 +136,9 @@ async def test_actual_paid_response_and_installed_decision_survive_consecutive_c
             return semantic_fixture._reply(json.dumps(semantic_fixture._answer(case["request"])))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        issuer, prepared, dispatched = semantic_fixture._begin(operation_store, case)
-        observed = await semantic_fixture._invoke(case, issuer)
-        assert type(observed) is SemanticAdvisorInvocationReturned
+        prepared, retained = await semantic_fixture._run_paid_semantic(case, monkeypatch)
         engine, repository, authority, _sessions, sid = operation_store
         running, work, lease = case["running"], case["work"], case["lease"]
-        with locked_session_transaction(engine, str(sid)) as conn:
-            retained = semantic_sql.retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
         stored = retained.snapshot
         original_paid = decode_continuation_snapshot(stored.payload_json)
         try:
@@ -181,7 +180,7 @@ async def test_actual_paid_response_and_installed_decision_survive_consecutive_c
                             conn, running, selected=stored, effect_key=prepared.binding.effect_key
                         )
                         assert paid.paid_root == original_paid
-                        assert paid.audit_call == observed.result.audit_call
+                        assert paid.audit_call == retained.audit_call
                         stored = semantic_sql.install_semantic_advisor_decision_on_connection(
                             conn, running, selected=stored, effect_key=prepared.binding.effect_key
                         )
@@ -189,8 +188,9 @@ async def test_actual_paid_response_and_installed_decision_survive_consecutive_c
                         cold = semantic_sql.read_semantic_advisor_decision_on_connection(
                             conn, running, selected=stored, effect_key=prepared.binding.effect_key
                         )
-                        assert cold.decision == observed.result.decision
-                        assert cold.source.response == observed.result.response.reference
+                        assert cold.decision == retained.decision
+                        assert retained.response is not None
+                        assert cold.source.response == retained.response.reference
             assert len(calls) == 1
             # Corrupt the actual recovered SQL source, never a supplied receipt.
             for corruption in ("event_tag", "generation", "attempt", "root"):
@@ -253,7 +253,7 @@ async def test_actual_paid_response_and_installed_decision_survive_consecutive_c
                         semantic_sql.read_semantic_advisor_decision_on_connection(
                             conn, running, selected=stored, effect_key=prepared.binding.effect_key
                         ).decision
-                        == observed.result.decision
+                        == retained.decision
                     )
             assert len(calls) == 1
         finally:

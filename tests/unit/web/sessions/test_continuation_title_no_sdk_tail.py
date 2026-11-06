@@ -1,19 +1,20 @@
 """The TITLE zero-use alternative is a closed source-bound terminal batch."""
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from uuid import uuid4
 
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v3_from_settings
 from elspeth.web.composer.continuation_title_no_sdk import TitleNoSdkRefusalReason
 from elspeth.web.sessions.continuation_paid_overflow import MODEL_MAX_LENGTH
 from elspeth.web.sessions.continuation_title_no_sdk_tail import build_title_no_sdk_tail_batch, prepare_title_no_sdk_tail_plan
-from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.sessions.test_continuation_title_paid_incomplete_tail import _source
 
 
@@ -74,17 +75,16 @@ def test_title_no_sdk_tail_rejects_unpaid_root_and_foreign_receipt_identity():
 def test_title_no_sdk_tail_refuses_a_historical_v3_policy_and_unbounded_model():
     admitted, identity = _source()
     root = decode_continuation_snapshot(admitted.payload_json)
-    old_policy = continuation_policy_v3_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=20000))
-    assert old_policy is not None
-    historical = replace(
-        admitted,
-        payload_json=encode_continuation_snapshot(
-            root.model_copy(update={"policy_hash": old_policy.policy_hash, "admission_policy_json": old_policy.model_dump_json()})
-        ),
-    )
-    with pytest.raises(AuditIntegrityError, match="original dispatched child"):
+    old_policy = json.loads(root.admission_policy_json)
+    old_policy["schema_version"] = "composer.continuation.policy.v3"
+    old_policy_json = canonical_json(old_policy)
+    old_hash = sha256(old_policy_json.encode("utf-8")).hexdigest()
+    historical_document = json.loads(admitted.payload_json)
+    historical_document.update(policy_hash=old_hash, admission_policy_json=old_policy_json)
+    historical = replace(admitted, payload_json=canonical_json(historical_document))
+    with pytest.raises(AuditIntegrityError, match="unsupported schema version"):
         prepare_title_no_sdk_tail_plan(
-            identity=identity.model_copy(update={"policy_sha256": old_policy.policy_hash}),
+            identity=identity.model_copy(update={"policy_sha256": old_hash}),
             admitted=historical,
             creator_sequence=1,
             requested_model="model",

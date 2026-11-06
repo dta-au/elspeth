@@ -1,4 +1,4 @@
-"""Original metadata tool issue/completion inside a fully admitted V3 tail."""
+"""Original metadata tool issue/completion inside a fully admitted V4 tail."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from elspeth.web.composer.continuation_codec import (
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_phase_transitions import ToolIssueSource, require_tool_issue_on_connection
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -101,7 +100,7 @@ def prepare_metadata_transitions_on_connection(
     policy = decode_continuation_policy(before.admission_policy_json, before.policy_hash)
     top = before.frames[-1]
     if (
-        type(policy) not in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
+        type(policy) is not ContinuationAdmissionPolicyV4
         or type(top) is not ToolBatchFrame
         or top.phase != "tool_ready"
         or top.next_tool_index != 0
@@ -126,7 +125,6 @@ def prepare_metadata_transitions_on_connection(
     if (
         len(calls) != 1
         or calls[0].function.name not in ("set_metadata", "set_pipeline")
-        or (calls[0].function.name == "set_pipeline" and type(policy) is not ContinuationAdmissionPolicyV4)
         or prepared.calls != calls
         or finished.calls != calls
         or call is None

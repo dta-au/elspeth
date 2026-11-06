@@ -24,7 +24,7 @@ from elspeth.web.composer.continuation_checkpoint_projection import (
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import PromptGuardMount
@@ -111,9 +111,7 @@ def _assert_paid(conn, verified):
 
 @pytest.mark.asyncio
 async def test_original_end_incomplete_finishes_after_authenticated_owner_stop(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy

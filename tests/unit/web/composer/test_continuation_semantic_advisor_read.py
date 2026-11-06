@@ -31,12 +31,11 @@ from elspeth.web.sessions.continuation_semantic_actions import (
     prepare_semantic_read_on_connection,
     read_committed_semantic_read_on_connection,
 )
-from elspeth.web.sessions.continuation_semantic_advisor import retain_semantic_advisor_outcome_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from tests.unit.web.composer.test_continuation_semantic_advisor import _reply
 from tests.unit.web.sessions.test_continuation_semantic_actions import _read_answer
-from tests.unit.web.sessions.test_continuation_semantic_advisor import _begin, _invoke, _semantic_case
+from tests.unit.web.sessions.test_continuation_semantic_advisor import _run_paid_semantic, _semantic_case
 from tests.unit.web.sessions.test_continuation_semantic_advisor import operation_store as _operation_store
 
 operation_store = _operation_store
@@ -100,13 +99,8 @@ async def _prepared_read(store, tmp_path, monkeypatch):
             return _reply(json.dumps(_read_answer(case["request"])))
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        issuer, prepared, dispatched = _begin(store, case)
-        observed = await _invoke(case, issuer)
+        prepared, retained = await _run_paid_semantic(case, monkeypatch)
         sid = str(store[4])
-        with locked_session_transaction(store[0], sid) as conn:
-            retained = retain_semantic_advisor_outcome_on_connection(
-                conn, prepared, selected=dispatched, outcome=observed, recorder=case["recorder"], issuer=issuer
-            )
         with locked_session_transaction(store[0], sid) as conn:
             installed = install_semantic_action_on_connection(
                 conn, case["running"], selected=retained.snapshot, effect_key=prepared.binding.effect_key

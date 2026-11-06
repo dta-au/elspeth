@@ -35,6 +35,7 @@ from elspeth.web.composer.continuation_checkpoint_end_dispositions import (
 )
 from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointPaidIncompleteTerminal
 from elspeth.web.composer.continuation_clock import ContinuationActionClock, ContinuationTimingObservation, SegmentFit, admit_action
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_composition_initialization import initialize_continuation_composition
 from elspeth.web.composer.continuation_control_transitions import StoredContinuationControlIntent, read_pending_control_on_connection
 from elspeth.web.composer.continuation_env_inventory import read_disposition_env_names
@@ -54,6 +55,7 @@ from elspeth.web.composer.continuation_selection import SelectedContinuationStat
 from elspeth.web.composer.continuation_semantic_advisor_phase import (
     SemanticAdvisorNoSdkTerminal,
     SemanticAdvisorPaidIncompleteTerminal,
+    SemanticAdvisorPaidInvalidTerminal,
     SemanticAdvisorPaidTerminal,
     run_continuation_semantic_advisor,
     run_prescribed_semantic_read,
@@ -105,9 +107,7 @@ from elspeth.web.sessions.continuation import (
     ComposerSegmentSuspendObservation,
     ComposerSegmentYieldReceipt,
     StoredContinuationSnapshot,
-    V3UnboundedTailRefusal,
     _require_current_continuation_running,
-    read_v3_retained_tail_refusal_on_connection,
 )
 from elspeth.web.sessions.continuation_checkpoint_early_owed_overflow import (
     read_v4_checkpoint_early_owed_overflow_terminal_on_connection,
@@ -181,6 +181,7 @@ from elspeth.web.sessions.continuation_sdk_terminal_result import (
     SdkTerminalResult,
     VerifiedSdkTerminal,
 )
+from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, _paid_result_data
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_terminal import read_v4_semantic_paid_incomplete_terminal_on_connection
 from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import (
     VerifiedSemanticPaidOverflowTerminal,
@@ -196,7 +197,7 @@ from elspeth.web.sessions.continuation_title_paid_overflow_terminal import (
     read_v4_title_paid_overflow_terminal_on_connection,
 )
 from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
-from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, read_v3_tool_no_execution_refusal_on_connection
+from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, read_tool_no_execution_refusal_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction, session_data_read_transaction
 from elspeth.web.sessions.schemas import SendMessageRequest
 
@@ -431,6 +432,7 @@ type _ActionResult = (
     | _TitleNoSdkResult
     | SemanticAdvisorPaidTerminal
     | SemanticAdvisorPaidIncompleteTerminal
+    | SemanticAdvisorPaidInvalidTerminal
     | EarlyCheckpointPaidIncompleteTerminal
     | EarlyCheckpointPaidOverflowTerminal
     | EarlyCheckpointOwedOverflowTerminal
@@ -449,7 +451,6 @@ type _ActionResult = (
     | SdkTerminalResult
     | SdkTerminalFailure
     | SemanticAdvisorNoSdkTerminal
-    | V3UnboundedTailRefusal
     | ToolNoExecutionRefusal
     | ObservedClassifierReplyDeadline
     | None
@@ -1094,7 +1095,7 @@ class _SegmentDriver:
 
         def verify_tool_refusal() -> ToolNoExecutionRefusal:
             with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
-                actual = read_v3_tool_no_execution_refusal_on_connection(
+                actual = read_tool_no_execution_refusal_on_connection(
                     conn,
                     session_id=self.running.claim.session_id,
                     operation_id=self.running.claim.operation_id,
@@ -1308,8 +1309,6 @@ class _SegmentDriver:
                     prepared = await prepare_current_title_provider(
                         service=self.service, authority=self.authority, selected=stored, required_work=self.work
                     )
-                    if isinstance(prepared, V3UnboundedTailRefusal):
-                        return prepared
                     title_result = await run_prepared_title_provider(prepared=prepared, invocation_owner=self.provider)
                     if isinstance(title_result, (SdkTerminalResult, SdkTerminalFailure)):
                         return title_result
@@ -1387,7 +1386,6 @@ class _SegmentDriver:
                     PrimaryPaidIncompleteTerminal,
                     PrimarySdkTerminal,
                     SdkTerminalFailure,
-                    V3UnboundedTailRefusal,
                 ),
             ):
                 return primary_result
@@ -1874,6 +1872,12 @@ class _SegmentDriver:
             original: BaseException | None = None
             try:
                 result = await self.lease.join_continuation_stage(stage_owner)
+                if type(result) is SemanticAdvisorPaidInvalidTerminal and not any(
+                    result.original_error is previous for previous in self._consumed_native
+                ):
+                    # The actual paid return already owns this failure. Keep
+                    # it before watcher cleanup or cold verification can fail.
+                    self._consumed_native.append(result.original_error)
             except (SessionOperationFenceLost, ComposerOperationFenceLost) as error:
                 original = error
                 _log_continuation_failure(
@@ -2347,6 +2351,42 @@ class _SegmentDriver:
                         _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
                     )
                     return ContinuationSegmentSettled(terminal)
+                if type(result) is SemanticAdvisorPaidInvalidTerminal:
+                    invalid_paid = result.paid
+
+                    def verify_semantic_paid_invalid(
+                        expected: SemanticAdvisorProviderResult = invalid_paid,
+                    ) -> SemanticAdvisorProviderResult:
+                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                            actual, _data, _root = _paid_result_data(
+                                conn,
+                                str(self.running.claim.session_id),
+                                self.running.claim.operation_id,
+                                expected.snapshot,
+                                decode_continuation_snapshot(expected.snapshot.payload_json),
+                                expected.effect_key,
+                            )
+                        if actual != expected:
+                            raise AuditIntegrityError("Semantic paid invalid lost its exact original cold result")
+                        return actual
+
+                    self.sql_deadline.begin_settlement()
+                    await _registered(
+                        work=self.work,
+                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+                        operation=verify_semantic_paid_invalid,
+                        expected=SemanticAdvisorProviderResult,
+                    )
+                    terminal = await self.record()
+                    if terminal.status != "failed" or terminal.journal_cursor != invalid_paid.snapshot.cursor + 1:
+                        raise AuditIntegrityError("Semantic paid invalid lost its atomic original failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        terminal,
+                        _StartedSettlement(terminal_receipt=terminal, deferred_cancellations=list(result.deferred_cancellations)),
+                    )
+                    return ContinuationSegmentSettled(terminal)
                 if type(result) is SemanticAdvisorPaidIncompleteTerminal:
                     semantic_incomplete_result = result
 
@@ -2616,35 +2656,6 @@ class _SegmentDriver:
                     return ContinuationSegmentSettled(terminal)
                 if type(result) is ToolNoExecutionRefusal:
                     return await self.consume_tool_refusal(result)
-                if isinstance(result, V3UnboundedTailRefusal):
-                    refusal = result
-
-                    def verify_refusal(expected_refusal: V3UnboundedTailRefusal = refusal) -> V3UnboundedTailRefusal:
-                        with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
-                            actual = read_v3_retained_tail_refusal_on_connection(
-                                conn, session_id=self.running.claim.session_id, operation_id=self.running.claim.operation_id
-                            )
-                        if actual is None or actual != expected_refusal:
-                            raise AuditIntegrityError("V3 unpaid refusal lost its exact original cold source")
-                        return actual
-
-                    self.sql_deadline.begin_settlement()
-                    await _registered(
-                        work=self.work,
-                        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
-                        operation=verify_refusal,
-                        expected=V3UnboundedTailRefusal,
-                    )
-                    terminal = await self.record()
-                    if terminal.status != "failed" or (terminal.checkpoint_id, terminal.journal_cursor) != (
-                        result.terminal.checkpoint_id,
-                        result.terminal.cursor,
-                    ):
-                        raise AuditIntegrityError("V3 unpaid refusal lost its actual committed failed terminal")
-                    await self.worker._verify_terminal_before_release(
-                        self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal)
-                    )
-                    return ContinuationSegmentSettled(terminal)
                 if type(result) is SemanticAdvisorNoSdkTerminal:
                     if result.terminal.status != "failed":
                         raise AuditIntegrityError("Semantic no-SDK close lost its actual failed terminal")

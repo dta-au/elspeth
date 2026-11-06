@@ -33,7 +33,7 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, decode_retained_physical_audit_call
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import PromptGuardMount
@@ -107,9 +107,7 @@ async def test_actual_semantic_review_repair_preserves_paid_lineage_without_anot
     from tests.unit.web.sessions import test_continuation_end_shared_execution as shared_fixture
     from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -393,7 +391,7 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
     replacement_overflow,
     replacement_commit,
 ):
-    policy = continuation_policy_v4_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=allowance))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy

@@ -28,7 +28,7 @@ from elspeth.web.composer.continuation_batch_data import (
 )
 from elspeth.web.composer.continuation_codec import owned_json
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime, build_runtime_tool_batch_context
 from elspeth.web.composer.continuation_tool_receipts import RetainedToolReceipt, capture_tool_receipt, encode_retained_tool_receipt
 from elspeth.web.composer.discovery_cache import serialize_tool_result
@@ -149,12 +149,11 @@ async def prepare_memory_tool_call(
         raise AuditIntegrityError("metadata preparation reused an original mutable owner")
     calls = call_model.completion.tool_batch.calls
     if (
-        type(runtime.source.policy) not in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4)
+        type(runtime.source.policy) is not ContinuationAdmissionPolicyV4
         or len(calls) != 1
         or calls != data.calls
         or calls[0] is not data.calls[0]
         or calls[0].function.name != tool_name
-        or (tool_name == "set_pipeline" and type(runtime.source.policy) is not ContinuationAdmissionPolicyV4)
         or batch.phase != "call_ready"
         or batch.next_tool_index != 0
         or batch.current_call is not None

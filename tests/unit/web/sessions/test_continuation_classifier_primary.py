@@ -20,15 +20,15 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
-from elspeth.web.composer.continuation_policy import decode_continuation_policy
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
+from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
+from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
-from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import _usage_entry_id
-from elspeth.web.required_work import required_failure_leaves
 from elspeth.web.sessions import continuation_classifier_primary as classifier
+from elspeth.web.sessions import continuation_classifier_primary_finalization as classifier_finalization
 from elspeth.web.sessions import continuation_iteration_return as stages
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.composer_operations import COMPOSER_CANCEL_REQUESTED, ComposerOperationCancelledDuringTurn
@@ -42,13 +42,14 @@ from elspeth.web.sessions.models import composer_continuation_chunks_table as ch
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_continuation_provider_ordinals_table as ordinals
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
+from elspeth.web.sessions.models import quota_provider_attempts_table as attempts
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.time_normalization import restore_utc
-from tests.helpers.continuation_policy import classifier_15s_probe_settings, continuation_test_settings
+from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.sessions import test_continuation_composition_initialization as initialization
-from tests.unit.web.sessions import test_continuation_initialization as bootstrap_fixture
 from tests.unit.web.sessions import test_continuation_live_phases as live_fixture
-from tests.unit.web.sessions.test_continuation_iteration_stages import _applied_case
+from tests.unit.web.sessions import test_continuation_v4_metadata_live as metadata_fixture
 from tests.unit.web.sessions.test_continuation_iteration_stages import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver
@@ -57,29 +58,32 @@ operation_store = _operation_store
 
 
 @asynccontextmanager
-async def _classifier_15s_case(store, tmp_path, monkeypatch):
-    """Admit an authentic V2 classifier with one explicit test-only PRIMARY bound."""
-    settings = classifier_15s_probe_settings()
-    policy = continuation_policy_from_settings(settings)
-    assert policy.actions.primary.preparation == 15.0
-    authority = ComposerAsyncOperationAuthority(
-        store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
-    )
-    original_input = live_fixture.initialized_primary_input
-
-    async def with_primary_probe(current_store, current_tmp_path, current_monkeypatch, *, settings_overrides=None):
-        overrides = {**(settings_overrides or {}), "composer_continuation_action_bounds": settings.composer_continuation_action_bounds}
-        return await original_input(current_store, current_tmp_path, current_monkeypatch, settings_overrides=overrides)
-
-    monkeypatch.setattr(bootstrap_fixture, "minimal_continuation_policy", lambda: policy)
-    monkeypatch.setattr(live_fixture, "initialized_primary_input", with_primary_probe)
-    probe_store = (store[0], store[1], authority, store[3], store[4])
-    async with _classifier_case(probe_store, tmp_path, monkeypatch) as case:
-        yield case
+async def _applied_case(store, tmp_path, monkeypatch, *, retained_payload_bytes=16 * 1_048_576, primary_preparation_probe_15s=False):
+    """Real current set_metadata/P4 source; specialized trials explicitly select their probe."""
+    async with metadata_fixture._v4_tool_case(
+        store,
+        tmp_path,
+        monkeypatch,
+        tool="set_metadata",
+        primary_preparation_probe_15s=primary_preparation_probe_15s,
+        retained_payload_bytes=retained_payload_bytes,
+    ) as (current_store, owner, running, sdk):
+        await live_fixture._advance(owner)
+        stored = owner.latest_snapshot
+        assert stored is not None and owner.finished_batch is None
+        selected = await load_selected_continuation(authority=owner.authority, running=running, selected=stored, required_work=owner.work)
+        cold = ContinuationLivePhases(owner.service, owner.authority, owner.work, owner.provider_owner, owner.lease)
+        runtime, inventory = await cold.current(selected)
+        assert type(runtime.source.policy) is ContinuationAdmissionPolicyV4
+        assert runtime.source.policy.actions.primary.preparation == (15.0 if primary_preparation_probe_15s else 5.0)
+        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+        assert current_store[0] is store[0] and len(sdk) == 1
+        yield cold, running, selected, inventory, captured, sdk
+    owner.work.coordinator.assert_completed()
 
 
 @asynccontextmanager
-async def _classifier_case(store, tmp_path, monkeypatch):
+async def _classifier_case(store, tmp_path, monkeypatch, *, retained_payload_bytes=16 * 1_048_576, primary_preparation_probe_15s=False):
     actual_work = initialization.inventory_work
 
     def timed_work(running):
@@ -107,7 +111,20 @@ async def _classifier_case(store, tmp_path, monkeypatch):
         return actual_work(running, sql_deadline_owner=owner)
 
     monkeypatch.setattr(initialization, "inventory_work", timed_work)
-    async with _applied_case(store, tmp_path, monkeypatch) as (phases, running, selected, _inventory, _captured, prior_sdk):
+    async with _applied_case(
+        store,
+        tmp_path,
+        monkeypatch,
+        retained_payload_bytes=retained_payload_bytes,
+        primary_preparation_probe_15s=primary_preparation_probe_15s,
+    ) as (
+        phases,
+        running,
+        selected,
+        _inventory,
+        _captured,
+        prior_sdk,
+    ):
         timing = phases.work.coordinator.sql_deadline_owner
         assert type(timing) is ContinuationSQLDeadlineOwner
         # A cold applied-P4 runtime still carries the prepublication Compose
@@ -181,7 +198,14 @@ async def _invoke(issuer, runtime, prepared, *, branch="composition_last_chance"
 @pytest.mark.asyncio
 @pytest.mark.parametrize("branch", ("staged_review", "composition_last_chance"))
 async def test_classifier_retains_actual_sdk_source_cost_and_next_shared_primary_ordinal(operation_store, tmp_path, monkeypatch, branch):
-    async with _classifier_15s_case(operation_store, tmp_path, monkeypatch) as (phases, running, runtime, issuer, prepared, prior_sdk):
+    async with _classifier_case(operation_store, tmp_path, monkeypatch, primary_preparation_probe_15s=True) as (
+        phases,
+        running,
+        runtime,
+        issuer,
+        prepared,
+        prior_sdk,
+    ):
         assert len(prior_sdk) == 1
         physical = []
         with operation_store[0].connect() as conn:
@@ -300,7 +324,7 @@ async def test_classifier_fresh_clock_cannot_renew_expired_original_action(opera
         monkeypatch.setattr(litellm, "acompletion", forbidden)
         timing = phases.work.coordinator.sql_deadline_owner
         assert type(timing) is ContinuationSQLDeadlineOwner
-        assert timing.policy.actions.primary.preparation == 15.0
+        assert timing.policy.actions.primary.preparation == 5.0
         timing.begin_action(timing.policy.actions.primary, started_at=time.monotonic() - timing.policy.actions.primary.total - 1)
         before = stored_rows(operation_store[0])
         with pytest.raises(TimeoutError, match="expired before preparation"):
@@ -329,7 +353,7 @@ def read_chunk_text(conn, running, digest):
 async def test_classifier_publication_refuses_equal_copy_before_original_positive(operation_store, tmp_path, monkeypatch, changed):
     async with _classifier_case(operation_store, tmp_path, monkeypatch) as (phases, _running, runtime, issuer, prepared, _prior_sdk):
         physical, refused = [], []
-        actual_publish = classifier.publish_classifier_primary_on_connection
+        actual_publish = classifier_finalization.publish_classifier_primary_on_connection
 
         async def completion(**kwargs):
             physical.append(kwargs)
@@ -345,7 +369,7 @@ async def test_classifier_publication_refuses_equal_copy_before_original_positiv
             return actual_publish(conn, original, **kwargs)
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        monkeypatch.setattr(classifier, "publish_classifier_primary_on_connection", observe)
+        monkeypatch.setattr(classifier_finalization, "publish_classifier_primary_on_connection", observe)
         result = await _invoke(issuer, runtime, prepared)
         assert issuer.result is result and len(physical) == len(refused) == 1
         phases.work.coordinator.assert_completed()
@@ -473,7 +497,7 @@ async def test_classifier_publication_rollback_preserves_original_failure_and_pa
     async with _classifier_case(operation_store, tmp_path, monkeypatch) as (phases, running, runtime, issuer, prepared, _prior_sdk):
         physical = []
         original = RuntimeError("original classifier publication transaction rollback")
-        actual_publish = classifier.publish_classifier_primary_on_connection
+        actual_publish = classifier_finalization.publish_classifier_primary_on_connection
 
         async def completion(**kwargs):
             physical.append(kwargs)
@@ -484,14 +508,19 @@ async def test_classifier_publication_rollback_preserves_original_failure_and_pa
             raise original
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        monkeypatch.setattr(classifier, "publish_classifier_primary_on_connection", rollback)
+        monkeypatch.setattr(classifier_finalization, "publish_classifier_primary_on_connection", rollback)
         with pytest.raises(RuntimeError) as failed:
             await _invoke(issuer, runtime, prepared)
         assert failed.value is original and issuer.result is None
         assert issuer.sdk_entered and len(physical) == 1
         with operation_store[0].connect() as conn:
             actual = conn.execute(select(effects).where(effects.c.owner == "provider", effects.c.disposition == "dispatched")).one()
-            assert actual.receipt_key is actual.result_chunk_key is actual.provider_attempt_id is None
+            assert actual.receipt_key is actual.result_chunk_key is None
+            assert actual.provider_attempt_id is not None
+            hold = conn.execute(select(holds).where(holds.c.effect_key == actual.effect_key)).one()
+            attempt = conn.execute(select(attempts).where(attempts.c.attempt_id == actual.provider_attempt_id)).one()
+            assert hold.state == "active" and hold.provider_attempt_id == actual.provider_attempt_id
+            assert attempt.settled_at is None and attempt.ledger_entry_id is None
             current = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
             assert current.cursor == issuer.selected.stack.cursor + 2
             with pytest.raises(AuditIntegrityError):
@@ -509,7 +538,7 @@ async def test_classifier_cancellation_joins_committed_actual_response_without_r
     async with _classifier_case(operation_store, tmp_path, monkeypatch) as (phases, running, runtime, issuer, prepared, _prior_sdk):
         physical = []
         entered, release = threading.Event(), threading.Event()
-        actual_publish = classifier.publish_classifier_primary_on_connection
+        actual_publish = classifier_finalization.publish_classifier_primary_on_connection
 
         async def completion(**kwargs):
             physical.append(kwargs)
@@ -521,7 +550,7 @@ async def test_classifier_cancellation_joins_committed_actual_response_without_r
             return actual_publish(*args, **kwargs)
 
         monkeypatch.setattr(litellm, "acompletion", completion)
-        monkeypatch.setattr(classifier, "publish_classifier_primary_on_connection", held_publish)
+        monkeypatch.setattr(classifier_finalization, "publish_classifier_primary_on_connection", held_publish)
         task = asyncio.create_task(_invoke(issuer, runtime, prepared))
         try:
             reached = await asyncio.to_thread(entered.wait, 15)
@@ -531,22 +560,19 @@ async def test_classifier_cancellation_joins_committed_actual_response_without_r
             task.cancel(COMPOSER_CANCEL_REQUESTED)
             await asyncio.sleep(0)
             release.set()
-            with pytest.raises(BaseException) as original:
-                await task
-            assert any(
-                isinstance(leaf, asyncio.CancelledError) and leaf.args == (COMPOSER_CANCEL_REQUESTED,)
-                for leaf in required_failure_leaves(original.value)
-            )
-            result = issuer.result
-            assert result is not None and issuer.sdk_entered and len(physical) == 1
+            result = await task
+            assert result is issuer.result and issuer.sdk_entered and len(physical) == 1
+            assert len(result.deferred_cancellations) == 1
+            original = result.deferred_cancellations[0]
+            assert type(original) is asyncio.CancelledError and original.args == (COMPOSER_CANCEL_REQUESTED,)
             with locked_session_transaction(operation_store[0], str(running.claim.session_id)) as conn:
                 cold = classifier.read_original_classifier_primary_on_connection(
                     conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, effect_key=result.effect_key
                 )
                 assert cold == result
-            with pytest.raises(BaseException) as repeated:
+            with pytest.raises(AuditIntegrityError, match="cannot issue or replay"):
                 await _invoke(issuer, runtime, prepared)
-            assert repeated.value is original.value and len(physical) == 1
+            assert result.deferred_cancellations[0] is original and len(physical) == 1
         finally:
             release.set()
             if not task.done():

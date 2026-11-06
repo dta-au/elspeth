@@ -46,9 +46,9 @@ class ProspectiveContinuationChunk:
 
 @dataclass(frozen=True, slots=True)
 class ContinuationReadContract:
-    version: str
-    policy_hash: str | None
-    allowance: int | None
+    version: Literal["composer.continuation.policy.v4"]
+    policy_hash: str
+    allowance: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,17 +93,10 @@ def load_continuation_read_contract(conn: Connection, *, session_id: str, operat
     version = row.continuation_policy_version
     digest = row.continuation_policy_sha256
     allowance = row.continuation_retained_payload_limit_bytes
-    if version in ("composer.continuation.policy.v1", "composer.continuation.policy.v2"):
-        if digest is not None or allowance is not None:
-            raise AuditIntegrityError("legacy continuation has a V3 read contract")
-    elif version == "composer.continuation.policy.v3":
-        if type(digest) is not str or len(digest) != 64 or type(allowance) is not int or allowance <= 0:
-            raise AuditIntegrityError("V3 continuation lost its original read contract")
-    elif version == "composer.continuation.policy.v4":
-        if type(digest) is not str or len(digest) != 64 or type(allowance) is not int or allowance <= 0:
-            raise AuditIntegrityError("V4 continuation lost its original read contract")
-    else:
-        raise AuditIntegrityError("continuation read contract is unclassified")
+    if version != "composer.continuation.policy.v4":
+        raise AuditIntegrityError("continuation read contract has an unsupported policy version")
+    if type(digest) is not str or len(digest) != 64 or type(allowance) is not int or allowance <= 0:
+        raise AuditIntegrityError("V4 continuation lost its original read contract")
     return ContinuationReadContract(version, digest, allowance)
 
 
@@ -153,8 +146,6 @@ def _live_provider_hold_bytes(conn: Connection, *, session_id: str, operation_id
         )
     )
     for row in rows:
-        if contract.version != "composer.continuation.policy.v4":
-            raise AuditIntegrityError("legacy continuation acquired a paid-provider terminal hold")
         if (
             row.policy_sha256 != contract.policy_hash
             or row.allowance_bytes != contract.allowance
@@ -632,16 +623,11 @@ def admit_retained_payload_chunks(
     if not conn.in_transaction():
         raise AuditIntegrityError("retained capacity admission requires the original SQL transaction")
     contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
-    if (
-        contract.version in ("composer.continuation.policy.v3", "composer.continuation.policy.v4")
-        and retained_payload_limit_bytes != contract.allowance
-    ):
+    if retained_payload_limit_bytes != contract.allowance:
         raise AuditIntegrityError("bounded retained payload allowance differs from original admission")
     if type(_new_hold_bytes) is not int or _new_hold_bytes < 0:
         raise ValueError("new provider hold bytes must be an exact nonnegative integer")
-    if _new_hold_bytes and contract.version != "composer.continuation.policy.v4":
-        raise AuditIntegrityError("only V4 may reserve a paid-provider terminal hold")
-    read_bound = contract.allowance if contract.version in ("composer.continuation.policy.v3", "composer.continuation.policy.v4") else None
+    read_bound = contract.allowance
     if conn.dialect.name == "postgresql":
         actual_length = func.octet_length(chunks.c.payload)
     elif conn.dialect.name == "sqlite":
@@ -683,27 +669,9 @@ def admit_retained_payload_chunks(
 
     for key in existing_keys:
         item = new_by_key[key]
-        if read_bound is not None:
-            old_bounded = read_bounded_retained_chunk(conn, session_id=session_id, operation_id=operation_id, key=key, allowance=read_bound)
-            if old_bounded is None or old_bounded != item:
-                raise AuditIntegrityError("immutable chunk collision")
-        else:
-            old = conn.execute(
-                select(chunks).where(
-                    chunks.c.session_id == session_id,
-                    chunks.c.operation_id == operation_id,
-                    chunks.c.chunk_key == key,
-                )
-            ).one()
-            if (
-                type(old.payload) is not bytes
-                or old.payload != item.payload
-                or old.sha256 != sha256(old.payload).hexdigest()
-                or old.sha256 != sha256(item.payload).hexdigest()
-                or old.byte_length != len(item.payload)
-                or old.codec != item.codec
-            ):
-                raise AuditIntegrityError("immutable chunk collision")
+        old_bounded = read_bounded_retained_chunk(conn, session_id=session_id, operation_id=operation_id, key=key, allowance=read_bound)
+        if old_bounded is None or old_bounded != item:
+            raise AuditIntegrityError("immutable chunk collision")
 
     added = sum(len(item.payload) for key, item in new_by_key.items() if key not in existing_keys)
     from elspeth.web.sessions.continuation_preview_result import (
@@ -733,26 +701,6 @@ def admit_retained_payload_chunks(
         # An ordinary fresh overflow must not conceal a corrupt old digest.
         # Fetch one row at a time; never materialize the entire history here.
         for key in stored_keys:
-            if read_bound is not None:
-                if (
-                    read_bounded_retained_chunk(conn, session_id=session_id, operation_id=operation_id, key=key, allowance=read_bound)
-                    is None
-                ):
-                    raise AuditIntegrityError("retained chunk disappeared during capacity admission")
-            else:
-                row = conn.execute(
-                    select(chunks.c.payload, chunks.c.sha256, chunks.c.codec, chunks.c.byte_length).where(
-                        chunks.c.session_id == session_id,
-                        chunks.c.operation_id == operation_id,
-                        chunks.c.chunk_key == key,
-                    )
-                ).one()
-                if (
-                    type(row.payload) is not bytes
-                    or type(row.codec) is not str
-                    or not row.codec
-                    or len(row.payload) != row.byte_length
-                    or sha256(row.payload).hexdigest() != row.sha256
-                ):
-                    raise AuditIntegrityError("retained chunk digest or binding mismatch")
+            if read_bounded_retained_chunk(conn, session_id=session_id, operation_id=operation_id, key=key, allowance=read_bound) is None:
+                raise AuditIntegrityError("retained chunk disappeared during capacity admission")
         raise ContinuationRetainedCapacityExceeded(observed_bytes=observed_bytes, limit_bytes=retained_payload_limit_bytes)

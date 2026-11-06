@@ -1,4 +1,4 @@
-"""Original V3 tool call refusal before preparation, issue, or execution."""
+"""Original V4 tool call refusal before preparation, issue, or execution."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from elspeth.web.composer.continuation_codec import (
 )
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
@@ -100,7 +99,7 @@ def _selected_call(
         raise AuditIntegrityError("V3 tool refusal lost its unissued complete source")
     matches = tuple(chunk for chunk in selected.chunks if chunk.reference == frame.accumulator)
     if len(matches) != 1:
-        raise AuditIntegrityError("V3 tool refusal lost its exact selected batch chunk")
+        raise AuditIntegrityError("V4 tool refusal lost its exact selected batch chunk")
     data = decode_coupled_batch_chunk(matches[0], env_ref_names=names)
     response = read_committed_primary_response_on_connection(conn, running, selected=selected, reference=frame.response)
     calls = decode_continuation_response(response).tool_batch.calls
@@ -111,15 +110,15 @@ def _selected_call(
         or data.batch.next_tool_index != frame.next_tool_index
         or frame.next_tool_index >= len(calls)
     ):
-        raise AuditIntegrityError("V3 tool refusal lost its exact next provider-authored call")
+        raise AuditIntegrityError("V4 tool refusal lost its exact next provider-authored call")
     call = calls[frame.next_tool_index]
     effect_key = f"tool:{frame.response.digest}:{frame.next_tool_index}"
     if any(entry.effect_id == effect_key for entry in root.effect_frontier):
-        raise AuditIntegrityError("V3 tool refusal found an already issued current call")
+        raise AuditIntegrityError("V4 tool refusal found an already issued current call")
     return frame, data, call, effect_key
 
 
-def refuse_v3_tool_no_execution_on_connection(
+def refuse_tool_no_execution_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
     *,
@@ -131,7 +130,7 @@ def refuse_v3_tool_no_execution_on_connection(
     from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 
     if type(running) is not ComposerOperationRunning or type(selected) is not SelectedContinuationState or inventory.running is not running:
-        raise AuditIntegrityError("V3 tool refusal requires its actual original live owners")
+        raise AuditIntegrityError("V4 tool refusal requires its actual original live owners")
     _require_current_continuation_running(conn, running)
     root = selected.stack
     sid, operation = str(running.claim.session_id), running.claim.operation_id
@@ -140,27 +139,27 @@ def refuse_v3_tool_no_execution_on_connection(
     )
     source = load_snapshot(conn, session_id=sid, operation_id=operation)
     if source.checkpoint_id != selected.checkpoint_id or source.payload_json != encode_continuation_snapshot(root):
-        raise AuditIntegrityError("V3 tool refusal changed its exact current selected root")
+        raise AuditIntegrityError("V4 tool refusal changed its exact current selected root")
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
     if (
-        (type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4)
+        type(policy) is not ContinuationAdmissionPolicyV4
         or parent.status != "running"
         or parent.continuation_policy_version != policy.schema_version
         or parent.continuation_policy_sha256 != policy.policy_hash
         or parent.continuation_retained_payload_limit_bytes != policy.max_retained_payload_bytes
     ):
-        raise AuditIntegrityError("V3 tool refusal lacks its original persisted admission")
+        raise AuditIntegrityError("V4 tool refusal lacks its original persisted admission")
     frame, _data, call, effect_key = _selected_call(conn, running, selected, inventory.names)
     if conn.execute(
         select(effects.c.effect_key).where(
             effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == effect_key
         )
     ).first():
-        raise AuditIntegrityError("V3 tool refusal found an existing current effect")
+        raise AuditIntegrityError("V4 tool refusal found an existing current effect")
     input_hash = stable_hash({"tool_call_id": call.id, "name": call.function.name, "arguments": call.function.arguments})
     public_error = project_composer_operation_error(
-        AuditIntegrityError("V3 tool result has no proven finite retained tail"), request_id=parent.request_id
+        AuditIntegrityError("V4 tool result has no proven finite retained tail"), request_id=parent.request_id
     )
     selected_error = _select_failure_on_connection(parent, public_error, authoritative_failure=False)
     receipt = ToolNoExecutionRefusal(
@@ -234,7 +233,7 @@ def refuse_v3_tool_no_execution_on_connection(
         prospective_append=prepared_append,
     )
     if len(prepared_settlement.append.events) != 1 or prepared_settlement.append.events[0].tag != "settled":
-        raise AuditIntegrityError("V3 tool refusal cannot settle another unresolved effect")
+        raise AuditIntegrityError("V4 tool refusal cannot settle another unresolved effect")
     admit_prepared_no_dispatch_tail_on_connection(
         conn,
         receipt=ProspectiveContinuationChunk(result_chunk_key, chunk.canonical.encode("utf-8"), chunk.reference.codec),
@@ -278,11 +277,11 @@ def refuse_v3_tool_no_execution_on_connection(
         conn, running, outcome=selected_error, authoritative_failure=True, prepared_settlement=prepared_settlement
     )
     if terminal.status != "failed" or terminal.journal_cursor != refused.cursor + 1:
-        raise AuditIntegrityError("V3 tool refusal did not atomically settle its failed terminal")
+        raise AuditIntegrityError("V4 tool refusal did not atomically settle its failed terminal")
     return receipt
 
 
-def read_v3_tool_no_execution_refusal_on_connection(
+def read_tool_no_execution_refusal_on_connection(
     conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, env_ref_names: frozenset[str]
 ) -> ToolNoExecutionRefusal | None:
     """Cold terminal proof for one provider-authored call that never issued."""
@@ -293,14 +292,14 @@ def read_v3_tool_no_execution_refusal_on_connection(
     terminal = load_snapshot(conn, session_id=sid, operation_id=operation_id)
     root = decode_continuation_snapshot(terminal.payload_json)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
-    if type(policy) is not ContinuationAdmissionPolicyV3 and type(policy) is not ContinuationAdmissionPolicyV4:
+    if type(policy) is not ContinuationAdmissionPolicyV4:
         return None
     if (
         parent.continuation_policy_version != policy.schema_version
         or parent.continuation_policy_sha256 != policy.policy_hash
         or parent.continuation_retained_payload_limit_bytes != policy.max_retained_payload_bytes
     ):
-        raise AuditIntegrityError("V3 tool refusal changed its original persisted admission")
+        raise AuditIntegrityError("V4 tool refusal changed its original persisted admission")
     effect = conn.execute(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation_id, effects.c.effect_key == effect_key)
     ).one_or_none()
@@ -319,14 +318,14 @@ def read_v3_tool_no_execution_refusal_on_connection(
         or effect.receipt_key is None
         or effect.result_chunk_key is None
     ):
-        raise AuditIntegrityError("V3 tool refusal changed its unissued effect")
+        raise AuditIntegrityError("V4 tool refusal changed its unissued effect")
     codec = conn.execute(
         select(chunks.c.codec).where(
             chunks.c.session_id == sid, chunks.c.operation_id == operation_id, chunks.c.chunk_key == effect.result_chunk_key
         )
     ).scalar_one_or_none()
     if codec != "composer.tool-no-execution-refusal.v1":
-        raise AuditIntegrityError("V3 tool refusal lost its exact result codec")
+        raise AuditIntegrityError("V4 tool refusal lost its exact result codec")
     try:
         canonical = read_chunk(conn, session_id=sid, operation_id=operation_id, key=effect.result_chunk_key).decode(
             "utf-8", errors="strict"
@@ -334,7 +333,7 @@ def read_v3_tool_no_execution_refusal_on_connection(
         receipt = ToolNoExecutionRefusal.model_validate_json(canonical, strict=True)
         failure = ComposerOperationError.model_validate_json(receipt.public_error_json, strict=True)
     except (UnicodeDecodeError, ValidationError, ValueError) as error:
-        raise AuditIntegrityError("V3 tool refusal violates its closed result") from error
+        raise AuditIntegrityError("V4 tool refusal violates its closed result") from error
     expected_chunk = encode_private_chunk(codec=codec, canonical=canonical)
     if (
         canonical != canonical_json(receipt.model_dump(mode="json"))
@@ -350,7 +349,7 @@ def read_v3_tool_no_execution_refusal_on_connection(
         or parent.settled_by != "owner_terminal"
         or terminal.cursor != receipt.source_cursor + 2
     ):
-        raise AuditIntegrityError("V3 tool refusal changed its original terminal identity")
+        raise AuditIntegrityError("V4 tool refusal changed its original terminal identity")
     source = conn.execute(
         select(checkpoints).where(
             checkpoints.c.session_id == sid,
@@ -373,7 +372,7 @@ def read_v3_tool_no_execution_refusal_on_connection(
         select(events).where(events.c.session_id == sid, events.c.operation_id == operation_id, events.c.sequence == terminal.cursor)
     ).one_or_none()
     if source is None or refusal is None or refused_event is None or settled_event is None:
-        raise AuditIntegrityError("V3 tool refusal lost its original source/refusal/terminal journal")
+        raise AuditIntegrityError("V4 tool refusal lost its original source/refusal/terminal journal")
     try:
         source_root = decode_continuation_snapshot(
             read_chunk(conn, session_id=sid, operation_id=operation_id, key=source.snapshot_chunk_key).decode("utf-8", errors="strict")
@@ -382,9 +381,9 @@ def read_v3_tool_no_execution_refusal_on_connection(
             read_chunk(conn, session_id=sid, operation_id=operation_id, key=refusal.snapshot_chunk_key).decode("utf-8", errors="strict")
         )
     except UnicodeDecodeError as error:
-        raise AuditIntegrityError("V3 tool refusal lost strict source snapshot bytes") from error
+        raise AuditIntegrityError("V4 tool refusal lost strict source snapshot bytes") from error
     if len(source_root.frames) != 2 or type(source_root.frames[-1]) is not ToolBatchFrame:
-        raise AuditIntegrityError("V3 tool refusal lost its original tool-ready frame")
+        raise AuditIntegrityError("V4 tool refusal lost its original tool-ready frame")
     frame = source_root.frames[-1]
     source_chunks = load_snapshot_private_data_on_connection(
         conn,
@@ -394,7 +393,7 @@ def read_v3_tool_no_execution_refusal_on_connection(
     )
     matching = tuple(chunk for chunk in source_chunks if chunk.reference == frame.accumulator)
     if len(matching) != 1:
-        raise AuditIntegrityError("V3 tool refusal lost its original accumulator")
+        raise AuditIntegrityError("V4 tool refusal lost its original accumulator")
     data = decode_coupled_batch_chunk(matching[0], env_ref_names=env_ref_names)
     response = read_original_committed_primary_response_data_on_connection(
         conn,
@@ -411,7 +410,7 @@ def read_v3_tool_no_execution_refusal_on_connection(
         or data.batch.current_call is not None
         or data.batch.next_tool_index != frame.next_tool_index
     ):
-        raise AuditIntegrityError("V3 tool refusal changed its original unissued accumulator")
+        raise AuditIntegrityError("V4 tool refusal changed its original unissued accumulator")
     if (
         source.kind != "transition"
         or refusal.kind != "transition"
@@ -460,5 +459,5 @@ def read_v3_tool_no_execution_refusal_on_connection(
             }
         ).encode("utf-8")
     ):
-        raise AuditIntegrityError("V3 tool refusal journal does not prove an unissued call")
+        raise AuditIntegrityError("V4 tool refusal journal does not prove an unissued call")
     return receipt

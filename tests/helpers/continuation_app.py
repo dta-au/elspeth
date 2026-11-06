@@ -215,12 +215,12 @@ def semantic_review_response(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def semantic_stop_response(request: dict[str, Any]) -> dict[str, Any]:
-    from elspeth.web.sessions.continuation_semantic_review_result import decode_semantic_review_result
-
     answer = semantic_primary_response(request)
     retained = json.loads(request["messages"][-1]["content"])
-    actual_review = decode_semantic_review_result(canonical_json(retained["review_result"]))
-    assert actual_review.publication_binding is not None
+    # The provider sees public paid-call DATA, not the complete retained codec.
+    actual_review = retained["review_result"]
+    assert type(actual_review["publication_binding"]) is str and len(actual_review["publication_binding"]) == 64
+    assert all(not {"private_request", "private_failure", "private_diagnostics"}.intersection(call) for call in actual_review["llm_calls"])
     frontier = decode_continuation_frontier(retained["frontier"])
     answer.update(
         decision="STOP_CONFIRMED",
@@ -270,7 +270,8 @@ class ScriptedSDK:
     ``("early", verdict)`` serves the EARLY checkpoint. A checkpoint payload
     callable receives actual SDK kwargs, allowing reached-cut assertions before
     an externally malformed reply. ``("semantic", response_factory)`` serves the actual
-    semantic Advisor request; its callable receives the real SDK kwargs.
+    semantic Advisor request; its callable receives the real SDK kwargs and
+    may return a complete ModelResponse for exact malformed bytes or metadata.
     ``("raise", exception)`` raises the original exception
     object at the SDK boundary, whatever the request.
     """
@@ -296,6 +297,8 @@ class ScriptedSDK:
         if role == "semantic":
             assert kwargs["model"] == ADVISOR_MODEL and "tools" not in kwargs
             response = payload(kwargs) if callable(payload) else payload
+            if isinstance(response, ModelResponse):
+                return response
             return sdk_reply(json.dumps(response), model=ADVISOR_MODEL)
         assert role in ("early", "end") and kwargs["model"] == ADVISOR_MODEL and "response_format" in kwargs, role
         if callable(payload):

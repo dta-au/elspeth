@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome, _DispatchOutcome, _PersistOutcome
-from elspeth.web.composer.continuation import ComposeFrame, EffectFrontierEntry, ToolBatchFrame
+from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, encode_coupled_batch_data
 from elspeth.web.composer.continuation_clock import ContinuationTimingObservation
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, encode_private_chunk
@@ -25,7 +25,6 @@ from elspeth.web.composer.continuation_control_transitions import (
     retain_control_completion,
 )
 from elspeth.web.composer.continuation_controls import ContinuationControlRefused, parse_continuation_control_batch
-from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
 from elspeth.web.composer.continuation_env_inventory import (
     ContinuationEnvSelection,
     CurrentContinuationEnvInventory,
@@ -37,12 +36,11 @@ from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchP
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
 from elspeth.web.composer.continuation_message_family_recipes import ControlResultMessageRecipe
-from elspeth.web.composer.continuation_phase_transitions import BatchTransition, refuse_v3_tool_before_dispatch, retain_batch_transition
-from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4
+from elspeth.web.composer.continuation_phase_transitions import BatchTransition, refuse_tool_before_dispatch, retain_batch_transition
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
     RestoredContinuationRuntime,
-    _capture_owners,
     _CurrentPhaseRead,
     _registered_read,
     _selected_chunks,
@@ -56,12 +54,9 @@ from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.tool_batch import (
     BatchAccumulator,
     ContinuationBatchState,
-    ContinuationCallState,
     ToolBatchContext,
-    _execute_continuation_call_live,
     _finish_continuation_batch_live,
     _initialize_continuation_batch_live,
-    _prepare_continuation_call_live,
 )
 from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -478,25 +473,6 @@ class ContinuationLivePhases:
         )
         await self.current(selected)
 
-    async def _capture_issued_finish(
-        self, runtime: RestoredContinuationRuntime, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
-    ) -> CapturedContinuationRuntime:
-        def read_source() -> ContinuationRuntimeSource:
-            try:
-                return self.authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
-            except ComposerOperationCancelledDuringTurn:
-                return self.authority.read_continuation_owed_tool_runtime(inventory.running, selected=selected, inventory=inventory)
-
-        def capture() -> CapturedContinuationRuntime:
-            source = read_source()
-            captured = _capture_owners(runtime, source=source, inventory=inventory)
-            following = read_source()
-            if following.selected != source.selected or following.bootstrap != source.bootstrap or following.evidence != source.evidence:
-                raise AuditIntegrityError("issued tool capture changed its complete current source during retention")
-            return captured
-
-        return await _registered_read(self.work, CapturedContinuationRuntime, capture)
-
     async def _initialize_batch(self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None) -> None:
         phase_read = await self._current_phase_read(selected) if phase_read is None else self._require_phase_read(selected, phase_read)
         runtime, inventory = phase_read.runtime, phase_read.inventory
@@ -630,308 +606,33 @@ class ContinuationLivePhases:
         return await self.lease.join_continuation_stage(stage)
 
     async def _execute_one_owned(self, selected: SelectedContinuationState) -> ToolNoExecutionRefusal | None:
+        from elspeth.web.composer.continuation_metadata_admission import try_admit_metadata_tool
+        from elspeth.web.composer.continuation_preview_dispatch import try_admit_preview_tool
+        from elspeth.web.composer.continuation_value_batch_admission import try_admit_value_batch_tool
+
         runtime, inventory = await self.current(selected)
-        data = runtime.graph.batch
-        if data is None:
+        if runtime.graph.batch is None or type(runtime.source.policy) is not ContinuationAdmissionPolicyV4:
             raise AuditIntegrityError("live dispatch lost its actual batch/provider owners")
-        result = await self._primary_for_phase(runtime, inventory, selected)
-        if type(runtime.source.policy) in (ContinuationAdmissionPolicyV3, ContinuationAdmissionPolicyV4):
-            from elspeth.web.composer.continuation_metadata_admission import try_admit_metadata_tool
-
-            if await try_admit_metadata_tool(self, runtime=runtime, selected=selected, inventory=inventory):
-                return None
-
-            if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
-                from elspeth.web.composer.continuation_preview_dispatch import try_admit_preview_tool
-                from elspeth.web.composer.continuation_value_batch_admission import try_admit_value_batch_tool
-
-                if await try_admit_preview_tool(self, runtime=runtime, selected=selected, inventory=inventory):
-                    return None
-                if await try_admit_value_batch_tool(self, runtime=runtime, selected=selected, inventory=inventory):
-                    return None
-
-            def commit_refusal() -> ToolNoExecutionRefusal:
-                receipt = refuse_v3_tool_before_dispatch(self.authority, inventory.running, selected=selected, inventory=inventory)
-                # Record the actual committed return before the async SQL ticket
-                # can deliver deferred cancellation instead of its result.
-                self.tool_refusal = CommittedToolNoExecutionRefusal(receipt, inventory)
-                return receipt
-
-            return await _registered(
-                work=self.work,
-                source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-                operation=commit_refusal,
-                expected=ToolNoExecutionRefusal,
-            )
-        batch, accumulator, live = data.batch, data.accumulator, runtime.live
-        if batch.phase != "call_ready" or batch.current_call is not None or batch.next_tool_index >= len(data.calls):
-            raise AuditIntegrityError("live dispatch lost its actual unissued next call")
-        context = await self._tool_context(runtime)
-        call = ContinuationCallState(batch.next_tool_index, data.calls[batch.next_tool_index], batch.state, batch.state.version)
-        batch.current_call, batch.phase = call, "call_active"
-        preparation = await _prepare_continuation_call_live(
-            call_model=result.outcome, ctx=context, llm_messages=live.llm_messages, batch=batch, call=call
-        )
-        issued_effect_key: str | None = None
-        if preparation == "prepared":
-            if call.audit is None:
-                raise AuditIntegrityError("tool preparation lost its actual dispatch audit")
-            # Prepared DATA precedes the SQL issue owner. The canonical writer
-            # binds this locator to its actual checkpoint/event/physical fence;
-            # it must never be injected into the pure prepared call codec.
-            issued_effect_key = f"tool:{result.response.reference.digest}:{call.index}"
-            self.runtime = runtime = replace(
-                runtime,
-                graph=runtime.graph.with_selected_dispatch(
-                    capture_dispatch_audit(call.audit, env_ref_names=inventory.names), context.tool_contract_dialect
-                ),
-            )
-            captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
-            top = captured.stack.frames[-1]
-            if type(top) is not ToolBatchFrame:
-                raise AuditIntegrityError("prepared tool capture changed its actual frame family")
-            if call.tool_name in ("read_attachment", "get_blob_content"):
-                # Retain this actual prepared SDK/audit graph before entering
-                # the attachment owner. No semantic Read grant is manufactured.
-                await self._retain(captured, inventory, "attachment_prepared")
-                self._bind_retained_attachment_audit()
-                if self.runtime is None:
-                    raise AuditIntegrityError("attachment preparation lost its actual runtime")
-                await self._advance_attachment(self.runtime.source.selected, context=context)
-                return None
-            root = captured.stack.model_copy(
-                update={
-                    "frames": (*captured.stack.frames[:-1], top.model_copy(update={"phase": "effect_reconciling"})),
-                    "effect_frontier": (
-                        *captured.stack.effect_frontier,
-                        EffectFrontierEntry(effect_id=issued_effect_key, disposition="dispatched", receipt_id=None),
-                    ),
-                }
-            )
-            await self._retain(CapturedContinuationRuntime(selected, root, captured.chunks), inventory, "tool_issued")
-            self.failure_custody = ContinuationToolFailureCustody(
-                inventory.running, self.work, result.response, batch, data.calls, live.recorder, call
-            )
-            await _execute_continuation_call_live(
-                call_model=result.outcome,
-                ctx=context,
-                acc=accumulator,
-                llm_messages=live.llm_messages,
-                batch=batch,
-                call=call,
-                failure_custody=self.failure_custody,
-            )
-        if preparation == "stop":
-            batch.current_call, batch.phase = None, "dispatch_ready"
+        await self._primary_for_phase(runtime, inventory, selected)
+        if await try_admit_metadata_tool(self, runtime=runtime, selected=selected, inventory=inventory):
             return None
-        batch.next_tool_index += 1
-        batch.current_call = None
-        batch.phase = "dispatch_ready" if batch.stop_issued_batch or batch.next_tool_index == len(data.calls) else "call_ready"
-        live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used = (
-            batch.state,
-            batch.last_validation,
-            batch.last_runtime_preflight,
-            batch.advisor_calls_used,
-        )
-        if batch.service_failure is not None:
-            custody = self.failure_custody
-            if preparation != "prepared" or custody is None or issued_effect_key is None or self.runtime is None:
-                raise AuditIntegrityError("service completion lost its actual issued native phase")
-            if self.terminal_completion is not None:
-                raise AuditIntegrityError("service completion cannot replace another native terminal owner")
-            try:
-                self.terminal_completion = TerminalServiceCompletion(custody, self.runtime, context, result.outcome, issued_effect_key)
-                # This failed batch cannot be encoded or restored. Its last valid
-                # issued SQL cut is only a source bookmark for terminal P4 proof.
-                await self._persist_batch(self.runtime.source.selected)
-            except BaseException as error:
-                combined = custody.failure(error)
-                if combined is error:
-                    raise
-                raise combined from combined.__cause__
+        if await try_admit_preview_tool(self, runtime=runtime, selected=selected, inventory=inventory):
             return None
-        if self.runtime is None:
-            raise AuditIntegrityError("completed tool lost its retained runtime")
-        runtime = self.runtime
-        inventory = runtime.materialization.inventory
-        selected = runtime.source.selected
-        self.runtime = runtime = replace(runtime, graph=runtime.graph.without_selected_dispatch())
-        captured = (
-            await self._capture_issued_finish(runtime, selected=selected, inventory=inventory)
-            if preparation == "prepared"
-            else await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+        if await try_admit_value_batch_tool(self, runtime=runtime, selected=selected, inventory=inventory):
+            return None
+
+        def commit_refusal() -> ToolNoExecutionRefusal:
+            receipt = refuse_tool_before_dispatch(self.authority, inventory.running, selected=selected, inventory=inventory)
+            # Preserve the actual committed return before deferred cancellation.
+            self.tool_refusal = CommittedToolNoExecutionRefusal(receipt, inventory)
+            return receipt
+
+        return await _registered(
+            work=self.work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=commit_refusal,
+            expected=ToolNoExecutionRefusal,
         )
-        top = captured.stack.frames[-1]
-        if type(top) is not ToolBatchFrame:
-            raise AuditIntegrityError("completed tool capture changed its actual frame family")
-        root = captured.stack.model_copy(update={"frames": (*captured.stack.frames[:-1], top.model_copy(update={"phase": "tool_ready"}))})
-        if preparation == "prepared":
-            if issued_effect_key is None:
-                raise AuditIntegrityError("completed tool lost its actual issued effect locator")
-            receipt = f"tool-result:{top.accumulator.digest}"
-            root = root.model_copy(
-                update={
-                    "effect_frontier": tuple(
-                        EffectFrontierEntry(effect_id=entry.effect_id, disposition="committed", receipt_id=receipt)
-                        if entry.effect_id == issued_effect_key
-                        else entry
-                        for entry in root.effect_frontier
-                    ),
-                    "frames": (
-                        *root.frames[:-1],
-                        root.frames[-1].model_copy(update={"settled_effect_ids": (*top.settled_effect_ids, issued_effect_key)}),
-                    ),
-                }
-            )
-        await self._retain(
-            CapturedContinuationRuntime(selected, root, captured.chunks),
-            inventory,
-            "tool_completed" if preparation == "prepared" else "tool_preparation_completed",
-        )
-        return None
-
-    async def _resume_attachment(self, selected: SelectedContinuationState, *, unissued: bool) -> None:
-        previous = self.business_stage
-        if previous is not None and (previous.task is None or not previous.task.done() or not previous.observed):
-            raise AuditIntegrityError("attachment resume cannot replace its retained physical stage")
-        operation = self._reprepare_attachment(selected) if unissued else self._advance_attachment(selected)
-        self.business_stage = stage = self.lease.create_continuation_stage(operation, name="continuation-attachment")
-        await self.lease.join_continuation_stage(stage)
-
-    async def _reprepare_attachment(self, selected: SelectedContinuationState) -> None:
-        """Fresh preparation after the current SQL reader proves no read issued."""
-        from elspeth.web.composer.continuation_batch_data import RestoredPreparedBatchData
-        from elspeth.web.sessions.continuation_attachment_preparation import read_unissued_attachment_preparation_on_connection
-
-        runtime, inventory = await self.current(selected)
-
-        def read_preparation() -> RestoredPreparedBatchData:
-            with locked_session_transaction(self.authority._engine, str(inventory.running.claim.session_id)) as conn:
-                return read_unissued_attachment_preparation_on_connection(conn, inventory.running, selected=selected, inventory=inventory)
-
-        await _registered_read(self.work, RestoredPreparedBatchData, read_preparation)
-        data = runtime.graph.batch
-        if data is None or data.batch.current_call is None:
-            raise AuditIntegrityError("attachment repreparation lost its original prepared graph")
-        call = data.batch.current_call
-        if call.tool_name not in ("read_attachment", "get_blob_content"):
-            raise AuditIntegrityError("attachment repreparation changed its original tool domain")
-        primary = await self._primary_for_phase(runtime, inventory, selected)
-        context = await self._tool_context(runtime)
-        preparation = await _prepare_continuation_call_live(
-            call_model=primary.outcome, ctx=context, llm_messages=runtime.live.llm_messages, batch=data.batch, call=call
-        )
-        if preparation != "prepared" or call.audit is None:
-            raise AuditIntegrityError("attachment repreparation did not produce its exact fresh audit owner")
-        self.runtime = runtime = replace(
-            runtime,
-            graph=runtime.graph.with_selected_dispatch(
-                capture_dispatch_audit(call.audit, env_ref_names=inventory.names), context.tool_contract_dialect
-            ),
-        )
-        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
-        await self._retain(captured, inventory, "attachment_reprepared")
-        self._bind_retained_attachment_audit()
-        if self.runtime is None:
-            raise AuditIntegrityError("attachment repreparation lost its current runtime")
-        await self._advance_attachment(self.runtime.source.selected, context=context)
-
-    def _bind_retained_attachment_audit(self) -> None:
-        """Use the exact retained portable DATA without replacing live owners."""
-        runtime = self.runtime
-        if runtime is None:
-            raise AuditIntegrityError("attachment preparation lost its current runtime")
-        selected = runtime.source.selected
-        frame = selected.stack.frames[-1]
-        source = runtime.source.admitted_evidence.graph
-        if (
-            type(frame) is not ToolBatchFrame
-            or frame.phase != "tool_ready"
-            or frame.accumulator.codec != "composer.tool-batch.v1"
-            or selected.stack.pending_owner_results
-            or source is None
-            or source.selected_audit is None
-            or source.selected_dialect is None
-        ):
-            raise AuditIntegrityError("attachment preparation lost its authenticated retained audit DATA")
-        # Capture sampled elapsed time when it encoded this preparation. The
-        # warm graph still owns the earlier sample; only these portable fields
-        # adopt the exact current SQL value. The original live timer stays put.
-        self.runtime = replace(runtime, graph=runtime.graph.with_selected_dispatch(source.selected_audit, source.selected_dialect))
-
-    async def _advance_attachment(self, selected: SelectedContinuationState, *, context: ToolBatchContext | None = None) -> None:
-        """Use the actual retained read owner and apply its original B2 suffix."""
-        from elspeth.web.composer.continuation_attachment_application_driver import apply_current_attachment_runtime
-        from elspeth.web.composer.continuation_attachment_result import apply_attachment_history, run_attachment_result
-
-        runtime, inventory = await self.current(selected)
-        frame = selected.stack.frames[-1]
-        if type(frame) is not ToolBatchFrame or frame.accumulator.codec != "composer.tool-batch.v1":
-            raise AuditIntegrityError("attachment phase lost its actual prepared/result cut")
-        data = runtime.graph.batch
-        if data is None or data.batch.current_call is None:
-            raise AuditIntegrityError("attachment phase lost its actual original prepared call")
-        call = data.batch.current_call
-        if frame.phase == "tool_ready":
-            # Only an actual live preparation can start a new read. Cold DATA
-            # first requires current source admission and fresh preparation.
-            if context is None or call.audit is None:
-                raise AuditIntegrityError("attachment read requires its original live preparation owner")
-            stored = await run_attachment_result(
-                service=self.service,
-                authority=self.authority,
-                selected=selected,
-                inventory=inventory,
-                required_work=self.work,
-                audit=call.audit,
-            )
-            self.latest_snapshot = stored
-            selected = await load_selected_continuation(
-                authority=self.authority, running=inventory.running, selected=stored, required_work=self.work
-            )
-            runtime, inventory = await self.current(selected)
-            frame = selected.stack.frames[-1]
-        if type(frame) is ToolBatchFrame and frame.phase == "effect_reconciling":
-            # This reader accepts only an actually committed retained result;
-            # an interrupted physical read cannot be redispatched here.
-            stored = await apply_attachment_history(
-                authority=self.authority, selected=selected, inventory=inventory, required_work=self.work
-            )
-            self.latest_snapshot = stored
-            selected = await load_selected_continuation(
-                authority=self.authority, running=inventory.running, selected=stored, required_work=self.work
-            )
-            runtime, inventory = await self.current(selected)
-            frame = selected.stack.frames[-1]
-        if type(frame) is not ToolBatchFrame or frame.phase != "result_retained":
-            raise AuditIntegrityError("attachment application requires its actual retained history")
-        primary = await self._primary_for_phase(runtime, inventory, selected)
-        if context is None:
-            context = await self._tool_context(runtime)
-        applied = await apply_current_attachment_runtime(
-            runtime=runtime,
-            selected=selected,
-            inventory=inventory,
-            ctx=context,
-            call_model=primary.outcome,
-            effect_key=f"attachment:{frame.response.digest}:{frame.next_tool_index}",
-        )
-        self.latest_snapshot = applied.snapshot
-        data = runtime.graph.batch
-        if data is None:
-            raise AuditIntegrityError("attachment application lost its actual completed batch")
-        batch, live = data.batch, runtime.live
-        live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used = (
-            batch.state,
-            batch.last_validation,
-            batch.last_runtime_preflight,
-            batch.advisor_calls_used,
-        )
-        self.runtime = replace(runtime, graph=runtime.graph.without_selected_dispatch())
-        following = await load_selected_continuation(
-            authority=self.authority, running=inventory.running, selected=applied.snapshot, required_work=self.work
-        )
-        await self.current(following)
 
     async def _persist_batch(self, selected: SelectedContinuationState) -> None:
         terminal = self.terminal_completion
@@ -1093,23 +794,6 @@ class ContinuationLivePhases:
             return None
         if phase_read is not None:
             raise AuditIntegrityError("live phase handoff belongs only to its retained PRIMARY response")
-        if type(top) is ToolBatchFrame and top.phase == "tool_ready" and top.accumulator.codec == "composer.tool-batch.v1":
-            await self._resume_attachment(selected, unissued=True)
-            return None
-        if (
-            type(top) is ToolBatchFrame
-            and top.accumulator.codec == "composer.tool-batch.v1"
-            and (
-                top.phase == "result_retained"
-                or (
-                    top.phase == "effect_reconciling"
-                    and len(selected.stack.pending_owner_results) == 1
-                    and selected.stack.pending_owner_results[0].kind == "read"
-                )
-            )
-        ):
-            await self._resume_attachment(selected, unissued=False)
-            return None
         if type(top) is ToolBatchFrame and top.phase == "tool_ready":
             runtime, _inventory = await self.current(selected)
             if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "call_ready":

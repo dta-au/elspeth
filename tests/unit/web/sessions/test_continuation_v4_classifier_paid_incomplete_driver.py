@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 import litellm
 import pytest
 from sqlalchemy import select
 
-from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.sessions import continuation_driver as driver_module
 from elspeth.web.sessions.continuation_classifier_primary import VerifiedClassifierPaidIncompleteTerminal
 from elspeth.web.sessions.continuation_classifier_primary_incomplete_terminal import (
@@ -23,7 +21,7 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as physica
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.sessions.test_continuation_classifier_primary_v4_paid import _incomplete_reply, _v4_applied_timed_case
-from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver
+from tests.unit.web.sessions.test_continuation_tool_failure import _claimed_driver, _unstarted_driver
 
 operation_store = operations.operation_store
 
@@ -42,13 +40,7 @@ async def test_v4_classifier_returned_incomplete_reaches_one_cold_public_507_wit
         work, lease = prior_owner.work, prior_owner.lease
         timing = work.coordinator.sql_deadline_owner
         assert timing is not None and lease.required_work is work.coordinator
-        phases = ContinuationLivePhases(prior_owner.service, prior_owner.authority, work, prior_owner.provider_owner, lease)
-        driver = _actual_failure_driver(store, phases, running, drain_signal=timing.drain_signal)
-        driver.work, driver.provider = work, prior_owner.provider_owner
-        key = (running.claim.session_id, running.claim.operation_id)
-        local_cancel = asyncio.Event()
-        assert key not in driver.worker._local_cancels
-        driver.worker._local_cancels[key] = local_cancel
+        driver = _unstarted_driver(store, prior_owner, running, drain_signal=timing.drain_signal)
         classifier_calls = []
         observed: list[VerifiedClassifierPaidIncompleteTerminal] = []
         advances: list[tuple[int, str, str]] = []
@@ -70,7 +62,7 @@ async def test_v4_classifier_returned_incomplete_reaches_one_cold_public_507_wit
 
         monkeypatch.setattr(litellm, "acompletion", completion)
         monkeypatch.setattr(driver_module._SegmentDriver, "advance", observe_advance)
-        try:
+        async with _claimed_driver(driver):
             outcome = await driver.run(None)
             assert type(outcome) is ContinuationSegmentSettled and outcome.terminal.status == "failed"
             with store[0].connect() as conn:
@@ -118,6 +110,3 @@ async def test_v4_classifier_returned_incomplete_reaches_one_cold_public_507_wit
             assert len({attempt.ledger_entry_id for attempt in attempts}) == 2
             assert verified.receipt.retryable is False and verified.receipt.provider_returned is True
             work.coordinator.assert_completed()
-        finally:
-            await driver.close_progress()
-            assert driver.worker._local_cancels.pop(key) is local_cancel

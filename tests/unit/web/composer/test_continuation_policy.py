@@ -9,14 +9,13 @@ from pydantic import ValidationError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
-    ContinuationAdmissionPolicy,
     decode_continuation_policy,
 )
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from tests.helpers.continuation_policy import continuation_test_settings, minimal_continuation_policy
 
 
-def test_v2_admission_retains_operator_cost_overrides_and_refuses_tampering():
+def test_current_admission_retains_operator_cost_overrides_and_refuses_tampering():
     settings = continuation_test_settings(
         composer_planner_max_provider_calls=3,
         composer_planner_max_request_bytes=4096,
@@ -24,7 +23,8 @@ def test_v2_admission_retains_operator_cost_overrides_and_refuses_tampering():
         composer_planner_max_cumulative_provider_cost=Decimal("1.25"),
     )
     policy = continuation_policy_from_settings(settings)
-    assert policy.schema_version == "composer.continuation.policy.v2"
+    assert policy is not None
+    assert policy.schema_version == "composer.continuation.policy.v4"
     assert policy.provider_cost.max_provider_calls == 3
     assert policy.provider_cost.max_request_bytes == 4096
     assert policy.provider_cost.max_completion_tokens == 31
@@ -38,19 +38,9 @@ def test_v2_admission_retains_operator_cost_overrides_and_refuses_tampering():
         decode_continuation_policy(json.dumps(changed), policy.policy_hash)
 
 
-def test_complete_policy_roundtrips_for_flag_off_draining():
+def test_complete_current_policy_roundtrips():
     policy = minimal_continuation_policy()
     assert decode_continuation_policy(policy.model_dump_json(), policy.policy_hash) == policy
-
-
-def test_retained_v1_policy_still_decodes_without_new_cost_limits():
-    current = minimal_continuation_policy()
-    old = ContinuationAdmissionPolicy(segment=current.segment, actions=current.actions)
-    assert old.schema_version == "composer.continuation.policy.v1"
-    restored = decode_continuation_policy(old.model_dump_json(), old.policy_hash)
-    assert type(restored) is ContinuationAdmissionPolicy
-    assert restored == old
-    assert "provider_cost" not in restored.model_dump()
 
 
 def test_changed_bound_is_refused_under_original_policy_hash():

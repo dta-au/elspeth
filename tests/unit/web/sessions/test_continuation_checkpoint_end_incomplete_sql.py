@@ -26,7 +26,7 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
 from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointPaidIncompleteTerminal
 from elspeth.web.composer.continuation_codec import decode_continuation_response, decode_retained_physical_audit_call
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_policy_settings import continuation_policy_v4_from_settings
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
@@ -80,9 +80,7 @@ def _incomplete_response() -> ModelResponse:
 
 @pytest.mark.asyncio
 async def test_actual_end_incomplete_result_rejects_copied_exception_then_settles_once(operation_store, tmp_path, monkeypatch):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy
@@ -369,9 +367,7 @@ async def test_actual_end_incomplete_result_rejects_copied_exception_then_settle
 async def test_actual_end_complete_return_retains_same_pending_attempt_and_cold_rejects_changed_hold(
     operation_store, tmp_path, monkeypatch
 ):
-    policy = continuation_policy_v4_from_settings(
-        continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576)
-    )
+    policy = continuation_policy_from_settings(continuation_test_settings(composer_continuation_max_retained_payload_bytes=16 * 1_048_576))
     assert policy is not None
     authority = ComposerAsyncOperationAuthority(
         operation_store[0], owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy

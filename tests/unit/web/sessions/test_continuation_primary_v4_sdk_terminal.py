@@ -23,8 +23,8 @@ from elspeth.web.sessions.models import composer_provider_terminal_holds_table a
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as ledger
 from tests.unit.web.sessions import test_continuation_primary_v4_live
+from tests.unit.web.sessions.test_continuation_primary_result import primary_input
 from tests.unit.web.sessions.test_continuation_primary_v4_incomplete import _invoke
-from tests.unit.web.sessions.test_continuation_primary_v4_live import _v4_primary_input
 
 operation_store = test_continuation_primary_v4_live.operation_store
 
@@ -32,7 +32,8 @@ operation_store = test_continuation_primary_v4_live.operation_store
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["provider_failure", "provider_timeout", "no_observed_result"])
 async def test_actual_sdk_failure_closes_original_attempt_hold_and_cold_terminal(operation_store, tmp_path, monkeypatch, kind):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     original = {
         "provider_failure": OpenAIError("private provider failure text"),
         "provider_timeout": TimeoutError("private timeout text"),
@@ -78,7 +79,8 @@ async def test_actual_sdk_failure_closes_original_attempt_hold_and_cold_terminal
 
 @pytest.mark.asyncio
 async def test_sdk_terminal_failure_after_parent_updates_rolls_back_all_disposition(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     calls = []
 
     async def completion(**_kwargs):
@@ -108,7 +110,8 @@ async def test_sdk_terminal_failure_after_parent_updates_rolls_back_all_disposit
 
 @pytest.mark.asyncio
 async def test_copied_original_sdk_witness_cannot_authorize_terminal_writer(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     actual = finalization.finalize_v4_primary_sdk_terminal_on_connection
 
     async def completion(**_kwargs):
@@ -129,7 +132,8 @@ async def test_copied_original_sdk_witness_cannot_authorize_terminal_writer(oper
 
 @pytest.mark.asyncio
 async def test_arbitrary_owned_failure_is_not_minted_as_sdk_provider_failure(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     original = AuditIntegrityError("owned failure inside instrumented SDK seam")
 
     async def completion(**_kwargs):
@@ -148,7 +152,8 @@ async def test_arbitrary_owned_failure_is_not_minted_as_sdk_provider_failure(ope
 
 @pytest.mark.asyncio
 async def test_original_sdk_error_survives_audit_failure_while_truthful_terminal_closes(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     sdk_failure = OpenAIError("private provider failure")
     audit_failure = AuditIntegrityError("owned audit builder failure")
 
@@ -179,15 +184,14 @@ async def test_original_sdk_error_survives_audit_failure_while_truthful_terminal
 
 
 @pytest.mark.asyncio
-async def test_original_plans_preserve_old_recipe_but_sdk_requires_new_reserved_tail(operation_store, tmp_path, monkeypatch):
-    from hashlib import sha256
+async def test_current_primary_reservation_covers_sdk_tail_and_rejects_underbound_batch(operation_store, tmp_path, monkeypatch):
 
-    from elspeth.contracts.hashing import canonical_json
     from elspeth.web.sessions.continuation_primary_sdk_tail import build_primary_sdk_tail_batch, prepare_primary_sdk_tail_plan
     from elspeth.web.sessions.continuation_primary_terminal_reservation import primary_terminal_reservation
     from elspeth.web.sessions.time_normalization import restore_utc
 
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     actual = finalization.finalize_v4_primary_sdk_terminal_on_connection
     checked = []
 
@@ -196,24 +200,10 @@ async def test_original_plans_preserve_old_recipe_but_sdk_requires_new_reserved_
 
     def check_original_recipe(conn, *, admission, **arguments):
         paid, no_sdk, incomplete = admission.tail, admission.no_sdk_tail, admission.incomplete_tail
-        old_reserved = max(paid.reserved_bytes, no_sdk.reserved_bytes, incomplete.reserved_bytes)
-        old_hash = sha256(
-            canonical_json(
-                {
-                    "version": "composer.primary-v4-combined-tail.v2",
-                    "paid": paid.fallback_contract_sha256,
-                    "incomplete": incomplete.fallback_contract_sha256,
-                    "no_sdk": no_sdk.contract_sha256,
-                    "reserved_bytes": old_reserved,
-                }
-            ).encode("utf-8")
-        ).hexdigest()
-        assert primary_terminal_reservation(paid, no_sdk, historical_contract_sha256=old_hash) == (incomplete, old_reserved, old_hash)
-        _, new_reserved, new_hash = primary_terminal_reservation(paid, no_sdk)
-        assert new_hash != old_hash and new_reserved >= old_reserved
-        assert admission.hold.fallback_contract_sha256 == new_hash and admission.hold.reserved_bytes == new_reserved
-        with pytest.raises(AuditIntegrityError, match="unsupported original recipe"):
-            primary_terminal_reservation(paid, no_sdk, historical_contract_sha256="f" * 64)
+        _, reserved, contract = primary_terminal_reservation(paid, no_sdk)
+        sdk_plan = prepare_primary_sdk_tail_plan(identity=paid.identity, admitted=paid.admitted, creator_sequence=paid.creator_sequence)
+        assert reserved == max(paid.reserved_bytes, no_sdk.reserved_bytes, incomplete.reserved_bytes, sdk_plan.reserved_bytes)
+        assert admission.hold.fallback_contract_sha256 == contract and admission.hold.reserved_bytes == reserved
         result = actual(conn, admission=admission, **arguments)
         plan = prepare_primary_sdk_tail_plan(identity=paid.identity, admitted=paid.admitted, creator_sequence=paid.creator_sequence)
         physical_row = conn.execute(select(physical).where(physical.c.attempt_id == admission.attempt.attempt_id)).one()

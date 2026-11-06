@@ -33,7 +33,7 @@ from elspeth.web.sessions.models import quota_provider_attempts_table as physica
 from elspeth.web.sessions.models import token_usage_ledger_table as ledger
 from elspeth.web.sessions.time_normalization import restore_utc
 from tests.unit.web.sessions import test_continuation_primary_v4_live
-from tests.unit.web.sessions.test_continuation_primary_v4_live import _v4_primary_input
+from tests.unit.web.sessions.test_continuation_primary_result import primary_input
 from tests.unit.web.sessions.test_continuation_prompt_producers import REQUEST
 
 operation_store = test_continuation_primary_v4_live.operation_store
@@ -70,7 +70,8 @@ def _incomplete_response():
 
 @pytest.mark.asyncio
 async def test_primary_actual_incomplete_return_settles_once_and_cold_rejects_ledger_mutation(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     sdk = []
 
     async def completion(**_kwargs):
@@ -107,7 +108,8 @@ async def test_primary_actual_incomplete_return_settles_once_and_cold_rejects_le
 
 @pytest.mark.asyncio
 async def test_primary_incomplete_sql_failure_rolls_back_original_effect_hold_and_ledger(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     sdk = []
 
     async def completion(**_kwargs):
@@ -139,7 +141,8 @@ async def test_primary_incomplete_sql_failure_rolls_back_original_effect_hold_an
 
 @pytest.mark.asyncio
 async def test_primary_direct_writer_rejects_unissued_copy_of_actual_incomplete_result(operation_store, tmp_path, monkeypatch):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
     actual_writer = finalization.finalize_v4_primary_incomplete_on_connection
     sdk_calls = []
 
@@ -168,7 +171,8 @@ async def test_primary_direct_writer_rejects_unissued_copy_of_actual_incomplete_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", ("delete", "companion", "cost", "usage", "finish_next_second"))
 async def test_primary_incomplete_cold_requires_original_public_audit(operation_store, tmp_path, monkeypatch, changed):
-    kwargs, produced, recorder, store = await _v4_primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    store = operation_store
 
     async def completion(**_kwargs):
         return _incomplete_response()

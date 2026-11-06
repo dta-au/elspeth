@@ -1,6 +1,6 @@
-"""Dormant provider-response observation for semantic Advisor assessments.
+"""Original provider-response observation for semantic Advisor assessments.
 
-This module classifies only a valid materialized semantic decision response.
+This module classifies complete valid or invalid returned semantic responses.
 Its values grant no decision application, SQL settlement, retry or retention
 authority. Review and EARLY checkpoint calls are separate provider producers.
 """
@@ -20,15 +20,17 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedLLMCompletion,
     _AdmittedLLMProviderMetadata,
     _AdmittedToolBatch,
+    _AdmittedToolCall,
 )
 from elspeth.web.composer.advisor_output import ContinuationAdvisorDecision, parse_continuation_advisor_decision
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation_advisor import ContinuationAdvisorInvocation
-from elspeth.web.composer.continuation_codec import PrivateChunk, encode_continuation_text_response, measure_continuation_response_size
+from elspeth.web.composer.continuation_codec import PrivateChunk, encode_continuation_response, measure_continuation_response_size
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_provider_outcomes import (
     _physical_audit_json_value,
     measure_physical_audit_call_size,
+    require_malformed_response_audit,
     require_successful_response_audit,
 )
 from elspeth.web.composer.continuation_semantic_advisor_outcome import SemanticAdvisorInvocationObservation
@@ -38,7 +40,7 @@ from elspeth.web.composer.provider_audit_source import (
     capture_provider_audit_source,
     provider_attempt_audit_drafts,
 )
-from elspeth.web.composer.provider_gateway import _require_no_credential_material_in_completion_fields
+from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError, _require_no_credential_material_in_completion_fields
 from elspeth.web.composer.provider_result_admission import diagnostic_provider_metadata, require_v4_provider_metadata_credentials
 from elspeth.web.coordination.quota_authority import ProviderAttempt
 from elspeth.web.credential_guard import require_no_credential_material
@@ -58,6 +60,20 @@ class SemanticCompleteResponseObservation:
     decision: ContinuationAdvisorDecision
     audit_call: ComposerLLMCall
     response: PrivateChunk
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticInvalidResponseObservation:
+    """Complete actual SDK DATA whose closed semantic decision was refused."""
+
+    source: ContinuationAdvisorInvocation
+    request_sha256: str
+    attempt: ProviderAttempt
+    message: _AdmittedAssistantMessage
+    provider_metadata: _AdmittedLLMProviderMetadata
+    audit_call: ComposerLLMCall
+    response: PrivateChunk
+    original_failure: _MalformedLLMResponseError
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,11 +109,13 @@ class SemanticIncompleteResponseObservation:
     usage: SemanticOverflowUsageObservation
 
 
-type SemanticProviderResponseObservation = SemanticCompleteResponseObservation | SemanticIncompleteResponseObservation
+type SemanticProviderResponseObservation = (
+    SemanticCompleteResponseObservation | SemanticInvalidResponseObservation | SemanticIncompleteResponseObservation
+)
 
 
 def observe_semantic_retained_tail_overflow(
-    complete: SemanticCompleteResponseObservation,
+    complete: SemanticCompleteResponseObservation | SemanticInvalidResponseObservation,
     *,
     context: SessionOperationContext,
     representation: Literal["recorder", "evidence_pair", "retained_history"],
@@ -105,7 +123,7 @@ def observe_semantic_retained_tail_overflow(
 ) -> SemanticIncompleteResponseObservation:
     """Classify only a measured mandatory tail of an already genuine response."""
     if (
-        type(complete) is not SemanticCompleteResponseObservation
+        type(complete) not in (SemanticCompleteResponseObservation, SemanticInvalidResponseObservation)
         or type(context) is not SessionOperationContext
         or context.operation_kind is not SessionOperationKind.COMPOSE
         or complete.attempt.attempt_id != complete.audit_call.call_id
@@ -187,11 +205,8 @@ def observe_semantic_provider_response(
         or type(env_ref_names) is not frozenset
         or type(require_v4_completeness) is not bool
         or observation.sdk_entered is not True
-        or observation.original_failure is not None
-        or observation.tool_calls_present is not False
         or type(observation.message) is not _AdmittedAssistantMessage
         or type(observation.provider_metadata) is not _AdmittedLLMProviderMetadata
-        or type(observation.decision) is not ContinuationAdvisorDecision
         or type(observation.audit_call) is not ComposerLLMCall
     ):
         raise AuditIntegrityError("semantic response observation requires original valid paid DATA")
@@ -199,36 +214,62 @@ def observe_semantic_provider_response(
     metadata = observation.provider_metadata
     decision = observation.decision
     call = observation.audit_call
+    calls = observation.admitted_tool_calls
+    if (
+        type(calls) is not tuple
+        or any(type(tool_call) is not _AdmittedToolCall for tool_call in calls)
+        or observation.tool_calls_present is not bool(calls)
+    ):
+        raise AuditIntegrityError("semantic response changed its complete admitted tool call observation")
+    original_failure = observation.original_failure
+    invalid = type(original_failure) is _MalformedLLMResponseError
+    if type(original_failure) is _MalformedLLMResponseError:
+        if decision is not None or original_failure.provider_metadata is not metadata:
+            raise AuditIntegrityError("invalid semantic response lost its original parse failure and metadata")
+    elif original_failure is not None or type(decision) is not ContinuationAdvisorDecision or calls:
+        raise AuditIntegrityError("semantic response lacks its original successful decision")
     completeness = metadata.v4_completeness
     if require_v4_completeness and completeness is None:
         raise AuditIntegrityError("V4 semantic paid observation lacks its original complete SDK return witness")
     if completeness is not None:
-        completeness.require_result(metadata, content=message.content, tool_calls=())
-    if type(message.content) is not str or not message.content.strip():
-        raise AuditIntegrityError("semantic response lost its original sole decision text")
+        completeness.require_result(metadata, content=message.content, tool_calls=calls)
     require_no_credential_material(
         source.model_dump(mode="json"),
         surface="composer_semantic_overflow_source",
         env_ref_names=env_ref_names,
         max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
     )
+    tool_identities = tuple((tool_call.id, tool_call.function.name) for tool_call in calls)
     if require_v4_completeness:
-        require_v4_provider_metadata_credentials(metadata, content=message.content, tool_calls=(), surface="composer_advisor_response")
+        require_v4_provider_metadata_credentials(
+            metadata, content=message.content, tool_calls=tool_identities, surface="composer_advisor_response"
+        )
         audit_metadata = diagnostic_provider_metadata(metadata)
     else:
         _require_no_credential_material_in_completion_fields(
-            content=message.content, tool_calls=(), provider_metadata=metadata, surface="composer_advisor_response"
+            content=message.content, tool_calls=tool_identities, provider_metadata=metadata, surface="composer_advisor_response"
         )
         audit_metadata = metadata
-    parsed = parse_continuation_advisor_decision(message.content, actual_advisor_call_id=attempt.attempt_id)
-    if parsed is None or parsed != decision or decision.decision_id != attempt.attempt_id:
+    parsed = (
+        parse_continuation_advisor_decision(message.content, actual_advisor_call_id=attempt.attempt_id)
+        if type(message.content) is str and message.content.strip() and not calls
+        else None
+    )
+    if invalid:
+        if parsed is not None:
+            raise AuditIntegrityError("invalid semantic response contains a valid original decision")
+    elif (
+        type(decision) is not ContinuationAdvisorDecision
+        or parsed is None
+        or parsed != decision
+        or decision.decision_id != attempt.attempt_id
+    ):
         raise AuditIntegrityError("semantic response changed its actual closed decision or attempt")
     # The quota attempt starts on the database clock at admission; the physical
     # call starts later on the worker clock. Their timestamps are distinct.
-    require_successful_response_audit(
-        call, audit_metadata, attempt_id=attempt.attempt_id, started_at=call.started_at, finished_at=call.finished_at
-    )
-    completion = _AdmittedLLMCompletion(message, _AdmittedToolBatch((), frozenset()), metadata)
+    require_audit = require_malformed_response_audit if invalid else require_successful_response_audit
+    require_audit(call, audit_metadata, attempt_id=attempt.attempt_id, started_at=call.started_at, finished_at=call.finished_at)
+    completion = _AdmittedLLMCompletion(message, _AdmittedToolBatch(calls, frozenset(call.id for call in calls)), metadata)
     measure_continuation_response_size(completion)
     source_data = capture_provider_audit_source(context)
     require_no_credential_material(
@@ -269,5 +310,9 @@ def observe_semantic_provider_response(
         return excess("physical_audit")
     if measure_continuation_response_size(completion, audit_call=call).exceeded:
         return excess("response")
-    response = encode_continuation_text_response(content=message.content, provider_metadata=metadata, audit_call=call)
+    response = encode_continuation_response(completion, audit_call=call)
+    if type(original_failure) is _MalformedLLMResponseError:
+        return SemanticInvalidResponseObservation(source, request_sha256, attempt, message, metadata, call, response, original_failure)
+    if type(decision) is not ContinuationAdvisorDecision:
+        raise AuditIntegrityError("semantic response lost its successful decision")
     return SemanticCompleteResponseObservation(source, request_sha256, attempt, message, metadata, decision, call, response)

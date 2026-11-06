@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 from weakref import WeakKeyDictionary
 
@@ -50,15 +50,11 @@ from elspeth.web.composer.continuation_evidence_application_data import append_p
 from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_data_on_connection
 from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
 from elspeth.web.composer.continuation_policy import (
-    ContinuationAdmissionPolicyV2,
-    ContinuationAdmissionPolicyV3,
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
-from elspeth.web.composer.continuation_primary_no_sdk import ContinuationRetainedTailUnbounded
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_json
 from elspeth.web.composer.continuation_provider_outcomes import (
-    require_successful_response_audit,
     require_v4_successful_response_audit,
 )
 from elspeth.web.composer.continuation_runtime import (
@@ -328,14 +324,6 @@ class VerifiedClassifierPaidIncompleteTerminal:
 
 
 @dataclass(frozen=True, slots=True)
-class DispatchedClassifierPrimary:
-    """Two original checkpoints committed together by one current actor."""
-
-    prepared: PreparedClassifierPrimary
-    snapshot: StoredContinuationSnapshot
-
-
-@dataclass(frozen=True, slots=True)
 class ClassifierPrimaryResult:
     """Actual returned source, or a cold immutable replay without SDK authority."""
 
@@ -532,9 +520,7 @@ def _prepare_classifier_primary_on_connection(
         conn, running, inventory=inventory, expected_checkpoint_id=selected.checkpoint_id, expected_cursor=selected.stack.cursor
     )
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
-    if type(policy) is ContinuationAdmissionPolicyV3:
-        raise ContinuationRetainedTailUnbounded("classifier PRIMARY has no proven complete retained result bound")
-    if type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV4):
+    if type(policy) is not ContinuationAdmissionPolicyV4:
         raise AuditIntegrityError("classifier PRIMARY requires its admitted current cost policy")
     stage = read_iteration_stage_on_connection(conn, running, selected=current)
     if (
@@ -579,9 +565,7 @@ def _prepare_classifier_primary_on_connection(
     descriptor = continuation_provider_input_json(request.kwargs)
     _input_value(descriptor, request.input_sha256)
     cost_source = read_continuation_cost_snapshot_on_connection(conn, selected.stack)
-    if type(cost_source) is not CommonProviderCostSnapshot or cost_source.policy != continuation_common_cost_policy(
-        cast(ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV4, policy)
-    ):
+    if type(cost_source) is not CommonProviderCostSnapshot or cost_source.policy != continuation_common_cost_policy(policy):
         raise AuditIntegrityError("classifier PRIMARY SQL input changed its immutable admitted cost policy")
     cost = CommonProviderCostBudget(cost_source)
     cost.validate_binding(
@@ -689,9 +673,9 @@ def _begin_classifier_primary_on_connection(
     conn: Connection,
     prepared: PreparedClassifierPrimary,
     *,
-    attempt: ProviderAttempt | None = None,
-    requested_model: str | None = None,
-    prepared_append: PreparedContinuationAppend | None = None,
+    attempt: ProviderAttempt,
+    requested_model: str,
+    prepared_append: PreparedContinuationAppend,
 ) -> StoredContinuationSnapshot:
     if type(prepared) is not PreparedClassifierPrimary:
         raise AuditIntegrityError("classifier PRIMARY dispatch requires its actual prepared owner")
@@ -741,9 +725,7 @@ def _begin_classifier_primary_on_connection(
         )
     ):
         raise AuditIntegrityError("classifier PRIMARY cannot dispatch an advanced or substituted effect")
-    if (attempt is None) != (requested_model is None) or (attempt is None) != (prepared_append is None):
-        raise AuditIntegrityError("classifier PRIMARY dispatch changed its physical admission shape")
-    if attempt is not None and (
+    if (
         type(attempt) is not ProviderAttempt
         or type(requested_model) is not str
         or not requested_model
@@ -755,16 +737,13 @@ def _begin_classifier_primary_on_connection(
         effects.c.operation_id == source.operation_id,
         effects.c.effect_key == source.effect_key,
     )
-    if attempt is None:
-        statement = statement.values(disposition="dispatched")
-    else:
-        statement = statement.values(
-            disposition="dispatched",
-            provider_attempt_id=attempt.attempt_id,
-            physical_sequence=binding.running.claim.segment_sequence,
-            physical_generation=binding.running.claim.ownership_generation,
-            requested_model=requested_model,
-        )
+    statement = statement.values(
+        disposition="dispatched",
+        provider_attempt_id=attempt.attempt_id,
+        physical_sequence=binding.running.claim.segment_sequence,
+        physical_generation=binding.running.claim.ownership_generation,
+        requested_model=requested_model,
+    )
     changed = conn.execute(statement)
     if changed.rowcount != 1:
         raise AuditIntegrityError("classifier PRIMARY dispatch lost its original prepared effect CAS")
@@ -782,31 +761,6 @@ def _begin_classifier_primary_on_connection(
     )
 
 
-def begin_classifier_primary_on_connection(
-    conn: Connection,
-    running: ComposerOperationRunning,
-    *,
-    selected: SelectedContinuationState,
-    inventory: CurrentContinuationEnvInventory,
-    captured: CapturedContinuationRuntime,
-    request: PreparedContinuationPrimaryRequest,
-    branch: ClassifierPrimaryBranch,
-    clock: ContinuationActionClock,
-) -> DispatchedClassifierPrimary:
-    """Prepare and dispatch in one transaction; never adopt an old intent.
-
-    The caller owns the enclosing locked transaction. Both immutable journal
-    checkpoints commit together, under this actual current claim, before SDK.
-    """
-    clock.require_preparation_time()
-    prepared = _prepare_classifier_primary_on_connection(
-        conn, running, selected=selected, inventory=inventory, captured=captured, request=request, branch=branch
-    )
-    dispatched = _begin_classifier_primary_on_connection(conn, prepared)
-    clock.require_preparation_time()
-    return DispatchedClassifierPrimary(prepared, dispatched)
-
-
 def publish_classifier_primary_on_connection(
     conn: Connection,
     prepared: PreparedClassifierPrimary,
@@ -815,7 +769,7 @@ def publish_classifier_primary_on_connection(
     outcome: _CallModelOutcome,
     recorder: RecorderSnapshot,
     permit: _PublishPermit,
-    v4_admission: V4ClassifierProviderAdmission | None = None,
+    v4_admission: V4ClassifierProviderAdmission,
     prepared_append: PreparedContinuationAppend | None = None,
 ) -> ClassifierPrimaryResult:
     issued = _returned.get(permit) if type(permit) is _PublishPermit else None
@@ -851,9 +805,6 @@ def publish_classifier_primary_on_connection(
         and row.requested_model == call.model_requested
         and selected == v4_admission.dispatched
     )
-    legacy_unbound = all(
-        value is None for value in (row.provider_attempt_id, row.physical_sequence, row.physical_generation, row.requested_model)
-    )
     if (
         row.disposition != "dispatched"
         or row.owner != "provider"
@@ -863,7 +814,7 @@ def publish_classifier_primary_on_connection(
         or row.action_json is not None
         or (row.creator_sequence, row.creator_generation) != (source.creator_sequence, source.creator_generation)
         or (source.creator_sequence, source.creator_generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
-        or (not v4_physical if v4_admission is not None else not legacy_unbound)
+        or not v4_physical
         or any(
             value is not None
             for value in (
@@ -876,25 +827,16 @@ def publish_classifier_primary_on_connection(
         )
     ):
         raise AuditIntegrityError("classifier PRIMARY publication cannot replace an unresolved original result")
-    if v4_admission is not None:
-        admitted_root = decode_continuation_snapshot(current.payload_json)
-        admitted_policy = decode_continuation_policy(admitted_root.admission_policy_json, admitted_root.policy_hash)
-        if type(admitted_policy) is not ContinuationAdmissionPolicyV4:
-            raise AuditIntegrityError("classifier V4 publication changed its admitted policy")
-        require_v4_successful_response_audit(
-            call,
-            outcome.completion.provider_metadata,
-            policy=admitted_policy,
-            attempt_id=call.call_id,
-            started_at=call.started_at,
-            finished_at=call.finished_at,
-        )
-    else:
-        require_successful_response_audit(
-            call, outcome.completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
-        )
-    if v4_admission is None:
-        _physical_source_data(conn, source.session_id, source.operation_id, row, call)
+    admitted_root = decode_continuation_snapshot(current.payload_json)
+    admitted_policy = decode_continuation_policy(admitted_root.admission_policy_json, admitted_root.policy_hash)
+    require_v4_successful_response_audit(
+        call,
+        outcome.completion.provider_metadata,
+        policy=admitted_policy,
+        attempt_id=call.call_id,
+        started_at=call.started_at,
+        finished_at=call.finished_at,
+    )
     before = decode_recorder_snapshot(_chunk_data(conn, source.session_id, source.operation_id, source.compose.audit_buffer))
     if replace(before, llm_calls=(*before.llm_calls, call)) != recorder or recorder.llm_calls[-1] is not call:
         raise AuditIntegrityError("classifier PRIMARY changed its exact original recorder prefix")
@@ -1035,19 +977,14 @@ def read_original_classifier_primary_on_connection(
         raise AuditIntegrityError("classifier PRIMARY changed its complete original physical receipt")
     prepared_root = decode_continuation_snapshot(dispatched.payload_json)
     admitted_policy = decode_continuation_policy(prepared_root.admission_policy_json, prepared_root.policy_hash)
-    if type(admitted_policy) is ContinuationAdmissionPolicyV4:
-        require_v4_successful_response_audit(
-            call,
-            completion.provider_metadata,
-            policy=admitted_policy,
-            attempt_id=call.call_id,
-            started_at=call.started_at,
-            finished_at=call.finished_at,
-        )
-    else:
-        require_successful_response_audit(
-            call, completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
-        )
+    require_v4_successful_response_audit(
+        call,
+        completion.provider_metadata,
+        policy=admitted_policy,
+        attempt_id=call.call_id,
+        started_at=call.started_at,
+        finished_at=call.finished_at,
+    )
     _physical_source_data(conn, session_id, operation_id, row, call)
     audit = _chunk_data(conn, session_id, operation_id, compose.audit_buffer)
     buffer = decode_recorder_snapshot(audit)
@@ -1098,12 +1035,11 @@ def read_original_classifier_primary_on_connection(
         or committed_evidence.source_chunk != encode_turn_evidence(extended, env_ref_names=frozenset(source.env_ref_names))
     ):
         raise AuditIntegrityError("classifier PRIMARY changed its complete original committed root")
-    if type(admitted_policy) is ContinuationAdmissionPolicyV4:
-        from elspeth.web.sessions.continuation_classifier_primary_complete_cold import require_v4_classifier_complete_hold_on_connection
+    from elspeth.web.sessions.continuation_classifier_primary_complete_cold import require_v4_classifier_complete_hold_on_connection
 
-        require_v4_classifier_complete_hold_on_connection(
-            conn, source=source, dispatched=dispatched, effect=row, call=call, completion=completion
-        )
+    require_v4_classifier_complete_hold_on_connection(
+        conn, source=source, dispatched=dispatched, effect=row, call=call, completion=completion
+    )
     return ClassifierPrimaryResult(
         committed,
         effect_key,
@@ -1358,7 +1294,7 @@ class ClassifierPrimaryIssuer:
         elif type(outcome) is RequiredSQLReturned:
             projection.begin_projection()
             try:
-                if type(outcome.value) not in (PreparedClassifierPrimary, DispatchedClassifierPrimary, ClassifierPrimaryResult):
+                if type(outcome.value) not in (PreparedClassifierPrimary, ClassifierPrimaryResult):
                     raise AuditIntegrityError("classifier state SQL returned an unfamiliar owner")
                 value = outcome.value
             except BaseException as error:
@@ -1428,9 +1364,7 @@ class ClassifierPrimaryIssuer:
         | SdkTerminalFailure
     ):
         policy = decode_continuation_policy(self.selected.stack.admission_policy_json, self.selected.stack.policy_hash)
-        if type(policy) is ContinuationAdmissionPolicyV3:
-            raise ContinuationRetainedTailUnbounded("classifier PRIMARY has no proven complete retained result bound")
-        if type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV4):
+        if type(policy) is not ContinuationAdmissionPolicyV4:
             raise AuditIntegrityError("classifier PRIMARY cannot fall back from its current admitted policy")
         if (
             type(prepared_input) is not PreparedProviderInput
@@ -1459,21 +1393,17 @@ class ClassifierPrimaryIssuer:
         if type(budget) is not CommonProviderCostBudget:
             raise AuditIntegrityError("classifier PRIMARY lost its original shared cost owner")
         captured = await capture_continuation_runtime_owners(self.runtime, selected=self.selected, inventory=self.inventory)
-        request: PreparedContinuationPrimaryRequest | None = None
-        no_sdk_issuer: ClassifierNoSdkIssuer | None = None
-        if type(policy) is ContinuationAdmissionPolicyV4:
-            request = self.service._provider_gateway.prepare_continuation_primary_from_input(prepared_input, cost_budget=budget)
-            no_sdk_issuer = ClassifierNoSdkIssuer(
-                running=self.running,
-                work=self.work,
-                selected_checkpoint_id=self.selected.checkpoint_id,
-                selected_cursor=self.selected.stack.cursor,
-                input_sha256=request.input_sha256,
-                clock=self.clock,
-            )
+        request = self.service._provider_gateway.prepare_continuation_primary_from_input(prepared_input, cost_budget=budget)
+        no_sdk_issuer = ClassifierNoSdkIssuer(
+            running=self.running,
+            work=self.work,
+            selected_checkpoint_id=self.selected.checkpoint_id,
+            selected_cursor=self.selected.stack.cursor,
+            input_sha256=request.input_sha256,
+            clock=self.clock,
+        )
 
-        def begin(conn: Connection) -> DispatchedClassifierPrimary | PreparedClassifierPrimary:
-            nonlocal request
+        def begin(conn: Connection) -> PreparedClassifierPrimary:
             from elspeth.web.sessions.continuation_iteration_return import read_iteration_stage_on_connection
 
             _require_current_continuation_running(conn, self.running)
@@ -1508,27 +1438,9 @@ class ClassifierPrimaryIssuer:
             ):
                 raise AuditIntegrityError("classifier PRIMARY stage already has its original physical attempt; replay is forbidden")
             source = read_continuation_cost_snapshot_on_connection(conn, self.selected.stack)
-            if source != budget.snapshot() or source.policy != continuation_common_cost_policy(
-                cast(ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | ContinuationAdmissionPolicyV4, policy)
-            ):
+            if source != budget.snapshot() or source.policy != continuation_common_cost_policy(policy):
                 raise AuditIntegrityError("classifier PRIMARY changed its immutable current cost source")
-            if request is None:
-                request = self.service._provider_gateway.prepare_continuation_primary_from_input(prepared_input, cost_budget=budget)
-            if type(policy) is ContinuationAdmissionPolicyV4:
-                if no_sdk_issuer is None:
-                    raise AuditIntegrityError("V4 classifier preparation lost its original no-SDK issuer")
-                prepared = _prepare_classifier_primary_on_connection(
-                    conn,
-                    self.running,
-                    selected=self.selected,
-                    inventory=self.inventory,
-                    captured=captured,
-                    request=request,
-                    branch=branch,
-                )
-                no_sdk_issuer.note_prepared_candidate(prepared)
-                return prepared
-            return begin_classifier_primary_on_connection(
+            prepared = _prepare_classifier_primary_on_connection(
                 conn,
                 self.running,
                 selected=self.selected,
@@ -1536,62 +1448,26 @@ class ClassifierPrimaryIssuer:
                 captured=captured,
                 request=request,
                 branch=branch,
-                clock=self.clock,
             )
+            no_sdk_issuer.note_prepared_candidate(prepared)
+            return prepared
 
         initial = await self._sql(begin)
         if type(request) is not PreparedContinuationPrimaryRequest:
             raise AuditIntegrityError("classifier PRIMARY lost its original prepared physical request")
-        if type(policy) is ContinuationAdmissionPolicyV4:
-            if type(initial) is not PreparedClassifierPrimary or no_sdk_issuer is None:
-                raise AuditIntegrityError("V4 classifier lost its original committed preparation")
-            no_sdk_issuer.bind_prepared(initial)
-            return await self._invoke_v4_prepared(
-                prepared=initial,
-                request=request,
-                no_sdk_issuer=no_sdk_issuer,
-                branch=branch,
-                prepared_input=prepared_input,
-                recorder=recorder,
-                deadline=deadline,
-                credential_state=credential_state,
-            )
-        if type(initial) is not DispatchedClassifierPrimary:
-            raise AuditIntegrityError("classifier V2 lost its original committed dispatch")
-        dispatched = initial
-        prepared = dispatched.prepared
-        self.clock.finish_preparation()
-        remaining = min(deadline - time.monotonic(), owner.remaining_dispatch(monotonic_now=time.monotonic()))
-        if remaining <= 0:
-            raise TimeoutError("classifier PRIMARY original allowance expired before SDK entry")
-        custody = self.provider_owner.mint(ProviderInvocationFamily.PRIMARY)
-        custody.bind_continuation_primary_clock(self.clock)
-
-        def entered() -> None:
-            self._sdk_entered = True
-
-        outcome = await self.service._provider_gateway._call_llm_outcome_with_audit(
-            prepared_input.evidence.messages,
-            prepared_input.tools if prepared_input.tools is not None else [],
-            timeout=remaining,
-            recorder=recorder,
-            provider_custody=custody,
-            credential_state=credential_state,
-            continuation_input_sha256=request.input_sha256,
+        if type(initial) is not PreparedClassifierPrimary:
+            raise AuditIntegrityError("V4 classifier lost its original committed preparation")
+        no_sdk_issuer.bind_prepared(initial)
+        return await self._invoke_v4_prepared(
+            prepared=initial,
+            request=request,
+            no_sdk_issuer=no_sdk_issuer,
+            branch=branch,
             prepared_input=prepared_input,
-            on_sdk_entry=entered,
+            recorder=recorder,
+            deadline=deadline,
+            credential_state=credential_state,
         )
-        buffer = recorder.snapshot_for_continuation(drained=self.runtime.drained)
-        permit = _PublishPermit()
-        _returned[permit] = (prepared, dispatched.snapshot, outcome, buffer)
-
-        def publish(conn: Connection) -> ClassifierPrimaryResult:
-            result = publish_classifier_primary_on_connection(
-                conn, prepared, selected=dispatched.snapshot, outcome=outcome, recorder=buffer, permit=permit
-            )
-            return result
-
-        return await self.clock.run("retention", lambda: self._sql(publish))
 
     async def _invoke_v4_prepared(
         self,

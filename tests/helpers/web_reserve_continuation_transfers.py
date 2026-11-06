@@ -2343,7 +2343,7 @@ TERMINAL_RESERVE_BODY_BINDINGS = {
     (
         "src/elspeth/web/sessions/continuation_driver.py",
         "_SegmentDriver",
-    ): "f2d33d7e790d9b3523c96cd84bd4ad2eb746c72d1580bbfd4e57134fcb63b55c",
+    ): "03b735579dcacce62b532acf47c6a879a46c65a6cf7af47e4de9bc2b949ac6fe",
     (
         "src/elspeth/web/sessions/continuation_tool_failure.py",
         "fail_continuation_tool_operation",

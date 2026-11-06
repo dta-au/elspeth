@@ -1,4 +1,8 @@
-"""Provider-stage semantic Advisor DATA, without decision or SQL authority."""
+"""Provider-stage semantic Advisor DATA from the original V4 paid phase.
+
+Copies below exercise DATA parsing only; they never supply SQL authority or
+replace the original physical owner used to obtain the positive observation.
+"""
 
 from __future__ import annotations
 
@@ -12,10 +16,8 @@ from elspeth.contracts.composer_audit import PrivateReceivedDiagnostic
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer import continuation_semantic_advisor as semantic
-from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation_semantic_advisor_outcome import (
-    SemanticAdvisorInvocationReturned,
-    observe_semantic_advisor_invocation,
+    SemanticAdvisorInvocationV4Finalized,
 )
 from elspeth.web.composer.continuation_semantic_observation import (
     SemanticCompleteResponseObservation,
@@ -23,13 +25,13 @@ from elspeth.web.composer.continuation_semantic_observation import (
     observe_semantic_provider_response,
 )
 from elspeth.web.credential_guard import CredentialMaterialRefused
-from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, _case, _reply
+from tests.unit.web.composer.test_continuation_semantic_advisor import _answer, _case, _observe_case, _reply
 from tests.unit.web.composer.test_continuation_semantic_advisor import operation_store as _operation_store
 
 operation_store = _operation_store
 
 
-async def _actual_success(inputs, provider, monkeypatch):
+async def _actual_success(inputs, phases, monkeypatch):
     request = semantic.prepare_semantic_advisor_request(**inputs)
     original = "\n" + json.dumps(_answer(request), indent=2) + "\n"
 
@@ -37,9 +39,11 @@ async def _actual_success(inputs, provider, monkeypatch):
         return _reply(original)
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    observed = await observe_semantic_advisor_invocation(request, provider_owner=provider, recorder=BufferingRecorder(), timeout=5)
-    assert type(observed) is SemanticAdvisorInvocationReturned
-    return request, observed, original
+    observed, terminal, error, actual_request = await _observe_case(phases, monkeypatch)
+    assert error is None and terminal is None
+    assert type(observed) is SemanticAdvisorInvocationV4Finalized
+    assert actual_request.request_sha256 == request.request_sha256
+    return actual_request, observed, original
 
 
 def _observe(request, returned, context, inputs):
@@ -68,21 +72,21 @@ def _with_large_audit(returned, *, count: int = 5):
 
 @pytest.mark.asyncio
 async def test_complete_semantic_observation_preserves_original_decision_text_and_chunk(operation_store, tmp_path, monkeypatch) -> None:
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, _baseline, _custodies):
-        request, returned, original = await _actual_success(inputs, provider, monkeypatch)
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, _baseline, _custodies):
+        request, returned, original = await _actual_success(inputs, _baseline["phases"], monkeypatch)
         observed = _observe(request, returned, context, inputs)
         assert isinstance(observed, SemanticCompleteResponseObservation)
         assert observed.message.content == original
-        assert observed.decision is returned.result.decision
-        assert observed.audit_call is returned.result.audit_call
-        assert observed.response == returned.result.response
+        assert observed.decision == returned.finalization.result.decision
+        assert observed.audit_call == returned.finalization.result.audit_call
+        assert observed.response == returned.finalization.result.response
         coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
 async def test_valid_semantic_physical_audit_excess_has_only_bounded_paid_data(operation_store, tmp_path, monkeypatch) -> None:
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, _baseline, _custodies):
-        request, returned, original = await _actual_success(inputs, provider, monkeypatch)
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, _baseline, _custodies):
+        request, returned, original = await _actual_success(inputs, _baseline["phases"], monkeypatch)
         changed = replace(returned, observation=_with_large_audit(returned))
         observed = _observe(request, changed, context, inputs)
         assert isinstance(observed, SemanticIncompleteResponseObservation)
@@ -101,8 +105,8 @@ async def test_valid_semantic_physical_audit_excess_has_only_bounded_paid_data(o
 
 @pytest.mark.asyncio
 async def test_escaped_semantic_response_excess_preserves_valid_decision(operation_store, tmp_path, monkeypatch) -> None:
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, _baseline, _custodies):
-        request, returned, _original = await _actual_success(inputs, provider, monkeypatch)
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, _baseline, _custodies):
+        request, returned, _original = await _actual_success(inputs, _baseline["phases"], monkeypatch)
         physical = returned.observation
         assert physical.provider_metadata is not None and physical.audit_call is not None
         metadata = replace(
@@ -131,8 +135,8 @@ async def test_escaped_semantic_response_excess_preserves_valid_decision(operati
 @pytest.mark.asyncio
 @pytest.mark.parametrize("large_audit", (False, True))
 async def test_wrong_decision_id_is_integrity_error_before_size(operation_store, tmp_path, monkeypatch, large_audit: bool) -> None:
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, _baseline, _custodies):
-        request, returned, _original = await _actual_success(inputs, provider, monkeypatch)
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, _baseline, _custodies):
+        request, returned, _original = await _actual_success(inputs, _baseline["phases"], monkeypatch)
         physical = _with_large_audit(returned) if large_audit else returned.observation
         assert physical.decision is not None
         changed = replace(returned, observation=replace(physical, decision=physical.decision.model_copy(update={"decision_id": "foreign"})))
@@ -144,8 +148,8 @@ async def test_wrong_decision_id_is_integrity_error_before_size(operation_store,
 @pytest.mark.asyncio
 @pytest.mark.parametrize("large_audit", (False, True))
 async def test_audit_only_credential_is_not_size(operation_store, tmp_path, monkeypatch, large_audit: bool) -> None:
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, _baseline, _custodies):
-        request, returned, _original = await _actual_success(inputs, provider, monkeypatch)
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, _baseline, _custodies):
+        request, returned, _original = await _actual_success(inputs, _baseline["phases"], monkeypatch)
         physical = _with_large_audit(returned) if large_audit else returned.observation
         assert physical.audit_call is not None
         audit = replace(
@@ -160,8 +164,8 @@ async def test_audit_only_credential_is_not_size(operation_store, tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_malformed_or_tool_bearing_decision_is_not_size(operation_store, tmp_path, monkeypatch) -> None:
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, _baseline, _custodies):
-        request, returned, _original = await _actual_success(inputs, provider, monkeypatch)
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, _baseline, _custodies):
+        request, returned, _original = await _actual_success(inputs, _baseline["phases"], monkeypatch)
         physical = _with_large_audit(returned)
         assert physical.message is not None
         for changed in (
@@ -175,8 +179,8 @@ async def test_malformed_or_tool_bearing_decision_is_not_size(operation_store, t
 
 @pytest.mark.asyncio
 async def test_provider_field_traversal_refusal_is_preserved(operation_store, tmp_path, monkeypatch) -> None:
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, _baseline, _custodies):
-        request, returned, _original = await _actual_success(inputs, provider, monkeypatch)
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, _baseline, _custodies):
+        request, returned, _original = await _actual_success(inputs, _baseline["phases"], monkeypatch)
         physical = _with_large_audit(returned)
         assert physical.provider_metadata is not None and physical.audit_call is not None
         metadata = replace(physical.provider_metadata, reasoning_content="x" * 262_145)
@@ -193,8 +197,8 @@ async def test_provider_field_traversal_refusal_is_preserved(operation_store, tm
 
 @pytest.mark.asyncio
 async def test_cost_and_usage_preserve_known_unknown_and_unavailable(operation_store, tmp_path, monkeypatch) -> None:
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, _baseline, _custodies):
-        request, returned, _original = await _actual_success(inputs, provider, monkeypatch)
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, _baseline, _custodies):
+        request, returned, _original = await _actual_success(inputs, _baseline["phases"], monkeypatch)
         physical = _with_large_audit(returned)
         assert physical.provider_metadata is not None and physical.audit_call is not None
         for amount, expected in ((None, None), (0.0, "0"), (0.25, "0.25"), (5e-324, "5e-324"), (1e308, "1e308")):

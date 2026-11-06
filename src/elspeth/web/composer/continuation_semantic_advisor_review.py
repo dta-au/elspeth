@@ -28,6 +28,7 @@ from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
 from elspeth.web.composer.continuation_end_effects import semantic_end_effect_key
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
+from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope, v4_preparation_memo_scope
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import load_snapshot
@@ -56,7 +57,7 @@ def _read_review_admission(
     semantic_effect_key: str,
 ) -> SemanticActionAdmission:
     sid, operation = str(running.claim.session_id), running.claim.operation_id
-    with locked_session_transaction(authority._engine, sid) as conn:
+    with locked_session_transaction(authority._engine, sid) as conn, borrow_v4_preparation_memo_scope():
         stored = load_snapshot(conn, session_id=sid, operation_id=operation)
         if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(selected.stack):
             raise AuditIntegrityError("prescribed Review changed its selected current END cut")
@@ -125,16 +126,20 @@ async def review_prescribed_continuation_end(
         or selected.stack.active_action_json is None
     ):
         raise AuditIntegrityError("prescribed Review requires its actual claimed END action cut")
-    admitted = await _registered(
-        work=phases.work,
-        source=RequiredWorkSource.CONTINUATION_READ_SQL,
-        operation=partial(_read_review_admission, phases.authority, running, selected, source.effect_key),
-        expected=SemanticActionAdmission,
-    )
-    candidate = admitted.review_candidate
-    if candidate is None or admitted.action_key is None:
-        raise AuditIntegrityError("prescribed Review lost its original paid END candidate")
-    execution = await execute_continuation_end_review(phases, selected)
+    clock = phases.action_clock
+    if clock is None:
+        raise AuditIntegrityError("V4 END preparation lost its original driver action clock")
+    with v4_preparation_memo_scope(clock):
+        admitted = await _registered(
+            work=phases.work,
+            source=RequiredWorkSource.CONTINUATION_READ_SQL,
+            operation=partial(_read_review_admission, phases.authority, running, selected, source.effect_key),
+            expected=SemanticActionAdmission,
+        )
+        candidate = admitted.review_candidate
+        if candidate is None or admitted.action_key is None:
+            raise AuditIntegrityError("prescribed Review lost its original paid END candidate")
+        execution = await execute_continuation_end_review(phases, selected)
     if type(execution) is EndCheckpointFormatRetryReady:
         if execution.completed.cursor <= selected.stack.cursor:
             raise AuditIntegrityError("prescribed Review format retry lost its committed successor")

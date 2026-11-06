@@ -20,7 +20,6 @@ from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_selection import load_selected_continuation
-from elspeth.web.composer.continuation_title_values import decode_title_provider_result
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.continuation_retention_memo import current_retention_stage_memo
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
@@ -42,7 +41,14 @@ from tests.unit.web.composer.test_explicit_provider_custody import _assert_requi
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
 from tests.unit.web.sessions.test_continuation_ingress import recovery_rows
-from tests.unit.web.sessions.test_continuation_title_provider import actual_title_update, observer, raw_reply, sql_rows, title_case
+from tests.unit.web.sessions.test_continuation_title_provider import (
+    actual_title_update,
+    decode_current_title_result,
+    observer,
+    raw_reply,
+    sql_rows,
+    title_case,
+)
 
 operation_store = operations.operation_store
 
@@ -155,6 +161,7 @@ async def test_paid_title_application_preserves_original_result_and_applies_exac
     try:
         await actual_title_update(operation_store, running, work, "Renamed Before Title Application")
         before = decode_continuation_snapshot(settled.selected.payload_json)
+        decoded = decode_current_title_result(service, running, settled)
         published = await application.apply_current_title_success(service=service, selected=settled.selected, required_work=work)
         assert published.applied and published.decision.disposition == disposition
         after = decode_continuation_snapshot(published.selected.payload_json)
@@ -165,7 +172,6 @@ async def test_paid_title_application_preserves_original_result_and_applies_exac
         assert published.selected.cursor == settled.selected.cursor + 1
         assert published.result == original.result and len(sdk) == len(calls) == 1
         assert published.finish_reason == calls[0].finish_reason
-        decoded = decode_title_provider_result(published.result, env_ref_names=published.inventory.names)
         assert decoded.audit_call == calls[0] and decoded.completion.message.content == content
         assert (await operation_store[3].get_session(operation_store[4])).title == (
             content if disposition == "accepted" else "Renamed Before Title Application"
@@ -541,22 +547,22 @@ async def test_actual_fresh_claim_applies_or_replays_paid_title_without_second_s
 
 
 @pytest.mark.asyncio
-async def test_real_pending_title_accounting_refuses_application_without_writes(operation_store, tmp_path, monkeypatch):
+async def test_real_uncommitted_title_result_refuses_application_without_writes(operation_store, tmp_path, monkeypatch):
     running, service, work, prepared, _requests = await title_case(operation_store, tmp_path, monkeypatch)
-    reached, resume = asyncio.Event(), asyncio.Event()
-    original_finish = type(operation_store[3]).finish_provider_attempt
+    reached, resume = Event(), Event()
+    original_finish = type(operation_store[3]).complete_v4_title_result_sync
     sdk = []
 
-    async def pause(self, **kwargs):
+    def pause(self, **kwargs):
         reached.set()
-        await resume.wait()
-        return await original_finish(self, **kwargs)
+        assert resume.wait(timeout=10)
+        return original_finish(self, **kwargs)
 
     async def completion(**kwargs):
         sdk.append(kwargs)
         return raw_reply(kwargs["model"])
 
-    monkeypatch.setattr(type(operation_store[3]), "finish_provider_attempt", pause)
+    monkeypatch.setattr(type(operation_store[3]), "complete_v4_title_result_sync", pause)
     monkeypatch.setattr(litellm, "acompletion", completion)
     task = asyncio.create_task(
         provider.run_prepared_title_provider(
@@ -566,9 +572,10 @@ async def test_real_pending_title_accounting_refuses_application_without_writes(
     joined = False
     body_error = None
     try:
-        await reached_or_failure(task, reached)
-        current = await provider.read_current_title_result(service=service, running=running, required_work=work)
-        assert not current.settled and len(sdk) == 1 and not sql_rows(operation_store)[1]
+        assert await asyncio.to_thread(reached.wait, 10)
+        with pytest.raises(AuditIntegrityError, match="unresolved"):
+            await provider.read_current_title_result(service=service, running=running, required_work=work)
+        assert len(sdk) == 1 and not sql_rows(operation_store)[1]
         before = recovery_rows(operation_store[0])
         with pytest.raises(AuditIntegrityError, match="complete settled-success cut"):
             await application.read_current_title_application(service=service, running=running, required_work=work)

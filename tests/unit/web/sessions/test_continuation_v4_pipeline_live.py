@@ -14,7 +14,7 @@ from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cut
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
-from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, read_v3_tool_no_execution_refusal_on_connection
+from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal, read_tool_no_execution_refusal_on_connection
 from elspeth.web.sessions.models import blobs_table as blobs
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composition_states_table as states
@@ -164,7 +164,7 @@ async def test_actual_v4_pipeline_unsupported_tail_is_cold_unissued_without_grap
         receipt = await owner._execute_one(selected)
         assert type(receipt) is ToolNoExecutionRefusal
         with store[0].connect() as conn:
-            cold = read_v3_tool_no_execution_refusal_on_connection(
+            cold = read_tool_no_execution_refusal_on_connection(
                 conn,
                 session_id=store[4],
                 operation_id=running.claim.operation_id,

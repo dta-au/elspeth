@@ -245,3 +245,207 @@ async def test_unpaid_early_refuses_changed_outer_physical_hold_ledger_and_lease
         error = project_composer_operation_error(ComposerContextUnsupported("prepared_request_bytes"), request_id=None)
         terminal = owner.authority.settle_continuation_owner(running, outcome=error, env_ref_names=names)
         assert terminal.failure_code == error.failure_code and len(sdk) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop", (False, True), ids=("original-timeout", "stop"))
+async def test_supported_review_end_prepared_failure_preserves_original_and_rejects_changed_source(tmp_path, monkeypatch, stop):
+    from elspeth.web.composer import continuation_checkpoint_end_detached as detached
+    from elspeth.web.composer.continuation import EndFrame
+    from elspeth.web.composer.continuation_next_action import unpaid_checkpoint_outer_on_connection
+    from elspeth.web.sessions import continuation_driver as driver_module
+    from tests.helpers.composer_operations import message_body
+    from tests.helpers.continuation_app import (
+        ACTOR,
+        ScriptedSDK,
+        continuation_app,
+        install_sdk,
+        observe_supported_path,
+        semantic_primary_response,
+        semantic_review_response,
+        submit_and_settle,
+        tool_call,
+    )
+
+    operation_id = str(uuid4())
+    failure = TimeoutError("controlled original unpaid END preparation failure")
+    original_restore = detached.restore_prepared_end_runtime
+    original_project = driver_module.project_composer_operation_error
+    reached, projected, rejected = [], [], []
+
+    def project_original(original, **arguments):
+        result = original_project(original, **arguments)
+        if original is failure:
+            projected.append(result)
+        return result
+
+    monkeypatch.setattr(driver_module, "project_composer_operation_error", project_original)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        engine = harness.app.state.session_engine
+        policy = harness.app.state.composer_async_operation_authority._continuation_policy
+        assert policy is not None and policy.actions.advisor.preparation == 5.0
+        sid = str(harness.session_id)
+
+        def rows(conn):
+            return tuple(
+                tuple(conn.execute(select(table).order_by(*table.primary_key.columns)).all())
+                for table in (chunks, events, effects, physical, ledger, holds)
+            )
+
+        async def restore_then_fail(*, phase_owner, prepared, captured):
+            restored = await original_restore(phase_owner=phase_owner, prepared=prepared, captured=captured)
+            running = phase_owner.phases.work.running
+            if running is None or running.claim.operation_id != operation_id or prepared.phase != "end":
+                return restored
+            assert not reached
+            assert prepared.source.checkpoint_id == phase_owner.selected.checkpoint_id
+            assert prepared.prepared_selected.cursor == prepared.source.cursor + 1
+            assert prepared.end_input_ref is not None
+            names = phase_owner.inventory.names
+            with engine.connect() as conn:
+                stored = load_snapshot(conn, session_id=sid, operation_id=operation_id)
+                assert stored == prepared.prepared_selected
+                root = decode_continuation_snapshot(stored.payload_json)
+                assert type(root.frames[-1]) is EndFrame and root.frames[-1].phase == "review_needed"
+                assert root.active_action_json is not None and json.loads(root.active_action_json)["kind"] == "review"
+                current = SelectedContinuationState(
+                    stored.checkpoint_id,
+                    root,
+                    load_snapshot_private_data_on_connection(conn, session_id=sid, operation_id=operation_id, selected=stored),
+                )
+                (outer,) = validate_continuation_structure_on_connection(conn, running, current, env_ref_names=names)
+                assert outer == prepared.outer_effect_key
+                event_key = conn.execute(
+                    select(events.c.payload_chunk_key).where(
+                        events.c.session_id == sid, events.c.operation_id == operation_id, events.c.sequence == stored.cursor
+                    )
+                ).scalar_one()
+                event_bytes = conn.execute(
+                    select(chunks.c.payload).where(
+                        chunks.c.session_id == sid, chunks.c.operation_id == operation_id, chunks.c.chunk_key == event_key
+                    )
+                ).scalar_one()
+                source_event = json.loads(event_bytes)
+                assert source_event["owner"] == "composer_checkpoint_source" and source_event["phase"] == "end"
+                assert source_event["stage"] == "source_prepared" and source_event["kind"] == "end_review"
+                assert source_event["source_checkpoint_id"] == prepared.source.checkpoint_id
+                paid_before = tuple(conn.execute(select(physical).where(physical.c.session_id == sid)).all())
+                usage_before = tuple(conn.execute(select(ledger).where(ledger.c.session_id == sid)).all())
+                holds_before = tuple(
+                    conn.execute(select(holds).where(holds.c.session_id == sid, holds.c.operation_id == operation_id)).all()
+                )
+                prior_effects = tuple(
+                    conn.execute(select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation_id)).all()
+                )
+            assert sdk.roles == ["primary", "semantic", "primary", "semantic"] and not sdk.steps
+            assert len(paid_before) == len(usage_before) == len(holds_before) == 4
+            assert all(item.settled_at is not None and item.ledger_entry_id is not None for item in paid_before)
+            assert all(item.state == "consumed" for item in holds_before)
+            assert {item.attempt_id for item in paid_before} == {item.provider_attempt_id for item in holds_before}
+            assert all(
+                any(item.provider_attempt_id == attempt.attempt_id and item.disposition == "committed" for item in prior_effects)
+                for attempt in paid_before
+            )
+            if not stop:
+                for opponent in ("source_checkpoint", "end_input", "paid_h"):
+                    with engine.begin() as conn:
+                        before = rows(conn)
+                        savepoint = conn.begin_nested()
+                        if opponent == "paid_h":
+                            actual_hold = holds_before[-1]
+                            changed = conn.execute(
+                                update(holds)
+                                .where(
+                                    holds.c.session_id == sid,
+                                    holds.c.operation_id == operation_id,
+                                    holds.c.effect_key == actual_hold.effect_key,
+                                    holds.c.provider_attempt_id == actual_hold.provider_attempt_id,
+                                )
+                                .values(state="active", consumed_at=None)
+                            )
+                        else:
+                            if opponent == "source_checkpoint":
+                                changed_event = dict(source_event)
+                                changed_event["source_checkpoint_id"] = stored.checkpoint_id
+                                payload = canonical_json(changed_event).encode("utf-8")
+                                key = event_key
+                            else:
+                                reference = prepared.end_input_ref
+                                key = f"value:{reference.codec}:{reference.digest}"
+                                payload = b"{}"
+                            changed = conn.execute(
+                                update(chunks)
+                                .where(chunks.c.session_id == sid, chunks.c.operation_id == operation_id, chunks.c.chunk_key == key)
+                                .values(payload=payload, byte_length=len(payload), sha256=sha256(payload).hexdigest())
+                            )
+                        assert changed.rowcount == 1
+                        changed_rows = rows(conn)
+                        with pytest.raises(AuditIntegrityError):
+                            unpaid_checkpoint_outer_on_connection(
+                                conn,
+                                session_id=harness.session_id,
+                                operation_id=operation_id,
+                                sequence=running.claim.segment_sequence,
+                                generation=running.claim.ownership_generation,
+                                selected=current,
+                                env_ref_names=names,
+                            )
+                        assert rows(conn) == changed_rows
+                        savepoint.rollback()
+                        assert rows(conn) == before
+                        assert validate_continuation_structure_on_connection(conn, running, current, env_ref_names=names) == (outer,)
+                    rejected.append(opponent)
+            reached.append((prepared, paid_before, usage_before, holds_before, outer))
+            if stop:
+                cancelled = harness.app.state.composer_async_operation_authority.request_owner_cancel(
+                    session_id=harness.session_id, operation_id=operation_id, actor_user_id=ACTOR, auth_provider_type="local"
+                )
+                assert cancelled is not None and cancelled.cancel_requested_at is not None
+            raise failure
+
+        monkeypatch.setattr(detached, "restore_prepared_end_runtime", restore_then_fail)
+        sdk = ScriptedSDK(
+            [
+                (
+                    "primary",
+                    lambda app: ("Inspecting the current pipeline.", [tool_call(app, "unpaid_end_read", "get_pipeline_state", {})]),
+                ),
+                ("semantic", semantic_primary_response),
+                ("primary", ("The inspected pipeline is ready for its original END review.", None)),
+                ("semantic", semantic_review_response),
+            ],
+            app_ref=[harness.app],
+        )
+        install_sdk(monkeypatch, sdk)
+        artifact = tmp_path / "unpaid-end-prepared-driver.json"
+        with observe_supported_path(monkeypatch, operation_id=operation_id, session_id=harness.session_id, artifact=artifact) as observed:
+            terminal = await submit_and_settle(
+                harness, message_body("Inspect the pipeline and explain its current state.", operation_id=operation_id), rounds=720
+            )
+            observed.require_driver_stages()
+            assert len(reached) == 1, f"Original Review/END preparation was not reached; safe metadata: {artifact}"
+            assert terminal.status == "failed" and terminal.error is not None and terminal.result is None
+            if stop:
+                assert terminal.error.failure_code == "request_cancelled" and terminal.error.http_status == 499
+                assert not projected and not rejected
+            else:
+                assert len(projected) == 1 and terminal.error == projected[0]
+                assert terminal.error.failure_code == "operation_failed" and terminal.error.http_status == 500
+                assert rejected == ["source_checkpoint", "end_input", "paid_h"]
+            prepared, paid_before, usage_before, holds_before, outer = reached[0]
+            with engine.connect() as conn:
+                current = load_snapshot(conn, session_id=sid, operation_id=operation_id)
+                root = decode_continuation_snapshot(current.payload_json)
+                assert tuple(item.effect_id for item in root.effect_frontier if item.disposition == "unknown") == (outer,)
+                appended = conn.execute(
+                    select(events).where(events.c.session_id == sid, events.c.operation_id == operation_id).order_by(events.c.sequence)
+                ).all()
+                assert [item.tag for item in appended[-2:]] == ["effect_unknown", "settled"]
+                assert current.cursor == prepared.prepared_selected.cursor + 2
+                assert tuple(conn.execute(select(physical).where(physical.c.session_id == sid)).all()) == paid_before
+                assert tuple(conn.execute(select(ledger).where(ledger.c.session_id == sid)).all()) == usage_before
+                assert (
+                    tuple(conn.execute(select(holds).where(holds.c.session_id == sid, holds.c.operation_id == operation_id)).all())
+                    == holds_before
+                )
+            assert sdk.roles == ["primary", "semantic", "primary", "semantic"] and not sdk.steps
