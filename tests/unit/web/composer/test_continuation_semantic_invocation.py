@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from uuid import UUID
 
 import pytest
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.advisor_output import ContinuationAdvisorDecision, ContinuationEvidenceRef, ReadContinuationAction
@@ -24,12 +27,47 @@ from elspeth.web.composer.continuation_semantic_advisor import prepare_semantic_
 from elspeth.web.composer.continuation_semantic_source import capture_semantic_advisor_source
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.turn_effects import authored_state_hash
-from tests.unit.web.composer.test_continuation_semantic_advisor import _case
-from tests.unit.web.composer.test_continuation_semantic_advisor import operation_store as _operation_store
 from tests.unit.web.composer.test_continuation_semantic_source import _with_frontier
+from tests.unit.web.sessions.test_continuation_composition_initialization import construct, ready_case
+from tests.unit.web.sessions.test_continuation_composition_initialization import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 
 operation_store = _operation_store
+
+
+@asynccontextmanager
+async def _initialized_invocation_data(store, tmp_path, monkeypatch):
+    """Use actual first-Compose DATA without entering a physical semantic action."""
+    running, service, work, ready, sdk = await ready_case(store, tmp_path, monkeypatch)
+    try:
+        runtime = await construct(store, running, service, work, ready)
+        assert not sdk and runtime.source.selected.stack.semantic_frontier is not None
+        provider = runtime.bindings.provider_owner
+        assert runtime.bindings.session_operation_context is running.session_operation_context
+        inputs = {
+            "owner": service._advisor_checkpoint,
+            "provider_owner": provider,
+            "state": runtime.live.state,
+            "content_scope": ComposerContentScope(
+                UUID(running.session_operation_context.fence.session_id), composition_content_hash(runtime.live.state)
+            ),
+            "user_message": runtime.bindings.message,
+            "runtime": runtime,
+            "env_ref_names": runtime.env_ref_names,
+        }
+        custodies = []
+        actual_mint = provider.mint
+
+        def mint(family):
+            actual = actual_mint(family)
+            custodies.append(actual)
+            return actual
+
+        with monkeypatch.context() as observe:
+            observe.setattr(provider, "mint", mint)
+            yield inputs, work.coordinator, custodies
+    finally:
+        store[1].release(running.session_operation_context)
 
 
 def _evidence(content, *, provider=False, receipt="retained-read:1"):
@@ -123,7 +161,7 @@ def _capture_with_history(capture):
 async def test_final_invocation_binds_exact_stable_request_and_existing_private_preparation(operation_store, tmp_path, monkeypatch):
     from elspeth.web.composer.continuation_semantic_invocation import SemanticAdvisorInvocationData, make_semantic_advisor_invocation
 
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, _baseline, custodies):
+    async with _initialized_invocation_data(operation_store, tmp_path, monkeypatch) as (inputs, coordinator, custodies):
         raw = capture_semantic_advisor_source(inputs["runtime"])
         before = stored_rows(operation_store[0])
         data = make_semantic_advisor_invocation(raw)
@@ -162,7 +200,7 @@ async def test_final_invocation_binds_exact_stable_request_and_existing_private_
 async def test_receipt_and_provider_history_cannot_reopen_unchanged_action(operation_store, tmp_path, monkeypatch, disposition):
     from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation, semantic_advisor_action_key
 
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, _baseline, _custodies):
+    async with _initialized_invocation_data(operation_store, tmp_path, monkeypatch) as (inputs, coordinator, _custodies):
         runtime = inputs["runtime"]
         frontier = decode_frontier_chunk(capture_semantic_advisor_source(runtime).predecessor_frontier)
         fact = _evidence({"authoritative_field": "original value"})
@@ -219,7 +257,7 @@ async def test_receipt_and_provider_history_cannot_reopen_unchanged_action(opera
 async def test_changed_nonprovider_content_changes_action_key_without_relabeling_request(operation_store, tmp_path, monkeypatch):
     from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation, semantic_advisor_action_key
 
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, _baseline, _custodies):
+    async with _initialized_invocation_data(operation_store, tmp_path, monkeypatch) as (inputs, coordinator, _custodies):
         runtime = inputs["runtime"]
         frontier = decode_frontier_chunk(capture_semantic_advisor_source(runtime).predecessor_frontier)
         first_fact = _evidence({"authoritative_field": "original value"})
@@ -258,7 +296,7 @@ async def test_changed_nonprovider_content_changes_action_key_without_relabeling
 async def test_final_invocation_refuses_original_source_tampering(operation_store, tmp_path, monkeypatch, change):
     from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
 
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, _baseline, _custodies):
+    async with _initialized_invocation_data(operation_store, tmp_path, monkeypatch) as (inputs, coordinator, _custodies):
         raw = capture_semantic_advisor_source(inputs["runtime"])
         data = make_semantic_advisor_invocation(raw)
         data.verify(raw)
@@ -285,7 +323,7 @@ async def test_final_invocation_refuses_original_source_tampering(operation_stor
 async def test_unselected_graph_proposal_cannot_become_final_invocation(operation_store, tmp_path, monkeypatch):
     from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
 
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, _baseline, _custodies):
+    async with _initialized_invocation_data(operation_store, tmp_path, monkeypatch) as (inputs, coordinator, _custodies):
         runtime = inputs["runtime"]
         retained = decode_frontier_chunk(capture_semantic_advisor_source(runtime).predecessor_frontier)
         old_graph = _with_frontier(runtime, replace(retained, graph_hash=stable_hash("actual predecessor graph")))
@@ -301,7 +339,7 @@ async def test_unselected_graph_proposal_cannot_become_final_invocation(operatio
 async def test_selected_frontier_refuses_a_different_graph_hash_domain(operation_store, tmp_path, monkeypatch):
     from elspeth.web.composer.continuation_semantic_invocation import make_semantic_advisor_invocation
 
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, _context, coordinator, _baseline, _custodies):
+    async with _initialized_invocation_data(operation_store, tmp_path, monkeypatch) as (inputs, coordinator, _custodies):
         runtime = inputs["runtime"]
         raw = capture_semantic_advisor_source(runtime)
         actual = make_semantic_advisor_invocation(raw)

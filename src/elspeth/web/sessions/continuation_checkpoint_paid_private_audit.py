@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from hashlib import sha256
 
-from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, or_, select
+from sqlalchemy import Connection, LargeBinary, Text, case, cast, func, select
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
@@ -24,6 +24,7 @@ from elspeth.web.composer.provider_audit_source import (
 )
 from elspeth.web.composer.visible_tool_event import validate_visible_audit_row
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
+from elspeth.web.sessions.continuation_audit_membership import private_audit_membership_predicate
 from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource
 from elspeth.web.sessions.models import chat_messages_table as messages
 
@@ -338,7 +339,7 @@ def require_checkpoint_paid_private_audit_on_connection(
             messages.c.session_id == source.session_id,
             messages.c.role == "audit",
             messages.c.content == _PRIVATE_CONTENT,
-            or_(text.like(f"%{attempt_id}%"), text.like(f"%{request_id}%"), text.like(f"%{failure_id}%")),
+            private_audit_membership_predicate(conn, attempt_id=attempt_id),
         )
         .limit(3)
     ).all()

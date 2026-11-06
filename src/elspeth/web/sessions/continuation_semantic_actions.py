@@ -45,7 +45,11 @@ from elspeth.web.composer.continuation_progress import (
     record_action_receipt,
     retain_advisor_action,
 )
-from elspeth.web.composer.continuation_semantic_advisor_evidence import SemanticAdvisorEvidenceData, derive_paid_semantic_evidence
+from elspeth.web.composer.continuation_semantic_advisor_evidence import (
+    SemanticAdvisorEvidenceData,
+    _derive_paid_semantic_evidence_from_original_invocation,
+    derive_paid_semantic_evidence,
+)
 from elspeth.web.composer.tools.continuation_support import continuation_tool_support
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
@@ -82,6 +86,7 @@ from elspeth.web.sessions.models import composer_continuation_effects_table as e
 from elspeth.web.sessions.models import composer_continuation_events_table as events
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_semantic_invocation import SemanticAdvisorInvocationData
     from elspeth.web.sessions.continuation_checkpoint_paid_terminal import VerifiedCheckpointPaidOverflowTerminal
     from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
 
@@ -200,6 +205,10 @@ def _admit_paid(conn: Connection, paid: SemanticAdvisorPaidDecisionData) -> Sema
     if type(paid) is not SemanticAdvisorPaidDecisionData:
         raise TypeError("semantic action requires its SQL-proved paid decision")
     evidence = derive_paid_semantic_evidence(paid, end_candidate=_end_candidate(conn, paid))
+    return _admit_paid_evidence(paid, evidence)
+
+
+def _admit_paid_evidence(paid: SemanticAdvisorPaidDecisionData, evidence: SemanticAdvisorEvidenceData) -> SemanticActionAdmission:
     decision = canonicalize_continuation_obligations(paid.decision, paid.invocation.frontier)
     action = decision.prescribed_action
     if action is not None and not isinstance(action, (ReadContinuationAction, ReviewContinuationAction)):
@@ -361,7 +370,7 @@ def _original_paid_for_selected(
     selected: StoredContinuationSnapshot,
     root: ContinuationFrameStack,
     effect_key: str,
-) -> SemanticAdvisorPaidDecisionData:
+) -> tuple[SemanticAdvisorPaidDecisionData, SemanticAdvisorInvocationData]:
     sid, operation = str(session_id), operation_id
     result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
     if result.outcome is not SemanticAdvisorProviderOutcome.SUCCESS or result.decision is None or result.response is None:
@@ -388,7 +397,7 @@ def _original_paid_for_selected(
         creator_operation_epoch=creator.session_operation_epoch,
         creator_lease_token=creator.session_operation_lease_token,
     )
-    return paid
+    return paid, data
 
 
 def _reprove_installed_snapshot(
@@ -401,9 +410,12 @@ def _reprove_installed_snapshot(
     from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
     root = decode_continuation_snapshot(selected.payload_json)
-    paid = _original_paid_for_selected(conn, session_id, operation_id, selected, root, effect_key)
+    paid, original_invocation = _original_paid_for_selected(conn, session_id, operation_id, selected, root, effect_key)
     original_selected = semantic_recovery_source(conn, str(session_id), operation_id, selected).snapshot
-    admission = _admit_paid(conn, paid)
+    if type(paid) is not SemanticAdvisorPaidDecisionData:
+        raise TypeError("semantic action requires its SQL-proved paid decision")
+    evidence = _derive_paid_semantic_evidence_from_original_invocation(paid, original_invocation, end_candidate=_end_candidate(conn, paid))
+    admission = _admit_paid_evidence(paid, evidence)
     expected = admission.expected_root.model_copy(update={"cursor": selected.cursor})
     if root != expected:
         raise AuditIntegrityError("installed semantic action changed its complete original paid/admitted root")

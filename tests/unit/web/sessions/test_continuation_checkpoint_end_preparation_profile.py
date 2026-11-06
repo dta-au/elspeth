@@ -37,7 +37,9 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from tests.helpers.continuation_end_profile import (
     EndPreparationProfile,
     EndTextMemoObservation,
+    StopDecisionProfile,
     _driver_review_observer,
+    _driver_stop_observer,
     driver_end_preparation_profile,
 )
 from tests.helpers.continuation_policy import minimal_continuation_policy
@@ -72,8 +74,10 @@ def test_driver_end_profile_absent_flag_preserves_original_alias(monkeypatch):
 
     monkeypatch.delenv("ELSPETH_TEST_DRIVER_END_PROFILE", raising=False)
     original = driver.review_prescribed_continuation_end
+    original_semantic = driver.run_continuation_semantic_advisor
     with driver_end_preparation_profile(monkeypatch, None, session_id="session", operation_id="operation"):
         assert driver.review_prescribed_continuation_end is original
+        assert driver.run_continuation_semantic_advisor is original_semantic
     assert driver.review_prescribed_continuation_end is original
 
 
@@ -929,3 +933,436 @@ async def test_first_capture_cpu_not_reached_keeps_original_error_and_invalid_re
         _assert_cpu_monitoring_cleanup()
     finally:
         engine.dispose()
+
+
+def _stop_profile_metadata():
+    from elspeth.web.composer.continuation import AdvisorFrame, EndFrame, PrivateChunkRef
+
+    # Discriminator-only metadata, never passed to a production authority.
+    reference = PrivateChunkRef(codec="composer.state.v1", digest="a" * 64, byte_length=2)
+    end = EndFrame(phase="publication_ready", state=reference, candidate=reference, publication_binding="binding")
+    advisor = AdvisorFrame(phase="response_retained", review=reference, response=reference, coverage_binding="coverage")
+    root = SimpleNamespace(
+        logical=SimpleNamespace(session_id="session", operation_id="operation"), frames=(object(), end, advisor), cursor=27
+    )
+    clock = ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    return SimpleNamespace(action_clock=clock), SimpleNamespace(stack=root)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrong", ("session", "operation", "cursor", "parent", "phase", "clock", "used_clock"))
+async def test_stop_profile_target_discrimination_and_single_entry(wrong):
+    phases, selected = _stop_profile_metadata()
+    profile = StopDecisionProfile(enabled=True, cpu_profile=True)
+    actual_clock = phases.action_clock
+    actual_frames = selected.stack.frames
+    result = object()
+    seen = []
+
+    async def original(actual_phases, actual_selected):
+        assert actual_phases is phases and actual_selected is selected
+        seen.append(profile._clock.get())
+        return result
+
+    observed = _driver_stop_observer(profile, original, session_id="session", operation_id="operation", cursor=27)
+    if wrong == "session":
+        selected.stack.logical.session_id = "other"
+    elif wrong == "operation":
+        selected.stack.logical.operation_id = "other"
+    elif wrong == "cursor":
+        selected.stack.cursor = 28
+    elif wrong == "parent":
+        selected.stack.frames = (actual_frames[0], actual_frames[1].model_copy(update={"phase": "review_needed"}), actual_frames[2])
+    elif wrong == "phase":
+        selected.stack.frames = (*actual_frames[:2], actual_frames[2].model_copy(update={"phase": "decision_ready"}))
+    elif wrong == "clock":
+        phases.action_clock = None
+    else:
+        actual_clock._seen.add("preparation")
+    assert await observed(phases, selected) is result
+    assert not profile._end_clocks and seen == [None]
+    selected.stack.logical.session_id = "session"
+    selected.stack.logical.operation_id = "operation"
+    selected.stack.cursor = 27
+    selected.stack.frames = actual_frames
+    phases.action_clock = actual_clock
+    actual_clock._seen.clear()
+    bounds = actual_clock.started_monotonic, actual_clock.preparation_deadline_monotonic, actual_clock.deadline
+    assert await observed(phases, selected) is result
+    assert seen[-1] == id(actual_clock)
+    assert await observed(phases, selected) is result
+    assert seen[-1] is None
+    assert bounds == (actual_clock.started_monotonic, actual_clock.preparation_deadline_monotonic, actual_clock.deadline)
+    assert not actual_clock._seen
+    assert not profile.snapshot()["cpu_capture_valid"]  # Selection alone is not worker evidence.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("none", "error", "cancel", "deferred_group", "abort"))
+async def test_stop_profile_actual_worker_context_cleanup_and_original_failures(monkeypatch, failure):
+    from elspeth.web.composer import continuation_semantic_advisor_phase as phase
+    from elspeth.web.continuation_retention_memo import prepare_retention_sql_callable
+
+    phases, selected = _stop_profile_metadata()
+    profile = StopDecisionProfile(enabled=True, cpu_profile=True)
+    engine = create_session_engine("sqlite://")
+    marker = object()
+    error = LookupError("original SQL failure")
+    cancel = asyncio.CancelledError("original deferred cancellation")
+    original_failure = (
+        BaseExceptionGroup("original SQL/deferred cancellation", [error, cancel])
+        if failure == "deferred_group"
+        else cancel
+        if failure == "cancel"
+        else error
+    )
+    original_install = phase.install_current_semantic_decision_on_connection
+    original_consume = phase.consume_semantic_advisor_end_stop_on_connection
+    calls = []
+    transported = []
+    original_invoke = RequiredInvocationWitness.invoke
+    main_hook = sys.getprofile()
+
+    def witness_observer(witness, callable_):
+        transported.append((witness, callable_))
+        return original_invoke(witness, callable_)
+
+    def body():
+        # The real retention adapter resets ContextVars; native worker lookup
+        # must still associate SQL/call spans with the original submitted clock.
+        assert profile._clock.get() is None
+        calls.append(marker)
+        with profile.span("control.original_sql_body"):
+            with engine.connect() as conn:
+                assert conn.execute(text("SELECT 1")).scalar_one() == 1
+            if failure not in ("none", "abort"):
+                raise original_failure
+            return marker
+
+    monkeypatch.setattr(RequiredInvocationWitness, "invoke", witness_observer)
+    with profile.install(monkeypatch, engine), ThreadPoolExecutor(max_workers=1) as executor:
+
+        async def original(actual_phases, actual_selected):
+            assert actual_phases is phases and actual_selected is selected
+            with retention_stage_memo_scope():
+                callable_ = prepare_retention_sql_callable(body)
+                witness = RequiredInvocationWitness(1)
+                future = executor.submit(witness.invoke, callable_)
+                witness.abort() if failure == "abort" else witness.arm()
+                try:
+                    return future.result(timeout=10)
+                finally:
+                    assert transported[-1] == (witness, callable_)
+                    assert executor.submit(sys.getprofile).result(timeout=5) is None
+
+        observed = _driver_stop_observer(profile, original, session_id="session", operation_id="operation", cursor=27)
+        if failure == "none":
+            assert await observed(phases, selected) is marker
+        elif failure == "abort":
+            with pytest.raises(RequiredInvocationAborted):
+                await observed(phases, selected)
+        else:
+            with pytest.raises(type(original_failure)) as raised:
+                await observed(phases, selected)
+            assert raised.value is original_failure
+        assert executor.submit(lambda: marker).result(timeout=5) is marker
+    assert phase.install_current_semantic_decision_on_connection is original_install
+    assert phase.consume_semantic_advisor_end_stop_on_connection is original_consume
+    assert calls == ([] if failure == "abort" else [marker])
+    assert sys.getprofile() is main_hook
+    _assert_cpu_monitoring_cleanup()
+    snapshot = profile.snapshot()
+    assert snapshot["cpu_capture_valid"], snapshot["cpu_capture_issues"]
+    assert snapshot["cpu_capture_status"] == ("captured_sql_action" if failure == "none" else "captured_sql_action_aborted")
+    assert len(snapshot["cpu_profiles"]) == len(snapshot["cpu_expected_workers"]) == 1
+    assert snapshot["cpu_profiles"][0]["within_sql_action_window"]
+    functions = {entry["function"] for entry in snapshot["cpu_profiles"][0]["entries"]}
+    assert ("body" in functions) is (failure != "abort")
+    body_spans = [row for row in snapshot["records"] if row["label"] == "control.original_sql_body"]
+    assert len(body_spans) == (0 if failure == "abort" else 1)
+    assert all(row["clock"] == id(phases.action_clock) and row["worker"] is not None for row in body_spans)
+    assert not snapshot["errors"] and not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
+    assert snapshot["pending_sql_contexts"] == 0
+    assert not phases.action_clock._seen
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stop_profile_preserves_actual_required_sql_join_after_task_cancellation(monkeypatch):
+    from elspeth.web import async_workers
+    from elspeth.web.required_sql_outcomes import RequiredSQLReturned
+    from tests.unit.web.test_required_sql_finish_once import publication_ticket
+
+    phases, selected = _stop_profile_metadata()
+    profile = StopDecisionProfile(enabled=True, cpu_profile=True)
+    engine = create_session_engine("sqlite://")
+    ticket = publication_ticket()
+    entered, release = threading.Event(), threading.Event()
+    value = object()
+    cancellations = []
+    original_retain = async_workers._retain_cancellation
+
+    def retain(actual, cancellation):
+        cancellations.append(cancellation)
+        original_retain(actual, cancellation)
+
+    def sql():
+        entered.set()
+        assert release.wait(timeout=10)
+        return value
+
+    async def original(actual_phases, actual_selected):
+        assert actual_phases is phases and actual_selected is selected
+        return await async_workers.run_required_sql_finish_once(ticket, sql)
+
+    monkeypatch.setattr(async_workers, "_retain_cancellation", retain)
+    monkeypatch.setattr(async_workers, "_SHARED_EXECUTOR", ThreadPoolExecutor(max_workers=1))
+    observed = _driver_stop_observer(profile, original, session_id="session", operation_id="operation", cursor=27)
+    try:
+        with profile.install(monkeypatch, engine):
+            task = asyncio.create_task(observed(phases, selected))
+            try:
+                async with asyncio.timeout(5):
+                    while not entered.is_set():
+                        await asyncio.sleep(0.001)
+                    task.cancel("original Stop SQL deadline control")
+                    while not cancellations:
+                        await asyncio.sleep(0.001)
+                assert not task.done() and not ticket.complete
+                release.set()
+                outcome = await task
+                assert type(outcome) is RequiredSQLReturned and outcome.value is value
+                assert outcome.deferred_cancellations == tuple(cancellations)
+                assert len(cancellations) == 1 and outcome.deferred_cancellations[0] is cancellations[0]
+                assert ticket.complete
+            finally:
+                release.set()
+                if not task.done():
+                    await task
+        snapshot = profile.snapshot()
+        assert snapshot["cpu_capture_valid"], snapshot["cpu_capture_issues"]
+        assert snapshot["cpu_capture_status"] == "captured_sql_action"
+        assert len(snapshot["cpu_profiles"]) == 1
+        assert not snapshot["incomplete_spans"] and not snapshot["unpaired_submissions"]
+        _assert_cpu_monitoring_cleanup()
+    finally:
+        release.set()
+        await async_workers.shutdown_async_workers()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stop_profile_opt_in_cursor_override_and_driver_alias_restoration(monkeypatch):
+    from elspeth.web.sessions import continuation_driver as driver
+
+    phases, selected = _stop_profile_metadata()
+    snapshots = []
+    marker = object()
+
+    async def original(actual_phases, actual_selected):
+        assert actual_phases is phases and actual_selected is selected
+        return marker
+
+    def capture(profile, _path):
+        snapshots.append(profile.snapshot())
+        return None
+
+    monkeypatch.setattr(driver, "run_continuation_semantic_advisor", original)
+    monkeypatch.setattr(StopDecisionProfile, "flush", capture)
+    monkeypatch.setenv("ELSPETH_TEST_DRIVER_END_PROFILE", "stop_cpu")
+    monkeypatch.setenv("ELSPETH_TEST_DRIVER_STOP_CURSOR", "17")
+    monkeypatch.setenv("ELSPETH_TEST_DRIVER_END_PROFILE_PATH", ".scratch/stop-adapter-control.json")
+    review = driver.review_prescribed_continuation_end
+    engine = create_session_engine("sqlite://")
+    try:
+        with driver_end_preparation_profile(monkeypatch, engine, session_id="session", operation_id="operation"):
+            assert driver.review_prescribed_continuation_end is review
+            assert await driver.run_continuation_semantic_advisor(phases, selected) is marker
+            selected.stack.cursor = 17
+            assert await driver.run_continuation_semantic_advisor(phases, selected) is marker
+        assert driver.run_continuation_semantic_advisor is original
+        assert len(snapshots) == 1
+        entries = [row for row in snapshots[0]["records"] if row["label"] == "driver.original_stop_decision"]
+        assert len(entries) == 1 and entries[0]["cursor"] == 17
+        assert not snapshots[0]["cpu_capture_valid"]  # No actual worker was submitted in this adapter control.
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (False, True))
+async def test_review_memo_observer_selects_exact_cursor_clock_and_worker_interval(monkeypatch, failure):
+    from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope, prepare_retention_sql_callable
+
+    phases, selected = _stop_profile_metadata()
+    selected.stack.frames = (selected.stack.frames[0], selected.stack.frames[1].model_copy(update={"phase": "review_needed"}))
+    selected.stack.cursor = 19
+    profile = EndPreparationProfile(enabled=True)
+    profile.text_memo = EndTextMemoObservation(include=profile.include_review_memo)
+    original_error = LookupError("original Review failure")
+    key = CanonicalTextVerificationKey("original-sensitive-reference-control", 1024)
+    produced = []
+
+    def verify(actual):
+        assert actual is key.canonical
+        produced.append(1)
+
+    def worker():
+        assert profile._clock.get() is None  # Actual empty-Context transport.
+        with borrow_v4_preparation_memo_scope() as child:
+            child.canonical_text_verification(key, verify)
+            child.canonical_text_verification(key, verify)
+
+    engine = create_session_engine("sqlite://")
+    postfinish = []
+
+    def after_finish(_key):
+        postfinish.append(1)
+
+    with profile.install(monkeypatch, engine), profile.text_memo.install(monkeypatch), ThreadPoolExecutor(max_workers=1) as executor:
+
+        async def original(actual_phases, actual_services, actual_selected):
+            assert actual_phases is phases and actual_services is services and actual_selected is selected
+            if selected.stack.cursor == 19:
+                foreign_clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+
+                def unrelated_review():
+                    with v4_preparation_memo_scope(foreign_clock) as foreign:
+                        foreign.canonical_text_verification(key, verify)
+
+                executor.submit(unrelated_review).result(timeout=5)
+            with v4_preparation_memo_scope(phases.action_clock) as parent:
+                callable_ = prepare_retention_sql_callable(worker)
+                witness = RequiredInvocationWitness(1)
+                future = executor.submit(witness.invoke, callable_)
+                witness.arm()
+                future.result(timeout=5)
+                if selected.stack.cursor == 19 and not failure:
+                    phases.action_clock.finish_preparation()
+                    parent.canonical_text_verification(CanonicalTextVerificationKey("postfinish", 1024), after_finish)
+            if failure and selected.stack.cursor == 19:
+                raise original_error
+            return services
+
+        services = object()
+        observed = _driver_review_observer(profile, original, session_id="session", operation_id="operation", cursor=19)
+        selected.stack.cursor = 18
+        assert await observed(phases, services, selected) is services
+        assert profile.text_memo.snapshot()["families"]["canonical"]["requests"] == 0
+        phases.action_clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+        selected.stack.cursor = 19
+        if failure:
+            with pytest.raises(LookupError) as raised:
+                await observed(phases, services, selected)
+            assert raised.value is original_error
+        else:
+            assert await observed(phases, services, selected) is services
+        target_clock = phases.action_clock
+        before = profile.text_memo.snapshot()
+        phases.action_clock = ContinuationActionClock(minimal_continuation_policy().actions.advisor)
+        selected.stack.cursor = 20
+        assert await observed(phases, services, selected) is services
+        assert profile.text_memo.snapshot() == before
+    engine.dispose()
+    snapshot = profile.snapshot()
+    assert snapshot["review_memo_capture_valid"], snapshot["review_memo_capture_issues"]
+    assert not snapshot["cpu_profile_enabled"]
+    counts = snapshot["text_memo"]["families"]["canonical"]
+    assert counts["requests"] == 2 and counts["misses"] == counts["hits"] == counts["admissions"] == 1
+    assert counts["evictions"] == counts["unretained"] == 0
+    interval = snapshot["review_memo_interval"]
+    assert interval["cursor"] == 19 and interval["clock"] == id(target_clock)
+    carriers = tuple(interval["carriers"].values())
+    assert {item["kind"] for item in carriers} == {"child", "parent"}
+    assert all(item["owner_clock"] == id(target_clock) for item in carriers)
+    assert len({item["parent_identity"] for item in carriers}) == 1
+    assert interval["callback_ns"] > 0 and snapshot["text_memo"]["observer_ns"] > 0
+    assert all(parent["closed_empty"] for parent in snapshot["text_memo"]["parents"])
+    assert len(produced) == 4
+    assert postfinish == ([] if failure else [1])
+    assert interval["preparation_boundary"]["kind"] == ("end_entry_aborted" if failure else "preparation_finish")
+    assert "original-sensitive-reference-control" not in json.dumps(snapshot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ("worker", "clock", "parent_clock"))
+async def test_review_memo_observer_refuses_missing_or_changed_original_witness(monkeypatch, missing):
+    phases, selected = _stop_profile_metadata()
+    selected.stack.frames = (selected.stack.frames[0], selected.stack.frames[1].model_copy(update={"phase": "review_needed"}))
+    selected.stack.cursor = 19
+    profile = EndPreparationProfile(enabled=True)
+    profile.text_memo = EndTextMemoObservation(include=profile.include_review_memo)
+    calls = []
+    key = CanonicalTextVerificationKey("control", 1024)
+
+    def verify(_key):
+        calls.append(1)
+
+    async def original(actual_phases, actual_services, actual_selected):
+        assert actual_phases is phases and actual_selected is selected
+        owner_clock = (
+            ContinuationActionClock(minimal_continuation_policy().actions.advisor) if missing == "parent_clock" else phases.action_clock
+        )
+        with v4_preparation_memo_scope(owner_clock) as parent:
+            if missing == "worker":
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    executor.submit(parent.canonical_text_verification, key, verify).result(timeout=5)
+            elif missing == "clock":
+                token = profile._clock.set(None)
+                try:
+                    parent.canonical_text_verification(key, verify)
+                finally:
+                    profile._clock.reset(token)
+            else:
+                parent.canonical_text_verification(key, verify)
+        return actual_services
+
+    with profile.text_memo.install(monkeypatch):
+        marker = object()
+        observed = _driver_review_observer(profile, original, session_id="session", operation_id="operation", cursor=19)
+        assert await observed(phases, marker, selected) is marker
+    snapshot = profile.snapshot()
+    assert calls == [1]  # Diagnostic refusal never suppresses actual work.
+    assert snapshot["text_memo"]["families"]["canonical"]["requests"] == 0
+    reason = {"worker": "missing_worker_witness", "clock": "wrong_observed_clock", "parent_clock": "wrong_parent_clock"}[missing]
+    assert snapshot["review_memo_interval"]["rejections"] == {reason: 1}
+    assert not snapshot["review_memo_capture_valid"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("spans", "cpu"))
+async def test_driver_review_explicit_cursor_applies_to_spans_and_cpu(monkeypatch, mode):
+    from elspeth.web.sessions import continuation_driver as driver
+
+    phases, selected = _stop_profile_metadata()
+    selected.stack.frames = (selected.stack.frames[0], selected.stack.frames[1].model_copy(update={"phase": "review_needed"}))
+    snapshots = []
+    marker = object()
+
+    async def original(actual_phases, actual_services, actual_selected):
+        assert actual_phases is phases and actual_services is marker and actual_selected is selected
+        return marker
+
+    def capture(profile, _path):
+        snapshots.append(profile.snapshot())
+        return None
+
+    monkeypatch.setattr(driver, "review_prescribed_continuation_end", original)
+    monkeypatch.setattr(EndPreparationProfile, "install", lambda *_args: nullcontext())
+    monkeypatch.setattr(EndPreparationProfile, "flush", capture)
+    monkeypatch.setenv("ELSPETH_TEST_DRIVER_END_PROFILE", mode)
+    monkeypatch.setenv("ELSPETH_TEST_DRIVER_REVIEW_CURSOR", "19")
+    monkeypatch.setenv("ELSPETH_TEST_DRIVER_END_PROFILE_PATH", ".scratch/review-cursor-control.json")
+    with driver_end_preparation_profile(monkeypatch, None, session_id="session", operation_id="operation"):
+        selected.stack.cursor = 7
+        assert await driver.review_prescribed_continuation_end(phases, marker, selected) is marker
+        selected.stack.cursor = 19
+        assert await driver.review_prescribed_continuation_end(phases, marker, selected) is marker
+    assert driver.review_prescribed_continuation_end is original
+    entries = [row for row in snapshots[0]["records"] if row["label"] == "driver.original_review_entry"]
+    assert len(entries) == 1 and entries[0]["cursor"] == 19
+    assert not snapshots[0]["review_memo_capture_valid"]
+    if mode == "spans":
+        assert (
+            "Review memo capture has no original preparation finish or aborted entry boundary" in snapshots[0]["review_memo_capture_issues"]
+        )

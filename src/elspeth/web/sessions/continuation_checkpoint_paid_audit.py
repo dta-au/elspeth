@@ -14,6 +14,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
+from elspeth.web.sessions.continuation_audit_membership import public_audit_membership_predicate
 from elspeth.web.sessions.continuation_cost import _closed_call
 from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowReceipt, encode_paid_overflow_cost_amount
@@ -50,8 +51,8 @@ def require_checkpoint_paid_public_audit_on_connection(
         byte_length = func.octet_length(text)
     else:
         byte_length = func.length(cast(messages.c.tool_calls, LargeBinary))
-    # SQL evaluates the byte bound before projecting JSON into Python. LIKE is
-    # candidate discovery only; _closed_call proves exact identity and source.
+    # SQL bounds Python projection; exact declared identity selects candidates
+    # while _closed_call still proves complete identity and source.
     bounded = case((byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, messages.c.tool_calls), else_=None).label("tool_calls")
     rows = conn.execute(
         select(
@@ -71,7 +72,7 @@ def require_checkpoint_paid_public_audit_on_connection(
             messages.c.session_id == source.session_id,
             messages.c.role == "audit",
             messages.c.content == "Provider call result recorded.",
-            text.like(f"%{attempt_id}%"),
+            public_audit_membership_predicate(conn, attempt_id=attempt_id),
         )
         .limit(2)
     ).all()

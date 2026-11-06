@@ -132,10 +132,7 @@ def _forbid_execution(monkeypatch):
         entered.append((args, kwargs))
         raise AssertionError("bounded metadata/refusal entered generic execution or another provider")
 
-    # The real live module imports the worker directly; forbid both routes.
-    from elspeth.web.composer import continuation_live_phases
-
-    monkeypatch.setattr(continuation_live_phases, "_execute_continuation_call_live", forbidden)
+    # Bounded metadata admission must not enter the generic worker or another SDK call.
     monkeypatch.setattr(tool_batch, "_execute_continuation_call_live", forbidden)
     monkeypatch.setattr(litellm, "acompletion", forbidden)
     return entered

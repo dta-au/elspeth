@@ -34,6 +34,7 @@ from elspeth.web.composer.continuation_progress import (
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.coordination.quota_authority import _usage_entry_id, token_usage_entry_from_llm_call_envelope
 from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+from elspeth.web.sessions.continuation_audit_membership import public_audit_membership_predicate
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import PreparedEndCompletePass, require_end_complete_pass_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_withheld import (
     PreparedEndRepairWithheldReply,
@@ -408,7 +409,7 @@ def _reprove_original_paid_audit(conn: Connection, *, owed: VerifiedCheckpointEn
             messages.c.session_id == sid,
             messages.c.role == "audit",
             messages.c.content == "Provider call result recorded.",
-            text.like(f"%{owed.attempt_id}%"),
+            public_audit_membership_predicate(conn, attempt_id=owed.attempt_id),
         )
         .limit(2)
     ).all()

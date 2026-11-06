@@ -24,6 +24,7 @@ from elspeth.web.composer.continuation_progress import (
 from elspeth.web.composer.tools._registry import _BLOB_DISCOVERY_TOOLS, _DISCOVERY_TOOLS, _SECRET_DISCOVERY_TOOLS
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_semantic_invocation import SemanticAdvisorInvocationData
     from elspeth.web.sessions.continuation_owner_results import ContinuationReadOwnerResult
     from elspeth.web.sessions.continuation_semantic_actions import SemanticActionAdmission, SemanticReadCommitted
     from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorPaidDecisionData
@@ -213,6 +214,29 @@ def derive_paid_semantic_evidence(
     if type(paid) is not SemanticAdvisorPaidDecisionData:
         raise TypeError("semantic evidence requires the original nominal paid decision")
     paid.invocation.verify()
+    return _paid_semantic_evidence(paid, end_candidate=end_candidate)
+
+
+def _derive_paid_semantic_evidence_from_original_invocation(
+    paid: SemanticAdvisorPaidDecisionData,
+    original_invocation: SemanticAdvisorInvocationData,
+    *,
+    end_candidate: EndContinuationCandidate | None,
+) -> SemanticAdvisorEvidenceData:
+    """Use the actual factory result retained by this same installed-source read."""
+    from elspeth.web.composer.continuation_semantic_invocation import SemanticAdvisorInvocationData
+    from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorPaidDecisionData
+
+    if type(paid) is not SemanticAdvisorPaidDecisionData or type(original_invocation) is not SemanticAdvisorInvocationData:
+        raise TypeError("semantic evidence requires its original nominal paid invocation")
+    if paid.invocation is not original_invocation:
+        raise AuditIntegrityError("semantic evidence substituted its original derived invocation")
+    return _paid_semantic_evidence(paid, end_candidate=end_candidate)
+
+
+def _paid_semantic_evidence(
+    paid: SemanticAdvisorPaidDecisionData, *, end_candidate: EndContinuationCandidate | None
+) -> SemanticAdvisorEvidenceData:
     source = paid.invocation.source
     invocation = paid.invocation.invocation
     call_id = paid.audit_call.call_id

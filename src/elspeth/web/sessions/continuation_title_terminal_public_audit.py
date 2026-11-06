@@ -17,6 +17,7 @@ from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.composer.visible_tool_event import visible_response_gap_for_source
+from elspeth.web.sessions.continuation_audit_membership import public_audit_membership_predicate
 from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowReceipt, encode_paid_overflow_cost_amount
 from elspeth.web.sessions.continuation_retained_capacity import ProviderTerminalHoldSource
@@ -97,7 +98,7 @@ def require_title_terminal_public_audit_on_connection(
             messages.c.session_id == source.session_id,
             messages.c.role == "audit",
             messages.c.content == "Provider call result recorded.",
-            text.like(f"%{attempt_id}%"),
+            public_audit_membership_predicate(conn, attempt_id=attempt_id),
         )
         .limit(2)
     ).all()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from uuid import UUID
 
 import litellm
@@ -30,7 +31,7 @@ from elspeth.web.coordination.quota_authority import _usage_entry_id
 from elspeth.web.sessions import continuation_semantic_actions as action_sql
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
-from elspeth.web.sessions.continuation import load_snapshot, read_chunk
+from elspeth.web.sessions.continuation import ContinuationCASConflict, load_snapshot, read_chunk
 from elspeth.web.sessions.continuation_owner_results import decode_read_owner_result
 from elspeth.web.sessions.continuation_semantic_actions import (
     install_semantic_action_on_connection,
@@ -191,6 +192,80 @@ async def test_current_paid_install_matches_original_writes_and_reproves_changed
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("read", "review"))
+async def test_installed_source_reuses_actual_derivation_and_refuses_substituted_invocation(operation_store, tmp_path, monkeypatch, kind):
+    from elspeth.web.composer import continuation_semantic_invocation as invocation_module
+
+    async with _paid_install_case(operation_store, tmp_path, monkeypatch, kind) as (case, selected, effect_key):
+        with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
+            running = case["running"]
+            installed = install_semantic_action_on_connection(conn, running, selected=selected, effect_key=effect_key)
+            original_derive = invocation_module._derive
+            original_pair = action_sql._original_paid_for_selected
+            sources, pairs = [], []
+
+            def derive(source):
+                sources.append(source)
+                return original_derive(source)
+
+            def paired(connection, session_id, operation_id, snapshot, root, key):
+                result = original_pair(connection, session_id, operation_id, snapshot, root, key)
+                if snapshot.checkpoint_id == installed.checkpoint_id and key == effect_key:
+                    pairs.append(result)
+                return result
+
+            monkeypatch.setattr(invocation_module, "_derive", derive)
+            monkeypatch.setattr(action_sql, "_original_paid_for_selected", paired)
+            before = _rows_on_connection(conn)
+            admitted = require_installed_semantic_action_on_connection(conn, running, selected=installed, effect_key=effect_key)
+            assert len(pairs) == 1
+            paid, original = pairs[0]
+            assert paid.invocation is original and admitted.paid is paid
+            assert sum(source is original.source for source in sources) == 1
+            assert _rows_on_connection(conn) == before
+
+            # Positive observer control: standalone verification still rederives.
+            original.verify(original.source)
+            assert sum(source is original.source for source in sources) == 2
+            independently_verified = action_sql._admit_paid(conn, paid)
+            assert independently_verified == admitted
+            assert sum(source is original.source for source in sources) == 3
+            assert _rows_on_connection(conn) == before
+
+            for change in ("derived", "equal_copy", "original_copy"):
+
+                def substituted(connection, session_id, operation_id, snapshot, root, key, *, change=change):
+                    actual_paid, actual_original = original_pair(connection, session_id, operation_id, snapshot, root, key)
+                    if snapshot.checkpoint_id != installed.checkpoint_id or key != effect_key:
+                        return actual_paid, actual_original
+                    if change == "original_copy":
+                        return actual_paid, replace(actual_original)
+                    replacement = replace(actual_original)
+                    if change == "derived":
+                        replacement = replace(
+                            actual_original,
+                            invocation=actual_original.invocation.model_copy(update={"coverage_binding": stable_hash("other")}),
+                        )
+                    else:
+                        assert replacement == actual_original and replacement is not actual_original
+                    return replace(actual_paid, invocation=replacement), actual_original
+
+                monkeypatch.setattr(action_sql, "_original_paid_for_selected", substituted)
+                with pytest.raises(AuditIntegrityError, match="substituted its original derived invocation"):
+                    require_installed_semantic_action_on_connection(conn, running, selected=installed, effect_key=effect_key)
+                assert _rows_on_connection(conn) == before
+
+            # The public evidence API continues refusing a nominal but inconsistent DTO.
+            changed = replace(
+                paid,
+                invocation=replace(original, invocation=original.invocation.model_copy(update={"coverage_binding": stable_hash("other")})),
+            )
+            with pytest.raises(AuditIntegrityError, match="derived identities"):
+                derive_paid_semantic_evidence(changed, end_candidate=action_sql._end_candidate(conn, paid))
+            assert _rows_on_connection(conn) == before
+
+
+@pytest.mark.asyncio
 async def test_current_paid_install_whole_stop_preserves_real_review_publication(operation_store, tmp_path, monkeypatch):
     installations = []
 
@@ -208,6 +283,86 @@ async def test_current_paid_install_whole_stop_preserves_real_review_publication
         assert proof.admission.paid.decision.decision == "STOP_CONFIRMED"
         assert proof.admission.paid.decision.prescribed_action is None
         assert case["publication"].cursor > installations[0].cursor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routed", (False, True), ids=("standalone", "end-router"))
+async def test_actual_end_stop_reuses_only_immediate_admission_and_reproves_changed_root(operation_store, tmp_path, monkeypatch, routed):
+    reached = []
+    original_require = action_sql.require_semantic_whole_stop_on_connection
+    original_append = semantic_sql.append_complete_snapshot
+    original_publication = action_sql.require_semantic_publication_on_connection
+    consume = (
+        semantic_sql.consume_semantic_advisor_end_stop_on_connection
+        if routed
+        else semantic_sql.consume_semantic_advisor_whole_stop_on_connection
+    )
+
+    def consume_actual(conn, running, *, selected, effect_key):
+        before = _rows_on_connection(conn)
+        with pytest.raises(ContinuationCASConflict, match="substituted its complete selected root"):
+            consume(conn, running, selected=replace(selected, payload_json="{}"), effect_key=effect_key)
+        assert _rows_on_connection(conn) == before
+        reads, appends, publications = [], [], []
+
+        def require_actual(connection, owner, *, selected, effect_key):
+            admission = original_require(connection, owner, selected=selected, effect_key=effect_key)
+            if not appends:
+                assert connection is conn and owner is running
+                reads.append(admission)
+                original_rows = _rows_on_connection(conn)
+                root = decode_continuation_snapshot(selected.payload_json)
+                for changed in (
+                    replace(admission, paid=replace(admission.paid, selected=replace(selected, cursor=selected.cursor + 1))),
+                    replace(
+                        admission,
+                        paid=replace(admission.paid, source=admission.paid.source.model_copy(update={"effect_key": effect_key + ":other"})),
+                    ),
+                ):
+                    with pytest.raises(AuditIntegrityError, match="locally admitted current source"):
+                        semantic_sql._consume_semantic_whole_stop_from_admission(
+                            conn, running, selected=selected, effect_key=effect_key, root=root, admission=changed
+                        )
+                    assert _rows_on_connection(conn) == original_rows
+            return admission
+
+        def append_actual(connection, **kwargs):
+            assert connection is conn and kwargs["expected_checkpoint_id"] == selected.checkpoint_id
+            # Count only the full proof before this actual root write. Later
+            # publication/history admissions remain required and unbounded here.
+            assert len(reads) == 1
+            appended = original_append(connection, **kwargs)
+            appends.append(appended)
+            return appended
+
+        def publication_actual(connection, owner, *, selected):
+            assert connection is conn and owner is running and appends == [selected]
+            original_rows = _rows_on_connection(conn)
+            with pytest.raises(ContinuationCASConflict, match="changed its complete selected root"):
+                original_publication(conn, running, selected=replace(selected, payload_json="{}"))
+            assert _rows_on_connection(conn) == original_rows
+            proof = original_publication(connection, owner, selected=selected)
+            assert proof is not None
+            publications.append(proof)
+            return proof
+
+        with monkeypatch.context() as capture:
+            capture.setattr(action_sql, "require_semantic_whole_stop_on_connection", require_actual)
+            capture.setattr(semantic_sql, "append_complete_snapshot", append_actual)
+            capture.setattr(action_sql, "require_semantic_publication_on_connection", publication_actual)
+            result = consume(conn, running, selected=selected, effect_key=effect_key)
+        assert len(reads) == len(appends) == len(publications) == 1
+        assert result == appends[0] and result.cursor == selected.cursor + 1
+        reached.append((selected, result, publications[0]))
+        return result
+
+    monkeypatch.setattr(publication_fixture, "consume_semantic_advisor_whole_stop_on_connection", consume_actual)
+    async with publication_fixture.actual_semantic_publication_case(operation_store, tmp_path, monkeypatch) as case:
+        assert len(reached) == 1
+        installed, consumed, proof = reached[0]
+        assert case["publication"] == consumed and installed.cursor + 1 == consumed.cursor
+        assert case["publication_proof"] == proof
+        assert proof.admission.paid.decision.decision == "STOP_CONFIRMED"
 
 
 @pytest.mark.asyncio

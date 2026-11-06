@@ -2638,14 +2638,54 @@ def consume_semantic_advisor_whole_stop_on_connection(
     conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
 ) -> StoredContinuationSnapshot:
     """Consume an actual whole-request Stop without replacing its reviewed result."""
-    from elspeth.web.sessions.continuation_semantic_actions import (
-        read_original_semantic_review_for_stop_on_connection,
-        require_semantic_publication_on_connection,
-        require_semantic_whole_stop_on_connection,
-    )
+    from elspeth.web.sessions.continuation_semantic_actions import require_semantic_whole_stop_on_connection
 
     root = _current(conn, running, selected)
     admission = require_semantic_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    return _consume_semantic_whole_stop_from_admission(
+        conn, running, selected=selected, effect_key=effect_key, root=root, admission=admission
+    )
+
+
+def _require_end_stop_admission_binding(
+    running: ComposerOperationRunning,
+    selected: StoredContinuationSnapshot,
+    effect_key: str,
+    root: ContinuationFrameStack,
+    admission: SemanticActionAdmission,
+) -> None:
+    """Check the same-call DATA handoff; this does not admit a SQL source."""
+    from elspeth.web.sessions.continuation_semantic_actions import SemanticActionAdmission
+
+    if (
+        type(admission) is not SemanticActionAdmission
+        or admission.paid.selected != selected
+        or admission.paid.source.effect_key != effect_key
+        or (admission.paid.session_id, admission.paid.operation_id) != (running.claim.session_id, running.claim.operation_id)
+        or admission.expected_root.model_copy(update={"cursor": selected.cursor}) != root
+        or admission.action is not None
+        or admission.action_key is not None
+        or not admission.evidence.coverage.complete
+    ):
+        raise AuditIntegrityError("semantic END Stop changed its locally admitted current source")
+
+
+def _consume_semantic_whole_stop_from_admission(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: StoredContinuationSnapshot,
+    effect_key: str,
+    root: ContinuationFrameStack,
+    admission: SemanticActionAdmission,
+) -> StoredContinuationSnapshot:
+    """Consume the caller's immediate same-transaction whole-Stop admission."""
+    from elspeth.web.sessions.continuation_semantic_actions import (
+        read_original_semantic_review_for_stop_on_connection,
+        require_semantic_publication_on_connection,
+    )
+
+    _require_end_stop_admission_binding(running, selected, effect_key, root, admission)
     if len(root.frames) != 3 or _advisor(root).phase != "decision_ready" or type(root.frames[1]) is not EndFrame:
         raise AuditIntegrityError("Semantic whole Stop lost its exact original reviewed END stack")
     parent, end = _parent(root), root.frames[1]
@@ -2756,8 +2796,12 @@ def consume_semantic_advisor_end_stop_on_connection(
     admission = require_semantic_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
     original = admission.evidence.coverage.end_candidate
     if original is not None and original.kind == "recovery":
-        return consume_semantic_advisor_ordinary_recovery_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
-    return consume_semantic_advisor_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+        return _consume_semantic_recovery_stop_from_admission(
+            conn, running, selected=selected, effect_key=effect_key, root=_current(conn, running, selected), admission=admission
+        )
+    return _consume_semantic_whole_stop_from_admission(
+        conn, running, selected=selected, effect_key=effect_key, root=_current(conn, running, selected), admission=admission
+    )
 
 
 def _ordinary_recovery_stop_event(
@@ -2781,6 +2825,22 @@ def consume_semantic_advisor_ordinary_recovery_stop_on_connection(
 
     root = _current(conn, running, selected)
     admission = require_semantic_whole_stop_on_connection(conn, running, selected=selected, effect_key=effect_key)
+    return _consume_semantic_recovery_stop_from_admission(
+        conn, running, selected=selected, effect_key=effect_key, root=root, admission=admission
+    )
+
+
+def _consume_semantic_recovery_stop_from_admission(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: StoredContinuationSnapshot,
+    effect_key: str,
+    root: ContinuationFrameStack,
+    admission: SemanticActionAdmission,
+) -> StoredContinuationSnapshot:
+    """Consume the caller's immediate same-transaction recovery-Stop admission."""
+    _require_end_stop_admission_binding(running, selected, effect_key, root, admission)
     if len(root.frames) != 3 or _advisor(root).phase != "decision_ready" or type(root.frames[1]) is not EndFrame:
         raise AuditIntegrityError("ordinary recovery Stop lost its original Compose/END/Advisor stack")
     parent, end = _parent(root), root.frames[1]

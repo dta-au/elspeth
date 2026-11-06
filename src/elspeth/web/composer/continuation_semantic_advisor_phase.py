@@ -47,7 +47,7 @@ from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_quota import V4PaidIncompleteCommitted
 from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
 from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
-from elspeth.web.continuation_retention_memo import v4_preparation_memo_scope
+from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope, v4_preparation_memo_scope
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.composer_operations import ComposerOperationRecord, ComposerOperationRunning
@@ -217,12 +217,23 @@ async def _consume_current_decision(phases: ContinuationLivePhases, selected: Se
             return consume_semantic_advisor_terminal_iteration_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
         return consume_semantic_advisor_end_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
 
-    phases.latest_snapshot = await _registered(
-        work=phases.work,
-        source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-        operation=lambda: _transaction(phases, consume),
-        expected=StoredContinuationSnapshot,
-    )
+    def transaction() -> StoredContinuationSnapshot:
+        with borrow_v4_preparation_memo_scope():
+            return _transaction(phases, consume)
+
+    clock = phases.action_clock
+    if clock is None:
+        raise AuditIntegrityError("Semantic consume lost its original driver SQL action clock")
+    # This is the new SQL action's lexical owner, not the preceding provider's
+    # preparation. Joining the registered outcome closes it without finishing
+    # or changing the original SQL clock.
+    with v4_preparation_memo_scope(clock):
+        phases.latest_snapshot = await _registered(
+            work=phases.work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=transaction,
+            expected=StoredContinuationSnapshot,
+        )
 
 
 async def run_prescribed_semantic_read(phases: ContinuationLivePhases, selected: SelectedContinuationState) -> None:

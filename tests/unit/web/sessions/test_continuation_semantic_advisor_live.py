@@ -4,21 +4,25 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from traceback import extract_tb
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import Text, cast, insert, or_, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
+from elspeth.web.sessions import continuation_checkpoint_end_complete_review_cold as end_review_cold
 from elspeth.web.sessions.composer_operations import ComposerOperationCancel
 from elspeth.web.sessions.continuation import read_chunk
 from elspeth.web.sessions.continuation_driver import _SegmentDriver
 from elspeth.web.sessions.continuation_semantic_actions import read_original_committed_semantic_read_on_connection
 from elspeth.web.sessions.continuation_semantic_advisor import read_original_prescribed_primary_source_on_connection
+from elspeth.web.sessions.models import chat_messages_table as audit_messages
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from tests.helpers.composer_operations import message_body
 from tests.helpers.continuation_app import (
@@ -36,6 +40,44 @@ from tests.helpers.continuation_app import (
 )
 from tests.helpers.continuation_end_profile import driver_end_preparation_profile
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
+from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store
+
+operation_store = _operation_store
+
+
+def _checkpoint_private_audit_candidates(conn, *, session_id, attempt_id):
+    """Repeat original candidate discovery, projecting only IDs and equality bits."""
+    request_id = diagnostic_evidence_identity("provider-request", attempt_id)
+    failure_id = diagnostic_evidence_identity("provider-failure", attempt_id)
+    text = cast(audit_messages.c.tool_calls, Text)
+    outer = audit_messages.c.tool_calls[0]
+    inner = outer["evidence"]
+    rows = conn.execute(
+        select(
+            audit_messages.c.id,
+            (outer["tool_call_id"].as_string() == attempt_id).label("outer_call"),
+            outer["evidence_id"].as_string().in_((request_id, failure_id)).label("outer_evidence"),
+            (inner["tool_call_id"].as_string() == attempt_id).label("inner_call"),
+            inner["evidence_id"].as_string().in_((request_id, failure_id)).label("inner_evidence"),
+        )
+        .where(
+            audit_messages.c.session_id == session_id,
+            audit_messages.c.role == "audit",
+            audit_messages.c.content == "Private credential-filtered diagnostic facts",
+            or_(text.like(f"%{attempt_id}%"), text.like(f"%{request_id}%"), text.like(f"%{failure_id}%")),
+        )
+        .limit(3)
+    ).all()
+    return tuple(
+        {
+            "id": row.id,
+            "outer_call": row.outer_call is True,
+            "outer_evidence": row.outer_evidence is True,
+            "inner_call": row.inner_call is True,
+            "inner_evidence": row.inner_evidence is True,
+        }
+        for row in rows
+    )
 
 
 def _observe_original_driver(monkeypatch, operation):
@@ -44,6 +86,20 @@ def _observe_original_driver(monkeypatch, operation):
     original_advance, original_settle = _SegmentDriver.advance, _SegmentDriver.settle
     original_run = _SegmentDriver.run
     original_cancel = ContinuationLivePhases.cancel_business
+    original_private_audit = end_review_cold.require_checkpoint_paid_private_audit_on_connection
+
+    def private_audit(conn, *, source, attempt_id, private_sha256, incomplete):
+        try:
+            return original_private_audit(conn, source=source, attempt_id=attempt_id, private_sha256=private_sha256, incomplete=incomplete)
+        except AuditIntegrityError as error:
+            if source.operation_id == operation and error.args == ("checkpoint private audit lost its exact original member count",):
+                observed = {"boundary": "checkpoint_private_audit_count", "attempt_id": attempt_id, "expected": 2 if incomplete else 1}
+                observations.append(observed)
+                try:
+                    observed["candidates"] = _checkpoint_private_audit_candidates(conn, session_id=source.session_id, attempt_id=attempt_id)
+                except Exception as observation_error:
+                    observed["observation_error_class"] = type(observation_error).__name__
+            raise
 
     def failure_data(error):
         return {
@@ -106,7 +162,52 @@ def _observe_original_driver(monkeypatch, operation):
     monkeypatch.setattr(_SegmentDriver, "settle", settle)
     monkeypatch.setattr(_SegmentDriver, "run", run)
     monkeypatch.setattr(ContinuationLivePhases, "cancel_business", cancel)
+    monkeypatch.setattr(end_review_cold, "require_checkpoint_paid_private_audit_on_connection", private_audit)
     return observations
+
+
+def test_checkpoint_private_audit_candidate_summary_distinguishes_nested_text(operation_store):
+    engine, _repository, _authority, _service, session_id = operation_store
+    attempt = str(uuid4())
+    request = diagnostic_evidence_identity("provider-request", attempt)
+    failure = diagnostic_evidence_identity("provider-failure", attempt)
+    member = {"tool_call_id": attempt, "evidence_id": request, "evidence": {"tool_call_id": attempt, "evidence_id": request}}
+    nested = {
+        "tool_call_id": "another-call",
+        "evidence_id": "another-evidence",
+        "evidence": {
+            "tool_call_id": "another-call",
+            "evidence_id": "another-evidence",
+            "arguments": {"content": f"{attempt} {request} {failure}"},
+        },
+    }
+    identifiers = tuple(str(uuid4()) for _ in range(3))
+    with engine.begin() as conn:
+        for sequence, (identifier, envelope) in enumerate(zip(identifiers, (member, nested, {"unrelated": "negative"}), strict=True), 1):
+            conn.execute(
+                insert(audit_messages).values(
+                    id=identifier,
+                    session_id=str(session_id),
+                    role="audit",
+                    content="Private credential-filtered diagnostic facts",
+                    tool_calls=[envelope],
+                    sequence_no=sequence,
+                    writer_principal="compose_loop",
+                    created_at=datetime.now(UTC),
+                )
+            )
+        summary = _checkpoint_private_audit_candidates(conn, session_id=str(session_id), attempt_id=attempt)
+        assert {row["id"]: row for row in summary} == {
+            identifiers[0]: {"id": identifiers[0], "outer_call": True, "outer_evidence": True, "inner_call": True, "inner_evidence": True},
+            identifiers[1]: {
+                "id": identifiers[1],
+                "outer_call": False,
+                "outer_evidence": False,
+                "inner_call": False,
+                "inner_evidence": False,
+            },
+        }
+        assert _checkpoint_private_audit_candidates(conn, session_id=str(session_id), attempt_id=str(uuid4())) == ()
 
 
 @pytest.mark.asyncio
@@ -223,9 +324,10 @@ async def test_actual_driver_read_result_reaches_next_advisor_then_real_review_a
 
     monkeypatch.setattr(semantic_sql, "_require_retained_input_document", observe_document)
     operation = str(uuid4())
+    original_answer = "The current pipeline has no configured nodes."
     sdk = ScriptedSDK(
         [
-            ("primary", ("The current pipeline has no configured nodes.", None)),
+            ("primary", (original_answer, None)),
             ("semantic", semantic_read_response),
             ("semantic", semantic_review_response),
             ("end", end_admit()),
@@ -239,8 +341,12 @@ async def test_actual_driver_read_result_reaches_next_advisor_then_real_review_a
             with driver_end_preparation_profile(
                 monkeypatch, harness.app.state.session_engine, session_id=harness.session_id, operation_id=operation
             ):
+                # Observe this complete multi-action scenario beyond the general
+                # 240-poll wait; this is not a macro-latency qualification.
                 result = await submit_and_settle(
-                    harness, message_body("Inspect the current pipeline and explain what it contains.", operation_id=operation)
+                    harness,
+                    message_body("Inspect the current pipeline and explain what it contains.", operation_id=operation),
+                    rounds=720,
                 )
         except BaseException:
             print("K7 original read driver observations: " + canonical_json(observations))
@@ -258,7 +364,23 @@ async def test_actual_driver_read_result_reaches_next_advisor_then_real_review_a
         assert "prescribing_provider_call_id" not in actual_read
         assert before_read["source"]["premise"]["input_hash"] == after_read["source"]["premise"]["input_hash"]
         final_document = json.loads(sdk.requests[-1]["messages"][-1]["content"])
-        assert final_document["review_result"]["message"] == "The current pipeline has no configured nodes."
+        assert len(review_documents) == 1
+        sid, actual_operation, root, physical_input, retained, env_ref_names = review_documents[0]
+        assert actual_operation == operation and retained.review is not None
+        full_review = json.loads(retained.review.result_json)
+        assert final_document["review_result"] == json.loads(retained.review.provider_json)
+        assert full_review["raw_assistant_content"] == original_answer
+        assert (
+            final_document["review_result"]["message"]
+            == full_review["message"]
+            == (
+                original_answer + "\n\n---\n\n"
+                "[ELSPETH-SYSTEM] Checkpoint save status: "
+                "Verified checkpoint evidence covers 0 saved draft revisions. "
+                "There is no net authored change from the starting draft. "
+                "Checkpoint evidence does not establish task completion."
+            )
+        )
         rows = effects(harness.app, operation)
         reads = tuple(row for row in rows if row.owner == "read")
         assert len(reads) == 1 and reads[0].disposition == "committed" and reads[0].provider_attempt_id is None
@@ -286,11 +408,7 @@ async def test_actual_driver_read_result_reaches_next_advisor_then_real_review_a
             "advisor",
             "advisor",
         ]
-        assert len(review_documents) == 1
-        sid, actual_operation, root, physical_input, retained, env_ref_names = review_documents[0]
-        assert actual_operation == operation and retained.review is not None
         original_document = json.loads(physical_input.messages[-1]["content"])
-        full_review = json.loads(retained.review.result_json)
         assert full_review["llm_calls"] and original_document["review_result"]["llm_calls"]
         assert any(call["private_request"] is not None for call in full_review["llm_calls"])
         assert all("private_request" not in call for call in original_document["review_result"]["llm_calls"])

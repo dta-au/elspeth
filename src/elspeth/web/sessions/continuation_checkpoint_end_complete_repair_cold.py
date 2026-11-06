@@ -23,6 +23,7 @@ from elspeth.web.composer.continuation_selection import SelectedContinuationStat
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.coordination.quota_authority import _usage_entry_id
 from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.continuation_audit_membership import public_audit_membership_predicate
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import require_end_complete_pass_on_connection
 from elspeth.web.sessions.continuation_checkpoint_end_complete_withheld import require_end_repair_withheld_reply_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import require_checkpoint_paid_private_audit_on_connection
@@ -279,7 +280,7 @@ def require_end_complete_repair_postwrite_on_connection(
             messages.c.session_id == sid,
             messages.c.role == "audit",
             messages.c.content == "Provider call result recorded.",
-            public_text.like(f"%{batch.owed.attempt_id}%"),
+            public_audit_membership_predicate(conn, attempt_id=batch.owed.attempt_id),
         )
         .limit(2)
     ).all()

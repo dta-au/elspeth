@@ -14,6 +14,7 @@ from sqlalchemy import select
 from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import prompt_guard as original_guard
+from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointCompleteReview
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
@@ -35,7 +36,6 @@ from elspeth.web.sessions.continuation_semantic_advisor import (
     consume_semantic_advisor_whole_stop_on_connection,
     read_semantic_advisor_retained_inputs_on_connection,
 )
-from elspeth.web.sessions.continuation_semantic_review_result import retain_semantic_review_result_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.routes._helpers import composer_turn_end_assistant_row
@@ -50,19 +50,17 @@ operation_store = shared_fixture.operation_store
 async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
     async with shared_fixture.actual_shared_end_case(store, tmp_path, monkeypatch) as case:
         running, execution = case["running"], case["execution"]
+        assert type(execution) is EndCheckpointCompleteReview
+        review = execution.review
         service, authority = case["phases"].service, case["phases"].authority
         sid, operation = str(running.claim.session_id), running.claim.operation_id
         with locked_session_transaction(store[0], sid) as conn:
-            dispatched = load_snapshot(conn, session_id=sid, operation_id=operation)
-            reviewed = retain_semantic_review_result_on_connection(
-                conn,
-                running,
-                selected=dispatched,
-                semantic_effect_key=case["semantic_effect_key"],
-                execution=execution,
-                captured=case["captured"],
-            )
+            reviewed = load_snapshot(conn, session_id=sid, operation_id=operation)
+            assert reviewed == review.completed
             retained_inputs = read_semantic_advisor_retained_inputs_on_connection(conn, running, selected=reviewed)
+            assert retained_inputs.review is not None
+            assert retained_inputs.review.owner_effect_key == review.owner_effect_key
+            assert retained_inputs.review.completed_checkpoint_id == reviewed.checkpoint_id
         selected = await load_selected_continuation(authority=authority, running=running, selected=reviewed, required_work=case["work"])
         inventory = await materialize_continuation_env_inventory(
             advisor=service._advisor_checkpoint, authority=authority, selected=selected, required_work=case["work"]
@@ -74,7 +72,7 @@ async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
             inventory=inventory,
             required_work=case["work"],
             provider_owner=case["provider"],
-            progress=execution.runtime.bindings.progress,
+            progress=case["phases"].progress,
         )
         invocation = make_semantic_advisor_invocation(capture_semantic_advisor_source(runtime))
         request = prepare_semantic_advisor_request(
@@ -194,7 +192,7 @@ async def actual_semantic_publication_case(store, tmp_path, monkeypatch):
         assert len(stop_sdk) == 1
         original = proof.review_result.result
         result = replace(original, llm_calls=(*original.llm_calls, proof.admission.paid.audit_call))
-        yield {**case, "publication": consumed, "publication_proof": proof, "publication_result": result}
+        yield {**case, "runtime": runtime, "publication": consumed, "publication_proof": proof, "publication_result": result}
 
 
 @pytest.mark.asyncio
@@ -210,7 +208,7 @@ async def test_actual_whole_stop_binds_terminal_result_and_rolls_back_substituti
             stopped = phases.authority.request_owner_cancel(
                 session_id=running.claim.session_id,
                 operation_id=running.claim.operation_id,
-                actor_user_id=case["execution"].runtime.bindings.user_id,
+                actor_user_id=case["runtime"].bindings.user_id,
                 auth_provider_type="local",
             )
             assert stopped is not None and stopped.cancel_requested_at is not None

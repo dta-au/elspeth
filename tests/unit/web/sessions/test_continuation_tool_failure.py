@@ -3372,7 +3372,7 @@ def _actual_failure_driver(store, owner, running, *, drain_signal=None):
 
 @asynccontextmanager
 async def _claimed_driver(driver):
-    """Own runnable claim cancellation/progress around an awaited original run.
+    """Own process drain binding and claim cancellation/progress for a run.
 
     The caller supplies an existing claimed lease and awaits driver.run inside
     this context. The run joins its stage and operation watchers before exit;
@@ -3382,6 +3382,13 @@ async def _claimed_driver(driver):
 
     assert driver.phases.runtime is None
     assert driver.phases.work is driver.work and driver.phases.provider_owner is driver.provider
+    drain_signal = driver.worker._drain_signal
+    if drain_signal is not None:
+
+        def begin_signal_drain(started: float) -> None:
+            driver.worker.begin_drain(started_at=started)
+
+        drain_signal.bind(asyncio.get_running_loop(), begin_signal_drain)
     key = (driver.running.claim.session_id, driver.running.claim.operation_id)
     local_cancel = asyncio.Event()
     assert key not in driver.worker._local_cancels

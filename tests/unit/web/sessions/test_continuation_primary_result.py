@@ -20,6 +20,7 @@ from sqlalchemy import or_, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.web.composer.advisor_output import PrimaryContinuationAction
 from elspeth.web.composer.continuation import ComposeFrame
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot, encode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
@@ -35,6 +36,7 @@ from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_primary import read_continuation_primary, run_continuation_primary
 from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalReason
+from elspeth.web.composer.continuation_progress import decode_prescribed_continuation_action
 from elspeth.web.composer.continuation_prompt_producers import load_current_message_producers
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash, continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
@@ -281,8 +283,13 @@ async def handover_to_next_primary(store, owner, running, monkeypatch, *, expect
         result = await actual_advance(current, stored, selected)
         if current is driver and result is None:
             _following, after = await current.selected()
-            if type(after.stack.frames[-1]) is ComposeFrame and after.stack.frames[-1].phase == "action_ready":
-                assert after.stack.active_action_json is not None
+            if (
+                type(after.stack.frames[-1]) is ComposeFrame
+                and after.stack.frames[-1].phase == "action_ready"
+                and after.stack.active_action_json is not None
+            ):
+                assert after.stack.active_action_source is not None
+                assert type(decode_prescribed_continuation_action(after.stack.active_action_json)) is PrimaryContinuationAction
                 assert roles == list(expected_roles) and not ready_cuts
                 ready_cuts.append(after)
                 timing.drain_signal.request()
@@ -293,7 +300,13 @@ async def handover_to_next_primary(store, owner, running, monkeypatch, *, expect
         capture.setattr(litellm, "acompletion", completion)
         async with _claimed_driver(driver):
             handover = await driver.run(None)
-    assert type(handover) is ContinuationSegmentHandedOver and len(ready_cuts) == 1
+    assert type(handover) is ContinuationSegmentHandedOver and len(ready_cuts) == 1, tuple(
+        (
+            type(original).__name__,
+            tuple((frame.filename, frame.lineno, frame.name) for frame in traceback.extract_tb(original.__traceback__)),
+        )
+        for original in driver._consumed_native
+    )
     store[1].verify_recovery(handover.receipt)
     assert roles == list(expected_roles)
     owner.work.coordinator.assert_completed()

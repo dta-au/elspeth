@@ -23,6 +23,7 @@ from elspeth.web.coordination.composer_operation_authority import _read, _record
 from elspeth.web.coordination.quota_authority import _usage_entry_id
 from elspeth.web.sessions.chat_message_decoder import chat_message_record_from_row
 from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.continuation_audit_membership import public_audit_membership_predicate
 from elspeth.web.sessions.continuation_checkpoint_end_complete_pass import require_end_complete_pass_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import require_checkpoint_paid_private_audit_on_connection
 from elspeth.web.sessions.continuation_cost import _closed_call
@@ -258,7 +259,7 @@ def _require_paid_custody(conn: Connection, *, prepared: PreparedCheckpointProvi
             messages.c.session_id == sid,
             messages.c.role == "audit",
             messages.c.content == "Provider call result recorded.",
-            public_text.like(f"%{batch.owed.attempt_id}%"),
+            public_audit_membership_predicate(conn, attempt_id=batch.owed.attempt_id),
         )
         .limit(2)
     ).all()

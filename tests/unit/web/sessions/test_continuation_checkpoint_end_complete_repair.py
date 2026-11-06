@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import replace
 from uuid import uuid4
 
@@ -12,7 +13,9 @@ from pydantic import TypeAdapter
 from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PromptGuardDecision
+from elspeth.web.composer.audit_storage import private_diagnostic_drafts_for_source
 from elspeth.web.composer.content_scope import composition_scope_for_operation
 from elspeth.web.composer.continuation import ComposeFrame
 from elspeth.web.composer.continuation_checkpoint_end_cold_consequence import (
@@ -36,7 +39,10 @@ from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
 from elspeth.web.composer.prompt_guard import PromptGuardMount
+from elspeth.web.composer.provider_audit_source import ProviderAuditSource
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_cost import CommonProviderCostBudget
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.turn_effects import AdvisorPublicationReview
@@ -64,6 +70,7 @@ from elspeth.web.sessions.continuation_checkpoint_end_owed import (
 )
 from elspeth.web.sessions.continuation_checkpoint_end_recovery import read_current_end_h_recovery_on_connection
 from elspeth.web.sessions.continuation_checkpoint_paid_private_audit import (
+    _OUTER_ROW_MAX_BYTES,
     admit_checkpoint_paid_audit_source_on_connection,
     checkpoint_paid_audit_cohort_for_hold,
     require_checkpoint_paid_private_audit_on_connection,
@@ -92,6 +99,95 @@ from tests.unit.web.sessions.test_continuation_primary_result import initialized
 from tests.unit.web.sessions.test_continuation_prompt_producers import current_service
 
 operation_store = test_composer_operation_authority.operation_store
+
+
+def _exercise_actual_private_cohort_membership(conn, *, owed, call, cohort):
+    """Oppose the actual written paid cohort, without fabricating paid custody."""
+    before = tuple(conn.execute(select(messages).where(messages.c.session_id == owed.session_id).order_by(messages.c.id)).all())
+
+    def require_original():
+        require_checkpoint_paid_private_audit_on_connection(
+            conn, source=owed.new_hold, attempt_id=owed.attempt_id, private_sha256=cohort.private_sha256, incomplete=False
+        )
+
+    original = conn.execute(
+        select(messages).where(
+            messages.c.session_id == owed.session_id,
+            messages.c.tool_calls[0]["tool_call_id"].as_string() == owed.attempt_id,
+            messages.c.content == "Private credential-filtered diagnostic facts",
+        )
+    ).one()
+    evidence = ComposerDiagnosticEvidence.from_envelope(
+        original.tool_calls[0], expected_session_id=owed.session_id, expected_tool_call_id=owed.attempt_id
+    )
+    source = ProviderAuditSource(owed.session_id, owed.new_hold.session_operation_id, owed.new_hold.session_operation_epoch)
+    context = capture_provider_context(
+        messages=[
+            {
+                "role": "user",
+                "content": " ".join(
+                    (owed.attempt_id, evidence.evidence_id, diagnostic_evidence_identity("provider-failure", owed.attempt_id))
+                ),
+            }
+        ],
+        tools=None,
+    )
+    assert context.disposition == "retained"
+    later_call = replace(call, call_id=str(uuid4()), private_request=context)
+    (later_draft,) = private_diagnostic_drafts_for_source(later_call, source=source)
+    later_envelopes = deep_thaw(later_draft.tool_calls)
+    assert type(later_envelopes) is list
+    later = ComposerDiagnosticEvidence.from_envelope(
+        later_envelopes[0], expected_session_id=owed.session_id, expected_tool_call_id=later_call.call_id
+    )
+    assert later.tool_call_id != evidence.tool_call_id and later.arguments.content == context.canonical
+    next_sequence = conn.execute(select(func.max(messages.c.sequence_no)).where(messages.c.session_id == owed.session_id)).scalar_one() + 1
+
+    def append(payload, sequence):
+        row = dict(original._mapping)
+        row.update(id=str(uuid4()), sequence_no=sequence, tool_calls=payload)
+        conn.execute(insert(messages).values(**row))
+
+    collision = conn.begin_nested()
+    try:
+        # More unrelated content matches than the original candidate limit.
+        for offset in range(3):
+            distinct_call = str(uuid4())
+            distinct = replace(
+                later, tool_call_id=distinct_call, evidence_id=diagnostic_evidence_identity("provider-request", distinct_call)
+            )
+            append([distinct.to_envelope()], next_sequence + offset)
+        require_original()
+    finally:
+        collision.rollback()
+    for duplicate in (original.tool_calls, [later_envelopes[0], original.tool_calls[0]], original.tool_calls[0]):
+        savepoint = conn.begin_nested()
+        try:
+            append(duplicate, next_sequence)
+            with pytest.raises(AuditIntegrityError, match="exact original member count"):
+                require_original()
+        finally:
+            savepoint.rollback()
+        require_original()
+    changed_identity = deepcopy(original.tool_calls)
+    changed_identity[0]["tool_call_id"] = str(uuid4())
+    wrong_source = [replace(evidence, operation_id=str(uuid4())).to_envelope()]
+    oversized = deepcopy(original.tool_calls)
+    oversized[0]["padding"] = "x" * (_OUTER_ROW_MAX_BYTES + 1)
+    for payload, refusal in (
+        (changed_identity, "correlation or integrity binding mismatch"),
+        (wrong_source, "correlation or integrity binding mismatch"),
+        (oversized, "bounded stored member"),
+    ):
+        savepoint = conn.begin_nested()
+        try:
+            conn.execute(update(messages).where(messages.c.id == original.id).values(tool_calls=payload))
+            with pytest.raises(AuditIntegrityError, match=refusal):
+                require_original()
+        finally:
+            savepoint.rollback()
+        require_original()
+    assert tuple(conn.execute(select(messages).where(messages.c.session_id == owed.session_id).order_by(messages.c.id)).all()) == before
 
 
 @pytest.mark.asyncio
@@ -608,6 +704,8 @@ async def test_actual_end_complete_flagged_repair_settles_original_paid_call_onc
                         private_sha256=cohort.private_sha256,
                         incomplete=False,
                     )
+                    if not repeat_recovery and not replacement_overflow and not replacement_commit:
+                        _exercise_actual_private_cohort_membership(conn, owed=fresh, call=call, cohort=cohort)
                     savepoint.rollback()
                 if repeat_recovery:
                     current_repository.release(context)

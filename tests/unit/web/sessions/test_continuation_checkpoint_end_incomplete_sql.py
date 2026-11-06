@@ -6,11 +6,12 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
 from hashlib import sha256
+from uuid import uuid4
 
 import litellm
 import pytest
 from litellm import ModelResponse
-from sqlalchemy import Text, cast, delete, select, update
+from sqlalchemy import Text, cast, delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -24,6 +25,7 @@ from elspeth.web.composer.continuation_checkpoint_end_physical import (
     prepare_checkpoint_end_physical_source,
 )
 from elspeth.web.composer.continuation_checkpoint_end_terminal import EndCheckpointPaidIncompleteTerminal
+from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_response, decode_retained_physical_audit_call
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
@@ -197,7 +199,17 @@ async def test_actual_end_incomplete_result_rejects_copied_exception_then_settle
             raise AssertionError("returned incomplete END call reached the successful verdict path")
 
         monkeypatch.setattr(phases.service._advisor_checkpoint, "_run_advisor_checkpoint", intercept_original_end_gate)
+        # This direct phase fixture starts its first END action at driver entry.
+        assert phases.action_clock is None
+        end_clock = ContinuationActionClock(entered.source.policy.actions.advisor)
+        deadline = work.coordinator.sql_deadline_owner
+        if deadline is not None:
+            assert deadline.running is running
+            deadline.begin_action(end_clock.policy, started_at=end_clock.started_monotonic)
+            deadline.require_action_clock(end_clock)
+        phases.bind_action_clock(end_clock)
         terminal = await execute_continuation_end_review(phases, entered_selected)
+        assert phases.action_clock is end_clock
         assert type(terminal) is EndCheckpointPaidIncompleteTerminal
         verified = terminal.verified
         assert sdk_calls == copied_rejected == [1] and len(guard.requests) == 1
@@ -222,9 +234,73 @@ async def test_actual_end_incomplete_result_rejects_copied_exception_then_settle
                 select(messages).where(
                     messages.c.session_id == str(store[4]),
                     messages.c.content == "Provider call result recorded.",
-                    cast(messages.c.tool_calls, Text).like(f"%{verified.provider_attempt_id}%"),
+                    messages.c.tool_calls[0]["call"]["call_id"].as_string() == verified.provider_attempt_id,
                 )
             ).one()
+            original_rows = tuple(conn.execute(select(messages).order_by(messages.c.sequence_no)).all())
+            next_sequence = conn.execute(select(func.max(messages.c.sequence_no))).scalar_one() + 1
+            original_call = _CALL.validate_json(canonical_json(public.tool_calls[0]["call"]), strict=True, extra="forbid")
+            unrelated_call = replace(
+                original_call,
+                call_id=str(uuid4()),
+                provider_request_id="provider metadata mentions " + verified.provider_attempt_id,
+            )
+            unrelated_envelope = llm_call_audit_envelope(unrelated_call)
+            unrelated = [
+                unrelated_envelope,
+                visible_response_gap_for_source(
+                    unrelated_call, capture_provider_audit_source(running.session_operation_context), unrelated_envelope
+                ),
+            ]
+            assert unrelated[0]["call"]["provider_request_id"].endswith(verified.provider_attempt_id)
+            assert unrelated[0]["call"]["call_id"] != verified.provider_attempt_id
+            assert unrelated[1]["provider_call_id"] != verified.provider_attempt_id
+            for kind, calls in (
+                ("metadata-only", unrelated),
+                ("duplicate-member", public.tool_calls),
+                ("companion-only-claim", [unrelated_envelope, public.tool_calls[1]]),
+            ):
+                savepoint = conn.begin_nested()
+                try:
+                    extra = dict(public._mapping)
+                    extra.update(id=str(uuid4()), sequence_no=next_sequence, tool_calls=calls)
+                    conn.execute(insert(messages).values(**extra))
+                    if kind == "metadata-only":
+                        assert (
+                            conn.execute(
+                                select(func.count())
+                                .select_from(messages)
+                                .where(
+                                    messages.c.session_id == public.session_id,
+                                    messages.c.content == "Provider call result recorded.",
+                                    cast(messages.c.tool_calls, Text).like(f"%{verified.provider_attempt_id}%"),
+                                )
+                            ).scalar_one()
+                            == 2
+                        )
+                        assert (
+                            read_v4_checkpoint_paid_incomplete_verified_on_connection(
+                                conn,
+                                session_id=running.claim.session_id,
+                                operation_id=running.claim.operation_id,
+                                effect_key=verified.source.effect_key,
+                                names=phase_names[0],
+                            )
+                            == verified
+                        )
+                    else:
+                        with pytest.raises(AuditIntegrityError, match="checkpoint paid audit lost its one bounded original public row"):
+                            read_v4_checkpoint_paid_incomplete_verified_on_connection(
+                                conn,
+                                session_id=running.claim.session_id,
+                                operation_id=running.claim.operation_id,
+                                effect_key=verified.source.effect_key,
+                                names=phase_names[0],
+                            )
+                finally:
+                    savepoint.rollback()
+                assert tuple(conn.execute(select(messages).order_by(messages.c.sequence_no)).all()) == original_rows
+            assert sdk_calls == [1]
             altered = deepcopy(public.tool_calls)
             altered[0]["call"]["provider_cost"] = 0.02
             savepoint = conn.begin_nested()
@@ -486,8 +562,18 @@ async def test_actual_end_complete_return_retains_same_pending_attempt_and_cold_
             raise CapturedBeforeEndConsequences
 
         monkeypatch.setattr(phases.service._advisor_checkpoint, "_run_advisor_checkpoint", intercept_original_end_gate)
+        # This direct phase fixture starts its first END action at driver entry.
+        assert phases.action_clock is None
+        end_clock = ContinuationActionClock(entered.source.policy.actions.advisor)
+        deadline = work.coordinator.sql_deadline_owner
+        if deadline is not None:
+            assert deadline.running is running
+            deadline.begin_action(end_clock.policy, started_at=end_clock.started_monotonic)
+            deadline.require_action_clock(end_clock)
+        phases.bind_action_clock(end_clock)
         with pytest.raises(CapturedBeforeEndConsequences):
             await execute_continuation_end_review(phases, entered_selected)
+        assert phases.action_clock is end_clock
         assert sdk_calls == [1] and len(retained) == 1 and len(guard.requests) == 1
         owed, names = retained[0]
         with locked_session_transaction(store[0], str(store[4])) as conn:

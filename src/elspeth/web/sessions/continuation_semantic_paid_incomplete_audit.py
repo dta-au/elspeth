@@ -12,6 +12,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
+from elspeth.web.sessions.continuation_audit_membership import public_audit_membership_predicate
 from elspeth.web.sessions.continuation_cost import _closed_call
 from elspeth.web.sessions.continuation_paid_incomplete import PaidIncompleteReceipt
 from elspeth.web.sessions.continuation_paid_overflow import encode_paid_overflow_cost_amount
@@ -65,7 +66,7 @@ def require_semantic_paid_incomplete_public_audit_on_connection(
             messages.c.session_id == source.session_id,
             messages.c.role == "audit",
             messages.c.content == "Provider call result recorded.",
-            text.like(f"%{attempt_id}%"),
+            public_audit_membership_predicate(conn, attempt_id=attempt_id),
         )
         .limit(2)
     ).all()

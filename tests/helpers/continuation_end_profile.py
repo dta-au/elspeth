@@ -10,7 +10,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 from hashlib import sha256
@@ -22,7 +22,7 @@ from weakref import WeakKeyDictionary
 from sqlalchemy import Engine, event
 
 
-def _driver_review_observer(profile, original, *, session_id, operation_id):
+def _driver_review_observer(profile, original, *, session_id, operation_id, cursor=None):
     from elspeth.web.composer.continuation import EndFrame
     from elspeth.web.composer.continuation_clock import ContinuationActionClock
 
@@ -33,6 +33,7 @@ def _driver_review_observer(profile, original, *, session_id, operation_id):
         if (
             root.logical.session_id != str(session_id)
             or root.logical.operation_id != operation_id
+            or (cursor is not None and root.cursor != cursor)
             or type(root.frames[-1]) is not EndFrame
             or root.frames[-1].phase != "review_needed"
             or type(clock) is not ContinuationActionClock
@@ -42,6 +43,7 @@ def _driver_review_observer(profile, original, *, session_id, operation_id):
             return await original(phases, services, selected)
         with (
             profile.end_entry(clock),
+            profile.review_memo_interval(clock, cursor=root.cursor),
             profile.span(
                 "driver.original_review_entry",
                 cursor=root.cursor,
@@ -62,7 +64,7 @@ def driver_end_preparation_profile(monkeypatch, engine, *, session_id, operation
     if mode is None:
         yield
         return
-    assert mode in {"spans", "cpu"}, "END driver profile must be spans or cpu"
+    assert mode in {"spans", "cpu", "stop_cpu"}, "END driver profile must be spans, cpu or stop_cpu"
     root = Path(__file__).resolve().parents[2]
     output = Path(os.environ.get("ELSPETH_TEST_DRIVER_END_PROFILE_PATH", ".claude/lanes/end-driver-profile/profile.json"))
     if not output.is_absolute():
@@ -71,16 +73,51 @@ def driver_end_preparation_profile(monkeypatch, engine, *, session_id, operation
     assert output.is_relative_to(root), "END diagnostic output must remain inside this project"
     from elspeth.web.sessions import continuation_driver as driver
 
-    profile = EndPreparationProfile(enabled=True, cpu_profile=mode == "cpu", cpu_selection="all_workers")
+    profile = (
+        StopDecisionProfile(enabled=True, cpu_profile=True)
+        if mode == "stop_cpu"
+        else EndPreparationProfile(enabled=True, cpu_profile=mode == "cpu", cpu_selection="all_workers")
+    )
+    if mode == "spans":
+        profile.text_memo = EndTextMemoObservation(include=profile.include_review_memo)
     try:
-        with profile.install(monkeypatch, engine), monkeypatch.context() as owned:
-            owned.setattr(
-                driver,
-                "review_prescribed_continuation_end",
-                _driver_review_observer(
-                    profile, driver.review_prescribed_continuation_end, session_id=session_id, operation_id=operation_id
-                ),
-            )
+        with (
+            profile.install(monkeypatch, engine),
+            profile.text_memo.install(monkeypatch) if profile.text_memo is not None else nullcontext(),
+            monkeypatch.context() as owned,
+        ):
+            if mode == "stop_cpu":
+                cursor = int(os.environ.get("ELSPETH_TEST_DRIVER_STOP_CURSOR", "27"))
+                assert cursor >= 0
+                owned.setattr(
+                    driver,
+                    "run_continuation_semantic_advisor",
+                    _driver_stop_observer(
+                        profile,
+                        driver.run_continuation_semantic_advisor,
+                        session_id=session_id,
+                        operation_id=operation_id,
+                        cursor=cursor,
+                    ),
+                )
+            else:
+                owned.setattr(
+                    driver,
+                    "review_prescribed_continuation_end",
+                    _driver_review_observer(
+                        profile,
+                        driver.review_prescribed_continuation_end,
+                        session_id=session_id,
+                        operation_id=operation_id,
+                        cursor=(
+                            int(os.environ["ELSPETH_TEST_DRIVER_REVIEW_CURSOR"])
+                            if "ELSPETH_TEST_DRIVER_REVIEW_CURSOR" in os.environ
+                            else 19
+                            if mode == "spans"
+                            else None
+                        ),
+                    ),
+                )
             yield
     except BaseException as original:
         profile.case_outcome = {"status": "raised", "error": type(original).__name__}
@@ -106,8 +143,9 @@ class EndTextMemoObservation:
 
     families = ("full", "canonical", "block", "request", "credential", "evidence")
 
-    def __init__(self, *, max_fingerprints: int = 1024) -> None:
+    def __init__(self, *, max_fingerprints: int = 1024, include=None) -> None:
         self.max_fingerprints = max_fingerprints
+        self.include = include
         self._lock = threading.Lock()
         self._parents = WeakKeyDictionary()
         self._parent_states = {}
@@ -159,6 +197,8 @@ class EndTextMemoObservation:
             return hit, weight, tuple(len(items) for items in entries), weights, memo._shared_text_budget_bytes, not memo._closed
 
     def _observe(self, memo, family, key, producer, digest_producer, operation):
+        if self.include is not None and not self.include(memo, family):
+            return operation()
         if memo._v4_preparation_owner is None:
             return operation()
         before_ns = time.monotonic_ns()
@@ -321,6 +361,78 @@ class EndPreparationProfile:
         self.installed = False
         self.text_memo: EndTextMemoObservation | None = None
         self.text_memo_budget_bytes: int | None = None
+        self.review_memo: dict[str, Any] | None = None
+        self._review_memo_active = False
+
+    @contextmanager
+    def review_memo_interval(self, clock, *, cursor):
+        if self.text_memo is None:
+            yield
+            return
+        self.review_memo = {
+            "clock": id(clock),
+            "cursor": cursor,
+            "thread": threading.get_native_id(),
+            "start_ns": time.monotonic_ns(),
+            "carriers": {},
+            "carrier_drops": 0,
+            "rejections": {},
+            "callback_ns": 0,
+        }
+        self._review_memo_active = True
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._review_memo_active = False
+                self.review_memo["end_ns"] = time.monotonic_ns()
+
+    def include_review_memo(self, memo, family):
+        started = time.monotonic_ns()
+        with self._lock:
+            interval = self.review_memo
+            if not self._review_memo_active or interval is None:
+                return False
+            if interval["clock"] in self._closed_clocks:
+                return False
+            thread = threading.get_native_id()
+            worker = self._workers.get(thread)
+            observed_clock = self._clock.get() if worker is None else worker["clock"]
+            parent = memo._text_parent if memo._text_parent is not None else memo
+            owner = parent._v4_preparation_owner
+            if observed_clock != interval["clock"] and (owner is None or id(owner) != interval["clock"]):
+                return False  # Unrelated concurrent work is not this Review's observation.
+            reason = None
+            if worker is None and thread != interval["thread"]:
+                reason = "missing_worker_witness"
+            elif observed_clock != interval["clock"]:
+                reason = "wrong_observed_clock"
+            if reason is not None:
+                interval["rejections"][reason] = interval["rejections"].get(reason, 0) + 1
+                interval["callback_ns"] += time.monotonic_ns() - started
+                return False
+            carriers = interval["carriers"]
+            identity = id(memo)
+            if identity not in carriers and len(carriers) < 128:
+                carriers[identity] = {
+                    "identity": identity,
+                    "parent_identity": id(parent) if owner is not None else None,
+                    "owner_clock": None if owner is None else id(owner),
+                    "kind": "child" if memo._text_parent is not None else "parent" if owner is not None else "ordinary",
+                    "active_at_first_call": memo.active,
+                    "families": {},
+                }
+            if identity in carriers:
+                carriers[identity]["active_at_last_call"] = memo.active
+                counts = carriers[identity]["families"]
+                counts[family] = counts.get(family, 0) + 1
+            else:
+                interval["carrier_drops"] += 1
+            accepted = owner is not None and id(owner) == interval["clock"]
+            if owner is not None and id(owner) != interval["clock"]:
+                interval["rejections"]["wrong_parent_clock"] = interval["rejections"].get("wrong_parent_clock", 0) + 1
+            interval["callback_ns"] += time.monotonic_ns() - started
+            return accepted
 
     def begin(self, label: str, *, kind: str = "call", **facts: Any) -> dict[str, Any]:
         wall = time.monotonic_ns()
@@ -928,6 +1040,24 @@ class EndPreparationProfile:
                 for row in self.records
                 if row["kind"] == "submission" and not row.get("submission_failed") and "worker_id" not in row
             ]
+            memo_snapshot = None if self.text_memo is None else self.text_memo.snapshot()
+            interval = self.review_memo
+            memo_issues = []
+            if interval is not None and memo_snapshot is not None:
+                boundary = self._cpu_boundary(interval["clock"])
+                if boundary is None or boundary["kind"] == "end_entry_returned_without_finish":
+                    memo_issues.append("Review memo capture has no original preparation finish or aborted entry boundary")
+                interval["preparation_boundary"] = boundary
+                if "end_ns" not in interval or not interval["carriers"]:
+                    memo_issues.append("Review memo interval has no complete observed carrier calls")
+                if interval["rejections"] or interval["carrier_drops"]:
+                    memo_issues.append("Review memo interval has rejected witnesses or dropped carriers")
+                if any(not parent["closed_empty"] for parent in memo_snapshot["parents"]):
+                    memo_issues.append("Review memo parent did not close empty")
+                if any(memo_snapshot[key] for key in ("observer_errors", "overlapping_calls", "budget_violations", "fingerprint_drops")):
+                    memo_issues.append("Review memo accounting is incomplete or inconsistent")
+                if self.errors or any(self.records[index]["clock"] == interval["clock"] for index in incomplete + unpaired):
+                    memo_issues.append("Review memo interval has incomplete transport or observer errors")
             return {
                 "enabled": self.enabled,
                 "cpu_profile_enabled": self.cpu_profile,
@@ -949,8 +1079,11 @@ class EndPreparationProfile:
                 "pending_sql_contexts": len(self._sql),
                 "cpu_scope": "native thread CPU; async intervals include other event-loop activity; worker body includes gate wait",
                 "wall_scope": "inclusive intervals; do not sum nested or overlapping spans",
-                "text_memo": None if self.text_memo is None else self.text_memo.snapshot(),
+                "text_memo": memo_snapshot,
                 "text_memo_budget_bytes": self.text_memo_budget_bytes,
+                "review_memo_interval": self.review_memo,
+                "review_memo_capture_valid": interval is not None and memo_snapshot is not None and not memo_issues,
+                "review_memo_capture_issues": memo_issues,
             }
 
     def flush(self, path: Path) -> OSError | None:
@@ -961,3 +1094,107 @@ class EndPreparationProfile:
         except OSError as error:
             return error
         return None
+
+
+def _driver_stop_observer(profile, original, *, session_id, operation_id, cursor):
+    from elspeth.web.composer.continuation import AdvisorFrame, EndFrame
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
+
+    @wraps(original)
+    async def observed(phases, selected):
+        root = selected.stack
+        clock = phases.action_clock
+        if (
+            root.logical.session_id != str(session_id)
+            or root.logical.operation_id != operation_id
+            or root.cursor != cursor
+            or len(root.frames) != 3
+            or type(root.frames[-1]) is not AdvisorFrame
+            or root.frames[-1].phase != "response_retained"
+            or type(root.frames[-2]) is not EndFrame
+            or root.frames[-2].phase != "publication_ready"
+            or type(clock) is not ContinuationActionClock
+            or clock._seen
+            or profile._end_clocks
+        ):
+            return await original(phases, selected)
+        # Observe the clock already created/bound by the real driver. No new
+        # timer, SQL deadline, stage, memo or provider ownership is installed.
+        profile.clocks.append({"identity": id(clock), "start_ns": int(clock.started_monotonic * 1_000_000_000)})
+        with profile.end_entry(clock), profile.span("driver.original_stop_decision", cursor=root.cursor):
+            return await original(phases, selected)
+
+    return observed
+
+
+class StopDecisionProfile(EndPreparationProfile):
+    """Original final decision SQL action, deliberately not a preparation capture."""
+
+    @contextmanager
+    def end_entry(self, clock):
+        identity = id(clock)
+        self._end_clocks.add(identity)
+        token = self._clock.set(identity)
+        try:
+            with self.span("SQL_ACTION.semantic_stop_decision", clock=identity) as row:
+                yield
+        finally:
+            self._end_exits[identity] = {
+                "end_ns": row["end_ns"],
+                "entry_id": row["id"],
+                "kind": "sql_action_aborted" if row["error"] is not None else "sql_action_returned",
+                "error": row["error"],
+            }
+            self._clock.reset(token)
+
+    def _cpu_boundary(self, clock):
+        return self._end_exits.get(clock)
+
+    @contextmanager
+    def install(self, monkeypatch, engine):
+        from elspeth.web.composer import continuation_semantic_advisor_phase as phase
+
+        with monkeypatch.context() as owned, self.sql(engine), self.workers(owned):
+            owned.setattr(
+                phase,
+                "install_current_semantic_decision_on_connection",
+                self.sync("stop.install_decision", phase.install_current_semantic_decision_on_connection),
+            )
+            owned.setattr(
+                phase,
+                "consume_semantic_advisor_end_stop_on_connection",
+                self.sync("stop.consume_end", phase.consume_semantic_advisor_end_stop_on_connection),
+            )
+            self.installed = True
+            try:
+                yield
+            finally:
+                self.installed = False
+
+    def snapshot(self):
+        result = super().snapshot()
+        issues = result["cpu_capture_issues"]
+        target_submissions = [row for row in self.records if row["kind"] == "submission" and row["clock"] in self._end_clocks]
+        if any(not row.get("submission_failed") and "worker_id" not in row for row in target_submissions):
+            issues.append("SQL action has an unpaired original worker submission")
+        if any(row["clock"] in self._end_clocks and "end_ns" not in row for row in self.records):
+            issues.append("SQL action has incomplete original spans")
+        if result["pending_sql_contexts"]:
+            issues.append("SQL action has pending SQL observations")
+        result["cpu_capture_valid"] = self.cpu_profile and not issues
+        result["cpu_capture_status"] = (
+            "captured_sql_action_aborted"
+            if result["cpu_capture_valid"] and any(boundary["kind"] == "sql_action_aborted" for boundary in self._end_exits.values())
+            else "captured_sql_action"
+            if result["cpu_capture_valid"]
+            else "invalid"
+        )
+        result["diagnostic_scope"] = "original selected SQL action entry through return/error; not preparation or SDK acceptance"
+        result["cpu_scope"] = (
+            "each original native worker thread CPU including gate; install/consume spans are nested, not additive; "
+            "event-loop CPU is NOT profiled; remaining action wall is not attributed to a worker; cProfile overhead included"
+        )
+        for captured in result["cpu_profiles"]:
+            captured["within_sql_action_window"] = captured.pop("within_preparation_window")
+            captured.pop("preparation_finish_ns")
+        return result

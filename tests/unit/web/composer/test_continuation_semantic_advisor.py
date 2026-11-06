@@ -112,6 +112,10 @@ async def _semantic_entry(store, tmp_path, monkeypatch):
             async with _claimed_driver(driver):
                 handover = await driver.run(None)
         assert type(handover) is ContinuationSegmentHandedOver and len(ready_cuts) == 1
+        assert timing.drain_signal.draining.is_set() and timing.drain_signal.started_at is not None
+        drain_deadline = driver.worker.drain_deadline
+        assert drain_deadline is not None
+        assert drain_deadline.expires_at == timing.drain_signal.started_at + driver.worker._drain_seconds
         store[1].verify_recovery(handover.receipt)
         service = owner.service
     owner.work.coordinator.assert_completed()
