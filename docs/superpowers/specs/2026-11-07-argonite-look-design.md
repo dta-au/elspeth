@@ -48,7 +48,12 @@ The mockup the user approved: claude.ai artifact `JCT2gATUupfVwtGrszUzAR`
      decisions).
    - The wiring disclosure becomes a pane footer row with a count pill.
    - The composer input becomes one rounded well with Send inside it.
-   - Run and Send become raised filled pills.
+   - Run and Send become raised filled pills. **Run stays red** (`variant="danger"`). That was
+     a deliberate operator decision on 2026-08-15, because Run is the one verb with egress and
+     spend (`ExecuteButton.tsx`). The mockup's green Run was a mockup error, not a design
+     change. Send is the green primary.
+   - The wordmark keeps JetBrains Mono, the audit register it owns (`header.css`). The nod is
+     the navy chip with a yellow wordmark.
 6. All of this applies through tokens where possible, with targeted CSS and small markup
    changes where it doesn't.
 
