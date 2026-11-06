@@ -176,7 +176,7 @@
     border: 1px solid CanvasText;
   }
 
-  .react-flow__controls {
+  :root .react-flow__controls {
     border: 1px solid ButtonText;
   }
 

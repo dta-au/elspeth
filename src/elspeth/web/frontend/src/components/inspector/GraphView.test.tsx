@@ -319,6 +319,8 @@ it("toggles quarantine routes with the keyboard, retains shared sinks and restor
   const routeList = screen.getByRole("list", { name: "Inspect pipeline routes" });
   await user.click(within(routeList).getAllByRole("button", { name: /\(error\)/ })[0]);
   expect(screen.getByText(/Selected route:/)).toBeInTheDocument();
+  // ARGOnite: a selected route's endpoint carries the forced-colours class too.
+  expect(screen.getByTestId("node-quarantine")).toHaveClass("graph-node--selected");
   await user.click(screen.getByRole("button", { name: /^sink: quarantine/ }));
   expect(useSessionStore.getState().selectedNodeId).toBe("quarantine");
   toggle.focus();

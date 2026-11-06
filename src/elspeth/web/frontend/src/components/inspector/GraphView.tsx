@@ -2066,7 +2066,7 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   // ARGOnite: a selected route's endpoints take the same solid 2px ring as a
   // selected node, over the card shadow.
   const renderedNodes = visibleGraph.nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
-    ? { ...node, style: { ...node.style, boxShadow: `0 0 0 2px ${SELECTED_RING_COLOR}, var(--shadow-card)` } }
+    ? { ...node, className: "graph-node--selected", style: { ...node.style, boxShadow: `0 0 0 2px ${SELECTED_RING_COLOR}, var(--shadow-card)` } }
     : node);
 
   // Accessible, keyboard-operable equivalent of the visual DAG. The React Flow
