@@ -198,9 +198,11 @@ describe("light theme colour contrast", () => {
   });
 
   it("keeps primary button text at WCAG AA contrast in both themes", () => {
-    const darkText = extractRootToken("--color-text-inverse");
+    // ARGOnite: the primary fill is DTA green with navy text, so the pair is
+    // --color-btn-primary-text, not --color-text-inverse (design doc §UX review).
+    const darkText = extractRootToken("--color-btn-primary-text");
     const darkBg = extractRootToken("--color-btn-primary-bg");
-    const lightText = extractLightThemeToken("--color-text-inverse");
+    const lightText = extractLightThemeToken("--color-btn-primary-text");
     const lightBg = extractLightThemeToken("--color-btn-primary-bg");
 
     expect(contrastRatio(darkText, darkBg)).toBeGreaterThanOrEqual(4.5);
@@ -356,7 +358,9 @@ describe("base interaction tokens", () => {
     const primaryRule = extractCssRule(".btn-primary");
 
     expect(primaryRule).toContain("background-color: var(--color-btn-primary-bg);");
-    expect(primaryRule).toContain("color: var(--color-text-inverse);");
+    // ARGOnite: primary text is navy --color-btn-primary-text on DTA green, so
+    // the contrast gate above measures the pair that actually renders.
+    expect(primaryRule).toContain("color: var(--color-btn-primary-text);");
     expect(primaryRule).not.toContain("rgba(");
   });
 
@@ -366,6 +370,38 @@ describe("base interaction tokens", () => {
     expect(dangerRule).toContain("background-color: var(--color-btn-danger-bg);");
     expect(dangerRule).toContain("color: var(--color-text-inverse);");
     expect(dangerRule).not.toContain("rgba(");
+  });
+
+  it("keeps declared text at AA on every accent or primary-button fill in both themes", () => {
+    // ARGOnite: the dark accent and both primary fills became the light DTA
+    // green #29b480, on which --color-text-inverse (white) is ~2.65:1. Gate
+    // every rule in the barrel that paints one of these fills AND declares a
+    // text colour, so a palette change cannot silently strand white text on
+    // green. Rules that declare no colour inherit their base rule's text.
+    const fills = ["--color-accent", "--color-btn-primary-bg", "--color-btn-primary-bg-hover"];
+    const uncommented = appCss.replace(/\/\*[\s\S]*?\*\//g, "");
+    let checked = 0;
+    for (const rule of uncommented.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const selector = rule[1].trim();
+      const body = rule[2];
+      const fill = /(?:^|[;\s])background(?:-color)?:\s*var\((--[\w-]+)\)\s*;/.exec(body)?.[1];
+      const text = /(?:^|[;\s])color:\s*var\((--[\w-]+)\)\s*;/.exec(body)?.[1];
+      if (fill === undefined || !fills.includes(fill) || text === undefined) {
+        continue;
+      }
+      checked += 1;
+      for (const [theme, hexOf] of [
+        ["dark", extractRootToken],
+        ["light", extractLightThemeToken],
+      ] as const) {
+        expect(
+          contrastRatio(hexOf(text), hexOf(fill)),
+          `${selector}: ${text} on ${fill} (${theme})`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+    // Positive control: .btn-primary alone guarantees the scan matched rules.
+    expect(checked).toBeGreaterThan(0);
   });
 
   it("keeps light theme hover surfaces visibly darker than resting surfaces", () => {
@@ -378,21 +414,33 @@ describe("base interaction tokens", () => {
 });
 
 describe("role-family surface contrast", () => {
-  // The DTA/AGDS three-family role palette (navy chrome, teal workspace, warm
-  // inspection paper) introduced --color-surface-nav, --color-surface-paper,
-  // and re-bound --color-surface-inspector to a warm neutral. These assertions
-  // gate that the new surfaces still host body text at WCAG AA (4.5:1) and
-  // muted text at AA in both themes — the muted-on-warm pair is the tightest
-  // and was the constraint that set the warm-neutral hex.
+  // The three-family role palette (ARGOnite: DTA green nav band, green/navy
+  // workspace, warm inspection paper) introduced --color-surface-nav,
+  // --color-surface-paper, and re-bound --color-surface-inspector to a warm
+  // neutral. These assertions gate that each surface hosts its text register
+  // at WCAG AA (4.5:1) in both themes — body and muted text on the workspace
+  // and inspection families, the on-nav pair on the nav band.
 
-  it("keeps body text at AA on the navy navigation surface in both themes", () => {
-    const darkText = extractRootToken("--color-text");
-    const darkNav = extractRootToken("--color-surface-nav");
-    const lightText = extractLightThemeToken("--color-text");
-    const lightNav = extractLightThemeToken("--color-surface-nav");
+  it("keeps on-nav text at AA on the green navigation band and its control tint in both themes", () => {
+    // ARGOnite: nav is DTA green; header text on it is --color-on-nav /
+    // --color-on-nav-muted, not body text (design doc §UX review). The muted
+    // register renders on the --color-nav-control tint (the model chip),
+    // where the review chose the dark tint precisely so it clears AA; bare
+    // light #c8ebd7 on #288264 is ~3.65:1, so it is gated where it renders.
+    for (const theme of ["dark", "light"] as const) {
+      const hexOf = theme === "dark" ? extractRootToken : extractLightThemeToken;
+      const nav = hexOf("--color-surface-nav");
+      const control = resolveTintOver(theme, "--color-nav-control", "--color-surface-nav");
+      const onNav = hexOf("--color-on-nav");
+      const onNavMuted = hexOf("--color-on-nav-muted");
 
-    expect(contrastRatio(darkText, darkNav)).toBeGreaterThanOrEqual(4.5);
-    expect(contrastRatio(lightText, lightNav)).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(onNav, nav), `on-nav on surface-nav (${theme})`).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(onNav, control), `on-nav on nav-control (${theme})`).toBeGreaterThanOrEqual(4.5);
+      expect(
+        contrastRatio(onNavMuted, control),
+        `on-nav-muted on nav-control (${theme})`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
   });
 
   it("keeps body text at AA on the warm inspector surface in both themes", () => {
@@ -647,7 +695,13 @@ function resolveTintOver(
 ): string {
   const rawOf = theme === "dark" ? extractRootRawToken : extractLightThemeRawToken;
   const hexOf = theme === "dark" ? extractRootToken : extractLightThemeToken;
-  const rgba = parseRgba(rawOf(tintToken));
+  const raw = rawOf(tintToken);
+  // ARGOnite: chat bubbles may be opaque hex cards; an opaque fill is its own
+  // ground, whatever surface sits behind it (mirrors resolveHex above).
+  if (raw.startsWith("#")) {
+    return raw;
+  }
+  const rgba = parseRgba(raw);
   const base = hexToRgb(hexOf(surfaceToken));
   return rgbToHex({
     r: rgba.red * rgba.alpha + base.r * (1 - rgba.alpha),
@@ -791,7 +845,9 @@ describe("muted text on every panel surface (elspeth-dae08efdc9)", () => {
     "--color-surface-raised",
     "--color-surface-inspector",
     "--color-surface-paper",
-    "--color-surface-nav",
+    // ARGOnite: bare --color-surface-nav is the DTA green band, which hosts
+    // --color-on-nav(-muted), not body muted text — gated in the role-family
+    // suite. nav-raised stays: the session-switcher popover's muted text sits on it.
     "--color-surface-nav-raised",
     "--color-surface-input",
   ];

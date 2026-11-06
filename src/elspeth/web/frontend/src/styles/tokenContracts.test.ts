@@ -139,19 +139,20 @@ describe("filled-button hover direction (elspeth-3b57d9025b)", () => {
     );
   });
 
-  it("keeps inverse button text at WCAG AA on the hover fills in both themes", () => {
+  it("keeps filled-button text at WCAG AA on the hover fills in both themes", () => {
+    // ARGOnite: primary text is navy --color-btn-primary-text on DTA green;
+    // danger keeps --color-text-inverse (design doc §UX review).
     for (const [theme, token] of [
       ["dark", rootToken],
       ["light", lightToken],
     ] as const) {
-      const inverse = token("--color-text-inverse");
-      for (const hover of [
-        "--color-btn-primary-bg-hover",
-        "--color-btn-danger-bg-hover",
-      ]) {
+      for (const [text, hover] of [
+        ["--color-btn-primary-text", "--color-btn-primary-bg-hover"],
+        ["--color-text-inverse", "--color-btn-danger-bg-hover"],
+      ] as const) {
         expect(
-          contrastRatio(inverse, token(hover)),
-          `inverse text on ${hover} (${theme})`,
+          contrastRatio(token(text), token(hover)),
+          `${text} on ${hover} (${theme})`,
         ).toBeGreaterThanOrEqual(4.5);
       }
     }
