@@ -217,3 +217,55 @@ Each decision below is a design call; "(review)" marks one taken directly from t
 - Per-component spacing inside title bars, within the existing height tokens.
 - Where the tab-track title collapse threshold sits. Measure it on a real 1280×720 build in the
   later browser pass.
+
+## Status (mechanical half complete; browser pass deferred)
+
+Verified on the branch: the full frontend test suite (276 files, 4864 tests), both typechecks,
+ESLint, Stylelint and the production build all pass. In the built `index.html`, `theme-init.js`
+loads before the module entry. The visual Playwright spec still compiles (`--list` only).
+
+### Done: Tasks 1-9
+
+1. Fonts: self-hosted Instrument Sans for UI, Bricolage Grotesque for display.
+2. Role and material tokens: shadows, shapes and surface elevation.
+3. Palette swap in dark and light, with contrast gates retargeted to what renders.
+4. Pill buttons, focus rings and the recessed sliding switch primitive.
+5. Header band in DTA green, with the navy and yellow wordmark chip.
+6. Workspace panes as cards with title bars and a pill tab track.
+7. Graph well, node chrome, checksum row, routes switch and wiring footer.
+8. Chat bubbles, composer well and action bar.
+9. Forced-colours and reduced-motion fallbacks.
+
+### Rulings made during implementation
+
+- The light track shadow blur is 5px, matching dark, so the theme-pair geometry check stays strict.
+- Primary button text uses its own token, and the contrast gates now measure that pair.
+- The pipeline pane gets `container-type: inline-size` so the title bar can collapse by width.
+- The selected tab pill has a 3:1 border, because shadows never carry a boundary alone.
+- Regions keep their aria-labels; making the pipeline title their accessible name was deferred.
+- Pane titles follow their host, so the tutorial run frame is no longer labelled "Conversation".
+- Chat icon buttons stay 44px circles, to keep the existing hit-target size.
+- Graph nodes gain a `graph-node--selected` class so forced-colours can outline selection.
+
+### Deferred, to run once 0.8.10 settles
+
+- Snapshot re-baseline, reviewed image by image, never `--update-snapshots` in bulk. This
+  includes the checksum-screenshot helper stylesheet.
+- Playwright geometry, accessibility, reflow, keyboard and visual specs on an isolated harness.
+  The graph fan-in spec was edited (Space toggle) but has not been run.
+- Real-browser checks:
+  - 1280x720 title-bar overflow, including 1px slack in the 46px bar and whether "Pipeline"
+    should hide below the 900px threshold.
+  - Hover states, the collapsed pane and the expanded Wiring list.
+  - Empty and pending states.
+  - Run button right edge no longer lines up with the catalog button.
+  - Non-portal dialogs (Explain, readiness row detail, YAML view, graph modal) in WebKit and
+    Firefox, to confirm the pane's container sizing does not clip them.
+  - Global Bricolage headings in markdown and tutorial content.
+  - The header session popover, which now separates from the band only by border and shadow.
+  - Selected versus valid graph node ring (3px against 2px, light colours close in tone).
+  - Dark-mode Run-tab dot contrast (decorative).
+- Small follow-ups: delete the unused workspace band size token; refresh stale comments in
+  the workspace stylesheet and its chrome test and in the primitive geometry test; make the
+  Pipeline pane heading outline less flat; tighten a few regex-only CSS tests; investigate the
+  jsdom "navigation not implemented" noise in the full suite.
