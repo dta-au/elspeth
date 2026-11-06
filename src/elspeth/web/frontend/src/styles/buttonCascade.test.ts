@@ -119,3 +119,47 @@ describe("button hover cascade (elspeth-b293bbd3c0)", () => {
     }
   });
 });
+
+/** Declaration body of the first rule whose selector list contains `selector` exactly. */
+function ruleBodyFor(selector: string): string {
+  for (const match of cssWithoutComments.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (match[1].split(",").some((candidate) => candidate.trim() === selector)) {
+      return match[2];
+    }
+  }
+  throw new Error(`No rule found for selector ${selector}`);
+}
+
+// ARGOnite: pill shadows on filled variants must not leak onto disabled buttons.
+describe("ARGOnite pill buttons", () => {
+  it("disabled filled buttons drop the pill shadow and outrank variants", () => {
+    const disabled = findSelectorStartingWith(".btn:disabled");
+    expect(ruleBodyFor(disabled)).toContain("box-shadow: none");
+    const disabledSpecificity = classLevelSpecificity(disabled);
+    for (const variant of [".btn-danger", ".btn-primary"]) {
+      expect(disabledSpecificity).toBeGreaterThanOrEqual(
+        classLevelSpecificity(findSelectorStartingWith(variant)),
+      );
+      expect(ruleBodyFor(variant)).toContain("box-shadow: var(--shadow-pill)");
+    }
+  });
+
+  it("gives .btn and .btn-compact the pill shape, strong border and well hover", () => {
+    for (const selector of [".btn", ".btn-compact"]) {
+      const body = ruleBodyFor(selector);
+      expect(body).toContain("border-radius: var(--radius-pill)");
+      expect(body).toContain("border: 1px solid var(--color-border-strong)");
+      expect(ruleBodyFor(findSelectorStartingWith(`${selector}:hover`))).toContain(
+        "background-color: var(--color-well)",
+      );
+    }
+  });
+
+  it("filled pills keep a visible focus ring", () => {
+    const ring =
+      "box-shadow: 0 0 0 2px var(--color-surface), 0 0 0 4px var(--color-focus-ring)";
+    expect(ruleBodyFor(".btn-primary:focus-visible")).toContain(ring);
+    expect(ruleBodyFor(".btn-danger:focus-visible")).toContain(ring);
+    expect(ruleBodyFor(":focus-visible")).toContain("outline-offset: 2px");
+  });
+});
