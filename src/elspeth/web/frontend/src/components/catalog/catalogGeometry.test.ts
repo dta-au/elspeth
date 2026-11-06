@@ -104,8 +104,8 @@ function tokenPx(name: string): number {
     throw new Error(`No px value for ${name} in the stylesheet barrel`);
   }
   if (values.size > 1) {
-    // e.g. --size-workspace-band, which a density media query overrides.
-    // Resolving one of several branches would be a guess, so refuse.
+    // e.g. a token that a density media query overrides. Resolving one of
+    // several branches would be a guess, so refuse.
     throw new Error(
       `${name} is defined at ${[...values].join("px, ")}px — it has no single value`,
     );

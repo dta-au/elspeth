@@ -364,6 +364,10 @@
    Contrast (thumb on track >= 3:1, both themes) is gated by
    styles/switchPrimitive.test.ts.
    --------------------------------------------------------------------------- */
+/* ARGOnite: from ARGO (dta-au) client ElspethWorkflowEditor.module.css — reuse assumed MIT, see design doc
+   (ARGO's .switch recipe: a visually hidden checkbox over a pill track,
+   checked = the primary fill, the thumb slides across, focus ring on the
+   track. Geometry retuned here: 40x24 track, 18px thumb, 16px travel.) */
 .switch {
   position: relative;
   display: inline-flex;

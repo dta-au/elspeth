@@ -88,7 +88,7 @@
     var(--space-pane-gutter) var(--space-pane-gutter);
 }
 
-/* ARGOnite: from ARGO (dta-au) client index.css — reuse assumed MIT, see design doc
+/* ARGOnite: from ARGO (dta-au) client ElspethWorkflowEditor.module.css — reuse assumed MIT, see design doc
    (ARGO's .pane: surface fill, 1px edge, 20px radius, the card shadow tier).
    overflow: hidden clips the title bar and body to the rounded corners. */
 .workspace-authoring-pane,
@@ -106,7 +106,9 @@
   box-shadow: var(--shadow-card);
 }
 
-/* The authoring pane's title bar. Same band, fill and rule as the artifact
+/* ARGOnite: from ARGO (dta-au) client ElspethWorkflowEditor.module.css — reuse assumed MIT, see design doc
+   (ARGO's .paneHeader: a 46px bar with a bottom rule on a tinted fill).
+   The authoring pane's title bar. Same band, fill and rule as the artifact
    toolbar (the pipeline pane's title bar), so the two bars register across
    the gutter. Name only: the pane toggles stay in the bar row. */
 .workspace-pane-header {
@@ -138,8 +140,9 @@
   overflow: hidden;
 }
 
-/* The application's bottom bar: the rule and the fill are painted ONCE, by
-   this one grid item spanning both columns (elspeth-9c94a58500). Its cells are
+/* The application's bottom bar: ONE grid item spanning both columns owns the
+   bottom edge (elspeth-9c94a58500). ARGOnite retired its top rule and fill: it
+   is transparent on the page canvas below the pane cards. Its cells are
    the parent grid's own columns via subgrid, so the collapse control lands in
    the authoring column and the action bar in the artifact column at whatever
    width the pane has — the resized one, the collapsed 0px one, narrow mode's
@@ -233,7 +236,7 @@
   gap: var(--space-xs);
 }
 
-/* ARGOnite: from ARGO (dta-au) client index.css — reuse assumed MIT, see design doc
+/* ARGOnite: from ARGO (dta-au) client ViewToggle.module.css — reuse assumed MIT, see design doc
    (ARGO's ViewToggle: a recessed pill track holding a raised pill). Shared by
    the artifact tablist and the narrow Compose/Pipeline view tabs. */
 .artifact-workspace-toolbar [role="tablist"],
@@ -479,10 +482,11 @@
   max-width: 74ch;
 }
 
-/* The bar carries no border-top and no background of its own: the rule and
-   the fill belong to .workspace-action-bar-slot above, which spans both
-   columns, and drawing them here as well would put two elements back in
-   charge of the bottom edge (elspeth-9c94a58500). Nor is it positioned or on
+/* The bar carries no border-top and no background of its own: the bottom
+   edge belongs to .workspace-action-bar-slot above, which spans both columns
+   (and, since ARGOnite, paints no rule or fill either). Drawing them here
+   would put two elements back in charge of the bottom edge
+   (elspeth-9c94a58500). Nor is it positioned or on
    a z rung any more — it was position: sticky on --z-panel-controls, which
    was dead as sticky (nothing here scrolls) but live as a compositor layer:
    with the opaque background gone, that layer stopped being opaque and Chrome
@@ -1088,10 +1092,10 @@
 }
 
 @media (min-width: 961px) and (max-height: 800px) {
-  /* Short-screen density. ARGOnite: the artifact toolbar no longer reads
-     --size-workspace-band (it is the pipeline pane's title bar, on the 46px
-     --size-pane-header shared with the authoring pane — 1px off the regime's
-     historic 45px), so the band override that compressed it is gone. */
+  /* Short-screen density. ARGOnite: the artifact toolbar is the pipeline
+     pane's title bar, on the 46px --size-pane-header shared with the
+     authoring pane (1px off the regime's historic 45px band), so the band
+     override that used to compress it is gone. */
   .composer-workspace {
     /* Tighten the WHOLE action-bar rhythm, not just the bar's own outer gap.
        Overriding only the bar left the group BOUNDARIES at 4px while the gaps

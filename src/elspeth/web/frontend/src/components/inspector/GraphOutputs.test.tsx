@@ -34,7 +34,6 @@ describe("GraphOutputs", () => {
     expect(hidden).toEqual(["(", ")"]);
   });
 
-
   it("mirrors hidden failure routes while retaining ordinary false branches and structural diagnostics", async () => {
     const state: CompositionState = {
       id: "session", ...compositionStateAuthorityFields, version: 1,
