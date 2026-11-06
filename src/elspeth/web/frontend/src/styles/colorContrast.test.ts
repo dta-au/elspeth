@@ -400,8 +400,11 @@ describe("base interaction tokens", () => {
         ).toBeGreaterThanOrEqual(4.5);
       }
     }
-    // Positive control: .btn-primary alone guarantees the scan matched rules.
-    expect(checked).toBeGreaterThan(0);
+    // Positive control: the seven known fill rules (.btn-primary,
+    // .skip-to-content, .catalog-tab-count--active, .chat-input-send-btn,
+    // .message-edit-fork, .ack-card-view-toggle--next and its :hover) must
+    // all be scanned, so a regex that silently skips rules fails here.
+    expect(checked).toBeGreaterThanOrEqual(7);
   });
 
   it("keeps light theme hover surfaces visibly darker than resting surfaces", () => {
@@ -869,9 +872,17 @@ describe("muted text on every panel surface (elspeth-dae08efdc9)", () => {
     // --color-surface-hover over the elevated dropdown while its meta/tag
     // spans stay muted. The wash lightens dark surfaces (and darkens light
     // ones), so it is the tightest composite muted text sits on.
+    // ARGOnite: the session-switcher popover's item/action :hover/:focus
+    // paint the same wash over --color-surface-nav-raised while the item
+    // time and action labels stay muted (header.css), so that ground is
+    // gated too.
     for (const theme of themes) {
       const muted = resolveHex(theme, "--color-text-muted");
-      for (const surface of ["--color-surface", "--color-surface-elevated"]) {
+      for (const surface of [
+        "--color-surface",
+        "--color-surface-elevated",
+        "--color-surface-nav-raised",
+      ]) {
         const washed = resolveTintOver(theme, "--color-surface-hover", surface);
         expect(
           contrastRatio(muted, washed),
