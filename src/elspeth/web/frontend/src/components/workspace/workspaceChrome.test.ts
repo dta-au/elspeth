@@ -22,6 +22,11 @@ const css = readFileSync(
   "utf8",
 );
 const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
+// shared.css owns the base .artifact-tab chrome the track rules build on.
+const sharedCss = readFileSync(
+  join(process.cwd(), "src/styles/shared.css"),
+  "utf8",
+).replace(/\/\*[\s\S]*?\*\//g, "");
 
 interface Rule {
   selector: string;
@@ -486,6 +491,12 @@ describe("ARGOnite pane cards, title bars and tab track", () => {
     expect(declaration(selected, "box-shadow")).toBe("var(--shadow-pill)");
     expect(declaration(selected, "background-color")).toBe("var(--color-pill)");
     expect(declaration(selected, "color")).toBe("var(--color-on-pill)");
+    // ARGOnite (controller ruling): the pill's edge is a 3:1 border, not the
+    // shadow alone (gated vs --color-track in colorContrast.test.ts). Unselected
+    // tabs keep shared.css's 1px transparent border, so selection never shifts
+    // layout.
+    expect(declaration(selected, "border-color")).toBe("var(--color-text-muted)");
+    expect(sharedCss).toMatch(/^\.artifact-tab\s*\{[^}]*border:\s*1px solid transparent;/m);
     expect(declaration(`${scope} .artifact-tab`, "color")).toBe(
       "var(--color-text-muted)",
     );
