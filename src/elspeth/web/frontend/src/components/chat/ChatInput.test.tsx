@@ -1318,3 +1318,36 @@ describe("ChatInput overflow glyph (elspeth-b720e0b932)", () => {
     expect(rule).toMatch(/fill:\s*none/);
   });
 });
+
+describe("ChatInput composer well CSS (ARGOnite Task 8)", () => {
+  const css = readFileSync("src/components/chat/chat.css", "utf8");
+  const rule = (selector: string): string => {
+    const escaped = selector.replace(/[.:()-]/g, "\\$&");
+    return css.match(new RegExp(`\\n${escaped}\\s*\\{([^}]*)\\}`, "s"))?.[1] ?? "";
+  };
+
+  it("makes the row a recessed card well", () => {
+    const row = rule(".chat-input-row");
+    expect(row).toMatch(/border-radius:\s*var\(--radius-card\)/);
+    expect(row).toMatch(/background-color:\s*var\(--color-surface-input\)/);
+    expect(row).toMatch(/box-shadow:\s*var\(--shadow-track\)/);
+    expect(row).toMatch(/border:\s*1px solid var\(--color-input-border\)/);
+  });
+
+  it("strips the textarea's own border and background", () => {
+    const textarea = rule(".chat-input-textarea");
+    expect(textarea).toMatch(/border:\s*none/);
+    expect(textarea).toMatch(/background-color:\s*transparent/);
+  });
+
+  it("moves the keyboard focus indication onto the well", () => {
+    expect(css).toMatch(
+      /\.chat-input-row:focus-within\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/s,
+    );
+  });
+
+  it("rounds the icon buttons into circles and the send button into a pill", () => {
+    expect(rule(".chat-input-icon-btn")).toMatch(/border-radius:\s*var\(--radius-pill\)/);
+    expect(rule(".chat-input-send-btn")).toMatch(/border-radius:\s*var\(--radius-pill\)/);
+  });
+});

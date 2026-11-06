@@ -581,3 +581,30 @@ describe("ARGOnite pane cards, title bars and tab track", () => {
     expect(body).not.toMatch(/display:\s*none|visibility:\s*hidden/);
   });
 });
+
+describe("run reason tone (ARGOnite Task 8)", () => {
+  const sidebarCss = readFileSync(
+    join(process.cwd(), "src/components/sidebar/sidebar.css"),
+    "utf8",
+  ).replace(/\/\*[\s\S]*?\*\//g, "");
+
+  function sidebarDecl(selector: string, property: string): string | undefined {
+    const rule = [...sidebarCss.matchAll(/([^{}]+)\{([^{}]*)\}/g)].find(
+      (match) => match[1].replace(/\s+/g, " ").trim() === selector,
+    );
+    return rule
+      ? new RegExp(`(?:^|;)\\s*${property}:\\s*([^;]+);`).exec(rule[2])?.[1].trim()
+      : undefined;
+  }
+
+  it("a blocking run reason reads at body-text colour", () => {
+    // ARGOnite: a block is the reason Run is unavailable, so it is not secondary text.
+    expect(sidebarDecl(".side-rail-execute-reason", "color")).toBe("var(--color-text)");
+  });
+
+  it("an advisory run note stays muted", () => {
+    expect(sidebarDecl(".side-rail-execute-reason--advisory", "color")).toBe(
+      "var(--color-text-muted)",
+    );
+  });
+});
