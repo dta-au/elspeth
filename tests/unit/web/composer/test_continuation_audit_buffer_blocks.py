@@ -152,3 +152,42 @@ def test_retained_size_is_linear_in_the_number_of_calls():
     assert v1_shape > 19 * one_call
     # Linear: the stable prefix once, plus a bounded per-call increment.
     assert v2 < one_call + 20 * 4_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allocation", (1_048_576, 32 * 1_048_576))
+async def test_complete_recorder_charge_uses_expanded_requests_and_oversize_keeps_result(monkeypatch, allocation):
+    from sys import getsizeof
+
+    from elspeth.web import continuation_retention_memo as memo
+    from elspeth.web.composer import continuation_audit_buffer as audit_buffer
+    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+
+    snapshot = _snapshot(20)
+    chunk = encode_recorder_snapshot(snapshot)
+    assert chunk.reference.byte_length < 1_048_576
+    actual_producer = audit_buffer._decode_recorder_data
+    produced = []
+
+    def produce(text):
+        result = actual_producer(text)
+        produced.append(result)
+        return result
+
+    monkeypatch.setattr(audit_buffer, "_decode_recorder_data", produce)
+    monkeypatch.setattr(memo, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", allocation)
+    with memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
+        first = decode_recorder_snapshot(chunk)
+        second = decode_recorder_snapshot(chunk)
+        assert first == second == snapshot
+        requests = {id(call.private_request.canonical): call.private_request.canonical for call in first.llm_calls}
+        expanded = sum(getsizeof(text) for text in requests.values())
+        assert expanded > 1_048_576
+        if allocation == 1_048_576:
+            assert len(produced) == 2 and not parent._recorder_data and parent._recorder_data_bytes == 0
+        else:
+            assert len(produced) == 1 and first is second
+            assert expanded < parent._recorder_data_bytes <= allocation
+            entry = next(iter(parent._recorder_data.values()))
+            assert entry.retained_bytes == parent._recorder_data_bytes
+    assert not parent._recorder_data and parent._recorder_data_bytes == 0

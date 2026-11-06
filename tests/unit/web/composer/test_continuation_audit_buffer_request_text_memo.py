@@ -11,6 +11,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web import async_workers
 from elspeth.web.composer import continuation_audit_buffer as audit_buffer
+from elspeth.web.composer import continuation_codec as codec
 from elspeth.web.composer.continuation_audit_buffer import (
     _deduplicate_request,
     _prepared_request_text,
@@ -296,3 +297,101 @@ async def test_v4_request_shape_changes_fallback_outer_guards_oversize_and_produ
             _deduplicate_request(request, _RecorderBlocks())
         assert raised.value is original_error
     assert parent.cached_entry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_complete_recorder_data_reuses_equal_chunks_across_children_and_admits_every_call(monkeypatch):
+    original = audit_buffer._decode_recorder_data
+    original_admit = audit_buffer._admit_recorder_data
+    produced, admitted = [], []
+
+    def produce(text):
+        produced.append(text)
+        return original(text)
+
+    def admit(key, data):
+        admitted.append((key.canonical, data))
+        original_admit(key, data)
+
+    monkeypatch.setattr(audit_buffer, "_decode_recorder_data", produce)
+    monkeypatch.setattr(audit_buffer, "_admit_recorder_data", admit)
+    first = encode_recorder_snapshot(_snapshot(1))
+    changed = encode_recorder_snapshot(_snapshot(2))
+    with v4_preparation_memo_scope(_clock()) as parent:
+        restored = []
+        for chunk in (first, codec.PrivateChunk(first.reference, (" " + first.canonical)[1:]), changed, first):
+            with borrow_v4_preparation_memo_scope() as child:
+                restored.append(decode_recorder_snapshot(chunk))
+                assert not child._recorder_data
+        assert produced == [first.canonical, changed.canonical]
+        assert len(admitted) == 4 and restored[0] is restored[1] is restored[3]
+        assert parent._recorder_data_bytes > 0 and len(parent._recorder_data) == 2
+
+        # Complete reference binding still precedes the warmed DATA lookup.
+        for reference in (
+            first.reference.model_copy(update={"digest": "0" * 64}),
+            first.reference.model_copy(update={"byte_length": first.reference.byte_length + 1}),
+            first.reference.model_copy(update={"codec": "composer.evidence.v2"}),
+        ):
+            with pytest.raises(AuditIntegrityError):
+                decode_recorder_snapshot(codec.PrivateChunk(reference, first.canonical))
+        assert len(admitted) == 4 and len(produced) == 2
+
+        def replacement(text):
+            return produce(text)
+
+        monkeypatch.setattr(audit_buffer, "_decode_recorder_data", replacement)
+        assert decode_recorder_snapshot(first) == restored[0]
+        assert len(produced) == 3 and len(admitted) == 5
+    assert parent._recorder_data_bytes == 0 and not parent._recorder_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_refusal", ("wire_bound", "credential_traversal"))
+async def test_warmed_recorder_data_runs_current_real_admission(monkeypatch, current_refusal):
+    from elspeth.web.composer import bounded_json
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+
+    chunk = encode_recorder_snapshot(_snapshot(1))
+    with v4_preparation_memo_scope(_clock()) as parent:
+        expected = decode_recorder_snapshot(chunk)
+        retained = parent._recorder_data_bytes
+        if current_refusal == "wire_bound":
+            monkeypatch.setattr(codec, "CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES", chunk.reference.byte_length - 1)
+            error, message = AuditIntegrityError, "admission bound"
+        else:
+            monkeypatch.setattr(bounded_json, "JSON_MAX_TOTAL_UTF8_BYTES", 8)
+            error, message = CredentialMaterialRefused, ""
+        with pytest.raises(error, match=message):
+            decode_recorder_snapshot(chunk)
+        assert parent._recorder_data_bytes == retained
+        assert next(iter(parent._recorder_data.values())).data.snapshot is expected
+
+
+@pytest.mark.asyncio
+async def test_recorder_miss_preserves_model_then_credential_then_roundtrip_refusal(monkeypatch):
+    from elspeth.web.composer import bounded_json
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+
+    snapshot = _snapshot(1)
+    chunk = encode_recorder_snapshot(snapshot)
+    document = json.loads(chunk.canonical)
+    del document["snapshot"]["llm_calls"][0]["finish_reason"]
+    normalized = codec.encode_private_chunk(codec=audit_buffer.RECORDER_CODEC, canonical=canonical_json(document))
+    del document["snapshot"]["invocations"]
+    malformed = codec.encode_private_chunk(codec=audit_buffer.RECORDER_CODEC, canonical=canonical_json(document))
+    with v4_preparation_memo_scope(_clock()) as parent:
+        with monkeypatch.context() as patch:
+            patch.setattr(bounded_json, "JSON_MAX_TOTAL_UTF8_BYTES", 8)
+            with pytest.raises(AuditIntegrityError, match="owned codec"):
+                decode_recorder_snapshot(malformed)
+            with pytest.raises(CredentialMaterialRefused):
+                decode_recorder_snapshot(normalized)
+            with pytest.raises(CredentialMaterialRefused):
+                decode_recorder_snapshot(chunk)
+            assert not parent._recorder_data and parent._recorder_data_bytes == 0
+        with pytest.raises(AuditIntegrityError, match="omitted or normalized"):
+            decode_recorder_snapshot(normalized)
+        assert not parent._recorder_data
+        assert decode_recorder_snapshot(chunk) == snapshot
+        assert len(parent._recorder_data) == 1

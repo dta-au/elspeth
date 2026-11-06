@@ -1,5 +1,8 @@
+import ast
+import inspect
 import json
 from copy import deepcopy
+from dataclasses import fields, replace
 from datetime import UTC, datetime
 
 import pytest
@@ -269,3 +272,82 @@ def test_buffer_snapshot_refuses_a_drain_past_the_retained_prefix():
     owner = BufferingRecorder()
     with pytest.raises(AuditIntegrityError, match="drain cursor"):
         owner.snapshot_for_continuation(drained=RecorderDrainCursors(llm_calls=1))
+
+
+def test_retained_record_field_dispatch_is_complete_and_detects_a_real_omission():
+    records = (
+        audit_buffer.DecodedRecorderData,
+        audit_buffer.RecorderSnapshot,
+        audit_buffer.RecorderDrainCursors,
+        audit_buffer.RetainedVisibleLink,
+        audit_buffer.ComposerToolInvocation,
+        audit_buffer.ComposerLLMCall,
+        audit_buffer.ComposerPlannerAttempt,
+        audit_buffer.WithheldReply,
+        audit_buffer.VisibleToolEvent,
+        audit_buffer.PrivatePlannerCandidate,
+        audit_buffer.PrivateToolAuthoring,
+        audit_buffer.PrivateFailureFacts,
+        audit_buffer.PrivateReceivedDiagnostic,
+        audit_buffer.PrivateProviderContext,
+    )
+    expected = {record.__name__: {field.name for field in fields(record)} for record in records}
+    source = ast.parse(inspect.getsource(audit_buffer._recorder_data_children))
+
+    def actual_fields(tree):
+        actual = {}
+        for branch in ast.walk(tree):
+            if not isinstance(branch, ast.If) or not isinstance(branch.test, ast.Compare):
+                continue
+            (target,) = branch.test.comparators
+            assert isinstance(target, ast.Name)
+            actual[target.id] = {
+                item.attr
+                for statement in branch.body
+                for item in ast.walk(statement)
+                if isinstance(item, ast.Attribute) and isinstance(item.value, ast.Name) and item.value.id == "value"
+            }
+        return actual
+
+    assert actual_fields(source) == expected
+    damaged = deepcopy(source)
+    first_return = next(item for item in ast.walk(damaged) if isinstance(item, ast.Return) and isinstance(item.value, ast.Tuple))
+    first_return.value.elts.pop()
+    with pytest.raises(AssertionError):
+        assert actual_fields(damaged) == expected
+
+
+@pytest.mark.asyncio
+async def test_reused_recorder_has_detached_nested_data_and_independent_mutable_owners():
+    from types import MappingProxyType
+
+    from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope, v4_preparation_memo_scope
+    from tests.unit.web.composer.test_continuation_audit_buffer_blocks import _snapshot
+    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+
+    snapshot = _snapshot(1)
+    original_nested = {"steps": [{"content": "café𐀀", "score": 1}]}
+    call = replace(snapshot.llm_calls[0], reasoning_details=original_nested, thinking_blocks=[{"text": "thinking"}])
+    snapshot = replace(snapshot, llm_calls=(call,))
+    chunk = encode_recorder_snapshot(snapshot)
+    original_nested["steps"][0]["content"] = "caller mutation"
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        with borrow_v4_preparation_memo_scope():
+            first = decode_recorder_snapshot(chunk)
+        with borrow_v4_preparation_memo_scope():
+            second = decode_recorder_snapshot(chunk)
+        assert first is second and parent._recorder_data_bytes > 0
+        nested = first.llm_calls[0].reasoning_details
+        assert type(nested) is MappingProxyType and type(nested["steps"]) is tuple
+        assert nested["steps"][0]["content"] == "café𐀀"
+        with pytest.raises(TypeError):
+            nested["steps"][0]["content"] = "mutated"
+        with pytest.raises(TypeError):
+            first.llm_calls[0].thinking_blocks[0]["text"] = "mutated"
+        left, left_cursor = BufferingRecorder.for_continuation(first)
+        right, right_cursor = BufferingRecorder.for_continuation(second)
+        assert left._lock is not right._lock
+        left.record_withheld_reply("planner_prose_unadmitted", "only left")
+        assert right.withheld_replies == () and len(left.withheld_replies) == 1
+        assert right.snapshot_for_continuation(drained=right_cursor) == second
+        assert left.snapshot_for_continuation(drained=left_cursor) != first

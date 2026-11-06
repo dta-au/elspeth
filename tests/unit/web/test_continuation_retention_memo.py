@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import replace
 from itertools import permutations
 from sys import getsizeof
+from types import MappingProxyType
 from typing import cast
 
 import pytest
@@ -1713,3 +1715,308 @@ async def test_semantic_inflight_v4_late_result_cannot_repopulate_finished_paren
             assert future.result(timeout=5) == (key.reference,)
             assert not parent.active and parent.cached_entry_count == child.cached_entry_count == 0
         assert not child.active
+
+
+def _recorder_data_chunk(text="recorder data"):
+    from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
+    from elspeth.web.composer.withheld_replies import WithheldReply
+    from tests.unit.web.composer.test_continuation_audit_buffer_blocks import _snapshot
+
+    return encode_recorder_snapshot(replace(_snapshot(0), withheld_replies=(WithheldReply("planner_prose_unadmitted", text),)))
+
+
+def _produce_uncached_recorder_data(text):
+    from elspeth.web.composer.continuation_audit_buffer import _decode_recorder_data
+
+    with memo_module.without_retention_stage_memo():
+        return _decode_recorder_data(text)
+
+
+def _admit_uncached_recorder_data(key, data):
+    from elspeth.web.composer.continuation_audit_buffer import _admit_recorder_data
+
+    # Isolate accounting of the complete DATA family while still running the
+    # original credential/canonical admission, which has its own memo families.
+    with memo_module.without_retention_stage_memo():
+        _admit_recorder_data(key, data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ("full", "canonical", "block", "request", "credential", "evidence"))
+@pytest.mark.parametrize("recorder_first", (False, True))
+async def test_recorder_data_pressure_evicts_each_family_in_both_directions(monkeypatch, family, recorder_first):
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", bound)
+    chunk = _recorder_data_chunk("r" * 220_000)
+    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    evidence_key = _evidence_key('"' + "e" * 650_000 + '"')
+    calls = {"recorder": 0, "other": 0}
+
+    def recorder(text):
+        calls["recorder"] += 1
+        return _produce_uncached_recorder_data(text)
+
+    def full(other):
+        calls["other"] += 1
+        return other.canonical.encode()
+
+    def verify(_key):
+        calls["other"] += 1
+
+    def request(_key):
+        calls["other"] += 1
+        return RecorderRequestTextProof("r" * 325_000, ())
+
+    def evidence(_text):
+        calls["other"] += 1
+        return (evidence_key.reference,)
+
+    dependencies = RecorderRequestTextDependencies(full, full, hashlib.sha256, frozenset({"shape"}))
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+
+        def insert(is_recorder):
+            with borrow_v4_preparation_memo_scope() as child:
+                if is_recorder:
+                    child.recorder_data(key, recorder, _admit_uncached_recorder_data)
+                    assert parent._recorder_data_bytes > bound // 2
+                elif family == "full":
+                    child.canonical_text_proof(CanonicalTextEncodingKey("f" * 350_000, bound), full, hashlib.sha256)
+                elif family == "canonical":
+                    child.canonical_text_verification(CanonicalTextVerificationKey("c" * 650_000, bound), verify)
+                elif family == "block":
+                    child.recorder_block_hash(RecorderBlockHashKey("0" * 64, "b" * 650_000), verify)
+                elif family == "request":
+                    child.v4_recorder_request_text(RecorderRequestTextKey("q" * 325_000, bound), dependencies, request)
+                elif family == "credential":
+                    child.credential_string_category("s" * 650_000, verify)
+                else:
+                    child.evidence_references(evidence_key, evidence)
+                assert not child._recorder_data
+            assert parent.cached_entry_count == 1
+            assert bool(parent._v4_recorder_requests) == bool(parent._v4_recorder_request_reverse)
+
+        insert(recorder_first)
+        insert(not recorder_first)
+        insert(not recorder_first)
+        assert calls == {"recorder": 1, "other": 1}
+        insert(recorder_first)
+        assert calls["recorder" if recorder_first else "other"] == 2
+    assert parent.cached_entry_count == parent._recorder_data_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_recorder_data_counter_omission_is_detected_by_actual_entry_weights(monkeypatch):
+    bound = CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", bound)
+    chunk = _recorder_data_chunk("r" * 220_000)
+    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+
+    def verify(_text):
+        return None
+
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        parent.recorder_data(key, _produce_uncached_recorder_data, _admit_uncached_recorder_data)
+        actual_charge = parent._recorder_data_bytes
+        assert actual_charge > bound // 2
+        monkeypatch.setattr(parent, "_recorder_data_bytes", 0)
+        parent.canonical_text_verification(CanonicalTextVerificationKey("c" * 650_000, bound), verify)
+        with pytest.raises(AssertionError):
+            assert (
+                sum(entry.retained_bytes for entry in parent._recorder_data.values()) + sum(parent._canonical_verifications.values())
+                <= bound
+            )
+
+
+@pytest.mark.asyncio
+async def test_recorder_data_lru_and_singleton_reset_keep_fixed_charges(monkeypatch):
+    chunks = [_recorder_data_chunk(letter * 100) for letter in ("a", "b", "c")]
+    keys = [PrivateChunkVerificationKey(chunk.reference, chunk.canonical) for chunk in chunks]
+    weights = [
+        memo_module.recorder_data_retained_bytes(
+            key, _produce_uncached_recorder_data(key.canonical), _produce_uncached_recorder_data, limit=32 * 1_048_576
+        )
+        for key in keys
+    ]
+    assert all(type(weight) is int for weight in weights)
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", 2 * max(weights))
+
+    def encode(key):
+        return key.canonical.encode()
+
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for key in (keys[0], keys[1], keys[0], keys[2]):
+            parent.recorder_data(key, _produce_uncached_recorder_data, _admit_uncached_recorder_data)
+        assert [key for _producer, key in parent._recorder_data] == [keys[0], keys[2]]
+        fixed = parent._recorder_data_bytes
+        parent.recorder_data(keys[2], _produce_uncached_recorder_data, _admit_uncached_recorder_data)
+        assert parent._recorder_data_bytes == fixed == sum(entry.retained_bytes for entry in parent._recorder_data.values())
+        # A real entry transplanted into the ordinary carrier opposes its
+        # legacy singleton reset; the public ordinary path never populates it.
+        ordinary = RetentionStageMemo()
+        ordinary._recorder_data.update(parent._recorder_data)
+        ordinary._recorder_data_bytes = fixed
+        ordinary.canonical_text_encoding(CanonicalTextEncodingKey("reset", 100), encode)
+        assert not ordinary._recorder_data and ordinary._recorder_data_bytes == 0
+        assert parent._recorder_data_bytes == fixed
+        ordinary.close()
+
+
+def test_recorder_weight_counts_unicode_proxy_backing_metadata_and_stops_before_expansion(monkeypatch):
+    from elspeth.web.composer import continuation_audit_buffer as audit_buffer
+    from tests.unit.web.composer.test_continuation_audit_buffer_blocks import _snapshot
+
+    snapshot = _snapshot(1)
+    call = replace(snapshot.llm_calls[0], reasoning_details={"large": "𐀀" * 2_000, "nested": [{"value": "café"}]})
+    chunk = audit_buffer.encode_recorder_snapshot(replace(snapshot, llm_calls=(call,)))
+    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    data = audit_buffer._decode_recorder_data(chunk.canonical)
+    charge = memo_module.recorder_data_retained_bytes(key, data, audit_buffer._decode_recorder_data, limit=32 * 1_048_576)
+    nested = data.snapshot.llm_calls[0].reasoning_details
+    assert type(nested) is MappingProxyType
+    minimum = (
+        getsizeof(key.reference)
+        + getsizeof(key.reference.__dict__)
+        + getsizeof(key.reference.__pydantic_fields_set__)
+        + getsizeof(key.canonical)
+        + getsizeof(data.canonical)
+        + getsizeof(nested)
+        + getsizeof(dict(nested))
+        + getsizeof(nested["large"])
+        + getsizeof(data.snapshot.llm_calls[0].private_request.canonical)
+    )
+    assert charge is not None and charge > minimum
+    visited = []
+    original = audit_buffer._recorder_data_children
+
+    def children(value):
+        visited.append(value)
+        return original(value)
+
+    monkeypatch.setattr(audit_buffer, "_recorder_data_children", children)
+    assert memo_module.recorder_data_retained_bytes(key, data, audit_buffer._decode_recorder_data, limit=1_024) == 1_025
+    assert not visited  # Source storage crosses cutoff before expanding DTOs.
+    foreign = audit_buffer.DecodedRecorderData(
+        replace(data.snapshot, llm_calls=(replace(call, reasoning_details=object()),)), data.canonical
+    )
+    assert memo_module.recorder_data_retained_bytes(key, foreign, audit_buffer._decode_recorder_data, limit=32 * 1_048_576) is None
+
+
+def test_recorder_proxy_and_index_allowances_dominate_actual_container_allocations():
+    # Small, resize-boundary and larger containers oppose the fixed arithmetic
+    # allowance using this runtime's actual allocations, not a copy of its sum.
+    for count in (0, 1, 5, 6, 21, 22, 85, 86, 341, 342, 4_096):
+        mapping = {f"key-{index}": None for index in range(count)}
+        assert getsizeof({}) + count * getsizeof({None: None}) >= getsizeof(mapping)
+        if count:
+            index = OrderedDict(mapping)
+            assert count * getsizeof(OrderedDict(((None, None),))) >= getsizeof(index)
+
+
+@pytest.mark.asyncio
+async def test_recorder_data_admission_failure_ordinary_and_closed_paths_do_not_retain():
+    chunk = _recorder_data_chunk()
+    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    produced, admitted = [], []
+    marker = RuntimeError("actual callback failure")
+
+    def produce(text):
+        data = _produce_uncached_recorder_data(text)
+        produced.append(data)
+        return data
+
+    def admit(candidate, data):
+        _admit_uncached_recorder_data(candidate, data)
+        admitted.append(data)
+
+    def refuse(candidate, data):
+        admit(candidate, data)
+        raise marker
+
+    ordinary = RetentionStageMemo()
+    for _ in range(2):
+        ordinary.recorder_data(key, produce, admit)
+    assert ordinary.cached_entry_count == 0 and len(produced) == len(admitted) == 2
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        with pytest.raises(RuntimeError) as caught:
+            parent.recorder_data(key, produce, refuse)
+        assert caught.value is marker and not parent._recorder_data
+        with borrow_v4_preparation_memo_scope() as child:
+            retained = child.recorder_data(key, produce, admit)
+        assert not child.active and parent.active
+        assert parent.recorder_data(key, produce, admit) is retained
+        with pytest.raises(RuntimeError) as caught:
+            parent.recorder_data(key, produce, refuse)
+        assert caught.value is marker and parent.cached_entry_count == 1
+        child.recorder_data(key, produce, admit)
+        assert not child._recorder_data and parent.cached_entry_count == 1
+    assert parent.cached_entry_count == parent._recorder_data_bytes == 0
+    parent.recorder_data(key, produce, admit)
+    assert not parent._recorder_data and parent._recorder_data_bytes == 0
+    assert len(produced) == 6 and len(admitted) == 8
+
+
+@pytest.mark.asyncio
+async def test_recorder_data_concurrent_misses_return_each_admitted_value_but_publish_one():
+    chunk = _recorder_data_chunk()
+    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    rendezvous = threading.Barrier(2)
+    admitted = []
+
+    def produce(text):
+        data = _produce_uncached_recorder_data(text)
+        rendezvous.wait(timeout=5)
+        return data
+
+    def admit(candidate, data):
+        _admit_uncached_recorder_data(candidate, data)
+        admitted.append(data)
+
+    with v4_preparation_memo_scope(_advisor_clock()) as parent, ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(parent.recorder_data, key, produce, admit)
+        second = executor.submit(parent.recorder_data, key, produce, admit)
+        left, right = first.result(timeout=5), second.result(timeout=5)
+        assert left == right and left is not right
+        assert {id(value) for value in admitted} == {id(left), id(right)}
+        assert len(parent._recorder_data) == 1
+        assert parent._recorder_data_bytes == next(iter(parent._recorder_data.values())).retained_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pause_at", ("producer", "admission"))
+async def test_recorder_data_parent_close_during_borrowed_work_cannot_repopulate(pause_at):
+    chunk = _recorder_data_chunk()
+    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    entered, release = threading.Event(), threading.Event()
+    admitted = []
+
+    def pause():
+        entered.set()
+        assert release.wait(5)
+
+    def produce(text):
+        data = _produce_uncached_recorder_data(text)
+        if pause_at == "producer":
+            pause()
+        return data
+
+    def admit(candidate, data):
+        _admit_uncached_recorder_data(candidate, data)
+        if pause_at == "admission":
+            pause()
+        admitted.append(data)
+
+    with (
+        v4_preparation_memo_scope(_advisor_clock()) as parent,
+        borrow_v4_preparation_memo_scope() as child,
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        future = executor.submit(child.recorder_data, key, produce, admit)
+        try:
+            assert entered.wait(5)
+            parent.close()
+        finally:
+            release.set()
+        result = future.result(timeout=5)
+        assert admitted == [result]
+        assert parent.cached_entry_count == parent._recorder_data_bytes == 0
+        assert not parent._recorder_data and not child._recorder_data

@@ -18,10 +18,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import Context, ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from hashlib import sha256 as _TRUSTED_SHA256
+from itertools import chain
 from sys import getsizeof
 from threading import Lock
-from types import BuiltinFunctionType, FunctionType
+from types import BuiltinFunctionType, FunctionType, MappingProxyType
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from elspeth.contracts.bounded_serialization import utf8_size
@@ -40,6 +42,7 @@ from elspeth.web.composer.continuation_limits import (
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation import ContinuationFrameStack, PrivateChunkRef
+    from elspeth.web.composer.continuation_audit_buffer import DecodedRecorderData
     from elspeth.web.composer.continuation_clock import ContinuationActionClock
 
 
@@ -161,6 +164,108 @@ class _CredentialStringEntry:
 class _EvidenceReferencesEntry:
     references: tuple[PrivateChunkRef, ...]
     retained_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RecorderDataEntry:
+    data: DecodedRecorderData
+    retained_bytes: int
+
+
+def recorder_data_retained_bytes(
+    key: PrivateChunkVerificationKey,
+    data: DecodedRecorderData,
+    producer: Callable[[str], DecodedRecorderData],
+    *,
+    limit: int,
+) -> int | None:
+    """Conservative expanded residence; limit+1 means oversize, None unknown.
+
+    Charge shared descendants once per entry, never across families/entries.
+    Iterator frames avoid eagerly copying a large container before the cutoff.
+    Class/function globals are shared implementation metadata, not entry DATA.
+    This is a retained-weight budget, not a process RSS or transient-work bound.
+    """
+    from pydantic_core import TzInfo
+
+    from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
+    from elspeth.contracts.composer_planner_audit import (
+        ComposerPlannerAttemptLedTo,
+        ComposerPlannerAttemptOutcome,
+        ComposerPlannerAttemptPhase,
+        ComposerPlannerCode,
+        ComposerPlannerInformationClass,
+    )
+    from elspeth.web.composer.continuation import PrivateChunkRef
+    from elspeth.web.composer.continuation_audit_buffer import _recorder_data_children
+
+    enum_types = (
+        ComposerToolStatus,
+        ToolArgumentErrorCategory,
+        ComposerLLMCallStatus,
+        ToolContractDialect,
+        ComposerPlannerAttemptLedTo,
+        ComposerPlannerAttemptOutcome,
+        ComposerPlannerAttemptPhase,
+        ComposerPlannerCode,
+        ComposerPlannerInformationClass,
+    )
+    # A whole one-entry index allocation per entry conservatively includes
+    # OrderedDict nodes/table spare capacity. A fresh proxy backing dictionary
+    # gets an empty table plus a general-key one-entry allocation per real key.
+    size = getsizeof(OrderedDict(((None, None),))) + getsizeof(producer)
+    dictionary_base, dictionary_entry = getsizeof({}), getsizeof({None: None})
+    entry = _RecorderDataEntry(data, limit)
+    frames: list[Iterator[object]] = [iter(((producer, key), entry))]
+    seen = {id(producer)}
+    while frames:
+        if size > limit:
+            return limit + 1
+        value = next(frames[-1], _MISSING)
+        if value is _MISSING:
+            frames.pop()
+            continue
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        size += getsizeof(value)
+        if size > limit:
+            return limit + 1
+        if value is None or type(value) in (str, int, float, bool):
+            continue
+        if type(value) is tuple:
+            frames.append(iter(value))
+        elif type(value) is MappingProxyType:
+            size += dictionary_base + len(value) * dictionary_entry
+            if size > limit:
+                return limit + 1
+            frames.append(chain(value.keys(), value.values()))
+        elif type(value) is PrivateChunkVerificationKey:
+            frames.append(iter((value.reference, value.canonical)))
+        elif type(value) is _RecorderDataEntry:
+            frames.append(iter((value.data, value.retained_bytes)))
+        elif type(value) is PrivateChunkRef:
+            if value.__pydantic_extra__ is not None or value.__pydantic_private__ is not None:
+                return None
+            size += getsizeof(value.__dict__) + getsizeof(value.__pydantic_fields_set__)
+            frames.append(chain(value.__dict__.keys(), value.__dict__.values(), value.__pydantic_fields_set__))
+        elif type(value) is datetime:
+            frames.append(iter((value.tzinfo,)))
+        elif type(value) is timezone or type(value) is TzInfo:
+            # Native TzInfo stores its offset inline; timezone may retain a
+            # timedelta/name. Charging these also is conservative for both.
+            size += getsizeof(value.utcoffset(None)) + getsizeof(value.tzname(None))
+        elif isinstance(value, enum_types):
+            # Enum member dictionaries/class metadata are shared static data.
+            frames.append(iter((value.value,)))
+        else:
+            children = _recorder_data_children(value)
+            if children is None:
+                return None
+            frames.append(iter(children))
+    return min(size, limit + 1)
 
 
 type CredentialInputKind = Literal["null", "bool", "int", "float", "string", "mapping", "mapping_proxy", "list", "tuple", "end"]
@@ -327,6 +432,10 @@ class RetentionStageMemo:
             tuple[Callable[[str], tuple[PrivateChunkRef, ...]], PrivateChunkVerificationKey], _EvidenceReferencesEntry
         ] = OrderedDict()
         self._evidence_reference_bytes = 0
+        self._recorder_data: OrderedDict[tuple[Callable[[str], DecodedRecorderData], PrivateChunkVerificationKey], _RecorderDataEntry] = (
+            OrderedDict()
+        )
+        self._recorder_data_bytes = 0
         self._recorder_request: (
             tuple[Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None], RecorderRequestTextKey, RecorderRequestTextProof]
             | None
@@ -359,6 +468,7 @@ class RetentionStageMemo:
                 + len(self._v4_recorder_requests)
                 + len(self._credential_strings)
                 + len(self._evidence_references)
+                + len(self._recorder_data)
                 + int(self._recorder_request is not None)
             )
 
@@ -380,6 +490,8 @@ class RetentionStageMemo:
             self._credential_string_bytes = 0
             self._evidence_references.clear()
             self._evidence_reference_bytes = 0
+            self._recorder_data.clear()
+            self._recorder_data_bytes = 0
             self._recorder_request = None
             self._credentials.clear()
             self._states.clear()
@@ -447,6 +559,8 @@ class RetentionStageMemo:
                 self._credential_string_bytes = 0
                 self._evidence_references.clear()
                 self._evidence_reference_bytes = 0
+                self._recorder_data.clear()
+                self._recorder_data_bytes = 0
                 self._canonical_text = (producer, key, value)
         return value
 
@@ -522,6 +636,7 @@ class RetentionStageMemo:
                 + self._v4_recorder_request_bytes
                 + self._credential_string_bytes
                 + self._evidence_reference_bytes
+                + self._recorder_data_bytes
                 + size
                 > self._shared_text_budget_bytes
             ):
@@ -536,9 +651,12 @@ class RetentionStageMemo:
                 elif self._credential_strings:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes
-                else:
+                elif self._evidence_references:
                     _, evicted_references = self._evidence_references.popitem(last=False)
                     self._evidence_reference_bytes -= evicted_references.retained_bytes
+                else:
+                    _, evicted_data = self._recorder_data.popitem(last=False)
+                    self._recorder_data_bytes -= evicted_data.retained_bytes
             self._canonical_proofs[cache_key] = proof
             self._canonical_proof_bytes += size
         return proof
@@ -593,6 +711,7 @@ class RetentionStageMemo:
                 + self._v4_recorder_request_bytes
                 + self._credential_string_bytes
                 + self._evidence_reference_bytes
+                + self._recorder_data_bytes
                 + size
                 > self._shared_text_budget_bytes
             ):
@@ -610,9 +729,12 @@ class RetentionStageMemo:
                 elif self._credential_strings:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes
-                else:
+                elif self._evidence_references:
                     _, evicted_references = self._evidence_references.popitem(last=False)
                     self._evidence_reference_bytes -= evicted_references.retained_bytes
+                else:
+                    _, evicted_data = self._recorder_data.popitem(last=False)
+                    self._recorder_data_bytes -= evicted_data.retained_bytes
             self._canonical_verifications[cache_key] = size
             self._canonical_verification_bytes += size
 
@@ -647,6 +769,7 @@ class RetentionStageMemo:
                 + self._v4_recorder_request_bytes
                 + self._credential_string_bytes
                 + self._evidence_reference_bytes
+                + self._recorder_data_bytes
                 + size
                 > self._shared_text_budget_bytes
             ):
@@ -664,9 +787,12 @@ class RetentionStageMemo:
                 elif self._credential_strings:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes
-                else:
+                elif self._evidence_references:
                     _, evicted_references = self._evidence_references.popitem(last=False)
                     self._evidence_reference_bytes -= evicted_references.retained_bytes
+                else:
+                    _, evicted_data = self._recorder_data.popitem(last=False)
+                    self._recorder_data_bytes -= evicted_data.retained_bytes
             self._recorder_block_hashes[cache_key] = size
             self._recorder_block_hash_bytes += size
 
@@ -750,6 +876,7 @@ class RetentionStageMemo:
                 + self._v4_recorder_request_bytes
                 + self._credential_string_bytes
                 + self._evidence_reference_bytes
+                + self._recorder_data_bytes
                 + entry.retained_bytes
                 > self._shared_text_budget_bytes
             ):
@@ -767,9 +894,12 @@ class RetentionStageMemo:
                 elif self._credential_strings:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes
-                else:
+                elif self._evidence_references:
                     _, evicted_references = self._evidence_references.popitem(last=False)
                     self._evidence_reference_bytes -= evicted_references.retained_bytes
+                else:
+                    _, evicted_data = self._recorder_data.popitem(last=False)
+                    self._recorder_data_bytes -= evicted_data.retained_bytes
             self._v4_recorder_requests[cache_key] = entry
             self._v4_recorder_request_reverse[reverse_key] = cache_key
             self._v4_recorder_request_bytes += entry.retained_bytes
@@ -905,6 +1035,7 @@ class RetentionStageMemo:
                 + self._v4_recorder_request_bytes
                 + self._credential_string_bytes
                 + self._evidence_reference_bytes
+                + self._recorder_data_bytes
                 + size
                 > self._shared_text_budget_bytes
             ):
@@ -922,9 +1053,12 @@ class RetentionStageMemo:
                     self._recorder_block_hash_bytes -= evicted_size
                 elif self._v4_recorder_requests:
                     self._discard_oldest_recorder_request()
-                else:
+                elif self._evidence_references:
                     _, evicted_references = self._evidence_references.popitem(last=False)
                     self._evidence_reference_bytes -= evicted_references.retained_bytes
+                else:
+                    _, evicted_data = self._recorder_data.popitem(last=False)
+                    self._recorder_data_bytes -= evicted_data.retained_bytes
             self._credential_strings[cache_key] = entry
             self._credential_string_bytes += size
         return category
@@ -984,6 +1118,7 @@ class RetentionStageMemo:
                 + self._v4_recorder_request_bytes
                 + self._credential_string_bytes
                 + self._evidence_reference_bytes
+                + self._recorder_data_bytes
                 + size
                 > self._shared_text_budget_bytes
             ):
@@ -1001,12 +1136,94 @@ class RetentionStageMemo:
                     self._recorder_block_hash_bytes -= evicted_size
                 elif self._v4_recorder_requests:
                     self._discard_oldest_recorder_request()
-                else:
+                elif self._credential_strings:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes
+                else:
+                    _, evicted_data = self._recorder_data.popitem(last=False)
+                    self._recorder_data_bytes -= evicted_data.retained_bytes
             self._evidence_references[cache_key] = entry
             self._evidence_reference_bytes += size
         return references
+
+    def recorder_data(
+        self,
+        key: PrivateChunkVerificationKey,
+        producer: Callable[[str], DecodedRecorderData],
+        admit: Callable[[PrivateChunkVerificationKey, DecodedRecorderData], None],
+    ) -> DecodedRecorderData:
+        """Reuse complete frozen recorder DATA; admit this invocation every time."""
+        from elspeth.web.composer.continuation import PrivateChunkRef
+        from elspeth.web.composer.continuation_audit_buffer import DecodedRecorderData, RecorderSnapshot
+
+        if type(key) is not PrivateChunkVerificationKey or type(key.reference) is not PrivateChunkRef or type(key.canonical) is not str:
+            raise TypeError("Recorder DATA memo requires its exact immutable input")
+        _require_function_producer(producer)
+        _require_function_producer(admit)
+        with self._lock:
+            parent = self._text_parent if not self._closed else None
+            retaining = not self._closed and self._v4_preparation_owner is not None
+        if parent is not None:
+            return parent.recorder_data(key, producer, admit)
+        cache_key = (producer, key)
+        with self._lock:
+            hit = self._recorder_data.get(cache_key) if retaining and not self._closed else None
+            if hit is not None:
+                self._recorder_data.move_to_end(cache_key)
+        if hit is not None:
+            admit(key, hit.data)
+            return hit.data
+        data = producer(key.canonical)
+        if type(data) is not DecodedRecorderData or type(data.snapshot) is not RecorderSnapshot or type(data.canonical) is not str:
+            raise TypeError("Recorder DATA memo requires its owned immutable result")
+        admit(key, data)
+        if not retaining:
+            return data
+        size = recorder_data_retained_bytes(key, data, producer, limit=self._shared_text_budget_bytes)
+        if size is None or size > self._shared_text_budget_bytes:
+            return data
+        entry = _RecorderDataEntry(data, size)
+        with self._lock:
+            if self._closed:
+                return data
+            if cache_key in self._recorder_data:
+                self._recorder_data.move_to_end(cache_key)
+                return data  # This invocation returns the actual DATA it admitted.
+            self._canonical_text = None
+            while (
+                self._canonical_proof_bytes
+                + self._canonical_verification_bytes
+                + self._recorder_block_hash_bytes
+                + self._v4_recorder_request_bytes
+                + self._credential_string_bytes
+                + self._evidence_reference_bytes
+                + self._recorder_data_bytes
+                + size
+                > self._shared_text_budget_bytes
+            ):
+                if self._recorder_data:
+                    _, evicted_data = self._recorder_data.popitem(last=False)
+                    self._recorder_data_bytes -= evicted_data.retained_bytes
+                elif self._canonical_verifications:
+                    _, evicted_size = self._canonical_verifications.popitem(last=False)
+                    self._canonical_verification_bytes -= evicted_size
+                elif self._canonical_proofs:
+                    _, evicted_proof = self._canonical_proofs.popitem(last=False)
+                    self._canonical_proof_bytes -= evicted_proof.retained_bytes
+                elif self._recorder_block_hashes:
+                    _, evicted_size = self._recorder_block_hashes.popitem(last=False)
+                    self._recorder_block_hash_bytes -= evicted_size
+                elif self._v4_recorder_requests:
+                    self._discard_oldest_recorder_request()
+                elif self._credential_strings:
+                    _, evicted_category = self._credential_strings.popitem(last=False)
+                    self._credential_string_bytes -= evicted_category.retained_bytes
+                else:
+                    _, evicted_references = self._evidence_references.popitem(last=False)
+                    self._evidence_reference_bytes -= evicted_references.retained_bytes
+            self._recorder_data[cache_key] = entry
+            self._recorder_data_bytes += size
+        return data
 
     @property
     def caches_credential_inputs(self) -> bool:

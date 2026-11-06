@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass as stdlib_dataclass
 from typing import Final, Literal
 
 from pydantic import ConfigDict, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass
 
 from elspeth.contracts._canonical_json_native import canonical_json_native_strings
-from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring
+from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateFailureFacts, PrivateReceivedDiagnostic, PrivateToolAuthoring
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
@@ -24,6 +26,7 @@ from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUME
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply
 from elspeth.web.continuation_retention_memo import (
+    PrivateChunkVerificationKey,
     RecorderBlockHashKey,
     RecorderRequestTextDependencies,
     RecorderRequestTextKey,
@@ -79,6 +82,180 @@ class RecorderSnapshot:
         authoring_ids = tuple(item.tool_call_id for item in self.private_authorings)
         if len(set(authoring_ids)) != len(authoring_ids):
             raise AuditIntegrityError("buffer repeats a private authoring identity")
+
+
+@stdlib_dataclass(frozen=True, slots=True)
+class DecodedRecorderData:
+    """Actual reconstructed DATA and roundtrip text, without current admission."""
+
+    snapshot: RecorderSnapshot
+    canonical: str
+
+
+def _recorder_data_children(value: object) -> tuple[object, ...] | None:
+    """Closed owned record fields for retained residence, never serialization.
+
+    Only the JSON decoder's detached frozen values enter the production memo.
+    Unknown future record types decline retention instead of changing admission.
+    The field-completeness control checks these actual direct attribute reads.
+    """
+    if type(value) is DecodedRecorderData:
+        return (value.snapshot, value.canonical)
+    if type(value) is RecorderSnapshot:
+        return (
+            value.invocations,
+            value.llm_calls,
+            value.planner_attempts,
+            value.withheld_replies,
+            value.visible_tool_events,
+            value.private_candidates,
+            value.private_authorings,
+            value.drained,
+        )
+    if type(value) is RecorderDrainCursors:
+        return (
+            value.invocations,
+            value.llm_calls,
+            value.planner_attempts,
+            value.withheld_replies,
+            value.visible_tool_events,
+            value.private_candidates,
+            value.private_authorings,
+        )
+    if type(value) is RetainedVisibleLink:
+        return (value.invocation_index, value.event)
+    if type(value) is ComposerToolInvocation:
+        return (
+            value.tool_call_id,
+            value.tool_name,
+            value.arguments_canonical,
+            value.arguments_hash,
+            value.result_canonical,
+            value.result_hash,
+            value.status,
+            value.error_class,
+            value.error_message,
+            value.version_before,
+            value.version_after,
+            value.started_at,
+            value.finished_at,
+            value.latency_ms,
+            value.actor,
+            value.cache_hit,
+            value.authority_arguments_canonical,
+            value.authority_arguments_hash,
+            value.error_category,
+            value.strict_sent,
+            value.wire_conformant,
+            value.private_authoring,
+            value.private_failure,
+        )
+    if type(value) is ComposerLLMCall:
+        return (
+            value.model_requested,
+            value.model_returned,
+            value.status,
+            value.prompt_tokens,
+            value.completion_tokens,
+            value.total_tokens,
+            value.latency_ms,
+            value.provider_request_id,
+            value.messages_hash,
+            value.tools_spec_hash,
+            value.declared_tool_names,
+            value.started_at,
+            value.finished_at,
+            value.error_class,
+            value.error_message,
+            value.temperature,
+            value.seed,
+            value.finish_reason,
+            value.cached_prompt_tokens,
+            value.cache_creation_input_tokens,
+            value.cache_read_input_tokens,
+            value.reasoning_tokens,
+            value.reasoning_content,
+            value.reasoning_details,
+            value.thinking_blocks,
+            value.provider_cost,
+            value.pricing_model,
+            value.provider_cost_source,
+            value.cost_response_accountable,
+            value.max_completion_tokens_requested,
+            value.planner_policy_hash,
+            value.planner_call_ordinal,
+            value.call_id,
+            value.provider_served,
+            value.tool_contract_dialect,
+            value.strict_tool_count,
+            value.private_failure,
+            value.private_diagnostics,
+            value.private_request,
+        )
+    if type(value) is ComposerPlannerAttempt:
+        return (
+            value.ordinal,
+            value.planner_call_ordinal,
+            value.phase,
+            value.outcome,
+            value.planner_code,
+            value.selected_tools,
+            value.requested_information,
+            value.new_information,
+            value.rejection_codes,
+            value.candidate_shape_hash,
+            value.repeated_fingerprint,
+            value.led_to,
+        )
+    if type(value) is WithheldReply:
+        return (value.origin, value.content)
+    if type(value) is VisibleToolEvent:
+        return (
+            value.session_id,
+            value.operation_id,
+            value.operation_epoch,
+            value.producer_declared_request_id,
+            value.tool_call_id,
+            value.tool_name,
+            value.display_arguments_hash,
+            value.display_result_hash,
+            value.payload_json,
+            value.payload_hash,
+            value.parent_assistant_id,
+        )
+    if type(value) is PrivatePlannerCandidate:
+        return (
+            value.evidence_id,
+            value.tool_call_id,
+            value.tool_name,
+            value.arguments_canonical,
+            value.authority_arguments_canonical,
+            value.raw_arguments,
+            value.status,
+            value.result_canonical,
+        )
+    if type(value) is PrivateToolAuthoring:
+        return (
+            value.tool_call_id,
+            value.tool_name,
+            value.arguments_canonical,
+            value.authority_arguments_canonical,
+            value.raw_arguments,
+        )
+    if type(value) is PrivateFailureFacts:
+        return (value.canonical,)
+    if type(value) is PrivateReceivedDiagnostic:
+        return (
+            value.evidence_id,
+            value.tool_call_id,
+            value.tool_name,
+            value.arguments_canonical,
+            value.result_canonical,
+            value.raw_arguments,
+        )
+    if type(value) is PrivateProviderContext:
+        return (value.disposition, value.canonical, value.reasons)
+    return None
 
 
 _BUFFER_CODEC = TypeAdapter(RecorderSnapshot)
@@ -287,10 +464,26 @@ def decode_recorder_snapshot(chunk: PrivateChunk) -> RecorderSnapshot:
     if type(chunk) is not PrivateChunk or chunk.reference.codec != RECORDER_CODEC:
         raise AuditIntegrityError("audit buffer has the wrong codec")
     verify_private_chunk(chunk.reference, chunk.canonical)
-    snapshot = _decode_recorder_document(chunk.canonical)
-    if encode_recorder_snapshot(snapshot).canonical != chunk.canonical:
+    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    memo = current_retention_stage_memo()
+    if memo is not None:
+        data = memo.recorder_data(key, _decode_recorder_data, _admit_recorder_data)
+    else:
+        data = _decode_recorder_data(chunk.canonical)
+        _admit_recorder_data(key, data)
+    return data.snapshot
+
+
+def _decode_recorder_data(canonical: str) -> DecodedRecorderData:
+    snapshot = _decode_recorder_document(canonical)
+    return DecodedRecorderData(snapshot, recorder_snapshot_json(snapshot))
+
+
+def _admit_recorder_data(key: PrivateChunkVerificationKey, data: DecodedRecorderData) -> None:
+    # Current size/canonical/credential admission still runs on every hit.
+    # Its refusal precedes roundtrip mismatch, just as in the cold decoder.
+    if encode_private_chunk(codec=RECORDER_CODEC, canonical=data.canonical).canonical != key.canonical:
         raise AuditIntegrityError("audit buffer omitted or normalized a retained field")
-    return snapshot
 
 
 def _decode_recorder_document(canonical: str) -> RecorderSnapshot:
