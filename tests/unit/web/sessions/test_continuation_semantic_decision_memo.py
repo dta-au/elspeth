@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer import continuation_semantic_advisor_phase as phase
 from elspeth.web.continuation_retention_memo import (
     CanonicalTextEncodingKey,
@@ -30,6 +31,7 @@ from tests.helpers.continuation_app import (
     semantic_stop_response,
     submit_and_settle,
 )
+from tests.unit.web.sessions.test_continuation_semantic_advisor_live import _observe_original_driver
 
 
 @pytest.mark.asyncio
@@ -149,9 +151,24 @@ async def test_final_consume_original_sql_clock_child_and_joined_closure(tmp_pat
     monkeypatch.setattr(phase, "install_current_semantic_decision_on_connection", install)
     monkeypatch.setattr(phase, "consume_semantic_advisor_end_stop_on_connection", stop)
     monkeypatch.setattr(phase, "_transaction", transaction)
+    observations = _observe_original_driver(monkeypatch, operation)
     async with continuation_app(tmp_path, monkeypatch) as harness:
         result = await submit_and_settle(
             harness, message_body("Inspect the current pipeline and explain what it contains.", operation_id=operation), rounds=720
+        )
+    if not parents or not clocks:
+        print(
+            "Final decision target not reached: "
+            + canonical_json(
+                {
+                    "status": result.status,
+                    "sdk_roles": sdk.roles,
+                    "parents_seen": len(parents),
+                    "clocks_seen": len(clocks),
+                    "driver_observation_count": len(observations),
+                    "driver_observations": observations[-32:],
+                }
+            )
         )
     assert len(parents) == len(children) == len(clocks) == 1
     assert all(not memo.active and memo.cached_entry_count == 0 for memo in (*parents, *children))

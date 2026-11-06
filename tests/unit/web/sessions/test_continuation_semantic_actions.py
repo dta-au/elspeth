@@ -16,7 +16,7 @@ from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.continuation import ComposeFrame, EndFrame
-from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot
 from elspeth.web.composer.continuation_end_values import continuation_candidate_id, decode_end_candidate
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_progress import ContinuationProtocolError
@@ -189,6 +189,86 @@ async def test_current_paid_install_matches_original_writes_and_reproves_changed
         with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
             installed = _prove_paid_install_equivalence(conn, case["running"], selected, effect_key, monkeypatch)
             assert installed.cursor == selected.cursor + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ("read", "review"))
+async def test_paid_source_reuses_actual_recorder_and_preserves_standalone_extension(operation_store, tmp_path, monkeypatch, kind):
+    async with _paid_install_case(operation_store, tmp_path, monkeypatch, kind) as (case, selected, effect_key):
+        with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
+            original_decode = semantic_sql.decode_recorder_snapshot
+            original_extend = semantic_sql._extend_admitted_evidence
+            decoder_inputs, decoded, extensions = [], [], []
+
+            def decode(chunk):
+                decoder_inputs.append(chunk)
+                snapshot = original_decode(chunk)
+                decoded.append((chunk, snapshot))
+                return snapshot
+
+            def extend(data, original, admitted, call, snapshot):
+                result = original_extend(data, original, admitted, call, snapshot)
+                extensions.append((data, original, admitted, call, snapshot, result))
+                return result
+
+            monkeypatch.setattr(semantic_sql, "decode_recorder_snapshot", decode)
+            monkeypatch.setattr(semantic_sql, "_extend_admitted_evidence", extend)
+            before = _rows_on_connection(conn)
+            running = case["running"]
+            root = decode_continuation_snapshot(selected.payload_json)
+            result, data, _paid_root = semantic_sql._paid_result_data(
+                conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key
+            )
+            assert len(extensions) == 1
+            observed_data, original, admitted, call, snapshot, expected = extensions[0]
+            assert observed_data is data and call is result.audit_call and snapshot.llm_calls[-1] is call
+            matching = [(chunk, value) for chunk, value in decoded if chunk == result.recorder]
+            assert len(matching) == 1
+            assert matching[0][0] is result.recorder and matching[0][1] is snapshot
+            assert _rows_on_connection(conn) == before
+
+            # The standalone wrapper still decodes the exact supplied bytes,
+            # and normalizes an equal-valued call to its decoder's actual atom.
+            equal_call = replace(call)
+            assert equal_call == call and equal_call is not call
+            standalone = semantic_sql._extended_evidence_data(
+                conn, str(running.claim.session_id), running.claim.operation_id, data, equal_call, result.recorder
+            )
+            assert standalone == expected
+            matching = [(chunk, value) for chunk, value in decoded if chunk == result.recorder]
+            assert len(matching) == 2 and all(chunk is result.recorder for chunk, _value in matching)
+            assert matching[-1][1] is extensions[-1][4] and matching[-1][1] is not snapshot
+
+            wrong_call = replace(call, call_id="other-original-paid-call")
+            with pytest.raises(AuditIntegrityError, match="one original physical call"):
+                semantic_sql._extended_evidence_data(
+                    conn, str(running.claim.session_id), running.claim.operation_id, data, wrong_call, result.recorder
+                )
+            wrong_prefix = replace(snapshot, llm_calls=(call, *snapshot.llm_calls))
+            with pytest.raises(AuditIntegrityError, match="exact original recorder prefix"):
+                original_extend(data, original, admitted, call, wrong_prefix)
+            with pytest.raises(AuditIntegrityError, match="exact original recorder prefix"):
+                semantic_sql.append_primary_call_to_evidence(
+                    admitted, call=equal_call, recorder=snapshot, env_ref_names=data.source.env_ref_names
+                )
+
+            # Both inputs are corrupt: original evidence admission must still
+            # refuse first, without even entering the recorder decoder.
+            broken_evidence = PrivateChunk(data.source.evidence.reference, "{")
+            broken_data = replace(data, source=replace(data.source, evidence=broken_evidence))
+            broken_recorder = PrivateChunk(result.recorder.reference, "{")
+            decoded_before = len(decoder_inputs)
+            with pytest.raises(AuditIntegrityError, match="evidence source exceeds its original complete document bound"):
+                semantic_sql._extended_evidence_data(
+                    conn, str(running.claim.session_id), running.claim.operation_id, broken_data, call, broken_recorder
+                )
+            assert len(decoder_inputs) == decoded_before
+            with pytest.raises(AuditIntegrityError):
+                semantic_sql._extended_evidence_data(
+                    conn, str(running.claim.session_id), running.claim.operation_id, data, call, broken_recorder
+                )
+            assert len(decoder_inputs) == decoded_before + 1 and decoder_inputs[-1] is broken_recorder
+            assert _rows_on_connection(conn) == before
 
 
 @pytest.mark.asyncio

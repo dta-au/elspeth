@@ -44,7 +44,7 @@ from elspeth.web.composer.continuation_advisor import (
     ContinuationAdvisorInvocation,
     encode_continuation_advisor_invocation,
 )
-from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot, decode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     decode_continuation_response,
@@ -58,7 +58,12 @@ from elspeth.web.composer.continuation_codec import (
 )
 from elspeth.web.composer.continuation_end_values import EndContinuationCandidate, decode_end_candidate, encode_end_candidate
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
-from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence, state_from_evidence_json
+from elspeth.web.composer.continuation_evidence import (
+    AdmittedTurnEvidence,
+    decode_turn_evidence,
+    encode_turn_evidence,
+    state_from_evidence_json,
+)
 from elspeth.web.composer.continuation_evidence_application_data import append_primary_call_to_evidence
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.continuation_progress import continuation_action_key, decode_prescribed_continuation_action, retain_advisor_action
@@ -1485,16 +1490,33 @@ def _extended_evidence(
 def _extended_evidence_data(
     conn: Connection, sid: str, operation: str, data: SemanticAdvisorInvocationData, call: ComposerLLMCall, recorder: PrivateChunk
 ) -> _ExtendedSemanticEvidence:
-    from elspeth.web.composer.continuation_evidence_application_data import require_selected_applied_batch_chunk
-    from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
+    original, admitted = _original_evidence_data(conn, sid, operation, data)
+    snapshot = decode_recorder_snapshot(recorder)
+    return _extend_admitted_evidence(data, original, admitted, call, snapshot)
 
+
+def _original_evidence_data(
+    conn: Connection, sid: str, operation: str, data: SemanticAdvisorInvocationData
+) -> tuple[ContinuationFrameStack, AdmittedTurnEvidence]:
     original = decode_continuation_snapshot(data.source.selected_snapshot_json)
     admitted = decode_turn_evidence(
         data.source.evidence,
         env_ref_names=data.source.env_ref_names,
         source_chunks=load_private_chunks(conn, session_id=sid, operation_id=operation, stack=original),
     )
-    snapshot = decode_recorder_snapshot(recorder)
+    return original, admitted
+
+
+def _extend_admitted_evidence(
+    data: SemanticAdvisorInvocationData,
+    original: ContinuationFrameStack,
+    admitted: AdmittedTurnEvidence,
+    call: ComposerLLMCall,
+    snapshot: RecorderSnapshot,
+) -> _ExtendedSemanticEvidence:
+    from elspeth.web.composer.continuation_evidence_application_data import require_selected_applied_batch_chunk
+    from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
+
     if not snapshot.llm_calls or snapshot.llm_calls[-1] != call:
         raise AuditIntegrityError("Semantic evidence extension changed its one original physical call")
     # This installed pure graph operation extends one actual Composer call
@@ -1601,7 +1623,10 @@ def _paid_result_data(
     if not captured.llm_calls or captured.llm_calls[-1] != call or replace(previous, llm_calls=(*previous.llm_calls, call)) != captured:
         raise AuditIntegrityError("Semantic cold result changed its complete original recorder prefix")
     call = captured.llm_calls[-1]
-    extended = _extended_evidence_data(conn, sid, operation, data, call, record)
+    # This exact recorder was just decoded and its complete prefix proved
+    # above. Fresh evidence/dependency admission remains independent.
+    original, admitted = _original_evidence_data(conn, sid, operation, data)
+    extended = _extend_admitted_evidence(data, original, admitted, call, captured)
     evidence = extended.evidence
     if extended.applied_batch is not None and _ref(conn, sid, operation, extended.applied_batch.reference) != extended.applied_batch:
         raise AuditIntegrityError("Semantic cold paid application changed its exact extended graph companion")
