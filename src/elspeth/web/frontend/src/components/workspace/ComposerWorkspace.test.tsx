@@ -172,6 +172,37 @@ describe("ComposerWorkspace", () => {
     ).not.toBe(0);
   });
 
+  it("titles the authoring pane 'Conversation' and leaves the pane toggles in the bar row", async () => {
+    // ARGOnite: each pane is a card with a title bar. The bar carries the
+    // pane's name only; the collapse control stays the bar row's child and
+    // the restore control stays in the collapsed affordance — neither moves
+    // into the title bar (design doc: pane collapse controls stay in the
+    // workspace action bar).
+    const user = userEvent.setup();
+    renderWorkspace();
+    const root = emitWidth(1280);
+    const authoringRegion = screen.getByRole("region", { name: "Authoring pane" });
+    const title = within(authoringRegion).getByRole("heading", {
+      level: 2,
+      name: "Conversation",
+    });
+    const header = title.closest("header");
+    expect(header).toHaveClass("workspace-pane-header");
+    expect(header?.parentElement).toBe(authoringRegion);
+    // The title bar precedes the pane body (it is not inside the tabpanel).
+    expect(header?.nextElementSibling).toHaveClass("workspace-authoring-body");
+
+    const barSlot = root.querySelector('[data-workspace-part="action-bar"]');
+    const collapse = screen.getByRole("button", { name: "Collapse authoring pane" });
+    expect(barSlot).toContainElement(collapse);
+    expect(header).not.toContainElement(collapse);
+
+    await user.click(collapse);
+    const restore = screen.getByRole("button", { name: "Restore authoring pane" });
+    expect(restore.closest(".workspace-collapsed-affordance")).not.toBeNull();
+    expect(restore.closest(".workspace-pane-header")).toBeNull();
+  });
+
   it.each([
     // width, collapse?, narrow view, expected: collapse shown, bar shown
     [1280, false, "compose", true, true],

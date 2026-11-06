@@ -974,14 +974,20 @@ describe("rendered markdown links (elspeth-05fef62901)", () => {
       "--color-bubble-assistant",
       "--color-bubble-system",
     ];
+    // ARGOnite: the conversation now renders inside a pane card filled with
+    // --color-surface, so the translucent tints composite over the surface as
+    // well as the page --color-bg; gate both grounds (gates measure what
+    // renders).
     for (const theme of themes) {
       const link = resolveHex(theme, "--color-link");
-      for (const tint of bubbleTints) {
-        const bg = resolveTintOver(theme, tint, "--color-bg");
-        expect(
-          contrastRatio(link, bg),
-          `link on ${tint} (${theme})`,
-        ).toBeGreaterThanOrEqual(4.5);
+      for (const ground of ["--color-bg", "--color-surface"]) {
+        for (const tint of bubbleTints) {
+          const bg = resolveTintOver(theme, tint, ground);
+          expect(
+            contrastRatio(link, bg),
+            `link on ${tint} over ${ground} (${theme})`,
+          ).toBeGreaterThanOrEqual(4.5);
+        }
       }
     }
   });
@@ -992,5 +998,32 @@ describe("rendered markdown links (elspeth-05fef62901)", () => {
     expect(appCss).toMatch(
       /^:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/m,
     );
+  });
+});
+
+describe("ARGOnite pane chrome text pairs (Task 6)", () => {
+  // Every text pair the pane title bars, the tab track and the Checks badge
+  // render, in both themes. All the grounds are opaque hex tokens.
+  const themes: Array<"dark" | "light"> = ["dark", "light"];
+  const pairs: Array<[string, string, string]> = [
+    ["pane title on the title bar", "--color-text", "--color-pane-header"],
+    // The thinnest pair in the design (UX review 2.1): do not go lighter.
+    ["inactive tab on the track", "--color-text-muted", "--color-track"],
+    ["hovered tab on the track", "--color-text", "--color-track"],
+    ["selected tab on its pill", "--color-on-pill", "--color-pill"],
+    // The Checks glyph badge is filled with its tone and knocked out in
+    // --color-surface (workspace.css .artifact-tab-badge--glyph).
+    ["Checks glyph on a success fill", "--color-surface", "--color-success"],
+    ["Checks glyph on a warning fill", "--color-surface", "--color-warning"],
+    ["Checks glyph on an error fill", "--color-surface", "--color-error"],
+  ];
+
+  it.each(pairs)("keeps the %s at AA in both themes", (_label, text, ground) => {
+    for (const theme of themes) {
+      expect(
+        contrastRatio(resolveHex(theme, text), resolveHex(theme, ground)),
+        `${text} on ${ground} (${theme})`,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
   });
 });

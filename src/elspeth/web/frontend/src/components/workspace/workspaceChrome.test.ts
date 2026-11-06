@@ -207,35 +207,41 @@ describe("workspace completion group (recut 2026-08-15, supersedes elspeth-c6fd7
     );
   });
 
-  it("tints settled Checks-badge verdicts with the matching semantic pair", () => {
+  it("fills settled Checks-badge verdicts with the tone and knocks the glyph out", () => {
     // Recut 2026-08-15, relocated with the chips-to-Checks-tab move: the
     // settled verdict surface is now the Checks tab's glyph badge. Each tone
-    // pairs the banner-family alpha background with the SAME family's text
-    // colour, so fill and glyph cannot disagree about the verdict (the
-    // glyph — count, checkmark, or bang — stays the information carrier,
-    // WCAG 1.4.1). busy and neutral deliberately stay dots on the base
-    // badge rule: in-flight and not-yet-checked are neither good nor bad.
+    // rule carries its fill AND its glyph colour together, so fill and glyph
+    // cannot disagree about the verdict (the glyph — count, checkmark, or
+    // bang — stays the information carrier, WCAG 1.4.1). busy and neutral
+    // deliberately stay dots on the base badge rule: in-flight and
+    // not-yet-checked are neither good nor bad.
+    // ARGOnite: the badge is a pill FILLED with the tone colour (design doc,
+    // "Checks tab badge"), so the glyph is knocked out in --color-surface —
+    // AA on every tone in both themes, gated in colorContrast.test.ts.
     const glyph = ".artifact-tab-badge--glyph";
-    expect(declaration(`${glyph}[data-tone="success"]`, "background-color")).toBe(
-      "var(--color-success-bg)",
-    );
-    expect(declaration(`${glyph}[data-tone="success"]`, "color")).toBe(
-      "var(--color-success)",
-    );
-    expect(declaration(`${glyph}[data-tone="warning"]`, "background-color")).toBe(
-      "var(--color-warning-bg)",
-    );
-    expect(declaration(`${glyph}[data-tone="warning"]`, "color")).toBe(
-      "var(--color-warning)",
-    );
-    expect(declaration(`${glyph}[data-tone="error"]`, "background-color")).toBe(
-      "var(--color-error-bg)",
-    );
-    expect(declaration(`${glyph}[data-tone="error"]`, "color")).toBe(
-      "var(--color-error)",
-    );
+    for (const tone of ["success", "warning", "error"]) {
+      expect(declaration(`${glyph}[data-tone="${tone}"]`, "background-color")).toBe(
+        `var(--color-${tone})`,
+      );
+      expect(declaration(`${glyph}[data-tone="${tone}"]`, "color")).toBe(
+        "var(--color-surface)",
+      );
+    }
     expect(cssWithoutComments).not.toContain(`${glyph}[data-tone="busy"]`);
     expect(cssWithoutComments).not.toContain(`${glyph}[data-tone="neutral"]`);
+  });
+
+  it("the Checks glyph badge can hold a two-digit count (Review Focus 4)", () => {
+    // ARGOnite: the real checks-open state reads "Checks 25", which a 1.4em
+    // box at 11-12px cannot hold. A 20px pill with a 20px floor and its own
+    // horizontal padding grows with the count instead of clipping it.
+    const glyph = ".artifact-tab-badge--glyph";
+    expect(declaration(glyph, "min-width")).toBe("20px");
+    expect(declaration(glyph, "min-height")).toBe("20px");
+    expect(declaration(glyph, "border-radius")).toBe("var(--radius-pill)");
+    const padding = declaration(glyph, "padding").split(" ");
+    const inline = padding.length > 1 ? padding[1] : padding[0];
+    expect(Number.parseFloat(inline)).toBeGreaterThan(0);
   });
 
   it("centers the members instead of stretching them to the bar's height", () => {
@@ -437,4 +443,111 @@ describe("artifact column gutter (elspeth-87195dda2c)", () => {
     expect(declaration(selector, property)).toBe(expected);
   });
 
+});
+
+/**
+ * Like declaration(), but for a selector that may share its rule with others
+ * in a selector list: every rule whose list contains `selector` contributes.
+ * Plain selector lists only — the naive comma split would cut a list selector
+ * that itself contains a comma inside :where()/:is() into fragments.
+ */
+function listedDeclaration(selector: string, property: string): string {
+  const declarations = rules
+    .filter((rule) => rule.selector.split(",").some((part) => part.trim() === selector))
+    .flatMap((rule) => [
+      ...rule.declarations.matchAll(
+        new RegExp(`(?:^|;)\\s*${property}:\\s*([^;]+);`, "g"),
+      ),
+    ])
+    .map((match) => match[1].replace(/\s+/g, " ").trim());
+
+  if (declarations.length !== 1) {
+    throw new Error(
+      `Expected exactly one ${property} for ${selector}, found ${declarations.length}`,
+    );
+  }
+  return declarations[0];
+}
+
+describe("ARGOnite pane cards, title bars and tab track", () => {
+  it("the active tab is a raised pill on a recessed track", () => {
+    // The tablist is a recessed track with a 4px inset; the selected tab is a
+    // raised pill on it, inactive tabs are muted text in the track. The tab
+    // rules stay at shared.css's (0,2,0)/(0,1,0) specificity via :where() and
+    // win on source order (workspace.css imports after shared.css).
+    const track = '.artifact-workspace-toolbar [role="tablist"]';
+    expect(listedDeclaration(track, "box-shadow")).toBe("var(--shadow-track)");
+    expect(listedDeclaration(track, "background-color")).toBe("var(--color-track)");
+    expect(listedDeclaration(track, "border-radius")).toBe("var(--radius-pill)");
+    expect(listedDeclaration(track, "padding")).toBe("4px");
+
+    const scope = ":where(.artifact-workspace-toolbar, .workspace-view-tabs)";
+    const selected = `${scope} .artifact-tab[aria-selected="true"]`;
+    expect(declaration(selected, "box-shadow")).toBe("var(--shadow-pill)");
+    expect(declaration(selected, "background-color")).toBe("var(--color-pill)");
+    expect(declaration(selected, "color")).toBe("var(--color-on-pill)");
+    expect(declaration(`${scope} .artifact-tab`, "color")).toBe(
+      "var(--color-text-muted)",
+    );
+    expect(declaration(`${scope} .artifact-tab`, "border-radius")).toBe(
+      "var(--radius-pill)",
+    );
+  });
+
+  it("draws both panes as cards with the gutter between and around them", () => {
+    const pane = ".workspace-authoring-pane, .workspace-artifact-pane";
+    expect(declaration(pane, "border-radius")).toBe("var(--radius-pane)");
+    expect(declaration(pane, "box-shadow")).toBe("var(--shadow-card)");
+    expect(declaration(pane, "border")).toBe("1px solid var(--color-border)");
+    expect(declaration(pane, "background-color")).toBe("var(--color-surface)");
+
+    // Half a gutter each side of the column seam makes one full gutter
+    // between the cards, with the separator centred in it.
+    const half = "calc(var(--space-pane-gutter) / 2)";
+    const gutter = "var(--space-pane-gutter)";
+    expect(declaration(".workspace-authoring-slot", "padding")).toBe(
+      `${gutter} ${half} ${gutter} ${gutter}`,
+    );
+    expect(declaration(".workspace-artifact-slot", "padding")).toBe(
+      `${gutter} ${gutter} ${gutter} ${half}`,
+    );
+  });
+
+  it("gives both title bars the 46px pane-header band and its fill", () => {
+    for (const bar of [".workspace-pane-header", ".artifact-workspace-toolbar"]) {
+      expect(declaration(bar, "min-height")).toBe("var(--size-pane-header)");
+      expect(declaration(bar, "background-color")).toBe("var(--color-pane-header)");
+      expect(declaration(bar, "border-bottom")).toBe(
+        "1px solid var(--color-border, currentcolor)",
+      );
+    }
+    expect(declaration(".workspace-pane-title", "font-family")).toBe(
+      "var(--font-display)",
+    );
+    expect(declaration(".workspace-pane-title", "font-size")).toBe(
+      "var(--font-size-lg)",
+    );
+    expect(declaration(".workspace-pane-title", "font-weight")).toBe(
+      "var(--font-weight-bold)",
+    );
+  });
+
+  it("visually hides the Pipeline title below 900px of pane width, keeping it in the tree", () => {
+    // The pipeline pane is the query container; it is sized by its grid
+    // track, so inline-size containment cannot collapse it.
+    expect(declaration(".artifact-workspace", "container")).toBe(
+      "pipeline-pane / inline-size",
+    );
+    const block = /@container pipeline-pane \(width < 900px\) \{([^{}]*\{[^{}]*\})\s*\}/.exec(
+      cssWithoutComments,
+    );
+    expect(block).not.toBeNull();
+    const body = block![1];
+    expect(body).toMatch(/^\s*\.workspace-pane-title--collapsible\s*\{/);
+    // The visually-hidden recipe (base.css): clipped, not display:none, so the
+    // heading stays in the accessibility tree.
+    expect(body).toContain("position: absolute;");
+    expect(body).toContain("clip: rect(0, 0, 0, 0);");
+    expect(body).not.toMatch(/display:\s*none|visibility:\s*hidden/);
+  });
 });
