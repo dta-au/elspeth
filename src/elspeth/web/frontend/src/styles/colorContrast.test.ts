@@ -1026,4 +1026,25 @@ describe("ARGOnite pane chrome text pairs (Task 6)", () => {
       ).toBeGreaterThanOrEqual(4.5);
     }
   });
+
+  it("edges the selected tab pill at 3:1 against the track, not by shadow alone", () => {
+    // ARGOnite (controller ruling, Task 6): light --color-pill vs --color-track
+    // is 1.35:1, so without a border the selected-state boundary would be
+    // carried by --shadow-pill alone (WCAG 1.4.11; global constraint "shadows
+    // never carry a boundary alone"). Read the border token the rendered rule
+    // actually uses and gate it against the track in both themes.
+    const match =
+      /:where\(\.artifact-workspace-toolbar, \.workspace-view-tabs\)\s+\.artifact-tab\[aria-selected="true"\]\s*\{([^}]*)\}/.exec(
+        appCss,
+      );
+    expect(match, "selected-tab-in-track rule").not.toBeNull();
+    const border = /(?:^|;)\s*border-color:\s*var\((--[\w-]+)\)\s*;/.exec(match![1]);
+    expect(border, "selected tab border-color token").not.toBeNull();
+    for (const theme of themes) {
+      expect(
+        contrastRatio(resolveHex(theme, border![1]), resolveHex(theme, "--color-track")),
+        `${border![1]} vs --color-track (${theme})`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
 });
