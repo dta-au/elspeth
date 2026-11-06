@@ -25,7 +25,8 @@
      source order and would otherwise silently win. */
   max-width: min(92%, 74ch);
   padding: var(--space-md) var(--space-lg);
-  border-radius: var(--radius-lg);
+  /* ARGOnite: bubbles are cards. */
+  border-radius: var(--radius-card);
   word-break: break-word;
   white-space: pre-wrap;
   line-height: var(--line-height-snug);
@@ -642,8 +643,22 @@
      shipped four-row textarea (107px against a 74px floor). */
   min-height: calc(
     var(--size-control) + var(--space-sm) + var(--space-xs) +
-      var(--font-size-xs) * var(--line-height-normal)
+      var(--font-size-xs) * var(--line-height-normal) + var(--space-md)
   );
+  /* ARGOnite: the row is the composer well - a recessed card holding the
+     textarea and the controls. The border carries the 3:1 boundary; the
+     inset shadow is decoration only. */
+  padding: var(--space-sm);
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-card);
+  background-color: var(--color-surface-input);
+  box-shadow: var(--shadow-track);
+}
+
+/* The textarea lost its own border, so keyboard focus is drawn on the well. */
+.chat-input-row:focus-within {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
 }
 
 .chat-input-textarea {
@@ -659,13 +674,17 @@
   overflow-y: auto;
   resize: vertical;
   padding: var(--space-sm) var(--space-md);
-  border: 1px solid var(--color-border-strong);
+  border: none;
   border-radius: var(--radius-md);
   font-size: var(--font-size-base);
   font-family: inherit;
   line-height: 1.4;
-  background-color: var(--color-surface-elevated);
+  background-color: transparent;
   color: var(--color-text);
+}
+
+.chat-input-textarea:focus-visible {
+  outline: none;
 }
 
 @media (min-width: 761px) and (max-height: 800px) {
@@ -774,7 +793,7 @@
   padding: var(--space-sm) var(--space-2-5);
   background-color: transparent;
   border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-pill);
   cursor: pointer;
   font-size: var(--font-size-lg);
   color: var(--color-text);
@@ -862,7 +881,7 @@
   background-color: var(--color-surface-elevated);
   color: var(--color-text-muted);
   border: none;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-pill);
   cursor: not-allowed;
   /* No stylesheet carries a bare `button` element rule, and the UA default for
      a <button> is its own font — not the inherited one. Declaring only
@@ -884,6 +903,7 @@
   background-color: var(--color-btn-primary-bg);
   color: var(--color-btn-primary-text);
   cursor: pointer;
+  box-shadow: var(--shadow-pill);
 }
 
 .chat-input-send-btn:hover:not(:disabled) {
@@ -893,7 +913,7 @@
 .chat-input-hint {
   position: absolute;
   right: 0;
-  bottom: calc(var(--size-control) + var(--space-xs));
+  bottom: calc(var(--size-control) + var(--space-xs) + var(--space-sm));
   flex-basis: 100%;
   padding: 0 0 var(--space-xs);
   font-size: var(--font-size-xs);
