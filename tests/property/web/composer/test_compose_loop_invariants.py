@@ -1,1372 +1,291 @@
-"""Stateful property surface for Phase 3 compose-loop audit invariants."""
+"""Generated audit invariants through the current Continuation app and worker.
+
+The removed V1 one-turn test driver and its result type are not a valid
+Continuation authority. This module drives the public route and checks actual
+SQL/audit owners. P4 SQL/lock fault and mutation cases remain in the release
+UNCOVERED ledger; this module does not relabel them as ordinary success.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
-import os
-import sqlite3
-import threading
-import uuid
-from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
-from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
-import httpx
 import pytest
-import structlog
-from hypothesis import example, given, settings
-from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, rule
-from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
-from sqlalchemy.pool import StaticPool
-from tests.fixtures.identities import grant_test_pipeline_user
-from tests.helpers.session_fences import seed_session_operation_fence
-from tests.integration.web.conftest import _make_session
-from tests.property.web.composer.strategies import (
-    CANCELLATION_ARRIVAL_TIMES,
-    FAILURE_INJECTION_POINTS,
-    CancellationArrivalTime,
-    FailureInjectionPoint,
-    RedactionPolicy,
-    SessionState,
-    ToolCallSpec,
-    st_argument_dict,
-    st_cancellation_arrival_time,
-    st_failure_injection_point,
-    st_redaction_policy,
-    st_session_state,
-    st_tool_call,
+from hypothesis import settings
+from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, invariant, rule, run_state_machine_as_test
+from litellm import ModelResponse
+from sqlalchemy import select
+from tests.helpers.composer_operations import message_body
+from tests.helpers.continuation_app import (
+    PRIMARY_MODEL,
+    ScriptedSDK,
+    assistant_contents,
+    continuation_app,
+    effects,
+    end_admit,
+    install_sdk,
+    settle,
+    submit_and_settle,
+    tool_call,
 )
 
-import elspeth.web.composer.tool_batch as composer_tool_batch_module
-from elspeth.contracts.prompt_guard import (
-    PromptGuardContentPart,
-    PromptGuardDecision,
-    PromptGuardRequest,
-    PromptGuardToolArgumentParts,
+from elspeth.web.sessions.models import (
+    chat_messages_table,
+    composer_continuation_effects_table,
+    composition_states_table,
+    quota_provider_attempts_table,
+    token_usage_ledger_table,
 )
-from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
-from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
-from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
-from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
-from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
-from elspeth.web.composer.provider_quota import ProviderInvocationOwner
-from elspeth.web.composer.redaction import REDACTED_UNKNOWN_RESPONSE_KEY
-from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.composer.tools import ToolResult
-from elspeth.web.config import WebSettings
-from elspeth.web.coordination.contracts import SessionOperationFenceLost
-from elspeth.web.prompt_guard_config import PromptGuardSettings
-from elspeth.web.required_work import (
-    RequiredAuthorityKind,
-    RequiredWorkAuthority,
-    RequiredWorkBinding,
-    RequiredWorkCoordinator,
-    RequiredWorkRole,
-    RequiredWorkSource,
-    RequiredWorkTicket,
-)
-from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
-from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
-
-EVAL_MODEL = "openrouter/openai/gpt-5.5"
-EVAL_USER_ID = "eval-user"
-_CURRENT_REQUEST = "one-turn compose-loop test driver"
-_GUARD_HOST = "property-shield.example.test"
 
 
 @dataclass(frozen=True, slots=True)
-class _FakeFunction:
-    name: str
-    arguments: str
-
-
-@dataclass(frozen=True, slots=True)
-class _FakeToolCall:
-    id: str
-    function: _FakeFunction
-
-
-@dataclass(frozen=True, slots=True)
-class _FakeMessage:
-    content: str | None
-    tool_calls: list[_FakeToolCall] | None
-
-
-@dataclass(frozen=True, slots=True)
-class _FakeChoice:
-    message: _FakeMessage
-
-
-@dataclass(frozen=True, slots=True)
-class _FakeLLMResponse:
-    choices: list[_FakeChoice]
-
-
-class _ReplayLLM:
-    def __init__(self, responses: tuple[_AdmittedLLMCompletion, ...]) -> None:
-        self._responses = list(responses)
-
-    async def __call__(
-        self,
-        _messages: Any,
-        _tools: Any,
-        *,
-        provider_custody: object | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-    ) -> _AdmittedLLMCompletion:
-        assert self._responses, "No further primary response is supplied by this trace"
-        return self._responses.pop(0)
-
-
-class _BlockingLLM:
-    def __init__(self) -> None:
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def __call__(
-        self,
-        _messages: Any,
-        _tools: Any,
-        *,
-        provider_custody: object | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-    ) -> _AdmittedLLMCompletion:
-        self.entered.set()
-        await self.release.wait()
-        return _make_llm_response(content="Done.")
-
-
-@dataclass(frozen=True, slots=True)
-class _Harness:
-    service: ComposerServiceImpl
-    sessions_service: SessionServiceImpl
-    session_id: str
-    # A real COMPOSE context minted through the production authority at
-    # construction time, BEFORE any trace installs commit gates or commit
-    # failures on the engine: the first instrumented commit must be the
-    # compose-turn audit persist, exactly as it was before the composer
-    # required session-operation authority. No optional-context arm.
-    compose_context: SessionOperationContext
-    required_work: RequiredWorkBinding
-    provider_owner: ProviderInvocationOwner
-    guard_policy_fingerprint: str
-    guard_requests: list[PromptGuardRequest]
-    guard_http_requests: list[dict[str, Any]]
-    guard_observers: contextlib.ExitStack
-    completed_results: list[ComposeLoopTestResult] = field(default_factory=list)
-
-    def release(self) -> None:
-        """Release the harness lease; a lost fence means a trace already consumed it."""
-        self.required_work.coordinator.assert_completed()
-        try:
-            with contextlib.suppress(SessionOperationFenceLost):
-                self.sessions_service.session_operation_authority.release(self.compose_context)
-        finally:
-            try:
-                self.guard_observers.close()
-            finally:
-                self.sessions_service._engine.dispose()
-
-
-@dataclass(frozen=True, slots=True)
-class _TraceOutcome:
-    cancellation_arrival_time: CancellationArrivalTime
+class _AuditOutcome:
     operation_id: str
-    operation_epoch: int
-    cancelled: bool
-    assistant_ids: frozenset[str]
-    tool_call_ids: frozenset[str]
-    rows: tuple[Any, ...]
-    state_rows: tuple[Any, ...]
-    tool_row_tier1_violations: int
-    tool_row_integrity_violations: int
-    tool_call_cap_exceeded: int
+    provider_calls: int
+    provider_effects: int
+    tool_effects: int
+    attempted_ids: frozenset[str]
+    ledger_ids: frozenset[str]
+    linked_ledger_ids: frozenset[str | None]
+    public_audit_ids: frozenset[str]
+    public_audit_count: int
+    private_request_ids: frozenset[str]
+    private_request_count: int
+    private_origins: frozenset[tuple[str, str, int]]
+    physical_origins: frozenset[tuple[str, str, int]]
+    sequence_numbers: tuple[int, ...]
+    orphan_tool_rows: tuple[str, ...]
+    orphan_tool_states: tuple[str, ...]
 
 
-def _mock_catalog() -> MagicMock:
-    catalog = MagicMock(spec=CatalogService)
-    catalog.list_sources.return_value = [
-        PluginSummary(name="csv", description="CSV source", plugin_type="source", config_fields=[]),
-    ]
-    catalog.list_transforms.return_value = []
-    catalog.list_sinks.return_value = [
-        PluginSummary(name="json", description="JSON sink", plugin_type="sink", config_fields=[]),
-    ]
-    catalog.get_schema.return_value = PluginSchemaInfo(
-        name="csv",
-        plugin_type="source",
-        description="CSV source",
-        json_schema={"title": "Config", "properties": {}},
-        knob_schema={"fields": []},
-    )
-    return catalog
+class _CostedSDK(ScriptedSDK):
+    async def __call__(self, **kwargs):
+        response = await super().__call__(**kwargs)
+        assert isinstance(response, ModelResponse) and response.usage is not None
+        response.usage.cost = 0.01
+        return response
 
 
-def _make_llm_response(
-    content: str | None = None,
-    tool_calls: list[dict[str, Any]] | None = None,
-) -> _AdmittedLLMCompletion:
-    fake_tool_calls: list[_FakeToolCall] | None = None
-    if tool_calls is not None:
-        fake_tool_calls = [
-            _FakeToolCall(
-                id=tool_call["id"],
-                function=_FakeFunction(
-                    name=tool_call["name"],
-                    arguments=json.dumps(tool_call["arguments"]),
-                ),
-            )
-            for tool_call in tool_calls
-        ]
-    response = _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=fake_tool_calls))])
-    return _admit_composer_llm_completion(response)
-
-
-def _web_settings(data_dir: Path) -> WebSettings:
-    guard = PromptGuardSettings(endpoint=f"https://{_GUARD_HOST}", subscription_key="offline-property-shield")
-    return WebSettings(
-        data_dir=data_dir,
-        composer_model=EVAL_MODEL,
-        composer_max_composition_turns=15,
-        composer_max_discovery_turns=10,
-        composer_timeout_seconds=180.0,
-        composer_rate_limit_per_minute=60,
-        shareable_link_signing_key=b"\x00" * 32,
-        composer_prompt_guard_mode="required",
-        composer_prompt_guard=guard,
-        composer_advisor_prompt_guard=guard,
-    )
-
-
-def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _Harness:
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    initialize_session_schema(engine)
-    data_dir = tmp_path / "data"
-    telemetry = build_sessions_telemetry()
-    sessions_service = SessionServiceImpl(
-        engine,
-        data_dir=data_dir,
-        telemetry=telemetry,
-        log=structlog.get_logger("test.property.compose-loop"),
-        # One lease spans a whole example, including the deliberately stalled
-        # cancellation traces; the 30 s HTTP default would expire under them.
-        session_operation_lease_seconds=600,
-    )
-    session_id = str(uuid.uuid4())
-    with engine.begin() as conn:
-        _make_session(conn, session_id=session_id, user_id=EVAL_USER_ID)
-        grant_test_pipeline_user(conn, identity_id=EVAL_USER_ID)
-        # The hand-inserted row needs the released epoch-1 fence the lifecycle
-        # method would have written, or every fenced writer reports ``missing``.
-        seed_session_operation_fence(conn, session_id, owner_instance_id=sessions_service.session_operation_owner_instance_id)
-        conn.execute(text("UPDATE sessions SET trust_mode = 'auto_commit' WHERE id = :session_id"), {"session_id": session_id})
-    compose_context = sessions_service.session_operation_authority.acquire(
-        session_id=uuid.UUID(session_id),
-        operation_kind=SessionOperationKind.COMPOSE,
-        owner_instance_id=sessions_service.session_operation_owner_instance_id,
-        lease_seconds=sessions_service.session_operation_lease_seconds,
-    )
-    guard_requests: list[PromptGuardRequest] = []
-    guard_http_requests: list[dict[str, Any]] = []
-    guard_observers = contextlib.ExitStack()
-
-    def shield_response(request: httpx.Request) -> httpx.Response:
-        assert request.url.host == _GUARD_HOST
-        payload = json.loads(request.content)
-        assert payload["userPrompt"] == _CURRENT_REQUEST
-        guard_http_requests.append(payload)
-        return httpx.Response(
-            200,
-            json={
-                "userPromptAnalysis": {"attackDetected": False},
-                "documentsAnalysis": [{"attackDetected": False} for _document in payload["documents"]],
-            },
-        )
-
-    def guard_client(settings: PromptGuardSettings) -> AzurePromptGuardClient:
-        client = AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(shield_response))
-        real_inspect = client.inspect
-
-        async def inspect(request: PromptGuardRequest) -> PromptGuardDecision:
-            # Observe the request; only the real Azure adapter supplies its decision.
-            guard_requests.append(request)
-            return await real_inspect(request)
-
-        guard_observers.enter_context(patch.object(client, "inspect", new=inspect))
-        return client
-
-    try:
-        coordinator = RequiredWorkCoordinator(
-            RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, compose_context, invocation_id=str(uuid.uuid4()))
-        )
-        required_work = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
-        provider_owner = ProviderInvocationOwner(service=sessions_service, required_work=required_work)
-        with patch("elspeth.web.composer.prompt_guard_clients.build_prompt_guard_client", new=guard_client):
-            service = ComposerServiceImpl.for_trained_operator(
-                catalog=_mock_catalog(),
-                settings=_web_settings(data_dir),
-                sessions_service=sessions_service,
-            )
-        service._telemetry = telemetry  # type: ignore[attr-defined]
-        # The property harness injects DB failures around compose-turn audit
-        # persistence. Skip the service-instance bootstrap upsert so the
-        # one-time skill-history write does not consume those fault injections.
-        service._skill_markdown_history_upserted = True  # type: ignore[attr-defined]
-        if session_state == "has_prior_state":
-            with engine.begin() as conn:
-                conn.execute(
-                    text(
-                        "INSERT INTO chat_messages "
-                        "(id, session_id, role, content, raw_content, tool_calls, tool_call_id, sequence_no, "
-                        " writer_principal, created_at, composition_state_id, parent_assistant_id) "
-                        "VALUES (:id, :session_id, 'user', 'prior', NULL, NULL, NULL, 1, "
-                        "        'route_user_message', CURRENT_TIMESTAMP, NULL, NULL)"
-                    ),
-                    {"id": str(uuid.uuid4()), "session_id": session_id},
-                )
-        assert service._advisor_prompt_guard_mount is not None
-        return _Harness(
-            service=service,
-            sessions_service=sessions_service,
-            session_id=session_id,
-            compose_context=compose_context,
-            required_work=required_work,
-            provider_owner=provider_owner,
-            guard_policy_fingerprint=service._advisor_prompt_guard_mount.client.policy_fingerprint,
-            guard_requests=guard_requests,
-            guard_http_requests=guard_http_requests,
-            guard_observers=guard_observers,
-        )
-    except BaseException as body:
-        try:
-            try:
-                guard_observers.close()
-            finally:
-                try:
-                    sessions_service.session_operation_authority.release(compose_context)
-                finally:
-                    engine.dispose()
-        except BaseException as cleanup:
-            raise BaseExceptionGroup("Property fixture setup and cleanup outcomes", [body, cleanup]) from None
-        raise
-
-
-async def _run_one_turn(harness: _Harness, llm: Any) -> Any:
-    driver = cast(Any, harness.service)
-    real_loop = driver._compose_loop
-
-    async def owned_loop(message: str, *args: Any, **kwargs: Any) -> Any:
-        assert message == _CURRENT_REQUEST
-        assert kwargs["session_id"] == harness.session_id
-        assert kwargs["session_operation_context"] is harness.compose_context
-        assert "required_work" not in kwargs and "provider_owner" not in kwargs and "user_id" not in kwargs
-        harness.required_work.validate_context(harness.compose_context)
-        with prompt_guard_user_scope(message):
-            return await real_loop(
-                message,
-                *args,
-                **kwargs,
-                user_id=EVAL_USER_ID,
-                required_work=harness.required_work,
-                provider_owner=harness.provider_owner,
-            )
-
-    with patch.object(driver, "_compose_loop", new=owned_loop):
-        result = await driver._run_one_turn_for_test(
-            llm=llm,
-            session_id=harness.session_id,
-            session_operation_context=harness.compose_context,
-            message=_CURRENT_REQUEST,
-            initial_state=CompositionState(
-                source=None,
-                nodes=(),
-                edges=(),
-                outputs=(),
-                metadata=PipelineMetadata(),
-                version=1,
-            ),
-        )
-    harness.completed_results.append(result)
-    return result
-
-
-def _chat_rows(harness: _Harness) -> tuple[Any, ...]:
-    with harness.sessions_service._engine.connect() as conn:
-        return tuple(
-            conn.execute(
-                text(
-                    "SELECT id, session_id, role, sequence_no, tool_calls, tool_call_id, "
-                    "parent_assistant_id, composition_state_id, content "
-                    "FROM chat_messages WHERE session_id = :session_id ORDER BY sequence_no"
-                ),
-                {"session_id": harness.session_id},
-            ).fetchall()
-        )
-
-
-def _state_rows(harness: _Harness) -> tuple[Any, ...]:
-    with harness.sessions_service._engine.connect() as conn:
-        return tuple(
-            conn.execute(
-                text("SELECT id, version, provenance FROM composition_states WHERE session_id = :session_id ORDER BY version"),
-                {"session_id": harness.session_id},
-            ).fetchall()
-        )
-
-
-def _assert_guard_row(harness: _Harness, row: Any) -> None:
-    assert row.role == "audit" and row.session_id == harness.session_id
-    envelopes = json.loads(row.tool_calls)
-    assert len(envelopes) == 1 and envelopes[0]["_kind"] == "prompt_guard_audit"
-    assert json.loads(row.content) == envelopes[0]
-    check = envelopes[0]["check"]
-    assert set(check) == {
-        "schema_version",
-        "audit_id",
-        "operation_id",
-        "operation_epoch",
-        "role",
-        "adapter",
-        "mode",
-        "policy_fingerprint",
-        "request_hash",
-        "disposition",
-        "reason",
-        "started_at",
-        "duration_ms",
+def _session_rows(app, session_id):
+    sid = str(session_id)
+    tables = {
+        "messages": chat_messages_table,
+        "states": composition_states_table,
+        "effects": composer_continuation_effects_table,
+        "attempts": quota_provider_attempts_table,
+        "ledger": token_usage_ledger_table,
     }
-    assert check["schema_version"] == 1
-    assert str(uuid.UUID(check["audit_id"])) == check["audit_id"]
-    assert check["operation_id"] == harness.compose_context.fence.operation_id
-    assert check["operation_epoch"] == harness.compose_context.fence.operation_epoch
-    assert (check["role"], check["adapter"], check["mode"]) == ("advisor", "azure_prompt_shields", "required")
-    assert (check["disposition"], check["reason"]) == ("allow", "clean")
-    assert len(harness.guard_requests) == 1
-    request = harness.guard_requests[0]
-    assert request.role == "advisor" and request.user_prompt == _CURRENT_REQUEST
-    assert check["policy_fingerprint"] == harness.guard_policy_fingerprint
-    assert check["request_hash"] == request.request_hash
-    assert harness.guard_http_requests
-    assert all(payload["userPrompt"] == _CURRENT_REQUEST for payload in harness.guard_http_requests)
-    assert tuple(document for payload in harness.guard_http_requests for document in payload["documents"]) == request.documents
+    with app.state.session_engine.connect() as conn:
+        return {name: tuple(conn.execute(select(table).where(table.c.session_id == sid)).all()) for name, table in tables.items()}
 
 
-def _provider_accounting_rows(harness: _Harness) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-    with harness.sessions_service._engine.connect() as conn:
-        attempts = tuple(
-            conn.execute(
-                text("SELECT * FROM quota_provider_attempts WHERE session_id = :session_id"),
-                {"session_id": harness.session_id},
-            ).fetchall()
-        )
-        ledger = tuple(
-            conn.execute(
-                text("SELECT * FROM token_usage_ledger WHERE session_id = :session_id"),
-                {"session_id": harness.session_id},
-            ).fetchall()
-        )
-    return attempts, ledger
-
-
-def _assert_end_accounting(harness: _Harness, *, settled: bool) -> None:
-    attempts, ledger = _provider_accounting_rows(harness)
-    assert len(attempts) == 1
-    attempt = attempts[0]
-    assert attempt.identity_id == EVAL_USER_ID and attempt.session_id == harness.session_id
-    assert attempt.source == "composer" and attempt.run_id is None
-    assert attempt.operation_id == harness.compose_context.fence.operation_id
-    assert attempt.operation_epoch == harness.compose_context.fence.operation_epoch
-    assert attempt.lease_token == harness.compose_context.fence.lease_token
-    if not settled:
-        assert attempt.settled_at is None and attempt.ledger_entry_id is None and ledger == ()
-        return
-    assert attempt.settled_at is not None and len(ledger) == 1
-    assert attempt.ledger_entry_id == ledger[0].entry_id
-    assert ledger[0].identity_id == EVAL_USER_ID and ledger[0].session_id == harness.session_id
-    assert ledger[0].source == "composer" and ledger[0].model == harness.service._settings.composer_advisor_model
-    harness.required_work.coordinator.assert_completed()
-
-
-def _assert_no_tool_row_without_parent_assistant(harness: _Harness) -> None:
-    with harness.sessions_service._engine.connect() as conn:
-        violations = conn.execute(
-            text(
-                "SELECT tool.id FROM chat_messages tool "
-                "LEFT JOIN chat_messages assistant "
-                "  ON assistant.id = tool.parent_assistant_id "
-                " AND assistant.session_id = tool.session_id "
-                " AND assistant.role = 'assistant' "
-                "WHERE tool.session_id = :session_id "
-                "  AND tool.role = 'tool' "
-                "  AND assistant.id IS NULL"
-            ),
-            {"session_id": harness.session_id},
-        ).fetchall()
-    assert violations == []
-
-
-def _assert_no_tool_state_without_tool_row(harness: _Harness) -> None:
-    with harness.sessions_service._engine.connect() as conn:
-        violations = conn.execute(
-            text(
-                "SELECT cs.id FROM composition_states cs "
-                "LEFT JOIN chat_messages cm "
-                "  ON cm.composition_state_id = cs.id AND cm.role = 'tool' "
-                "WHERE cs.session_id = :session_id "
-                "  AND cs.provenance = 'tool_call' AND cs.version > 0 "
-                "  AND cm.id IS NULL"
-            ),
-            {"session_id": harness.session_id},
-        ).fetchall()
-    assert violations == []
-
-
-def _assert_sequence_numbers_unique_and_monotonic(harness: _Harness) -> None:
-    rows = _chat_rows(harness)
-    sequence_numbers = [row.sequence_no for row in rows]
-    assert sequence_numbers == sorted(sequence_numbers)
-    assert len(sequence_numbers) == len(set(sequence_numbers))
-
-
-def _assert_persisted_tool_payloads_match_manifest(harness: _Harness) -> None:
-    for row in _chat_rows(harness):
-        if row.role != "tool":
+def _audit_outcome(app, session_id, operation_id, sdk: ScriptedSDK) -> _AuditOutcome:
+    rows = _session_rows(app, session_id)
+    messages = sorted(rows["messages"], key=lambda row: row.sequence_no)
+    by_id = {row.id: row for row in messages}
+    states = {row.id: row for row in rows["states"]}
+    effects_for_operation = tuple(row for row in rows["effects"] if row.operation_id == operation_id)
+    # The charged SDK attempt retains its original physical operation/epoch.
+    # The current worker can settle it under a different public operation, so
+    # the public operation ID is not a valid attempt filter.
+    attempts = rows["attempts"]
+    ledger = rows["ledger"]
+    public_ids: set[str] = set()
+    private_ids: set[str] = set()
+    public_count = 0
+    private_count = 0
+    private_origins: set[tuple[str, str, int]] = set()
+    for row in messages:
+        if row.role != "audit":
             continue
-        payload = json.loads(row.content)
-        assert "do-not-persist" not in row.content
-        # The declarative walker DROPS an unknown key's name and aggregates the fact under
-        # ``_unknown_response`` (redaction.redact_tool_call_response); the old
-        # ``if "stray_provider_field" in payload`` guard therefore never fired and the
-        # invariant was dead (elspeth-e405ad7cd2 census). A stray key is only ever
-        # observable as the aggregate sentinel.
-        assert "stray_provider_field" not in payload
-        if "_unknown_response" in payload:
-            assert payload["_unknown_response"] == REDACTED_UNKNOWN_RESPONSE_KEY
-
-
-def _tool_call_payload(tool_call: ToolCallSpec, argument_dict: Mapping[str, object]) -> dict[str, Any]:
-    if tool_call.name == "set_metadata":
-        return {
-            "id": tool_call.call_id,
-            "name": "set_metadata",
-            "arguments": argument_dict if "patch" in argument_dict else {"patch": {"name": "property trace"}},
-        }
-    return {"id": tool_call.call_id, "name": "get_pipeline_state", "arguments": {}}
-
-
-@contextlib.contextmanager
-def _instrument_tool_turn_commits(harness: _Harness, instrument: Callable[[Any], None]) -> Iterator[None]:
-    """Instrument the tool persistence worker, never an unrelated checkpoint."""
-    service = harness.sessions_service
-    real_persist = service.persist_compose_turn
-    real_commit = service._engine.dialect.do_commit
-    active_threads: set[int] = set()
-
-    def persist(**kwargs: Any) -> Any:
-        thread_id = threading.get_ident()
-        assert thread_id not in active_threads
-        active_threads.add(thread_id)
-        try:
-            return real_persist(**kwargs)
-        finally:
-            active_threads.remove(thread_id)
-
-    def commit(connection: Any) -> None:
-        if threading.get_ident() in active_threads:
-            instrument(connection)
-        else:
-            real_commit(connection)
-
-    with patch.object(service, "persist_compose_turn", side_effect=persist), patch.object(service._engine.dialect, "do_commit", commit):
-        yield
-    assert not active_threads
-
-
-async def _drive_trace_async(
-    harness: _Harness,
-    *,
-    cancellation_arrival_time: CancellationArrivalTime,
-    tool_call: ToolCallSpec,
-    argument_dict: Mapping[str, object],
-) -> bool:
-    tool_payload = _tool_call_payload(tool_call, argument_dict)
-    llm = _ReplayLLM(
-        (
-            _make_llm_response(tool_calls=[tool_payload]),
-            _make_llm_response(content="Done."),
+        for envelope in row.tool_calls or ():
+            if envelope.get("_kind") == "llm_call_audit":
+                public_count += 1
+                public_ids.add(envelope["call"]["call_id"])
+            if envelope.get("_kind") == "composer_diagnostic_evidence":
+                evidence = envelope["evidence"]
+                if evidence["status"] == "provider_request":
+                    private_count += 1
+                    private_ids.add(evidence["tool_call_id"])
+                    private_origins.add((evidence["tool_call_id"], evidence["operation_id"], evidence["operation_epoch"]))
+    orphan_tools = tuple(
+        row.id
+        for row in messages
+        if row.role == "tool"
+        and (
+            row.parent_assistant_id not in by_id
+            or by_id[row.parent_assistant_id].role != "assistant"
+            or (row.composition_state_id is not None and row.composition_state_id not in states)
         )
     )
-
-    if cancellation_arrival_time == "before_llm_call":
-        task = asyncio.create_task(_run_one_turn(harness, llm))
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        return True
-
-    if cancellation_arrival_time == "during_llm_call":
-        blocking_llm = _BlockingLLM()
-        task = asyncio.create_task(_run_one_turn(harness, blocking_llm))
-        await asyncio.wait_for(blocking_llm.entered.wait(), timeout=2.0)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        return True
-
-    if cancellation_arrival_time in {"after_llm_before_tool", "during_tool_dispatch"}:
-
-        def _cancel_at_tool_boundary(*_args: Any, **_kwargs: Any) -> ToolResult:
-            raise asyncio.CancelledError()
-
-        with patch.object(composer_tool_batch_module, "execute_tool", _cancel_at_tool_boundary), pytest.raises(asyncio.CancelledError):
-            await _run_one_turn(harness, llm)
-        return True
-
-    if cancellation_arrival_time == "after_tool_before_sync_dispatch":
-        real_persist_async = harness.sessions_service.persist_compose_turn_async
-
-        async def _cancel_before_sync(**kwargs: Any) -> Any:
-            ticket = kwargs["required_work"]
-            assert type(ticket) is RequiredWorkTicket
-            assert ticket.key.source is RequiredWorkSource.COMPOSE_CHECKPOINT_SQL
-            assert ticket.key.authority.context is harness.compose_context
-            assert kwargs["session_operation_context"] is harness.compose_context
-            cancellation = asyncio.CancelledError()
-            # This stub has not called the dispatcher: no physical work was submitted.
-            ticket.complete_without_submission(cancellation)
-            raise cancellation
-
-        harness.sessions_service.persist_compose_turn_async = _cancel_before_sync  # type: ignore[method-assign]
-        try:
-            with pytest.raises(asyncio.CancelledError):
-                await _run_one_turn(harness, llm)
-        finally:
-            harness.sessions_service.persist_compose_turn_async = real_persist_async  # type: ignore[method-assign]
-        return True
-
-    if cancellation_arrival_time == "during_run_sync_between_insert_and_commit":
-        original_do_commit = harness.sessions_service._engine.dialect.do_commit
-        commit_started = threading.Event()
-        release_commit = threading.Event()
-        commit_finished = threading.Event()
-        commit_errors: list[BaseException] = []
-        target_commits = 0
-
-        def _gated_commit(dbapi_conn: object) -> None:
-            nonlocal target_commits
-            target_commits += 1
-            try:
-                commit_started.set()
-                if not release_commit.wait(timeout=10.0):
-                    pytest.fail("property worker commit gate was not released within 10s")
-                original_do_commit(dbapi_conn)
-            except BaseException as exc:
-                commit_errors.append(exc)
-                raise
-            finally:
-                commit_finished.set()
-
-        with _instrument_tool_turn_commits(harness, _gated_commit):
-            task = asyncio.create_task(_run_one_turn(harness, llm))
-            for _ in range(200):
-                if commit_started.is_set():
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("property trace did not reach COMMIT gate within 2s")
-            task.cancel()
-            # Persistence is shielded from caller cancellation. Release the
-            # in-flight critical section before awaiting the deferred cancel.
-            release_commit.set()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            for _ in range(1000):
-                if commit_finished.is_set():
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("property trace did not finish shielded COMMIT within 10s")
-            if commit_errors:
-                raise AssertionError("property trace shielded COMMIT failed after caller cancellation") from commit_errors[0]
-            await _wait_for_tool_rows(harness)
-        assert target_commits == 1
-        return True
-
-    if cancellation_arrival_time == "during_advisory_lock_acquisition":
-        real_session_write_lock = harness.sessions_service._session_write_lock
-        lock_entered = threading.Event()
-        release_lock = threading.Event()
-
-        @contextlib.contextmanager
-        def _blocked_session_write_lock(*_args: Any, **_kwargs: Any) -> Any:
-            lock_entered.set()
-            if not release_lock.wait(timeout=2.0):
-                pytest.fail("property advisory-lock gate was not released within 2s")
-            raise OperationalError(
-                "session write lock acquisition",
-                {},
-                sqlite3.OperationalError("simulated session/advisory lock unavailable"),
-            )
-            yield
-
-        harness.sessions_service._session_write_lock = _blocked_session_write_lock  # type: ignore[method-assign]
-        try:
-            task = asyncio.create_task(_run_one_turn(harness, llm))
-            for _ in range(200):
-                if lock_entered.is_set():
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("property trace did not reach advisory-lock gate within 2s")
-            task.cancel()
-            # The lock acquisition runs inside the shielded persistence task;
-            # let it finish before asserting that cancellation is re-raised.
-            release_lock.set()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            await asyncio.sleep(0)
-        finally:
-            harness.sessions_service._session_write_lock = real_session_write_lock  # type: ignore[method-assign]
-        return True
-
-    if cancellation_arrival_time == "after_commit_before_response_yielded":
-        commit_returned = asyncio.Event()
-        release_response = asyncio.Event()
-        real_persist_async = harness.sessions_service.persist_compose_turn_async
-
-        async def _gated_after_commit(**kwargs: Any) -> Any:
-            outcome = await real_persist_async(**kwargs)
-            commit_returned.set()
-            await release_response.wait()
-            return outcome
-
-        harness.sessions_service.persist_compose_turn_async = _gated_after_commit  # type: ignore[method-assign]
-        try:
-            task = asyncio.create_task(_run_one_turn(harness, llm))
-            await asyncio.wait_for(commit_returned.wait(), timeout=2.0)
-            task.cancel()
-            # Model response publication after the durable write, then observe
-            # the cancellation deferred across that critical section.
-            release_response.set()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        finally:
-            harness.sessions_service.persist_compose_turn_async = real_persist_async  # type: ignore[method-assign]
-        return True
-
-    if cancellation_arrival_time == "after_response_yielded":
-        task = asyncio.create_task(_run_one_turn(harness, llm))
-        await task
-        task.cancel()
-        return False
-
-    raise AssertionError(f"unhandled cancellation arrival time: {cancellation_arrival_time}")
-
-
-async def _wait_for_tool_rows(harness: _Harness) -> None:
-    for _ in range(1000):
-        # Private evidence is a third atomic sibling, not conversation text.
-        rows = _chat_rows(harness)
-        if [row.role for row in rows][-3:] == ["assistant", "tool", "audit"]:
-            _assert_private_tool_cohort(
-                rows[-3:], harness.compose_context.fence.operation_id, harness.compose_context.fence.operation_epoch
-            )
-            return
-        await asyncio.sleep(0.01)
-    pytest.fail("property trace did not persist assistant/tool rows within 10s")
-
-
-def _assert_private_tool_cohort(rows: tuple[Any, ...], operation_id: str, operation_epoch: int) -> None:
-    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
-
-    assistant, tool, private = rows
-    assert tool.parent_assistant_id == assistant.id
-    assert assistant.session_id == tool.session_id == private.session_id
-    envelopes = json.loads(private.tool_calls)
-    assert len(envelopes) == 1
-    evidence = ComposerDiagnosticEvidence.from_envelope(
-        envelopes[0],
-        expected_session_id=tool.session_id,
-        expected_operation_id=operation_id,
-        expected_tool_call_id=tool.tool_call_id,
-    )
-    assert evidence.status == "success"
-    assert evidence.operation_epoch == operation_epoch
-
-
-def _drive_single_example_trace(
-    *,
-    cancellation_arrival_time: CancellationArrivalTime,
-    tool_call: ToolCallSpec | None = None,
-    argument_dict: Mapping[str, object] | None = None,
-    failure_injection_point: FailureInjectionPoint = "none",
-    session_state: SessionState = "empty",
-) -> _TraceOutcome:
-    if failure_injection_point != "none":
-        cancellation_arrival_time = "after_response_yielded"
-    tmp_path = Path(os.environ.get("PYTEST_TMPDIR", "/tmp")) / f"cl_pp_prop_{uuid.uuid4().hex}"
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    harness = _make_harness(tmp_path, session_state=session_state)
-    body: BaseException | None = None
-    try:
-        return _drive_single_example_trace_with(
-            harness,
-            cancellation_arrival_time=cancellation_arrival_time,
-            tool_call=tool_call,
-            argument_dict=argument_dict,
-            failure_injection_point=failure_injection_point,
-        )
-    except BaseException as failure:
-        body = failure
-        raise
-    finally:
-        try:
-            harness.release()
-        except BaseException as cleanup:
-            if body is not None and cleanup is not body:
-                raise BaseExceptionGroup("Property trace body and owned cleanup outcomes", [body, cleanup]) from None
-            raise
-
-
-def _drive_single_example_trace_with(
-    harness: _Harness,
-    *,
-    cancellation_arrival_time: CancellationArrivalTime,
-    tool_call: ToolCallSpec | None,
-    argument_dict: Mapping[str, object] | None,
-    failure_injection_point: FailureInjectionPoint,
-) -> _TraceOutcome:
-    chosen_tool_call = tool_call or ToolCallSpec(name="set_metadata", call_id=f"call_{uuid.uuid4().hex[:12]}")
-    chosen_arguments = argument_dict or {"patch": {"name": "property trace"}}
-    reviews: list[dict[str, Any]] = []
-    sdk_messages: list[list[dict[str, Any]]] = []
-
-    async def unavailable_end(**kwargs: Any) -> Any:
-        from litellm import AuthenticationError
-        from tests.helpers.advisor_review import parse_advisor_publication_review
-
-        assert kwargs["model"] == harness.service._settings.composer_advisor_model
-        assert len(reviews) < 1, "Only one nonretryable END SDK refusal is supplied per trace"
-        assert "tools" not in kwargs and kwargs["num_retries"] == kwargs["max_retries"] == 0
-        assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
-        _assert_guard_row(harness, _chat_rows(harness)[-1])
-        _assert_end_accounting(harness, settled=False)
-        review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
-        assert review["current_request"] == "one-turn compose-loop test driver" and review["candidate_reply"] == "Done."
-        states = _state_rows(harness)
-        assert review["saved_effects"]["saved_revision_count"] == len(states)
-        if states:
-            assert review["saved_effects"]["latest_committed_state_id"] == states[-1].id
-        reviews.append(review)
-        sdk_messages.append(json.loads(json.dumps(kwargs["messages"])))
-        raise AuthenticationError(message="property fixture advisor unavailable", llm_provider="anthropic", model=kwargs["model"])
-
-    with (
-        patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-openrouter-key"}),
-        patch("litellm.acompletion", side_effect=unavailable_end),
-    ):
-        if failure_injection_point == "audit_raises_OperationalError_on_commit":
-            _drive_commit_failure_trace(harness, chosen_tool_call, chosen_arguments)
-            cancelled = False
-        elif failure_injection_point == "advisory_lock_unavailable":
-            _drive_advisory_lock_failure_trace(harness, chosen_tool_call, chosen_arguments)
-            cancelled = False
-        elif failure_injection_point == "tool_call_cap_exceeded":
-            _drive_tool_call_cap_trace(harness)
-            cancelled = False
-        elif failure_injection_point == "unknown_response_key":
-            _drive_unknown_response_key_trace(harness, chosen_tool_call, chosen_arguments)
-            cancelled = False
-        else:
-            cancelled = asyncio.run(
-                _drive_trace_async(
-                    harness,
-                    cancellation_arrival_time=cancellation_arrival_time,
-                    tool_call=chosen_tool_call,
-                    argument_dict=chosen_arguments,
-                )
-            )
-    if harness.completed_results:
-        assert not cancelled and len(harness.completed_results) == 1 and len(reviews) == 1
-        _assert_end_accounting(harness, settled=True)
-        assert len(sdk_messages) == 1
-        _assert_completed_trace_ledger(harness, harness.completed_results[0], reviews[0], sdk_messages[0])
-    else:
-        assert reviews == [], "Cancellation or failed atomic persistence must prevent END dispatch"
-        assert sdk_messages == []
-        assert harness.guard_requests == [] and harness.guard_http_requests == []
-        assert _provider_accounting_rows(harness) == ((), ())
-    outcome = _TraceOutcome(
-        cancellation_arrival_time=cancellation_arrival_time,
-        operation_id=harness.compose_context.fence.operation_id,
-        operation_epoch=harness.compose_context.fence.operation_epoch,
-        cancelled=cancelled,
-        assistant_ids=frozenset(row.id for row in _chat_rows(harness) if row.role == "assistant"),
-        tool_call_ids=frozenset(row.tool_call_id for row in _chat_rows(harness) if row.role == "tool"),
-        rows=_chat_rows(harness),
-        state_rows=_state_rows(harness),
-        tool_row_tier1_violations=observed_value(harness.sessions_service._telemetry.tool_row_tier1_violation_total),
-        tool_row_integrity_violations=observed_value(harness.sessions_service._telemetry.tool_row_integrity_violation_total),
-        tool_call_cap_exceeded=observed_value(harness.service._telemetry.tool_call_cap_exceeded_total),  # type: ignore[attr-defined]
-    )
-    _assert_common_invariants(harness)
-    return outcome
-
-
-def _assert_provider_settlement_rows(harness: _Harness, rows: tuple[Any, ...], sdk_messages: list[dict[str, Any]]) -> None:
-    from elspeth.contracts.hashing import stable_hash
-    from elspeth.web.composer.audit import _LLM_CALL_PUBLIC_AUDIT_FIELDS
-    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
-    from elspeth.web.composer.provider_context import capture_provider_context
-    from elspeth.web.composer.visible_tool_event import validate_visible_response_gap
-
-    assert len(rows) == 2
-    call_row, request_row = rows
-    assert all(row.role == "audit" and row.session_id == harness.session_id for row in rows)
-    assert all(row.composition_state_id is None and row.tool_call_id is None and row.parent_assistant_id is None for row in rows)
-    assert call_row.content == "Provider call result recorded."
-    envelopes = json.loads(call_row.tool_calls)
-    assert len(envelopes) == 2 and set(envelopes[0]) == {"_kind", "call"}
-    assert envelopes[0]["_kind"] == "llm_call_audit"
-    validate_visible_response_gap(envelopes[1], envelopes[0])
-    assert envelopes[1]["session_id"] == harness.session_id
-    assert envelopes[1]["operation_id"] == harness.compose_context.fence.operation_id
-    assert envelopes[1]["operation_epoch"] == harness.compose_context.fence.operation_epoch
-    call = envelopes[0]["call"]
-    assert set(call) == set(_LLM_CALL_PUBLIC_AUDIT_FIELDS)
-    attempts, ledger = _provider_accounting_rows(harness)
-    assert len(attempts) == len(ledger) == 1
-    assert call["call_id"] == attempts[0].attempt_id
-    assert attempts[0].ledger_entry_id == ledger[0].entry_id
-    assert call["model_requested"] == ledger[0].model == harness.service._settings.composer_advisor_model
-    assert (call["status"], call["error_class"], call["error_message"]) == ("auth_error", "AuthenticationError", "AuthenticationError")
-    assert call["model_returned"] is None and call["provider_request_id"] is None and call["finish_reason"] is None
-    assert call["messages_hash"] == stable_hash(sdk_messages)
-    assert call["tools_spec_hash"] is None and call["declared_tool_names"] == []
-
-    assert request_row.content == "Private credential-filtered diagnostic facts"
-    envelopes = json.loads(request_row.tool_calls)
-    assert len(envelopes) == 1
-    request = ComposerDiagnosticEvidence.from_envelope(
-        envelopes[0],
-        expected_session_id=harness.session_id,
-        expected_operation_id=harness.compose_context.fence.operation_id,
-        expected_tool_call_id=attempts[0].attempt_id,
-    )
-    assert request.operation_epoch == harness.compose_context.fence.operation_epoch
-    assert request.evidence_id == diagnostic_evidence_identity("provider-request", attempts[0].attempt_id)
-    assert request.status == "provider_request" and request.tool_name == "composer_provider_context"
-    # Apply the real privacy policy to the actual SDK input; generated text need not always be retainable.
-    expected = capture_provider_context(messages=sdk_messages, tools=None)
-    assert (request.arguments.disposition, request.arguments.content, request.arguments.reasons) == (
-        expected.disposition,
-        expected.canonical,
-        expected.reasons,
-    )
-    assert request.authority_arguments is None
-    assert (request.result.disposition, request.result.content, request.result.reasons) == ("not_returned", None, ())
-    assert (request.wire_arguments.disposition, request.wire_arguments.content, request.wire_arguments.reasons) == (
-        "unavailable",
-        None,
-        ("not_recorded",),
+    linked_state_ids = {row.composition_state_id for row in messages if row.role == "tool"}
+    orphan_states = tuple(row.id for row in rows["states"] if row.provenance == "tool_call" and row.id not in linked_state_ids)
+    return _AuditOutcome(
+        operation_id=operation_id,
+        provider_calls=len(sdk.requests),
+        provider_effects=sum(row.owner == "provider" for row in effects_for_operation),
+        tool_effects=sum(row.owner == "tool_dispatch" for row in effects_for_operation),
+        attempted_ids=frozenset(row.attempt_id for row in attempts),
+        ledger_ids=frozenset(row.entry_id for row in ledger),
+        linked_ledger_ids=frozenset(row.ledger_entry_id for row in attempts),
+        public_audit_ids=frozenset(public_ids),
+        public_audit_count=public_count,
+        private_request_ids=frozenset(private_ids),
+        private_request_count=private_count,
+        private_origins=frozenset(private_origins),
+        physical_origins=frozenset((row.attempt_id, row.operation_id, row.operation_epoch) for row in attempts),
+        sequence_numbers=tuple(row.sequence_no for row in messages),
+        orphan_tool_rows=orphan_tools,
+        orphan_tool_states=orphan_states,
     )
 
 
-def _assert_completed_trace_ledger(
-    harness: _Harness, result: ComposeLoopTestResult, review: dict[str, Any], sdk_messages: list[dict[str, Any]]
-) -> None:
-    from elspeth.contracts.hashing import stable_hash
-    from elspeth.web.composer import advisor_policy, no_tool_policy
-    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND, ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND
-    from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
-    from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope
-    from elspeth.web.composer.withheld_replies import withheld_reply_envelope
-    from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_or_tool_messages
-
-    rows = _chat_rows(harness)
-    prior = rows[:1] if rows[0].role == "user" else ()
-    if prior:
-        assert prior[0].content == "prior"
-    cohort = rows[len(prior) :]
-    assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit", "audit", "audit", "audit"]
-    _assert_guard_row(harness, cohort[3])
-    _assert_provider_settlement_rows(harness, cohort[4:6], sdk_messages)
-    # Remove only the validated guard and settlement rows; retain the original END oracle verbatim.
-    cohort = (*cohort[:3], *cohort[6:])
-    assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit"]
-    _assert_private_tool_cohort(cohort[:3], harness.compose_context.fence.operation_id, harness.compose_context.fence.operation_epoch)
-    assert cohort[1].composition_state_id == cohort[2].composition_state_id
-    assert all(row.session_id == harness.session_id for row in cohort)
-    pass_rows = cohort[3:4]
-    for index, row in enumerate(pass_rows, 1):
-        envelope = {
-            "_kind": ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
-            "pass": {
-                "phase": "end",
-                "pass_index": index,
-                "verdict": "unavailable",
-                "source": "model",
-                "findings_hash": stable_hash({"advisor_findings": advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL}),
-                "provider_attempts": 1,
-                "first_attempt_schema_valid": None,
-                "first_attempt_accepted": None,
-                "format_reprompt_sent": False,
-                "step_ids_offered": None,
-                "step_ids_kept": None,
-                "note_present": None,
-                "url_redactions": None,
-                "email_redactions": None,
-                "publication_verdict": None,
-                "publication_binding": None,
-            },
-        }
-        assert json.loads(row.tool_calls) == [envelope] and json.loads(row.content) == envelope
-    assert cohort[4].content == "Done."
-    assert json.loads(cohort[4].tool_calls) == [withheld_reply_envelope("advisor_publication_withheld", "Done.")]
-    assert cohort[5].content == advisor_policy.ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
-    assert json.loads(cohort[5].tool_calls) == [advisor_signoff_withheld_control_envelope(cohort[5].content)]
-    terminal = {
-        "_kind": ADVISOR_TERMINAL_PUBLICATION_AUDIT_KIND,
-        "publication": {
-            "branch": "terminal_block",
-            "reason": "unavailable",
-            "preflight_shape": "absent",
-            "findings_backend_authored": False,
-        },
-    }
-    assert json.loads(cohort[6].tool_calls) == [terminal] and json.loads(cohort[6].content) == terminal
-    states = _state_rows(harness)
-    assert all(state.provenance == "tool_call" for state in states)
-    assert {state.id for state in states} == ({cohort[1].composition_state_id} if cohort[1].composition_state_id else set())
-    effects = review["saved_effects"]
-    assert effects["verification"] == "verified" and effects["saved_revision_count"] == len(states)
-    saved_scope = f"Verified checkpoint evidence covers {len(states)} saved draft revisions. " + (
-        "There are net authored changes from the starting draft."
-        if effects["net_changed"]
-        else "There is no net authored change from the starting draft."
-    )
-    assert result.raw_assistant_content == saved_scope
-    base = saved_scope + no_tool_policy._ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
-    notice = f"Checkpoint save status: {saved_scope} Checkpoint evidence does not establish task completion."
-    assert result.assistant_message == base + "\n\n" + notice
-    assert no_tool_policy.visible_message_segments(content=result.assistant_message, raw_content=saved_scope) == (
-        *no_tool_policy.visible_message_segments(content=base, raw_content=saved_scope),
-        no_tool_policy.TrustedSystemNoticeSegment(notice),
-    )
-    assert result.runtime_preflight is not None and result.runtime_preflight.readiness.completion_ready is False
-    assert (
-        isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
-        and result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
-    )
-    stored = asyncio.run(harness.sessions_service.get_messages(uuid.UUID(harness.session_id), limit=None))
-    public = _composer_conversation_or_tool_messages(stored)
-    assert [str(row.id) for row in public] == [row.id for row in (*prior, *cohort[:2])]
-    assert all(row.content != "Done." and row.raw_content != "Done." for row in public)
-    history = _composer_chat_history(stored)
-    assert [item["role"] for item in history] == [*("user" for _ in prior), "assistant", "user"]
-    assert history[-1]["content"] == advisor_policy.ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE
-    assert all(item["content"] != "Done." for item in history)
-
-
-def _drive_advisory_lock_failure_trace(
-    harness: _Harness,
-    tool_call: ToolCallSpec,
-    argument_dict: Mapping[str, object],
-) -> None:
-    from elspeth.contracts.errors import AuditIntegrityError
-
-    real_session_write_lock = harness.sessions_service._session_write_lock
-
-    @contextlib.contextmanager
-    def _unavailable_session_write_lock(*_args: Any, **_kwargs: Any) -> Any:
-        raise OperationalError(
-            "session write lock acquisition",
-            {},
-            sqlite3.OperationalError("simulated session/advisory lock unavailable"),
-        )
-        yield
-
-    payload = _tool_call_payload(tool_call, argument_dict)
-    payload["name"] = "set_metadata"
-    payload["arguments"] = {"patch": {"name": "advisory unavailable property"}}
-    llm = _ReplayLLM(
-        (
-            _make_llm_response(tool_calls=[payload]),
-            _make_llm_response(content="Done."),
-        )
-    )
-    harness.sessions_service._session_write_lock = _unavailable_session_write_lock  # type: ignore[method-assign]
-    try:
-        with pytest.raises(AuditIntegrityError):
-            asyncio.run(_run_one_turn(harness, llm))
-    finally:
-        harness.sessions_service._session_write_lock = real_session_write_lock  # type: ignore[method-assign]
-
-
-def _drive_commit_failure_trace(
-    harness: _Harness,
-    tool_call: ToolCallSpec,
-    argument_dict: Mapping[str, object],
-) -> None:
-    original_do_commit = harness.sessions_service._engine.dialect.do_commit
-    fired = False
-
-    def _fail_once(dbapi_conn: object) -> None:
-        nonlocal fired
-        if not fired:
-            fired = True
-            raise sqlite3.OperationalError("simulated property COMMIT failure")
-        original_do_commit(dbapi_conn)
-
-    payload = _tool_call_payload(tool_call, argument_dict)
-    payload["name"] = "set_metadata"
-    payload["arguments"] = {"patch": {"name": "commit failure property"}}
-    llm = _ReplayLLM(
-        (
-            _make_llm_response(tool_calls=[payload]),
-            _make_llm_response(content="Done."),
-        )
-    )
-    with _instrument_tool_turn_commits(harness, _fail_once):
-        from elspeth.contracts.errors import AuditIntegrityError
-
-        with pytest.raises(AuditIntegrityError):
-            asyncio.run(_run_one_turn(harness, llm))
-    assert fired, "failure injection must reach the tool persistence commit"
-
-
-def _drive_tool_call_cap_trace(harness: _Harness) -> None:
-    llm = _ReplayLLM(
-        (
-            _make_llm_response(
-                tool_calls=[{"id": f"call_cap_{index}", "name": "get_pipeline_state", "arguments": {}} for index in range(17)]
+async def _completed_read_trace(path: Path, monkeypatch: pytest.MonkeyPatch, call_id: str) -> _AuditOutcome:
+    app_ref = []
+    sdk = _CostedSDK(
+        [
+            (
+                "primary",
+                lambda app: (
+                    "Reading the current pipeline state.",
+                    [tool_call(app, call_id, "get_pipeline_state", {})],
+                ),
             ),
+            ("primary", ("The current pipeline state has been inspected.", None)),
+            ("end", end_admit()),
+        ],
+        app_ref=app_ref,
+    )
+    install_sdk(monkeypatch, sdk)
+    operation_id = str(uuid4())
+    async with continuation_app(path, monkeypatch) as harness:
+        app_ref.append(harness.app)
+        terminal = await submit_and_settle(
+            harness,
+            message_body("Inspect the current pipeline.", operation_id=operation_id),
         )
+        assert terminal.status == "completed", terminal.error
+        assert sdk.roles == ["primary", "primary", "end"] and not sdk.steps
+        assert [content.split("\n\n---\n\n")[0] for content in assistant_contents(harness.app, harness.session_id)] == [
+            "The current pipeline state has been inspected."
+        ]
+        second_messages = sdk.requests[1]["messages"]
+        assert any(message.get("role") == "tool" and message.get("tool_call_id") == call_id for message in second_messages)
+        current_effects = effects(harness.app, operation_id)
+        assert all(row.disposition == "committed" for row in current_effects)
+        assert {row.owner for row in current_effects} >= {"provider", "tool_dispatch", "composer_end"}
+        assert any(row.owner == "tool_dispatch" and row.receipt_key and row.result_chunk_key for row in current_effects)
+        return _audit_outcome(harness.app, harness.session_id, operation_id, sdk)
+
+
+def test_continuation_audit_state_machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generated read-tool calls retain bidirectional audit and owner custody."""
+
+    class ContinuationAuditMachine(RuleBasedStateMachine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.outcomes: list[_AuditOutcome] = []
+
+        @rule(call_id=st.from_regex(r"call_[a-z0-9_]{1,12}", fullmatch=True))
+        def read_tool(self, call_id: str) -> None:
+            case = tmp_path / f"continuation-property-{uuid4().hex}"
+            case.mkdir()
+            self.outcomes.append(asyncio.run(_completed_read_trace(case, monkeypatch, call_id)))
+
+        @invariant()
+        def no_orphan_or_unaccounted_audit(self) -> None:
+            for outcome in self.outcomes:
+                assert outcome.provider_calls == 3
+                assert outcome.provider_effects == 2 and outcome.tool_effects == 1
+                assert len(outcome.attempted_ids) == outcome.provider_calls
+                assert outcome.public_audit_ids == outcome.private_request_ids == outcome.attempted_ids
+                assert outcome.public_audit_count == outcome.private_request_count == outcome.provider_calls
+                assert outcome.private_origins == outcome.physical_origins
+                assert None not in outcome.linked_ledger_ids
+                assert outcome.ledger_ids == outcome.linked_ledger_ids
+                assert len(outcome.ledger_ids) == outcome.provider_calls
+                assert outcome.sequence_numbers == tuple(sorted(set(outcome.sequence_numbers)))
+                assert not outcome.orphan_tool_rows and not outcome.orphan_tool_states
+
+    run_state_machine_as_test(ContinuationAuditMachine, settings=settings(max_examples=25, stateful_step_count=2, deadline=None))
+
+
+@pytest.mark.asyncio
+async def test_public_stop_during_parked_primary_keeps_paid_audit_and_no_assistant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A public Stop controls the worker; cancelling the HTTP observer does not."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    script = _CostedSDK([("primary", ("This reply must be withheld.", None)), ("end", end_admit())])
+
+    async def parked(**kwargs):
+        if kwargs["model"] == PRIMARY_MODEL:
+            entered.set()
+            await release.wait()
+        return await script(**kwargs)
+
+    install_sdk(monkeypatch, parked)
+    operation_id = str(uuid4())
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        async with harness.client() as client:
+            accepted = await client.post(
+                f"/api/sessions/{harness.session_id}/messages",
+                json=message_body("Wait for the model.", operation_id=operation_id),
+            )
+            assert accepted.status_code == 202, accepted.text
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=45.0)
+                cancelled = await client.post(f"/api/sessions/{harness.session_id}/operations/{operation_id}/cancel")
+                assert cancelled.status_code in (200, 202), cancelled.text
+            finally:
+                release.set()
+            terminal = await settle(harness, operation_id=operation_id, client=client)
+        assert terminal.status == "failed" and terminal.cancel_requested
+        assert assistant_contents(harness.app, harness.session_id) == []
+        outcome = _audit_outcome(harness.app, harness.session_id, operation_id, script)
+        assert outcome.provider_calls == 1
+        assert outcome.public_audit_ids == outcome.private_request_ids == outcome.attempted_ids
+        assert outcome.public_audit_count == outcome.private_request_count == outcome.provider_calls
+        assert outcome.private_origins == outcome.physical_origins
+        assert None not in outcome.linked_ledger_ids
+        assert outcome.ledger_ids == outcome.linked_ledger_ids and len(outcome.ledger_ids) == 1
+        assert not outcome.orphan_tool_rows and not outcome.orphan_tool_states
+
+
+@pytest.mark.asyncio
+async def test_tool_call_cap_refuses_before_any_tool_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The current phase owner rejects an over-cap model batch after paid PRIMARY."""
+    app_ref = []
+    script = _CostedSDK(
+        [
+            (
+                "primary",
+                lambda app: (
+                    "Over-cap tool batch.",
+                    [tool_call(app, f"cap_{index}", "get_pipeline_state", {}) for index in range(17)],
+                ),
+            )
+        ],
+        app_ref=app_ref,
     )
-    harness.service._max_tool_calls_per_turn = 16  # type: ignore[attr-defined]
-    with pytest.raises(ComposerConvergenceError):
-        asyncio.run(_run_one_turn(harness, llm))
-
-
-def _drive_unknown_response_key_trace(
-    harness: _Harness,
-    tool_call: ToolCallSpec,
-    argument_dict: Mapping[str, object],
-) -> None:
-    class _StrayToolResult(ToolResult):
-        def to_dict(self) -> dict[str, Any]:
-            payload = super().to_dict()
-            payload["stray_provider_field"] = "do-not-persist"
-            return payload
-
-    def _return_stray_result(
-        _tool_name: str,
-        _arguments: dict[str, Any],
-        state: CompositionState,
-        *_args: Any,
-        **_kwargs: Any,
-    ) -> ToolResult:
-        return _StrayToolResult(
-            success=True,
-            updated_state=state,
-            validation=state.validate(),
-            affected_nodes=(),
+    install_sdk(monkeypatch, script)
+    operation_id = str(uuid4())
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        app_ref.append(harness.app)
+        terminal = await submit_and_settle(
+            harness,
+            message_body("Inspect the current pipeline.", operation_id=operation_id),
         )
-
-    payload = _tool_call_payload(tool_call, argument_dict)
-    payload["name"] = "set_metadata"
-    payload["arguments"] = {"patch": {"name": "unknown response key property"}}
-    llm = _ReplayLLM(
-        (
-            _make_llm_response(tool_calls=[payload]),
-            _make_llm_response(content="Done."),
-        )
-    )
-    with patch.object(composer_tool_batch_module, "execute_tool", _return_stray_result):
-        asyncio.run(_run_one_turn(harness, llm))
-
-
-def _assert_common_invariants(harness: _Harness) -> None:
-    _assert_no_tool_row_without_parent_assistant(harness)
-    _assert_no_tool_state_without_tool_row(harness)
-    _assert_sequence_numbers_unique_and_monotonic(harness)
-    _assert_persisted_tool_payloads_match_manifest(harness)
-
-
-class ComposeLoopAuditMachine(RuleBasedStateMachine):
-    def __init__(self) -> None:
-        super().__init__()
-        self.outcomes: list[_TraceOutcome] = []
-        self.cancellation_points_seen: set[CancellationArrivalTime] = set()
-
-    @initialize()
-    def start_session(self) -> None:
-        self.outcomes = []
-        self.cancellation_points_seen = set()
-
-    @rule(
-        tool_call=st_tool_call(),
-        argument_dict=st_argument_dict(),
-        redaction_policy=st_redaction_policy(),
-        failure_injection_point=st_failure_injection_point(),
-        cancellation_arrival_time=st_cancellation_arrival_time(),
-        session_state=st_session_state(),
-    )
-    def compose_turn(
-        self,
-        tool_call: ToolCallSpec,
-        argument_dict: Mapping[str, object],
-        redaction_policy: RedactionPolicy,
-        failure_injection_point: FailureInjectionPoint,
-        cancellation_arrival_time: CancellationArrivalTime,
-        session_state: SessionState,
-    ) -> None:
-        if redaction_policy == "unknown_response_key":
-            failure_injection_point = "unknown_response_key"
-        outcome = _drive_single_example_trace(
-            cancellation_arrival_time=cancellation_arrival_time,
-            tool_call=tool_call,
-            argument_dict=argument_dict,
-            failure_injection_point=failure_injection_point,
-            session_state=session_state,
-        )
-        self.outcomes.append(outcome)
-        self.cancellation_points_seen.add(outcome.cancellation_arrival_time)
-
-    @invariant()
-    def audit_rows_are_bidirectional(self) -> None:
-        for outcome in self.outcomes:
-            assert not [row for row in outcome.state_rows if row.provenance == "tool_call" and not outcome.tool_call_ids]
-
-    @invariant()
-    def cancellation_outcomes_are_classified(self) -> None:
-        for outcome in self.outcomes:
-            assert outcome.cancellation_arrival_time in CANCELLATION_ARRIVAL_TIMES
-
-    @invariant()
-    def counters_stay_non_negative(self) -> None:
-        for outcome in self.outcomes:
-            assert outcome.tool_row_tier1_violations >= 0
-            assert outcome.tool_row_integrity_violations >= 0
-            assert outcome.tool_call_cap_exceeded >= 0
-
-
-TestComposeLoopAuditMachine = ComposeLoopAuditMachine.TestCase
-TestComposeLoopAuditMachine.settings = settings(max_examples=25, stateful_step_count=2, deadline=None)
-
-
-@example(cancellation_arrival_time="before_llm_call")
-@example(cancellation_arrival_time="during_llm_call")
-@example(cancellation_arrival_time="after_llm_before_tool")
-@example(cancellation_arrival_time="during_tool_dispatch")
-@example(cancellation_arrival_time="after_tool_before_sync_dispatch")
-@example(cancellation_arrival_time="during_run_sync_between_insert_and_commit")
-@example(cancellation_arrival_time="during_advisory_lock_acquisition")
-@example(cancellation_arrival_time="after_commit_before_response_yielded")
-@example(cancellation_arrival_time="after_response_yielded")
-@settings(max_examples=50, deadline=None)
-@given(cancellation_arrival_time=st_cancellation_arrival_time())
-def test_compose_loop_audit_machine_examples(cancellation_arrival_time: CancellationArrivalTime) -> None:
-    outcome = _drive_single_example_trace(cancellation_arrival_time=cancellation_arrival_time)
-    assert outcome.cancellation_arrival_time == cancellation_arrival_time
-    if cancellation_arrival_time in {
-        "during_run_sync_between_insert_and_commit",
-        "after_commit_before_response_yielded",
-        "after_response_yielded",
-    }:
-        if cancellation_arrival_time == "after_response_yielded":
-            assert [row.role for row in outcome.rows] == [
-                "assistant",
-                "tool",
-                "audit",
-                "audit",
-                "audit",
-                "audit",
-                "audit",
-                "audit",
-                "audit",
-                "audit",
-            ]
-            assert len(outcome.state_rows) == 1 and outcome.state_rows[0].id == outcome.rows[1].composition_state_id
-        else:
-            assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit"]
-        _assert_private_tool_cohort(outcome.rows[:3], outcome.operation_id, outcome.operation_epoch)
-    if cancellation_arrival_time in {
-        "before_llm_call",
-        "during_llm_call",
-        "after_llm_before_tool",
-        "during_tool_dispatch",
-        "after_tool_before_sync_dispatch",
-        "during_advisory_lock_acquisition",
-    }:
-        assert outcome.rows == ()
-
-
-def test_failure_injection_strategy_contains_required_arms() -> None:
-    assert set(FAILURE_INJECTION_POINTS) == {
-        "none",
-        "audit_raises_OperationalError_on_commit",
-        "advisory_lock_unavailable",
-        "tool_call_cap_exceeded",
-        "unknown_response_key",
-    }
-
-
-@pytest.mark.parametrize("failure_injection_point", FAILURE_INJECTION_POINTS)
-def test_failure_injection_arms_are_mechanically_drivable(failure_injection_point: FailureInjectionPoint) -> None:
-    outcome = _drive_single_example_trace(
-        cancellation_arrival_time="after_response_yielded",
-        failure_injection_point=failure_injection_point,
-    )
-    if failure_injection_point in {
-        "audit_raises_OperationalError_on_commit",
-        "advisory_lock_unavailable",
-        "tool_call_cap_exceeded",
-    }:
-        assert outcome.rows == ()
-
-
-def test_otel_counter_postconditions() -> None:
-    """§1.4 SLO counters stay dark except for explicit injected faults."""
-
-    success = _drive_single_example_trace(cancellation_arrival_time="after_response_yielded")
-    assert success.tool_row_tier1_violations == 0
-    assert success.tool_row_integrity_violations == 0
-    assert success.tool_call_cap_exceeded == 0
-
-    cap = _drive_single_example_trace(
-        cancellation_arrival_time="after_response_yielded",
-        failure_injection_point="tool_call_cap_exceeded",
-    )
-    assert cap.tool_row_tier1_violations == 0
-    assert cap.tool_row_integrity_violations == 0
-    assert cap.tool_call_cap_exceeded == 1
-
-    tier1 = _drive_single_example_trace(
-        cancellation_arrival_time="after_response_yielded",
-        failure_injection_point="audit_raises_OperationalError_on_commit",
-    )
-    assert tier1.tool_row_tier1_violations == 1
-    assert tier1.tool_row_integrity_violations == 0
-    assert tier1.rows == ()
+        assert terminal.status == "failed" and terminal.error is not None
+        assert script.roles == ["primary"]
+        current_effects = effects(harness.app, operation_id)
+        assert any(row.owner == "provider" and row.disposition == "committed" for row in current_effects)
+        assert not any(row.owner == "tool_dispatch" for row in current_effects)
+        outcome = _audit_outcome(harness.app, harness.session_id, operation_id, script)
+        assert outcome.public_audit_ids == outcome.private_request_ids == outcome.attempted_ids
+        assert outcome.public_audit_count == outcome.private_request_count == outcome.provider_calls
+        assert outcome.private_origins == outcome.physical_origins
+        assert None not in outcome.linked_ledger_ids
+        assert outcome.ledger_ids == outcome.linked_ledger_ids and len(outcome.ledger_ids) == 1

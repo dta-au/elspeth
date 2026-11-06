@@ -2,9 +2,11 @@
 
 import json
 from dataclasses import replace
+from uuid import UUID
 
 import pytest
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -77,7 +79,11 @@ def test_current_projection_roundtrip_preserves_amendments_and_review_authority(
     catalog = _mock_catalog()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    visible = json.loads(build_context_string(state, policy, plugin_snapshot=snapshot).split("\n", 1)[1])["current_state"]
+    context = build_context_string(state, policy, plugin_snapshot=snapshot, content_scope=ComposerContentScope(UUID(int=1), before_hash))
+    view = json.loads(context.split("\n", 1)[1])["current_state"]
+    assert view["schema_version"] == "composer.bounded-view.v1"
+    assert view["content_manifest"]["values"] == []
+    visible = view["data"]
     node = visible["nodes"][0]
     options = node["options"]
     original = state.nodes[0].options

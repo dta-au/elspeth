@@ -76,7 +76,7 @@ def _run_rule(rule_id: str, root: str, *, allowlist_dir: Path | None = None) -> 
     matching the CI's separation of "did the lint find anything" from "did the
     lint process crash".
     """
-    env = {**os.environ, "PYTHONPATH": str(ELSPETH_LINTS_SRC)}
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "src"), str(ELSPETH_LINTS_SRC)))}
     resolved_root = root if Path(root).is_absolute() else str(REPO_ROOT / root)
     command = [
         str(PYTHON),

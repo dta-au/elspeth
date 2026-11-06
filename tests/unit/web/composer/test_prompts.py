@@ -16,7 +16,9 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
+from uuid import UUID
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
@@ -26,6 +28,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
 from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.prompts import (
     CATALOG_CONTEXT_PREFIX,
@@ -118,7 +121,13 @@ def build_context_string(state: CompositionState, catalog: CatalogService, **kwa
     kwargs.pop("secret_service", None)
     kwargs.pop("user_id", None)
     view, snapshot = _trained_policy_context(catalog)
-    return _build_context_string(state, view, plugin_snapshot=snapshot, **kwargs)
+    return _build_context_string(
+        state,
+        view,
+        plugin_snapshot=snapshot,
+        content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
+        **kwargs,
+    )
 
 
 def build_catalog_context_string(catalog: CatalogService) -> str:
@@ -144,6 +153,7 @@ def build_messages(
         view,
         data_dir,
         plugin_snapshot=snapshot,
+        content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
         **kwargs,
     )
 
@@ -365,8 +375,8 @@ class TestBuildMessages:
             state = result.updated_state
 
         assert [json.loads(message["content"])["version"] for message in messages if message["role"] == "tool"] == [3, 4]
-        assert snapshot["current_state"]["version"] == 2
-        assert snapshot["current_state"]["metadata"]["name"] == "Test Pipeline"
+        assert snapshot["current_state"]["data"]["version"] == 2
+        assert snapshot["current_state"]["data"]["metadata"]["name"] == "Test Pipeline"
         header = snapshot_content.split("\n", 1)[0]
         assert "snapshot at context construction" in header
         assert "as of current_state.version" in header
@@ -377,8 +387,8 @@ class TestBuildMessages:
 
         refreshed = build_messages([], state, "Continue.", catalog, schemas_loaded=frozenset())
         refreshed_snapshot = json.loads(refreshed[-2]["content"].split("\n", 1)[1])
-        assert refreshed_snapshot["current_state"]["version"] == 4
-        assert refreshed_snapshot["current_state"]["metadata"]["name"] == "Renamed pipeline"
+        assert refreshed_snapshot["current_state"]["data"]["version"] == 4
+        assert refreshed_snapshot["current_state"]["data"]["metadata"]["name"] == "Renamed pipeline"
         assert refreshed_snapshot["composer_progress"] == snapshot["composer_progress"]
 
     def test_untrusted_state_is_not_emitted_as_system_message(self) -> None:
@@ -574,7 +584,7 @@ class TestBuildContextString:
         context = build_context_string(state, catalog)
         parsed = json.loads(context.split("\n", 1)[1])
 
-        validation = parsed["current_state"]["validation"]
+        validation = parsed["validation"]
         assert "is_valid" in validation
         assert "errors" in validation
 
@@ -585,7 +595,7 @@ class TestBuildContextString:
         context = build_context_string(state, catalog)
         parsed = json.loads(context.split("\n", 1)[1])
 
-        assert parsed["current_state"]["metadata"]["name"] == "Test Pipeline"
+        assert parsed["current_state"]["data"]["metadata"]["name"] == "Test Pipeline"
 
     def test_includes_warnings_and_suggestions(self) -> None:
         """Validation context must include warnings and suggestions, not just errors."""
@@ -595,7 +605,7 @@ class TestBuildContextString:
         context = build_context_string(state, catalog)
         parsed = json.loads(context.split("\n", 1)[1])
 
-        validation = parsed["current_state"]["validation"]
+        validation = parsed["validation"]
         assert "warnings" in validation
         assert "suggestions" in validation
 
@@ -1319,7 +1329,7 @@ class TestServerOwnedMetadataProjection:
     def test_context_state_drops_server_owned_keys_and_reduces_requirement_rows(self) -> None:
         state = self._review_bound_state()
         context = build_context_string(state, _stub_catalog())
-        current = json.loads(context.split("\n", 1)[1])["current_state"]
+        current = json.loads(context.split("\n", 1)[1])["current_state"]["data"]
 
         source_options = current["sources"]["source"]["options"]
         assert SOURCE_AUTHORING_KEY not in source_options
@@ -1435,7 +1445,9 @@ class TestServerOwnedMetadataProjection:
 
         real_catalog = create_catalog_service()
         context = build_context_string(previous, real_catalog)
-        current = json.loads(context.split("\n", 1)[1])["current_state"]
+        displayed = json.loads(context.split("\n", 1)[1])["current_state"]
+        assert displayed["content_manifest"]["values"] == []
+        current = displayed["data"]
         # The context block carries only the reduced projection.
         echoed_row = current["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]
         assert set(echoed_row) == {"id", "kind", "user_term", "historical_draft", "status"}

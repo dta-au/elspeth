@@ -1,0 +1,623 @@
+"""Drive a Composer request through the production app, worker and Continuation driver.
+
+Only the external SDK (``litellm.acompletion``) and the Azure prompt-guard HTTP
+boundary are scripted. Everything between admission and the sealed terminal
+is production code. This mirrors the U-40 completion-owner harness
+(``tests/unit/web/sessions/test_continuation_completion_owners.py``) so that
+tests ported off the deleted V1 lifecycle share one shape.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import httpx
+import litellm
+import pytest
+from fastapi import FastAPI
+from litellm import ModelResponse
+from pydantic import SecretStr
+from sqlalchemy import select
+
+from elspeth.contracts.hashing import canonical_json
+from elspeth.web.app import create_app
+from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.composer import prompt_guard_clients
+from elspeth.web.composer.continuation_advisor import ContinuationAdvisorInvocation
+from elspeth.web.composer.continuation_progress import decode_continuation_frontier
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+from elspeth.web.config import WebSettings
+from elspeth.web.prompt_guard_config import PromptGuardSettings
+from elspeth.web.sessions.models import chat_messages_table, composer_continuation_effects_table
+from elspeth.web.sessions.schemas import ComposerOperationSnapshot
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+
+PRIMARY_MODEL = "test/model"
+ADVISOR_MODEL = "test/advisor"
+ACTOR = "continuation-user"
+
+
+def install_clean_guard(monkeypatch: pytest.MonkeyPatch) -> PromptGuardSettings:
+    """A prompt guard whose HTTP boundary reports no attack for every document."""
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in body["documents"]],
+            },
+        )
+
+    monkeypatch.setattr(
+        prompt_guard_clients,
+        "build_prompt_guard_client",
+        lambda configuration: AzurePromptGuardClient(configuration, http_transport=httpx.MockTransport(serve)),
+    )
+    return PromptGuardSettings(endpoint="https://guard.example.test", subscription_key=SecretStr("fixture-guard-credential"))
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuationApp:
+    app: FastAPI
+    token: str
+    session_id: UUID
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test", headers=self.headers)
+
+
+def continuation_settings(tmp_path: Path, guard: PromptGuardSettings, **overrides: Any) -> WebSettings:
+    values: dict[str, Any] = {
+        "data_dir": tmp_path,
+        "landscape_url": f"sqlite:///{tmp_path}/runs/audit.db",
+        "payload_store_path": tmp_path / "payloads",
+        "composer_model": PRIMARY_MODEL,
+        "composer_advisor_model": ADVISOR_MODEL,
+        "composer_prompt_guard": guard,
+        "composer_advisor_prompt_guard": guard,
+        "composer_prompt_guard_mode": "required",
+        "composer_max_composition_turns": 15,
+        "composer_max_discovery_turns": 10,
+        "composer_timeout_seconds": 85.0,
+        "composer_boot_probe_enabled": False,
+        "composer_rate_limit_per_minute": 100,
+        "shareable_link_signing_key": b"\x00" * 32,
+        "plugin_allowlist": ("transform:passthrough",),
+        "composer_async_scan_interval_seconds": 0.05,
+    }
+    values.update(overrides)
+    return WebSettings(**values)
+
+
+@asynccontextmanager
+async def continuation_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **settings_overrides: Any) -> AsyncIterator[ContinuationApp]:
+    """The production app, lifespan and worker; only external I/O is scripted."""
+    from tests.helpers.fenced_session import seed_token_policies
+
+    settings = continuation_settings(tmp_path, install_clean_guard(monkeypatch), **settings_overrides)
+    app = create_app(settings=settings)
+    async with app.router.lifespan_context(app):
+        provider = app.state.auth_provider
+        assert isinstance(provider, LocalAuthProvider)
+        provider.create_user(ACTOR, "test continuation password", "Continuation User")
+        with app.state.session_engine.begin() as conn:
+            ensure_test_identity(conn, identity_id=ACTOR)
+            grant_test_pipeline_user(conn, identity_id=ACTOR)
+            seed_token_policies(conn, identity_id=ACTOR)
+        token = provider._issuer.mint(identity_id=ACTOR, username=ACTOR)
+        session = await app.state.session_service.create_session(user_id=ACTOR, title="Continuation evidence", auth_provider_type="local")
+        yield ContinuationApp(app=app, token=token, session_id=session.id)
+
+
+def sdk_reply(
+    content: str | None, tool_calls: Sequence[dict[str, Any]] | None = None, *, model: str = PRIMARY_MODEL, cost: float | None = 0.01
+) -> ModelResponse:
+    usage = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    if cost is not None:
+        usage["cost"] = cost
+    return ModelResponse(
+        model=model,
+        choices=[
+            {
+                "finish_reason": "tool_calls" if tool_calls else "stop",
+                "message": {"role": "assistant", "content": content, "tool_calls": list(tool_calls) if tool_calls else None},
+            }
+        ],
+        usage=usage,
+    )
+
+
+def end_admit(findings: str = "The reply answers the request and changes nothing.") -> dict[str, Any]:
+    """A clean END Advisor verdict that admits publication."""
+    return {
+        "verdict": "CLEAN",
+        "category": "other",
+        "steps": [],
+        "findings": findings,
+        "note": None,
+        "publication_verdict": "ADMIT",
+    }
+
+
+def semantic_primary_response(
+    request: dict[str, Any], *, instruction: str = "Use the retained inspection to explain the current pipeline to the user."
+) -> dict[str, Any]:
+    """One SDK response bound to the actual semantic request's own premise.
+
+    This runs only at the external scripted SDK boundary. It does not produce
+    a graph, tell a custody it dispatched, or replace the production parser.
+    """
+    assert request["model"] == ADVISOR_MODEL and "tools" not in request
+    schema = request["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["schema_version"]["const"] == "composer.continuation-decision.v1"
+    retained = json.loads(request["messages"][-1]["content"])
+    source = ContinuationAdvisorInvocation.model_validate_json(canonical_json(retained["source"]), strict=True)
+    frontier = decode_continuation_frontier(retained["frontier"])
+    assert source.kind == "semantic" and source.premise is not None
+    obligations = [item.obligation_id for item in frontier.obligations if item.status == "open"]
+    assert obligations
+    return {
+        "schema_version": "composer.continuation-decision.v1",
+        "decision": "CONTINUE",
+        "scope": "whole_request",
+        "obligation_ids": obligations,
+        "obligations": [],
+        "evidence": [],
+        "reason": "The actual inspected state supports one concrete explanatory PRIMARY turn.",
+        "remaining_actionable_ids": obligations,
+        "prescribed_action": {
+            "kind": "primary_turn",
+            "obligation_ids": obligations,
+            "evidence_ids": [],
+            "input_hash": source.premise.input_hash,
+            "graph_hash": frontier.graph_hash,
+            "policy_hash": source.premise.policy_hash,
+            "tool_manifest_hash": source.premise.tool_manifest_hash,
+            "instruction": instruction,
+        },
+    }
+
+
+def semantic_read_response(request: dict[str, Any], *, tool_name: str = "get_pipeline_state", arguments_json: str = "{}") -> dict[str, Any]:
+    answer = semantic_primary_response(request)
+    action = answer["prescribed_action"]
+    action.pop("instruction")
+    action.update(kind="read_tool", tool_name=tool_name, arguments_json=arguments_json)
+    answer["reason"] = "Use the real read owner to inspect an unresolved source fact before review."
+    return answer
+
+
+def semantic_review_response(request: dict[str, Any]) -> dict[str, Any]:
+    from elspeth.web.composer.continuation_end_values import EndContinuationCandidate, continuation_candidate_id
+
+    answer = semantic_primary_response(request)
+    retained = json.loads(request["messages"][-1]["content"])
+    candidate = EndContinuationCandidate.model_validate_json(canonical_json(retained["end_candidate"]), strict=True)
+    source = ContinuationAdvisorInvocation.model_validate_json(canonical_json(retained["source"]), strict=True)
+    action = answer["prescribed_action"]
+    action.pop("instruction")
+    action.update(kind="review", candidate_ref=continuation_candidate_id(candidate), evidence_binding=source.coverage_binding)
+    answer["reason"] = "The actual retained candidate must pass the original shared END review."
+    return answer
+
+
+def semantic_stop_response(request: dict[str, Any]) -> dict[str, Any]:
+    answer = semantic_primary_response(request)
+    retained = json.loads(request["messages"][-1]["content"])
+    # The provider sees public paid-call DATA, not the complete retained codec.
+    actual_review = retained["review_result"]
+    assert type(actual_review["publication_binding"]) is str and len(actual_review["publication_binding"]) == 64
+    assert all(not {"private_request", "private_failure", "private_diagnostics"}.intersection(call) for call in actual_review["llm_calls"])
+    frontier = decode_continuation_frontier(retained["frontier"])
+    answer.update(
+        decision="STOP_CONFIRMED",
+        remaining_actionable_ids=[],
+        prescribed_action=None,
+        obligation_ids=[item.obligation_id for item in frontier.obligations],
+        obligations=[
+            {
+                "obligation_id": item.obligation_id,
+                "parent_id": item.parent_id,
+                "description": item.description,
+                "original_message_id": item.original_message_id,
+                "start": item.start,
+                "end": item.end,
+                "status": "satisfied",
+            }
+            for item in frontier.obligations
+        ],
+        reason="The complete real reviewed result addresses the originating request; no actionable work remains.",
+    )
+    return answer
+
+
+def tool_call(app: FastAPI, call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """A provider tool call in the app's own planner dialect."""
+    from elspeth.contracts.hashing import canonical_json
+    from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
+
+    dialect = app.state.composer_service._planner_dialect
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": canonical_json(encode_semantic_arguments(name, dialect, arguments))},
+    }
+
+
+type ScriptStep = tuple[str, Any]
+
+
+class ScriptedSDK:
+    """Physical SDK replies in order; each step names the role it must serve.
+
+    ``("primary", (content, tool_calls))`` serves the composer model with the
+    full palette; the payload may also be a callable taking the app, for tool
+    calls that need the app's planner dialect. ``("end", verdict)`` serves the
+    END Advisor review; a string payload supplies deliberately malformed text.
+    ``("early", verdict)`` serves the EARLY checkpoint. A checkpoint payload
+    callable receives actual SDK kwargs, allowing reached-cut assertions before
+    an externally malformed reply. ``("semantic", response_factory)`` serves the actual
+    semantic Advisor request; its callable receives the real SDK kwargs and
+    may return a complete ModelResponse for exact malformed bytes or metadata.
+    ``("raise", exception)`` raises the original exception
+    object at the SDK boundary, whatever the request.
+    """
+
+    def __init__(self, steps: Sequence[ScriptStep], *, app_ref: list[FastAPI] | None = None) -> None:
+        self.steps = list(steps)
+        self.requests: list[dict[str, Any]] = []
+        self.app_ref = app_ref if app_ref is not None else []
+
+    async def __call__(self, **kwargs: Any) -> object:
+        assert self.steps, "unscripted physical SDK call"
+        role, payload = self.steps.pop(0)
+        self.requests.append({"role": role, **kwargs})
+        if role == "raise":
+            raise payload
+        if role == "primary":
+            assert kwargs["model"] == PRIMARY_MODEL
+            assert kwargs["tools"], "every PRIMARY call carries the provider palette"
+            if callable(payload):
+                payload = payload(self.app_ref[0])
+            content, calls = payload
+            return sdk_reply(content, calls)
+        if role == "semantic":
+            assert kwargs["model"] == ADVISOR_MODEL and "tools" not in kwargs
+            response = payload(kwargs) if callable(payload) else payload
+            if isinstance(response, ModelResponse):
+                return response
+            return sdk_reply(json.dumps(response), model=ADVISOR_MODEL)
+        assert role in ("early", "end") and kwargs["model"] == ADVISOR_MODEL and "response_format" in kwargs, role
+        if callable(payload):
+            payload = payload(kwargs)
+        return ModelResponse(
+            model=ADVISOR_MODEL,
+            choices=[
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": payload if type(payload) is str else json.dumps(payload),
+                        "tool_calls": None,
+                    },
+                }
+            ],
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
+        )
+
+    @property
+    def roles(self) -> list[str]:
+        return [request["role"] for request in self.requests]
+
+
+def install_sdk(monkeypatch: pytest.MonkeyPatch, sdk: Callable[..., Any]) -> None:
+    monkeypatch.setattr(litellm, "acompletion", sdk)
+
+
+@dataclass(slots=True)
+class SupportedPathObservation:
+    """Actual driver cuts and watcher identities, never a replacement scheduler."""
+
+    events: list[dict[str, Any]] = field(default_factory=list)
+    watched_tasks: set[int] = field(default_factory=set)
+
+    def require_driver_stages(self) -> None:
+        entries = [event for event in self.events if event["boundary"] == "advance" and event["event"] == "entry"]
+        assert entries
+        assert all(event["clock_bound"] and event["sql_owner_bound"] and event["task_id"] in self.watched_tasks for event in entries)
+
+
+@contextmanager
+def observe_supported_path(
+    monkeypatch: pytest.MonkeyPatch, *, operation_id: str, session_id: UUID, artifact: Path
+) -> Iterator[SupportedPathObservation]:
+    """Write complete bounded metadata even when a predecessor/assertion fails."""
+    from elspeth.web.sessions.continuation_driver import _SegmentDriver
+
+    observed = SupportedPathObservation()
+    original_watch = _SegmentDriver.watch_stage
+
+    async def watch(driver: _SegmentDriver, stage: Any, reader: Any) -> None:
+        if driver.running.claim.operation_id == operation_id and driver.running.claim.session_id == session_id:
+            observed.watched_tasks.add(id(stage))
+        return await original_watch(driver, stage, reader)
+
+    with monkeypatch.context() as scoped:
+        observed.events = observe_original_driver_failures(scoped, operation_id, session_id=session_id)
+        scoped.setattr(_SegmentDriver, "watch_stage", watch)
+        try:
+            yield observed
+        finally:
+            artifact.write_text(
+                json.dumps({"events": observed.events, "watched_tasks": sorted(observed.watched_tasks)}, indent=2), encoding="utf-8"
+            )
+
+
+def observe_original_driver_failures(monkeypatch: pytest.MonkeyPatch, operation_id: str, *, session_id: UUID) -> list[dict[str, Any]]:
+    """Observe original worker failures without changing dispatch or logging payloads.
+
+    Retained private failure facts omit traceback locations. Observe both
+    escaping exceptions and originals carried by successfully reserved no-SDK
+    permits. Tests retain bounded metadata while original results, exceptions
+    and settlement remain unchanged.
+    """
+    from hashlib import sha256
+    from time import monotonic, perf_counter
+    from traceback import extract_tb
+
+    from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalPermit
+    from elspeth.web.sessions.continuation_driver import _SegmentDriver
+
+    observations: list[dict[str, Any]] = []
+    original_advance, original_settle = _SegmentDriver.advance, _SegmentDriver.settle
+    original_refusal, original_v4_refusal = PrimaryNoSdkIssuer.reserve_refusal, PrimaryNoSdkIssuer.reserve_v4_refusal
+
+    project_root = Path(__file__).resolve().parents[2]
+
+    def exception_data(error: BaseException, depth: int = 0) -> dict[str, Any]:
+        first = error.args[0] if error.args and type(error.args[0]) is str else None
+        line = first.splitlines()[0] if first else ""
+        # An exception may contain provider words or tool arguments. Preserve
+        # a matching digest/length and print only a small fixed vocabulary.
+        safe_line = line if line in {"", "cancelled", "deadline expired", "operation cancelled"} else "[redacted]"
+        frames = []
+        for frame in extract_tb(error.__traceback__)[-16:]:
+            filename = Path(frame.filename)
+            safe_path = filename.relative_to(project_root).as_posix() if filename.is_relative_to(project_root) else filename.name
+            frames.append((safe_path, frame.name, frame.lineno))
+        data: dict[str, Any] = {
+            "type": type(error).__name__,
+            "first_line": safe_line,
+            "line_length": len(line),
+            "line_sha256": sha256(line.encode("utf-8", errors="replace")).hexdigest(),
+            "frames": tuple(frames),
+        }
+        if isinstance(error, BaseExceptionGroup):
+            data["members"] = tuple(exception_data(member, depth + 1) for member in error.exceptions[:8]) if depth < 2 else ("depth_limit",)
+        return data
+
+    def record_refusal(permit: PrimaryNoSdkRefusalPermit, method: str) -> None:
+        matched = False
+        try:
+            claim = permit.issuer.running.claim
+            matched = claim.operation_id == operation_id and claim.session_id == session_id
+            if matched:
+                observations.append(
+                    {
+                        "boundary": "primary_no_sdk_refusal",
+                        "event": "reserved",
+                        "method": method,
+                        "reason": permit.reason.value,
+                        "cursor": permit.prepared.snapshot.cursor,
+                        "effect_key": permit.prepared.binding.effect_key,
+                        "original": exception_data(permit.original_failure),
+                    }
+                )
+        except Exception:
+            if matched:
+                observations.append({"boundary": "primary_no_sdk_refusal", "event": "observation_unavailable", "method": method})
+
+    def reserve_refusal(issuer: PrimaryNoSdkIssuer, *, reason: Any, original_failure: BaseException) -> PrimaryNoSdkRefusalPermit:
+        permit = original_refusal(issuer, reason=reason, original_failure=original_failure)
+        record_refusal(permit, "reserve_refusal")
+        return permit
+
+    def reserve_v4_refusal(
+        issuer: PrimaryNoSdkIssuer, *, admission: Any, reason: Any, original_failure: BaseException
+    ) -> PrimaryNoSdkRefusalPermit:
+        permit = original_v4_refusal(issuer, admission=admission, reason=reason, original_failure=original_failure)
+        record_refusal(permit, "reserve_v4_refusal")
+        return permit
+
+    def action_kind(driver: _SegmentDriver, clock: Any) -> str | None:
+        if clock is None:
+            return None
+        policy = driver.sql_deadline.policy.actions
+        return next(
+            (
+                name
+                for candidate, name in (
+                    (policy.primary, "primary"),
+                    (policy.advisor, "advisor"),
+                    (policy.title, "title"),
+                    (policy.read, "read"),
+                    (policy.session_sql, "session_sql"),
+                    (policy.blob, "blob"),
+                    (policy.external, "external"),
+                )
+                if clock.policy is candidate
+            ),
+            "unmapped",
+        )
+
+    async def advance(driver: _SegmentDriver, stored: Any, selected: Any) -> Any:
+        if driver.running.claim.operation_id != operation_id or driver.running.claim.session_id != session_id:
+            return await original_advance(driver, stored, selected)
+        claim = driver.running.claim
+        started = perf_counter()
+        before_ordinal = driver._action_ordinal
+        bound_clock = driver._action_clock
+        task = asyncio.current_task()
+        source: dict[str, Any] = {"boundary": "advance", "event": "entry", "cursor": stored.cursor}
+        try:
+            frame = selected.stack.frames[-1]
+            source.update(
+                {
+                    "frame": frame.model_dump(include={"frame_kind", "phase", "ingress_phase"}),
+                    "segment": claim.segment_sequence,
+                    "generation": claim.ownership_generation,
+                    "attempt": claim.attempt,
+                    "action_ordinal_before": before_ordinal,
+                    "action_kind": action_kind(driver, bound_clock),
+                    "driver_id": id(driver),
+                    "task_id": None if task is None else id(task),
+                    "clock_bound": bound_clock is not None and driver.phases.action_clock is bound_clock,
+                    "sql_owner_bound": driver.work.coordinator.sql_deadline_owner is driver.sql_deadline,
+                    "perf_counter": started,
+                }
+            )
+        except Exception:
+            source["frame"] = "observation_unavailable"
+        observations.append(source)
+        original_error: BaseException | None = None
+        try:
+            return await original_advance(driver, stored, selected)
+        except BaseException as error:
+            original_error = error
+            raise
+        finally:
+            # Observation must never replace a real worker result or error.
+            try:
+                now = monotonic()
+                runtime = driver.phases.runtime
+                exit_task = asyncio.current_task()
+                exit_row: dict[str, Any] = {
+                    "boundary": "advance",
+                    "event": "exit",
+                    "cursor": stored.cursor,
+                    "frame": source["frame"],
+                    "segment": claim.segment_sequence,
+                    "generation": claim.ownership_generation,
+                    "attempt": claim.attempt,
+                    "action_ordinal_after": driver._action_ordinal,
+                    "action_kind": action_kind(driver, bound_clock),
+                    "clock_identity_changed": driver._action_clock is not bound_clock,
+                    "driver_id": id(driver),
+                    "task_id": None if exit_task is None else id(exit_task),
+                    "action_total": None if bound_clock is None else bound_clock.policy.total,
+                    "action_preparation": None if bound_clock is None else bound_clock.policy.preparation,
+                    "remaining_preparation": None if bound_clock is None else bound_clock.preparation_deadline_monotonic - now,
+                    "remaining_clock_loop": None if bound_clock is None else bound_clock.deadline - asyncio.get_running_loop().time(),
+                    "elapsed_seconds": perf_counter() - started,
+                    "remaining_action": driver.sql_deadline.remaining_action(monotonic_now=now),
+                    "remaining_dispatch": driver.sql_deadline.remaining_dispatch(monotonic_now=now),
+                    "hard_remaining": driver.sql_deadline.hard_expires_at - now,
+                    "loop_remaining": None if runtime is None else runtime.bindings.deadline - asyncio.get_running_loop().time(),
+                    "drain_started": driver.sql_deadline.drain_signal.started_at is not None,
+                    "cancellation_requested": driver.phases.cancellation_requested.is_set(),
+                    "task_cancelling": None if exit_task is None else exit_task.cancelling(),
+                }
+                if original_error is not None:
+                    exit_row["original"] = exception_data(original_error)
+                observations.append(exit_row)
+            except Exception:
+                observations.append({"boundary": "advance", "event": "observation_unavailable", "cursor": stored.cursor})
+
+    async def settle(driver: _SegmentDriver, record: Any, original: BaseException | None = None, *, expired_failure: Any = None) -> Any:
+        if driver.running.claim.operation_id == operation_id and driver.running.claim.session_id == session_id:
+            try:
+                task = asyncio.current_task()
+                observations.append(
+                    {
+                        "boundary": "settle",
+                        "cursor": record.journal_cursor,
+                        "segment": driver.running.claim.segment_sequence,
+                        "generation": driver.running.claim.ownership_generation,
+                        "attempt": driver.running.claim.attempt,
+                        "driver_id": id(driver),
+                        "task_id": None if task is None else id(task),
+                        "task_cancelling": None if task is None else task.cancelling(),
+                        "original": None if original is None else exception_data(original),
+                        "expired_failure_code": None if expired_failure is None else expired_failure.failure_code,
+                    }
+                )
+            except Exception:
+                observations.append({"boundary": "settle", "event": "observation_unavailable"})
+        return await original_settle(driver, record, original, expired_failure=expired_failure)
+
+    monkeypatch.setattr(_SegmentDriver, "advance", advance)
+    monkeypatch.setattr(_SegmentDriver, "settle", settle)
+    monkeypatch.setattr(PrimaryNoSdkIssuer, "reserve_refusal", reserve_refusal)
+    monkeypatch.setattr(PrimaryNoSdkIssuer, "reserve_v4_refusal", reserve_v4_refusal)
+    return observations
+
+
+async def settle(
+    harness: ContinuationApp, *, operation_id: str, client: httpx.AsyncClient | None = None, rounds: int = 240
+) -> ComposerOperationSnapshot:
+    """Poll the public operation until it is sealed, then join the owner's release."""
+
+    async def poll(active: httpx.AsyncClient) -> ComposerOperationSnapshot:
+        for _ in range(rounds):
+            response = await active.get(f"/api/sessions/{harness.session_id}/operations/{operation_id}")
+            if response.status_code == 503 and response.json()["error_type"] == "database_unavailable":
+                # SQLite serialises writers; a poll can lose its busy wait to
+                # the owner's locked reads. The browser observer also retries.
+                await asyncio.sleep(0.25)
+                continue
+            assert response.status_code == 200, response.text
+            snapshot = ComposerOperationSnapshot.model_validate_json(response.content, strict=True)
+            if snapshot.status in ("completed", "failed"):
+                await harness.app.state.composer_async_worker.run_until_idle()
+                return snapshot
+            await asyncio.sleep(0.25)
+        raise AssertionError("Continuation request did not settle")
+
+    if client is not None:
+        return await poll(client)
+    async with harness.client() as owned:
+        return await poll(owned)
+
+
+async def submit_and_settle(
+    harness: ContinuationApp, body: dict[str, Any], *, route: str = "messages", rounds: int = 240
+) -> ComposerOperationSnapshot:
+    """Admit one request through the production route and wait for its terminal."""
+    async with harness.client() as client:
+        accepted = await client.post(f"/api/sessions/{harness.session_id}/{route}", json=body)
+        assert accepted.status_code == 202, accepted.text
+        return await settle(harness, operation_id=body["operation_id"], client=client, rounds=rounds)
+
+
+def effects(app: FastAPI, operation_id: str) -> tuple[Any, ...]:
+    with app.state.session_engine.connect() as conn:
+        return tuple(
+            conn.execute(
+                select(composer_continuation_effects_table)
+                .where(composer_continuation_effects_table.c.operation_id == operation_id)
+                .order_by(composer_continuation_effects_table.c.effect_key)
+            )
+        )
+
+
+def assistant_contents(app: FastAPI, session_id: UUID) -> list[str]:
+    with app.state.session_engine.connect() as conn:
+        rows = conn.execute(
+            select(chat_messages_table.c.content)
+            .where(chat_messages_table.c.session_id == str(session_id), chat_messages_table.c.role == "assistant")
+            .order_by(chat_messages_table.c.sequence_no)
+        )
+        return [row.content for row in rows]

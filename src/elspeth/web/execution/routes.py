@@ -43,7 +43,7 @@ from elspeth.web.auth.session_token import SessionBinding
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
-from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerContextUnsupported, ComposerService, ComposerServiceError
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
@@ -1497,6 +1497,11 @@ def create_execution_router() -> APIRouter:
                     expose_provider_error=settings.composer_expose_provider_errors,
                 ),
             ) from exc
+        except ComposerContextUnsupported as exc:
+            # Ordinary input refusal cannot hide an owed audit write or
+            # custody loss. Retain the existing mandatory-drain disposition.
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=False)
+            raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc
         except ComposerAdmissionRefused as exc:
             if isinstance(exc, CredentialMaterialRefused):
                 raise HTTPException(status_code=422, detail=exc.to_payload()) from exc

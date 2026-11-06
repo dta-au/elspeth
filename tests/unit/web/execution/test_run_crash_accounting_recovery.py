@@ -30,12 +30,12 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.landscape import leader_coordination_token
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.fenced_session import seed_token_policies
 from tests.unit.plugins.clients.test_audited_llm_client import FakeOpenAIClient, provider_response
 
@@ -80,7 +80,7 @@ async def test_restart_settles_orphan_from_explicit_call_identity(
         lease_seconds=30,
     ) as compose:
         state = await sessions.save_composition_state(
-            session.id, CompositionStateData(is_valid=True), provenance="session_seed", session_operation_context=compose.context
+            session.id, composition_state_data(is_valid=True), provenance="session_seed", session_operation_context=compose.context
         )
     async with await SessionOperationLease.acquire(
         sessions.session_operation_authority,

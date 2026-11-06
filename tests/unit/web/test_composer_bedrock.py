@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.web.composer import no_tool_policy
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
@@ -29,11 +30,11 @@ from elspeth.web.required_work import (
     RequiredWorkCoordinator,
     RequiredWorkRole,
 )
-from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
-from tests.helpers.session_fences import fenced_operation_context
+from tests.helpers import continuation_app as continuation_app_module
+from tests.helpers.continuation_app import continuation_app, submit_and_settle
+from tests.helpers.session_fences import acquire_compose_context, fenced_operation_context
 from tests.unit.web.composer._helpers import _composer_service_with_session, _make_settings, _mock_catalog
-from tests.unit.web.composer.test_service import _assert_checkpoint_reply
 
 _BEDROCK_PRIMARY = "bedrock/global.anthropic.claude-sonnet-4-6"
 _BEDROCK_ADVISOR = "bedrock/global.anthropic.claude-opus-4-6-v1"
@@ -133,7 +134,9 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     captured: list[dict[str, Any]] = []
     reviews: list[dict[str, Any]] = []
     unexpected_models: list[str] = []
+    shield_requests: list[dict[str, Any]] = []
     candidate = "No pipeline changes were saved in this request."
+    prompt = "No pipeline changes are needed."
 
     async def fake_acompletion(**kwargs: Any) -> Any:
         captured.append(deepcopy(kwargs))
@@ -147,7 +150,7 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
             review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             reviews.append(review)
             assert review["candidate_reply"] == candidate
-            assert review["current_request"] == "No pipeline changes are needed."
+            assert review["current_request"] == prompt
             assert review["saved_effects"]["saved_revision_count"] == 0
             assert review["saved_effects"]["net_changed"] is False
             content = json.dumps(
@@ -162,51 +165,78 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
             usage={"prompt_tokens": 10, "completion_tokens": 20},
         )
 
-    # Fake only the native SDK seam, after custody/callback handling. END
-    # request construction, strict parser, binding and durable audit run.
+    def shield_response(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST" and request.url.path == "/contentsafety/text:shieldPrompt"
+        assert request.url.params["api-version"] == "2024-09-01"
+        payload = json.loads(request.content)
+        assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
+        assert payload["userPrompt"] == prompt
+        assert type(payload["documents"]) is list and all(type(document) is str for document in payload["documents"])
+        shield_requests.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in payload["documents"]],
+            },
+        )
+
+    def guard_factory(configuration: PromptGuardSettings, *, http_transport: httpx.AsyncBaseTransport) -> AzurePromptGuardClient:
+        del http_transport
+        return AzurePromptGuardClient(configuration, http_transport=httpx.MockTransport(shield_response))
+
+    # Fake only the native SDK seam and the guard's HTTP transport. The real
+    # app, worker and Continuation driver build every request; END request
+    # construction, strict parser, binding and durable audit run.
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
-    service, session_id, shield_requests = _required_bedrock_service(
-        monkeypatch, user_prompt="No pipeline changes are needed.", data_dir=tmp_path
-    )
-    source_path = tmp_path / "blobs" / session_id / "existing.csv"
-    source_path.parent.mkdir(parents=True, exist_ok=True)
-    source_path.write_text("value\n1\n", encoding="utf-8")
-    output_path = tmp_path / "outputs" / session_id / "existing.jsonl"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    baseline = CompositionState(
-        source=SourceSpec(
-            plugin="csv",
-            on_success="existing_output",
-            options={"path": str(source_path), "schema": {"mode": "observed"}},
-            on_validation_failure="discard",
-        ),
-        nodes=(),
-        edges=(),
-        outputs=(
-            OutputSpec(
-                name="existing_output",
-                plugin="json",
-                options={"path": str(output_path), "format": "jsonl", "schema": {"mode": "observed"}},
-                on_write_failure="discard",
+    monkeypatch.setattr(continuation_app_module, "AzurePromptGuardClient", guard_factory)
+    async with continuation_app(
+        tmp_path,
+        monkeypatch,
+        composer_model=_BEDROCK_PRIMARY,
+        composer_advisor_model=_BEDROCK_ADVISOR,
+        composer_temperature=None,
+        composer_seed=None,
+    ) as harness:
+        session_id = str(harness.session_id)
+        sessions = harness.app.state.session_service
+        service = harness.app.state.composer_service
+        source_path = tmp_path / "blobs" / session_id / "existing.csv"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text("value\n1\n", encoding="utf-8")
+        output_path = tmp_path / "outputs" / session_id / "existing.jsonl"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        baseline = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="existing_output",
+                options={"path": str(source_path), "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
             ),
-        ),
-        metadata=PipelineMetadata(),
-        version=1,
-    )
-    assert baseline.validate().is_valid
-    baseline_payload = baseline.to_dict()
+            nodes=(),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="existing_output",
+                    plugin="json",
+                    options={"path": str(output_path), "format": "jsonl", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        assert baseline.validate().is_valid
+        baseline_payload = baseline.to_dict()
 
-    availability = service.get_availability()
-    assert availability.available is True
-    assert availability.provider == "bedrock"
-    expected_tool_names = {tool["function"]["name"] for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)}
+        availability = service.get_availability()
+        assert availability.available is True
+        assert availability.provider == "bedrock"
+        expected_tool_names = {tool["function"]["name"] for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)}
 
-    engine = service._require_sessions_service()._engine
-    try:
-        with fenced_operation_context(engine, session_id) as context:
-            sessions = service._require_sessions_service()
+        async with acquire_compose_context(sessions, harness.session_id) as context:
             initial = await sessions.save_composition_state(
-                UUID(session_id),
+                harness.session_id,
                 CompositionStateData(
                     sources=baseline_payload["sources"],
                     nodes=baseline_payload["nodes"],
@@ -219,37 +249,12 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
                 provenance="session_seed",
                 session_operation_context=context,
             )
-            user_message = await sessions.add_message(
-                UUID(session_id),
-                "user",
-                "No pipeline changes are needed.",
-                writer_principal="route_user_message",
-                session_operation_context=context,
-            )
-            coordinator = RequiredWorkCoordinator(
-                RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
-            )
-            binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
-            owner = ProviderInvocationOwner(service=sessions, required_work=binding)
-            result = await service.compose(
-                "No pipeline changes are needed.",
-                [],
-                state_from_record(initial),
-                session_id=session_id,
-                current_state_id=str(initial.id),
-                session_operation_context=context,
-                user_message_id=str(user_message.id),
-                required_work=binding,
-                provider_owner=owner,
-            )
-            coordinator.assert_completed()
-        stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
-    finally:
-        engine.dispose()
+        operation_id = str(uuid4())
+        snapshot = await submit_and_settle(harness, {"content": prompt, "operation_id": operation_id, "state_id": str(initial.id)})
+        stored = await sessions.get_messages(harness.session_id, limit=None)
+        record = harness.app.state.composer_async_operation_authority.get(session_id=harness.session_id, operation_id=operation_id)
 
     assert unexpected_models == []
-    assert len(captured) == len(result.llm_calls) == 2 and len(reviews) == 1
-    _assert_checkpoint_reply(result, candidate, count=0)
     request = captured[0]
     assert request["model"] == _BEDROCK_PRIMARY
     assert {tool["function"]["name"] for tool in request["tools"]} == expected_tool_names
@@ -260,6 +265,12 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     assert request["num_retries"] == request["max_retries"] == 0
     assert request["reasoning_effort"] == "low"
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))
+    assert shield_requests
+    # Integration completion point (U-40): the END Advisor admits the reply,
+    # the request completes with the checkpoint receipt, and both guard
+    # checks and the END pass are durable.
+    assert snapshot.status == "completed", snapshot.model_dump_json()
+    assert len(captured) == 2 and len(reviews) == 1
     end_request = captured[1]
     assert end_request["model"] == _BEDROCK_ADVISOR
     assert set(end_request) == {"model", "messages", "max_tokens", "reasoning_effort", "response_format", "num_retries", "max_retries"}
@@ -268,7 +279,17 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     assert end_request["response_format"]["type"] == "json_schema"
     assert end_request["response_format"]["json_schema"]["strict"] is True
     assert "tools" not in end_request
-    assert [call.model_requested for call in result.llm_calls] == [_BEDROCK_PRIMARY, _BEDROCK_ADVISOR]
+    notice = (
+        "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
+        "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
+    )
+    assert snapshot.result is not None and snapshot.result.message.content == candidate + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    (reply,) = [row for row in stored if row.role == "assistant"]
+    assert reply.raw_content == candidate
+    assert no_tool_policy.visible_message_segments(content=reply.content, raw_content=reply.raw_content) == (
+        *no_tool_policy.visible_message_segments(content=candidate, raw_content=candidate),
+        no_tool_policy.TrustedSystemNoticeSegment(notice),
+    )
     passes = [
         row.tool_calls[0]["pass"]
         for row in stored
@@ -289,8 +310,8 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
         (check["adapter"], check["mode"], check["disposition"], check["reason"]) == ("azure_prompt_shields", "required", "allow", "clean")
         for check in checks
     )
-    assert checks[0]["operation_id"] == checks[1]["operation_id"] == context.fence.operation_id
-    assert shield_requests
+    assert record is not None
+    assert checks[0]["operation_id"] == checks[1]["operation_id"] == record.session_operation_id
 
 
 @pytest.mark.asyncio

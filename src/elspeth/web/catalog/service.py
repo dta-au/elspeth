@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from inspect import cleandoc
 from typing import Any, cast
 
@@ -243,7 +244,13 @@ class CatalogServiceImpl:
 
         key = (plugin_type, name)
         if key in self._schema_cache:
-            return self._schema_cache[key]
+            # The cache is shared for the life of the process, so each caller
+            # gets its own copy. Returning the cached record directly let one
+            # caller's edit rewrite every later listing and schema read.
+            # A deep copy, not just the two schema dicts: the nested
+            # PluginSecretRequirement entries are mutable too, and their
+            # candidates feed the plugin-availability check.
+            return self._schema_cache[key].model_copy(deep=True)
 
         available = self._available_names(plugin_type)
         raise ValueError(f"Unknown {plugin_type} plugin: {name}. Available: {available}")
@@ -397,7 +404,12 @@ class CatalogServiceImpl:
         """
         name: str = plugin_cls.name
         description = get_plugin_description(plugin_cls)
-        schema = self._catalog_schema(plugin_cls, plugin_type)
+        # The construction-time cache already holds this plugin's schema, built
+        # by the same _catalog_schema. Regenerating it here cost a full
+        # get_config_schema per plugin per listing (U-45 F3). Read-only use:
+        # _extract_config_fields parses the document and never writes to it,
+        # and PluginSummary carries no schema dict, so nothing aliases out.
+        schema = self._schema_cache[(plugin_type, name)].json_schema
         config_fields = self._extract_config_fields(schema)
 
         # Direct attribute access: the bases and protocols declare every
@@ -593,7 +605,11 @@ class CatalogServiceImpl:
             type=json_type,
             required=required,
             description=field_schema.description,
-            default=field_schema.default,
+            # The schema document now comes from the construction-time cache,
+            # so a mutable default handed to a caller would point into it. Copy
+            # per summary: before the reuse this pointed at a freshly generated
+            # document and could not reach the cache.
+            default=deepcopy(field_schema.default),
         )
 
     def _available_names(self, plugin_type: PluginKind) -> list[str]:

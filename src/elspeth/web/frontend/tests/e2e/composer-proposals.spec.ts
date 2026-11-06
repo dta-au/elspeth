@@ -203,13 +203,13 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
           state: baseState,
           proposals: [pendingProposal],
         };
-      await route.fulfill({ status: 202, json: { operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000 } }); return;
+      await route.fulfill({ status: 202, json: { operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000, phase: "queued", status_revision: 1, created_at: "2026-05-14T00:00:00Z", observed_at: "2026-05-14T00:00:00Z", cancel_requested: false, segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null }, result: null, error: null } }); return;
     }
     if (operationId !== null && path === `/api/sessions/${sessionId}/operations/${operationId}/stream`) {
       await route.fulfill({ status: 503, json: { detail: "stream unavailable" } }); return;
     }
     if (operationId !== null && path === `/api/sessions/${sessionId}/operations/${operationId}`) {
-      await route.fulfill({ json: { operation_id: operationId, kind: "compose_message", status: "completed", poll_after_ms: 1000, cancel_requested: false, deadline_at: "2026-05-14T00:00:00Z", deadline_remaining_ms: 0, result: terminalResult, error: null } }); return;
+      await route.fulfill({ json: { operation_id: operationId, kind: "compose_message", status: "completed", poll_after_ms: 1000, cancel_requested: false, phase: "settled", status_revision: 2, created_at: "2026-05-14T00:00:00Z", observed_at: "2026-05-14T00:00:00Z", segment: null, result: terminalResult, error: null } }); return;
     }
 
     if (path === `/api/sessions/${sessionId}/state` && method === "GET") {

@@ -51,6 +51,7 @@ from elspeth.web.composer.state import (
     NodeSpec,
     SourceSpec,
     _coalesce_branch_connections,
+    _coalesce_branch_names,
     _well_formed_query_entries,
 )
 from elspeth.web.plugin_policy.coverage import (
@@ -520,8 +521,8 @@ def validate_pipeline_decision_semantics(
         {
             field_name
             for source_field, target_field in mapping.items()
-            for field_name in _validated_mapping_pair(source_field, target_field, context=context, node_id=node_id)
-            if field_name in web_scrape_raw_fields
+            for field_name in (_validated_mapping_pair(source_field, target_field, context=context, node_id=node_id)[0],)
+            if _mapping_source_preserves_raw(field_name, web_scrape_raw_fields)
         }
     )
     if preserved_raw_fields:
@@ -551,7 +552,7 @@ def validate_pipeline_decision_node_semantics(
         user_term=user_term,
         draft=draft,
         context=context,
-        web_scrape_raw_fields=_web_scrape_raw_fields(all_nodes),
+        web_scrape_raw_fields=_upstream_web_scrape_raw_fields(node, _output_stream_graph(all_nodes)),
     )
 
 
@@ -575,21 +576,24 @@ def validate_pipeline_decision_node_semantics(
 )
 def raw_html_cleanup_review_contract_error(state: CompositionState) -> str | None:
     """Return a composer-facing error for unreviewed or contradictory raw cleanup."""
-    web_scrape_raw_fields = _web_scrape_raw_fields(state.nodes)
-    if not web_scrape_raw_fields:
+    if not _web_scrape_raw_fields(state.nodes):
         return None
+    graph = _output_stream_graph(state.nodes)
     for node in state.nodes:
+        web_scrape_raw_fields = _upstream_web_scrape_raw_fields(node, graph)
         requirement_error = _raw_html_cleanup_requirement_contract_error(node, web_scrape_raw_fields=web_scrape_raw_fields)
         if requirement_error is not None:
             return requirement_error
     for node in state.nodes:
+        web_scrape_raw_fields = _upstream_web_scrape_raw_fields(node, graph)
+        if not web_scrape_raw_fields:
+            continue
         if node.plugin != "field_mapper" or "select_only" not in node.options or node.options["select_only"] is not True:
             continue
         mapping = node.options["mapping"] if "mapping" in node.options else None
         if not isinstance(mapping, Mapping) or not mapping:
             continue
-        preserved_fields = _preserved_mapping_fields(mapping)
-        preserved_raw_fields = sorted(field for field in web_scrape_raw_fields if field in preserved_fields)
+        preserved_raw_fields = _raw_fields_preserved_by_mapping(mapping, web_scrape_raw_fields)
         if preserved_raw_fields:
             continue
         requirements = _requirements(node.options)
@@ -1011,25 +1015,21 @@ def _validated_mapping_pair(source_field: object, target_field: object, *, conte
     "or YAML import",
     source_param="mapping",
     suppresses=("R5",),
-    invariant="collects only entries that are genuinely str; a non-string key or value contributes "
-    "nothing rather than being coerced or stringified, so the returned frozenset never names a field the "
-    "authored mapping does not carry. Non-raising: its one caller, "
-    "raw_html_cleanup_review_contract_error, reads a smaller set as 'this raw field is NOT preserved', "
-    "which falls through to that function's review-requirement check rather than emitting a "
-    "preserves-raw-fields contradiction. The sibling enumerator "
-    "_missing_raw_html_cleanup_review_sites deliberately does NOT call this helper: it needs the STRICTER "
-    "both-sides-str pair filter, and widening it to this helper's per-side collection would grow its "
-    "preserved set and suppress review sites.",
+    invariant="only genuinely str->str pairs can preserve raw input fields. Non-string entries contribute "
+    "nothing, never being coerced or stringified. Only a mapping SOURCE can select raw input content; a "
+    "target with a raw-looking spelling cannot confer provenance on unrelated input. The returned fields "
+    "are always a subset of raw_fields, and malformed entries cannot suppress a required review.",
     non_raising=True,
 )
-def _preserved_mapping_fields(mapping: Mapping[str, Any]) -> frozenset[str]:
-    fields: set[str] = set()
-    for source_field, target_field in mapping.items():
-        if isinstance(source_field, str):
-            fields.add(source_field.strip())
-        if isinstance(target_field, str):
-            fields.add(target_field.strip())
-    return frozenset(fields)
+def _raw_fields_preserved_by_mapping(mapping: Mapping[str, Any], raw_fields: frozenset[str]) -> frozenset[str]:
+    """Return raw input paths selected by well-formed mapping source entries."""
+    return frozenset(
+        field
+        for source, target in mapping.items()
+        if isinstance(source, str) and isinstance(target, str)
+        for field in raw_fields
+        if _mapping_source_preserves_raw(source.strip(), frozenset({field}))
+    )
 
 
 @trust_boundary(
@@ -1126,13 +1126,13 @@ def interpretation_sites(
     for source_name, source in state.sources.items():
         sites.extend(_pending_source_sites(source, component_id=source_component_id(source_name)))
     sites.extend(_pending_source_data_contract_sites(state))
-    web_scrape_raw_fields = _web_scrape_raw_fields(state.nodes)
+    graph = _output_stream_graph(state.nodes)
     for node in state.nodes:
         node_sites = [*_pending_node_sites(node), *_legacy_placeholder_sites(node)]
         if node.id in operator_resolved_model_node_ids:
             node_sites = [site for site in node_sites if site.kind is not InterpretationKind.LLM_MODEL_CHOICE]
         sites.extend(node_sites)
-        sites.extend(_missing_raw_html_cleanup_review_sites(node, web_scrape_raw_fields=web_scrape_raw_fields))
+        sites.extend(_missing_raw_html_cleanup_review_sites(node, web_scrape_raw_fields=_upstream_web_scrape_raw_fields(node, graph)))
         if not any(site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE for site in node_sites):
             sites.extend(_missing_prompt_template_review_sites(node))
         if node.id not in operator_resolved_model_node_ids and not any(
@@ -1581,6 +1581,174 @@ def _web_scrape_raw_fields(nodes: Sequence[NodeSpec]) -> frozenset[str]:
     return frozenset(fields)
 
 
+def _mapping_source_preserves_raw(source: str, raw_fields: frozenset[str]) -> bool:
+    """Read provenance from a mapping's source, including nested selections."""
+    return any(source == field or source.startswith(f"{field}.") or field.startswith(f"{source}.") for field in raw_fields)
+
+
+@dataclass(frozen=True, slots=True)
+class _RawScrapeField:
+    current_path: str
+    original_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ScrapeProvenance:
+    raw_fields: frozenset[_RawScrapeField] = frozenset()
+    guaranteed_current_names: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class _MapperProjection:
+    entries: tuple[tuple[str, str], ...]
+    select_only: bool
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec.options mapping/select_only authored by Composer, imported YAML or persisted sessions",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant="returns an owned projection only for a str->str mapping and genuine bool select_only; "
+    "absent mapping/select_only mirror FieldMapperConfig defaults of empty mapping/False. Malformed "
+    "options return None, so they cannot prove removal of raw content or guarantee a clean normalized "
+    "name that would shadow an original-name alias",
+)
+def _mapper_projection(node: NodeSpec) -> _MapperProjection | None:
+    mapping = node.options.get("mapping", {})
+    select_only = node.options.get("select_only", False)
+    if not isinstance(mapping, Mapping) or not isinstance(select_only, bool):
+        return None
+    entries: list[tuple[str, str]] = []
+    for source, target in mapping.items():
+        if not isinstance(source, str) or not source.strip() or not isinstance(target, str) or not target.strip():
+            return None
+        entries.append((source, target))
+    return _MapperProjection(tuple(entries), select_only)
+
+
+def _readable_raw_fields(provenance: _ScrapeProvenance) -> frozenset[str]:
+    current = frozenset(field.current_path for field in provenance.raw_fields)
+    return current | frozenset(
+        field.original_path
+        for field in provenance.raw_fields
+        if field.original_path not in provenance.guaranteed_current_names or field.original_path in current
+    )
+
+
+def _upstream_web_scrape_raw_fields(node: NodeSpec, graph: _OutputStreamGraph) -> frozenset[str]:
+    """Track declared scrape fields along this input's producer paths.
+
+    Gates, queues and row unions carry rows; nested coalesce wraps each branch.
+    Field mappers rename and project fields while preserving original-name
+    aliases, as narrow_contract_to_output does. Dotted extraction and nested
+    coalesce create fresh identities. A guaranteed normalized field shadows an
+    original-name alias only on the same arriving row: require-all coalesce
+    unions guarantees, whereas queues/row unions/partial coalesce intersect
+    them. Other plugins retain possible raw content but supply no field-name
+    guarantees. Sources and unknown streams terminate the walk.
+    """
+
+    def combine(arms: Sequence[_ScrapeProvenance], *, all_arrive: bool = False) -> _ScrapeProvenance:
+        if not arms:
+            return _ScrapeProvenance()
+        known = [arm.guaranteed_current_names for arm in arms]
+        return _ScrapeProvenance(
+            frozenset(field for arm in arms for field in arm.raw_fields),
+            frozenset.union(*known) if all_arrive else frozenset.intersection(*known),
+        )
+
+    def stream_fields(stream: str | None, visited: frozenset[str]) -> _ScrapeProvenance:
+        if not stream or stream not in graph.producers_by_stream:
+            return _ScrapeProvenance()
+        return combine(
+            tuple(
+                producer_fields(producer, visited, is_error=stream == producer.on_error) for producer in graph.producers_by_stream[stream]
+            )
+        )
+
+    def producer_fields(producer: NodeSpec, visited: frozenset[str], *, is_error: bool = False) -> _ScrapeProvenance:
+        if producer.id in visited:
+            return _ScrapeProvenance()
+        visited = visited | {producer.id}
+        if is_error:
+            # A failed mapper did not emit its success projection. Error routes
+            # cannot guarantee its targets or prove that input raw data vanished.
+            return _ScrapeProvenance(stream_fields(producer.input, visited).raw_fields)
+        if producer.node_type == "queue":
+            return combine(
+                tuple(
+                    producer_fields(predecessor, visited, is_error=predecessor.on_error == producer.id)
+                    for predecessor in graph.queue_predecessors[producer.id]
+                )
+            )
+        if producer.node_type in ("coalesce", "row_union"):
+            names = _coalesce_branch_names(producer.branches)
+            arms = tuple(stream_fields(connection, visited) for connection in _coalesce_branch_connections(producer.branches))
+            all_arrive = producer.node_type == "coalesce" and producer.policy == "require_all"
+            if producer.node_type == "coalesce" and producer.merge == "nested":
+                return _ScrapeProvenance(
+                    frozenset(
+                        _RawScrapeField(f"{name}.{field.current_path}", f"{name}.{field.current_path}")
+                        for name, arm in zip(names, arms, strict=True)
+                        for field in arm.raw_fields
+                    ),
+                    frozenset(names) if all_arrive else frozenset(),
+                )
+            return combine(arms, all_arrive=all_arrive)
+        incoming = stream_fields(producer.input, visited)
+        if producer.plugin == "web_scrape":
+            own = _web_scrape_raw_fields((producer,))
+            return _ScrapeProvenance(
+                incoming.raw_fields | frozenset(_RawScrapeField(field, field) for field in own),
+                incoming.guaranteed_current_names | own,
+            )
+        if producer.node_type == "gate" or producer.plugin == "passthrough":
+            return incoming
+        if producer.plugin != "field_mapper":
+            return _ScrapeProvenance(incoming.raw_fields)
+        projection = _mapper_projection(producer)
+        if projection is None:
+            return _ScrapeProvenance(incoming.raw_fields)
+        fields = incoming.raw_fields
+        output_fields = set() if projection.select_only else set(fields)
+        known_names = set() if projection.select_only else set(incoming.guaranteed_current_names)
+        for source, target in projection.entries:
+            # PipelineRow resolves a normalized name before an original alias.
+            # Dotted extraction reads the plain row dict, so it has no alias lookup.
+            normalized_matches = frozenset(
+                field for field in fields if _mapping_source_preserves_raw(source, frozenset({field.current_path}))
+            )
+            selected = (
+                normalized_matches
+                or frozenset(
+                    field
+                    for field in fields
+                    if "." not in source and _mapping_source_preserves_raw(source, frozenset({field.original_path}))
+                )
+                if source not in incoming.guaranteed_current_names
+                else normalized_matches
+            )
+            if "." not in source:
+                output_fields.difference_update(selected)
+                if source in incoming.guaranteed_current_names:
+                    known_names.discard(source)
+                elif selected:
+                    known_names.difference_update(field.current_path.split(".", 1)[0] for field in selected)
+                else:
+                    known_names.clear()  # An unknown original alias may remove an inherited field.
+            output_fields.difference_update(
+                field for field in tuple(output_fields) if field.current_path == target or field.current_path.startswith(f"{target}.")
+            )
+            for field in selected:
+                source_path = field.current_path if field in normalized_matches else field.original_path
+                suffix = source_path[len(source) :] if source_path.startswith(f"{source}.") else ""
+                output_fields.add(_RawScrapeField(target + suffix, target + suffix if "." in source else field.original_path))
+        return _ScrapeProvenance(frozenset(output_fields), frozenset(known_names) | frozenset(target for _, target in projection.entries))
+
+    return _readable_raw_fields(stream_fields(node.input, frozenset({node.id})))
+
+
 @trust_boundary(
     tier=3,
     source="NodeSpec.options['mapping'] / ['select_only'], untyped Mapping[str, Any] entries persisted "
@@ -1613,13 +1781,7 @@ def _missing_raw_html_cleanup_review_sites(
     mapping = node.options["mapping"] if "mapping" in node.options else None
     if not isinstance(mapping, Mapping) or not mapping:
         return ()
-    preserved_fields = {
-        field_name
-        for source_field, target_field in mapping.items()
-        if isinstance(source_field, str) and isinstance(target_field, str)
-        for field_name in (source_field.strip(), target_field.strip())
-    }
-    if any(field in preserved_fields for field in web_scrape_raw_fields):
+    if _raw_fields_preserved_by_mapping(mapping, web_scrape_raw_fields):
         return ()
     return (
         InterpretationReviewSite(
@@ -2221,7 +2383,7 @@ def _raw_html_cleanup_artifact_hash(node: NodeSpec, all_nodes: Sequence[NodeSpec
     it's a downstream consequence of the mapping, not adjudication input.
     """
 
-    upstream_raw_fields = sorted(_web_scrape_raw_fields(all_nodes))
+    upstream_raw_fields = sorted(_upstream_web_scrape_raw_fields(node, _output_stream_graph(all_nodes)))
     raw_mapping = node.options["mapping"] if "mapping" in node.options else None
     if raw_mapping is not None and not isinstance(raw_mapping, Mapping):
         raise ValueError(

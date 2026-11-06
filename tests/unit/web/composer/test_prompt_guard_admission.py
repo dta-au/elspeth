@@ -79,7 +79,11 @@ def authority(tmp_path):
 def _checks(engine):
     with engine.connect() as connection:
         rows = connection.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).all()
-    return [row.tool_calls[0]["check"] for row in rows if row.tool_calls and row.tool_calls[0]["_kind"] == "prompt_guard_audit"]
+    return [
+        row.tool_calls[0]["check"]
+        for row in rows
+        if row.tool_calls and "_kind" in row.tool_calls[0] and row.tool_calls[0]["_kind"] == "prompt_guard_audit"
+    ]
 
 
 @pytest.mark.asyncio

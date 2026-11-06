@@ -1,0 +1,37 @@
+[Unit]
+Description=ELSPETH independent baseline maintenance supervisor
+After=systemd-journald.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+RootDirectory=/opt/elspeth/baseline-supervisor
+MountAPIVFS=yes
+ExecStart=/usr/bin/python3.13 -I -B -m elspeth_lints.core.baseline_supervisor
+Environment=PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1
+PassEnvironment=
+WorkingDirectory=/
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+LimitCORE=0
+UMask=0077
+BindReadOnlyPaths=/etc/elspeth/baseline-workers.json
+BindReadOnlyPaths=/opt/elspeth/baseline-worker
+BindReadOnlyPaths=/sys/fs/cgroup
+BindPaths=/run/systemd/private
+BindPaths=/run/elspeth-baseline
+ReadWritePaths=/run/elspeth-baseline
+KillMode=control-group
+TimeoutStopSec=5
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

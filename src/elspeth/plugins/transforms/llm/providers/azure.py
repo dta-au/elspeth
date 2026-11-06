@@ -26,7 +26,7 @@ from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.value_source import ValueSource
-from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError, build_llm_call_request
+from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, LLMClientError, build_llm_call_request, classify_unusable_content
 from elspeth.plugins.llm.config_validation import (
     AZURE_MODEL_VALUE_SOURCES,
     derive_azure_model,
@@ -248,18 +248,10 @@ class AzureLLMProvider:
             # Tier 3 envelope read through the declared boundary.
             finish_reason = finish_reason_from_raw_response(response.raw_response)
 
-            # Empty/whitespace content — AuditedLLMClient converts None→""
-            # (known fabrication). Detect here and raise typed errors so the
-            # transform's except LLMClientError handler catches them.
-            if not response.content or not response.content.strip():
-                if finish_reason == FinishReason.TOOL_CALLS:
-                    raise LLMClientError(
-                        "Azure returned tool_calls response (not supported by ELSPETH)",
-                        retryable=False,
-                    )
-                raise ContentPolicyError(
-                    f"LLM returned empty content (finish_reason={finish_reason})",
-                )
+            # Historical SUCCESS replay bypasses live SDK admission; refuse its
+            # unusable text without rewriting the recorded call's history.
+            if not response.content.strip():
+                raise classify_unusable_content(content=response.content, raw_response=response.raw_response).error
 
             return LLMQueryResult(
                 content=response.content,
@@ -307,6 +299,7 @@ class AzureLLMProvider:
             llm_call_governance=self._llm_call_governance,
             max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
             call_mode_session=self._call_mode_session,
+            require_nonempty_content=True,
         )
         try:
             response = client.chat_completion(
@@ -318,7 +311,7 @@ class AzureLLMProvider:
                 max_tokens=_PREFLIGHT_MAX_COMPLETION_TOKENS,
             )
             if not response.content.strip():
-                raise ContentPolicyError("Azure preflight returned empty content")
+                raise classify_unusable_content(content=response.content, raw_response=response.raw_response).error
             finish_reason = finish_reason_from_raw_response(response.raw_response)
             if finish_reason not in (None, FinishReason.STOP):
                 raise LLMClientError("Azure preflight returned an unusable finish reason", retryable=False)
@@ -359,6 +352,7 @@ class AzureLLMProvider:
                     llm_call_governance=self._llm_call_governance,
                     max_tokens_param=_AZURE_MAX_TOKENS_PARAM,
                     call_mode_session=self._call_mode_session,
+                    require_nonempty_content=True,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

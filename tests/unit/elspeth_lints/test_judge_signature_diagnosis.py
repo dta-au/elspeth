@@ -21,6 +21,8 @@ from elspeth_lints.core.allowlist import JudgeVerdict, compute_judge_metadata_si
 from elspeth_lints.core.cli import main
 from elspeth_lints.core.judge import JUDGE_POLICY_HASH
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
+
 _HMAC_KEY = "x" * 32
 _RECORDED_AT = "2024-01-01T00:00:00+00:00"
 _MODEL = "claude-opus-4-7"
@@ -322,7 +324,7 @@ def test_cli_diagnose_reports_scope_drift_with_rejustify_command(
     assert key in captured.out
     assert "re-justify required" in captured.out
     assert "ELSPETH_JUDGE_METADATA_HMAC_KEY=<operator-held-key>" in captured.out
-    assert "elspeth_lints.core.cli justify" in captured.out
+    assert "/usr/local/libexec/elspeth-operator justify" in captured.out
     assert "--file-path plugins/widget.py" in captured.out
     assert "--rule R1" in captured.out
     assert "--symbol Widget.lookup" in captured.out
@@ -435,7 +437,7 @@ def test_cli_sign_loads_env_removes_stale_entry_and_invokes_justify(
         assert calls[0].fingerprint == key.rsplit(":fp=", 1)[1]
         assert "payload is Tier-3 external data" in calls[0].rationale
         assert key not in (allowlist_dir / "plugins.yaml").read_text(encoding="utf-8")
-        assert os.environ["OPENROUTER_API_KEY"] == "test-openrouter-key"
+        assert "OPENROUTER_API_KEY" not in os.environ
         assert "UNRELATED_SECRET" not in os.environ
     finally:
         for env_key in ("ELSPETH_JUDGE_METADATA_HMAC_KEY", "OPENROUTER_API_KEY", "UNRELATED_SECRET"):

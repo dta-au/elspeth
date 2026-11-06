@@ -1,11 +1,9 @@
 # tests/unit/web/composer/test_validation_error_codes.py
 """Every candidate-path rejection carries a closed error_code + structural facts.
 
-Planner repair can exhaust with ``rejection_codes=[]``: the redacted repair
-feedback (``_allowlisted_candidate_feedback``) strips raw validation messages
-and keys its enrichment on the closed ``error_code`` — so a ``ValidationEntry``
-emitted without one forwards NOTHING actionable. A rejection with no code and
-no message is unrepairable by construction.
+Inline repair guidance (``build_validation_guidance``) is keyed on the closed
+``error_code``, so a ``ValidationEntry`` emitted without one gets no catalogue
+repair text.
 
 These tests pin the closure:
 
@@ -18,9 +16,8 @@ These tests pin the closure:
 - the closed-code catalogue stays containment-free (no code is a substring of
   another), which the explain tool's fuzzy route and the regex alternations
   in ``_VALIDATION_ERROR_PATTERNS`` both depend on;
-- the planner feedback projection forwards code + static guidance + contract
-  facts, and the per-attempt trail can never report an empty code list for a
-  rejection that carried entries.
+- the tool-result wire forwards code + contract facts, and the code resolves
+  to static inline guidance.
 """
 
 from __future__ import annotations
@@ -49,7 +46,6 @@ from elspeth.web.composer.state import (
     SourceSpec,
     ValidationEntry,
     ValidationSummary,
-    route_destination_facts,
 )
 from elspeth.web.composer.tools._common import _PLUGIN_UNAVAILABLE_EXPLANATIONS
 from elspeth.web.composer.tools.generation import (
@@ -812,9 +808,8 @@ class TestClosedCodeCatalogueInvariants:
         answered "does not match any known validation message or closed
         error_code". The planner had nothing new and resubmitted an identical
         payload. Both lookup paths are pinned here: the tool matches
-        the MESSAGE, and the one-shot planner feedback
-        (``_allowlisted_candidate_feedback``) strips the message and can only
-        resolve the bare CODE.
+        the MESSAGE, and inline guidance (``build_validation_guidance``)
+        resolves the bare CODE.
         """
         code = "review_reconciliation_failed"
         assert code in _CLOSED_VALIDATION_ERROR_CODES
@@ -877,15 +872,15 @@ class TestClosedCodeCatalogueInvariants:
         assert not offenders, offenders
 
 
-class TestPlannerFeedbackCarriesStructuralFacts:
-    def test_allowlisted_feedback_projects_contract_facts(self) -> None:
-        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+class TestRejectionCarriesStructuralFacts:
+    def test_tool_result_wire_carries_contract_facts_and_inline_guidance(self) -> None:
         from elspeth.web.composer.state import SchemaContractDetail
         from elspeth.web.composer.tools import ToolResult
+        from elspeth.web.composer.tools.generation import build_validation_guidance
 
         entry = ValidationEntry(
             component="node:llm_tone",
-            message="Schema contract violation: 'fork_ab' -> 'llm_tone'. (raw message must NOT be forwarded)",
+            message="Schema contract violation: 'fork_ab' -> 'llm_tone'.",
             severity="high",
             error_code="schema_contract_violation",
             contract=SchemaContractDetail(
@@ -900,31 +895,17 @@ class TestPlannerFeedbackCarriesStructuralFacts:
             validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
             affected_nodes=(),
         )
-        feedback = _allowlisted_candidate_feedback(result)
-        projected = feedback["validation"]["errors"][0]
+        projected = result.to_dict()["validation"]["errors"][0]
         assert projected["error_code"] == "schema_contract_violation"
-        assert "message" not in projected
-        assert projected["explanation"]
-        assert projected["suggested_fix"]
         assert projected["contract"] == {
             "producer": "fork_ab",
             "consumer": "llm_tone",
             "missing_fields": ["color_name", "hex"],
         }
-
-    def test_allowlisted_feedback_codeless_entry_still_names_a_code(self) -> None:
-        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-        from elspeth.web.composer.tools import ToolResult
-
-        entry = ValidationEntry(component="node:x", message="anything", severity="high")
-        result = ToolResult(
-            success=False,
-            updated_state=_empty_state(),
-            validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
-            affected_nodes=(),
-        )
-        feedback = _allowlisted_candidate_feedback(result)
-        assert feedback["validation"]["errors"][0]["error_code"] == "validation_error"
+        guidance = build_validation_guidance(["schema_contract_violation"])
+        assert guidance is not None
+        assert guidance["codes"]["schema_contract_violation"]["explanation"]
+        assert guidance["codes"]["schema_contract_violation"]["suggested_fix"]
 
     def test_review_contract_guidance_supplies_registered_term_and_example_draft(self) -> None:
         """Repair guidance includes a complete example of the required review row."""
@@ -940,17 +921,13 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         assert RAW_HTML_CLEANUP_USER_TERM in suggested_fix
         assert RAW_HTML_CLEANUP_REVIEW_DRAFT in suggested_fix
 
-    def test_full_replacement_rejection_excludes_saved_findings_from_feedback_and_trail(self) -> None:
+    def test_full_replacement_rejection_excludes_saved_findings(self) -> None:
         """The owned full-replacement boundary withholds surviving saved findings.
 
         Use the actual file-write-policy diagnostic with the candidate helper;
         this qualifies that boundary and its consumers, not a full set_pipeline
         producer invocation. Saved-graph mutations retain their standing findings.
         """
-        from elspeth.web.composer.pipeline_planner import (
-            _allowlisted_candidate_feedback,
-            _candidate_rejection_codes,
-        )
         from elspeth.web.composer.tools._common import (
             _candidate_rejection_result,
             normalize_tool_result_validation,
@@ -981,84 +958,9 @@ class TestPlannerFeedbackCarriesStructuralFacts:
             assert (entry.component, entry.error_code, entry.rejected_component) == ("rejected_mutation", code, "output:main")
             assert entry.message == diagnostic
             assert not any(entry in saved_errors for entry in candidate.validation.errors)
-            feedback = _allowlisted_candidate_feedback(candidate)
-            (reported,) = feedback["validation"]["errors"]
-            assert (reported["component"], reported["error_code"]) == ("output:main", code)
-            assert (reported["explanation"], reported["suggested_fix"]) == explain_validation_code(code)
-            assert "message" not in reported and "detail" not in reported
-            assert diagnostic not in repr(feedback)
-            assert _candidate_rejection_codes(candidate) == (code,)
-
-    def test_validated_candidate_rejections_pass_through_ungated(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Without a rejected_mutation entry, every real error must survive.
-
-        Guards the instance-1 class (built candidate validated, real errors,
-        e.g. coalesce_branch_unreachable) against over-gating.
-        """
-        import elspeth.web.composer.pipeline_planner as planner_module
-        from elspeth.web.composer.pipeline_planner import (
-            _allowlisted_candidate_feedback,
-            _candidate_rejection_codes,
-        )
-        from elspeth.web.composer.tools import ToolResult
-
-        entries = (
-            ValidationEntry(component="node:merge", message="m", severity="high", error_code="coalesce_branch_unreachable"),
-            ValidationEntry(component="node:copy", message="m", severity="high", error_code="node_input_not_reachable"),
-        )
-        result = ToolResult(
-            success=False,
-            updated_state=_empty_state(),
-            validation=ValidationSummary(is_valid=False, errors=entries, warnings=(), suggestions=()),
-            affected_nodes=(),
-        )
-        monkeypatch.setattr(
-            planner_module,
-            "coalesce_reachability_facts",
-            # A realistic fact value: the real function never emits an entry
-            # without unreachable_branches, so a double that omits it could
-            # not catch the projection dropping a field.
-            lambda _state: {
-                "merge": {
-                    "unreachable_branches": [{"branch": "left", "consumed_connection": "left_done"}],
-                    "produced_connections": ["left", "right"],
-                }
-            },
-        )
-        feedback = _allowlisted_candidate_feedback(result)
-        assert [entry["error_code"] for entry in feedback["validation"]["errors"]] == [
-            "coalesce_branch_unreachable",
-            "node_input_not_reachable",
-        ]
-        assert feedback["validation"]["errors"][0]["connectivity"] == {
-            "unreachable_branches": [{"branch": "left", "consumed_connection": "left_done"}],
-            "produced_connections": ["left", "right"],
-        }
-        assert _candidate_rejection_codes(result) == ("coalesce_branch_unreachable", "node_input_not_reachable")
-
-    def test_rejection_trail_codes_never_empty_when_entries_exist(self) -> None:
-        """The per-attempt trail must name every rejection, coded or not.
-
-        A codeless entry surfaces as the 'validation_error' placeholder in
-        rejection_codes rather than silently vanishing — REPAIR_EXHAUSTED
-        with rejection_codes=[] while entries existed is the exact blindness
-        session 5113b7ac exposed.
-        """
-        from elspeth.web.composer.pipeline_planner import _candidate_rejection_codes
-        from elspeth.web.composer.tools import ToolResult
-
-        entries = (
-            ValidationEntry(component="node:a", message="m", severity="high"),
-            ValidationEntry(component="node:b", message="m", severity="high", error_code="schema_contract_violation"),
-        )
-        result = ToolResult(
-            success=False,
-            updated_state=_empty_state(),
-            validation=ValidationSummary(is_valid=False, errors=entries, warnings=(), suggestions=()),
-            affected_nodes=(),
-        )
-        codes = _candidate_rejection_codes(result)
-        assert codes == ("validation_error", "schema_contract_violation")
+            (reported,) = candidate.to_dict()["validation"]["errors"]
+            assert reported["error_code"] == code
+            assert explain_validation_code(code) is not None
 
 
 class TestFullReplacementRejectionsWithholdStaleStateEntries:
@@ -1176,16 +1078,8 @@ def _orphaned_coalesce_state(branches: Any) -> CompositionState:
     return state
 
 
-class TestCoalesceReachabilityFacts:
-    """The coalesce reachability rejection carries instance wiring facts.
-
-    Repeated ``coalesce_branch_unreachable`` rejections are possible: the static guidance directs
-    the repair at the coalesce node, but the observed miswiring lives in the
-    branch transforms' ``on_success`` — a repair the planner cannot find
-    from a bare code. These facts name each unreachable branches value and
-    the connections the pipeline actually produces (node ids and connection
-    names the planner itself authored — never user row content).
-    """
+class TestRouteReachabilityCodes:
+    """Unreachable coalesce branches and dangling routes reject with their own codes."""
 
     def test_orphaned_coalesce_rejects_with_the_single_observed_code(self) -> None:
         state = _orphaned_coalesce_state({"branch_a": "a_done", "branch_b": "b_done"})
@@ -1193,163 +1087,7 @@ class TestCoalesceReachabilityFacts:
         assert not result.is_valid
         assert [e.error_code for e in result.errors] == ["coalesce_branch_unreachable"]
 
-    def test_reachability_facts_name_unreachable_pairs_and_produced_connections(self) -> None:
-        from elspeth.web.composer.state import coalesce_reachability_facts
-
-        state = _orphaned_coalesce_state({"branch_a": "a_done", "branch_b": "b_done"})
-        facts = coalesce_reachability_facts(state)
-        assert facts == {
-            "merge": {
-                # One record per broken branch, each carrying its own lure:
-                # the repair reads "this branch is broken AND this node broke
-                # it" as one fact, with no join back by connection name
-                # so the planner can identify the source of the broken branch.
-                "unreachable_branches": [
-                    {
-                        "branch": "branch_a",
-                        "consumed_connection": "a_done",
-                        "sink_lure": {"node_id": "t_a", "publishes_to_sink": "main"},
-                    },
-                    {
-                        "branch": "branch_b",
-                        "consumed_connection": "b_done",
-                        "sink_lure": {"node_id": "t_b", "publishes_to_sink": "main"},
-                    },
-                ],
-                # Sink names and the coalesce's own published id are excluded:
-                # both pass the membership walk today but are not connections a
-                # branch value should be steered toward.
-                "produced_connections": ["branch_a", "branch_b", "rows"],
-            }
-        }
-
-    def test_produced_connections_are_sorted_on_a_fixture_authored_out_of_order(self) -> None:
-        """The sort pin must not depend on the hash seed.
-
-        The three-element fixtures elsewhere in this class pin
-        ``produced_connections`` sortedness only on seeds whose set iteration
-        happens to be alphabetical (an unsorted emitter survived at
-        PYTHONHASHSEED=5 under red-team mutation M6). Six connections authored
-        in non-alphabetical order make accidental agreement 1-in-720.
-        """
-        from elspeth.web.composer.state import coalesce_reachability_facts
-
-        aliases = ("zeta", "eta", "beta", "alpha", "gamma")
-        state = _empty_state()
-        state = state.with_source(_make_source(on_success="rows"))
-        state = state.with_node(_make_gate("fan_out", "rows", aliases))
-        for alias in aliases:
-            state = state.with_node(_make_transform(f"t_{alias}", alias, "main"))
-        state = state.with_node(_make_coalesce("merge", {alias: f"{alias}_done" for alias in aliases}))
-        state = state.with_node(_make_transform("tidy", "merge", "main"))
-        state = state.with_output(_make_output())
-
-        facts = coalesce_reachability_facts(state)
-        produced = facts["merge"]["produced_connections"]
-        assert produced == ["alpha", "beta", "eta", "gamma", "rows", "zeta"]
-        assert [record["branch"] for record in facts["merge"]["unreachable_branches"]] == list(aliases)
-
-    def test_reachability_facts_handle_list_form_branches(self) -> None:
-        from elspeth.web.composer.state import coalesce_reachability_facts
-
-        state = _orphaned_coalesce_state(("a_done", "b_done"))
-        facts = coalesce_reachability_facts(state)
-        # List-form branch keys are the arriving connection names themselves,
-        # so they are identity branches and never carry a lure — see
-        # test_identity_branch_never_carries_a_sink_lure for the case where a
-        # transform DOES consume the name. The record states branch and
-        # connection as the same string outright; the old mapping form encoded
-        # this as {"a_done": "a_done"}, which reads like an alias->connection
-        # pair carrying information it does not have.
-        assert facts == {
-            "merge": {
-                "unreachable_branches": [
-                    {"branch": "a_done", "consumed_connection": "a_done"},
-                    {"branch": "b_done", "consumed_connection": "b_done"},
-                ],
-                "produced_connections": ["branch_a", "branch_b", "rows"],
-            }
-        }
-
-    def test_identity_branch_never_carries_a_sink_lure(self) -> None:
-        """An identity branch must not name a lure — the walk finds a CONSUMER.
-
-        ``_sink_lure`` walks from the branch NAME. For a mapped branch that
-        name is the fork alias, so the transform consuming it is the branch's
-        producer and re-pointing its on_success is the correct repair. For an
-        identity branch the name IS the consumed connection, so the walk finds
-        a node competing for the connection the coalesce awaits. Naming it
-        would make the planner set that node's on_success to its own input —
-        a self-loop rejected as ``pipeline_cycle``, burning a repair turn in
-        the payload that exists to stop exactly that.
-
-        Here ``t_a`` consumes ``a_done`` (the identity branch name) and
-        publishes to the sink, so the pre-guard code DID attribute a lure.
-        """
-        from elspeth.web.composer.state import coalesce_reachability_facts
-
-        state = _empty_state()
-        state = state.with_source(_make_source(on_success="rows"))
-        state = state.with_node(_make_gate("fan_out", "rows", ("branch_a", "branch_b")))
-        state = state.with_node(_make_transform("t_a", "a_done", "main"))
-        state = state.with_node(_make_coalesce("merge", ("a_done", "b_done")))
-        state = state.with_node(_make_transform("tidy", "merge", "main"))
-        state = state.with_output(_make_output())
-        facts = coalesce_reachability_facts(state)
-        assert facts["merge"]["unreachable_branches"] == [
-            {"branch": "a_done", "consumed_connection": "a_done"},
-            {"branch": "b_done", "consumed_connection": "b_done"},
-        ]
-
-    def test_unreachable_branches_follow_authored_order_not_sorted_order(self) -> None:
-        """Order is the order the planner authored, never sorted.
-
-        Pinned because the list form makes order observable where the old
-        mapping's was incidental: a reader matching record N against its own
-        emitted branches must see them in the order it wrote them. The branch
-        names here sort into the opposite order, so a ``sorted()`` slipped
-        into the emitter fails this and passes a same-order fixture.
-        """
-        from elspeth.web.composer.state import coalesce_reachability_facts
-
-        state = _orphaned_coalesce_state({"branch_b": "b_done", "branch_a": "a_done"})
-        facts = coalesce_reachability_facts(state)
-        assert [record["branch"] for record in facts["merge"]["unreachable_branches"]] == ["branch_b", "branch_a"]
-
-    def test_sink_lure_attribution_follows_transform_chains_and_skips_non_sink_dangles(self) -> None:
-        """The lure walk follows a branch's transform CHAIN to the sink hop.
-
-        branch_a: t_a -> x_mid -> t_mid -> main (sink): the transform to
-        repair is t_mid, the chain's sink-publishing hop. branch_b: t_b
-        publishes a dangling non-sink name — unreachable, but not the sink
-        lure, so no attribution entry.
-        """
-        from elspeth.web.composer.state import coalesce_reachability_facts
-
-        state = _empty_state()
-        state = state.with_source(_make_source(on_success="rows"))
-        state = state.with_node(_make_gate("fan_out", "rows", ("branch_a", "branch_b")))
-        state = state.with_node(_make_transform("t_a", "branch_a", "x_mid"))
-        state = state.with_node(_make_transform("t_mid", "x_mid", "main"))
-        state = state.with_node(_make_transform("t_b", "branch_b", "b_dangle"))
-        state = state.with_node(_make_coalesce("merge", {"branch_a": "a_done", "branch_b": "b_done"}))
-        state = state.with_node(_make_transform("tidy", "merge", "main"))
-        state = state.with_output(_make_output())
-        facts = coalesce_reachability_facts(state)
-        assert facts["merge"]["unreachable_branches"] == [
-            {
-                "branch": "branch_a",
-                "consumed_connection": "a_done",
-                "sink_lure": {"node_id": "t_mid", "publishes_to_sink": "main"},
-            },
-            # branch_b is unreachable but carries NO sink_lure: t_b dangles to
-            # a non-sink name, so there is no sink-publishing hop to name.
-            {"branch": "branch_b", "consumed_connection": "b_done"},
-        ]
-
-    def test_reachability_facts_empty_for_correctly_wired_coalesce(self) -> None:
-        from elspeth.web.composer.state import coalesce_reachability_facts
-
+    def test_correctly_wired_coalesce_is_valid(self) -> None:
         state = _empty_state()
         state = state.with_source(_make_source(on_success="rows"))
         state = state.with_node(_make_gate("fan_out", "rows", ("branch_a", "branch_b")))
@@ -1359,58 +1097,8 @@ class TestCoalesceReachabilityFacts:
         state = state.with_node(_make_transform("tidy", "merge", "main"))
         state = state.with_output(_make_output())
         assert state.validate().is_valid
-        assert coalesce_reachability_facts(state) == {}
 
-    def test_allowlisted_feedback_projects_connectivity_facts(self) -> None:
-        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-        from elspeth.web.composer.tools import ToolResult
-
-        state = _orphaned_coalesce_state({"branch_a": "a_done", "branch_b": "b_done"})
-        result = ToolResult(
-            success=False,
-            updated_state=state,
-            validation=state.validate(),
-            affected_nodes=(),
-        )
-        feedback = _allowlisted_candidate_feedback(result)
-        projected = feedback["validation"]["errors"][0]
-        assert projected["error_code"] == "coalesce_branch_unreachable"
-        assert "message" not in projected
-        # The one PROJECTION-level assertion for this payload: it proves the
-        # facts cross _allowlisted_candidate_feedback unmodified. The other
-        # sites call coalesce_reachability_facts directly, so only this one
-        # would catch the projection dropping or reshaping a field.
-        assert projected["connectivity"] == {
-            "unreachable_branches": [
-                {
-                    "branch": "branch_a",
-                    "consumed_connection": "a_done",
-                    "sink_lure": {"node_id": "t_a", "publishes_to_sink": "main"},
-                },
-                {
-                    "branch": "branch_b",
-                    "consumed_connection": "b_done",
-                    "sink_lure": {"node_id": "t_b", "publishes_to_sink": "main"},
-                },
-            ],
-            "produced_connections": ["branch_a", "branch_b", "rows"],
-        }
-
-    def test_route_destination_entries_ship_only_their_own_fields_keys(self) -> None:
-        """A component whose on_success AND on_error both dangle gets two entries, each with its own field's keys.
-
-        ``route_destination_facts`` merges both findings into one dict per
-        component; attaching that dict to every entry shipped
-        ``dangling_on_success`` / ``consumable_connections`` under the on_error
-        code and ``dangling_on_error`` under the on_success code — keys the
-        code's guidance never names and the teaching gate never enumerated
-        (red-team finding on bc8b9e237). The consumer now projects each entry
-        to ``route_destination_fact_keys(code)``; this pins that projection on
-        the doubly-dangling fixture the finding used.
-        """
-        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback, route_destination_fact_keys
-        from elspeth.web.composer.tools import ToolResult
-
+    def test_doubly_dangling_transform_reports_both_route_codes(self) -> None:
         state = _empty_state()
         state = state.with_source(_make_source(on_success="rows"))
         state = state.with_node(
@@ -1434,39 +1122,6 @@ class TestCoalesceReachabilityFacts:
         validation = state.validate()
         codes = {entry.error_code for entry in validation.errors}
         assert {"transform_on_success_dangling", "transform_on_error_unknown_sink"} <= codes
-        # The producer really does merge: both fields' keys live in one dict.
-        assert set(route_destination_facts(state)["node:t1"]) == {
-            "dangling_on_success",
-            "declared_sinks",
-            "consumable_connections",
-            "dangling_on_error",
-        }
-
-        feedback = _allowlisted_candidate_feedback(ToolResult(success=False, updated_state=state, validation=validation, affected_nodes=()))
-        shipped = {entry["error_code"]: set(entry["connectivity"]) for entry in feedback["validation"]["errors"] if "connectivity" in entry}
-        assert shipped["transform_on_success_dangling"] == route_destination_fact_keys("transform_on_success_dangling")
-        assert shipped["transform_on_error_unknown_sink"] == route_destination_fact_keys("transform_on_error_unknown_sink")
-        assert "dangling_on_success" not in shipped["transform_on_error_unknown_sink"]
-        assert "dangling_on_error" not in shipped["transform_on_success_dangling"]
-
-    def test_allowlisted_feedback_omits_connectivity_for_other_codes(self) -> None:
-        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-        from elspeth.web.composer.tools import ToolResult
-
-        entry = ValidationEntry(
-            component="node:merge",
-            message="anything",
-            severity="high",
-            error_code="coalesce_missing_branches",
-        )
-        result = ToolResult(
-            success=False,
-            updated_state=_empty_state(),
-            validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
-            affected_nodes=(),
-        )
-        feedback = _allowlisted_candidate_feedback(result)
-        assert "connectivity" not in feedback["validation"]["errors"][0]
 
 
 class TestPluginUnavailabilityFamilyIsExplainable:

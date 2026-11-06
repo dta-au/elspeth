@@ -85,7 +85,6 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.required_executor import RequiredExecutorGenerationCustodian, RequiredGenerationUnavailable
 from elspeth.web.sessions.models import run_events_table
 from elspeth.web.sessions.protocol import (
-    CompositionStateData,
     RunRecord,
     RunStartPermitRecord,
     SessionOperationAuthority,
@@ -95,6 +94,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.helpers import execution_custody
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.execution_custody import (
     ActualPrivatePipelineExecutorControl,
     CanonicalExecutionAuthorityObservation,
@@ -4592,7 +4592,7 @@ async def _seed_run_through_service(
     try:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_context,
         )

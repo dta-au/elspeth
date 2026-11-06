@@ -11,6 +11,7 @@ import pytest
 import structlog
 from sqlalchemy import Engine, update
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data
 
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.membership_authority import (
@@ -20,7 +21,7 @@ from elspeth.web.coordination.membership_authority import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import session_operation_fences_table, web_instances_table
-from elspeth.web.sessions.protocol import CompositionStateData, RunRecord
+from elspeth.web.sessions.protocol import RunRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -105,7 +106,7 @@ async def _create_running_run(service: SessionServiceImpl, engine: Engine) -> tu
     try:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_context,
         )

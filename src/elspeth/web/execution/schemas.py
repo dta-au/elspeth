@@ -10,7 +10,7 @@ values or dropping unknown fields.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, ClassVar, Final, Literal, Self, TypeAliasType, get_args
+from typing import Annotated, Any, ClassVar, Final, Literal, Self, TypeAliasType, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -739,12 +739,27 @@ class RunEvent(_StrictResponse):
 # If a developer adds a new event type to the Literal but forgets the mapping
 # (or vice versa), this assertion fires at module load — not at runtime when
 # a user hits the mismatch.
-_event_type_literal = get_args(RunEvent.model_fields["event_type"].annotation)
-_mapping_keys = frozenset(RunEvent._EVENT_TYPE_TO_DATA_TYPE.keys())
-_literal_values = frozenset(_event_type_literal)
-if _mapping_keys != _literal_values:
-    raise AssertionError(f"_EVENT_TYPE_TO_DATA_TYPE keys {_mapping_keys} != event_type Literal values {_literal_values}")
-del _event_type_literal, _mapping_keys, _literal_values
+def _require_run_event_mapping(annotation: object, mapping: object) -> None:
+    """Check the current event Literal and mapping without hashing retained objects."""
+    if annotation is not RunEventType or get_origin(annotation) is not Literal:
+        raise TypeError("Run event field must retain its current Literal owner")
+    if type(mapping) is not dict:
+        raise TypeError("Run event data mapping must be an exact dict")
+    literal_values: set[str] = set()
+    for value in get_args(annotation):
+        if type(value) is not str:
+            raise TypeError("Run event Literal members must be exact strings")
+        literal_values.add(value)
+    mapping_keys: set[str] = set()
+    for key in mapping:
+        if type(key) is not str:
+            raise TypeError("Run event mapping keys must be exact strings")
+        mapping_keys.add(key)
+    if mapping_keys != literal_values:
+        raise AssertionError(f"_EVENT_TYPE_TO_DATA_TYPE keys {mapping_keys} != event_type Literal values {literal_values}")
+
+
+_require_run_event_mapping(RunEvent.model_fields["event_type"].annotation, RunEvent._EVENT_TYPE_TO_DATA_TYPE)
 
 
 class DiscardStageSummary(_StrictResponse):
@@ -1258,6 +1273,22 @@ def revalidated_with_discard_summary(
     return RunStatusResponse(**field_values)
 
 
+def _status_literal_values(annotation: object, expected: object) -> frozenset[str]:
+    """Project the real status field only through its current shared Literal owner."""
+    if annotation is not expected:
+        raise TypeError("Run status field must retain its current shared Literal owner")
+    if get_origin(annotation) is not Literal:
+        raise TypeError("Run status field annotation must be a Literal")
+    names: list[str] = []
+    for value in get_args(annotation):
+        if type(value) is not str:
+            raise TypeError("Run status Literal members must be exact strings")
+        names.append(value)
+    if not names:
+        raise TypeError("Run status Literal must not be empty")
+    return frozenset(names)
+
+
 # ── Status set derivation (Literal → frozenset) ────────────────────────
 #
 # The REST /results endpoint must reject non-terminal runs with 409.  The
@@ -1271,8 +1302,10 @@ def revalidated_with_discard_summary(
 # without this, a typo in one Literal would produce a runtime set diff
 # with surprising contents.
 
-RUN_STATUS_ALL_VALUES: frozenset[str] = frozenset(get_args(RunStatusResponse.model_fields["status"].annotation))
-RUN_STATUS_TERMINAL_VALUES: frozenset[str] = frozenset(get_args(RunResultsResponse.model_fields["status"].annotation))
+RUN_STATUS_ALL_VALUES: frozenset[str] = _status_literal_values(RunStatusResponse.model_fields["status"].annotation, SessionRunStatus)
+RUN_STATUS_TERMINAL_VALUES: frozenset[str] = _status_literal_values(
+    RunResultsResponse.model_fields["status"].annotation, TerminalSessionRunStatus
+)
 RUN_STATUS_NON_TERMINAL_VALUES: frozenset[str] = RUN_STATUS_ALL_VALUES - RUN_STATUS_TERMINAL_VALUES
 
 if not RUN_STATUS_TERMINAL_VALUES.issubset(RUN_STATUS_ALL_VALUES):

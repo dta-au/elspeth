@@ -50,9 +50,15 @@ def test_private_evidence_preserves_owned_field_mapper_labels(tool: str, authori
         if tool == "upsert_node"
         else {"node": {"plugin": "field_mapper", "options": node["options"]}}
         if tool == "splice_transform"
+        else {"nodes": [node]}
+        if tool == "set_pipeline"
         else {"pipeline": {"nodes": [node]}}
     )
     evidence = build(arguments, tool=tool)
+    if tool == "emit_pipeline_proposal":
+        assert evidence.arguments.disposition == "filtered"
+        assert "customer_id" not in evidence.arguments.content
+        return
     assert evidence.arguments.disposition == "retained"
     assert json.loads(evidence.arguments.content) == arguments
 
@@ -407,26 +413,28 @@ def test_plugin_declared_slot_does_not_spread_to_nested_reference_urls() -> None
 
 
 def test_planner_emit_authority_preserves_wrapped_pipeline_order() -> None:
+    """Retain the native control on live flat set_pipeline and its wrapped wire."""
     from elspeth.web.composer.authority_hashing import project_composer_authority_payload, restore_composer_authority_payload
 
     pipeline = {"sources": {"z": {"plugin": "csv"}, "a": {"plugin": "csv"}}, "nodes": []}
-    arguments = {"pipeline": pipeline, "explanation": "Ordinary candidate"}
-    authority = {**arguments, "pipeline": project_composer_authority_payload(pipeline)}
+    arguments = pipeline
+    authority = project_composer_authority_payload(pipeline)
+    wire = json.dumps({"pipeline": pipeline})
     evidence = build_private_tool_evidence(
         session_id="session-a",
         operation_id="operation-a",
         operation_epoch=1,
-        tool_call_id="emit-a",
-        tool_name="emit_pipeline_proposal",
-        status="received_not_dispatched",
+        tool_call_id="pipeline-a",
+        tool_name="set_pipeline",
+        status="success",
         arguments_canonical=canonical_json(arguments),
         authority_arguments_canonical=canonical_json(authority),
         result_canonical=None,
-        raw_arguments=json.dumps(arguments),
+        raw_arguments=wire,
     )
     retained_authority = json.loads(evidence.authority_arguments.content)
-    assert list(restore_composer_authority_payload(retained_authority["pipeline"])["sources"]) == ["z", "a"]
-    assert evidence.wire_arguments.content == json.dumps(arguments)
+    assert list(restore_composer_authority_payload(retained_authority)["sources"]) == ["z", "a"]
+    assert evidence.wire_arguments.content == wire
     assert ComposerDiagnosticEvidence.from_envelope(evidence.to_envelope(), expected_session_id="session-a") == evidence
 
 

@@ -2286,8 +2286,12 @@ class TestAggregationFailureMatrix:
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
             patch.object(processor._scheduler, "complete_barrier", wraps=processor._scheduler.complete_barrier) as complete_barrier,
             patch.object(processor, "_emit_token_completed", side_effect=RuntimeError("telemetry down")),
@@ -2349,8 +2353,12 @@ class TestAggregationFailureMatrix:
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(factory.data_flow, "record_token_outcome_leader") as record_outcome,
             patch.object(processor._scheduler, "complete_barrier", wraps=processor._scheduler.complete_barrier) as complete_barrier,
         ):
@@ -2407,8 +2415,12 @@ class TestAggregationFailureMatrix:
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(processor._data_flow, "record_token_outcome"),
             patch.object(processor, "_emit_transform_completed"),
             pytest.raises(FrameworkBugError, match=r"result\.rows None"),
@@ -2454,8 +2466,12 @@ class TestAggregationFailureMatrix:
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(processor._data_flow, "record_token_outcome"),
             patch.object(processor._data_flow, "record_token_outcome_leader") as record_leader,
             patch.object(processor, "_emit_transform_completed"),
@@ -2603,8 +2619,12 @@ class TestAggregationFailureMatrix:
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(processor, "_emit_transform_completed"),
             patch.object(processor, "_emit_token_completed"),
             patch.object(processor._token_manager, "expand_token", return_value=([], "expand-group-1")) as expand_token,
@@ -2666,8 +2686,12 @@ class TestAggregationFailureMatrix:
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
             patch.object(processor, "_emit_transform_completed"),
             patch.object(processor, "_emit_token_completed"),
@@ -2727,8 +2751,12 @@ class TestAggregationFailureMatrix:
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(factory.data_flow, "record_token_outcome"),
             patch.object(processor, "_emit_transform_completed"),
             patch.object(processor, "_emit_token_completed"),

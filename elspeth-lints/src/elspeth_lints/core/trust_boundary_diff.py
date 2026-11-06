@@ -11,12 +11,12 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from elspeth_lints.core.trusted_git import SourceSnapshotError, git_metadata_operation, run_git_metadata
 from elspeth_lints.rules.trust_boundary.shared import extract_keywords, iter_boundary_decorators
 
 
@@ -49,6 +49,17 @@ class TrustBoundaryDiffError(RuntimeError):
 
 
 def find_new_trust_boundary_decorators(
+    *,
+    root: Path,
+    baseline_ref: str,
+    repo_root: Path,
+) -> TrustBoundaryDiffReport:
+    """Compare decorators using one callback-free metadata view per operation."""
+    with git_metadata_operation(repo_root):
+        return _find_new_trust_boundary_decorators(root=root, baseline_ref=baseline_ref, repo_root=repo_root)
+
+
+def _find_new_trust_boundary_decorators(
     *,
     root: Path,
     baseline_ref: str,
@@ -258,19 +269,10 @@ def _git_show(*, baseline_ref: str, rel_path: str, repo_root: Path) -> str | Non
 
 
 def _run_git(args: list[str], *, repo_root: Path) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
     try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=repo_root,
-            capture_output=True,
-            check=False,
-            text=True,
-            env=env,
-        )
-    except OSError as exc:
-        raise TrustBoundaryDiffError(f"git command failed to start: {exc}") from exc
+        return run_git_metadata(args, repo_root=repo_root)
+    except SourceSnapshotError as exc:
+        raise TrustBoundaryDiffError(f"git metadata observation failed: {exc}") from exc
 
 
 def _git_commit_exists(*, baseline_ref: str, repo_root: Path) -> bool:

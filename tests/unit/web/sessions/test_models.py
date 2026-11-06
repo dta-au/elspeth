@@ -24,6 +24,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.protocol import OperationReceiptFailureCode
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 
 
 @pytest.fixture
@@ -126,31 +127,37 @@ class TestCompositionStateUniqueConstraint:
             # First state version
             conn.execute(
                 insert(composition_states_table).values(
-                    id=state_id_1,
-                    session_id=session_id,
-                    version=1,
-                    is_valid=False,
-                    # Plan §2294: schema-test direct insert must supply
-                    # provenance after Task 3's NOT NULL/CHECK addition.
-                    provenance="session_seed",
-                    created_at=datetime.now(UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id_1,
+                        session_id=session_id,
+                        version=1,
+                        is_valid=False,
+                        # Plan §2294: schema-test direct insert must supply
+                        # provenance after Task 3's NOT NULL/CHECK addition.
+                        provenance="session_seed",
+                        created_at=datetime.now(UTC),
+                    )
                 )
             )
             # Duplicate version should fail
             with pytest.raises(IntegrityError):
                 conn.execute(
                     insert(composition_states_table).values(
-                        id=state_id_2,
-                        session_id=session_id,
-                        version=1,
-                        is_valid=False,
-                        # Plan §2294: provenance required even on the
-                        # expected-to-fail row, so the failure exercises
-                        # ``uq_composition_state_version`` (the actual
-                        # subject under test) rather than the provenance
-                        # NOT NULL constraint.
-                        provenance="session_seed",
-                        created_at=datetime.now(UTC),
+                        **stamped_state_values(
+                            metadata_=stored_default_pipeline_metadata(),
+                            id=state_id_2,
+                            session_id=session_id,
+                            version=1,
+                            is_valid=False,
+                            # Plan §2294: provenance required even on the
+                            # expected-to-fail row, so the failure exercises
+                            # ``uq_composition_state_version`` (the actual
+                            # subject under test) rather than the provenance
+                            # NOT NULL constraint.
+                            provenance="session_seed",
+                            created_at=datetime.now(UTC),
+                        )
                     )
                 )
 
@@ -351,15 +358,18 @@ class TestCheckConstraints:
             )
             conn.execute(
                 insert(composition_states_table).values(
-                    id=state_id,
-                    session_id=session_id,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: schema-test direct insert; provenance
-                    # required for the FK-target row that subsequent
-                    # runs_table inserts depend on.
-                    provenance="session_seed",
-                    created_at=datetime.now(UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: schema-test direct insert; provenance
+                        # required for the FK-target row that subsequent
+                        # runs_table inserts depend on.
+                        provenance="session_seed",
+                        created_at=datetime.now(UTC),
+                    )
                 )
             )
             with pytest.raises(IntegrityError):
@@ -391,15 +401,18 @@ class TestCheckConstraints:
             )
             conn.execute(
                 insert(composition_states_table).values(
-                    id=state_id,
-                    session_id=session_id,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: schema-test direct insert; provenance
-                    # required for the FK-target row that subsequent
-                    # runs_table inserts depend on.
-                    provenance="session_seed",
-                    created_at=datetime.now(UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: schema-test direct insert; provenance
+                        # required for the FK-target row that subsequent
+                        # runs_table inserts depend on.
+                        provenance="session_seed",
+                        created_at=datetime.now(UTC),
+                    )
                 )
             )
             conn.execute(

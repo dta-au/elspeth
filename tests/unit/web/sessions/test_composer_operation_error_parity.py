@@ -7,17 +7,35 @@ from pathlib import Path
 
 import pytest
 from fastapi import Request
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.exceptions import HTTPException
 from structlog.testing import capture_logs
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
+from elspeth.contracts.credential_material import scrub_credential_material
+from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
+from elspeth.web.composer.protocol import (
+    ComposerConvergenceError,
+    ComposerMutationAuthorityRevoked,
+    ComposerPluginCrashError,
+    ComposerRuntimePreflightError,
+)
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.required_executor import RequiredGenerationUnavailable
-from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error, request_cancelled_error
+from elspeth.web.sessions.composer_operation_errors import (
+    project_composer_operation_error,
+    project_convergence_failure_data,
+    request_cancelled_error,
+)
 from elspeth.web.sessions.protocol import StaleComposeStateError
+
+pytest_plugins = ("tests.unit.web.coordination.test_composer_operation_authority",)
+
+_EXECUTOR_DETAIL = "Server execution capacity is currently unavailable. Review the session before retrying."
 
 
 @pytest.fixture
@@ -103,6 +121,132 @@ def test_nonretryable_permission_failure_is_safe_diagnostic() -> None:
     assert projected.failure_code == "operation_failed"
     assert projected.diagnostic_id is not None
     assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("budget", "reason", "cause"),
+    [
+        ("composition", "convergence_composition_budget", "The LLM kept making tool calls without producing a final response."),
+        ("discovery", "convergence_discovery_budget", "The LLM kept making tool calls without producing a final response."),
+        ("timeout", "convergence_wall_clock_timeout", "The request ran out of time before the turn could be completed."),
+    ],
+)
+def test_nominal_convergence_projects_only_closed_safe_facts(budget, reason, cause) -> None:
+    original = ComposerConvergenceError(3, budget_exhausted=budget)
+    original.args = ("PRIVATE altered exception text",)
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    from_data = project_convergence_failure_data(
+        max_turns=3, budget_exhausted=budget, request_id="nominal-request", diagnostic_id="private-diagnostic"
+    )
+    assert from_data == projected
+    assert projected.http_status == 422 and projected.failure_code == "http_error"
+    assert projected.error_type == "convergence" and projected.diagnostic_id is None
+    assert projected.body == {
+        "detail": {
+            "error_type": "convergence",
+            "detail": f"Composer did not converge within 3 turns (budget exhausted: {budget}). {cause}",
+            "turns_used": 3,
+            "budget_exhausted": budget,
+            "reason": reason,
+            "recovery_text": {
+                "composition": "Split the request into smaller turns, or ask an operator to raise the mutation-turn budget.",
+                "discovery": "Narrow the schema or catalog exploration, or ask an operator to raise the discovery-turn budget.",
+                "timeout": "Retry once the provider responds faster, or ask an operator to raise the composer wall-clock budget.",
+            }[budget],
+        }
+    }
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("turns", "budget"),
+    [(-1, "composition"), (True, "composition"), ("3", "composition"), (3, "PRIVATE invalid budget"), (3, object())],
+    ids=["negative-turns", "bool-turns", "string-turns", "foreign-budget", "foreign-object"],
+)
+def test_convergence_data_projection_rejects_malformed_cold_facts(turns: object, budget: object) -> None:
+    projected = project_convergence_failure_data(
+        max_turns=turns,
+        budget_exhausted=budget,
+        request_id="nominal-request",
+        diagnostic_id="11111111-1111-4111-8111-111111111111",
+    )
+    assert projected.failure_code == "operation_failed" and projected.diagnostic_id == "11111111-1111-4111-8111-111111111111"
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("foreign_budget", ["PRIVATE invalid budget", object()], ids=["foreign-string", "foreign-object"])
+def test_nominal_convergence_with_invalid_budget_does_not_publish_private_args(foreign_budget: object) -> None:
+    original = ComposerConvergenceError(3)
+    original.__dict__["budget_exhausted"] = foreign_budget
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.failure_code == "operation_failed"
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+def test_nominal_convergence_rejects_foreign_string_subclass_before_interpolation() -> None:
+    class ForeignBudget(str):
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __str__(self) -> str:
+            return "PRIVATE foreign subclass interpolation"
+
+        __hash__ = str.__hash__
+
+    original = ComposerConvergenceError(3)
+    original.__dict__["budget_exhausted"] = ForeignBudget("timeout")
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.failure_code == "operation_failed"
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("kind", ["plugin", "preflight"])
+def test_nominal_plugin_and_preflight_project_fixed_safe_distinct_details(kind: str) -> None:
+    original = RuntimeError("PRIVATE native plugin URL and secret")
+    unverified_state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    failure = (
+        ComposerPluginCrashError(original, partial_state=unverified_state)
+        if kind == "plugin"
+        else ComposerRuntimePreflightError(original_exc=original, partial_state=unverified_state)
+    )
+    projected = project_composer_operation_error(failure, request_id="nominal-request")
+    assert projected.http_status == 500 and projected.failure_code == "http_error"
+    assert projected.error_type == "composer_plugin_error" and projected.diagnostic_id is None
+    detail = projected.body["detail"]
+    assert isinstance(detail, dict) and detail["error_type"] == "composer_plugin_error"
+    assert ("runtime preflight" in detail["detail"]) == (kind == "preflight")
+    assert "failed_turn" not in detail and "partial_state" not in detail
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("wrapper", [RuntimeError, TimeoutError])
+def test_unowned_nominal_cause_cannot_promote_generic_failure(wrapper) -> None:
+    nominal = ComposerConvergenceError(2)
+    original = wrapper("PRIVATE unowned wrapper")
+    original.__cause__ = nominal
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.failure_code == "operation_failed" and projected.error_type == "operation_failed"
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("primary", [AuditIntegrityError("PRIVATE audit"), OperationalError("PRIVATE SQL", {}, RuntimeError())])
+def test_integrity_and_storage_outrank_nominal_failure(primary: BaseException) -> None:
+    original = ExceptionGroup("PRIVATE grouped error", [ComposerConvergenceError(2), primary])
+    projected = project_composer_operation_error(original, request_id="nominal-request")
+    assert projected.error_type == ("audit_integrity_error" if isinstance(primary, AuditIntegrityError) else "database_unavailable")
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("other", [RuntimeError("PRIVATE ordinary"), ComposerPluginCrashError(RuntimeError("PRIVATE plugin"))])
+def test_multiple_ordinary_leaves_and_owned_settlement_stay_generic(other: Exception) -> None:
+    nominal = ComposerConvergenceError(2)
+    grouped = ExceptionGroup("PRIVATE grouped error", [nominal, other])
+    owned = ComposerOwnedSettlementFailure()
+    owned.__cause__ = nominal
+    for original in (grouped, owned, SQLAlchemyError("PRIVATE SQL")):
+        projected = project_composer_operation_error(original, request_id="nominal-request")
+        assert projected.failure_code == "operation_failed" and projected.error_type == "operation_failed"
+        assert "PRIVATE" not in projected.model_dump_json()
 
 
 def test_failure_projection_does_not_log_before_atomic_terminal_audit() -> None:
@@ -242,20 +386,99 @@ async def test_generation_handler_uses_no_sql_diagnostics(parity_app, monkeypatc
     response = await parity_app.exception_handlers[RequiredGenerationUnavailable](request, RequiredGenerationUnavailable("PRIVATE"))
     assert response.status_code == 503
     assert json.loads(response.body) == {
-        "detail": "Database is currently unavailable. Please retry in a moment.",
-        "error_type": "database_unavailable",
+        "detail": _EXECUTOR_DETAIL,
+        "error_type": "executor_unavailable",
         "request_id": "owned-correlation",
     }
 
 
+@pytest.mark.asyncio
+async def test_actual_sql_handler_retains_database_diagnosis_and_owned_diagnostics(parity_app, monkeypatch) -> None:
+    import elspeth.web.app as web_app
+
+    with parity_app.state.session_engine.connect() as conn, pytest.raises(OperationalError) as caught:
+        conn.exec_driver_sql("SELECT * FROM f1_private_missing_table")
+    original = caught.value
+    diagnostics = []
+    actual_pool = web_app.admit_pool_diagnostics
+    actual_sqlstate = web_app.database_sqlstate
+
+    def observe_pool(pool):
+        diagnostics.append(("pool", pool))
+        return actual_pool(pool)
+
+    def observe_sqlstate(error):
+        diagnostics.append(("sqlstate", error))
+        return actual_sqlstate(error)
+
+    monkeypatch.setattr(web_app, "admit_pool_diagnostics", observe_pool)
+    monkeypatch.setattr(web_app, "database_sqlstate", observe_sqlstate)
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/parity",
+            "headers": [],
+            "query_string": b"",
+            "app": parity_app,
+            "state": {"request_id": "sql-correlation"},
+        }
+    )
+    with capture_logs() as logs:
+        response = await parity_app.exception_handlers[OperationalError](request, original)
+        projected = project_composer_operation_error(original, request_id="sql-correlation")
+    assert response.status_code == projected.http_status == 503
+    assert (
+        json.loads(response.body)
+        == projected.body
+        == {
+            "detail": "Database is currently unavailable. Please retry in a moment.",
+            "error_type": "database_unavailable",
+            "request_id": "sql-correlation",
+        }
+    )
+    assert diagnostics == [("pool", parity_app.state.session_engine.pool), ("sqlstate", original)]
+    assert [row["event"] for row in logs] == ["http_database_unavailable"]
+    assert original.__cause__ is original.orig
+    assert "f1_private_missing_table" not in response.body.decode() + repr(logs)
+
+
+@pytest.mark.parametrize(
+    "executor_type", [RequiredGenerationUnavailable, AsyncWorkerAdmissionTimeoutError], ids=["generation", "admission"]
+)
+def test_executor_projector_retains_fixed_diagnosis_without_logging(executor_type) -> None:
+    original = executor_type("PRIVATE executor input")
+    cause = RuntimeError("PRIVATE prior cause")
+    original.__cause__ = cause
+    with capture_logs() as logs:
+        projected = project_composer_operation_error(original, request_id="executor-correlation")
+    assert projected.http_status == 503
+    assert projected.failure_code == "http_error"
+    assert projected.error_type == "executor_unavailable"
+    assert projected.diagnostic_id is None
+    assert projected.body == {
+        "detail": _EXECUTOR_DETAIL,
+        "error_type": "executor_unavailable",
+        "request_id": "executor-correlation",
+    }
+    assert original.__cause__ is cause
+    assert "PRIVATE" not in projected.model_dump_json()
+    assert logs == []
+    if executor_type is AsyncWorkerAdmissionTimeoutError:
+        assert isinstance(original, TimeoutError)
+
+
 @pytest.mark.parametrize("owned_wrapper", ["settlement", "recovery", "cancellation"])
-def test_owned_generation_cause_preserves_fixed_projection_and_original_identity(owned_wrapper) -> None:
+@pytest.mark.parametrize(
+    "executor_type", [RequiredGenerationUnavailable, AsyncWorkerAdmissionTimeoutError], ids=["generation", "admission"]
+)
+def test_owned_generation_cause_preserves_fixed_projection_and_original_identity(owned_wrapper, executor_type) -> None:
     import asyncio
 
     from elspeth.contracts.errors import ComposerOwnedSettlementFailure
     from elspeth.web.sessions.composer_operations import ComposerRequiredRecoveryFailure
 
-    original = RequiredGenerationUnavailable("PRIVATE generation detail")
+    original = executor_type("PRIVATE executor detail")
     if owned_wrapper == "settlement":
         wrapper = ComposerOwnedSettlementFailure()
         wrapper.__cause__ = original
@@ -265,14 +488,17 @@ def test_owned_generation_cause_preserves_fixed_projection_and_original_identity
         wrapper = asyncio.CancelledError()
         wrapper.__cause__ = original
     projected = project_composer_operation_error(wrapper, request_id="owned")
-    assert projected.http_status == 503 and projected.error_type == "database_unavailable"
+    assert projected.http_status == 503 and projected.error_type == "executor_unavailable"
     assert wrapper.__cause__ is original
     assert "PRIVATE" not in projected.model_dump_json()
 
 
 @pytest.mark.parametrize("wrapper_type", [RuntimeError, TimeoutError, ValueError])
-def test_unowned_generation_cause_is_never_promoted(wrapper_type) -> None:
-    original = RequiredGenerationUnavailable("PRIVATE generation detail")
+@pytest.mark.parametrize(
+    "executor_type", [RequiredGenerationUnavailable, AsyncWorkerAdmissionTimeoutError], ids=["generation", "admission"]
+)
+def test_unowned_generation_cause_is_never_promoted(wrapper_type, executor_type) -> None:
+    original = executor_type("PRIVATE executor detail")
     wrapper = wrapper_type("PRIVATE database shutdown timeout text")
     wrapper.__cause__ = original
     projected = project_composer_operation_error(wrapper, request_id="owned")
@@ -283,10 +509,13 @@ def test_unowned_generation_cause_is_never_promoted(wrapper_type) -> None:
 
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("audit", [False, True])
-def test_generation_group_priority_is_order_independent_and_retains_original_group(reverse, audit) -> None:
+@pytest.mark.parametrize(
+    "executor_type", [RequiredGenerationUnavailable, AsyncWorkerAdmissionTimeoutError], ids=["generation", "admission"]
+)
+def test_generation_group_priority_is_order_independent_and_retains_original_group(reverse, audit, executor_type) -> None:
     from sqlalchemy.exc import SQLAlchemyError
 
-    generation = RequiredGenerationUnavailable("PRIVATE")
+    generation = executor_type("PRIVATE")
     leaves = [generation, OSError(errno.ENOSPC, "PRIVATE"), SQLAlchemyError("PRIVATE"), RuntimeError("PRIVATE")]
     if audit:
         leaves.append(AuditIntegrityError("PRIVATE"))
@@ -296,6 +525,185 @@ def test_generation_group_priority_is_order_independent_and_retains_original_gro
     original_leaves = group.exceptions
     projected = project_composer_operation_error(group, request_id="owned")
     assert projected.http_status == (500 if audit else 503)
-    assert projected.error_type == ("audit_integrity_error" if audit else "database_unavailable")
+    assert projected.error_type == ("audit_integrity_error" if audit else "executor_unavailable")
     assert group.exceptions is original_leaves and generation in group.exceptions
     assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.parametrize("executor_first", [False, True], ids=["database-first", "executor-first"])
+@pytest.mark.parametrize("audit", [False, True], ids=["availability", "audit"])
+@pytest.mark.parametrize(
+    "executor_type", [RequiredGenerationUnavailable, AsyncWorkerAdmissionTimeoutError], ids=["generation", "admission"]
+)
+def test_mixed_availability_group_projects_stable_first_witness(executor_first, audit, executor_type) -> None:
+    database = OperationalError("PRIVATE SQL", {}, RuntimeError("PRIVATE driver"))
+    executor = executor_type("PRIVATE executor")
+    leaves = [executor, database] if executor_first else [database, executor]
+    if audit:
+        leaves.append(AuditIntegrityError("PRIVATE audit"))
+    group = ExceptionGroup("PRIVATE mixed availability", leaves)
+    original_leaves = group.exceptions
+    projected = project_composer_operation_error(group, request_id="mixed-correlation")
+    assert projected.http_status == (500 if audit else 503)
+    assert projected.error_type == (
+        "audit_integrity_error" if audit else "executor_unavailable" if executor_first else "database_unavailable"
+    )
+    if not audit:
+        assert projected.body == {
+            "detail": _EXECUTOR_DETAIL if executor_first else "Database is currently unavailable. Please retry in a moment.",
+            "error_type": "executor_unavailable" if executor_first else "database_unavailable",
+            "request_id": "mixed-correlation",
+        }
+        assert projected.failure_code == "http_error" and projected.diagnostic_id is None
+    assert group.exceptions is original_leaves
+    assert group.exceptions[:2] == tuple(leaves[:2])
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "executor_type", [RequiredGenerationUnavailable, AsyncWorkerAdmissionTimeoutError], ids=["generation", "admission"]
+)
+async def test_actual_manual_executor_failure_keeps_original_custody_and_safe_presentation(
+    operation_store, tmp_path, monkeypatch, executor_type
+) -> None:
+    import httpx
+
+    from elspeth.web import app as app_module
+    from elspeth.web import async_workers
+    from elspeth.web.composer.pipeline_commit import PipelineCommitError
+    from elspeth.web.required_work import RequiredWorkSource
+    from elspeth.web.sessions.routes.composer import pipeline_settlement
+    from tests.unit.web.sessions.test_pipeline_rejection_callers import mounted_app, originals
+    from tests.unit.web.sessions.test_pipeline_rejection_required import prepared_rejection
+
+    _engine, repository, authority, service, sid = operation_store
+    expected, running = await prepared_rejection(operation_store)
+    cancelled = authority.request_cancel(session_id=sid, operation_id=running.claim.operation_id)
+    assert cancelled is not None and cancelled.cancel_requested_at is not None
+    terminal = authority.settle_continuation_owner(running, outcome=request_cancelled_error(request_id=cancelled.request_id))
+    assert terminal.status == "failed" and terminal.failure_code == "request_cancelled"
+    repository.release(running.session_operation_context)
+    retained = await service.get_authoritative_pipeline_proposal(session_id=sid, proposal_id=expected.authority.row.id)
+    assert retained.row.id == expected.authority.row.id
+    assert retained.proposal.draft_hash == expected.authority.proposal.draft_hash
+    assert retained.row.status == "pending"
+    app = mounted_app(operation_store, tmp_path)
+    body = PipelineCommitError("controlled candidate validation failure", code="VALIDATION_FAILED")
+    original = executor_type("PRIVATE executor input")
+    cause = RuntimeError("PRIVATE prior executor cause")
+    original.__cause__ = cause
+    reached, captured = [], []
+    pending_admission = False
+    actual_generation = async_workers._generation_for
+    actual_admission = async_workers._acquire_admission
+    actual_consume = app_module.consume_manual_proposal_failure
+
+    async def fail_candidate(**kwargs):
+        raise body
+
+    def observe_generation(executor, ticket, finalizer, *, claim_release=None, watch_reader=None, progress_cleanup=None):
+        nonlocal pending_admission
+        if ticket is not None and ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL:
+            assert not reached
+            reached.append(ticket)
+            if executor_type is RequiredGenerationUnavailable:
+                raise original
+            pending_admission = True
+        return actual_generation(
+            executor,
+            ticket,
+            finalizer,
+            claim_release=claim_release,
+            watch_reader=watch_reader,
+            progress_cleanup=progress_cleanup,
+        )
+
+    async def observe_admission():
+        nonlocal pending_admission
+        if pending_admission:
+            pending_admission = False
+            raise original
+        return await actual_admission()
+
+    def consume(carrier):
+        observation = actual_consume(carrier)
+        captured.append(observation)
+        return observation
+
+    monkeypatch.setattr(pipeline_settlement, "prepare_pipeline_proposal_commit", fail_candidate)
+    monkeypatch.setattr(async_workers, "_generation_for", observe_generation)
+    monkeypatch.setattr(async_workers, "_acquire_admission", observe_admission)
+    monkeypatch.setattr(app_module, "consume_manual_proposal_failure", consume)
+    with capture_logs() as logs:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                f"/api/sessions/{sid}/proposals/{expected.authority.row.id}/accept",
+                json={"draft_hash": expected.authority.proposal.draft_hash},
+                headers={"X-Request-ID": "f1-manual-correlation"},
+            )
+    assert len(reached) == len(captured) == 1 and not pending_admission, (
+        f"HTTP status={response.status_code}, body={scrub_credential_material(response.json())}"
+    )
+    observation = captured[0]
+    assert observation.selected_original is original
+    assert observation.lease.closed
+    observation.coordinator.assert_completed()
+    assert any(leaf is body for leaf in originals(observation.original_root))
+    assert any(leaf is original for leaf in originals(observation.original_root))
+    assert original.__cause__ is cause
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": _EXECUTOR_DETAIL,
+        "error_type": "executor_unavailable",
+        "request_id": "f1-manual-correlation",
+    }
+    assert "PRIVATE" not in response.text + repr(logs)
+    assert not any(row["event"] == "http_database_unavailable" for row in logs)
+
+
+def mutation_error():
+    return ComposerMutationAuthorityRevoked(
+        revocation=ComposerMutationRevocation(
+            ComposerMutationCeiling("11111111-1111-4111-8111-111111111111", "request", "auto_commit"),
+            "explicit_approve",
+        ),
+        llm_calls=(),
+        failed_turn=None,
+        state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        initial_version=1,
+    )
+
+
+def test_mutation_revocation_projects_same_safe_http_outcome():
+    error = mutation_error()
+    nominal = project_composer_operation_error(error, request_id="request")
+    route = project_composer_operation_error(HTTPException(status_code=409, detail=error.to_payload()), request_id="request")
+    assert nominal.http_status == route.http_status == 409
+    assert nominal.failure_code == route.failure_code == "http_error"
+    assert nominal.error_type == route.error_type == "composer_mutation_authority_revoked"
+    assert nominal.body == route.body == {"detail": error.to_payload()}
+    assert error.partial_state is None
+    assert "proposal" not in json.dumps(nominal.body)
+
+
+def test_audit_failure_still_outranks_mutation_revocation():
+    error = mutation_error()
+    original = AuditIntegrityError("PRIVATE original audit failure")
+    projected = project_composer_operation_error(ExceptionGroup("original pair", [error, original]), request_id="request")
+    assert projected.error_type == "audit_integrity_error"
+    assert projected.http_status == 500
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+def test_mutation_refusal_roundtrips_actual_durable_error_codec():
+    from elspeth.web.sessions.composer_operations import ComposerOperationError, composer_operation_result_hash
+
+    projected = project_composer_operation_error(mutation_error(), request_id="request")
+    encoded = projected.model_dump_json()
+    recovered = ComposerOperationError.model_validate_json(encoded, strict=True)
+    assert recovered == projected
+    assert composer_operation_result_hash(encoded) == composer_operation_result_hash(recovered.model_dump_json())
+    assert recovered.http_status == 409 and recovered.error_type == "composer_mutation_authority_revoked"
+    assert set(recovered.body["detail"]) == {"error_type", "detail", "request_id", "initial_trust_mode", "current_trust_mode"}
+    assert recovered.body["detail"]["request_id"] == "request"

@@ -137,6 +137,8 @@ def check_aggregation_timeouts(
     counters = ExecutionCounters()
 
     for agg_node_id_str, agg_settings in config.aggregation_settings.items():
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            break
         agg_node_id = NodeID(agg_node_id_str)
 
         # Use public facade method to check timeout (no private member access)
@@ -227,6 +229,8 @@ def flush_remaining_aggregation_buffers(
     counters = ExecutionCounters()
 
     for agg_node_id_str, agg_settings in config.aggregation_settings.items():
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            break
         agg_node_id = NodeID(agg_node_id_str)
 
         # Use public facade (not private member)

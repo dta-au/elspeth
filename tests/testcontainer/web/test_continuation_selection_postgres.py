@@ -1,0 +1,46 @@
+"""The same actual selected-read and metadata tests on real PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_actual_admission_wait_cancellation_is_one_original_with_no_submission as test_actual_admission_wait_cancellation_is_one_original_with_no_submission,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_cancelled_wait_joins_actual_read_once_before_raising as test_cancelled_wait_joins_actual_read_once_before_raising,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_coherent_invalid_utf8_is_owned_integrity_failure_with_original_cause as test_coherent_invalid_utf8_is_owned_integrity_failure_with_original_cause,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_complete_private_read_preserves_actual_frontier_and_all_sql_rows as test_complete_private_read_preserves_actual_frontier_and_all_sql_rows,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_finish_once_returns_exact_cohort_and_completes_both_registered_owners as test_finish_once_returns_exact_cohort_and_completes_both_registered_owners,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_inventory_rechecks_checkpoint_after_actual_names_lookup as test_inventory_rechecks_checkpoint_after_actual_names_lookup,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_joined_sql_carrier_cannot_replace_actual_result_identity as test_joined_sql_carrier_cannot_replace_actual_result_identity,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_read_refuses_actual_sql_chunk_tamper_after_positive as test_read_refuses_actual_sql_chunk_tamper_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_read_refuses_substituted_selection_or_current_claim_after_positive as test_read_refuses_substituted_selection_or_current_claim_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_real_current_inventory_consumes_actual_selected_owner as test_real_current_inventory_consumes_actual_selected_owner,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_reconciliation_read_keeps_live_lease_and_ordinary_inventory_strict as test_reconciliation_read_keeps_live_lease_and_ordinary_inventory_strict,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_same_context_wrong_required_work_claim_refuses_before_reservation as test_same_context_wrong_required_work_claim_refuses_before_reservation,
+)
+from tests.unit.web.sessions.test_continuation_selection import (
+    test_validation_failure_closes_projection_and_preserves_original_exception as test_validation_failure_closes_projection_and_preserves_original_exception,
+)
+
+pytestmark = pytest.mark.testcontainer

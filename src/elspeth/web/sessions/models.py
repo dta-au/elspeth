@@ -68,7 +68,33 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # Epoch 78 binds settled provider attempts to the exact ledger custody tuple,
 # rejects negative token measures, records shared rate bucket policy, and
 # reserves local run output storage before writing physical bytes.
-SESSION_SCHEMA_EPOCH = 78
+# Epoch 79 retains versioned Composer continuation segments, exact byte chunks,
+# attributed journal events and complete snapshots. Older stores are refused.
+# Epoch 80 makes Continuation the only Composer lifecycle: the parent operation
+# loses lifecycle_version, deadline_at, claim_token, claim_expires_at and the
+# queued-claim index, and its status bundle and transition guard describe one
+# lifecycle. It also adds the terminal-run and run-counter CHECKs and closed
+# Continuation value CHECKs, and drops the unused sessions_cleanup_claims table.
+# Every epoch-79 store is refused; 0.8.10 starts from a fresh store.
+# Epoch 82 makes the original Continuation parent policy/version/allowance
+# tuple immutable. Epoch-81 stores retain the weaker trigger and are refused
+# unchanged; there is no automatic upgrade or store reset.
+# Epoch 83 admits the distinct V4 paid-provider overflow policy and retains
+# provider-terminal holds. Epoch-82 stores lack those original admission facts;
+# preserve them unchanged rather than retrofitting a hold or changing a parent.
+# Epoch 84 adds the distinct paid_overflow effect and private receipt codec.
+# Published epoch-83 stores have the older effect CHECK and are refused intact.
+# Epoch 85 adds the distinct returned paid_incomplete effect and private receipt.
+# Published epoch-84 stores lack its effect CHECK and are refused intact.
+# Epoch 86 adds source-bound unpaid preview terminal reservations and the
+# distinct validation_incomplete effect. Preserve epoch-85 stores unchanged;
+# no automatic migration or reset is authorized by this format boundary.
+# Epoch 87 binds each H-preserving recovery edge to its exact original paid
+# END checkpoint without adding an unreserved continuation-journal append.
+# Epoch-86 stores are preserved and refused; there is no automatic migration.
+# Epoch 88 adds the distinct original-attempt SDK terminal disposition.
+# Preserve epoch-87 stores unchanged; no migration or reset is authorized.
+SESSION_SCHEMA_EPOCH = 88
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -77,6 +103,19 @@ _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(1
 # from the Literal would let a contract edit change what the database admits
 # with no epoch bump; pinning it means the drift is caught instead.
 _AUTH_PROVIDER_TYPE_CHECK = "auth_provider_type IN ('local', 'oidc', 'entra', 'vanguard', 'google')"
+# Hand-written for the same reason, and pinned against ``ContinuationEventTag``
+# by ``tests/unit/web/sessions/test_continuation_closed_value_checks.py``.
+_CONTINUATION_EVENT_TAG_CHECK = (
+    "tag IN ('ingress', 'checkpoint', 'input_prepared', 'provider_admitted', 'may_dispatch', "
+    "'response_retained', 'tool_prepared', 'effect_committed', 'effect_refused', 'effect_unknown', "
+    "'review_retained', 'yielded', 'recovered', 'settled')"
+)
+# Pinned against ``ContinuationYieldReason`` by the same test.
+_CONTINUATION_ROLLOVER_REASON_CHECK = (
+    "rollover_reason IS NULL OR rollover_reason IN ('quantum', 'watermark', 'action_fit', 'slice_limit', 'shutdown', 'model_request')"
+)
+# Pinned against ``ContinuationEffectOwner`` by the same independent test.
+_CONTINUATION_EFFECT_OWNER_CHECK = "owner IN ('provider', 'tool_dispatch', 'read', 'session_sql', 'composer_end', 'composer_iteration')"
 
 
 def _sql_non_blank_text(column_name: str, *, dialect: Literal["sqlite", "postgresql"]) -> str:
@@ -530,12 +569,11 @@ composition_states_table = Table(
         index=True,
     ),
     Column("version", Integer, nullable=False),
-    Column("source", JSON, nullable=True),
     Column("sources", JSON, nullable=True),
     Column("nodes", JSON, nullable=True),
     Column("edges", JSON, nullable=True),
     Column("outputs", JSON, nullable=True),
-    Column("metadata_", JSON, nullable=True),
+    Column("metadata_", JSON, nullable=False),
     Column("is_valid", Boolean, nullable=False, default=False),
     Column("validation_errors", JSON, nullable=True),
     # Operational/audit metadata produced by the composer pipeline that
@@ -550,10 +588,10 @@ composition_states_table = Table(
     # ``_composer_persisted_validation``). Two writers share the
     # ``is_valid`` column, so rows with byte-identical content can differ
     # in validity across lanes; the marker makes that transition legible
-    # to an auditor. Absence (NULL composer_meta or missing key) is honest
-    # for writer paths that predate the marker or copy an existing row
-    # (revert and fork).
-    Column("composer_meta", JSON, nullable=True),
+    # to an auditor. Every insert stamps ``content_publication``, so the
+    # column is never NULL; a missing ``validation_lane`` key is honest for
+    # writer paths that copy an existing row (revert and fork).
+    Column("composer_meta", JSON, nullable=False),
     Column("creator_operation_id", String, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column(
@@ -1987,6 +2025,25 @@ runs_table = Table(
         "status IN ('pending', 'running', 'completed', 'completed_with_failures', 'failed', 'empty', 'cancelled')",
         name="ck_runs_status",
     ),
+    CheckConstraint(
+        "status NOT IN ('completed', 'completed_with_failures', 'empty') OR landscape_run_id IS NOT NULL",
+        name="ck_runs_completed_landscape_run_id",
+    ),
+    CheckConstraint(
+        "status != 'failed' OR error IS NOT NULL",
+        name="ck_runs_failed_error",
+    ),
+    CheckConstraint(
+        "rows_processed >= 0 AND rows_succeeded >= 0 AND rows_failed >= 0 AND "
+        "rows_routed_success >= 0 AND rows_routed_failure >= 0 AND rows_quarantined >= 0",
+        name="ck_runs_counters_nonnegative",
+    ),
+    # ADR-019 subset rules, mirrored by ``RunRecord``: routed and quarantined
+    # rows are counted inside their base success/failure counters.
+    CheckConstraint(
+        "rows_routed_success <= rows_succeeded AND rows_routed_failure <= rows_failed AND rows_quarantined <= rows_failed",
+        name="ck_runs_counter_subsets",
+    ),
     *_non_blank_text_constraints("id", name="ck_runs_id_nonblank"),
     *_non_blank_text_constraints("session_id", name="ck_runs_session_id_nonblank"),
     CheckConstraint(
@@ -2279,32 +2336,6 @@ rate_limit_events_table = Table(
     *_lower_sha256_constraints("subject_digest", name="ck_rate_limit_events_digest_sha256"),
 )
 Index("ix_rate_limit_events_subject_occurred", rate_limit_events_table.c.subject_digest, rate_limit_events_table.c.occurred_at)
-
-sessions_cleanup_claims_table = Table(
-    "sessions_cleanup_claims",
-    metadata,
-    Column("claim_name", String, primary_key=True),
-    Column("claim_token", String, nullable=False),
-    Column("owner_instance_id", String, nullable=False),
-    Column("claim_epoch", Integer, nullable=False),
-    Column("lease_expires_at", DateTime(timezone=True), nullable=False, index=True),
-    Column("renewal_count", Integer, nullable=False),
-    Column("batch_count", Integer, nullable=False),
-    Column("max_renewals", Integer, nullable=False),
-    Column("max_batches", Integer, nullable=False),
-    Column("acquired_at", DateTime(timezone=True), nullable=False),
-    Column("updated_at", DateTime(timezone=True), nullable=False),
-    *_non_blank_text_constraints("claim_name", name="ck_sessions_cleanup_claims_name_nonblank"),
-    *_non_blank_text_constraints("claim_token", name="ck_sessions_cleanup_claims_token_nonblank"),
-    *_non_blank_text_constraints("owner_instance_id", name="ck_sessions_cleanup_claims_owner_nonblank"),
-    CheckConstraint("claim_token <> owner_instance_id", name="ck_sessions_cleanup_claims_token_not_owner"),
-    CheckConstraint("claim_epoch > 0", name="ck_sessions_cleanup_claims_positive_epoch"),
-    CheckConstraint(
-        "renewal_count >= 0 AND batch_count >= 0 AND max_renewals > 0 AND max_batches > 0 "
-        "AND renewal_count <= max_renewals AND batch_count <= max_batches",
-        name="ck_sessions_cleanup_claims_bounded_counts",
-    ),
-)
 
 blobs_table = Table(
     "blobs",
@@ -3624,15 +3655,23 @@ composer_async_operations_table = Table(
     Column("operation_id", String(36), primary_key=True),
     Column("kind", String(32), nullable=False),
     Column("status", String(16), nullable=False),
+    Column("phase", String(24), nullable=False),
+    Column("status_revision", BigInteger, nullable=False, server_default=text("0")),
+    Column("current_segment_sequence", Integer, nullable=False),
+    Column("ownership_generation", Integer, nullable=False),
+    Column("checkpoint_id", String(36), nullable=False),
+    Column("journal_cursor", BigInteger, nullable=False, server_default=text("0")),
+    Column("ingress_phase", String(16), nullable=False),
+    Column("reserved_user_message_id", String(128), nullable=False),
     Column("request_hash", String(64), nullable=False),
+    Column("continuation_policy_version", String(64), nullable=False),
+    Column("continuation_policy_sha256", String(64)),
+    Column("continuation_retained_payload_limit_bytes", BigInteger),
     Column("actor_user_id", String(128), ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False),
     Column("request_id", String(128)),
     Column("base_state_id", String(128)),
     Column("request_json", Text),
-    Column("deadline_at", DateTime(timezone=True), nullable=False),
-    Column("claim_token", String(256)),
     Column("claim_owner_instance_id", String(128)),
-    Column("claim_expires_at", DateTime(timezone=True)),
     Column("attempt", Integer, nullable=False, server_default="0"),
     Column("session_operation_id", String(128)),
     Column("session_operation_lease_token", String(256)),
@@ -3668,26 +3707,53 @@ composer_async_operations_table = Table(
         name="ck_composer_operations_failure",
     ),
     CheckConstraint(
-        "settled_by IN ('owner_terminal', 'settle_unstarted', 'request_cancel', 'settle_lost', 'settle_own_lapsed', 'settle_lost_inactive_session')",
+        "settled_by IN ('owner_terminal', 'settle_lost', 'settle_lost_inactive_session')",
         name="ck_composer_operations_settler",
     ),
     CheckConstraint("length(operation_id) = 36 AND attempt >= 0", name="ck_composer_operations_identity"),
     *_lower_sha256_constraints("request_hash", name="ck_composer_operations_request_hash"),
+    *_lower_sha256_constraints("continuation_policy_sha256", name="ck_composer_operations_continuation_policy_hash", nullable=True),
+    CheckConstraint(
+        "continuation_policy_version IS NOT NULL AND "
+        "((continuation_policy_version IN ('composer.continuation.policy.v1', 'composer.continuation.policy.v2') "
+        "AND continuation_policy_sha256 IS NULL AND continuation_retained_payload_limit_bytes IS NULL) OR "
+        "(continuation_policy_version IN ('composer.continuation.policy.v3', 'composer.continuation.policy.v4') "
+        "AND continuation_policy_sha256 IS NOT NULL "
+        "AND continuation_retained_payload_limit_bytes IS NOT NULL "
+        "AND continuation_retained_payload_limit_bytes > 0))",
+        name="ck_composer_operations_continuation_policy_contract",
+    ),
     *_lower_sha256_constraints("result_sha256", name="ck_composer_operations_result_hash", nullable=True),
     CheckConstraint("session_operation_epoch IS NULL OR session_operation_epoch > 0", name="ck_composer_operations_epoch"),
     CheckConstraint(
-        "updated_at >= created_at AND deadline_at > created_at AND "
+        "updated_at >= created_at AND "
+        "(cancel_requested_at IS NULL OR cancel_requested_at >= created_at) AND "
         "(started_at IS NULL OR started_at >= created_at) AND "
         "(settled_at IS NULL OR settled_at >= created_at) AND "
         "(started_at IS NULL OR settled_at IS NULL OR settled_at >= started_at)",
         name="ck_composer_operations_times",
     ),
 )
+# One lifecycle (Continuation). Each clause is its own string so a later
+# epoch can add or narrow one without rewriting the bundle.
+_COMPOSER_OPERATION_STATUS_BUNDLE = (
+    "current_segment_sequence > 0 AND ownership_generation > 0 AND journal_cursor >= 0 AND status_revision >= 0 AND "
+    "ingress_phase IN ('pending', 'committed') AND "
+    "((ingress_phase = 'pending' AND user_message_id IS NULL) OR "
+    "(ingress_phase = 'committed' AND user_message_id IS NOT NULL AND user_message_id = reserved_user_message_id)) AND "
+    "(kind <> 'compose_recompose' OR ingress_phase = 'committed') AND "
+    "((status IN ('queued', 'running') AND phase IN ('queued', 'executing', 'continuation_queued', 'reconciling', 'retry_waiting') AND "
+    "request_json IS NOT NULL AND result_schema IS NULL AND result_json IS NULL AND result_sha256 IS NULL AND "
+    "failure_code IS NULL AND settled_by IS NULL AND settled_at IS NULL) OR "
+    "(status = 'completed' AND phase = 'settled' AND request_json IS NULL AND "
+    "cancel_requested_at IS NULL AND failure_code IS NULL AND result_schema = 'message_with_state.v1' AND result_json IS NOT NULL AND "
+    "result_sha256 IS NOT NULL AND settled_at IS NOT NULL AND settled_by IS NOT NULL AND user_message_id IS NOT NULL) OR "
+    "(status = 'failed' AND phase = 'settled' AND request_json IS NULL AND "
+    "failure_code IS NOT NULL AND result_schema = 'composer_operation_error.v1' AND result_json IS NOT NULL AND "
+    "result_sha256 IS NOT NULL AND settled_at IS NOT NULL AND settled_by IS NOT NULL))"
+)
 composer_async_operations_table.append_constraint(
-    CheckConstraint(
-        "(status = 'queued' AND request_json IS NOT NULL AND session_operation_id IS NULL AND session_operation_lease_token IS NULL AND session_operation_epoch IS NULL AND started_at IS NULL AND result_schema IS NULL AND result_json IS NULL AND result_sha256 IS NULL AND failure_code IS NULL AND settled_by IS NULL AND settled_at IS NULL AND user_message_id IS NULL AND ((claim_token IS NULL AND claim_owner_instance_id IS NULL AND claim_expires_at IS NULL) OR (claim_token IS NOT NULL AND claim_owner_instance_id IS NOT NULL AND claim_expires_at IS NOT NULL))) OR (status = 'running' AND request_json IS NOT NULL AND claim_token IS NOT NULL AND claim_owner_instance_id IS NOT NULL AND started_at IS NOT NULL AND session_operation_id IS NOT NULL AND session_operation_lease_token IS NOT NULL AND session_operation_epoch IS NOT NULL AND claim_expires_at IS NULL AND result_schema IS NULL AND result_json IS NULL AND result_sha256 IS NULL AND failure_code IS NULL AND settled_by IS NULL AND settled_at IS NULL) OR (status = 'completed' AND request_json IS NULL AND claim_token IS NULL AND claim_expires_at IS NULL AND cancel_requested_at IS NULL AND failure_code IS NULL AND claim_owner_instance_id IS NOT NULL AND started_at IS NOT NULL AND result_json IS NOT NULL AND result_sha256 IS NOT NULL AND settled_at IS NOT NULL AND settled_by IS NOT NULL AND session_operation_id IS NOT NULL AND session_operation_lease_token IS NOT NULL AND session_operation_epoch IS NOT NULL AND result_schema = 'message_with_state.v1') OR (status = 'failed' AND request_json IS NULL AND claim_token IS NULL AND claim_expires_at IS NULL AND result_json IS NOT NULL AND result_sha256 IS NOT NULL AND settled_at IS NOT NULL AND failure_code IS NOT NULL AND settled_by IS NOT NULL AND result_schema = 'composer_operation_error.v1' AND ((session_operation_id IS NULL AND session_operation_lease_token IS NULL AND session_operation_epoch IS NULL AND started_at IS NULL) OR (session_operation_id IS NOT NULL AND session_operation_lease_token IS NOT NULL AND session_operation_epoch IS NOT NULL AND started_at IS NOT NULL AND claim_owner_instance_id IS NOT NULL)))",
-        name="ck_composer_operations_status_bundle",
-    )
+    CheckConstraint(_COMPOSER_OPERATION_STATUS_BUNDLE, name="ck_composer_operations_status_bundle")
 )
 
 Index(
@@ -3696,14 +3762,6 @@ Index(
     unique=True,
     sqlite_where=composer_async_operations_table.c.status.in_(("queued", "running")),
     postgresql_where=composer_async_operations_table.c.status.in_(("queued", "running")),
-)
-Index(
-    "ix_composer_async_operations_claimable",
-    composer_async_operations_table.c.status,
-    composer_async_operations_table.c.claim_expires_at,
-    composer_async_operations_table.c.created_at,
-    sqlite_where=composer_async_operations_table.c.status == "queued",
-    postgresql_where=composer_async_operations_table.c.status == "queued",
 )
 Index(
     "uq_composer_async_operations_bound_fence",
@@ -3729,6 +3787,438 @@ composer_async_operations_table.append_constraint(
 )
 
 
+def _continuation_parent_fk(name: str) -> ForeignKeyConstraint:
+    return ForeignKeyConstraint(
+        ["session_id", "operation_id"],
+        ["composer_async_operations.session_id", "composer_async_operations.operation_id"],
+        name=name,
+        ondelete="CASCADE",
+    )
+
+
+composer_operation_segments_table = Table(
+    "composer_operation_segments",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("sequence", Integer, primary_key=True),
+    Column("predecessor_sequence", Integer),
+    Column("state", String(16), nullable=False),
+    Column("generation", Integer, nullable=False),
+    Column("claim_token", String(256)),
+    Column("claim_owner_instance_id", String(128)),
+    Column("claim_expires_at", DateTime(timezone=True)),
+    Column("session_operation_id", String(128)),
+    Column("session_operation_lease_token", String(256)),
+    Column("session_operation_epoch", Integer),
+    Column("enqueued_at", DateTime(timezone=True), nullable=False),
+    Column("next_eligible_at", DateTime(timezone=True), nullable=False),
+    Column("started_at", DateTime(timezone=True)),
+    Column("cooperative_at", DateTime(timezone=True)),
+    Column("deadline_at", DateTime(timezone=True)),
+    Column("checkpoint_id", String(36), nullable=False),
+    Column("next_action_json", Text, nullable=False),
+    Column("policy_sha256", String(64), nullable=False),
+    Column("rollover_reason", String(32)),
+    _continuation_parent_fk("fk_composer_segments_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "predecessor_sequence"],
+        ["composer_operation_segments.session_id", "composer_operation_segments.operation_id", "composer_operation_segments.sequence"],
+        name="fk_composer_segments_predecessor",
+        ondelete="CASCADE",
+    ),
+    UniqueConstraint("session_id", "operation_id", "predecessor_sequence", name="uq_composer_segments_successor"),
+    CheckConstraint("sequence > 0 AND generation > 0", name="ck_composer_segments_identity"),
+    CheckConstraint("predecessor_sequence IS NULL OR predecessor_sequence = sequence - 1", name="ck_composer_segments_predecessor"),
+    CheckConstraint("state IN ('queued', 'running', 'yielded', 'interrupted', 'settled')", name="ck_composer_segments_state"),
+    CheckConstraint(_CONTINUATION_ROLLOVER_REASON_CHECK, name="ck_composer_segments_rollover_reason"),
+    CheckConstraint(
+        "(state = 'queued' AND started_at IS NULL AND deadline_at IS NULL AND cooperative_at IS NULL) OR "
+        "(state <> 'queued' AND started_at IS NOT NULL AND deadline_at IS NOT NULL AND cooperative_at IS NOT NULL AND deadline_at > started_at AND cooperative_at >= started_at AND cooperative_at < deadline_at)",
+        name="ck_composer_segments_times",
+    ),
+    CheckConstraint(
+        "(claim_token IS NULL AND claim_owner_instance_id IS NULL AND claim_expires_at IS NULL) OR "
+        "(claim_token IS NOT NULL AND claim_owner_instance_id IS NOT NULL AND claim_expires_at IS NOT NULL)",
+        name="ck_composer_segments_claim",
+    ),
+    CheckConstraint(
+        "(session_operation_id IS NULL AND session_operation_lease_token IS NULL AND session_operation_epoch IS NULL) OR "
+        "(session_operation_id IS NOT NULL AND session_operation_lease_token IS NOT NULL AND session_operation_epoch IS NOT NULL AND session_operation_epoch > 0)",
+        name="ck_composer_segments_fence",
+    ),
+    *_lower_sha256_constraints("policy_sha256", name="ck_composer_segments_policy_sha256"),
+)
+Index(
+    "ix_composer_segments_eligible",
+    composer_operation_segments_table.c.next_eligible_at,
+    composer_operation_segments_table.c.enqueued_at,
+    composer_operation_segments_table.c.session_id,
+    composer_operation_segments_table.c.operation_id,
+    composer_operation_segments_table.c.sequence,
+    sqlite_where=composer_operation_segments_table.c.state.in_(("queued", "interrupted")),
+    postgresql_where=composer_operation_segments_table.c.state.in_(("queued", "interrupted")),
+)
+
+composer_segment_attempts_table = Table(
+    "composer_segment_attempts",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("sequence", Integer, primary_key=True),
+    Column("generation", Integer, primary_key=True),
+    Column("claim_attempt", Integer, nullable=False),
+    Column("session_operation_id", String(128), nullable=False),
+    Column("session_operation_epoch", Integer, nullable=False),
+    Column("session_operation_lease_token", String(256), nullable=False),
+    Column("owner_instance_id", String(128), nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("claim_expires_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_at", DateTime(timezone=True)),
+    Column("outcome", String(16)),
+    Column("recovered_end_h_checkpoint_id", String(36)),
+    _continuation_parent_fk("fk_composer_attempts_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "sequence"],
+        ["composer_operation_segments.session_id", "composer_operation_segments.operation_id", "composer_operation_segments.sequence"],
+        name="fk_composer_attempts_segment",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "recovered_end_h_checkpoint_id"],
+        [
+            "composer_continuation_checkpoints.session_id",
+            "composer_continuation_checkpoints.operation_id",
+            "composer_continuation_checkpoints.checkpoint_id",
+        ],
+        name="fk_composer_attempts_recovered_end_h_checkpoint",
+        ondelete="NO ACTION",
+    ),
+    UniqueConstraint("session_id", "session_operation_epoch", name="uq_composer_attempts_epoch"),
+    UniqueConstraint("session_id", "session_operation_id", name="uq_composer_attempts_fence"),
+    CheckConstraint(
+        "sequence > 0 AND generation > 0 AND session_operation_epoch > 0 AND claim_attempt > 0", name="ck_composer_attempts_identity"
+    ),
+    CheckConstraint("outcome IS NULL OR outcome IN ('yielded', 'interrupted', 'settled')", name="ck_composer_attempts_outcome"),
+    CheckConstraint("(revoked_at IS NULL) = (outcome IS NULL)", name="ck_composer_attempts_revocation"),
+    CheckConstraint(
+        "recovered_end_h_checkpoint_id IS NULL OR (revoked_at IS NOT NULL AND outcome = 'interrupted')",
+        name="ck_composer_attempts_recovered_end_h_interrupted",
+    ),
+)
+
+composer_continuation_chunks_table = Table(
+    "composer_continuation_chunks",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("chunk_key", String(128), primary_key=True),
+    Column("codec", String(64), nullable=False),
+    Column("payload", LargeBinary, nullable=False),
+    Column("sha256", String(64), nullable=False),
+    Column("byte_length", BigInteger, nullable=False),
+    _continuation_parent_fk("fk_composer_chunks_parent"),
+    CheckConstraint("byte_length >= 0", name="ck_composer_chunks_byte_length"),
+    CheckConstraint("length(payload) = byte_length", name="ck_composer_chunks_exact_bytes").ddl_if(dialect="sqlite"),
+    CheckConstraint("octet_length(payload) = byte_length", name="ck_composer_chunks_exact_bytes").ddl_if(dialect="postgresql"),
+    *_lower_sha256_constraints("sha256", name="ck_composer_chunks_sha256"),
+)
+
+composer_continuation_checkpoints_table = Table(
+    "composer_continuation_checkpoints",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("checkpoint_id", String(36), primary_key=True),
+    Column("kind", String(16), nullable=False),
+    Column("cursor", BigInteger, nullable=False),
+    Column("snapshot_chunk_key", String(128), nullable=False),
+    Column("frame_stack_version", Integer, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    _continuation_parent_fk("fk_composer_checkpoints_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "snapshot_chunk_key"],
+        ["composer_continuation_chunks.session_id", "composer_continuation_chunks.operation_id", "composer_continuation_chunks.chunk_key"],
+        name="fk_composer_checkpoints_chunk",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("kind IN ('transition', 'handoff')", name="ck_composer_checkpoints_kind"),
+    CheckConstraint("cursor >= 0 AND frame_stack_version = 1", name="ck_composer_checkpoints_version"),
+    UniqueConstraint("session_id", "operation_id", "cursor", name="uq_composer_checkpoints_cursor"),
+)
+
+composer_continuation_events_table = Table(
+    "composer_continuation_events",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("sequence", BigInteger, primary_key=True),
+    Column("tag", String(32), nullable=False),
+    Column("payload_chunk_key", String(128), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    _continuation_parent_fk("fk_composer_events_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "payload_chunk_key"],
+        ["composer_continuation_chunks.session_id", "composer_continuation_chunks.operation_id", "composer_continuation_chunks.chunk_key"],
+        name="fk_composer_events_chunk",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("sequence > 0", name="ck_composer_events_sequence"),
+    CheckConstraint(_CONTINUATION_EVENT_TAG_CHECK, name="ck_composer_events_tag"),
+)
+
+composer_continuation_effects_table = Table(
+    "composer_continuation_effects",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("effect_key", String(128), primary_key=True),
+    Column("input_sha256", String(64), nullable=False),
+    Column("owner", String(32), nullable=False),
+    Column("action_json", Text),
+    Column("disposition", String(32), nullable=False),
+    Column("receipt_key", String(256)),
+    Column("result_chunk_key", String(128)),
+    Column("provider_attempt_id", String),
+    Column("physical_sequence", Integer),
+    Column("physical_generation", Integer),
+    Column("requested_model", String(1024)),
+    Column("response_finished_at", DateTime(timezone=True)),
+    Column("creator_sequence", Integer, nullable=False),
+    Column("creator_generation", Integer, nullable=False),
+    Column("committed_state_ids_json", Text),
+    Column("graph_sha256", String(64)),
+    _continuation_parent_fk("fk_composer_effects_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "creator_sequence", "creator_generation"],
+        [
+            "composer_segment_attempts.session_id",
+            "composer_segment_attempts.operation_id",
+            "composer_segment_attempts.sequence",
+            "composer_segment_attempts.generation",
+        ],
+        name="fk_composer_effects_creator",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "physical_sequence", "physical_generation"],
+        [
+            "composer_segment_attempts.session_id",
+            "composer_segment_attempts.operation_id",
+            "composer_segment_attempts.sequence",
+            "composer_segment_attempts.generation",
+        ],
+        name="fk_composer_effects_physical_creator",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint(
+        "(provider_attempt_id IS NULL AND physical_sequence IS NULL AND physical_generation IS NULL AND requested_model IS NULL) OR "
+        "(provider_attempt_id IS NOT NULL AND physical_sequence IS NOT NULL AND physical_generation IS NOT NULL AND physical_sequence > 0 AND physical_generation > 0 AND requested_model IS NOT NULL)",
+        name="ck_composer_effects_physical_bundle",
+    ),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "result_chunk_key"],
+        ["composer_continuation_chunks.session_id", "composer_continuation_chunks.operation_id", "composer_continuation_chunks.chunk_key"],
+        name="fk_composer_effects_result",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["provider_attempt_id"], ["quota_provider_attempts.attempt_id"], name="fk_composer_effects_attempt", ondelete="RESTRICT"
+    ),
+    CheckConstraint(
+        "disposition IN ('prepared', 'dispatched', 'committed', 'refused', 'unknown', 'paid_overflow', 'paid_incomplete', 'validation_incomplete', 'sdk_terminal')",
+        name="ck_composer_effects_disposition",
+    ),
+    CheckConstraint(_CONTINUATION_EFFECT_OWNER_CHECK, name="ck_composer_effects_owner"),
+    CheckConstraint(
+        "disposition NOT IN ('committed', 'refused', 'paid_overflow', 'paid_incomplete', 'validation_incomplete', 'sdk_terminal') OR (receipt_key IS NOT NULL AND result_chunk_key IS NOT NULL)",
+        name="ck_composer_effects_receipt",
+    ),
+    CheckConstraint(
+        "disposition != 'paid_incomplete' OR (owner = 'provider' AND provider_attempt_id IS NOT NULL)",
+        name="ck_composer_effects_paid_incomplete_original_attempt",
+    ),
+    CheckConstraint(
+        "disposition != 'sdk_terminal' OR (owner = 'provider' AND provider_attempt_id IS NOT NULL)",
+        name="ck_composer_effects_sdk_terminal_original_attempt",
+    ),
+    CheckConstraint(
+        "disposition != 'validation_incomplete' OR (owner = 'tool_dispatch' AND provider_attempt_id IS NULL)",
+        name="ck_composer_effects_validation_incomplete_unpaid",
+    ),
+    *_lower_sha256_constraints("input_sha256", name="ck_composer_effects_input_sha256"),
+    *_lower_sha256_constraints("graph_sha256", name="ck_composer_effects_graph_sha256", nullable=True),
+)
+
+composer_provider_terminal_holds_table = Table(
+    "composer_provider_terminal_holds",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("effect_key", String(128), primary_key=True),
+    Column("policy_sha256", String(64), nullable=False),
+    Column("allowance_bytes", BigInteger, nullable=False),
+    Column("source_checkpoint_id", String(36), nullable=False),
+    Column("source_cursor", BigInteger, nullable=False),
+    Column("source_snapshot_sha256", String(64), nullable=False),
+    Column("source_input_sha256", String(64), nullable=False),
+    Column("creator_sequence", Integer, nullable=False),
+    Column("creator_generation", Integer, nullable=False),
+    Column("claim_attempt", Integer, nullable=False),
+    Column("session_operation_id", String(128), nullable=False),
+    Column("session_operation_epoch", Integer, nullable=False),
+    Column("lease_sha256", String(64), nullable=False),
+    Column("reserved_bytes", BigInteger, nullable=False),
+    Column("fallback_contract_sha256", String(64), nullable=False),
+    Column("provider_attempt_id", String, ForeignKey("quota_provider_attempts.attempt_id", ondelete="RESTRICT")),
+    Column("state", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True)),
+    _continuation_parent_fk("fk_composer_provider_holds_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "effect_key"],
+        [
+            "composer_continuation_effects.session_id",
+            "composer_continuation_effects.operation_id",
+            "composer_continuation_effects.effect_key",
+        ],
+        name="fk_composer_provider_holds_effect",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "creator_sequence", "creator_generation"],
+        [
+            "composer_segment_attempts.session_id",
+            "composer_segment_attempts.operation_id",
+            "composer_segment_attempts.sequence",
+            "composer_segment_attempts.generation",
+        ],
+        name="fk_composer_provider_holds_creator",
+        ondelete="CASCADE",
+    ),
+    UniqueConstraint("provider_attempt_id", name="uq_composer_provider_holds_attempt"),
+    CheckConstraint(
+        "allowance_bytes > 0 AND reserved_bytes > 0 AND reserved_bytes <= allowance_bytes "
+        "AND source_cursor >= 0 AND creator_sequence > 0 AND creator_generation > 0 "
+        "AND claim_attempt > 0 AND session_operation_epoch > 0",
+        name="ck_composer_provider_holds_bounds",
+    ),
+    CheckConstraint("state IN ('active', 'consumed')", name="ck_composer_provider_holds_state"),
+    CheckConstraint(
+        "(state = 'active' AND consumed_at IS NULL) OR "
+        "(state = 'consumed' AND consumed_at IS NOT NULL AND provider_attempt_id IS NOT NULL AND consumed_at >= created_at)",
+        name="ck_composer_provider_holds_consumption",
+    ),
+    CheckConstraint("length(source_checkpoint_id) = 36", name="ck_composer_provider_holds_checkpoint"),
+    *_lower_sha256_constraints("policy_sha256", name="ck_composer_provider_holds_policy"),
+    *_lower_sha256_constraints("source_snapshot_sha256", name="ck_composer_provider_holds_snapshot"),
+    *_lower_sha256_constraints("source_input_sha256", name="ck_composer_provider_holds_input"),
+    *_lower_sha256_constraints("lease_sha256", name="ck_composer_provider_holds_lease"),
+    *_lower_sha256_constraints("fallback_contract_sha256", name="ck_composer_provider_holds_fallback"),
+)
+
+composer_validation_terminal_holds_table = Table(
+    "composer_validation_terminal_holds",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("effect_key", String(128), primary_key=True),
+    Column("policy_sha256", String(64), nullable=False),
+    Column("allowance_bytes", BigInteger, nullable=False),
+    Column("source_checkpoint_id", String(36), nullable=False),
+    Column("source_cursor", BigInteger, nullable=False),
+    Column("source_json", Text, nullable=False),
+    Column("source_sha256", String(64), nullable=False),
+    Column("reserved_bytes", BigInteger, nullable=False),
+    Column("fallback_contract_sha256", String(64), nullable=False),
+    Column("state", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True)),
+    _continuation_parent_fk("fk_composer_validation_holds_parent"),
+    ForeignKeyConstraint(
+        ["session_id", "operation_id", "effect_key"],
+        [
+            "composer_continuation_effects.session_id",
+            "composer_continuation_effects.operation_id",
+            "composer_continuation_effects.effect_key",
+        ],
+        name="fk_composer_validation_holds_effect",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint(
+        "allowance_bytes > 0 AND reserved_bytes > 0 AND reserved_bytes <= allowance_bytes AND source_cursor >= 0",
+        name="ck_composer_validation_holds_bounds",
+    ),
+    CheckConstraint("state IN ('active', 'consumed')", name="ck_composer_validation_holds_state"),
+    CheckConstraint(
+        "(state = 'active' AND consumed_at IS NULL) OR (state = 'consumed' AND consumed_at IS NOT NULL AND consumed_at >= created_at)",
+        name="ck_composer_validation_holds_consumption",
+    ),
+    CheckConstraint("length(source_checkpoint_id) = 36", name="ck_composer_validation_holds_checkpoint"),
+    *_lower_sha256_constraints("policy_sha256", name="ck_composer_validation_holds_policy"),
+    *_lower_sha256_constraints("source_sha256", name="ck_composer_validation_holds_source"),
+    *_lower_sha256_constraints("fallback_contract_sha256", name="ck_composer_validation_holds_fallback"),
+)
+
+composer_continuation_provider_ordinals_table = Table(
+    "composer_continuation_provider_ordinals",
+    metadata,
+    Column("session_id", String(128), primary_key=True),
+    Column("operation_id", String(36), primary_key=True),
+    Column("family", Integer, primary_key=True),
+    Column("next_ordinal", BigInteger, nullable=False),
+    _continuation_parent_fk("fk_composer_ordinals_parent"),
+    CheckConstraint("family IN (0, 1, 3) AND next_ordinal >= 0", name="ck_composer_ordinals_range"),
+)
+
+
+def _composer_operation_transition_condition(*, dialect: Literal["sqlite", "postgresql"]) -> str:
+    different = "IS NOT" if dialect == "sqlite" else "IS DISTINCT FROM"
+    immutable = (
+        "session_id",
+        "operation_id",
+        "kind",
+        "request_hash",
+        "actor_user_id",
+        "request_id",
+        "base_state_id",
+        "created_at",
+        "reserved_user_message_id",
+        "continuation_policy_version",
+        "continuation_policy_sha256",
+        "continuation_retained_payload_limit_bytes",
+    )
+    clauses = [f"NEW.{name} {different} OLD.{name}" for name in immutable]
+    clauses.extend(
+        (
+            "OLD.status IN ('completed', 'failed')",
+            "(OLD.status = 'running' AND NEW.status = 'queued')",
+            "(OLD.status = 'queued' AND NEW.status = 'completed')",
+            f"(NEW.status IN ('queued', 'running') AND NEW.request_json {different} OLD.request_json)",
+            f"(OLD.cancel_requested_at IS NOT NULL AND NEW.cancel_requested_at {different} OLD.cancel_requested_at)",
+            f"(OLD.user_message_id IS NOT NULL AND NEW.user_message_id {different} OLD.user_message_id)",
+            "(NEW.status_revision < OLD.status_revision)",
+            "(NEW.journal_cursor < OLD.journal_cursor)",
+        )
+    )
+    # Continuation re-fences a running parent at every segment claim and start
+    # (attempt, claim owner and session_operation_*), so those stay mutable.
+    return " OR ".join(clauses)
+
+
+_SQLITE_COMPOSER_TRANSITION_DDL = (
+    "CREATE TRIGGER trg_composer_async_operations_transition_guard BEFORE UPDATE ON composer_async_operations "
+    "FOR EACH ROW WHEN "
+    + _composer_operation_transition_condition(dialect="sqlite")
+    + " BEGIN SELECT RAISE(ABORT, 'composer operation immutable transition'); END"
+)
+_POSTGRESQL_COMPOSER_TRANSITION_FUNCTION = (
+    "CREATE FUNCTION elspeth_composer_operations_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF "
+    + _composer_operation_transition_condition(dialect="postgresql")
+    + " THEN RAISE EXCEPTION 'composer operation immutable transition' USING ERRCODE = '23514'; END IF; RETURN NEW; END $$"
+)
+
+
 def _composer_operation_ddl(statement: str) -> DDL:
     """Type the pinned SQLAlchemy DDL constructor's external string ABI."""
     constructor = cast(Callable[[str], DDL], DDL)
@@ -3738,9 +4228,7 @@ def _composer_operation_ddl(statement: str) -> DDL:
 event.listen(
     composer_async_operations_table,
     "after_create",
-    _composer_operation_ddl(
-        "CREATE TRIGGER trg_composer_async_operations_transition_guard BEFORE UPDATE ON composer_async_operations FOR EACH ROW WHEN (NEW.status IN ('queued', 'running') AND NEW.request_json IS NOT OLD.request_json) OR (OLD.status = 'queued' AND NEW.status = 'completed') OR (OLD.status = 'running' AND NEW.status = 'running' AND NEW.claim_token IS NOT OLD.claim_token) OR OLD.status IN ('completed', 'failed') OR (OLD.status = 'running' AND NEW.status = 'queued') OR NEW.session_id IS NOT OLD.session_id OR NEW.operation_id IS NOT OLD.operation_id OR NEW.kind IS NOT OLD.kind OR NEW.request_hash IS NOT OLD.request_hash OR NEW.actor_user_id IS NOT OLD.actor_user_id OR NEW.request_id IS NOT OLD.request_id OR NEW.base_state_id IS NOT OLD.base_state_id OR NEW.created_at IS NOT OLD.created_at OR NEW.deadline_at IS NOT OLD.deadline_at OR (OLD.status = 'running' AND (NEW.claim_owner_instance_id IS NOT OLD.claim_owner_instance_id OR NEW.session_operation_id IS NOT OLD.session_operation_id OR NEW.session_operation_lease_token IS NOT OLD.session_operation_lease_token OR NEW.session_operation_epoch IS NOT OLD.session_operation_epoch OR NEW.started_at IS NOT OLD.started_at OR NEW.attempt IS NOT OLD.attempt)) OR (OLD.cancel_requested_at IS NOT NULL AND (NEW.cancel_requested_at IS NOT OLD.cancel_requested_at)) OR (OLD.user_message_id IS NOT NULL AND (NEW.user_message_id IS NOT OLD.user_message_id)) BEGIN SELECT RAISE(ABORT, 'composer operation immutable transition'); END"
-    ).execute_if(dialect="sqlite"),
+    _composer_operation_ddl(_SQLITE_COMPOSER_TRANSITION_DDL).execute_if(dialect="sqlite"),
 )
 event.listen(
     composer_async_operations_table,
@@ -3754,7 +4242,7 @@ POSTGRESQL_COMPOSER_OPERATION_DDL: tuple[PostgresqlAuditDDL, ...] = (
         table=composer_async_operations_table,
         trigger_name="trg_composer_async_operations_transition_guard",
         function_name="elspeth_composer_operations_guard",
-        function_sql="CREATE FUNCTION elspeth_composer_operations_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF (NEW.status IN ('queued', 'running') AND (NEW.request_json IS DISTINCT FROM OLD.request_json)) OR (OLD.status = 'queued' AND NEW.status = 'completed') OR (OLD.status = 'running' AND NEW.status = 'running' AND NEW.claim_token IS DISTINCT FROM OLD.claim_token) OR OLD.status IN ('completed', 'failed') OR (OLD.status = 'running' AND NEW.status = 'queued') OR NEW.session_id IS DISTINCT FROM OLD.session_id OR NEW.operation_id IS DISTINCT FROM OLD.operation_id OR NEW.kind IS DISTINCT FROM OLD.kind OR NEW.request_hash IS DISTINCT FROM OLD.request_hash OR NEW.actor_user_id IS DISTINCT FROM OLD.actor_user_id OR NEW.request_id IS DISTINCT FROM OLD.request_id OR NEW.base_state_id IS DISTINCT FROM OLD.base_state_id OR NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.deadline_at IS DISTINCT FROM OLD.deadline_at OR (OLD.status = 'running' AND (NEW.claim_owner_instance_id IS DISTINCT FROM OLD.claim_owner_instance_id OR NEW.session_operation_id IS DISTINCT FROM OLD.session_operation_id OR NEW.session_operation_lease_token IS DISTINCT FROM OLD.session_operation_lease_token OR NEW.session_operation_epoch IS DISTINCT FROM OLD.session_operation_epoch OR NEW.started_at IS DISTINCT FROM OLD.started_at OR NEW.attempt IS DISTINCT FROM OLD.attempt)) OR (OLD.cancel_requested_at IS NOT NULL AND (NEW.cancel_requested_at IS DISTINCT FROM OLD.cancel_requested_at)) OR (OLD.user_message_id IS NOT NULL AND (NEW.user_message_id IS DISTINCT FROM OLD.user_message_id)) THEN RAISE EXCEPTION 'composer operation immutable transition' USING ERRCODE = '23514'; END IF; RETURN NEW; END $$",
+        function_sql=_POSTGRESQL_COMPOSER_TRANSITION_FUNCTION,
         trigger_sql="CREATE TRIGGER trg_composer_async_operations_transition_guard BEFORE UPDATE ON composer_async_operations FOR EACH ROW EXECUTE FUNCTION elspeth_composer_operations_guard()",
     ),
     PostgresqlAuditDDL(

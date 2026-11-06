@@ -1,4 +1,4 @@
-"""S-gate rejections carry a closed repair signal on the compose loop (S1 T9).
+"""S-gate rejections carry a closed repair signal on the tool-batch dispatch path (S1 T9).
 
 The closed-root S gate (``tools/_dispatch.py``) builds one
 :class:`SchemaViolation` per jsonschema error and carries them on the raised
@@ -7,19 +7,20 @@ The closed-root S gate (``tools/_dispatch.py``) builds one
 fixed message), the same shape the pydantic canonicaliser emits. A loc names
 only schema-declared properties (or the generic ``field``/``item``/``index``
 tokens), so the model-authored key of an ``additionalProperties`` failure is
-never echoed (plan C10). MCP text and the planner's discovery
-``argument_error`` body stay byte-equal to the base (D19, ruling 9).
+never echoed (plan C10). MCP text stays byte-equal to the base (D19,
+ruling 9).
 
 Plan: ``docs/plans/2026-09-23-composer-strict-tool-contracts-s1.md`` T9.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import pytest
@@ -28,25 +29,25 @@ from jsonschema import Draft202012Validator
 from elspeth.composer_mcp.server import create_server
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.errors import FrameworkBugError
-from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
-from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
-from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
-from elspeth.web.composer.audit import VALIDATION_ERROR_MESSAGES
+from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome, _DispatchOutcome
+from elspeth.web.composer.anti_anchor import AntiAnchorTracker
+from elspeth.web.composer.audit import VALIDATION_ERROR_MESSAGES, BufferingRecorder
 from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
-from elspeth.web.composer.provider_discovery_response import argument_error_response
-from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.tool_batch import BatchAccumulator, ToolBatchContext, ToolBatchCustody, ToolBatchProvenance, run_tool_batch
 from elspeth.web.composer.tool_error_payloads import arg_error_payload
 from elspeth.web.composer.tools._dispatch import require_arguments_conform_to_schema, require_schema_valid_arguments
-from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.session_fences import fenced_operation_context
 
 from .conftest import (
-    _fake_llm_response,
+    _empty_composition_state,
     _FakeChoice,
-    _FakeComposeLLM,
     _FakeFunction,
     _FakeLLMResponse,
     _FakeMessage,
@@ -105,89 +106,110 @@ _MSG_CHOICE = "Value is not an allowed choice"
 _MSG_INVALID = "Validation failed"
 
 
-class _RecordingComposeLLM(_FakeComposeLLM):
-    """Fake compose LLM that keeps every tool-role message it is sent."""
+async def _dispatch_batch(
+    service: ComposerServiceImpl,
+    session_id: str,
+    calls: tuple[tuple[str, str, str], ...],
+    *,
+    current_state_id: str | None = None,
+) -> tuple[_DispatchOutcome, BufferingRecorder, list[dict[str, Any]]]:
+    """Dispatch one admitted provider tool batch through ``tool_batch.run_tool_batch``.
 
-    def __init__(self, responses: tuple[_FakeLLMResponse, ...]) -> None:
-        super().__init__(responses)
-        self.tool_messages: list[dict[str, Any]] = []
-
-    async def __call__(
-        self,
-        _messages: Any,
-        _tools: Any,
-        *,
-        provider_custody: object | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-    ) -> Any:
-        for message in _messages:
-            if type(message) is dict and message["role"] == "tool":
-                self.tool_messages.append(dict(message))
-        return await super().__call__(_messages, _tools)
-
-
-def _raw_call_llm(*, name: str, raw_arguments: str) -> _RecordingComposeLLM:
-    first = _FakeLLMResponse(
+    ``calls`` are ``(tool_call_id, name, raw_arguments)``. The context is built
+    from the service exactly as Continuation builds it from its restored
+    runtime (``continuation_runtime.build_runtime_tool_batch_context``); the
+    shared dispatch owner is the code under test.
+    """
+    sessions = service._require_sessions_service()
+    session_uuid = UUID(session_id)
+    preferences = await sessions.get_composer_preferences(session_uuid)
+    ceiling = ComposerMutationCeiling(session_id, "schema-gate-request", preferences.trust_mode)
+    snapshot, policy_catalog = service._policy_context.build("phase3-test-user")
+    response = _FakeLLMResponse(
         choices=[
             _FakeChoice(
                 message=_FakeMessage(
                     content=None,
-                    tool_calls=[_FakeToolCall(id="call_repair", function=_FakeFunction(name=name, arguments=raw_arguments))],
+                    tool_calls=[
+                        _FakeToolCall(id=call_id, function=_FakeFunction(name=name, arguments=raw)) for call_id, name, raw in calls
+                    ],
                 )
             )
         ]
     )
-    return _RecordingComposeLLM((first, _fake_llm_response(content="Done.")))
-
-
-async def _run_schema_turn(
-    service: ComposerServiceImpl,
-    session_id: str,
-    llm: _RecordingComposeLLM,
-    *,
-    current_state_id: str | None = None,
-) -> ComposeLoopTestResult:
-    """Isolate the advisor dependency while preserving real END withholding."""
-    checkpoint = AsyncMock(
-        spec=service._advisor_checkpoint._run_advisor_checkpoint,
-        return_value=AdvisorCheckpointVerdict(
-            ok=False,
-            blocking=False,
-            findings_text="Advisor unavailable in this schema-dispatch unit fixture.",
-            failure_class="unavailable",
-            retryable=False,
+    state = _empty_composition_state()
+    recorder = BufferingRecorder()
+    ctx = ToolBatchContext(
+        session_tools=service._session_tools,
+        provenance=ToolBatchProvenance(
+            model_identifier=service._model, provider=service._availability.provider, skill_hash=service._composer_skill_hash
         ),
+        custody=ToolBatchCustody(
+            data_dir=service._data_dir,
+            session_engine=service._session_engine,
+            secret_service=service._secret_service,
+            secret_wiring_policy=service._secret_wiring_policy,
+            max_blob_storage_per_session_bytes=service._settings.max_blob_storage_per_session_bytes,
+        ),
+        redaction_telemetry=service._redaction_telemetry,
+        preflight=service._preflight,
+        schema_disclosure=service._schema_disclosure,
+        advisor_checkpoint=service._advisor_checkpoint,
+        advisor_max_calls_per_compose=service._settings.composer_advisor_max_calls_per_compose,
+        advisor_timeout_seconds=service._settings.composer_advisor_timeout_seconds,
+        recorder=recorder,
+        anti_anchor=AntiAnchorTracker(),
+        discovery_cache={},
+        runtime_preflight_cache=service._preflight.new_cache(),
+        session_id=session_id,
+        session_operation_context=None,
+        user_id="phase3-test-user",
+        user_message_id=None,
+        user_message_content=None,
+        current_state_id=current_state_id,
+        actor="composer-web:user:phase3-test-user",
+        initial_version=state.version,
+        deadline=asyncio.get_running_loop().time() + 60,
+        progress=None,
+        session_scope=f"session:{session_id}",
+        turn_sessions_service=sessions,
+        turn_session_uuid=session_uuid,
+        turn_preferences=preferences,
+        mutation_ceiling=ceiling,
+        review_required=not ceiling.permits_auto(preferences.trust_mode),
+        cancellation_requested=asyncio.Event(),
+        plugin_snapshot=snapshot,
+        policy_catalog=policy_catalog,
+        tool_contract_dialect=service._planner_dialect,
+        session_operation_authority=sessions.session_operation_authority,
     )
-    with patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", new=checkpoint):
-        result = await service._run_one_turn_for_test(llm=llm, session_id=session_id, current_state_id=current_state_id)
-    checkpoint.assert_awaited_once()
-    call = checkpoint.await_args
-    assert call is not None
-    assert call.kwargs["phase"] == "end"
-    assert call.kwargs["user_message"] == "one-turn compose-loop test driver"
-    assert type(call.kwargs["publication_review"]) is AdvisorPublicationReview
-    assert type(result.advisor_gate_decision) is AdvisorGateBlocked
-    assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
-    assert result.raw_assistant_content != "Done."
-    return result
+    acc = BatchAccumulator(state=state, last_validation=None, last_runtime_preflight=None, advisor_calls_used=0)
+    llm_messages: list[dict[str, Any]] = []
+    with fenced_operation_context(sessions._engine, session_id) as context:
+        outcome, _advisor_calls = await run_tool_batch(
+            call_model=_CallModelOutcome(completion=_admit_composer_llm_completion(response)),
+            ctx=replace(ctx, session_operation_context=context),
+            acc=acc,
+            llm_messages=llm_messages,
+        )
+    return outcome, recorder, llm_messages
 
 
 async def _compose_arg_error(
     service: ComposerServiceImpl, session_id: str, *, name: str, arguments: object, current_state_id: str | None = None
 ) -> tuple[dict[str, Any], str]:
-    """Run one compose-loop turn with one bad call; return (audited payload, LLM tool-message text)."""
-    llm = _raw_call_llm(name=name, raw_arguments=json.dumps(arguments))
-    result = await _run_schema_turn(service, session_id, llm, current_state_id=current_state_id)
-    assert len(result.tool_invocations) == 1
-    invocation: ComposerToolInvocation = result.tool_invocations[0]
+    """Dispatch one bad call; return (audited payload, provider tool-message text)."""
+    _outcome, recorder, llm_messages = await _dispatch_batch(
+        service, session_id, (("call_repair", name, json.dumps(arguments)),), current_state_id=current_state_id
+    )
+    invocations = recorder.invocations
+    assert len(invocations) == 1
+    invocation: ComposerToolInvocation = invocations[0]
     assert invocation.status is ComposerToolStatus.ARG_ERROR
     assert invocation.error_class == "ToolArgumentError"
     assert invocation.result_canonical is not None
     audited = cast(dict[str, Any], json.loads(invocation.result_canonical))
-    sent = [message for message in llm.tool_messages if message["tool_call_id"] == "call_repair"]
+    sent = [message for message in llm_messages if message["role"] == "tool" and message["tool_call_id"] == "call_repair"]
     assert len(sent) == 1
     content = sent[0]["content"]
     assert type(content) is str
@@ -286,20 +308,23 @@ async def test_strict_marker_rejection_allows_repaired_tool_call_with_compositio
     fake_composer_service._planner_dialect = ToolContractDialect.OPENAI_STRICT
     fake_composer_service._max_composition_turns = 1
     fake_composer_service._max_discovery_turns = 3
-    llm = _RecordingComposeLLM(
-        (
-            _fake_llm_response(tool_calls=({"id": "bad", "name": "preview_pipeline", "arguments": {}},)),
-            _fake_llm_response(tool_calls=({"id": "repaired", "name": "preview_pipeline", "arguments": {"_elspeth_no_arguments": True}},)),
-            _fake_llm_response(content="Done."),
-        )
+
+    bad, bad_recorder, _ = await _dispatch_batch(fake_composer_service, result_session_id, (("bad", "preview_pipeline", "{}"),))
+    # The rejected discovery call is not a mutation, so the driver's
+    # accounting (``ComposerServiceImpl._classify_and_budget_turn``, which
+    # charges composition only from ``turn_has_mutation``) spends no
+    # composition turn: the repair still fits a composition budget of one.
+    assert bad.turn_has_mutation is False
+    assert bad.turn_has_discovery is True
+    repaired, repaired_recorder, _ = await _dispatch_batch(
+        fake_composer_service, result_session_id, (("repaired", "preview_pipeline", json.dumps({"_elspeth_no_arguments": True})),)
     )
 
-    result = await _run_schema_turn(fake_composer_service, result_session_id, llm)
-
-    assert [(call.tool_call_id, call.status) for call in result.tool_invocations] == [
+    assert [(call.tool_call_id, call.status) for call in (*bad_recorder.invocations, *repaired_recorder.invocations)] == [
         ("bad", ComposerToolStatus.ARG_ERROR),
         ("repaired", ComposerToolStatus.SUCCESS),
     ]
+    assert repaired.turn_has_mutation is False
 
 
 # A nested ``required`` failure cannot reach the S gate through the compose
@@ -651,16 +676,3 @@ _MCP_PLAIN_TEXT = "Tool error: 'tool arguments' must be an object conforming to 
 async def test_mcp_error_text_is_unchanged(name: str, arguments: dict[str, Any], expected: str) -> None:
     """Characterization: MCP builds its own text and does not render violations."""
     assert await _mcp_error_text(name, arguments) == expected
-
-
-def test_planner_discovery_argument_error_preserves_closed_schema_facts() -> None:
-    """Discovery preserves bounded schema facts without the raw input or message."""
-    with pytest.raises(ToolArgumentError) as caught:
-        require_schema_valid_arguments("list_models", {"limit": 0})
-    assert caught.value.schema_violations  # the exception does carry them
-    assert json.dumps(argument_error_response(caught.value).to_wire()) == (
-        '{"argument_error": {"component": "tool arguments", "severity": "high", '
-        '"error_code": "SCHEMA_VALIDATION", "error_class": "ToolArgumentError", '
-        '"error_category": "schema_shape", "validation_errors": [{"loc": ["limit"], '
-        '"msg": "Value is outside allowed bounds", "type": "out_of_bounds"}]}}'
-    )

@@ -9,7 +9,7 @@ reopens the mutable input path or reruns source validation.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -68,13 +68,19 @@ def load_committed_source_snapshot(
     return decode_source_snapshot(content, source_name=source_name)
 
 
-def capture_source_snapshot_rows(rows: Iterable[SourceRow], ctx: PluginContext) -> Iterator[SourceRow]:
+def capture_source_snapshot_rows(
+    rows: Iterable[SourceRow], ctx: PluginContext, *, check_advance: Callable[[], None] | None = None
+) -> Iterator[SourceRow]:
     """Bind each quarantined emission to its already recorded validation error.
 
     Consume provenance before requesting the next emission, while the source's
     context still owns the pending error. Equal payloads remain separate
     emissions with separate IDs; resume never reconstructs identity from data.
+    ``check_advance`` may refuse an advance or exhausted capture by raising;
+    its exception propagates rather than presenting a truncated stream as EOF.
     """
+    if check_advance is not None:
+        check_advance()
     for source_row in rows:
         if type(source_row) is not SourceRow:
             raise TypeError("source snapshot requires SourceRow values")
@@ -84,6 +90,10 @@ def capture_source_snapshot_rows(rows: Iterable[SourceRow], ctx: PluginContext) 
                 raise OrchestrationInvariantError("quarantined source snapshot emission has no recorded validation error")
             source_row = replace(source_row, validation_error_id=error_id)
         yield source_row
+        if check_advance is not None:
+            check_advance()
+    if check_advance is not None:
+        check_advance()
 
 
 def encode_source_snapshot(rows: Iterable[SourceRow], *, source_name: str, max_bytes: int) -> bytes:

@@ -87,6 +87,10 @@ class _SourceRowSentinel(enum.Enum):
 _SOURCE_ROW_EXHAUSTED = _SourceRowSentinel.EXHAUSTED
 
 
+class _SourceSnapshotCaptureInterrupted(Exception):
+    """A cooperative stop left the finite source capture incomplete."""
+
+
 class SourceIterationDriver:
     """Coordinate the source-iteration / row-loop cluster of an Orchestrator run.
 
@@ -542,8 +546,8 @@ class SourceIterationDriver:
             Optional zero-argument callable that raises
             :class:`~elspeth.contracts.errors.RunWorkerEvictedError` if the
             heartbeat thread has detected seat deposition or registry eviction.
-            Called at the same boundary as the ``shutdown_event`` check — once
-            per row, after row processing completes.  Pass
+            Called before source advances, throughout finite snapshot capture,
+            at exhaustion, and after row processing, before shutdown checks. Pass
             ``RunHeartbeatThread.check_and_raise`` here.  ``None`` (the
             default) disables latch polling (e.g. non-coordinated single-shot
             runs or tests that do not start a heartbeat thread).
@@ -559,6 +563,15 @@ class SourceIterationDriver:
         coalesce_node_map = dict(loop_ctx.coalesce_node_map)
         agg_transform_lookup = dict(loop_ctx.agg_transform_lookup)
         row_union_executor = processor.row_union_executor
+
+        def source_shutdown_requested() -> bool:
+            if check_coordination_latch is not None:
+                check_coordination_latch()
+            return shutdown_event is not None and shutdown_event.is_set()
+
+        def check_snapshot_advance() -> None:
+            if source_shutdown_requested():
+                raise _SourceSnapshotCaptureInterrupted("shutdown requested during source snapshot capture")
 
         audited_source: AuditedSource | None = None
         source_rows: Iterator[SourceRow] | None = None
@@ -596,27 +609,47 @@ class SourceIterationDriver:
                 RunSourceLifecycleState.LOADING,
                 coordination_token=coordination_token,
             )
-            with (
-                self._span_factory.source_span(active_source.name, run_id=run_id),
-                track_operation(
-                    recorder=factory.execution,
-                    run_id=run_id,
-                    node_id=source_id,
-                    operation_type="source_load",
-                    ctx=ctx,
-                    input_data={**source_load_input_data(active_source), "snapshot_for_resume": True},
-                ) as snapshot_operation,
-            ):
-                content = encode_source_snapshot(
-                    capture_source_snapshot_rows(self.load_source_with_events(run_id, ctx, active_source=active_source), ctx),
-                    source_name=active_source_name,
-                    max_bytes=SOURCE_SNAPSHOT_MAX_BYTES,
+            try:
+                with (
+                    self._span_factory.source_span(active_source.name, run_id=run_id),
+                    track_operation(
+                        recorder=factory.execution,
+                        run_id=run_id,
+                        node_id=source_id,
+                        operation_type="source_load",
+                        ctx=ctx,
+                        input_data={**source_load_input_data(active_source), "snapshot_for_resume": True},
+                    ) as snapshot_operation,
+                ):
+                    content = encode_source_snapshot(
+                        capture_source_snapshot_rows(
+                            self.load_source_with_events(run_id, ctx, active_source=active_source),
+                            ctx,
+                            check_advance=check_snapshot_advance,
+                        ),
+                        source_name=active_source_name,
+                        max_bytes=SOURCE_SNAPSHOT_MAX_BYTES,
+                    )
+                    check_snapshot_advance()
+                    snapshot_ref = hashlib.sha256(content).hexdigest()
+                    snapshot_operation.output_data = {
+                        "source_snapshot_ref": snapshot_ref,
+                        "source_snapshot_version": 1,
+                    }
+            except _SourceSnapshotCaptureInterrupted:
+                # A stopped iterator must not look like EOF to the encoder.
+                # The failed operation has closed and restored attribution;
+                # retain incompleteness and use the normal leader sink handoff.
+                self._lifecycle_recorder.record_run_source_lifecycle(
+                    factory,
+                    source_id,
+                    active_source_name,
+                    active_source,
+                    RunSourceLifecycleState.INTERRUPTED,
+                    coordination_token=coordination_token,
                 )
-                snapshot_ref = hashlib.sha256(content).hexdigest()
-                snapshot_operation.output_data = {
-                    "source_snapshot_ref": snapshot_ref,
-                    "source_snapshot_version": 1,
-                }
+                stopped_at = time.perf_counter()
+                return LoopResult(interrupted=True, start_time=stopped_at, phase_start=stopped_at, last_progress_time=stopped_at)
             # The operation's metadata commits before the large blob is
             # published. A crash at either side leaves no unreferenced source
             # copy; lifecycle stays LOADING until both writes are complete.
@@ -703,24 +736,25 @@ class SourceIterationDriver:
                 idle_pump.start()
             try:
                 source_exhausted = False
-                interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+                interrupted_by_shutdown = source_shutdown_requested()
                 pending_source_item: SourceRow | None = None
-                try:
-                    if use_idle_polling:
-                        pending_source_item = self._next_source_item_with_idle_timeout_flushes(
-                            source_iterator,
-                            loop_ctx,
-                            agg_transform_lookup=agg_transform_lookup,
-                            coalesce_node_map=coalesce_node_map,
-                            source_id=source_id,
-                            source_operation_id=source_operation_id,
-                            pump=idle_pump,
-                        )
-                    else:
-                        pending_source_item = next(source_iterator)
-                except StopIteration:
-                    interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
-                    source_exhausted = not interrupted_by_shutdown
+                if not interrupted_by_shutdown:
+                    try:
+                        if use_idle_polling:
+                            pending_source_item = self._next_source_item_with_idle_timeout_flushes(
+                                source_iterator,
+                                loop_ctx,
+                                agg_transform_lookup=agg_transform_lookup,
+                                coalesce_node_map=coalesce_node_map,
+                                source_id=source_id,
+                                source_operation_id=source_operation_id,
+                                pump=idle_pump,
+                            )
+                        else:
+                            pending_source_item = next(source_iterator)
+                    except StopIteration:
+                        interrupted_by_shutdown = source_shutdown_requested()
+                        source_exhausted = not interrupted_by_shutdown
 
                 # Deferred recording flags — field resolution after first iteration,
                 # schema contract after first VALID row. Always start false so
@@ -751,6 +785,9 @@ class SourceIterationDriver:
                             source_item = pending_source_item
                             pending_source_item = None
                         else:
+                            if source_shutdown_requested():
+                                interrupted_by_shutdown = True
+                                break
                             try:
                                 if use_idle_polling:
                                     source_item = self._next_source_item_with_idle_timeout_flushes(
@@ -765,7 +802,7 @@ class SourceIterationDriver:
                                 else:
                                     source_item = next(source_iterator)
                             except StopIteration:
-                                interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+                                interrupted_by_shutdown = source_shutdown_requested()
                                 source_exhausted = not interrupted_by_shutdown
                                 break
 
@@ -933,7 +970,10 @@ class SourceIterationDriver:
                         if check_coordination_latch is not None:
                             check_coordination_latch()
 
-                        # Graceful shutdown — current row fully processed, safe to stop
+                        # The current row is completed or retained undecided by
+                        # the scheduler (requeued on resume, or ABANDONED at
+                        # finalization if the run is not resumable); stop
+                        # before advancing the source.
                         if shutdown_event is not None and shutdown_event.is_set():
                             interrupted_by_shutdown = True
                             break

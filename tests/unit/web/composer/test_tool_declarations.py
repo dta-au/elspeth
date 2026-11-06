@@ -596,7 +596,7 @@ class TestStep3DiscoveryTierMigration:
         }
 
     def test_cacheable_subset_is_correct(self) -> None:
-        """The 10 discovery tools that should be cacheable are; the 3
+        """Discovery tools opted into caching remain cacheable; the four
         session-mutable ones are not."""
         from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
         from elspeth.web.composer.tools.declarations import derive_cacheable_names
@@ -614,8 +614,9 @@ class TestStep3DiscoveryTierMigration:
             "get_audit_info",
         }
         assert expected_cacheable <= cacheable
-        # The three session-mutable discovery tools MUST NOT be cacheable.
+        # The four session-mutable discovery tools MUST NOT be cacheable.
         assert "get_pipeline_state" not in cacheable
+        assert "get_complete_pipeline_value" not in cacheable
         assert "preview_pipeline" not in cacheable
         assert "diff_pipeline" not in cacheable
 
@@ -1083,9 +1084,11 @@ class TestStep3SecretTierMigration:
         assert self._get("list_secret_refs") == {
             "name": "list_secret_refs",
             "description": (
-                "List available secret references (API keys, credentials). Each entry carries the reference `name`, its "
-                "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
-                "does not); never values."
+                "List secret-reference metadata (API keys, credentials), never values. Each entry carries `name`, "
+                "`scope`, `source_kind`, `available`, and `reason` (null when available). User-store availability "
+                "means a stored row exists and fingerprinting is configured; listing does not check decryption. "
+                "Server availability checks the allowlisted environment value and fingerprinting configuration. "
+                "Call validate_secret_ref for the selected reference's current resolvability before relying on it."
             ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -1125,7 +1128,15 @@ class TestStep3SecretTierMigration:
                         "enum": ["source", "node", "output"],
                         "description": "Which component to wire the secret into.",
                     },
-                    "target_id": {"type": "string", "description": "Node ID or output name (required for node/output targets)."},
+                    "target_id": {
+                        "type": "string",
+                        "description": (
+                            "Raw source name (for example, 'left'), node ID, or output name. "
+                            "A selector value is required for node/output targets and for source targets when multiple sources "
+                            "are configured. For a sole source, an unspecified selector defaults to that source; follow the wire "
+                            "schema's requiredness and nullability. Do not prefix a source name with 'source:'."
+                        ),
+                    },
                     "option_key": {"type": "string", "description": "Config option key to set (e.g. 'api_key')."},
                 },
                 "required": ["name", "target", "option_key"],

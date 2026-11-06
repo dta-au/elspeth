@@ -424,7 +424,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9b3702740122b8f8"
+    source_file_hash: str | None = "sha256:85cc0b37ba44a156"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -1237,34 +1237,27 @@ class AzureBlobSource(BaseSource):
             validated = self._schema_class.model_validate(row_to_validate)
             validated_row = validated.to_row()
 
-            # For FLEXIBLE/OBSERVED schemas, process first valid row to lock contract
-            if self._contract_builder is not None and not self._first_valid_row_processed:
+            builder = self._contract_builder
+            if builder is not None and not self._first_valid_row_processed:
                 if prospective_resolution is None:
                     field_resolution_map: Mapping[str, str] = {k: k for k in validated_row}
                 else:
                     field_resolution_map = prospective_resolution.resolution_mapping
 
-                self._contract_builder.process_first_row(validated_row, field_resolution_map)
-                self.set_schema_contract(self._contract_builder.contract)
-                self._first_valid_row_processed = True
+                if self._format in ("json", "jsonl"):
+                    if prospective_resolution is None:
+                        raise ValueError("field_resolution must exist before first-row inference")
+                    # CSV retains its header builder; JSON takes declared names
+                    # from the first accepted candidate, never a rejected one.
+                    if not builder.contract.locked:
+                        builder = ContractBuilder(create_contract_from_config(self._schema_config, field_resolution=field_resolution_map))
+                contract = builder.process_first_row(validated_row, field_resolution_map)
+            else:
+                contract = self.require_schema_contract()
 
             # Validate against locked contract to catch type drift on inferred
             # fields. Pydantic extra="allow" accepts any type for extras — the
             # contract knows inferred types from the first row and enforces here.
-            contract = self.require_schema_contract()
-            if self._format in ("json", "jsonl") and self._contract_builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
-                # JSON/JSONL blobs can be sparse. If a later row emits a new
-                # normalized key, the row contract must own its original-name
-                # and type metadata before validation and yield.
-                if prospective_resolution is None:
-                    raise ValueError("field_resolution must be established before sparse-field contract inference")
-                contract = self._contract_builder.process_sparse_fields(
-                    validated_row,
-                    prospective_resolution.resolution_mapping,
-                )
-                self.set_schema_contract(contract)
-
-            self._field_resolution = prospective_resolution
             if contract.locked:
                 violations = contract.validate(validated_row)
                 if violations:
@@ -1284,6 +1277,15 @@ class AzureBlobSource(BaseSource):
                         )
                     return
 
+            if self._format in ("json", "jsonl") and builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
+                if prospective_resolution is None:
+                    raise ValueError("field_resolution must be established before sparse-field contract inference")
+                contract = builder.process_sparse_fields(validated_row, prospective_resolution.resolution_mapping)
+            if builder is not None:
+                self._contract_builder = builder
+                self.set_schema_contract(contract)
+                self._first_valid_row_processed = True
+            self._field_resolution = prospective_resolution
             yield SourceRow.valid(validated_row, contract=contract, source_row_index=source_row_index)
         except ContractFieldLimitExceeded as e:
             ctx.record_validation_error(

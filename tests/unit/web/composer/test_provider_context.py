@@ -9,6 +9,7 @@ import litellm
 import pytest
 
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.provider_context import capture_provider_context
 from tests.unit.contracts.test_composer_llm_audit import _make_call
 from tests.unit.web.composer.test_private_evidence_persistence import private_writer as _private_writer
@@ -274,7 +275,14 @@ async def test_gateway_terminal_paths_keep_the_preawait_context(tmp_path, monkey
     messages = [{"role": "user", "content": "PRIVATE REQUEST BEFORE AWAIT"}]
     expected = deepcopy(messages)
 
-    async def completion(wire_messages, wire_tools, *, provider_custody: object | None = None, credential_state: object | None = None):
+    async def completion(
+        wire_messages,
+        wire_tools,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prepared_input: PreparedProviderInput | None = None,
+    ):
         assert wire_messages == expected
         wire_messages[0]["content"] = "MUTATED AFTER SNAPSHOT"
         if mode == "timeout":
@@ -300,25 +308,6 @@ async def test_gateway_terminal_paths_keep_the_preawait_context(tmp_path, monkey
     assert call.private_request is not None
     assert json.loads(call.private_request.canonical)["messages"] == expected
     assert "PRIVATE REQUEST BEFORE AWAIT" not in json.dumps(call.to_dict())
-
-
-@pytest.mark.asyncio
-async def test_planner_context_matches_each_ordered_request_including_feedback(tmp_path, tool_context) -> None:
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    completion = _ScriptedCompletion(
-        _response(("list_sources", {})), _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
-    )
-    recorder = BufferingRecorder()
-    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
-    assert len(recorder.llm_calls) == len(completion.requests) == 2
-    for call, request in zip(recorder.llm_calls, completion.requests, strict=True):
-        assert call.private_request is not None
-        assert call.private_request.disposition == "retained"
-        context = json.loads(call.private_request.canonical)
-        assert context["messages"] == request["messages"]
-        assert context["tools"] == request["tools"]
-    assert recorder.llm_calls[0].private_request != recorder.llm_calls[1].private_request
 
 
 @pytest.mark.asyncio

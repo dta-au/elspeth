@@ -269,7 +269,7 @@ target health, public probes, and affected AWS integration checks.
 
 `docs/runbooks/aws-ecs-deployment.md` describes a much larger disposable
 two-scenario acceptance program. It is not the everyday redeploy workflow. Its
-Terraform package is external to the tracked repository, and the current text
-contains hard-coded schema epochs that do not all match the live schema
-constants. Do not execute that runbook mechanically until those values and the
-owning Terraform state have been reconciled.
+Terraform package is tracked at `deploy/aws-ecs/terraform/`. Its hard-coded
+schema epochs matched the live constants on 2026-10-24. Re-check them after
+any epoch change, and reconcile the owning
+Terraform state before executing it.

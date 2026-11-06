@@ -32,8 +32,8 @@ Choose one mode before doing anything:
   the existing service, and verify it.
 - **Stop/resume**: change desired count without deleting infrastructure.
 - **Bootstrap/destroy environment**: out of scope unless the user explicitly
-  asks. The tracked repository does not contain the Terraform package needed
-  to recreate the acceptance environment.
+  asks. The Terraform package is tracked at `deploy/aws-ecs/terraform/`
+  (README there); bootstrap uses its own state and the cold-install runbook.
 
 Do not merge branches merely to build or deploy. Build from the worktree and
 commit the user selected. AWS CLI login lives under `~/.aws`, so it is shared
@@ -360,6 +360,17 @@ Discover-don't-remember still applies, but these are the traps that cost time.
   acceptance, not the everyday redeploy command sheet.
 
 Before using the exhaustive runbook for a new environment, reconcile every
-hard-coded schema epoch with the live constants. It currently contains stale
-epoch prose/commands and is not safe to execute mechanically from top to
-bottom. The Terraform package it describes is not tracked in this repository.
+hard-coded schema epoch with the live constants. On 2026-10-24 its epoch
+literals matched the live constants; its Scenario A
+compatibility record is pinned to them by
+`tests/unit/docs/test_release_version_surfaces.py`. Re-check after any epoch
+change. The Terraform package it describes is tracked at `deploy/aws-ecs/terraform/`.
+
+For the 0.8.10 session-epoch cut (to epoch 80), follow
+`docs/release/0.8.10-upgrade-notes-draft.md`, "AWS ECS: new stores only". As on
+ACA, 0.8.10 is installed as a **separate, fresh Scenario A deployment** through
+`docs/runbooks/aws-ecs-cold-install.md`, with new Sessions and Landscape
+databases. That procedure runs `provision-storage`, then the `schema_init_doctor`
+and `runtime_doctor` tasks, then `bootstrap-admin`. The existing service and all
+its stores stay untouched; do not roll 0.8.10 onto them. The drop-everything
+reset above is not an upgrade procedure.

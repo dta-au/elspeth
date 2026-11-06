@@ -788,35 +788,25 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"coalesce_branch_unreachable|branches .* are not reachable",
         "A coalesce branches mapping names an incoming connection that no runtime routing field produces. The usual cause is "
         "the WIRING AROUND the coalesce, not the coalesce itself: a branch transform's on_success routes past the coalesce "
-        "(e.g. straight to a sink), so nothing arrives under the connection name the branches value claims. The rejection's "
-        "'connectivity' facts, when present, carry 'unreachable_branches' — one record per broken branch, each naming the "
-        "branch ('branch'), the connection it consumes that nothing produces ('consumed_connection'), and — only for a "
-        "MAPPED branch, whose key differs from its value — when that branch's transform chain ends by publishing to a sink, "
-        "the node that did it ('sink_lure', carrying 'node_id' and 'publishes_to_sink'). An identity branch (a list-form "
-        "entry, or a key equal to its value) never carries 'sink_lure', so its absence there says nothing about the wiring; "
-        "such a branch is unreachable only when its name is not a gate fork_to name, and 'coalesce_branch_alias_unreachable' "
-        "fires alongside. Also carried: 'produced_connections', the connections the reachability check accepts, with sink "
-        "names, the coalesce's own id and the fork keyword removed because they pass that check but are never a correct "
-        "branch value. Membership in 'produced_connections' does NOT make a value correct for a given branch: the right "
-        "value is whatever THAT branch's own transform publishes.",
+        "(e.g. straight to a sink), so nothing arrives under the connection name the branches value claims. "
+        "Compare each branch's consumed connection with the source, gate fork_to and upstream node routing fields "
+        "in the authored candidate; the saved state may differ from a rejected replacement.",
         "Wire each fork branch end-to-end: the gate fork_to name is the branch transform's input; that transform's on_success "
         "must be a unique connection name (NOT a sink); the coalesce branches VALUE for that branch is exactly that connection. "
         "A branch with no transforms uses its fork branch name as the value. If a branches value names a connection nothing "
         "produces, repair that branch's transform — point its on_success at the branches value — rather than merely swapping "
-        "the branches value for one of the produced_connections. Where a branch record carries 'sink_lure', that node_id IS "
-        "the transform to repair: set its on_success to that record's 'consumed_connection' instead of the sink it currently "
-        "publishes to.",
+        "the branches value for an unrelated connection. Inspect the whole branch chain for a transform that publishes "
+        "to a sink before reaching the coalesce, and repair that route.",
     ),
     (
         r"coalesce_branch_alias_unreachable",
         "A coalesce branches KEY — the branch alias; for list-form branches, the entry itself — is not a fork_to name on any "
         "gate. Arrival at a coalesce is tracked by fork branch name, so a key no gate forks can never be satisfied whatever "
-        "its value names. No 'connectivity' facts accompany this code: compare every coalesce branches key against "
+        "its value names. Compare every coalesce branches key against "
         "every gate's fork_to names yourself.",
         "Use the upstream gate's fork_to branch names, spelled exactly, as the coalesce branches keys (or list entries); do "
         "not invent an alias. Add a name to the gate's fork_to only when that fork genuinely lacks the branch. When "
-        "'coalesce_branch_unreachable' fires for the same branch, fix the alias first — its record carries no 'sink_lure' "
-        "for an identity branch.",
+        "'coalesce_branch_unreachable' fires for the same branch, fix the alias first, then inspect its incoming connection.",
     ),
     (
         r"node_input_not_reachable|input '(.+)' is not reachable",
@@ -1031,9 +1021,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"coalesce_on_success_must_be_sink|coalesce_on_success_unknown_sink|Coalesce on_success must point to a sink|Coalesce '(.+)' on_success references unknown sink",
-        "A coalesce node's on_success may only name an existing sink; merged rows otherwise flow to whichever node reads the coalesce id as its input. "
-        "For coalesce_on_success_unknown_sink the rejection's 'connectivity' facts, when present, carry the offending value ('dangling_on_success') and the candidate's sink names ('declared_sinks').",
-        "Either set the coalesce on_success to a sink name from outputs[] (the connectivity facts' declared_sinks) exactly, or leave on_success null and give the downstream node input='<coalesce node id>'.",
+        "A coalesce node's on_success may only name an existing sink; merged rows otherwise flow to whichever node reads the coalesce id as its input.",
+        "Either set the coalesce on_success to a sink name from the authored candidate's outputs[] exactly, or leave on_success null and give the downstream node input='<coalesce node id>'.",
     ),
     (
         r"coalesce_missing_branches|Coalesce '(.+)' is missing required field 'branches'",
@@ -1107,21 +1096,17 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"transform_on_success_dangling|aggregation_on_success_dangling|source_on_success_dangling|is neither a sink nor a known connection",
-        "An on_success destination must be an existing sink name or a connection another node reads as its input. "
-        "The rejection's 'connectivity' facts, when present, name the exact mismatch in YOUR rejected candidate: "
-        "'dangling_on_success' is the value that matched nothing; 'declared_sinks' and 'consumable_connections' are the only valid destinations.",
-        "Re-emit with on_success set to one of the connectivity facts' declared_sinks or consumable_connections, copied exactly — "
+        "An on_success destination must be an existing sink name or a connection another node reads as its input.",
+        "Re-emit with on_success set to a sink name or node input connection from YOUR authored candidate, copied exactly — "
         "for a straight source-to-sink pipeline the source's on_success must equal the outputs[].sink_name byte-for-byte. "
-        "Change nothing else. Only without connectivity facts: call get_pipeline_state to list the CURRENT saved state's sink names "
+        "Change nothing else. For an edit to the saved pipeline, call get_pipeline_state to list the CURRENT saved state's sink names "
         "and node input connections (note it shows the saved state, not a rejected candidate).",
     ),
     (
         r"gate_on_error_unknown_sink",
         "A gate's node-level on_error policy may name 'discard', an existing sink, or an eligible enclosing "
-        "bound-region closer. Arbitrary processing destinations are forbidden. The rejection's "
-        "'connectivity' facts carry the offending value as 'dangling_on_error' and the candidate's sink names as "
-        "'declared_sinks'.",
-        "Use upsert_node to set the gate's on_error='discard', or copy one of the connectivity facts' declared_sinks "
+        "bound-region closer. Arbitrary processing destinations are forbidden.",
+        "Use upsert_node to set the gate's on_error='discard', or copy one of the authored candidate's outputs[].sink_name values "
         "exactly. If the intended destination is an eligible enclosing closer, correct that binding instead. "
         "Preserve the user's retention choices and required-control coverage. Gate evaluation-error routing "
         "is configured on the gate node; do not add an on_error edge.",
@@ -1129,10 +1114,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"transform_on_error_unknown_sink|references unknown sink",
         "An on_error destination ordinarily names 'discard' or an existing sink. A transform or gate inside a valid "
-        "bound region may instead name its enclosing closer; aggregations cannot. Required-control coverage still applies. "
-        "The rejection's 'connectivity' facts, when present, "
-        "carry the offending value as 'dangling_on_error' and the candidate's sink names as 'declared_sinks'.",
-        "Set on_error='discard', or point it at one of the connectivity facts' declared_sinks (outputs[].sink_name) exactly. "
+        "bound region may instead name its enclosing closer; aggregations cannot. Required-control coverage still applies.",
+        "Set on_error='discard', or point it at an authored candidate's outputs[].sink_name exactly. "
         "For a transform or gate whose intended destination is an eligible enclosing closer, correct that binding instead. "
         "Preserve the user's retention choices and required-control coverage.",
     ),
@@ -1378,8 +1361,8 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
 )
 
 
-# The closed validation codes the planner's redacted repair feedback can carry
-# (see ``pipeline_planner._allowlisted_candidate_feedback``). Every entry MUST
+# The closed validation codes the compose loop's repair guidance can carry.
+# Every entry MUST
 # resolve through :func:`explain_validation_code` — the explain tool's fallback
 # advertises this list and its fuzzy route scans for these substrings, so a
 # dead entry would route the model to a code that then explains nothing
@@ -1599,10 +1582,8 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
     # aggregation on_error sink is refused by the DAG builder too.
     DirectValidationGuidance(
         "aggregation_on_error_unknown_sink",
-        "An aggregation's on_error names where every input row of a FAILED batch goes, and may only be 'discard' or "
-        "an existing sink name. The rejection's 'connectivity' facts carry the offending value as 'dangling_on_error' "
-        "and the candidate's sink names as 'declared_sinks'.",
-        "Set the aggregation's on_error='discard', or copy one of the connectivity facts' declared_sinks exactly. It "
+        "An aggregation's on_error names where every input row of a FAILED batch goes, and may only be 'discard' or an existing sink name.",
+        "Set the aggregation's on_error='discard', or copy an authored candidate's outputs[].sink_name exactly. It "
         "cannot name a coalesce, row_union or collector: an aggregation never sits inside a bound region.",
     ),
     DirectValidationGuidance(
@@ -1762,7 +1743,8 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "source_binding_ambiguous",
         "The candidate supplies competing source bindings. No replacement was applied.",
         "Keep the intended input and supply exactly one source or named sources map. For a blob-backed source, choose "
-        "either an existing blob_id or new inline_blob content, never both.",
+        "one non-null blob_id or ordered blob_ids per root. Only the default source also supports inline_blob. "
+        "Omitted/null selectors are absent; do not combine non-null selectors.",
     ),
     DirectValidationGuidance(
         "source_binding_locked",
@@ -1872,6 +1854,13 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "The plural binding contains LLM-authored content whose interpretation review is not established by this flow.",
         "Use a supported set_source_from_blob flow to stage the intended artifact's review where its content is "
         "representable. Otherwise preserve the artifact and report the limitation; never relabel provenance or drop review.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_plugin_mismatch",
+        "The plural attachment binding requires the provider to select the document-row source plugin.",
+        "Use plugin='blob_rows' with ordered blob_ids for document rows, including a one-element list. "
+        "For scalar parsing, choose the intended source plugin explicitly and supply blob_id instead. "
+        "Preserve the intended attachments and topology; the server does not substitute a plugin.",
     ),
     DirectValidationGuidance(
         "source_blob_plugin_required",
@@ -2023,11 +2012,9 @@ def _augment_with_expected_hint(fix: str, error_text: str) -> str:
 def explain_validation_code(code: str) -> tuple[str, str] | None:
     """Resolve a closed validation ``error_code`` to ``(explanation, suggested_fix)``.
 
-    The one-shot pipeline planner's repair feedback strips raw validation
-    messages before returning a rejection to the model — a redaction boundary,
-    since a raw message can quote plugin names, option values, or row content
-    (see ``pipeline_planner._allowlisted_candidate_feedback``). The closed
-    ``error_code`` selects an exact catalogue record. Legacy codes retain their
+    The closed ``error_code`` selects an exact public catalogue record without
+    deriving guidance from raw validation messages, plugin names, option values
+    or row content. Legacy codes retain their
     original first-match record; new codes carry direct guidance. Prose belongs
     to the public ``explain_validation_error`` tool, not this boundary.
 
@@ -2046,19 +2033,6 @@ def explain_validation_code(code: str) -> tuple[str, str] | None:
     return record[1], record[2]
 
 
-# Static usage line, never per-request data. Live planners called
-# explain_validation_error with junk ({"error_text": "ValidationError"})
-# because nothing said the exact code string is the lookup key. Kept
-# deliberately free of topology hints — mid-repair suggestions have derailed
-# otherwise-converging repairs.
-#
-# Public because BOTH repair surfaces advertise the tool with these exact
-# bytes: the planner's redacted feedback (pipeline_planner) and the freeform
-# tool envelope (tools._dispatch). Two copies would drift, and the parity
-# suite pins the string.
-EXPLAIN_VALIDATION_ERROR_GUIDANCE: Final[str] = "To expand any code, call explain_validation_error with the exact code string."
-"""Planner-surface pointer: there the catalogue text rides inline on each entry, so no container is named."""
-
 EXPLAIN_TOOL_GUIDANCE: Final[str] = (
     "An entry whose error_code has no entry under 'validation_guidance.codes' — or that has no error_code "
     "at all — can be expanded by calling explain_validation_error with the entry's error_code, or with its "
@@ -2071,9 +2045,8 @@ so the model knows which codes the call can still add something for (elspeth-e40
 def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance | None:
     """Resolve a failed envelope's error codes to inline catalogue guidance.
 
-    The freeform twin of the planner's ``_allowlisted_candidate_feedback``
-    enrichment: the two surfaces read the SAME closed catalogue, so a model
-    on either one gets the repair text without spending a turn on
+    The compose loop reads the closed catalogue, so the model gets repair
+    text without spending a turn on
     ``explain_validation_error``. Same rationale as the ``plugin_schemas``
     augmentation that already rides these envelopes.
 
@@ -2124,50 +2097,6 @@ def build_validation_guidance(codes: Iterable[str | None]) -> ValidationGuidance
     return payload
 
 
-# Static text, never per-request data — the same public-constant posture as
-# every catalogue entry above, so it cannot re-open the message boundary the
-# planner's allowlist protects.
-_WITHHELD_VALIDATION_GUIDANCE: Final[tuple[str, str]] = (
-    "This error is on a component whose configuration is bound server-side for this surface. "
-    "Its true component id and validator detail are deliberately withheld: the message could "
-    "quote reviewed private values that are redacted from this conversation.",
-    "Do not guess at the withheld configuration — you cannot see or edit it. Re-verify only the "
-    "components you authored yourself: call get_plugin_schema(<plugin_type>, <plugin_name>) for "
-    "the exact option shapes and allowed values, and change only fields the other errors name. "
-    "If visible rejection classifiers repeat, compare the fields you changed: matching classifiers alone do not "
-    "prove the cause is unchanged or that repair is impossible. When necessary facts remain withheld, explain that "
-    "limitation and ask for the smallest actionable input rather than guessing.",
-)
-
-
-def explain_withheld_validation_code(code: str) -> tuple[str, str] | None:
-    """Blind-mode ``(explanation, suggested_fix)`` for a withheld rejection entry.
-
-    The planner's repair feedback withholds a rejection entry's component id
-    and validator detail when the entry is about a finalizer-owned component
-    (such as auto-wired controls). The ordinary catalogue guidance is
-    dishonest in that mode: ``plugin_options_invalid``'s fix opens with
-    "Apply exactly what 'detail' names" when no detail is present, which
-    sent live planners chasing a field that does not exist and burned the
-    repair budget on re-emissions. This accessor returns guidance that is
-    honest about the blindness for EVERY code — unlike
-    :func:`explain_validation_code` it never returns ``None`` for a
-    well-formed code, because naming the withholding is precisely the point.
-    """
-    if type(code) is not str or not code:
-        return None
-    if code in {reason.value for reason in PluginUnavailableReason}:
-        guidance = explain_validation_code(code)
-        assert guidance is not None
-        # Availability remedies use only the closed code, not private validator
-        # detail. Keep that diagnosis while explicitly withholding the binding.
-        return (
-            f"{_WITHHELD_VALIDATION_GUIDANCE[0]} {guidance[0]}",
-            f"Do not guess at or edit the withheld configuration. {guidance[1]}",
-        )
-    return _WITHHELD_VALIDATION_GUIDANCE
-
-
 def _execute_explain_validation_error(
     args: dict[str, Any],
     state: CompositionState,
@@ -2194,12 +2123,14 @@ def _execute_explain_validation_error(
     exact = explain_validation_code(error_text)
     if exact is not None:
         explanation, fix = exact
+        # TC-004: the exact (case-sensitive) catalogue key is the canonical
+        # code, so name it as the noisy-code branch already does.
         return ToolResult(
             success=True,
             updated_state=state,
             validation=validation,
             affected_nodes=(),
-            data={"error_text": error_text, "explanation": explanation, "suggested_fix": fix},
+            data={"error_text": error_text, "error_code": error_text, "explanation": explanation, "suggested_fix": fix},
         )
     for pattern, explanation, fix in _VALIDATION_ERROR_PATTERNS:
         if re.search(pattern, error_text):

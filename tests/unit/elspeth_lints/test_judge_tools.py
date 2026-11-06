@@ -50,6 +50,8 @@ from elspeth_lints.core.judge import (
     call_judge,
 )
 
+pytestmark = pytest.mark.usefixtures("synthetic_judge_worker")
+
 _VERDICT_JSON = (
     '{"verdict": "ACCEPTED", "rationale": "PRESCRIBED FORM; offensive isinstance->raise at '
     'the construction boundary (composer_interpretation.py:121).", "confidence": 0.8, '

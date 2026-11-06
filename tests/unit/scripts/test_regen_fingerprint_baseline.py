@@ -1,0 +1,34 @@
+"""The editable baseline wrapper directs operators to protected startup."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from unittest.mock import create_autospec
+
+import pytest
+from scripts.cicd import regen_fingerprint_baseline
+
+
+@pytest.mark.parametrize("signing_key", [None, "", "synthetic-signing-key"])
+@pytest.mark.parametrize("options", [[], ["--env-file", "unread-operator.env", "--commit"]])
+def test_editable_regeneration_refuses_before_repository_callbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    signing_key: str | None,
+    options: list[str],
+) -> None:
+    if signing_key is None:
+        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", signing_key)
+    monkeypatch.setattr(sys, "argv", ["regen_fingerprint_baseline.py", *options])
+    run = create_autospec(subprocess.run, spec_set=True, side_effect=AssertionError("disabled maintenance must not execute subprocesses"))
+    monkeypatch.setattr(subprocess, "run", run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        regen_fingerprint_baseline.main()
+
+    assert exc_info.value.code == 1
+    assert "Baseline regeneration requires the protected operator entrypoint" in capsys.readouterr().err
+    run.assert_not_called()

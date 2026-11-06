@@ -8,16 +8,18 @@ connections.
 from __future__ import annotations
 
 import json
+import math
 import secrets
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final, get_args
 from uuid import UUID, uuid4
+from weakref import WeakKeyDictionary
 
-from pydantic import JsonValue
 from sqlalchemy import ColumnElement, Connection, Engine, Row, and_, delete, func, insert, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
@@ -56,10 +58,12 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
     InterpretationSurfaceOrigin,
 )
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
+from elspeth.web.composer.continuation_policy import ContinuationSegmentPolicy
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
 from elspeth.web.coordination.approval_authority import (
     ApprovalGateInputs,
@@ -70,10 +74,10 @@ from elspeth.web.coordination.approval_authority import (
     supersede_open_approvals,
 )
 from elspeth.web.coordination.chargeable_admission_authority import RepositoryChargeableAdmissionAuthority
+from elspeth.web.coordination.composer_mutation_guard import require_auto_mutation_on_connection
 from elspeth.web.coordination.composer_operation_authority import (
-    get_composer_operation_for_start_on_connection,
+    _require_owner,
     require_composer_operation_mutation_on_connection,
-    start_composer_operation_on_connection,
 )
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
@@ -98,13 +102,14 @@ from elspeth.web.coordination.quota_authority import (
     session_storage_bytes_on_connection,
 )
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
-from elspeth.web.sessions.composer_operation_preconditions import check_composer_operation_preconditions_on_connection
+from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationClaim,
-    ComposerOperationError,
     ComposerOperationFenceLost,
-    ComposerOperationPreconditionRefused,
+    ComposerOperationRunning,
 )
+from elspeth.web.sessions.content_publication import prepare_content_publication, read_content_publication
+from elspeth.web.sessions.continuation import _read_segment_start_data_on_connection, start_segment_on_connection
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
@@ -115,6 +120,7 @@ from elspeth.web.sessions.models import (
     blob_run_links_table,
     blobs_table,
     chat_messages_table,
+    composer_async_operations_table,
     composer_completion_events_table,
     composition_proposals_table,
     composition_rejection_events_table,
@@ -147,6 +153,7 @@ from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     CompositionStateRecord,
     IllegalRunTransitionError,
+    InterpretationResolveError,
     OperationReceiptFence,
     PendingInterpretationCreationResult,
     PendingInterpretationPolicy,
@@ -181,6 +188,7 @@ from elspeth.web.sessions.protocol import (
     SessionRunEventType,
     SessionRunStatus,
     decode_stored_composition_validation_errors,
+    require_stored_state_metadata,
     serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.state_envelope import envelope_state_column, unwrap_state_column
@@ -189,10 +197,29 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from contextlib import AbstractContextManager
 
+    from elspeth.web.composer.continuation_handoff import ContinuationYieldReason
     from elspeth.web.execution.envelope import RunExecutionInput
+    from elspeth.web.sessions.continuation import (
+        ComposerSegmentRecoveryReceipt,
+        ComposerSegmentStartObservation,
+        ComposerSegmentSuspendObservation,
+        ComposerSegmentYieldReceipt,
+    )
+    from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
+    from elspeth.web.sessions.pending_interpretation import PendingInterpretationPolicyPlan, _SessionPendingInterpretationValidator
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
+
+
+@dataclass(frozen=True, slots=True)
+class _UnavailableComposerSegment:
+    parent: Row[Any]
+    segment: Row[Any]
+    history: Row[Any]
+    fence: Row[Any]
+    now: datetime
+    archived: bool
 
 
 class _ForkMutationConnectionResolver(Protocol):
@@ -379,7 +406,6 @@ _ACTIVE_RUN_COMPOSITION_COLUMNS = (
     composition_states_table.c.id.label("state_id"),
     composition_states_table.c.session_id.label("state_session_id"),
     composition_states_table.c.version.label("state_version"),
-    composition_states_table.c.source,
     composition_states_table.c.sources,
     composition_states_table.c.nodes,
     composition_states_table.c.edges,
@@ -395,11 +421,10 @@ _ACTIVE_RUN_COMPOSITION_COLUMNS = (
 
 def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
     """Project one active-run join row onto its exact composition-state record."""
-    return CompositionStateRecord(
+    record = CompositionStateRecord(
         id=UUID(str(active_run.state_id)),
         session_id=UUID(str(active_run.state_session_id)),
         version=active_run.state_version,
-        source=unwrap_state_column(active_run.source),
         sources=unwrap_state_column(active_run.sources),
         nodes=unwrap_state_column(active_run.nodes),
         edges=unwrap_state_column(active_run.edges),
@@ -411,6 +436,8 @@ def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
         derived_from_state_id=(UUID(str(active_run.derived_from_state_id)) if active_run.derived_from_state_id is not None else None),
         composer_meta=unwrap_state_column(active_run.composer_meta),
     )
+    read_content_publication(record)
+    return record
 
 
 def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
@@ -688,6 +715,7 @@ class _RepositorySessionMutations:
         planner_payload: str,
         composition_state_id: str | None,
         created_at: datetime,
+        rejection_id: UUID | None = None,
     ) -> None:
         """Persist one refused composer tool call's unredacted reason (elspeth-3e28029d2f).
 
@@ -707,9 +735,11 @@ class _RepositorySessionMutations:
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
         if type(created_at) is not datetime:
             raise TypeError("created_at must be an exact datetime")
+        if rejection_id is not None and type(rejection_id) is not UUID:
+            raise TypeError("planned rejection identity must be an exact UUID")
         _resolve_mutation_connection(state._connection_token).execute(
             insert(composition_rejection_events_table).values(
-                id=str(uuid4()),
+                id=str(uuid4() if rejection_id is None else rejection_id),
                 session_id=state._session_id,
                 composition_state_id=composition_state_id,
                 tool_call_id=tool_call_id,
@@ -892,13 +922,13 @@ class _RepositoryCompositionStateMutations:
                 )
             ).scalar_one()
         )
-        data = creation.data
+        data = prepare_content_publication(creation.data, session_id=UUID(state._session_id), state_id=creation.id, state_version=version)
+        require_stored_state_metadata(data, state_id=creation.id)
         connection.execute(
             insert(composition_states_table).values(
                 id=str(creation.id),
                 session_id=state._session_id,
                 version=version,
-                source=None,
                 sources=_composition_state_column(data.sources),
                 nodes=_composition_state_column(data.nodes),
                 edges=_composition_state_column(data.edges),
@@ -917,7 +947,6 @@ class _RepositoryCompositionStateMutations:
             id=creation.id,
             session_id=UUID(state._session_id),
             version=version,
-            source=None,
             sources=data.sources,
             nodes=data.nodes,
             edges=data.edges,
@@ -950,6 +979,41 @@ class _RepositoryCompositionStateMutations:
             record=state._approval_supersession_recorder,
         )
         return record
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class PendingInterpretationWritePlan:
+    """Original read/validation DATA; construction alone grants no apply authority.
+
+    Approval supersession is exposed before any write. This plan does not
+    authorize a V4 policy decision or make Sessions/Landscape atomic.
+    """
+
+    policy_plan: PendingInterpretationPolicyPlan
+    pending_events: tuple[InterpretationEventRecord, ...]
+    open_approval_ids: tuple[str, ...]
+    database_now: datetime
+    appended_record: CompositionStateRecord | None
+    retired_dead_site_ids: tuple[str, ...]
+
+    @property
+    def requires_approval_supersession(self) -> bool:
+        return self.appended_record is not None and bool(self.open_approval_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class _IssuedPendingWritePlan:
+    context: SessionOperationContext
+    validator: _SessionPendingInterpretationValidator
+    policy_plan: PendingInterpretationPolicyPlan
+    pending_events: tuple[InterpretationEventRecord, ...]
+    open_approval_ids: tuple[str, ...]
+    database_now: datetime
+    appended_record: CompositionStateRecord | None
+    retired_dead_site_ids: tuple[str, ...]
+
+
+_pending_write_plans: WeakKeyDictionary[PendingInterpretationWritePlan, _IssuedPendingWritePlan] = WeakKeyDictionary()
 
 
 @final
@@ -989,11 +1053,10 @@ class _RepositoryInterpretationMutations:
 
     @classmethod
     def _state_record(cls, row: Row[Any]) -> CompositionStateRecord:
-        return CompositionStateRecord(
+        record = CompositionStateRecord(
             id=UUID(row.id),
             session_id=UUID(row.session_id),
             version=row.version,
-            source=cls._state_column(row.source),
             sources=cls._state_column(row.sources),
             nodes=cls._state_column(row.nodes),
             edges=cls._state_column(row.edges),
@@ -1005,6 +1068,8 @@ class _RepositoryInterpretationMutations:
             derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
             composer_meta=cls._state_column(row.composer_meta),
         )
+        read_content_publication(record)
+        return record
 
     @staticmethod
     def _event_record(row: Row[Any]) -> InterpretationEventRecord:
@@ -1057,11 +1122,20 @@ class _RepositoryInterpretationMutations:
         policy: PendingInterpretationPolicy,
     ) -> PendingInterpretationCreationResult:
         """Apply the canonical pending-review decision inside the exact live fence."""
+        return self.apply_pending_plan(self.plan_pending(command, validator, policy=policy))
+
+    def _read_pending_snapshot(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+        *,
+        policy: PendingInterpretationPolicy,
+    ) -> SessionPendingInterpretationSnapshot:
+        """Read the original planner inputs under the unchanged writer checks."""
         self._require_pending_creation_authority()
         if type(command) is not SessionPendingInterpretationCommand:
             raise TypeError("pending interpretation command must be exact")
         from elspeth.web.sessions.pending_interpretation import (
-            _SessionPendingInterpretationPlanner,
             _SessionPendingInterpretationValidator,
         )
 
@@ -1171,7 +1245,135 @@ class _RepositoryInterpretationMutations:
             )
             if any(term.strip() == command.user_term.strip() for term in candidate_terms):
                 raise AuditIntegrityError("pipeline candidate review site already has immutable evidence")
-        decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator, policy=policy)
+        return snapshot
+
+    def _pending_plan_tail_source(self) -> tuple[tuple[InterpretationEventRecord, ...], tuple[str, ...]]:
+        self._require_pending_creation_authority()
+        state = self.__state
+        connection = _resolve_mutation_connection(state._connection_token)
+        pending_rows = connection.execute(
+            select(interpretation_events_table)
+            .where(
+                interpretation_events_table.c.session_id == state._session_id,
+                interpretation_events_table.c.choice == InterpretationChoice.PENDING.value,
+            )
+            .order_by(interpretation_events_table.c.id)
+        ).all()
+        approvals = (
+            connection.execute(
+                select(approvals_table.c.approval_id)
+                .where(approvals_table.c.session_id == state._session_id, approvals_table.c.decision.is_(None))
+                .order_by(approvals_table.c.approval_id)
+            )
+            .scalars()
+            .all()
+        )
+        return tuple(self._event_record(row) for row in pending_rows), tuple(approvals)
+
+    def plan_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+        *,
+        policy: PendingInterpretationPolicy = PendingInterpretationPolicy.RECONCILE,
+    ) -> PendingInterpretationWritePlan:
+        """Read and plan without Sessions DML or approval-audit callbacks."""
+        from elspeth.web.sessions.pending_interpretation import (
+            _reviewed_content_identity,
+            _SessionPendingInterpretationValidator,
+            plan_pending_interpretation,
+        )
+
+        snapshot = self._read_pending_snapshot(command, validator, policy=policy)
+        if type(validator) is not _SessionPendingInterpretationValidator:
+            raise TypeError("pending interpretation validator must be exact")
+        policy_plan = plan_pending_interpretation(command, snapshot, validator, policy=policy)
+        pending, approvals = self._pending_plan_tail_source()
+        appended = policy_plan.decision.appended_state
+        record = None
+        if appended is not None:
+            version = snapshot.live_state.version + 1
+            data = prepare_content_publication(
+                appended.data, session_id=snapshot.live_state.session_id, state_id=appended.id, state_version=version
+            )
+            require_stored_state_metadata(data, state_id=appended.id)
+            record = CompositionStateRecord(
+                id=appended.id,
+                session_id=snapshot.live_state.session_id,
+                version=version,
+                sources=data.sources,
+                nodes=data.nodes,
+                edges=data.edges,
+                outputs=data.outputs,
+                metadata_=data.metadata_,
+                is_valid=data.is_valid,
+                validation_errors=data.validation_errors,
+                created_at=appended.created_at,
+                derived_from_state_id=appended.derived_from_state_id,
+                composer_meta=data.composer_meta,
+            )
+        retired: list[str] = []
+        if record is not None:
+            for event in pending:
+                if (
+                    event.id in policy_plan.decision.superseded_event_ids
+                    or event.interpretation_source is not InterpretationSource.USER_APPROVED
+                ):
+                    continue
+                if event.kind is None or event.affected_node_id is None or event.user_term is None:
+                    raise AuditIntegrityError("pending review lost its dead-site identity")
+                try:
+                    _reviewed_content_identity(
+                        record,
+                        kind=event.kind,
+                        affected_node_id=event.affected_node_id,
+                        user_term=event.user_term,
+                        context="supersede_dead_site_pending_interpretation_events",
+                    )
+                except InterpretationResolveError:
+                    retired.append(str(event.id))
+        planned = PendingInterpretationWritePlan(policy_plan, pending, approvals, self.__state._database_now, record, tuple(retired))
+        context = self.__state._operation_context
+        if context is None:
+            raise AuditIntegrityError("pending interpretation plan lost its checked operation context")
+        _pending_write_plans[planned] = _IssuedPendingWritePlan(
+            context,
+            validator,
+            policy_plan,
+            pending,
+            approvals,
+            planned.database_now,
+            record,
+            planned.retired_dead_site_ids,
+        )
+        return planned
+
+    def apply_pending_plan(self, planned: PendingInterpretationWritePlan) -> PendingInterpretationCreationResult:
+        """Reprove original read custody before entering the existing DML tail."""
+        from elspeth.web.sessions.pending_interpretation import reprove_pending_interpretation_plan
+
+        self._require_pending_creation_authority()
+        source = _pending_write_plans.get(planned) if type(planned) is PendingInterpretationWritePlan else None
+        if (
+            source is None
+            or source.context != self.__state._operation_context
+            or source.policy_plan is not planned.policy_plan
+            or source.pending_events != planned.pending_events
+            or source.open_approval_ids != planned.open_approval_ids
+            or source.database_now != planned.database_now
+            or source.appended_record != planned.appended_record
+            or source.retired_dead_site_ids != planned.retired_dead_site_ids
+        ):
+            raise AuditIntegrityError("pending interpretation apply requires its original fenced plan")
+        policy_plan = planned.policy_plan
+        command, snapshot, decision = policy_plan.command, policy_plan.snapshot, policy_plan.decision
+        current = self._read_pending_snapshot(command, source.validator, policy=policy_plan.policy)
+        if current != snapshot or self._pending_plan_tail_source() != (planned.pending_events, planned.open_approval_ids):
+            raise AuditIntegrityError("pending interpretation source changed before apply")
+        reprove_pending_interpretation_plan(policy_plan)
+        state = self.__state
+        connection = _resolve_mutation_connection(state._connection_token)
+        state_id = str(command.composition_state_id)
         if type(decision) is not SessionPendingInterpretationDecision:
             raise TypeError("pending interpretation planner must return an exact decision")
         matching_term_ids = {
@@ -1340,16 +1542,18 @@ class _RepositoryInterpretationMutations:
                     )
                 ).scalar_one()
             )
-            data = appended_state.data
+            data = prepare_content_publication(
+                appended_state.data, session_id=UUID(state._session_id), state_id=appended_state.id, state_version=version
+            )
             # This append is a genuine session HEAD (version MAX+1, derived_from
             # set), so retire pending reviews whose site the new head extinguished
             # in this transaction.
+            require_stored_state_metadata(data, state_id=appended_state.id)
             connection.execute(
                 insert(composition_states_table).values(
                     id=str(appended_state.id),
                     session_id=state._session_id,
                     version=version,
-                    source=None,
                     sources=_composition_state_column(data.sources),
                     nodes=_composition_state_column(data.nodes),
                     edges=_composition_state_column(data.edges),
@@ -1369,7 +1573,6 @@ class _RepositoryInterpretationMutations:
                 id=appended_state.id,
                 session_id=UUID(state._session_id),
                 version=version,
-                source=None,
                 sources=data.sources,
                 nodes=data.nodes,
                 edges=data.edges,
@@ -1381,16 +1584,20 @@ class _RepositoryInterpretationMutations:
                 derived_from_state_id=appended_state.derived_from_state_id,
                 composer_meta=data.composer_meta,
             )
-            supersede_dead_site_pending_interpretation_events(
+            if appended_record != planned.appended_record:
+                raise AuditIntegrityError("pending interpretation changed its planned state publication")
+            retired = supersede_dead_site_pending_interpretation_events(
                 connection,
                 session_id=state._session_id,
                 build_state_record=lambda: appended_record,
-                now=state._database_now,
+                now=planned.database_now,
             )
+            if tuple(sorted(item.event_id for item in retired)) != planned.retired_dead_site_ids:
+                raise AuditIntegrityError("pending interpretation changed its planned dead-site supersession")
             supersede_open_approvals(
                 connection,
                 session_id=state._session_id,
-                now=state._database_now,
+                now=planned.database_now,
                 record=state._approval_supersession_recorder,
             )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(command.event_id))).one()
@@ -4187,12 +4394,15 @@ class _ForkChildSessionMutations:
             )
         ).scalar_one()
         connection = self._require_exact_child_context()
+        state = prepare_content_publication(
+            state, session_id=UUID(self.__child_session_id), state_id=creation.id, state_version=int(next_version)
+        )
+        require_stored_state_metadata(state, state_id=creation.id)
         connection.execute(
             insert(composition_states_table).values(
                 id=str(creation.id),
                 session_id=self.__child_session_id,
                 version=int(next_version),
-                source=None,
                 sources=self._state_column(state.sources),
                 nodes=self._state_column(state.nodes),
                 edges=self._state_column(state.edges),
@@ -4924,12 +5134,23 @@ class _SessionOperationAuthorityRepository:
         operation_kind: SessionOperationKind,
         owner_instance_id: str,
         lease_seconds: int,
+        composer_operation_id: str | None = None,
     ) -> SessionOperationContext:
         session_row = conn.execute(
             select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id_text).with_for_update()
         ).one_or_none()
         if session_row is None:
             raise SessionOperationFenceLost(FenceLossReason.MISSING)
+        parent = conn.execute(
+            select(composer_async_operations_table.c.operation_id)
+            .where(
+                composer_async_operations_table.c.session_id == session_id_text,
+                composer_async_operations_table.c.status.in_(("queued", "running")),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if parent is not None and (operation_kind is not SessionOperationKind.COMPOSE or composer_operation_id != parent):
+            raise SessionOperationConflictError
         row = self._select_fence(conn, session_id=session_id_text)
         if row is None:
             raise SessionOperationFenceLost(FenceLossReason.MISSING)
@@ -4983,50 +5204,701 @@ class _SessionOperationAuthorityRepository:
             operation_kind=operation_kind,
         )
 
-    def start_composer_async_operation(
+    def recover_composer_segment(
+        self,
+        *,
+        session_id: UUID,
+        operation_id: str,
+        expected_generation: int,
+        actor_user_id: str,
+        auth_provider_type: str,
+    ) -> bool:
+        """Advance one unavailable owner while retaining its complete selected cut.
+
+        This never executes a prepared business effect, creates a successor,
+        releases another physical fence or fabricates a current context.
+        """
+        from elspeth.web.sessions.continuation import recover_segment_on_connection
+
+        if type(session_id) is not UUID or type(operation_id) is not str or str(UUID(operation_id)) != operation_id:
+            raise ValueError("recovery requires canonical logical operation identities")
+        if type(expected_generation) is not int or expected_generation < 1:
+            raise ValueError("recovery requires its actual positive generation")
+        if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
+            raise ValueError("auth_provider_type must name a browser authentication provider")
+        with self._locked_transaction(str(session_id)) as conn:
+            unavailable = self._unavailable_composer_segment_on_connection(
+                conn,
+                session_id=session_id,
+                operation_id=operation_id,
+                expected_generation=expected_generation,
+                actor_user_id=actor_user_id,
+                auth_provider_type=auth_provider_type,
+            )
+            if unavailable is None:
+                return False
+            recover_segment_on_connection(
+                conn,
+                session_id=str(session_id),
+                operation_id=operation_id,
+                parent=unavailable.parent,
+                segment=unavailable.segment,
+                history=unavailable.history,
+                now=unavailable.now,
+                next_eligible_at=unavailable.now,
+            )
+            return True
+
+    def _unavailable_composer_segment_on_connection(
+        self,
+        conn: Connection,
+        *,
+        session_id: UUID,
+        operation_id: str,
+        expected_generation: int,
+        actor_user_id: str,
+        auth_provider_type: str,
+        candidate: ContinuationRecoveryCandidate | None = None,
+    ) -> _UnavailableComposerSegment | None:
+        from elspeth.web.sessions.models import composer_operation_segments_table as segments
+        from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+        if candidate is None:
+            _require_owner(conn, session_id=session_id, actor_user_id=actor_user_id, auth_provider_type=auth_provider_type)
+        session = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id)).with_for_update()).one_or_none()
+        if session is None or session.user_id != actor_user_id or session.auth_provider_type != auth_provider_type:
+            return None
+        parent = conn.execute(
+            select(composer_async_operations_table).where(
+                composer_async_operations_table.c.session_id == str(session_id),
+                composer_async_operations_table.c.operation_id == operation_id,
+            )
+        ).one_or_none()
+        if (
+            parent is None
+            or parent.status not in ("queued", "running")
+            or parent.ownership_generation != expected_generation
+            or parent.actor_user_id != actor_user_id
+        ):
+            return None
+        segment = conn.execute(
+            select(segments).where(
+                segments.c.session_id == str(session_id),
+                segments.c.operation_id == operation_id,
+                segments.c.sequence == parent.current_segment_sequence,
+            )
+        ).one_or_none()
+        if segment is None or segment.state != "running" or segment.generation != expected_generation:
+            return None
+        history = conn.execute(
+            select(attempts).where(
+                attempts.c.session_id == str(session_id),
+                attempts.c.operation_id == operation_id,
+                attempts.c.sequence == segment.sequence,
+                attempts.c.generation == expected_generation,
+            )
+        ).one_or_none()
+        fence = self._select_fence(conn, session_id=str(session_id))
+        if candidate is not None and (
+            parent.checkpoint_id != candidate.checkpoint_id
+            or parent.attempt != candidate.claim_attempt
+            or segment.sequence != candidate.segment_sequence
+            or segment.checkpoint_id != candidate.segment_checkpoint_id
+            or history is None
+            or history.session_operation_id != candidate.session_operation_id
+            or history.session_operation_epoch != candidate.session_operation_epoch
+            or history.session_operation_lease_token != candidate.session_operation_lease_token
+            or history.owner_instance_id != candidate.owner_instance_id
+            or fence is None
+            or fence.operation_id != candidate.session_operation_id
+            or fence.operation_epoch != candidate.session_operation_epoch
+            or fence.lease_token != candidate.session_operation_lease_token
+            or fence.owner_instance_id != candidate.owner_instance_id
+        ):
+            return None
+        if candidate is not None:
+            from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+
+            head = conn.execute(
+                select(checkpoints.c.cursor).where(
+                    checkpoints.c.session_id == str(session_id),
+                    checkpoints.c.operation_id == operation_id,
+                    checkpoints.c.checkpoint_id == candidate.checkpoint_id,
+                )
+            ).scalar_one_or_none()
+            entry = conn.execute(
+                select(checkpoints.c.cursor).where(
+                    checkpoints.c.session_id == str(session_id),
+                    checkpoints.c.operation_id == operation_id,
+                    checkpoints.c.checkpoint_id == candidate.segment_checkpoint_id,
+                )
+            ).scalar_one_or_none()
+            if head is None or entry is None or head != parent.journal_cursor or entry > head:
+                return None
+        if (
+            history is None
+            or history.revoked_at is not None
+            or history.outcome is not None
+            or history.claim_attempt != parent.attempt
+            or history.session_operation_id != segment.session_operation_id
+            or history.session_operation_epoch != segment.session_operation_epoch
+            or history.session_operation_lease_token != segment.session_operation_lease_token
+            or history.owner_instance_id != segment.claim_owner_instance_id
+        ):
+            raise AuditIntegrityError("continuation recovery lost its exact immutable attempt")
+        if (
+            fence is None
+            or fence.operation_kind != SessionOperationKind.COMPOSE.value
+            or fence.operation_id != history.session_operation_id
+            or fence.operation_epoch != history.session_operation_epoch
+            or fence.lease_token != history.session_operation_lease_token
+            or fence.owner_instance_id != history.owner_instance_id
+        ):
+            raise AuditIntegrityError("continuation recovery lost its actual previous physical fence")
+        now = self._database_now(conn)
+        if fence.released_at is None and (
+            _ensure_utc(fence.lease_expires_at) > now
+            or self._expired_owner_allows_takeover(conn, owner_instance_id=fence.owner_instance_id, database_now=now) is not True
+        ):
+            return None
+        return _UnavailableComposerSegment(parent, segment, history, fence, now, session.archived_at is not None)
+
+    def reconcile_unavailable_composer_segment(
+        self,
+        candidate: ContinuationRecoveryCandidate,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+    ) -> Literal["recovered", "settled", "unchanged"]:
+        """Reprove advisory discovery and decide Stop/recovery under one lock."""
+        from elspeth.web.composer.continuation_next_action import ContinuationCutNotResumable
+        from elspeth.web.sessions.composer_operation_errors import request_cancelled_error, worker_lost_error
+        from elspeth.web.sessions.continuation import (
+            recover_segment_on_connection,
+            settle_segment_on_connection,
+            validate_lost_continuation_on_connection,
+        )
+        from elspeth.web.sessions.continuation_recovery_candidates import ContinuationRecoveryCandidate
+
+        if type(candidate) is not ContinuationRecoveryCandidate:
+            raise TypeError("continuation reconciliation requires its nominal discovery observation")
+        if (
+            type(candidate.session_id) is not UUID
+            or type(candidate.operation_id) is not str
+            or str(UUID(candidate.operation_id)) != candidate.operation_id
+            or type(candidate.expected_generation) is not int
+            or candidate.expected_generation < 1
+            or type(candidate.segment_sequence) is not int
+            or candidate.segment_sequence < 1
+            or type(candidate.claim_attempt) is not int
+            or candidate.claim_attempt < 1
+        ):
+            raise ValueError("continuation reconciliation requires exact positive original identities")
+        _validate_owner(owner_instance_id)
+        _validate_lease_seconds(lease_seconds)
+        if (
+            type(auth_provider_type) is not str
+            or candidate.auth_provider_type != auth_provider_type
+            or auth_provider_type not in get_args(AuthProviderType)
+        ):
+            raise ValueError("continuation recovery must retain the configured authentication provider")
+        with self._locked_transaction(str(candidate.session_id)) as conn:
+            old = self._unavailable_composer_segment_on_connection(
+                conn,
+                session_id=candidate.session_id,
+                operation_id=candidate.operation_id,
+                expected_generation=candidate.expected_generation,
+                actor_user_id=candidate.actor_user_id,
+                auth_provider_type=auth_provider_type,
+                candidate=candidate,
+            )
+            if old is None:
+                return "unchanged"
+            validate_lost_continuation_on_connection(conn, session_id=str(candidate.session_id), operation_id=candidate.operation_id)
+            from elspeth.web.sessions.continuation_p4 import read_lost_terminal_p4_on_connection, terminal_service_failure
+            from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
+
+            terminal_source = read_lost_terminal_p4_on_connection(
+                conn, session_id=str(candidate.session_id), operation_id=candidate.operation_id
+            )
+            if old.parent.cancel_requested_at is None and not old.archived and terminal_source is None:
+                try:
+                    recover_segment_on_connection(
+                        conn,
+                        session_id=str(candidate.session_id),
+                        operation_id=candidate.operation_id,
+                        parent=old.parent,
+                        segment=old.segment,
+                        history=old.history,
+                        now=old.now,
+                        next_eligible_at=old.now,
+                    )
+                except ContinuationCutNotResumable:
+                    pass
+                else:
+                    return "recovered"
+            terminal_failure = (
+                terminal_service_failure(terminal_source, request_id=old.parent.request_id)
+                if type(terminal_source) is StoredTerminalP4Application
+                else None
+            )
+            # A later Stop cannot replace the original retained audit failure.
+            outcome = (
+                terminal_failure
+                if terminal_failure is not None and terminal_failure.error_type == "audit_integrity_error"
+                else request_cancelled_error(request_id=old.parent.request_id)
+                if old.parent.cancel_requested_at is not None
+                else terminal_failure
+                if terminal_failure is not None
+                else worker_lost_error(request_id=old.parent.request_id)
+            )
+            context = (
+                None
+                if old.archived
+                else self._advance_exclusive_fence_on_connection(
+                    conn,
+                    session_id_text=str(candidate.session_id),
+                    operation_kind=SessionOperationKind.COMPOSE,
+                    owner_instance_id=owner_instance_id,
+                    lease_seconds=lease_seconds,
+                    composer_operation_id=candidate.operation_id,
+                )
+            )
+            settle_segment_on_connection(
+                conn,
+                session_id=str(candidate.session_id),
+                operation_id=candidate.operation_id,
+                parent=old.parent,
+                segment=old.segment,
+                history=old.history,
+                outcome=outcome,
+                settled_by="settle_lost_inactive_session" if old.archived else "settle_lost",
+                attempt_outcome="interrupted",
+                now=old.now,
+            )
+            if context is not None:
+                self._release_fence_on_connection(conn, context, database_now=self._database_now(conn))
+            return "settled"
+
+    def settle_lost_inactive_continuation(self, candidate: ContinuationInactiveCandidate, *, auth_provider_type: str) -> bool:
+        """Settle an archived non-running segment without advancing its fence."""
+        from elspeth.web.sessions.composer_operation_errors import request_cancelled_error, worker_lost_error
+        from elspeth.web.sessions.continuation import settle_segment_on_connection, validate_lost_continuation_on_connection
+        from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate
+        from elspeth.web.sessions.models import composer_operation_segments_table as segments
+        from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+        if type(candidate) is not ContinuationInactiveCandidate:
+            raise TypeError("inactive settlement requires its nominal discovery observation")
+        if (
+            type(candidate.session_id) is not UUID
+            or type(candidate.operation_id) is not str
+            or str(UUID(candidate.operation_id)) != candidate.operation_id
+            or type(candidate.expected_generation) is not int
+            or candidate.expected_generation < 1
+            or type(candidate.segment_sequence) is not int
+            or candidate.segment_sequence < 1
+            or type(candidate.claim_attempt) is not int
+            or candidate.claim_attempt < 0
+        ):
+            raise ValueError("inactive settlement requires exact original identities")
+        if (
+            type(auth_provider_type) is not str
+            or candidate.auth_provider_type != auth_provider_type
+            or auth_provider_type not in get_args(AuthProviderType)
+        ):
+            raise ValueError("inactive settlement must retain the configured authentication provider")
+        sid = str(candidate.session_id)
+        with self._locked_transaction(sid) as conn:
+            session = conn.execute(select(sessions_table).where(sessions_table.c.id == sid).with_for_update()).one_or_none()
+            if (
+                session is None
+                or session.archived_at is None
+                or session.user_id != candidate.actor_user_id
+                or session.auth_provider_type != auth_provider_type
+            ):
+                return False
+            parent = conn.execute(
+                select(composer_async_operations_table).where(
+                    composer_async_operations_table.c.session_id == sid,
+                    composer_async_operations_table.c.operation_id == candidate.operation_id,
+                )
+            ).one_or_none()
+            segment = conn.execute(
+                select(segments).where(
+                    segments.c.session_id == sid,
+                    segments.c.operation_id == candidate.operation_id,
+                    segments.c.sequence == candidate.segment_sequence,
+                )
+            ).one_or_none()
+            now = self._database_now(conn)
+            if (
+                parent is None
+                or segment is None
+                or parent.status not in ("queued", "running")
+                or parent.actor_user_id != candidate.actor_user_id
+                or parent.current_segment_sequence != candidate.segment_sequence
+                or parent.ownership_generation != candidate.expected_generation
+                or segment.generation != candidate.expected_generation
+                or parent.checkpoint_id != candidate.checkpoint_id
+                or segment.checkpoint_id != candidate.checkpoint_id
+                or parent.attempt != candidate.claim_attempt
+                or segment.state not in ("queued", "interrupted")
+                or segment.claim_token != candidate.claim_token
+                or segment.claim_owner_instance_id != candidate.claim_owner_instance_id
+                or (None if segment.claim_expires_at is None else _ensure_utc(segment.claim_expires_at)) != candidate.claim_expires_at
+                or (segment.claim_expires_at is not None and _ensure_utc(segment.claim_expires_at) > now)
+            ):
+                return False
+            history = conn.execute(
+                select(attempts).where(
+                    attempts.c.session_id == sid,
+                    attempts.c.operation_id == candidate.operation_id,
+                    attempts.c.sequence == candidate.segment_sequence,
+                    attempts.c.generation == candidate.expected_generation,
+                )
+            ).one_or_none()
+            if history is not None and (history.revoked_at is None or history.outcome is None):
+                raise AuditIntegrityError("inactive non-running segment retains an unrevoked attempt")
+            validate_lost_continuation_on_connection(conn, session_id=sid, operation_id=candidate.operation_id)
+            from elspeth.web.sessions.continuation_p4 import read_lost_terminal_p4_on_connection, terminal_service_failure
+            from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
+
+            terminal_source = read_lost_terminal_p4_on_connection(conn, session_id=sid, operation_id=candidate.operation_id)
+            terminal_failure = (
+                terminal_service_failure(terminal_source, request_id=parent.request_id)
+                if type(terminal_source) is StoredTerminalP4Application
+                else None
+            )
+            outcome = (
+                terminal_failure
+                if terminal_failure is not None and terminal_failure.error_type == "audit_integrity_error"
+                else request_cancelled_error(request_id=parent.request_id)
+                if parent.cancel_requested_at is not None
+                else terminal_failure
+                if terminal_failure is not None
+                else worker_lost_error(request_id=parent.request_id)
+            )
+            settle_segment_on_connection(
+                conn,
+                session_id=sid,
+                operation_id=candidate.operation_id,
+                parent=parent,
+                segment=segment,
+                history=None,
+                outcome=outcome,
+                settled_by="settle_lost_inactive_session",
+                attempt_outcome="interrupted",
+                now=now,
+            )
+            return True
+
+    def suspend_composer_segment(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        retry_delay_seconds: float = 0.0,
+        observation: ComposerSegmentSuspendObservation | None = None,
+        deadline: ComposerDrainDeadline | None = None,
+    ) -> ComposerSegmentRecoveryReceipt:
+        """Hand a live owner's segment to the next generation and release its fence.
+
+        One transaction: the live owner's exact fence and attempt are proved,
+        the shared recovery transition is written, and the fence is released,
+        so any replica can claim the same sequence at once without waiting for
+        lease expiry (design §2.1, §3.4 disposition B). A pending Stop refuses
+        with ``ComposerOperationCancelledDuringTurn``: the owner settles the
+        cancellation instead. A cut holding unresolved work refuses with
+        ``ContinuationCutNotResumable`` and nothing is written.
+        """
+        from elspeth.web.sessions.continuation import (
+            ComposerSegmentSuspendObservation,
+            recover_segment_on_connection,
+            require_continuation_mutation,
+        )
+        from elspeth.web.sessions.models import composer_operation_segments_table as segments
+        from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+        if type(running) is not ComposerOperationRunning:
+            raise TypeError("handover requires the owned running custody")
+        if observation is not None and (
+            type(observation) is not ComposerSegmentSuspendObservation
+            or observation.running is not running
+            or observation.candidate is not None
+        ):
+            raise AuditIntegrityError("handover observation is not fresh custody of this exact running owner")
+        claim, context = running.claim, running.session_operation_context
+        if type(retry_delay_seconds) not in (int, float) or not math.isfinite(retry_delay_seconds) or not 0 <= retry_delay_seconds <= 60:
+            raise ValueError("handover retry delay must be finite between zero and sixty seconds")
+        session_id_text = str(claim.session_id)
+        with locked_session_transaction(self._engine, session_id_text, deadline=deadline) as conn:
+            now = self._lock_fence_and_read_database_time(conn, context)
+            # False means no live continuation attempt holds this fence: not this owner.
+            if not require_continuation_mutation(conn, context, allow_cancel=False, allow_expired_segment=True):
+                raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+            parent = conn.execute(
+                select(composer_async_operations_table).where(
+                    composer_async_operations_table.c.session_id == session_id_text,
+                    composer_async_operations_table.c.operation_id == claim.operation_id,
+                )
+            ).one()
+            segment = conn.execute(
+                select(segments).where(
+                    segments.c.session_id == session_id_text,
+                    segments.c.operation_id == claim.operation_id,
+                    segments.c.sequence == claim.segment_sequence,
+                )
+            ).one()
+            history = conn.execute(
+                select(attempts).where(
+                    attempts.c.session_id == session_id_text,
+                    attempts.c.operation_id == claim.operation_id,
+                    attempts.c.sequence == claim.segment_sequence,
+                    attempts.c.generation == claim.ownership_generation,
+                )
+            ).one()
+            if segment.claim_token != claim.claim_token or parent.attempt != claim.attempt:
+                raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+            receipt = recover_segment_on_connection(
+                conn,
+                session_id=session_id_text,
+                operation_id=claim.operation_id,
+                parent=parent,
+                segment=segment,
+                history=history,
+                now=now,
+                next_eligible_at=now + timedelta(seconds=retry_delay_seconds),
+            )
+            remaining = self._observed_lease_validity(conn, context, database_now=now)
+            self._release_fence_on_connection(conn, context, database_now=now)
+            candidate = replace(receipt, lease_validity_remaining=remaining, released_context=context)
+            if observation is not None:
+                observation.candidate = candidate
+            return candidate
+
+    def commit_checkpoint_and_successor(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        expected_head: UUID | None,
+        expected_checkpoint_id: str,
+        expected_cursor: int,
+        snapshot_json: str,
+        reason: ContinuationYieldReason,
+    ) -> ComposerSegmentYieldReceipt:
+        """Yield at a handoff-safe cut: handoff checkpoint, one successor, fence released.
+
+        One locked transaction, so the successor is claimable by any replica
+        at commit (design §2.2). Only a phase owner that reads handoff lineage
+        may yield; every landed owner hands over instead (§2.2, §3.4).
+        """
+        from elspeth.web.sessions.continuation import yield_segment_on_connection
+
+        if type(running) is not ComposerOperationRunning:
+            raise TypeError("yield requires the owned running custody")
+        context = running.session_operation_context
+        with self._locked_transaction(context.fence.session_id) as conn:
+            now = self._lock_fence_and_read_database_time(conn, context)
+            receipt = yield_segment_on_connection(
+                conn,
+                running,
+                expected_head=expected_head,
+                expected_checkpoint_id=expected_checkpoint_id,
+                expected_cursor=expected_cursor,
+                snapshot_json=snapshot_json,
+                reason=reason,
+                now=now,
+            )
+            remaining = self._observed_lease_validity(conn, context, database_now=now)
+            self._release_fence_on_connection(conn, context, database_now=now)
+            return replace(receipt, lease_validity_remaining=remaining)
+
+    def verify_yield(self, receipt: ComposerSegmentYieldReceipt) -> None:
+        from elspeth.web.sessions.continuation import ComposerSegmentYieldReceipt, verify_yield_on_connection
+
+        if type(receipt) is not ComposerSegmentYieldReceipt:
+            raise TypeError("yield verification requires its nominal receipt")
+        with self._locked_transaction(str(receipt.session_id)) as conn:
+            verify_yield_on_connection(conn, receipt)
+
+    def verify_recovery(self, receipt: ComposerSegmentRecoveryReceipt, *, deadline: ComposerDrainDeadline | None = None) -> None:
+        from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, verify_recovery_on_connection
+
+        if type(receipt) is not ComposerSegmentRecoveryReceipt:
+            raise TypeError("recovery verification requires its nominal receipt")
+        with locked_session_transaction(self._engine, str(receipt.session_id), deadline=deadline) as conn:
+            verify_recovery_on_connection(conn, receipt)
+
+    def read_suspend_outcome(
+        self, observation: ComposerSegmentSuspendObservation, *, deadline: ComposerDrainDeadline | None = None
+    ) -> ComposerSegmentRecoveryReceipt:
+        from elspeth.web.sessions.continuation import ComposerSegmentSuspendObservation, read_suspend_outcome_on_connection
+
+        if type(observation) is not ComposerSegmentSuspendObservation:
+            raise TypeError("suspend outcome requires its nominal writer observation")
+        with locked_session_transaction(self._engine, str(observation.running.claim.session_id), deadline=deadline) as conn:
+            return read_suspend_outcome_on_connection(conn, observation)
+
+    def read_yield_outcome(self, running: ComposerOperationRunning) -> ComposerSegmentYieldReceipt | None:
+        from elspeth.web.sessions.continuation import read_yield_outcome_on_connection
+
+        if type(running) is not ComposerOperationRunning:
+            raise TypeError("yield outcome requires the owned running custody")
+        with self._locked_transaction(running.session_operation_context.fence.session_id) as conn:
+            return read_yield_outcome_on_connection(conn, running)
+
+    def start_composer_segment(
         self,
         claim: ComposerOperationClaim,
         *,
         owner_instance_id: str,
         lease_seconds: int,
         auth_provider_type: str,
+        segment_policy: ContinuationSegmentPolicy | None = None,
+        observation: ComposerSegmentStartObservation | None = None,
+        deadline: ComposerDrainDeadline | None = None,
     ) -> SessionOperationContext:
         if type(claim) is not ComposerOperationClaim:
-            raise TypeError("claim must be ComposerOperationClaim")
+            raise TypeError("continuation start requires its nominal segment claim")
         if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
             raise ValueError("auth_provider_type must name a browser authentication provider")
         _validate_owner(owner_instance_id)
         _validate_lease_seconds(lease_seconds)
-        with self._locked_transaction(str(claim.session_id)) as conn:
-            job = get_composer_operation_for_start_on_connection(conn, claim)
-            if job.claim_owner_instance_id != owner_instance_id:
-                raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-            if job.deadline_at <= self._database_now(conn):
-                body: dict[str, JsonValue] = {
-                    "error_type": "composer_operation_deadline_expired",
-                    "detail": "The composer request waited too long to start. Please resubmit.",
-                    "timeout_seconds": (job.deadline_at - job.created_at).total_seconds(),
-                }
-                body["request_id"] = job.request_id
-                raise ComposerOperationPreconditionRefused(
-                    error=ComposerOperationError(
-                        http_status=504,
-                        failure_code="deadline_expired",
-                        error_type="composer_operation_deadline_expired",
-                        body=body,
-                        diagnostic_id=None,
-                    )
+        if observation is not None:
+            from elspeth.web.sessions.continuation import ComposerSegmentStartObservation
+
+            if (
+                type(observation) is not ComposerSegmentStartObservation
+                or observation.claim is not claim
+                or observation.context is not None
+            ):
+                raise AuditIntegrityError("segment start lost its actual fresh observation owner")
+        monotonic_before_start = time.monotonic()
+        with locked_session_transaction(self._engine, str(claim.session_id), deadline=deadline) as conn:
+            parent = conn.execute(
+                select(composer_async_operations_table.c.actor_user_id).where(
+                    composer_async_operations_table.c.session_id == str(claim.session_id),
+                    composer_async_operations_table.c.operation_id == claim.operation_id,
+                    composer_async_operations_table.c.status.in_(("queued", "running")),
                 )
+            ).one_or_none()
+            if parent is None:
+                raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+            _require_owner(conn, session_id=claim.session_id, actor_user_id=parent.actor_user_id, auth_provider_type=auth_provider_type)
+            from elspeth.web.composer.continuation_clock import size_segment
+
+            provisional, _, _ = _read_segment_start_data_on_connection(
+                conn, claim, owner_instance_id=owner_instance_id, segment_policy=segment_policy
+            )
+            size_segment(provisional.action, provisional.policy.segment)
             context = self._advance_exclusive_fence_on_connection(
                 conn,
                 session_id_text=str(claim.session_id),
                 operation_kind=SessionOperationKind.COMPOSE,
                 owner_instance_id=owner_instance_id,
                 lease_seconds=lease_seconds,
+                composer_operation_id=claim.operation_id,
             )
-            user_message_id = check_composer_operation_preconditions_on_connection(conn, job, auth_provider_type=auth_provider_type)
-            start_composer_operation_on_connection(conn, claim, context=context, user_message_id=user_message_id)
-            return context
+            if observation is not None:
+                observation.context = context
+            _, selected_start = start_segment_on_connection(
+                conn, claim, context=context, owner_instance_id=owner_instance_id, segment_policy=segment_policy
+            )
+            if selected_start != provisional:
+                raise AuditIntegrityError("segment startup DATA changed after its original retained read")
+            if observation is not None:
+                observation.policy = selected_start.policy
+                observation.hard_expires_at = monotonic_before_start + size_segment(selected_start.action, selected_start.policy.segment)
+        if observation is not None:
+            observation.committed = True
+        return context
+
+    def reconcile_composer_segment_start(
+        self, observation: ComposerSegmentStartObservation, *, deadline: ComposerDrainDeadline | None = None
+    ) -> SessionOperationContext | None:
+        """Read back the actual producer's start, never reconstruct another fence."""
+        from elspeth.web.sessions.continuation import ComposerSegmentStartObservation, _require_current_continuation_running
+        from elspeth.web.sessions.models import composer_operation_segments_table as segments
+        from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+        if type(observation) is not ComposerSegmentStartObservation:
+            raise TypeError("start reconciliation requires its actual retained producer observation")
+        claim = observation.claim
+        context = observation.context
+        if type(claim) is not ComposerOperationClaim or (
+            context is not None
+            and (
+                type(context) is not SessionOperationContext
+                or context.operation_kind is not SessionOperationKind.COMPOSE
+                or context.fence.session_id != str(claim.session_id)
+            )
+        ):
+            raise AuditIntegrityError("start reconciliation changed its original claim/context")
+        with locked_session_transaction(self._engine, str(claim.session_id), deadline=deadline) as conn:
+            history = conn.execute(
+                select(attempts).where(
+                    attempts.c.session_id == str(claim.session_id),
+                    attempts.c.operation_id == claim.operation_id,
+                    attempts.c.sequence == claim.segment_sequence,
+                    attempts.c.generation == claim.ownership_generation,
+                )
+            ).one_or_none()
+            segment = conn.execute(
+                select(segments).where(
+                    segments.c.session_id == str(claim.session_id),
+                    segments.c.operation_id == claim.operation_id,
+                    segments.c.sequence == claim.segment_sequence,
+                    segments.c.generation == claim.ownership_generation,
+                    segments.c.state.in_(("queued", "interrupted")),
+                    segments.c.claim_token == claim.claim_token,
+                )
+            ).one_or_none()
+            parent = conn.execute(
+                select(composer_async_operations_table).where(
+                    composer_async_operations_table.c.session_id == str(claim.session_id),
+                    composer_async_operations_table.c.operation_id == claim.operation_id,
+                )
+            ).one_or_none()
+            if (
+                history is None
+                and segment is not None
+                and parent is not None
+                and parent.status in ("queued", "running")
+                and parent.current_segment_sequence == claim.segment_sequence
+                and parent.ownership_generation == claim.ownership_generation
+                and parent.attempt == claim.attempt
+                and parent.checkpoint_id == segment.checkpoint_id
+            ):
+                if observation.committed:
+                    raise AuditIntegrityError("committed start lost its original attempt")
+                if context is not None:
+                    # A rolled-back candidate was issued one epoch after the
+                    # retained fence. It cannot leave its own fence/history,
+                    # nor can a later owner be mistaken for that rollback.
+                    fence = self._select_fence(conn, session_id=str(claim.session_id))
+                    candidate_history = conn.execute(
+                        select(attempts.c.session_operation_epoch).where(
+                            attempts.c.session_id == str(claim.session_id),
+                            attempts.c.session_operation_epoch == context.fence.operation_epoch,
+                        )
+                    ).one_or_none()
+                    if (
+                        fence is None
+                        or fence.operation_epoch + 1 != context.fence.operation_epoch
+                        or fence.operation_id == context.fence.operation_id
+                        or fence.lease_token == context.fence.lease_token
+                        or candidate_history is not None
+                    ):
+                        raise AuditIntegrityError("unstarted claim retains or replaced the observed start candidate")
+                observation.reconciled = True
+                return None
+            if history is not None and context is not None:
+                running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+                _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+                observation.reconciled = True
+                return context
+            raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
 
     def _admit_blob_read(
         self,
@@ -5208,6 +6080,13 @@ class _SessionOperationAuthorityRepository:
         )
         if result.rowcount != 1:
             self._raise_fence_lost(conn, context, database_now=database_now)
+
+    def _observed_lease_validity(self, conn: Connection, context: SessionOperationContext, *, database_now: datetime) -> timedelta:
+        """The live fence's remaining lease at a handoff, by the database clock (design §2.5, F11)."""
+        fence = self._select_fence(conn, session_id=context.fence.session_id)
+        if fence is None:
+            raise SessionOperationFenceLost(FenceLossReason.MISSING)
+        return _ensure_utc(fence.lease_expires_at) - database_now
 
     def _lock_fence_and_read_database_time(
         self,
@@ -5444,6 +6323,8 @@ class _SessionOperationAuthorityRepository:
         self,
         context: SessionOperationContext,
         mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> T:
         """CAS the exact context and run one bounded mutation atomically.
 
@@ -5460,6 +6341,8 @@ class _SessionOperationAuthorityRepository:
             self._compare_and_swap_on_connection(conn, context, database_now=database_now)
             if mutation is not _composer_liveness_proof:
                 require_composer_operation_mutation_on_connection(conn, context)
+            if auto_mutation is not None:
+                require_auto_mutation_on_connection(conn, context=context, ceiling=auto_mutation)
             transaction = _RepositoryMutationTransaction(
                 conn,
                 session_id=fence.session_id,
@@ -5830,18 +6713,26 @@ class _SessionOperationAuthorityRepository:
                 if released.rowcount != 1:
                     raise SessionOperationFenceLost(FenceLossReason.RELEASED)
                 return
-            result = conn.execute(
-                update(session_operation_fences_table)
-                .where(and_(*self._exact_active_predicates(context, database_now)))
-                .values(lease_expires_at=database_now, released_at=database_now)
+            self._release_fence_on_connection(conn, context, database_now=database_now)
+
+    def _release_fence_on_connection(self, conn: Connection, context: SessionOperationContext, *, database_now: datetime) -> None:
+        """Release one exact live fence inside the caller's locked transaction.
+
+        ``release`` and the continuation handover/yield share this one write,
+        so a released fence always looks the same to every claim predicate.
+        """
+        result = conn.execute(
+            update(session_operation_fences_table)
+            .where(and_(*self._exact_active_predicates(context, database_now)))
+            .values(lease_expires_at=database_now, released_at=database_now)
+        )
+        if result.rowcount != 1:
+            self._raise_fence_lost(
+                conn,
+                context,
+                database_now=database_now,
+                execution_release=context.operation_kind is SessionOperationKind.EXECUTE,
             )
-            if result.rowcount != 1:
-                self._raise_fence_lost(
-                    conn,
-                    context,
-                    database_now=database_now,
-                    execution_release=context.operation_kind is SessionOperationKind.EXECUTE,
-                )
 
     def archive_delete(self, context: SessionOperationContext) -> None:
         """Delete a parent only while its exact current archive fence is live."""

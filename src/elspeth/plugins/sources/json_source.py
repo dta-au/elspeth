@@ -184,7 +184,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:997ca99f1069c7e6"
+    source_file_hash: str | None = "sha256:3f3ae45367ec0636"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -596,34 +596,24 @@ class JSONSource(BaseSource):
             validated = self._schema_class.model_validate(normalized_row)
             validated_row = validated.to_row()
 
-            # For FLEXIBLE/OBSERVED schemas, process first valid row to lock contract
-            if self._contract_builder is not None and not self._first_valid_row_processed:
-                self._contract_builder.process_first_row(
+            builder = self._contract_builder
+            if builder is not None and not self._first_valid_row_processed:
+                # A rejected candidate may have staged declared original names.
+                # Build the first accepted contract from this row's resolution.
+                if not builder.contract.locked:
+                    builder = ContractBuilder(
+                        create_contract_from_config(self._schema_config, field_resolution=prospective_resolution.resolution_mapping)
+                    )
+                contract = builder.process_first_row(
                     validated_row,
                     prospective_resolution.resolution_mapping,
                 )
-                self.set_schema_contract(self._contract_builder.contract)
-                self._first_valid_row_processed = True
+            else:
+                contract = self.require_schema_contract()
 
             # Validate against locked contract to catch type drift on inferred fields.
             # Pydantic's extra="allow" accepts any type for extras — the contract
             # knows the inferred types from the first row and enforces them here.
-            contract = self.require_schema_contract()
-            if self._contract_builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
-                # Sparse JSON records can introduce optional fields after the
-                # first valid row. If we emit those fields, the row contract must
-                # own their original-name/type metadata before validation and
-                # audit recording.
-                contract = self._contract_builder.process_sparse_fields(
-                    validated_row,
-                    prospective_resolution.resolution_mapping,
-                )
-                self.set_schema_contract(contract)
-
-            # ContractBuilder commits inferred metadata in process_* above.
-            # Keep the matching raw-name resolution in the same transaction;
-            # a ContractFieldLimitExceeded exit reaches neither assignment.
-            self._field_resolution = prospective_resolution
             if contract.locked:
                 violations = contract.validate(validated_row)
                 if violations:
@@ -643,6 +633,14 @@ class JSONSource(BaseSource):
                         )
                     return
 
+            # Only accepted records can add inferred fields or raw aliases.
+            # The builder checks the complete field budget before mutation.
+            if builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
+                contract = builder.process_sparse_fields(validated_row, prospective_resolution.resolution_mapping)
+                self._contract_builder = builder
+                self.set_schema_contract(contract)
+                self._first_valid_row_processed = True
+            self._field_resolution = prospective_resolution
             yield SourceRow.valid(validated_row, contract=contract, source_row_index=source_row_index)
         except ContractFieldLimitExceeded as e:
             quarantined = self._record_validation_failure(

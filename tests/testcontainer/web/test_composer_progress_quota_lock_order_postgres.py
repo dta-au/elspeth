@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -13,19 +14,29 @@ import pytest
 import structlog
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import Connection, Engine, event, select, text, update
+from sqlalchemy import Connection, Engine, event, func, select, text, update
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web import async_workers
+from elspeth.web.async_workers import (
+    ProgressCleanupDeadlineExpired,
+    ProgressRequestCleanup,
+    ProgressSQLDeadlineExpired,
+    ProgressSQLInvocation,
+)
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.progress import ComposerRequestLease
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry, SessionComposerProgressAuthority
 from elspeth.web.coordination.quota_authority import TokenUsageEntry, record_token_usage_on_connection
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
+from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import identities_table, sessions_table, token_usage_ledger_table
+from elspeth.web.sessions.models import composer_inflight_requests_table, identities_table, sessions_table, token_usage_ledger_table
 from elspeth.web.sessions.routes.composer.state import router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -284,3 +295,218 @@ def test_progress_session_waiter_does_not_hold_identity_lock(progress_database: 
             mutation.result(timeout=10)
     finally:
         event.remove(reader, "before_cursor_execute", observe_session_lock)
+
+
+@pytest.mark.asyncio
+async def test_exact_progress_token_cleanup_is_admitted_during_process_drain(
+    progress_database: tuple[Engine, Engine, str],
+) -> None:
+    _writer, reader, session_id = progress_database
+    authority = SessionComposerProgressAuthority(reader, owner_instance_id="progress-drain")
+    registry = DatabaseComposerProgressRegistry(authority)
+    lease = await registry.start_request(session_id, "owner")
+    with pytest.raises(AuditIntegrityError, match="bound exact-token authority deletion"):
+        ProgressRequestCleanup(lambda _lease: None, lease)
+    try:
+        async_workers._GENERATION_UNAVAILABLE.set()
+        with pytest.raises(RequiredGenerationUnavailable):
+            await registry.finish_request(lease)
+        async_workers._GENERATION_UNAVAILABLE.clear()
+        with reader.connect() as conn:
+            assert (
+                conn.execute(
+                    select(func.count())
+                    .select_from(composer_inflight_requests_table)
+                    .where(composer_inflight_requests_table.c.request_token == lease.request_token)
+                ).scalar_one()
+                == 1
+            )
+        async_workers._INSTANCE_DRAINING.set()
+        with pytest.raises(RequiredGenerationUnavailable):
+            await async_workers.run_sync_in_worker(lambda: None)
+        await registry.finish_request(lease)
+    finally:
+        async_workers._GENERATION_UNAVAILABLE.clear()
+        async_workers._INSTANCE_DRAINING.clear()
+    with reader.connect() as conn:
+        assert (
+            conn.execute(
+                select(func.count())
+                .select_from(composer_inflight_requests_table)
+                .where(composer_inflight_requests_table.c.request_token == lease.request_token)
+            ).scalar_one()
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_stalled_progress_sql_retains_exact_generation_until_native_completion(
+    progress_database: tuple[Engine, Engine, str],
+) -> None:
+    _writer, reader, session_id = progress_database
+    authority = SessionComposerProgressAuthority(reader, owner_instance_id="progress-native")
+    lease = authority.begin_request(session_id, "owner")
+    generation = authority.bind_request(lease, "request")
+    entered, release = Event(), Event()
+    expiry = [monotonic() + 10]
+    invocation = ProgressSQLInvocation(
+        authority.publish,
+        (lease, generation, "request", ComposerProgressEvent(phase="saving", headline="Saving"), None, None, None),
+    )
+
+    def park_native_sql(_conn: Connection, _cursor: object, statement: str, _parameters: object, _context: object, _many: bool) -> None:
+        if statement.lstrip().upper().startswith("SELECT") and "sessions" in statement and "FOR UPDATE" in statement:
+            entered.set()
+            assert release.wait(10), "Progress SQL did not release its native barrier"
+
+    event.listen(reader, "before_cursor_execute", park_native_sql)
+    try:
+        publishing = asyncio.create_task(async_workers.run_progress_sql_in_worker(invocation, deadline=lambda: expiry[0]))
+        assert await asyncio.to_thread(entered.wait, 5), "Progress publisher did not enter actual SQL"
+        expiry[0] = monotonic() + 0.05
+        with pytest.raises(ProgressSQLDeadlineExpired) as caught:
+            await publishing
+        assert caught.value.invocation is invocation and caught.value.native_pending
+        custody = invocation.generation
+        assert custody is not None and custody.state == "quarantined"
+        assert invocation.future is not None and not invocation.future.done()
+        assert invocation.reservation is not None and not invocation.reservation.released
+        release.set()
+        async with asyncio.timeout(10):
+            while not invocation.late_observed or not custody.recovery_finished.is_set():
+                await asyncio.sleep(0.01)
+        assert invocation.late_outcome is None
+        assert invocation.reservation.released and custody.joined.is_set()
+        await DatabaseComposerProgressRegistry(authority).finish_request(lease)
+    finally:
+        release.set()
+        event.remove(reader, "before_cursor_execute", park_native_sql)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_progress_start_joins_late_lease_and_exact_token_cleanup(
+    progress_database: tuple[Engine, Engine, str],
+) -> None:
+    _writer, reader, session_id = progress_database
+    authority = SessionComposerProgressAuthority(reader, owner_instance_id="progress-cancelled-start")
+    registry = DatabaseComposerProgressRegistry(authority)
+    entered, release = Event(), Event()
+    starts: list[ProgressSQLInvocation] = []
+    cleanups: list[ProgressRequestCleanup] = []
+    expires_at = monotonic() + 10
+
+    def park_native_sql(_conn: Connection, _cursor: object, statement: str, _parameters: object, _context: object, _many: bool) -> None:
+        if statement.lstrip().upper().startswith("SELECT") and "sessions" in statement and "FOR UPDATE" in statement:
+            entered.set()
+            assert release.wait(10), "Cancelled Progress admission did not release its SQL barrier"
+
+    event.listen(reader, "before_cursor_execute", park_native_sql)
+    try:
+        operation = asyncio.create_task(
+            registry.start_request(
+                session_id,
+                "owner",
+                deadline=lambda: expires_at,
+                on_submission=starts.append,
+                on_cleanup=cleanups.append,
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 5), "Progress admission did not enter actual SQL"
+        operation.cancel("retained Progress cancellation")
+        await asyncio.sleep(0)
+        assert not operation.done(), "Cancellation detached the actual admission SQL"
+        release.set()
+        with pytest.raises(asyncio.CancelledError, match="retained Progress cancellation"):
+            await operation
+        assert len(starts) == len(cleanups) == 1
+        started = starts[0].late_outcome
+        assert type(started) is ComposerRequestLease and starts[0].late_observed
+        assert cleanups[0].lease is started and cleanups[0].late_observed and cleanups[0].late_outcome is None
+        with reader.connect() as conn:
+            assert (
+                conn.execute(
+                    select(func.count())
+                    .select_from(composer_inflight_requests_table)
+                    .where(composer_inflight_requests_table.c.request_token == started.request_token)
+                ).scalar_one()
+                == 0
+            )
+    finally:
+        release.set()
+        event.remove(reader, "before_cursor_execute", park_native_sql)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["late-begin", "late-cleanup"])
+async def test_progress_expiry_retains_late_token_or_cleanup_outcome(progress_database: tuple[Engine, Engine, str], kind: str) -> None:
+    _writer, reader, session_id = progress_database
+    authority = SessionComposerProgressAuthority(reader, owner_instance_id="progress-late")
+    registry = DatabaseComposerProgressRegistry(authority)
+    lease = authority.begin_request(session_id, "owner") if kind == "late-cleanup" else None
+    entered, release = Event(), Event()
+    expiry = [monotonic() + 10]
+    starts: list[ProgressSQLInvocation] = []
+    cleanups: list[ProgressRequestCleanup] = []
+
+    def park_native_sql(_conn: Connection, _cursor: object, statement: str, _parameters: object, _context: object, _many: bool) -> None:
+        if statement.lstrip().upper().startswith("SELECT") and "sessions" in statement and "FOR UPDATE" in statement:
+            entered.set()
+            assert release.wait(10), "Progress token SQL did not release its native barrier"
+
+    event.listen(reader, "before_cursor_execute", park_native_sql)
+    try:
+        if kind == "late-begin":
+            operation = asyncio.create_task(
+                registry.start_request(session_id, "owner", deadline=lambda: expiry[0], on_submission=starts.append)
+            )
+        else:
+            assert lease is not None
+            operation = asyncio.create_task(registry.finish_request(lease, deadline=lambda: expiry[0], on_cleanup=cleanups.append))
+        assert await asyncio.to_thread(entered.wait, 5), "Progress token SQL did not reach its session lock"
+        expiry[0] = monotonic() + 0.05
+        if kind == "late-begin":
+            with pytest.raises(ProgressSQLDeadlineExpired) as caught:
+                await operation
+            assert len(starts) == 1 and caught.value.invocation is starts[0] and caught.value.native_pending
+            submission = starts[0]
+        else:
+            with pytest.raises(ProgressCleanupDeadlineExpired) as caught:
+                await operation
+            assert len(cleanups) == 1 and caught.value.cleanup is cleanups[0] and caught.value.native_pending
+            submission = cleanups[0]
+        custody = submission.generation
+        assert custody is not None and custody.state == "quarantined"
+        assert submission.future is not None and not submission.future.done()
+        release.set()
+        async with asyncio.timeout(10):
+            while not submission.late_observed or not custody.recovery_finished.is_set():
+                await asyncio.sleep(0.01)
+        assert submission.reservation is not None and submission.reservation.released
+        if kind == "late-begin":
+            late_lease = submission.late_outcome
+            assert type(late_lease) is ComposerRequestLease
+            assert (late_lease.session_id, late_lease.user_id) == (session_id, "owner")
+            with reader.connect() as conn:
+                assert (
+                    conn.execute(
+                        select(func.count())
+                        .select_from(composer_inflight_requests_table)
+                        .where(composer_inflight_requests_table.c.request_token == late_lease.request_token)
+                    ).scalar_one()
+                    == 1
+                )
+            await registry.finish_request(late_lease)
+        else:
+            assert lease is not None and submission.late_outcome is None
+            with reader.connect() as conn:
+                assert (
+                    conn.execute(
+                        select(func.count())
+                        .select_from(composer_inflight_requests_table)
+                        .where(composer_inflight_requests_table.c.request_token == lease.request_token)
+                    ).scalar_one()
+                    == 0
+                )
+    finally:
+        release.set()
+        event.remove(reader, "before_cursor_execute", park_native_sql)

@@ -352,7 +352,8 @@ class TestPromoteSetPipelineArgErrorRouting:
         assert isinstance(cause, PydanticValidationError)
         assert any(err["loc"] == ("outputs", 0, "plugin") for err in cause.errors())
 
-    def test_valid_arguments_dispatch_normally(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+    @pytest.mark.parametrize("nullable_companions", [False, True], ids=("omitted", "null"))
+    def test_valid_arguments_dispatch_normally(self, tmp_path: Path, operation_scopes: ExitStack, nullable_companions: bool) -> None:
         """Functional smoke: a valid inline_blob set_pipeline materialises
         the blob and binds it as the source.
 
@@ -398,6 +399,8 @@ class TestPromoteSetPipelineArgErrorRouting:
                 }
             ],
         }
+        if nullable_companions:
+            args["source"].update(blob_id=None, blob_ids=None)
 
         result = _execute_set_pipeline(
             args,
@@ -606,7 +609,10 @@ class TestPromoteSetPipelineArgErrorRouting:
         assert source.plugin == "csv"
         assert source.options["schema"]["fields"] == ({"name": "url", "field_type": "str"},)
 
-    def test_inline_blob_llm_authored_source_records_authoring_metadata(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+    @pytest.mark.parametrize("nullable_companions", [False, True], ids=("omitted", "null"))
+    def test_inline_blob_llm_authored_source_records_authoring_metadata(
+        self, tmp_path: Path, operation_scopes: ExitStack, nullable_companions: bool
+    ) -> None:
         """LLM-authored inline source blobs must stamp source-level provenance."""
         user_message_content = "Create a tiny generated CSV for the pipeline."
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
@@ -626,6 +632,8 @@ class TestPromoteSetPipelineArgErrorRouting:
             "edges": [],
             "outputs": [],
         }
+        if nullable_companions:
+            args["source"].update(blob_id=None, blob_ids=None)
 
         result = _execute_set_pipeline(
             args,

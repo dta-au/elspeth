@@ -47,8 +47,18 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # Epoch 77 retains that semantic authority, separates container storage from
 # identity allowances, and fixes the active container policy singleton across
 # actors. Neither distinct epoch-76 predecessor is this combined contract.
+# Epoch 83 adds the V4 paid-provider policy and provider-terminal hold table.
+# Epoch-82 stores are preserved unchanged; there is no automatic upgrade.
+# Epoch 84 adds the paid_overflow effect/receipt contract. Epoch-83 stores are
+# likewise preserved and refused, not migrated or reset.
+# Epoch 85 adds the distinct paid_incomplete returned-result effect/receipt.
+# Published epoch-84 stores are preserved and refused unchanged.
+# Epoch 87 binds H-preserving recovery attempt edges to the original paid END
+# checkpoint. Epoch-86 stores are preserved and refused without migration.
+# Epoch 88 adds the original-attempt SDK terminal effect/receipt contract.
+# Epoch-87 stores are preserved and refused without migration or reset.
 # Incompatible stores require a separately reviewed compatibility disposition.
-_COORDINATION_HARD_CUT_EPOCH = 78
+_COORDINATION_HARD_CUT_EPOCH = 88
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "auth_session_families": "ix_auth_session_families_expires_at",
     "web_instances": "ix_web_instances_lease_expires_at",
@@ -60,7 +70,6 @@ _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "composer_progress_snapshots": "ix_composer_progress_snapshots_expires_at",
     "rate_limit_buckets": "ix_rate_limit_buckets_expires_at",
     "rate_limit_events": "ix_rate_limit_events_expires_at",
-    "sessions_cleanup_claims": "ix_sessions_cleanup_claims_lease_expires_at",
 }
 _COORDINATION_HARD_CUT_TABLES: frozenset[str] = frozenset({*_COORDINATION_HARD_CUT_EXPIRY_INDEXES, "run_execution_inputs"})
 

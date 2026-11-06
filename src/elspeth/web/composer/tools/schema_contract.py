@@ -591,8 +591,9 @@ def assert_upsert_node_schema_compatible(*, advertised_schema: Mapping[str, Any]
     The distinction is not static-vs-runtime, it is WHO CONSTRUCTS THE VALUE
     production hands out. `canonical_set_pipeline_schema` BUILDS a new object
     on every call — deepcopy plus `_disclose_runtime_naming_constraints` — and
-    gives it to the planner, so the artifact does not exist until run time and
-    must verify its own construction. `upsert_node`'s advertised schema is not
+    gives it to the compose-loop wire projection at module initialization, so it
+    must verify its own construction before being frozen for the wire.
+    `upsert_node`'s advertised schema is not
     built per call in any meaningful sense: `get_tool_definitions` `deep_thaw`s
     every entry from a deeply immutable module-level registry, so each call
     yields a fresh mutable copy of identical content and no production path can

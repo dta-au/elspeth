@@ -21,7 +21,6 @@ from elspeth.web.composer.state import (
     _fork_branch_reaches_sink_before_closer,
     _runtime_nodes_downstream_of_connection,
     queue_node_contract_error,
-    route_destination_facts,
 )
 
 
@@ -2826,20 +2825,16 @@ def test_gate_on_error_must_reference_declared_sink_or_discard() -> None:
     result = state.validate()
 
     assert ("node:threshold", "gate_on_error_unknown_sink") in {(entry.component, entry.error_code) for entry in result.errors}
-    assert route_destination_facts(state)["node:threshold"] == {
-        "dangling_on_error": "missing_error_sink",
-        "declared_sinks": ["high", "standard"],
-    }
 
 
 @pytest.mark.parametrize("on_error", ["missing_error_sink", "merge"])
-def test_aggregation_on_error_route_facts_match_the_unknown_sink_rule(on_error: str) -> None:
-    """An aggregation's dangling on_error ships repair facts like a transform's.
+def test_aggregation_on_error_must_reference_declared_sink(on_error: str) -> None:
+    """An aggregation's dangling on_error is an unknown sink like a transform's.
 
     No rule-9 closer relax for an aggregation: a closer-shaped value ('merge'
-    names a coalesce here) is still an unknown sink, both in the error rule
-    and in the facts, because rule 6 keeps aggregations out of every bound
-    region (elspeth-d2e3f29d10 parity with the DAG builder).
+    names a coalesce here) is still an unknown sink, because rule 6 keeps
+    aggregations out of every bound region (elspeth-d2e3f29d10 parity with
+    the DAG builder).
     """
     aggregation = NodeSpec(
         id="stats",
@@ -2885,7 +2880,6 @@ def test_aggregation_on_error_route_facts_match_the_unknown_sink_rule(on_error: 
     result = state.validate()
 
     assert ("node:stats", "aggregation_on_error_unknown_sink") in {(entry.component, entry.error_code) for entry in result.errors}
-    assert route_destination_facts(state)["node:stats"] == {"dangling_on_error": on_error, "declared_sinks": ["high"]}
 
 
 def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:

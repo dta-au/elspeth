@@ -251,6 +251,9 @@ def _build_gateway_app(
     inspect how many times (and with what bearer) the gateway's internal
     HTTP client actually hit the OAuth token endpoint / the upstream
     endpoint.
+
+    A supplied adapter is injected directly through the gateway's supported
+    in-process API; None retains its configured adapter resolution.
     """
     oauth_app = create_mock_oauth_app(client_id=_OAUTH_CLIENT_ID, client_secret=_OAUTH_CLIENT_SECRET)
     upstream_app = create_mock_upstream_app(require_bearer_prefix=require_bearer_prefix)
@@ -293,7 +296,11 @@ def _build_gateway_app(
         "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS": json.dumps({model_alias: {"target": model_target}}),
     }
     config = load_config(env)
-    app = create_app(config, adapter=adapter, upstream_client=upstream_client)
+    app = create_app(
+        config,
+        adapter=adapter,
+        upstream_client=upstream_client,
+    )
     return app, oauth_transport, upstream_transport
 
 

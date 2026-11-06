@@ -81,17 +81,17 @@ class SettledComposerOperation:
     final: httpx.Response
 
     def result(self):
-        from elspeth.web.sessions.schemas import ComposerOperationStatusResponse
+        from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
-        snapshot = ComposerOperationStatusResponse.model_validate_json(self.final.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(self.final.content, strict=True)
         if snapshot.result is None:
             raise AssertionError("Composer operation did not complete successfully")
         return snapshot.result.model_dump(mode="json")
 
     def error(self):
-        from elspeth.web.sessions.schemas import ComposerOperationStatusResponse
+        from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
-        snapshot = ComposerOperationStatusResponse.model_validate_json(self.final.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(self.final.content, strict=True)
         if snapshot.error is None:
             raise AssertionError("Composer operation did not fail")
         return snapshot.error.http_status, snapshot.error.body
@@ -100,13 +100,13 @@ class SettledComposerOperation:
 def install_composer_async_worker(
     app: FastAPI, *, concurrency: int = 4, scan_interval_seconds: float = 1.0, claim_lease_seconds: int = 30, drain_seconds: float = 10.0
 ):
-    from threading import Event
-
+    from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
     from elspeth.web.composer.progress import ComposerProgressRegistry
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
     from elspeth.web.middleware.request_id import RequestIdMiddleware
     from elspeth.web.process_recovery import ProcessRecovery
     from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+    from elspeth.web.sessions.composer_drain import ComposerDrainSignal
     from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 
     service = app.state.session_service
@@ -115,11 +115,20 @@ def install_composer_async_worker(
     limiter = app.state.rate_limiter
     if isinstance(limiter, ComposerRateLimiter):
         install_composer_rate_limiter(app, limit=limiter._limit)
+    # Production builds the authority with the validated Continuation policy
+    # (``web/app.py``); a hand-built worker fixture must carry the same one.
     authority = ComposerAsyncOperationAuthority(
-        app.state.session_engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=claim_lease_seconds
+        app.state.session_engine,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        claim_lease_seconds=claim_lease_seconds,
+        continuation_policy=continuation_policy_from_settings(app.state.settings),
     )
+    signal = ComposerDrainSignal()
     if "instance_draining" not in app.state._state:
-        app.state.instance_draining = Event()
+        app.state.instance_draining = signal.draining
+    else:
+        signal.draining = app.state.instance_draining
+    app.state.composer_drain_signal = signal
     if "process_recovery" not in app.state._state:
         app.state.process_recovery = ProcessRecovery(
             watchdog=OwnedTestProcessWatchdog(app.state.instance_draining), instance_draining=app.state.instance_draining
@@ -138,6 +147,7 @@ def install_composer_async_worker(
         owner_instance_id=service.session_operation_owner_instance_id,
         process_recovery=app.state.process_recovery,
         instance_draining=app.state.instance_draining,
+        drain_signal=signal,
     )
     app.state.composer_async_operation_authority = authority
     app.state.composer_async_worker = worker
@@ -161,9 +171,9 @@ async def submit_and_settle(client: httpx.AsyncClient, app: FastAPI, *, path: st
     accepted = await client.post(path, json=body)
     if accepted.status_code != 202:
         raise AssertionError(f"Composer admission returned {accepted.status_code}: {accepted.text}")
-    from elspeth.web.sessions.schemas import ComposerOperationAcceptedResponse, ComposerOperationStatusResponse
+    from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
-    acknowledgement = ComposerOperationAcceptedResponse.model_validate_json(accepted.content, strict=True)
+    acknowledgement = ComposerOperationSnapshot.model_validate_json(accepted.content, strict=True)
     operation_id = body["operation_id"]
     assert acknowledgement.operation_id == operation_id
     endpoint = path.rsplit("/", 1)[1]
@@ -177,7 +187,7 @@ async def submit_and_settle(client: httpx.AsyncClient, app: FastAPI, *, path: st
         terminal = await client.get(f"/api/sessions/{session_id}/operations/{operation_id}")
         if terminal.status_code != 200:
             raise AssertionError(f"Composer observation returned {terminal.status_code}: {terminal.text}")
-        snapshot = ComposerOperationStatusResponse.model_validate_json(terminal.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(terminal.content, strict=True)
         assert snapshot.operation_id == operation_id
         assert snapshot.kind == expected_kind
         if snapshot.status in ("completed", "failed"):

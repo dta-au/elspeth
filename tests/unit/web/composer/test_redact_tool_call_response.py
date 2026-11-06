@@ -191,6 +191,60 @@ def test_declarative_nested_tool_result_envelopes_scrub_external_scalars() -> No
     assert _EXTERNAL_SCALAR_CANARY not in serialized
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        "REPAIR_POLICY_UNSUPPORTED",
+        "COST_UNAVAILABLE",
+        "COST_CAP_EXCEEDED",
+        "PROVIDER_CALLS_EXHAUSTED",
+        "REQUEST_BYTES_EXHAUSTED",
+        "MALFORMED_RESPONSE",
+        "COMPLETION_TOKENS_EXCEEDED",
+        "RESPONSE_TRUNCATED",
+    ],
+)
+@pytest.mark.parametrize("outbound_call_made", [False, True])
+def test_advisor_policy_refusal_preserves_only_closed_safe_metadata(code: str, outbound_call_made: bool) -> None:
+    response = {"success": False, "status": "PROVIDER_POLICY_REFUSED", "code": code, "outbound_call_made": outbound_call_made}
+    assert redact_tool_call_response("request_advisor_hint", response, telemetry=NoopRedactionTelemetry()) == response
+
+
+@pytest.mark.parametrize("value", [1, "true", {"private": _EXTERNAL_SCALAR_CANARY}, None, [_EXTERNAL_SCALAR_CANARY]])
+def test_advisor_policy_refusal_outbound_evidence_requires_exact_bool(value: Any) -> None:
+    result = redact_tool_call_response("request_advisor_hint", {"outbound_call_made": value}, telemetry=NoopRedactionTelemetry())
+    assert result["outbound_call_made"] != value
+    assert _EXTERNAL_SCALAR_CANARY not in json.dumps(result)
+
+
+@pytest.mark.parametrize("value", ["UNKNOWN_CODE", _EXTERNAL_SCALAR_CANARY, {"private": _EXTERNAL_SCALAR_CANARY}, True])
+def test_advisor_policy_refusal_code_does_not_admit_external_values(value: Any) -> None:
+    result = redact_tool_call_response("request_advisor_hint", {"code": value}, telemetry=NoopRedactionTelemetry())
+    assert result["code"] != value
+    assert _EXTERNAL_SCALAR_CANARY not in json.dumps(result)
+
+
+def test_advisor_policy_metadata_does_not_expand_other_tools_or_sensitive_fields() -> None:
+    result = redact_tool_call_response(
+        "request_advisor_hint",
+        {
+            "code": "COST_UNAVAILABLE",
+            "outbound_call_made": True,
+            "guidance": _EXTERNAL_SCALAR_CANARY,
+            "private": _EXTERNAL_SCALAR_CANARY,
+        },
+        telemetry=NoopRedactionTelemetry(),
+    )
+    assert result["code"] == "COST_UNAVAILABLE" and result["outbound_call_made"] is True
+    assert result["guidance"] == "<redacted>"
+    assert result["_unknown_response"] == REDACTED_UNKNOWN_RESPONSE_KEY
+    assert _EXTERNAL_SCALAR_CANARY not in json.dumps(result)
+    other = redact_tool_call_response(
+        "set_metadata", {"code": "COST_UNAVAILABLE", "outbound_call_made": True}, telemetry=NoopRedactionTelemetry()
+    )
+    assert other == {"_unknown_response": REDACTED_UNKNOWN_RESPONSE_KEY}
+
+
 def test_type_driven_tool_result_accepts_and_scrubs_row_union_schema_facts() -> None:
     response = _tool_result_canary_response(success=False)
     response["validation"]["errors"][0]["row_union_schema"] = {

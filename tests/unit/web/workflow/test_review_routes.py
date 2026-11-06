@@ -26,6 +26,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.routes.workflow.reviews import create_reviews_router
 from elspeth.web.sessions.state_envelope import envelope_state_column
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 STATE = "22222222-2222-4222-8222-222222222222"
@@ -91,16 +92,18 @@ def app(closed_local_app: Any) -> Any:
         for state_id, version in ((STATE, 1), (OTHER_STATE, 2)):
             conn.execute(
                 insert(composition_states_table).values(
-                    id=state_id,
-                    session_id=SESSION,
-                    version=version,
-                    provenance="session_seed",
-                    created_at=now,
-                    sources=envelope_state_column({"source": {"plugin": "csv", "options": {"path": "in.csv"}}}),
-                    nodes=envelope_state_column([{"id": "n1", "plugin": "passthrough", "options": {}}]),
-                    edges=envelope_state_column([]),
-                    outputs=envelope_state_column([]),
-                    metadata_=envelope_state_column({"name": "demo", "description": ""}),
+                    **stamped_state_values(
+                        id=state_id,
+                        session_id=SESSION,
+                        version=version,
+                        provenance="session_seed",
+                        created_at=now,
+                        sources=envelope_state_column({"source": {"plugin": "csv", "options": {"path": "in.csv"}}}),
+                        nodes=envelope_state_column([{"id": "n1", "plugin": "passthrough", "options": {}}]),
+                        edges=envelope_state_column([]),
+                        outputs=envelope_state_column([]),
+                        metadata_=envelope_state_column({"name": "demo", "description": ""}),
+                    )
                 )
             )
     closed_local_app.app.state.review_authority = RepositoryReviewAuthority(engine)

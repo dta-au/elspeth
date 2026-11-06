@@ -70,6 +70,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     NetworkError,
     RateLimitError,
     ServerError,
+    classify_unusable_content,
     public_llm_error_category,
 )
 from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
@@ -468,15 +469,10 @@ def _validate_gateway_success_response(
     content = message["content"]
     raw_finish_reason = first_choice.get("finish_reason")
 
-    if content is None:
-        raise ContentPolicyError("Gateway returned null content (likely content-filtered upstream)")
-    if not isinstance(content, str):
+    if content is not None and not isinstance(content, str):
         raise LLMClientError(f"Gateway response content is {type(content).__name__}, expected str", retryable=False)
-    if not content.strip():
-        if raw_finish_reason == "tool_calls":
-            raise LLMClientError("Gateway returned a tool_calls response (not supported by ELSPETH)", retryable=False)
-        # finish_reason is agency-controlled data — never interpolated.
-        raise ContentPolicyError("Gateway returned empty content")
+    if content is None or not content.strip():
+        raise classify_unusable_content(content=content, raw_response=data).error
 
     raw_usage = data.get("usage")
     if usage_required and raw_usage is None:
@@ -491,6 +487,11 @@ def _validate_gateway_success_response(
                 # interpolated, even though it's "just a key name".
                 raise LLMClientError("Non-finite value in gateway usage", retryable=False)
     usage = TokenUsage.from_dict(raw_usage)
+    if usage_required and not usage.has_data:
+        raise LLMClientError(
+            "Gateway response contains no valid token counts required by this profile's required_capabilities",
+            retryable=False,
+        )
 
     finish_reason = parse_finish_reason(str(raw_finish_reason)) if raw_finish_reason is not None else None
 
@@ -592,7 +593,7 @@ class GatewayLLMProvider:
             RateLimitError: gateway ``upstream_rate_limited`` (retryable)
             ServerError: gateway ``upstream_unavailable``/``oauth_token_unavailable`` (retryable)
             NetworkError: transport failure or gateway ``upstream_timeout`` (retryable)
-            ContentPolicyError: gateway ``content_policy_rejected`` or blank content (not retryable)
+            ContentPolicyError: explicit gateway refusal or filtering of unusable content (not retryable)
             ContextLengthError: gateway ``context_length_exceeded`` (not retryable)
             LLMClientError: every other failure (not retryable)
         """

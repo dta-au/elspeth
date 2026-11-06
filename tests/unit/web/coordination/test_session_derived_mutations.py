@@ -9,6 +9,8 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import Engine, func, insert, select, text
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data, stamped_state_values, stored_default_pipeline_metadata
+from tests.helpers.run_terminal_checks import run_values
 
 from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
@@ -28,7 +30,7 @@ from elspeth.web.sessions.models import (
     run_events_table,
     runs_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation
+from elspeth.web.sessions.protocol import SessionCompositionStateCreation
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +56,7 @@ def _seed_run_and_blob(
     session_id: UUID,
     content_hash: str,
     size_bytes: int,
+    completed: bool = False,
 ) -> tuple[UUID, UUID]:
     now = datetime.now(UTC)
     state_id = uuid4()
@@ -62,40 +65,44 @@ def _seed_run_and_blob(
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id),
-                session_id=str(session_id),
-                version=1,
-                source=None,
-                sources=None,
-                nodes=None,
-                edges=None,
-                outputs=None,
-                metadata_=None,
-                is_valid=True,
-                validation_errors=None,
-                composer_meta=None,
-                created_at=now,
-                derived_from_state_id=None,
-                provenance="session_seed",
+                **stamped_state_values(
+                    id=str(state_id),
+                    session_id=str(session_id),
+                    version=1,
+                    sources=None,
+                    nodes=None,
+                    edges=None,
+                    outputs=None,
+                    metadata_=stored_default_pipeline_metadata(),
+                    is_valid=True,
+                    validation_errors=None,
+                    composer_meta=None,
+                    created_at=now,
+                    derived_from_state_id=None,
+                    provenance="session_seed",
+                )
             )
         )
         conn.execute(
             insert(runs_table).values(
-                id=str(run_id),
-                session_id=str(session_id),
-                state_id=str(state_id),
-                status="pending",
-                started_at=now,
-                finished_at=None,
-                rows_processed=0,
-                rows_succeeded=0,
-                rows_failed=0,
-                rows_routed_success=0,
-                rows_routed_failure=0,
-                rows_quarantined=0,
-                error=None,
-                landscape_run_id=None,
-                pipeline_yaml=None,
+                {
+                    **run_values(
+                        str(session_id),
+                        str(state_id),
+                        status="completed" if completed else "pending",
+                        error=None,
+                        landscape_run_id=str(uuid4()) if completed else None,
+                    ),
+                    "id": str(run_id),
+                    "started_at": now,
+                    "rows_processed": 0,
+                    "rows_succeeded": 0,
+                    "rows_failed": 0,
+                    "rows_routed_success": 0,
+                    "rows_routed_failure": 0,
+                    "rows_quarantined": 0,
+                    "pipeline_yaml": None,
+                }
             )
         )
         conn.execute(
@@ -132,7 +139,7 @@ def _state_creation(
 ) -> SessionCompositionStateCreation:
     return SessionCompositionStateCreation(
         id=uuid4(),
-        data=CompositionStateData(
+        data=composition_state_data(
             sources={"orders": {"plugin": "csv", "options": {"path": "orders.csv"}}},
             is_valid=True,
         ),
@@ -338,9 +345,7 @@ def test_derived_mutations_reject_foreign_parents_and_raw_execute(engine: Engine
 def test_compose_prepares_durable_blob_replacement_intent(engine: Engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = _create(authority, title="durable replacement")
-    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
-    with engine.begin() as conn:
-        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    _run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3, completed=True)
     context = authority.acquire(
         session_id=session.id,
         operation_kind=SessionOperationKind.COMPOSE,
@@ -374,9 +379,7 @@ def test_compose_prepares_durable_blob_replacement_intent(engine: Engine) -> Non
 def test_non_proposal_blob_mutations_cannot_inherit_proposal_retention_exclusion(engine: Engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = _create(authority, title="non-proposal retention exclusion")
-    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
-    with engine.begin() as conn:
-        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    _run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3, completed=True)
     context = authority.acquire(
         session_id=session.id,
         operation_kind=SessionOperationKind.COMPOSE,
@@ -418,9 +421,7 @@ def test_non_proposal_blob_mutations_cannot_inherit_proposal_retention_exclusion
 def test_blob_replacement_ledger_commits_exact_metadata_and_retires(engine: Engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = _create(authority, title="replacement lifecycle")
-    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
-    with engine.begin() as conn:
-        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    _run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3, completed=True)
     context = authority.acquire(
         session_id=session.id,
         operation_kind=SessionOperationKind.COMPOSE,
@@ -487,9 +488,7 @@ def test_blob_replacement_ledger_commits_exact_metadata_and_retires(engine: Engi
 def test_blob_deletion_and_replacement_ledgers_exclude_each_other_and_invocations(engine: Engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = _create(authority, title="replacement exclusion")
-    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
-    with engine.begin() as conn:
-        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    _run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3, completed=True)
     context = authority.acquire(
         session_id=session.id,
         operation_kind=SessionOperationKind.COMPOSE,
@@ -583,9 +582,7 @@ def test_ready_blob_replacement_rejects_wrong_kind_and_quota_without_row_delta(e
 
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = _create(authority, title="replace guards")
-    run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
-    with engine.begin() as conn:
-        conn.execute(runs_table.update().where(runs_table.c.id == str(run_id)).values(status="completed"))
+    _run_id, blob_id = _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3, completed=True)
 
     execute_context = _acquire(authority, session_id=session.id)
     expected = authority.mutate(execute_context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id))

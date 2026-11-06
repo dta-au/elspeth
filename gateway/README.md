@@ -170,6 +170,32 @@ gateway:
 No stage requires ELSPETH maintainers to receive your agency's live
 credentials or proprietary payloads.
 
+### Adapter trust model
+
+An adapter is trusted code, in the same way an ELSPETH plugin is. Anyone can
+author one, but it only runs because the operator wrote it or deliberately
+copied it into their derived image, much like installing a kernel module.
+The adapter executes inside the gateway process, alongside the inbound bearer,
+the OAuth client credentials and the upstream connection, and the gateway does
+not sandbox it. The returned `InvokePlan` is validated (fixed origin, bounded
+path and headers, no authority headers), but that validation constrains the
+wire request; it does not contain the adapter's code.
+
+This is a deliberate design choice, not a missing control. The gateway is a
+published reference that agencies adapt, and it is held compatible with GovAI.
+The agency that writes or installs the adapter is the same party that owns the
+credentials and runs the gateway, so there is no less-trusted party for an
+in-process boundary to defend against. In practice:
+
+- review an adapter and its dependency closure before you build it into an
+  image, exactly as you would any other code given your credentials;
+- install it from a pinned, digest-verified wheel (step 4 above), so the code
+  you reviewed is the code you run;
+- if your organisation requires adapter code to be isolated from the
+  credentials, run that code as a separate service with its own (credential-
+  free) runtime and network policy; the gateway itself does not provide that
+  isolation.
+
 ### The adapter contract
 
 Five methods are required — `descriptor`, `validate_configuration`,

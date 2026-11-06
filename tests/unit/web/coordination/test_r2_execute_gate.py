@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import insert, select, update
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 from tests.unit.web.coordination.test_durable_run_admission import _admission
 
 from elspeth.contracts.chargeable_admission import (
@@ -170,11 +171,14 @@ def test_approval_for_a_different_state_cannot_admit_this_run(engine) -> None:
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(other_state_id),
-                session_id=str(run.session_id),
-                version=2,
-                provenance="session_seed",
-                created_at=datetime.now(UTC),
+                **stamped_state_values(
+                    metadata_=stored_default_pipeline_metadata(),
+                    id=str(other_state_id),
+                    session_id=str(run.session_id),
+                    version=2,
+                    provenance="session_seed",
+                    created_at=datetime.now(UTC),
+                )
             )
         )
     _approve(engine, run, gate.binding, state_id=other_state_id)

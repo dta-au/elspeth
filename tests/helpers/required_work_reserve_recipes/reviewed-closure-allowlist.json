@@ -1,0 +1,1161 @@
+{
+ "schema": 1,
+ "description": "Reviewed allowlist for the Common supported-boundary whole-tree closure layer. Each entry is matched by (category, path, symbol) with an exact row count; a changed count surfaces every row of that key, and a dropped count is reported stale.",
+ "entries": [
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/config_loading.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/contracts/audit_evidence.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/contracts/data.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/contracts/emitted_option.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier class-check recipient is unclosed",
+   "path": "src/elspeth/contracts/emitted_option.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier stored in unclosed carrier",
+   "path": "src/elspeth/contracts/emitted_option.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/contracts/errors.py",
+   "symbol": "elspeth.contracts.tier_registry.FrameworkBugError",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/contracts/freeze.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier lazy alias escaped",
+   "path": "src/elspeth/contracts/plugin_protocols.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/contracts/prompt_guard.py",
+   "symbol": "elspeth.contracts.prompt_guard.PromptGuardContentPart",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/contracts/prompt_guard.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/contracts/runtime_val_manifest.py",
+   "symbol": "types.ModuleType",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/contracts/runtime_val_manifest.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/contracts/safe_validation_errors.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/contracts/transform_contract.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/core/dag/schema_validation.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/core/dag/schema_validation.py",
+   "symbol": null,
+   "count": 6,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/core/landscape/factory.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/core/schema_shape.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected origin mapping replaced",
+   "path": "src/elspeth/core/security/__init__.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected origin mapping replaced",
+   "path": "src/elspeth/engine/__init__.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/engine/batch_adapter.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/engine/clock.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/engine/executors/non_canonical_output.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected origin mapping replaced",
+   "path": "src/elspeth/engine/orchestrator/__init__.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/engine/orchestrator/schema_reconstruction.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/plugins/infrastructure/base.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/plugins/infrastructure/base.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/plugins/infrastructure/clients/deadline.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/plugins/infrastructure/config_base.py",
+   "symbol": "pydantic.ValidationError",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/plugins/infrastructure/templates.py",
+   "symbol": "elspeth.contracts.tier_registry.FrameworkBugError",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/plugins/infrastructure/templates.py",
+   "symbol": null,
+   "count": 4,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/plugins/infrastructure/validation.py",
+   "symbol": "pydantic.ValidationError",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier lazy alias escaped",
+   "path": "src/elspeth/plugins/sources/csv_source.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "typing supplier namespace transfer is unclosed",
+   "path": "src/elspeth/plugins/sources/llm/source.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/plugins/transforms/field_mapper.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "typing supplier namespace transfer is unclosed",
+   "path": "src/elspeth/plugins/transforms/llm/transform.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/plugins/transforms/reference_join.py",
+   "symbol": null,
+   "count": 8,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/_aws_ecs_acceptance/bedrock.py",
+   "symbol": "elspeth.web.config.settings_from_env",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/web/_aws_ecs_acceptance/contracts.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/_aws_ecs_acceptance/operator_telemetry.py",
+   "symbol": "elspeth.web.config.settings_from_env",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/_aws_ecs_acceptance/textract.py",
+   "symbol": "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/_azure_container_apps_acceptance/controller.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/application_finalizers.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/auth/session_token.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/web/catalog/knob_schema.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained enum callable capture is unclosed",
+   "path": "src/elspeth/web/catalog/service.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/web/composer/advisor_checkpoint.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier mutated through unclosed receiver",
+   "path": "src/elspeth/web/composer/advisor_checkpoint.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/web/composer/advisor_context.py",
+   "symbol": null,
+   "count": 6,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/advisor_decision.py",
+   "symbol": "elspeth.contracts.provider_rejection.SafeRequestRejection",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/composer/advisor_transcript.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_application_graph.py",
+   "symbol": "elspeth.web.composer.continuation_codec.owned_json",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_application_graph.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_application_graph.py",
+   "symbol": null,
+   "count": 6,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_batch_data.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/continuation_caches.py",
+   "symbol": "pydantic.ValidationError",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_caches.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_composition_initialization.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_composition_initialization.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected owner capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_composition_initialization.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_composition_initialization_data.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_current_evidence.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected owner capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_current_evidence.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/continuation_evidence.py",
+   "symbol": "elspeth.web.composer.protocol.RetainedOperationContext",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_evidence.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/composer/continuation_evidence_graph.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_first_runtime.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_first_runtime.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_initialization.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_iteration.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._decode_owned",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_iteration.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._dump_owned",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_live_phases.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_message_shelf.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_message_shelf.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_p4_batch.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._decode_owned",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_p4_batch.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._dump_owned",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_p4_outcome.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._decode_owned",
+   "count": 6,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_p4_outcome.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._dump_owned",
+   "count": 6,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/continuation_p4_outcome.py",
+   "symbol": "elspeth.contracts.composer_mutation.ComposerMutationRevocation",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_p4_outcome.py",
+   "symbol": null,
+   "count": 4,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/continuation_p4_state_payload.py",
+   "symbol": "elspeth.web.sessions._persist_payload.StatePayload",
+   "count": 4,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/continuation_prepared_p4.py",
+   "symbol": "elspeth.web.sessions._persist_payload.RejectionRecord",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_prompt_producers.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata escaped",
+   "path": "src/elspeth/web/composer/continuation_retention.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/web/composer/continuation_retention.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_retention.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_retention.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_runtime.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_runtime.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected owner capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_runtime.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_schema_credentials.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/continuation_terminal_p4_data.py",
+   "symbol": "elspeth.web.composer.continuation_prepared_p4.PreparedP4Value",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/web/composer/continuation_terminal_p4_data.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_title_provider.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_title_provider.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_title_values.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_tool_receipts.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._decode_owned",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/composer/continuation_tool_receipts.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._dump_owned",
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/continuation_tool_receipts.py",
+   "symbol": null,
+   "count": 4,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/continuation_tool_receipts.py",
+   "symbol": null,
+   "count": 9,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/pipeline_proposal.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/prepared_provider_input.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/prepared_provider_input.py",
+   "symbol": null,
+   "count": 7,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata escaped",
+   "path": "src/elspeth/web/composer/prompts.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained enum callable capture is unclosed",
+   "path": "src/elspeth/web/composer/protocol.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
+  },
+  {
+   "category": "typing supplier namespace transfer is unclosed",
+   "path": "src/elspeth/web/composer/protocol.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/composer/provider_cost.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/web/composer/redaction.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier class-check recipient is unclosed",
+   "path": "src/elspeth/web/composer/redaction.py",
+   "symbol": null,
+   "count": 5,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata escaped",
+   "path": "src/elspeth/web/composer/redaction.py",
+   "symbol": null,
+   "count": 7,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/web/composer/redaction.py",
+   "symbol": null,
+   "count": 4,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier lazy alias escaped",
+   "path": "src/elspeth/web/composer/reply_preparation.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected capability escaped by return/yield",
+   "path": "src/elspeth/web/composer/reply_preparation.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected module capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/reply_preparation.py",
+   "symbol": null,
+   "count": 4,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained enum callable capture is unclosed",
+   "path": "src/elspeth/web/composer/required_controls.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/state.py",
+   "symbol": "elspeth.plugins.infrastructure.manager.PluginNotFoundError",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier callable recovered",
+   "path": "src/elspeth/web/composer/state.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/web/composer/state.py",
+   "symbol": null,
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "typing supplier namespace transfer is unclosed",
+   "path": "src/elspeth/web/composer/state.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/composer/tool_batch.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/tools/_common.py",
+   "symbol": "elspeth.web.execution.schemas.ValidationResult",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/tools/_common.py",
+   "symbol": "types.MappingProxyType",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected owner capability passed to unreviewed caller",
+   "path": "src/elspeth/web/composer/tools/_generation_schema_response.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/composer/tools/sessions.py",
+   "symbol": "collections.abc.Awaitable",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier mutated through unclosed receiver",
+   "path": "src/elspeth/web/composer/tools/wire_projection.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/composer/turn_effects.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained enum callable capture is unclosed",
+   "path": "src/elspeth/web/composer/tutorial_service.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/web/composer/yaml_importer.py",
+   "symbol": null,
+   "count": 8,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/composer_watch_reads.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier class-check recipient is unclosed",
+   "path": "src/elspeth/web/config.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier metadata transferred",
+   "path": "src/elspeth/web/config.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected owner capability passed to unreviewed caller",
+   "path": "src/elspeth/web/coordination/lifecycle.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/coordination/lifecycle.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/coordination/repository.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/execution/recovery.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/execution_lease_cleanup.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/preferences/routes.py",
+   "symbol": "fastapi.APIRouter",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/required_work.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "retained supplier mutated through unclosed receiver",
+   "path": "src/elspeth/web/sessions/_auto_title.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected origin mapping replaced",
+   "path": "src/elspeth/web/sessions/_auto_title.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/sessions/composer_turn.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/sessions/composer_turn.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/content_publication.py",
+   "symbol": "elspeth.web.sessions.protocol.CompositionStateData",
+   "count": 3,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/content_publication.py",
+   "symbol": "elspeth.web.sessions.protocol.CompositionStateRecord",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/sessions/continuation_bootstrap_source.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._GATES",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/sessions/continuation_bootstrap_source.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._RECOVERY",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/sessions/continuation_bootstrap_source.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._canonical_adapter_json",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/continuation_bootstrap_source.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._GATES",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/continuation_bootstrap_source.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._RECOVERY",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected owner capability passed to unreviewed caller",
+   "path": "src/elspeth/web/sessions/continuation_bootstrap_source.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/sessions/continuation_composition_initialization.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._GATES",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/sessions/continuation_composition_initialization.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._RECOVERY",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/sessions/continuation_composition_initialization.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._canonical_adapter_json",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/continuation_composition_initialization.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._GATES",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/continuation_composition_initialization.py",
+   "symbol": "elspeth.web.composer.continuation_bootstrap._RECOVERY",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected owner capability passed to unreviewed caller",
+   "path": "src/elspeth/web/sessions/continuation_composition_initialization.py",
+   "symbol": null,
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "selected constructed instance stored outside local binding",
+   "path": "src/elspeth/web/sessions/continuation_driver.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "unknown protected attribute receiver",
+   "path": "src/elspeth/web/sessions/continuation_driver.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/sessions/continuation_p4.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._decode_owned",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "batch callback consumer unproved supplier role",
+   "path": "src/elspeth/web/sessions/continuation_p4.py",
+   "symbol": "elspeth.web.composer.continuation_tool_batch._dump_owned",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "guarded constructed instance transferred to unreviewed caller",
+   "path": "src/elspeth/web/sessions/continuation_title_provider.py",
+   "symbol": null,
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/routes/_helpers.py",
+   "symbol": "elspeth.web.execution.schemas.ValidationResult",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/routes/composer/state.py",
+   "symbol": "elspeth.plugins.infrastructure.manager.PluginNotFoundError",
+   "count": 1,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  },
+  {
+   "category": "canonical supplier first-class role is unproved",
+   "path": "src/elspeth/web/sessions/service.py",
+   "symbol": "elspeth.web.sessions.protocol.CompositionStateRecord",
+   "count": 2,
+   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
+  }
+ ]
+}

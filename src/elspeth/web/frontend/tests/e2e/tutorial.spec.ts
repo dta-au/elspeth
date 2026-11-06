@@ -139,7 +139,7 @@ async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
           chatMessage("assistant", "I built the pipeline for review."),
         ];
         fixture.composed = true;
-        await route.fulfill({ status: 202, json: { operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000 } });
+        await route.fulfill({ status: 202, json: { operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000, phase: "queued", status_revision: 1, created_at: stamp, observed_at: stamp, cancel_requested: false, segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null }, result: null, error: null } });
       } else {
         await fulfill(fixture.messages);
       }
@@ -149,7 +149,7 @@ async function installRoutes(page: Page, fixture: Fixture): Promise<void> {
       await route.fulfill({ status: 503, json: { detail: "stream unavailable" } }); return;
     }
     if (operationId !== null && path === `/api/sessions/${sid}/operations/${operationId}`) {
-      await fulfill({ operation_id: operationId, kind: "compose_message", status: "completed", poll_after_ms: 1000, cancel_requested: false, deadline_at: stamp, deadline_remaining_ms: 0, result: { message: fixture.messages[1], state, proposals: [] }, error: null }); return;
+      await fulfill({ operation_id: operationId, kind: "compose_message", status: "completed", poll_after_ms: 1000, cancel_requested: false, phase: "settled", status_revision: 2, created_at: stamp, observed_at: stamp, segment: null, result: { message: fixture.messages[1], state, proposals: [] }, error: null }); return;
     }
     if (path === `/api/sessions/${sid}/state` && method === "GET") {
       await fulfill(fixture.composed ? state : null);

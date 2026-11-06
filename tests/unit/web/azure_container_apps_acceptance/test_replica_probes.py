@@ -111,7 +111,7 @@ class _RecordedReplicas:
                 body = operation_document(self.operation_id, "session-1")
                 if self.pending_polls:
                     self.pending_polls -= 1
-                    body.update(status="running", result=None, deadline_remaining_ms=1000)
+                    body.update(status="running", phase="executing", result=None)
                 return httpx.Response(200, json=body, headers=headers)
             if request.url.path.endswith("/messages"):
                 operation_id = json.loads(request.content)["operation_id"]

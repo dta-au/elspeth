@@ -30,8 +30,6 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime
-from typing import Any
 
 import pytest
 import structlog
@@ -39,7 +37,7 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import OperationalError
 
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.helpers.session_fences import RecordingSessionOperationAuthority, seed_live_compose_context
+from tests.helpers.session_fences import seed_live_compose_context
 
 # Shared ``engine`` fixture and ``_make_session`` helper come from
 # ``tests/unit/web/conftest.py`` — the parent-package conftest that
@@ -319,59 +317,3 @@ def test_audit_fail_non_integrity_non_operational_raises_even_on_unwind_path(ser
         )
 
     assert isinstance(exc_info.value.__cause__, DataError)
-
-
-@pytest.mark.asyncio
-async def test_compose_loop_rejects_unwind_audit_failure_without_plugin_crash(
-    composer_service_with_real_sessions,
-    fake_llm_two_tool_calls,
-    result_session_id,
-) -> None:
-    """AuditOutcome(None, unwind=True) is invalid without an in-flight crash."""
-
-    from elspeth.contracts.errors import AuditIntegrityError
-    from elspeth.web.sessions._persist_payload import AuditOutcome
-    from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord
-
-    class _ImpossibleOutcomeSessionsService:
-        session_operation_authority = RecordingSessionOperationAuthority()
-        session_operation_owner_instance_id = "primacy-test-owner"
-        session_operation_lease_seconds = 60
-
-        async def get_composer_preferences(self, session_id: Any) -> ComposerSessionPreferencesRecord:
-            return ComposerSessionPreferencesRecord(
-                session_id=session_id,
-                trust_mode="auto_commit",
-                density_default="high",
-                interpretation_review_disabled=False,
-                updated_at=datetime.now(UTC),
-            )
-
-        async def get_messages(self, *_args: Any, **_kwargs: Any) -> list[Any]:
-            return []
-
-        async def list_composition_proposals(self, *_args: Any, **_kwargs: Any) -> list[Any]:
-            return []
-
-        async def list_interpretation_events(self, *_args: Any, **_kwargs: Any) -> list[Any]:
-            return []
-
-        async def persist_compose_turn_async(self, **_kwargs: Any) -> AuditOutcome:
-            return AuditOutcome(assistant_id=None, unwind_audit_failed=True, checkpoint_disposition="unavailable", checkpoint=None)
-
-        async def upsert_skill_markdown_history(self, **_kwargs: Any) -> bool:
-            # Phase 5b Task 5 follow-on (F-5c). Mock satisfies the protocol
-            # so the compose-loop entry-time upsert is a no-op.
-            return False
-
-    composer_service_with_real_sessions._sessions_service = _ImpossibleOutcomeSessionsService()
-
-    with pytest.raises(AuditIntegrityError) as exc_info:
-        await composer_service_with_real_sessions._run_one_turn_for_test(
-            llm=fake_llm_two_tool_calls,
-            session_id=result_session_id,
-        )
-
-    assert exc_info.value.failed_turn is not None
-    assert exc_info.value.failed_turn.assistant_message_id is None
-    assert exc_info.value.failed_turn.tool_calls_attempted == 2

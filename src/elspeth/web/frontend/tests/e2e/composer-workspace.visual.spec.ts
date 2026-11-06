@@ -1,6 +1,8 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { fileURLToPath } from "node:url";
 
 import { expectDialogGeometry } from "./helpers/workspace-assertions";
+import { authedContext, tokenFromStorageState } from "./helpers/api";
 import {
   deleteWorkspaceScenario,
   installWorkspaceScenario,
@@ -11,6 +13,36 @@ import { ComposerPage } from "./page-objects/composer-page";
 import { setupWorkspaceScenario } from "./helpers/workspace-setup";
 
 const FIXED_BROWSER_TIME = new Date("2026-08-11T08:00:30.000Z");
+const CHECKSUM_SCREENSHOT_STYLE_PATH = fileURLToPath(
+  new URL("./helpers/checksum-screenshot.css", import.meta.url),
+);
+
+async function assertCurrentChecksum(page: Page, sessionId: string): Promise<Locator> {
+  const token = tokenFromStorageState(await page.context().storageState());
+  const ctx = await authedContext(token);
+  try {
+    // Read the real server value independently of the rendered DOM. Fresh
+    // fixture blob paths and references are intentionally checksum-covered.
+    const response = await ctx.get(`/api/sessions/${sessionId}/state`);
+    expect(response.ok()).toBe(true);
+    const state: unknown = await response.json();
+    if (
+      typeof state !== "object" || state === null ||
+      !("session_id" in state) || state.session_id !== sessionId ||
+      !("composition_content_hash" in state) ||
+      typeof state.composition_content_hash !== "string"
+    ) {
+      throw new Error("Visual fixture requires its current session's authoritative checksum");
+    }
+    expect(state.composition_content_hash).toMatch(/^[0-9a-f]{64}$/);
+    const value = page.getByRole("region", { name: "Graph checksum" }).locator(".graph-checksum-value");
+    await expect(value).toBeVisible();
+    await expect(value, "Rendered graph checksum must match current server state").toHaveText(state.composition_content_hash);
+    return value;
+  } finally {
+    await ctx.dispose();
+  }
+}
 
 function expectedTerminalChecksStatus(scenario: WorkspaceScenario): string {
   // The Checks tab's merged worst-of status: 24 validation errors plus the
@@ -118,6 +150,34 @@ test.describe("Composer workspace visual baselines", () => {
     await page.clock.setFixedTime(FIXED_BROWSER_TIME);
   });
 
+  test("rejects a forged rendered checksum before screenshot masking", async ({ page }) => {
+    const { sessionId } = await openStableVisualScenario(
+      page,
+      "populated-long-transcript",
+      { width: 1920, height: 930 },
+      2,
+    );
+    try {
+      const value = await assertCurrentChecksum(page, sessionId);
+      const original = await value.textContent();
+      expect(original).toMatch(/^[0-9a-f]{64}$/);
+      const forged = original === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64);
+      try {
+        await value.evaluate((element, digest) => { element.textContent = digest; }, forged);
+        // A setup/API/visibility failure must not satisfy this control: only
+        // the named semantic comparison's toHaveText mismatch is accepted.
+        await expect(assertCurrentChecksum(page, sessionId)).rejects.toThrow(
+          /Rendered graph checksum must match current server state[\s\S]*toHaveText/,
+        );
+      } finally {
+        await value.evaluate((element, digest) => { element.textContent = digest; }, original);
+      }
+      await assertCurrentChecksum(page, sessionId);
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
   for (const viewport of [
     // 1920x1080 (full-screen 1080p) and 1920x930 (1080p minus browser chrome
     // and a taskbar) are the PRIMARY deployment targets. Neither was sampled
@@ -151,15 +211,20 @@ test.describe("Composer workspace visual baselines", () => {
           .locator(".react-flow__edge-text")
           .filter({ hasText: "success" });
         await expect(fractionalEdgeLabel).toHaveText("success");
+        const checksumValue = await assertCurrentChecksum(page, sessionId);
         await expect(composer.workspace()).toHaveScreenshot(
           `populated-freeform-${viewport.width}x${viewport.height}.png`,
           {
             animations: "disabled",
             caret: "hide",
+            stylePath: CHECKSUM_SCREENSHOT_STYLE_PATH,
             // React Flow centers this one word on a fractional transform.
             // Mask only that glyph raster; every surrounding pixel remains
             // an exact geometry and appearance oracle.
-            mask: [fractionalEdgeLabel],
+            // Only the per-fixture digest glyph region is volatile. Its
+            // semantic value was checked against the current server above;
+            // the checksum panel and controls remain in the geometry oracle.
+            mask: [fractionalEdgeLabel, checksumValue],
             maskColor: "#0f2d35",
           },
         );
@@ -186,6 +251,7 @@ test.describe("Composer workspace visual baselines", () => {
       await composer.collapseAuthoring().click();
       await expect(composer.restoreAuthoring()).toBeFocused();
       await settleGraphViewport(page);
+      const checksumValue = await assertCurrentChecksum(page, sessionId);
       // Mask the canvas ROOT (.react-flow — sized to the panel), never the
       // transformed .react-flow__viewport layer: after the post-collapse
       // re-fit that layer's bounding box extends over the action bar, and a
@@ -195,7 +261,8 @@ test.describe("Composer workspace visual baselines", () => {
         {
           animations: "disabled",
           caret: "hide",
-          mask: [page.locator(".react-flow")],
+          stylePath: CHECKSUM_SCREENSHOT_STYLE_PATH,
+          mask: [page.locator(".react-flow"), checksumValue],
           maskColor: "#0f2d35",
         },
       );

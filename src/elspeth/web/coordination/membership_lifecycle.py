@@ -170,8 +170,14 @@ class RegisteredWebInstanceMembership(WebInstanceMembership):
 
     async def _heartbeat_loop(self) -> None:
         consecutive_failures = 0
-        while True:
+        while not self._draining.is_set():
             await asyncio.sleep(self._interval_seconds)
+            # The process latch closes ordinary executor admission before
+            # lifespan reaches stop(). Do not start another recurrence after
+            # that latch; an already submitted heartbeat still joins and keeps
+            # its original outcome through stop().
+            if self._draining.is_set():
+                return
             try:
                 await run_sync_in_worker(self._authority.heartbeat, self._identity.instance_id, lease_seconds=self._lease_seconds)
                 consecutive_failures = 0

@@ -25,7 +25,14 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.engine import Connection, Row
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from elspeth.contracts.blobs import BlobAtomicDeletionObligation, BlobCreationObligation, BlobDeletionPlan, blob_record_snapshot_hash
+from elspeth.contracts.blobs import (
+    BlobAtomicDeletionObligation,
+    BlobCreationObligation,
+    BlobDeletionPlan,
+    VerifiedBlobPrefix,
+    blob_record_snapshot_hash,
+)
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -246,7 +253,6 @@ _ACTIVE_RUN_COMPOSITION_COLUMNS = (
     composition_states_table.c.id.label("state_id"),
     composition_states_table.c.session_id.label("state_session_id"),
     composition_states_table.c.version.label("state_version"),
-    composition_states_table.c.source,
     composition_states_table.c.sources,
     composition_states_table.c.nodes,
     composition_states_table.c.edges,
@@ -276,7 +282,6 @@ def _active_run_pipeline_dict(active_run: Any) -> LoweredPipelineDocument:
             id=_uuid_from_db(active_run.state_id),
             session_id=_uuid_from_db(active_run.state_session_id),
             version=active_run.state_version,
-            source=unwrap_state_column(active_run.source),
             sources=unwrap_state_column(active_run.sources),
             nodes=unwrap_state_column(active_run.nodes),
             edges=unwrap_state_column(active_run.edges),
@@ -1485,6 +1490,7 @@ def _persist_blob_content(
     session_operation_authority: SessionOperationAuthority | None = None,
     session_operation_context: SessionOperationContext | None = None,
     quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+    auto_mutation: ComposerMutationCeiling | None = None,
 ) -> Row[Any] | BlobRecord:
     """Persist one blob through committed reservation, file, and ready phases."""
     if type(blob_id) is not UUID:
@@ -1601,6 +1607,7 @@ def _persist_blob_content(
             content,
             session_operation_context,
             idempotent=idempotent,
+            auto_mutation=auto_mutation,
         )
     if fork_write_fence is None:
         raise AuditIntegrityError("blob persistence requires exact session-operation or composite fork authority")
@@ -2697,6 +2704,7 @@ class BlobServiceImpl:
         session_operation_context: SessionOperationContext,
         *,
         idempotent: bool,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> BlobRecord:
         """Share exact-context reservation, publication and commit recovery."""
         _require_blob_operation_context(session_operation_context, allowed_kinds=_CREATE_BLOB_OPERATION_KINDS)
@@ -2733,6 +2741,7 @@ class BlobServiceImpl:
                             max_storage_per_session=self._max_storage_per_session,
                             idempotent=idempotent,
                         ),
+                        auto_mutation=auto_mutation,
                     )
                     reserved = self._fenced_blob_record(blob_id, session_operation_context)
                     if reserved.status == "ready" and not storage.exists():
@@ -2752,6 +2761,7 @@ class BlobServiceImpl:
                         lambda transaction: transaction.blobs.mark_blob_ready(
                             blob_id=blob_id,
                         ),
+                        auto_mutation=auto_mutation,
                     )
                 except BaseException as primary_exc:
                     reconciled = self._session_operation_authority.reconcile_blob_reservation(
@@ -3027,6 +3037,7 @@ class BlobServiceImpl:
         context: SessionOperationContext,
         plan: BlobDeletionPlan,
         accepting_proposal_id: UUID | None = None,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> BlobDeletionPlan:
         storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
         self._session_operation_authority.compare_and_swap(context)
@@ -3049,6 +3060,7 @@ class BlobServiceImpl:
                     plan=plan,
                     accepting_proposal_id=accepting_proposal_id,
                 ),
+                auto_mutation=auto_mutation,
             )
         except Exception as exc:
             observed = self._observe_after_uncertain_deletion_mutation(
@@ -3121,6 +3133,7 @@ class BlobServiceImpl:
         blob_id: UUID,
         context: SessionOperationContext,
         accepting_proposal_id: UUID | None = None,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> None:
         """Drive one idempotent deletion state machine without holding DB over FS."""
         from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
@@ -3208,6 +3221,7 @@ class BlobServiceImpl:
                         expected_file_hash=expected_file_hash,
                         accepting_proposal_id=accepting_proposal_id,
                     ),
+                    auto_mutation=auto_mutation,
                 )
             except Exception as exc:
                 observed = self._observe_after_uncertain_deletion_mutation(
@@ -3226,7 +3240,9 @@ class BlobServiceImpl:
                 plan = self._stage_blob_deletion_plan(context=context, plan=plan)
                 continue
             if plan.phase == "staged":
-                plan = self._commit_blob_deletion_plan(context=context, plan=plan, accepting_proposal_id=accepting_proposal_id)
+                plan = self._commit_blob_deletion_plan(
+                    context=context, plan=plan, accepting_proposal_id=accepting_proposal_id, auto_mutation=auto_mutation
+                )
                 continue
             if plan.phase == "purge_pending":
                 self._purge_blob_deletion_plan(context=context, plan=plan)
@@ -3365,64 +3381,83 @@ class BlobServiceImpl:
         source inspection's 8 KiB peek) verify a full-content hash without
         materializing a 100 MiB upload to do it.
         """
-        _require_blob_operation_context(session_operation_context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
+        verified = await self._run_sync(
+            lambda: self.read_blob_content_prefix_verified_sync(blob_id, session_operation_context, prefix_bytes=prefix_bytes)
+        )
+        return verified.prefix, verified.verified_content_hash, verified.total_size_bytes
+
+    def read_blob_content_prefix_verified_sync(
+        self,
+        blob_id: UUID,
+        context: SessionOperationContext,
+        *,
+        prefix_bytes: int,
+    ) -> VerifiedBlobPrefix:
+        """Stream one fenced blob version, verify its full hash, keep only a prefix.
+
+        The synchronous body of :meth:`read_blob_content_prefix_verified`, for
+        callers already on a worker thread (source inspection). It takes the
+        same custody lock, deletion and storage-version reconciliation and
+        post-read fenced comparison as every content read, and returns the
+        exact record observed with the bytes.
+        """
+        _require_blob_operation_context(context, allowed_kinds=_READ_BLOB_OPERATION_KINDS)
         if prefix_bytes < 1:
             raise ValueError("prefix_bytes must be >= 1")
         blob_id_str = str(blob_id)
+        with self._locked_blob_row_for_read(blob_id_str, context) as row:
+            # Lifecycle guard — only ready blobs have finalized content
+            if row.status != "ready":
+                raise BlobStateError(
+                    blob_id_str,
+                    message=f"Cannot read blob {blob_id_str} — status is '{row.status}', expected 'ready'",
+                )
 
-        def _sync() -> tuple[bytes, str, int]:
-            with self._locked_blob_row_for_read(blob_id_str, session_operation_context) as row:
-                # Lifecycle guard — only ready blobs have finalized content
-                if row.status != "ready":
-                    raise BlobStateError(
-                        blob_id_str,
-                        message=f"Cannot read blob {blob_id_str} — status is '{row.status}', expected 'ready'",
-                    )
+            storage = Path(row.storage_path)
+            if not storage.exists():
+                raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
 
-                storage = Path(row.storage_path)
-                if not storage.exists():
-                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path)
+            # Integrity verification — Tier 1: our data must be pristine.
+            # A ready blob must always have a content_hash — it is set
+            # by create_blob() and required by the authority facet's
+            # mark_run_output_blob_ready when transitioning to ready.
+            # NULL here is a DB anomaly.
+            if row.content_hash is None:
+                raise AuditIntegrityError(f"Tier 1: ready blob {blob_id_str} has NULL content_hash — DB integrity anomaly, cannot verify")
 
-                # Integrity verification — Tier 1: our data must be pristine.
-                # A ready blob must always have a content_hash — it is set
-                # by create_blob() and required by the authority facet's
-                # mark_run_output_blob_ready when transitioning to ready.
-                # NULL here is a DB anomaly.
-                if row.content_hash is None:
-                    raise AuditIntegrityError(
-                        f"Tier 1: ready blob {blob_id_str} has NULL content_hash — DB integrity anomaly, cannot verify"
-                    )
+            digest = hashlib.sha256()
+            prefix = bytearray()
+            total_bytes = 0
+            try:
+                with storage.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(_STREAM_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        total_bytes += len(chunk)
+                        if len(prefix) < prefix_bytes:
+                            prefix.extend(chunk[: prefix_bytes - len(prefix)])
+            except OSError as exc:
+                # Raced deletion between the existence guard and the open
+                # (ENOENT), or a sibling replica's delete revoking the
+                # inode under the open handle on NFS (ESTALE): typed as
+                # missing content; any other errno propagates
+                # (elspeth-632373963d).
+                if exc.errno in _RACED_DELETION_ERRNOS:
+                    raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
+                raise
 
-                digest = hashlib.sha256()
-                prefix = bytearray()
-                total_bytes = 0
-                try:
-                    with storage.open("rb") as handle:
-                        while True:
-                            chunk = handle.read(_STREAM_CHUNK_BYTES)
-                            if not chunk:
-                                break
-                            digest.update(chunk)
-                            total_bytes += len(chunk)
-                            if len(prefix) < prefix_bytes:
-                                prefix.extend(chunk[: prefix_bytes - len(prefix)])
-                except OSError as exc:
-                    # Raced deletion between the existence guard and the open
-                    # (ENOENT), or a sibling replica's delete revoking the
-                    # inode under the open handle on NFS (ESTALE): typed as
-                    # missing content; any other errno propagates
-                    # (elspeth-632373963d).
-                    if exc.errno in _RACED_DELETION_ERRNOS:
-                        raise BlobContentMissingError(blob_id_str, storage_path=row.storage_path) from None
-                    raise
+            actual = digest.hexdigest()
+            if not hmac.compare_digest(actual, row.content_hash):
+                raise BlobIntegrityError(blob_id_str, expected=row.content_hash, actual=actual)
 
-                actual = digest.hexdigest()
-                if not hmac.compare_digest(actual, row.content_hash):
-                    raise BlobIntegrityError(blob_id_str, expected=row.content_hash, actual=actual)
-
-            return bytes(prefix[:prefix_bytes]), actual, total_bytes
-
-        return await self._run_sync(_sync)
+        return VerifiedBlobPrefix(
+            record=row,
+            prefix=bytes(prefix[:prefix_bytes]),
+            verified_content_hash=actual,
+            total_size_bytes=total_bytes,
+        )
 
     async def read_blob_preview(
         self,

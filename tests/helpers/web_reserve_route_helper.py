@@ -9,6 +9,10 @@ import types
 
 HELPERS = "src/elspeth/web/sessions/routes/_helpers.py"
 TURN = "src/elspeth/web/sessions/composer_turn.py"
+# 41fcaafce moved the second runtime-preflight caller out of _run_composer_turn
+# into settle_composer_result; both owners together keep the four callers.
+FINALIZATION = "src/elspeth/web/sessions/composer_finalization.py"
+CALLER_OWNERS = {TURN: "_run_composer_turn", FINALIZATION: "settle_composer_result"}
 HANDLERS = ("_handle_convergence_error", "_handle_plugin_crash", "_handle_runtime_preflight_failure")
 
 
@@ -87,15 +91,23 @@ def code_for(tree, owners):
 
 
 GRAMMARS = {
-    "_handle_convergence_error": "8032fa7144f05421b9d59d93be654a0e800bb6090b8307f374c34296c99f45be",
-    "_handle_plugin_crash": "c0345259ed743d014249dfc660177a0f614e7d48572bd85107b2dbf1cc33aa25",
-    "_handle_runtime_preflight_failure": "fd3578fce1748f626a5c0e09fab7f7f60f15c1e8ee0e8c950f580c378f553865",
-    "_run_composer_turn": "8a2354fd86180d228a8f870d8f91b04e1a1aec67778bec0d2a1337a0f340ae57",
+    # Reviewed 2026-11-01 (fix-crash-capture): each handler saves its capture
+    # only when it re-projects the durable head; _handle_plugin_crash also
+    # drains a P4 unwind carrier's rolled-back suffix.
+    "_handle_convergence_error": "6ccf500918a5775e8e98e1e1545d99ef01f1039e237a5c6df9aca381054fd70c",
+    "_handle_plugin_crash": "248e52ed5296fdff3757dfc93002093368fea979ae6bbcb682ee66fd77535b2c",
+    "_handle_runtime_preflight_failure": "f2a2910daf52855281b32006f9a3663ca28489ddd9a6ee4b74aa8ca64ca4503e",
+    "_run_composer_turn": "7e4bc316e58c1c2c8abfef2c7a0038fa364313d7c9eeb4e040418547292b422c",
+    # Reviewed 2026-11-01: the moved runtime-preflight caller (41fcaafce),
+    # then the verified-checkpoint refusal before the strict-lane save
+    # (the head verification read, fix-autocommit).
+    "settle_composer_result": "743ca996546636bf24704d96b43c9181831aa652935ba448da58bfdc970e9eee",
 }
 IMPORT_GRAMMARS = {
     "src/elspeth/web/sessions/routes/_helpers.py|elspeth.web.required_work": "24c410aedf7d87072b30e0483a70191b9729d6d67166d1ef15b55ff0013b5199",
     "src/elspeth/web/sessions/composer_turn.py|elspeth.web.required_work": "4572b3179e9539f528774bd9f251888fa3c9f2531b5be474427d6339e9ecc32a",
-    "src/elspeth/web/sessions/composer_turn.py|elspeth.web.sessions.routes._helpers": "901b019d65c5e8523ee5ff9afdff54fe99f485ed5edc01283867fac310cf4ba6",
+    "src/elspeth/web/sessions/composer_turn.py|elspeth.web.sessions.routes._helpers": "d268151286df897e75d8d59b028911b35c6908ad1e36c42c51fba6685d944b4a",
+    "src/elspeth/web/sessions/composer_finalization.py|elspeth.web.sessions.routes._helpers": "1ea12685840f2b0be5c91fd365f0fd1de0fb1c488e2332316968d31fd1054e5c",
 }
 
 
@@ -139,11 +151,11 @@ def _route1_local_contracts(units):
     ]
     units = list(units)
     index = {str(unit.path): unit for unit in units}
-    if len(index) != len(units) or not all(path in index for path in (HELPERS, TURN)):
+    if len(index) != len(units) or not all(path in index for path in (HELPERS, *CALLER_OWNERS)):
         return (["route helpers: missing/duplicate SourceUnit"], receipt)
     failures = []
     selected = {}
-    for path in (HELPERS, TURN):
+    for path in (HELPERS, *CALLER_OWNERS):
         tree = index[path].tree
         if not isinstance(tree, ast.Module):
             failures.append("route helpers: unsupported AST " + path)
@@ -153,9 +165,11 @@ def _route1_local_contracts(units):
             for n in tree.body
         ):
             failures.append("route helpers: annotation execution mode changed " + path)
-        modules = (
-            ("elspeth.web.required_work",) if path == HELPERS else ("elspeth.web.required_work", "elspeth.web.sessions.routes._helpers")
-        )
+        modules = {
+            HELPERS: ("elspeth.web.required_work",),
+            TURN: ("elspeth.web.required_work", "elspeth.web.sessions.routes._helpers"),
+            FINALIZATION: ("elspeth.web.sessions.routes._helpers",),
+        }[path]
         for module in modules:
             imports = [n for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == module]
             digest = (
@@ -167,7 +181,7 @@ def _route1_local_contracts(units):
                 failures.append("route helpers: canonical import binding changed " + module)
             else:
                 receipt["import_nodes"].append((path, id(imports[0])))
-        names = HANDLERS if path == HELPERS else ("_run_composer_turn",)
+        names = HANDLERS if path == HELPERS else (CALLER_OWNERS[path],)
         for name in names:
             function, owners = find(tree, name)
             if not isinstance(function, ast.AsyncFunctionDef):
@@ -221,36 +235,65 @@ def _route1_local_contracts(units):
         receipt["reserve_calls"].append((HELPERS, id(calls[0])))
         receipt["sql_keyword_values"].append((HELPERS, id(sql_values[0])))
         receipt["return_nodes"].append((HELPERS, id(returns[0])))
-    turn = selected["_run_composer_turn"]
-    calls = [n for n in ast.walk(turn) if isinstance(n, ast.Call) and chain(n.func) in [(name,) for name in HANDLERS]]
-    parents = {id(child): parent for parent in ast.walk(turn) for child in ast.iter_child_nodes(parent)}
-    for call in calls:
-        wrapper = parents.get(id(call))
-        awaited = parents.get(id(wrapper))
-        if (
-            not isinstance(wrapper, ast.Call)
-            or chain(wrapper.func) != ("_required_audit",)
-            or len(wrapper.args) != 2
-            or (chain(wrapper.args[0]) != ("observation",))
-            or (wrapper.args[1] is not call)
-            or wrapper.keywords
-            or (not isinstance(awaited, ast.Await))
-            or (awaited.value is not wrapper)
-        ):
-            return (["route helpers: exact required audit wrapper transfer changed"], receipt)
-    if len(calls) != 4 or [sum(chain(c.func) == (name,) for c in calls) for name in HANDLERS] != [1, 1, 2]:
+    calls = []
+    for path, owner_name in CALLER_OWNERS.items():
+        owner = selected[owner_name]
+        owned = [n for n in ast.walk(owner) if isinstance(n, ast.Call) and chain(n.func) in [(name,) for name in HANDLERS]]
+        parents = {id(child): parent for parent in ast.walk(owner) for child in ast.iter_child_nodes(parent)}
+        for call in owned:
+            wrapper = parents.get(id(call))
+            awaited = parents.get(id(wrapper))
+            if (
+                not isinstance(wrapper, ast.Call)
+                or chain(wrapper.func) != ("_required_audit",)
+                or len(wrapper.args) != 2
+                or (chain(wrapper.args[0]) != ("observation",))
+                or (wrapper.args[1] is not call)
+                or wrapper.keywords
+                or (not isinstance(awaited, ast.Await))
+                or (awaited.value is not wrapper)
+            ):
+                return (["route helpers: exact required audit wrapper transfer changed"], receipt)
+        calls.extend((path, call) for call in owned)
+    if len(calls) != 4 or [sum(chain(c.func) == (name,) for _path, c in calls) for name in HANDLERS] != [1, 1, 2]:
         return (["route helpers: four exact awaited callers changed"], receipt)
-    for call in calls:
+    for path, call in calls:
         values = [k.value for k in call.keywords if k.arg == "required_work"]
         if len(values) != 1 or chain(values[0]) != ("required_work",):
             return (["route helpers: caller coordinator keyword changed"], receipt)
-        receipt["caller_calls"].append((TURN, id(call)))
-    stores = [
-        n for n in ast.walk(turn) if isinstance(n, ast.Assign) and len(n.targets) == 1 and (chain(n.targets[0]) == ("required_work",))
+        receipt["caller_calls"].append((path, id(call)))
+    # The moved owner takes its coordinator from its inputs; its own guard
+    # refuses unless that is the observation's coordinator (grammar-sealed).
+    expected_stores = {
+        TURN: [("lease", "required_work"), ("observation", "required_work")],
+        FINALIZATION: [("inputs", "required_work")],
+    }
+    stores = []
+    for path, owner_name in CALLER_OWNERS.items():
+        owned = [
+            n
+            for n in ast.walk(selected[owner_name])
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and (chain(n.targets[0]) == ("required_work",))
+        ]
+        if sorted(chain(n.value) for n in owned) != expected_stores[path]:
+            return (["route helpers: coordinator producer stores changed"], receipt)
+        stores.extend((path, id(n)) for n in owned)
+    receipt["producer_stores"] = stores
+    # settle_composer_result binds the same _required_audit wrapper through a
+    # function-local import of the turn module.
+    local = [
+        n
+        for n in ast.walk(selected["settle_composer_result"])
+        if isinstance(n, ast.ImportFrom) and any(alias.name == "_required_audit" for alias in n.names)
     ]
-    if sorted(chain(n.value) for n in stores) != [("lease", "required_work"), ("observation", "required_work")]:
-        return (["route helpers: coordinator producer stores changed"], receipt)
-    receipt["producer_stores"] = [(TURN, id(n)) for n in stores]
+    if (
+        len(local) != 1
+        or local[0].level
+        or local[0].module != "elspeth.web.sessions.composer_turn"
+        or any(alias.asname is not None for alias in local[0].names if alias.name == "_required_audit")
+    ):
+        return (["route helpers: moved caller wrapper import changed"], receipt)
+    receipt["import_nodes"].append((FINALIZATION, id(local[0])))
     return ([], receipt)
 
 

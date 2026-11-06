@@ -39,6 +39,7 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.composer_app_services import ComposerAppServices
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+from elspeth.web.sessions.continuation_publication_projection import PipelinePublicationReplayData
 from elspeth.web.sessions.graph_recovery import CompositionGraphRead
 from elspeth.web.sessions.pipeline_finish_once import (
     ComposerPipelineBusinessReturned,
@@ -97,6 +98,7 @@ class _DeferredCancellationState:
 class PipelineRouteSettlement:
     settlement: PipelineProposalSettlementResult
     validation: ValidationSummary | None
+    publication_replay: PipelinePublicationReplayData | None = None
 
 
 async def _await_with_deferred_cancellation[T](
@@ -383,7 +385,11 @@ async def _settle_pipeline_proposal_under_compose_lock(
                 or replayed.state.session_id != proposal.session_id
             ):
                 raise AuditIntegrityError("Pipeline replay returned inconsistent committed evidence")
-            outcome = PipelineRouteSettlement(settlement=replayed, validation=None)
+            outcome = PipelineRouteSettlement(
+                settlement=replayed,
+                validation=None,
+                publication_replay=PipelinePublicationReplayData(proposal.id, draft_hash, prepared_interpretations),
+            )
         except BaseException as error:
             projection_ticket.complete_owned(error)
             raise
@@ -643,7 +649,11 @@ async def _settle_pipeline_proposal_under_compose_lock(
             raise
         publication_projection.complete_owned()
         cancellation_state.raise_if_requested()
-        return PipelineRouteSettlement(settlement=settled, validation=validation)
+        return PipelineRouteSettlement(
+            settlement=settled,
+            validation=validation,
+            publication_replay=PipelinePublicationReplayData(proposal.id, draft_hash, prepared_interpretations),
+        )
     if isinstance(handoff, (ComposerPipelineRevocationCompleted, ComposerPipelineRaised)):
         if handoff.publication_projection_disposition is not handoff.publication_projection_unused.disposition:
             raise AuditIntegrityError("Pipeline publication unused disposition disagrees with its receipt")

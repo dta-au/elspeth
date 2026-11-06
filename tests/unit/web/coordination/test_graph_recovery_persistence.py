@@ -1,15 +1,18 @@
 """Transactional recovery proofs with real session storage and no providers."""
 
 from dataclasses import replace
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, select, text, update
-from tests.unit.web.coordination.test_composer_operation_authority import response, start
+from tests.unit.web.coordination.test_composer_operation_authority import _ingress, response, start
 
+from elspeth.contracts.composer_content import ContentPublication
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
 from elspeth.web.composer.state import PipelineMetadata
 from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite
+from elspeth.web.sessions.content_publication import read_content_publication, storage_content_hash
 from elspeth.web.sessions.graph_recovery import checkpoint_data, empty_recovery_state
 from elspeth.web.sessions.models import chat_messages_table, composition_graph_parks_table, composition_states_table
 from elspeth.web.sessions.protocol import StaleComposeStateError
@@ -20,17 +23,8 @@ pytest_plugins = ["tests.unit.web.coordination.test_composer_operation_authority
 
 async def begin(store, state_id=None):
     _engine, _repo, _authority, service, sid = store
-    record, running = start(store, SendMessageRequest(operation_id=str(uuid4()), content="Recover and discuss", state_id=state_id))
-    await service.add_message_with_transcript(
-        sid,
-        "user",
-        "Recover and discuss",
-        operation_id=UUID(record.operation_id),
-        requested_state_id=state_id,
-        writer_principal="route_user_message",
-        session_operation_context=running.session_operation_context,
-        running=running,
-    )
+    _record, running = start(store, SendMessageRequest(operation_id=str(uuid4()), content="Recover and discuss", state_id=state_id))
+    await _ingress(store, running)
     admission = await service.load_graph_recovery_context(
         sid,
         turn_start_state_id=state_id,
@@ -269,11 +263,18 @@ async def test_safe_checkpoint_skips_lossy_unknown_graph_fields(operation_store)
     await finish(operation_store, running, settlement)
     restored = await service.get_current_state(sid)
     assert restored is not None and restored.version == 3 and not restored.is_valid
-    assert restored.composer_meta is None and restored.derived_from_state_id == good.id
+    assert restored.derived_from_state_id == good.id
+    assert restored.id == settlement.state_id
+    publication = ContentPublication(sid, restored.id, restored.version, storage_content_hash(restored))
+    assert read_content_publication(restored) == publication
+    assert deep_thaw(restored.composer_meta) == {"content_publication": publication.to_payload()}
 
 
 @pytest.mark.asyncio
-async def test_malformed_gate_metadata_is_quarantined(operation_store):
+async def test_unsupported_gate_envelope_refuses_recovery_as_integrity_failure(operation_store):
+    """Control: swallow the envelope refusal and quarantine the head again -> red."""
+    from elspeth.contracts.errors import AuditIntegrityError
+
     engine, _repo, _authority, service, sid = operation_store
     running, _admission = await begin(operation_store)
     saved = await service.save_composition_state(
@@ -292,15 +293,17 @@ async def test_malformed_gate_metadata_is_quarantined(operation_store):
         session_operation_context=running.session_operation_context,
     )
     assert admission.context.malformed_head and admission.record is None
-    settlement = await service.prepare_graph_recovery(
-        sid,
-        context=admission.context,
-        intent=GraphRecoveryIntent("reset_to_safe_checkpoint", "Let's discuss.", None, "recover-7"),
-        session_operation_context=running.session_operation_context,
-    )
-    assert settlement.target_state_id == saved.id and settlement.malformed_head
-    terminal = await finish(operation_store, running, settlement)
-    assert "historical row was preserved" in terminal.result_json
+    with pytest.raises(AuditIntegrityError, match="envelope version 999 is not supported"):
+        await service.prepare_graph_recovery(
+            sid,
+            context=admission.context,
+            intent=GraphRecoveryIntent("reset_to_safe_checkpoint", "Let's discuss.", None, "recover-7"),
+            session_operation_context=running.session_operation_context,
+        )
+    with engine.connect() as conn:
+        assert conn.execute(
+            select(composition_states_table.c.composer_meta).where(composition_states_table.c.id == str(saved.id))
+        ).scalar_one() == {"_version": 999}
 
 
 @pytest.mark.asyncio
@@ -369,4 +372,8 @@ async def test_explicit_restore_uses_parked_identity_across_turns(operation_stor
     await finish(operation_store, running, restore)
     result = await service.get_current_state(sid)
     assert result.version == 3 and result.metadata_["name"] == "Parked draft"
-    assert not result.is_valid and result.composer_meta is None
+    assert not result.is_valid
+    assert result.id == restore.state_id
+    publication = ContentPublication(sid, result.id, result.version, storage_content_hash(result))
+    assert read_content_publication(result) == publication
+    assert deep_thaw(result.composer_meta) == {"content_publication": publication.to_payload()}

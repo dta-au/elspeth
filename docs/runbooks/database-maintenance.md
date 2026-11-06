@@ -15,7 +15,9 @@ ELSPETH's audit evidence.
 
 ## Before Any Maintenance
 
-1. Stop active writers or confirm the target database is a restored copy.
+1. Stop active writers and prevent new starts or automatic restarts for the
+   maintenance interval. A restored database must use an isolated payload copy
+   rather than the live payload store.
 2. Back up the database and payload store.
 3. Confirm legal/compliance retention requirements.
 4. Record any accepted audit limitation before deleting evidence.
@@ -75,6 +77,18 @@ psql -d elspeth -c "
 Use the maintained `elspeth purge` command for payload retention. Do not delete
 payload files with `find -delete`; the purge command discovers references from
 Landscape and updates reproducibility grades where applicable.
+
+Payload purge is offline-only. Stop **every** writer using the payload store.
+Maintain that exclusion from reference selection through any confirmation prompt,
+deletion and grade updates.
+The CLI and `PurgeManager` do not acquire maintenance exclusion. `--yes` only skips
+confirmation; a dry-run is advisory and must not be reused as deletion authority.
+After stopping writers, run the command again to select the eligible payloads.
+
+All references to the payload namespace must belong to the selected Landscape.
+Purging a store shared by independent Landscape databases is unsupported even
+with every writer stopped: the command cannot protect references it cannot query.
+Use an isolated corresponding database and payload copy for copy-based maintenance.
 
 Dry-run:
 

@@ -24,12 +24,12 @@ from sqlalchemy.exc import IntegrityError
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.postgres_target import postgres_test_target
 from tests.testcontainer.web.test_session_operation_fence_postgres import _register_instance
-from tests.unit.web.sessions.test_service import _admit_durable_ingress, _durable_ingress
+from tests.unit.web.sessions.test_service import _RUNNING, _admit_durable_ingress, _durable_ingress
 
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, message_ingress_receipts_table, sessions_table
-from elspeth.web.sessions.protocol import MessageIngressFresh
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -109,7 +109,7 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(result, MessageIngressFresh)
+        assert isinstance(result, ContinuationIngressCheckpoint)
         record, transcript = result.message, result.transcript
 
         # The REPEATABLE READ snapshot still cannot see the committed
@@ -155,25 +155,17 @@ async def test_postgres_two_service_instances_accept_one_receipt_for_same_key_an
         admissions = list(pool.map(admit_one, (postgres_service, second)))
     assert sorted(item[2] for item in admissions) == [False, True]
     assert admissions[0][1].operation_id == admissions[1][1].operation_id
-    authority = admissions[0][0]
-    (claim,) = authority.claim_next(limit=1)
-    context = postgres_service.session_operation_authority.start_composer_async_operation(
-        claim, owner_instance_id=postgres_service.session_operation_owner_instance_id, lease_seconds=30, auth_provider_type="local"
-    )
-    from elspeth.web.sessions.composer_operations import ComposerOperationRunning
-
     try:
-        fresh = await postgres_service.add_message_with_transcript(
+        fresh = await _durable_ingress(
+            postgres_service,
             session.id,
             "user",
             "one admission",
             operation_id=request_id,
             requested_state_id=None,
             writer_principal="route_user_message",
-            session_operation_context=context,
-            running=ComposerOperationRunning(claim=claim, session_operation_context=context),
         )
-        assert isinstance(fresh, MessageIngressFresh)
+        assert isinstance(fresh, ContinuationIngressCheckpoint) and fresh.disposition == "inserted"
         with postgres_engine.connect() as conn:
             assert (
                 conn.scalar(
@@ -199,7 +191,7 @@ async def test_postgres_two_service_instances_accept_one_receipt_for_same_key_an
             with pytest.raises(IntegrityError), conn.begin_nested():
                 conn.execute(delete(message_ingress_receipts_table).where(message_ingress_receipts_table.c.session_id == str(session.id)))
     finally:
-        postgres_service.session_operation_authority.release(context)
+        postgres_service.session_operation_authority.release(_RUNNING[(str(session.id), str(request_id))][1].session_operation_context)
 
     with postgres_engine.begin() as conn:
         conn.execute(delete(sessions_table).where(sessions_table.c.id == str(session.id)))

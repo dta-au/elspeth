@@ -13,6 +13,7 @@ from sqlalchemy import insert
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.web.sessions import models
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.unit.web.conftest import _make_session
 
 
@@ -42,6 +43,7 @@ def test_provenance_check_accepts_known_values(engine):
             _make_session(conn, session_id=f"s_{provenance}")
             conn.execute(
                 insert(models.composition_states_table).values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=f"cs_{provenance}",
                     session_id=f"s_{provenance}",
                     version=1,
@@ -60,6 +62,7 @@ def test_provenance_check_rejects_unknown_value(engine):
         with pytest.raises(IntegrityError, match="ck_composition_states_provenance"):
             conn.execute(
                 insert(models.composition_states_table).values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id="cs_x",
                     session_id="s1",
                     version=1,
@@ -78,6 +81,7 @@ def test_provenance_not_null(engine):
         with pytest.raises(IntegrityError, match=r"NOT NULL.*composition_states.provenance"):
             conn.execute(
                 insert(models.composition_states_table).values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id="cs_x",
                     session_id="s1",
                     version=1,

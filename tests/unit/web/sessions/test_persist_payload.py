@@ -59,7 +59,17 @@ def test_audit_outcome_no_tier1_violation_field():
     import dataclasses
 
     fields = {f.name for f in dataclasses.fields(AuditOutcome)}
-    assert fields == {"assistant_id", "unwind_audit_failed", "current_state_id", "checkpoint_disposition", "checkpoint"}
+    assert fields == {
+        "assistant_id",
+        "unwind_audit_failed",
+        "current_state_id",
+        "checkpoint_disposition",
+        "checkpoint",
+        "authority_revocation",
+        "published_tool_rows",
+        "published_assistant_content",
+        "continuation_retention_failure",
+    }
 
 
 def test_redacted_tool_row_with_state_advance():

@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
@@ -32,6 +32,7 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
@@ -39,6 +40,7 @@ from elspeth.web.composer.state import ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools import execute_tool as _real_execute_tool
 from elspeth.web.sessions.models import chat_messages_table
+from tests.helpers.composer_sdk import ComposerSDKScript
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     FakeFunction,
@@ -77,22 +79,23 @@ def _composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
+def _sdk_response(*calls: tuple[str, str, str]) -> FakeLLMResponse:
+    """Original SDK-shaped turn with the exact supplied argument bytes."""
+    return FakeLLMResponse(
+        choices=[
+            FakeChoice(
+                message=FakeMessage(
+                    content=None,
+                    tool_calls=[FakeToolCall(id=call_id, function=FakeFunction(name=name, arguments=raw)) for call_id, name, raw in calls],
+                )
+            )
+        ]
+    )
+
+
 def _raw_response(*calls: tuple[str, str, str]) -> _AdmittedLLMCompletion:
     """One assistant turn whose tool calls carry already-encoded argument strings."""
-    return _admit_composer_llm_completion(
-        FakeLLMResponse(
-            choices=[
-                FakeChoice(
-                    message=FakeMessage(
-                        content=None,
-                        tool_calls=[
-                            FakeToolCall(id=call_id, function=FakeFunction(name=name, arguments=raw)) for call_id, name, raw in calls
-                        ],
-                    )
-                )
-            ]
-        )
-    )
+    return _admit_composer_llm_completion(_sdk_response(*calls))
 
 
 def _text_response(content: str = "Done.") -> _AdmittedLLMCompletion:
@@ -139,6 +142,7 @@ class _Turn:
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
             prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
             prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+            prepared_input: PreparedProviderInput | None = None,
         ) -> _AdmittedLLMCompletion:
             self.sent_tool_lists.append(tools)
             return responses.pop(0) if responses else _text_response()
@@ -335,7 +339,7 @@ class TestPersistedP4RowCarriesTheFacts:
         assert service._planner_dialect is _STRICT
         state = _empty_state()
         turns = [
-            _raw_response((call_id, "set_metadata", json.dumps({"patch": {"name": f"Step {index}", "description": None}})))
+            _sdk_response((call_id, "set_metadata", json.dumps({"patch": {"name": f"Step {index}", "description": None}})))
             for index, call_id in enumerate(("call_success", "call_arg_error", "call_plugin_crash"))
         ]
         success_result = ToolResult(
@@ -344,8 +348,9 @@ class TestPersistedP4RowCarriesTheFacts:
             validation=ValidationSummary(is_valid=True, errors=(), warnings=(), suggestions=(), semantic_contracts=()),
             affected_nodes=(),
         )
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=turns)
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=[
@@ -354,10 +359,9 @@ class TestPersistedP4RowCarriesTheFacts:
                     RuntimeError("synthetic plugin bug"),
                 ],
             ),
+            pytest.raises(ComposerPluginCrashError),
         ):
-            mock_llm.side_effect = turns
-            with pytest.raises(ComposerPluginCrashError):
-                await service.compose("Drive the sequence", [], state, session_id=session_id)
+            await service.compose("Drive the sequence", [], state, session_id=session_id)
 
         entries = _persisted_assistant_entries(service, session_id)
         for call_id in ("call_success", "call_arg_error", "call_plugin_crash"):

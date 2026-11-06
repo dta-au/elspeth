@@ -446,6 +446,11 @@ def test_profiled_prompt_shield_contract_uses_executable_binding_without_mutatin
 
 
 def test_private_bindings_never_enter_authored_prompt_snapshot_or_policy_evidence() -> None:
+    from uuid import UUID
+
+    from elspeth.contracts.composer_content import ComposerContentScope
+    from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
     policy, profiles, snapshot = _policy_context(_guardrail_settings())
     state = _guarded_state()
     view = PolicyCatalogView(create_catalog_service(), snapshot, profiles)
@@ -454,7 +459,13 @@ def test_private_bindings_never_enter_authored_prompt_snapshot_or_policy_evidenc
     prompt = (
         build_catalog_context_string(view, plugin_snapshot=snapshot)
         + "\n"
-        + build_context_string(state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+        + build_context_string(
+            state,
+            view,
+            plugin_snapshot=snapshot,
+            content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
+            schemas_loaded=frozenset(),
+        )
     )
     evidence = _build_web_plugin_policy_evidence(snapshot=snapshot, policy=policy)
     surfaces = {

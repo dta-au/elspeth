@@ -403,6 +403,7 @@ class TestInterpretationResolveResponse:
             id=str(uuid4()),
             session_id=str(event.session_id),
             version=2,
+            composition_content_hash="a" * 64,
             is_valid=True,
             created_at=datetime(2026, 5, 18, 12, 0, 6, tzinfo=UTC),
         )
@@ -416,6 +417,7 @@ class TestInterpretationResolveResponse:
             id=str(uuid4()),
             session_id=str(event.session_id),
             version=2,
+            composition_content_hash="a" * 64,
             is_valid=True,
             created_at=datetime(2026, 5, 18, 12, 0, 6, tzinfo=UTC),
         )

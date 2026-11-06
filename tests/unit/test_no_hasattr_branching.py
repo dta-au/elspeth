@@ -182,8 +182,6 @@ tests/unit/web/composer/test_no_sampling_inference.py::not hasattr(svc, '_COMPOS
 tests/unit/web/composer/test_no_sampling_inference.py::not hasattr(svc, '_COMPOSER_LLM_TEMPERATURE')
 tests/unit/web/composer/test_no_sampling_inference.py::not hasattr(svc, '_composer_llm_seed_for_model')
 tests/unit/web/composer/test_no_sampling_inference.py::not hasattr(svc, '_litellm_completion_supports_param')
-tests/unit/web/composer/test_pipeline_planner.py::not hasattr(pipeline_planner, 'PlannerTerminalContract')
-tests/unit/web/composer/test_pipeline_planner.py::not hasattr(pipeline_planner, 'canonical_planner_terminal_contract')
 tests/unit/web/composer/test_state.py::not hasattr(state, 'source')
 tests/unit/web/composer/test_state.py::not hasattr(state, 'source')
 tests/unit/web/coordination/test_contracts.py::not hasattr(context, '__dict__')

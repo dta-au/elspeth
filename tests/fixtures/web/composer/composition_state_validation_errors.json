@@ -4,6 +4,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -56,6 +57,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -108,6 +110,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -166,6 +169,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -224,6 +228,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -282,6 +287,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -342,6 +348,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -394,6 +401,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -446,6 +454,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -504,6 +513,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -562,6 +572,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",
@@ -620,6 +631,7 @@
       "id": "00000000-0000-4000-8000-000000000001",
       "session_id": "00000000-0000-4000-8000-000000000002",
       "version": 1,
+      "composition_content_hash": "f7db612a36581b5dfb575fdc77b508e104a9c773a4f641a9136f65a966e34f1a",
       "sources": {
         "primary": {
           "plugin": "csv",

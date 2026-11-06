@@ -50,7 +50,7 @@ def arg_error_payload(exc: ToolArgumentError, tool_name: str) -> Mapping[str, An
     ``validation_errors`` comes from a pydantic ``__cause__`` when there is
     one, otherwise from the S gate's closed violations (S1 T9). The compose
     loop is this function's only caller, so the S-gate repair signal reaches
-    only the compose loop (MCP and planner discovery build their own bodies).
+    only the compose loop (MCP builds its own body).
     """
     payload: dict[str, Any] = {"error": f"Tool '{tool_name}' failed: {exc.safe_message}"}
     validation_errors = canonicalize_pydantic_cause(exc.__cause__)

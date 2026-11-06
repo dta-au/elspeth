@@ -1,0 +1,14 @@
+Defensive security review of our own static-analysis gate (ELSPETH repo, maintainer-authorised). Read-only; no exploit work. Answer inline in under 900 words; cite file:line.
+
+Context: `scripts/fencing_inventory.py` is the Landscape mutation-fencing gate. It proves every audit-DB mutation path in src/elspeth is fenced (lease/fence-token checked) and that "reserve" proofs hold; `_mutation_callable_escapes` is its hot function. It is path-sensitive and memoised with a reviewed "two-witness" memo pinned by tests/unit/architecture/test_web_reserve_reviewed_contracts.py (bounded storage; results must equal the no-memo run). After a large overlay landed, one query — the variable state at src/elspeth/web/composer/tool_batch.py:3758, inside the 2,030-line `_execute_continuation_call_live` — runs >241 CPU-s and >5.48M evaluations without finishing (pre-overlay: 2.9 s). A multi-witness memo fixes other files but not this one. Read: .claude/lanes/release-0.8.10/u46fix/EVIDENCE.md, docs/release/0.8.10-fencing-gate-diagnosis.md (if present), scripts/fencing_inventory.py, and the two test files above.
+
+Options proposed by the engineer:
+(a) re-evaluate cycles as a per-function fixpoint (standard dataflow) — "changes results in some cyclic cases unless proven equal";
+(b) a fail-closed per-query evaluation budget (exceeding it = gate RED), keeping detection power but leaving the target red until (a) or (c);
+(c) split `_execute_continuation_call_live` into smaller functions (production refactor).
+
+Questions:
+1. Which option(s) preserve the gate's soundness (never miss an unfenced mutation)? For (a): under what conditions is a per-function fixpoint at least as strict as the current path-sensitive recursion, and where could it lose precision vs. lose soundness? Is the current recursion itself sound on cycles, or does its cycle cut-off already under-approximate?
+2. Is (b) acceptable as a permanent safety net alongside (a)? What must "fail closed" mean precisely so it can never become fail-open?
+3. Is (c) a gate fix or an independent code-quality change? Would (c) alone leave the gate exponential for the next long function?
+4. Recommend a plan, and the equivalence/soundness evidence required before it lands (e.g. which corpus, which known-positive plants, how to treat result differences).

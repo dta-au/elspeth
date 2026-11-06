@@ -320,6 +320,19 @@ terminals or CI, prefer `--no-tui` or `--json`.
 
 Over time, payload storage grows. Purge old data while preserving audit metadata:
 
+Purge is offline-only. Stop every writer using the payload store and prevent new
+starts and automatic restarts. Keep them stopped from payload selection through
+confirmation, deletion and reproducibility-grade updates. A restored database requires an
+isolated payload copy; pointing it at the live payload store is unsafe.
+All references to the payload namespace must belong to the selected Landscape.
+Purging a store shared by independent Landscape databases is unsupported even
+when their writers are stopped: this command cannot see the other databases'
+retained references.
+The command does not acquire maintenance exclusion. `--yes` only skips the
+confirmation prompt, and a dry-run does not authorize later deletion. Select
+payloads again after stopping writers. See the
+[maintenance runbook](../runbooks/database-maintenance.md#payload-retention).
+
 ```bash
 # See what would be deleted (dry run)
 elspeth purge --dry-run --retention-days 90

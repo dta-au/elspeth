@@ -12,11 +12,10 @@ from unittest.mock import MagicMock
 
 import pytest
 from pydantic import BaseModel, JsonValue
-from sqlalchemy import Engine
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.plugin_capabilities import CapabilityDeclaration
+from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSummary
@@ -77,27 +76,66 @@ def test_inventory_real_handlers_preserve_baseline_bytes(tool: str, kind: str) -
     assert json.dumps(admitted.to_wire()) == expected
 
 
-def test_inspection_real_handler_preserves_baseline_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    path = tmp_path / "data.csv"
-    path.write_bytes(b"z,a\n1,true\n")
+def test_inspection_real_handler_preserves_baseline_bytes(tmp_path: Path) -> None:
+    # inspect_source reads through the blob service's fenced reader (9aff4e441):
+    # the blob row, its storage under the service root and a genuine operation
+    # context are real, so the witness covers the shipped read path.
+    from datetime import UTC, datetime
+
+    from sqlalchemy.pool import StaticPool
+
+    from elspeth.web.sessions.engine import create_session_engine
+    from elspeth.web.sessions.models import blobs_table, sessions_table
+    from elspeth.web.sessions.schema import initialize_session_schema
+    from tests.fixtures.identities import ensure_test_identity
+    from tests.unit.web.composer.test_tools import _blob_operation
+
     blob_id = "00000000-0000-0000-0000-000000000001"
-    blob = {
-        "id": blob_id,
-        "status": "ready",
-        "storage_path": str(path),
-        "filename": "data.csv",
-        "mime_type": "text/csv",
-        "content_hash": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "size_bytes": 11,
-    }
-    monkeypatch.setattr(sources, "_sync_get_blob", lambda *args: blob)
-    context = ToolContext(
-        catalog=MagicMock(spec=PolicyCatalogView),
-        plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
-        session_engine=MagicMock(spec=Engine),
-        session_id="00000000-0000-0000-0000-000000000002",
-    )
-    result = sources._INSPECT_SOURCE_DECLARATION.handler({"blob_id": blob_id}, _state(), context)
+    session_id = "00000000-0000-0000-0000-000000000002"
+    content = b"z,a\n1,true\n"
+    storage_dir = tmp_path / "blobs" / session_id
+    storage_dir.mkdir(parents=True)
+    path = storage_dir / f"{blob_id}_data.csv"
+    path.write_bytes(content)
+    engine = create_session_engine("sqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
+    initialize_session_schema(engine)
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="test-user")
+        conn.execute(
+            sessions_table.insert().values(
+                id=session_id, user_id="test-user", auth_provider_type="local", title="Test", created_at=now, updated_at=now
+            )
+        )
+        conn.execute(
+            blobs_table.insert().values(
+                id=blob_id,
+                session_id=session_id,
+                filename="data.csv",
+                mime_type="text/csv",
+                size_bytes=len(content),
+                content_hash=hashlib.sha256(content).hexdigest(),
+                storage_path=str(path),
+                created_at=now,
+                created_by="user",
+                source_description=None,
+                status="ready",
+            )
+        )
+    try:
+        with _blob_operation(engine, session_id) as (authority, operation_context):
+            context = ToolContext(
+                catalog=MagicMock(spec=PolicyCatalogView),
+                plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation_context,
+            )
+            result = sources._INSPECT_SOURCE_DECLARATION.handler({"blob_id": blob_id}, _state(), context)
+    finally:
+        engine.dispose()
     assert result.success
     assert sources._INSPECT_SOURCE_DECLARATION.response_contract is SOURCE_INSPECTION_RESPONSE_CONTRACT
     admitted = SOURCE_INSPECTION_RESPONSE_CONTRACT.admit(result.data)
@@ -228,14 +266,19 @@ def test_owned_cache_containers_cannot_be_repaired_from_mutable_shapes() -> None
     default_corruption: dict[str, Any] = {"default": {"nested": []}}
     bad_default = replace(inventory.available[0].config_fields[0], **default_corruption)
     capability_corruption: dict[str, Any] = {"capability": "llm"}
-    bad_capability = CapabilityDeclaration(**capability_corruption)
+    valid_capability = CapabilityDeclaration(PluginCapability.LLM)
+    valid_inventory = replace(inventory, available=(replace(inventory.available[0], policy_capabilities=(valid_capability,)),))
+    assert PLUGIN_INVENTORY_RESPONSE_CONTRACT.admit(valid_inventory).to_wire()["available"][0]["policy_capabilities"] == [
+        {"capability": "llm", "control_role": None, "blocks_positive_detection": False}
+    ]
+    with pytest.raises(TypeError, match="requires a PluginCapability"):
+        CapabilityDeclaration(**capability_corruption)
     corruptions = (
         replace(inventory, **root_corruption),
         replace(inventory, **root_item_corruption),
         replace(inventory, available=(replace(inventory.available[0], **nested_corruption),)),
         replace(inventory, available=(replace(inventory.available[0], **nested_item_corruption),)),
         replace(inventory, available=(replace(inventory.available[0], config_fields=(bad_default,)),)),
-        replace(inventory, available=(replace(inventory.available[0], policy_capabilities=(bad_capability,)),)),
     )
     for corrupted in corruptions:
         with pytest.raises(FrameworkBugError):

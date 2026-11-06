@@ -15,6 +15,7 @@ export function ComposerOperationOutcomeNotice({ outcome }: { outcome: ComposerO
   return (
     <aside className="trusted-system-notice" role="note" aria-label="Composer operation outcome" data-operation-id={outcome.operation_id}>
       <strong>{OUTCOME_LABELS[outcome.failure_code]}</strong>
+      {outcome.error_type === "paid_result_incomplete" && <p>A model call returned, but its result or audit evidence could not be fully retained. ELSPETH stopped without using or retrying that result. Cost information is unavailable in this history notice; the call may have incurred a charge. Review the saved session before starting another request.</p>}
       {outcome.settled_at !== null && <p><time dateTime={outcome.settled_at}>{new Date(outcome.settled_at).toLocaleString()}</time></p>}
       {saved.attribution === "unavailable" ? (
         <p>Saved progress has not been confirmed. Review the current draft before deciding what to do next.</p>
@@ -23,7 +24,7 @@ export function ComposerOperationOutcomeNotice({ outcome }: { outcome: ComposerO
       ) : saved.count === 0 ? (
         <p>No draft revisions were saved by this operation. Earlier draft changes remain available.</p>
       ) : (
-        <p>This operation saved {saved.count} draft revisions, last saved version {saved.latest_version}. Later changes may be newer.</p>
+        <p>{outcome.failure_code === "request_cancelled" && "Saved draft changes remain available. "}This operation saved {saved.count} draft {saved.count === 1 ? "revision" : "revisions"}, last saved version {saved.latest_version}. Later changes may be newer.</p>
       )}
       <p>Support reference: <code>{reference}</code></p>
     </aside>

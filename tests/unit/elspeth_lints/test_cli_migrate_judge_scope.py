@@ -46,6 +46,8 @@ from elspeth_lints.core.judge import JUDGE_POLICY_HASH
 
 # Synthetic source: one R1 finding (dict.get on Tier-2 data) inside
 # Widget.lookup. Mirrors the justify/reaudit fixtures.
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
+
 _SYNTHETIC_SOURCE = '''\
 """Synthetic module used in migrate-judge-scope tests."""
 

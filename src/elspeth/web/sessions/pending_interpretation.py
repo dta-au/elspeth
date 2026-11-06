@@ -610,22 +610,6 @@ def _source_data_contract_demand_from_state_record(
     return source_name, demand
 
 
-# Prefixes (case-insensitive) that, when they appear immediately before the
-# placeholder, indicate the LLM placed the placeholder inside a structural
-# directive rather than in the prompt body. Substituting the user's
-# accepted_value into a structural-directive position would produce a
-# broken prompt at runtime — fail closed.
-#
-# CLOSED LIST — extending this set is a governance action for the
-# prompt-template patch helper. Any new prefix must be paired with a
-# direct-helper unit test and a writer-path audit.
-_STRUCTURAL_DIRECTIVE_PREFIXES: tuple[str, ...] = (
-    "system:",
-    "role:",
-    "instructions:",
-)
-
-
 @trust_boundary(
     tier=3,
     source=(
@@ -765,14 +749,6 @@ def _patch_structured_interpretation_prompt(
             )
         stored_requirement = requirements_by_id[requirement_id]
         if requirement_id == matching_requirement_id:
-            prefix_lower = "".join(rendered).rstrip().lower()
-            for directive in _STRUCTURAL_DIRECTIVE_PREFIXES:
-                if prefix_lower.endswith(directive):
-                    raise InterpretationPlaceholderConsumedError(
-                        f"_patch_llm_transform_prompt: interpretation requirement {requirement_id!r} in node "
-                        f"{affected_node_id!r} is immediately preceded by structural directive {directive!r}; "
-                        f"substituting into a directive position would produce a broken prompt"
-                    )
             matched_ref_count += 1
             rendered.append(accepted_value)
             continue
@@ -871,9 +847,11 @@ def _patch_llm_transform_prompt(
     * the affected node has no ``options`` mapping;
     * ``options.prompt_template`` is missing or not a string;
     * the prompt template does not contain the expected placeholder;
-    * the placeholder appears more than once in the template;
-    * the prefix immediately before the placeholder matches (case-insensitive)
-      any of :data:`_STRUCTURAL_DIRECTIVE_PREFIXES`.
+    * the placeholder appears more than once in the template.
+
+    Prompt labels remain text in the user prompt template. Provider message
+    roles come from the separate runtime configuration, while the caller
+    validates the accepted value and binds it to the reviewed prompt.
 
     The helper is pure (no DB IO). It is called from
     :meth:`SessionServiceImpl.resolve_interpretation_event` BEFORE the
@@ -969,22 +947,6 @@ def _patch_llm_transform_prompt(
             )
         placeholder_match = placeholder_matches[0]
 
-        # Structural-directive guard: the substring ending at the placeholder
-        # is the "prefix immediately before". We strip trailing whitespace
-        # (so "System: {{...}}" is caught even though there's a space before
-        # the placeholder) and compare case-insensitively against the closed
-        # prefix list.
-        prefix = template[: placeholder_match.start()].rstrip()
-        prefix_lower = prefix.lower()
-        for directive in _STRUCTURAL_DIRECTIVE_PREFIXES:
-            if prefix_lower.endswith(directive):
-                raise InterpretationPlaceholderConsumedError(
-                    f"_patch_llm_transform_prompt: placeholder {placeholder!r} in node "
-                    f"{affected_node_id!r} is immediately preceded by structural "
-                    f"directive {directive!r}; substituting into a directive position "
-                    f"would produce a broken prompt"
-                )
-
         # Patch is a single span replacement; we already verified exactly one
         # matching placeholder so this is unambiguous. The resolved string is written
         # back into ``options.prompt_template`` so it lands on
@@ -1075,7 +1037,7 @@ def _resolve_vague_term(
         else:
             final_nodes.append(n)
     # Vague-term review patches only nodes; the sources map is carried forward
-    # unchanged. The legacy singular ``source`` column is dead.
+    # unchanged.
     return state_record.sources, final_nodes, artifact_hash
 
 
@@ -1236,7 +1198,7 @@ def _resolve_prompt_template_review(
         else:
             final_nodes.append(current_node)
     # Prompt-template review patches only node review metadata; the sources map
-    # is carried forward unchanged. The legacy singular ``source`` column is dead.
+    # is carried forward unchanged.
     return state_record.sources, final_nodes, artifact_hash
 
 
@@ -1368,7 +1330,7 @@ def _resolve_pipeline_decision_review(
         else:
             final_nodes.append(current_node)
     # Pipeline-decision review patches only node review metadata; the sources map
-    # is carried forward unchanged. The legacy singular ``source`` column is dead.
+    # is carried forward unchanged.
     return state_record.sources, final_nodes, None
 
 
@@ -1453,7 +1415,7 @@ def _resolve_model_choice_review(
         else:
             final_nodes.append(current_node)
     # Model-choice review patches only node options; the sources map is
-    # carried forward unchanged. The legacy singular ``source`` column is dead.
+    # carried forward unchanged.
     return state_record.sources, final_nodes, None
 
 
@@ -1656,7 +1618,6 @@ class _SessionPendingInterpretationValidator:
         candidate_state = state_from_record(
             replace(
                 candidate.base_state,
-                source=None,
                 sources=data.sources,
                 nodes=data.nodes,
                 edges=data.edges,
@@ -1719,6 +1680,73 @@ class _PreparedPendingInterpretation:
             raise TypeError("prepared pending interpretation validator must be exact")
 
 
+@dataclass(frozen=True, slots=True)
+class PendingInterpretationValidationObservation:
+    """The original validation and the complete candidate it actually examined."""
+
+    candidate: SessionPendingInterpretationValidationCandidate
+    result: SessionPendingInterpretationValidationResult
+
+
+@dataclass(frozen=True, slots=True)
+class PendingInterpretationPolicyPlan:
+    """Replayable policy DATA, never authority to write either audit store."""
+
+    command: SessionPendingInterpretationCommand
+    snapshot: SessionPendingInterpretationSnapshot
+    policy: PendingInterpretationPolicy
+    appended_state_id: UUID
+    decision: SessionPendingInterpretationDecision
+    validation: PendingInterpretationValidationObservation | None
+
+
+def plan_pending_interpretation(
+    command: SessionPendingInterpretationCommand,
+    snapshot: SessionPendingInterpretationSnapshot,
+    validator: _SessionPendingInterpretationValidator,
+    *,
+    policy: PendingInterpretationPolicy,
+) -> PendingInterpretationPolicyPlan:
+    """Observe validation once, then retain its exact pure policy consequence."""
+    if type(validator) is not _SessionPendingInterpretationValidator:
+        raise TypeError("pending plan requires the original validation-only capability")
+    validator.assert_source_state(snapshot)
+    observation: PendingInterpretationValidationObservation | None = None
+
+    def observe(candidate: SessionPendingInterpretationValidationCandidate) -> SessionPendingInterpretationValidationResult:
+        nonlocal observation
+        if observation is not None:
+            raise AuditIntegrityError("pending interpretation requested validation twice")
+        result = validator(candidate)
+        observation = PendingInterpretationValidationObservation(candidate, result)
+        return result
+
+    appended_state_id = uuid.uuid4()
+    decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, observe, policy=policy, appended_state_id=appended_state_id)
+    return PendingInterpretationPolicyPlan(command, snapshot, policy, appended_state_id, decision, observation)
+
+
+def reprove_pending_interpretation_plan(plan: PendingInterpretationPolicyPlan) -> None:
+    """Recompute using retained validation only; no external read or write."""
+    if type(plan) is not PendingInterpretationPolicyPlan:
+        raise TypeError("pending interpretation policy plan must be exact")
+    consumed = False
+
+    def replay(candidate: SessionPendingInterpretationValidationCandidate) -> SessionPendingInterpretationValidationResult:
+        nonlocal consumed
+        observation = plan.validation
+        if consumed or type(observation) is not PendingInterpretationValidationObservation or candidate != observation.candidate:
+            raise AuditIntegrityError("pending interpretation lost its original validation candidate")
+        consumed = True
+        return observation.result
+
+    decision = _SessionPendingInterpretationPlanner.plan(
+        plan.command, plan.snapshot, replay, policy=plan.policy, appended_state_id=plan.appended_state_id
+    )
+    if decision != plan.decision or consumed != (plan.validation is not None):
+        raise AuditIntegrityError("pending interpretation changed its original policy consequence")
+
+
 @final
 class _SessionPendingInterpretationPlanner:
     """Canonical reconciliation planner; it can request validation but cannot perform DML."""
@@ -1739,9 +1767,12 @@ class _SessionPendingInterpretationPlanner:
         validator: SessionPendingInterpretationValidator,
         *,
         policy: PendingInterpretationPolicy = PendingInterpretationPolicy.RECONCILE,
+        appended_state_id: UUID | None = None,
     ) -> SessionPendingInterpretationDecision:
         if type(policy) is not PendingInterpretationPolicy:
             raise TypeError("pending interpretation policy must be exact")
+        if appended_state_id is not None and type(appended_state_id) is not UUID:
+            raise TypeError("pending interpretation appended state identity must be exact")
         if type(validator) is _SessionPendingInterpretationValidator:
             validator.assert_source_state(snapshot)
         event_id = command.event_id
@@ -2145,7 +2176,7 @@ class _SessionPendingInterpretationPlanner:
             ),
             ensure_opt_out_marker=True,
             appended_state=SessionCompositionStateCreation(
-                id=uuid.uuid4(),
+                id=uuid.uuid4() if appended_state_id is None else appended_state_id,
                 data=patched_state,
                 provenance="interpretation_resolve",
                 created_at=now,

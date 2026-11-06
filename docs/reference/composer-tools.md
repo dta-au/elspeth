@@ -178,7 +178,7 @@ Get a human-readable explanation of a validation error with suggested fixes.
 |-----------|------|----------|-------------|
 | `error_text` | string | **Yes** | The exact validation error message to explain |
 
-**Returns:** Explanation of what the error means and how to fix it.
+**Returns:** `error_text` (echoed), `explanation` and `suggested_fix`. When the text is a closed validation code (exact, case-sensitive) or contains one (any case), the result also carries that canonical `error_code`. A runtime-only reason such as `union_field_collision`, a matched message pattern and unmatched text carry no `error_code`; unmatched text lists the closed codes inside `suggested_fix`. Lookup order: runtime-only reason, exact code, message patterns, a code inside other text, then usage guidance.
 
 **When to use:** When a mutation tool or export surface returns validation errors that aren't immediately clear. Pass the exact error text from the validation result.
 
@@ -409,15 +409,51 @@ Atomically replace the entire pipeline in one call.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `source` | object | **Yes** | `{plugin, options, on_success, on_validation_failure}`; full replacement requires an explicit nonempty failure choice. |
+| `source` | object | One of `source` / `sources` | Default root: `{plugin, options?, on_success, on_validation_failure, blob_id?, blob_ids?, inline_blob?}`; full replacement requires an explicit nonempty failure choice. |
+| `sources` | object | One of `source` / `sources` | Named roots keyed by stable provider-authored names. Each value has `{plugin, options?, on_success, on_validation_failure, blob_id?, blob_ids?}`; named inline creation is undeclared. |
 | `nodes` | array | **Yes** | Array of `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?, timeout_seconds?, scope_name?, scope_opener?, scope_policy?}]` |
 | `edges` | array | **Yes** | Array of edge specs: `[{id, from_node, to_node, edge_type}]` |
-| `outputs` | array | **Yes** | Array of output specs with required explicit `on_write_failure`: `[{name, plugin, options, on_write_failure}]`. |
+| `outputs` | array | **Yes** | Array of output specs with required explicit `on_write_failure`: `[{sink_name, plugin, options, on_write_failure}]`. |
 | `metadata` | object | No | `{name?, description?}` |
 
 **When to use:** When the user describes a complete pipeline and you can construct the whole thing at once. More efficient than sequential `set_source` + `upsert_node` + `upsert_edge` + `set_output` calls. Also useful for major restructuring where most components change.
 
 Generated `csv` and `json` outputs must include `options.collision_policy`; the web composer and MCP composer controls reject missing policy choices before export.
+
+**Attachment selection in 0.8.10:** default and named roots accept nullable
+`blob_id` or ordered `blob_ids`; only the default root accepts `inline_blob`.
+Choose exactly one top-level `source` or `sources` object and omit the other;
+null is not a keep-existing-source instruction.
+Omitted/null selectors are absent. Competing correctly typed non-null selectors
+produce root-attributed `source_binding_ambiguous`; wrong shapes, empty/over-width
+lists and undeclared named inline fields use the argument-error channel.
+`blob_ids` contains 1–512 strings and requires the provider's explicit
+`plugin:"blob_rows"`; even one member retains document-row semantics. Duplicate
+identity/content within a list refuses it; separate roots may reuse an
+attachment. Binding uses current owned READY records and never substitutes a
+plugin, root name or route to make the request pass. The private/plugin storage
+bound of 1,000 does not increase the 512 public selector bound.
+Plural attachments retain original user-verbatim upload provenance; they do
+not admit LLM-authored document content.
+
+For a current saved draft,
+`get_pipeline_state({"component":"set_pipeline_arguments"})` returns a public
+replacement document with scalar IDs or ordered plural IDs, ordinary/review
+options and `sink_name` output names, stripping matching private custody.
+Public reapplication resolves current metadata rather than copying historical
+entry facts. Malformed, contradictory or unreconstructible custody refuses
+instead of being dropped or truncated; earlier credential admission can refuse
+before the serializer. Public projection grants no private reviewed authority.
+
+The public implementation is published at `9d7f626` after source review and unit
+receiving, with bounded authenticated SDK/dialect receiving at `776d25bd`.
+A separate nine-case public PostgreSQL slice passes against that production
+checkpoint, including persistence/private reuse, atomic refusal, ownership,
+metadata freshness and cross-connection transaction visibility. Full final-source
+PostgreSQL, live-provider delivery, the full scripted tutorial and final global
+receiving remain pending; see the
+[versioned TC-001/TC-005 contract](composer-tool-contracts-0.8.10.md#tc-001--provider-authored-scalar-and-plural-attachment-roots)
+for its exact status and boundaries.
 
 ---
 
@@ -491,6 +527,47 @@ discovery turns to read every page.
 
 ---
 
+### `inspect_source`
+
+Return bounded structural facts about a blob-backed source, never its rows.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `blob_id` | string | **Yes** | Blob ID to inspect |
+| `encoding` | string or null | No | Explicit CSV/TSV text encoding for this inspection only (1–128 characters); null or omitted uses default inspection. It does not configure the pipeline source. |
+
+**Returns:** `source_kind`, `observed_headers`, `runtime_headers`,
+`field_name_mapping`, `sample_row_count`, `inferred_types`, `url_candidates`,
+`warnings`, `byte_range_inspected` and `redacted_identity` (`filename`,
+`mime_type`, `byte_size`, `blob_id`, `content_hash_prefix`). Facts come from at
+most an 8 KiB prefix and at most 100 records, so they are bounded observations,
+not a complete inspection of the file.
+
+**Read path:** the same fenced reader as every blob content read. The read
+takes the session's blob-custody lock, reconciles crash leftovers (a pre-update
+sidecar or one matching delete tombstone) to the committed version, streams
+the whole file in bounded chunks to verify its stored SHA-256, and re-reads the
+blob's metadata after the stream. The facts use the metadata observed with the
+bytes, and `byte_size` is the number of bytes actually streamed. The draft
+graph and its version are unchanged.
+
+**Failures:**
+
+| Condition | Outcome |
+|-----------|---------|
+| Malformed `blob_id`, unknown blob, or a blob in another session | Repairable failure (`not found` for both of the latter; no other session's metadata is disclosed) |
+| Blob not `ready` | Repairable failure naming its status |
+| Backing file already missing, or removed during the read | Repairable failure; the storage path is not disclosed |
+| Explicit encoding on a non-CSV/TSV source, or an unsupported codec | Repairable failure |
+| Credential material in the facts | Repairable failure (`credential_material_rejected`) |
+| Content hash mismatch | Integrity error; no facts |
+| Released or stale session operation | `SessionOperationFenceLost`; storage is not read and no facts are published |
+| Metadata changed during the read, or a ready blob with no stored hash | Integrity error |
+| Missing storage root or session operation context, or a context for another session | Integrity error (a dispatcher fault, not an argument error) |
+| Any other I/O error | Propagates |
+
+---
+
 ### `set_source_from_blob`
 
 Wire a blob as the pipeline source. Resolves the blob's storage path internally and infers the source plugin from its MIME type.
@@ -554,7 +631,7 @@ Place a secret reference marker in the pipeline config. The secret is resolved a
 |-----------|------|----------|-------------|
 | `name` | string | **Yes** | Secret reference name |
 | `target` | string | **Yes** | `"source"`, `"node"`, or `"output"` |
-| `target_id` | string | No | Node ID or output name (required for `"node"` and `"output"` targets) |
+| `target_id` | string | Conditional | Exact raw source-map name, node ID or output name. Required for `"node"`/`"output"` and for `"source"` when multiple sources exist; an unspecified selector chooses the sole source. Use `left`, not `source:left`; follow the offered wire schema's requiredness and nullability. |
 | `option_key` | string | **Yes** | Config option key to set (e.g. `"api_key"`) |
 
 **When to use:** When a plugin needs a credential. Always use `list_secret_refs` first to check availability, then `validate_secret_ref` to confirm access, then `wire_secret_ref` to connect it.
@@ -563,12 +640,20 @@ Place a secret reference marker in the pipeline config. The secret is resolved a
 
 ## Tool Result Format
 
-Every tool returns a `ToolResult`. The model receives it serialized verbatim;
-the audit row receives the redaction manifest's projection of the same object.
-The key vocabulary is one registry (`src/elspeth/web/composer/tool_result_envelope.py`)
-that the producer, the redaction manifest, and the planner's closed discovery
-twin all derive from, and this section is pinned to it by
-`tests/unit/web/composer/test_tool_result_envelope_gate.py`.
+Every registered tool, and `request_interpretation_review`, returns a
+`ToolResult`. The model receives it serialized verbatim; the audit row
+receives the redaction manifest's projection of the same object. The offered
+tools below answer in another form:
+
+| Tool | What the model receives |
+|------|-------------------------|
+| `request_advisor_hint` | A flat feedback object keyed by `status`. `SUCCESS` carries the advice in `guidance` with a `note`; `ARG_ERROR`, `BUDGET_EXHAUSTED`, `DEADLINE_TOO_CLOSE` and `ADVISOR_ERROR` carry no advice. Budget accounting is kept in the audit row and removed from the model's copy. There is no `version`, `affected_nodes` or `validation`. |
+| `handoff_to_user`, `restore_parked_graph` | No tool result. The call must be the only one in its response; it ends the turn, and the server settles the recovery and reports the outcome. |
+
+The envelope key vocabulary is defined in
+`src/elspeth/web/composer/tool_result_envelope.py`.
+`tests/unit/web/composer/test_tool_result_envelope_gate.py` pins the producer,
+the redaction manifest, and this section to that vocabulary.
 
 ```json
 {

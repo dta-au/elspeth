@@ -26,6 +26,8 @@ from elspeth_lints.core.judge import (
     call_judge,
 )
 
+pytestmark = pytest.mark.usefixtures("synthetic_judge_worker")
+
 # The COMPLETE set of Codex feature settings the judge transport is allowed to
 # send, in order. The judge's shell being ON is a security property of
 # `543066e17`, so it is pinned by asserting the WHOLE config list, unfiltered.
@@ -290,21 +292,20 @@ def test_codex_cli_missing_binary_is_configuration_error(monkeypatch: pytest.Mon
         _call_codex_cli(_request(), DEFAULT_CODEX_JUDGE_MODEL, 1024)
 
 
-def test_call_judge_codex_transport_uses_codex_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict[str, Any] = {}
+def test_call_judge_codex_transport_is_refused_and_spawns_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The native shell could read the worker's provider home, so the
+    # production route refuses before any worker or Codex process starts.
+    spawned: list[list[str]] = []
 
     def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-        captured["command"] = command
+        spawned.append(command)
         return subprocess.CompletedProcess(command, 0, stdout=_jsonl(), stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    response = call_judge(_request(), transport=TRANSPORT_CODEX_CLI)
-
-    assert response.judge_transport == TRANSPORT_CODEX_CLI
-    assert response.model_id == DEFAULT_CODEX_JUDGE_MODEL
-    command = captured["command"]
-    assert command[command.index("--model") : command.index("--model") + 2] == ["--model", DEFAULT_CODEX_JUDGE_MODEL]
+    with pytest.raises(JudgeConfigurationError, match="codex-cli judge transport is disabled"):
+        call_judge(_request(), transport=TRANSPORT_CODEX_CLI)
+    assert spawned == []
 
 
 # The affordances the tool-mode prompt MUST carry. A fourth adversarial review

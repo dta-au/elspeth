@@ -442,13 +442,6 @@ def _rewrite_fork_state_blob_custody(
     if state is None:
         return None
     sources = deep_thaw(state.sources) if state.sources is not None else None
-    if sources is None and state.source is not None:
-        # Mirror ``sessions/converters.py::state_from_record``: a pre-migration
-        # row carries its single source in the legacy ``source`` column. Promote
-        # it under the converter's key so the rewrite, the re-derivation below,
-        # and the returned CompositionStateData all see the same source -- not
-        # an empty source set with the legacy column silently dropped.
-        sources = {"source": deep_thaw(state.source)}
     nodes = deep_thaw(state.nodes)
     edges = deep_thaw(state.edges)
     outputs = deep_thaw(state.outputs)

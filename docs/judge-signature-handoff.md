@@ -48,6 +48,18 @@ not a grant.
 
 ## Judging runs on the Codex CLI harness with tool access (updated 2026-07-27)
 
+> **2026-10-24: `--judge-transport codex-cli` is disabled.** In the installed
+> judge worker, Codex's native shell could read the provider home: `HOME` and
+> `CODEX_HOME` point at `/provider`, which holds provider credentials. Codex
+> CLI cannot be shown to disable that shell completely. `call_judge` refuses
+> the transport before any worker call, and the worker refuses it before it
+> reads its profile or provider home. Both say "the codex-cli judge transport
+> is disabled". The refusal stays until provider authentication is brokered
+> outside model and tool authority. Use `--judge-transport agent`: readonly
+> tools are realpath-confined to the `/evidence` snapshot, and blinded mode
+> allows no tools. Every judge rationale is now secret-scrubbed in every mode.
+> The Codex description below is historical until then.
+
 All judging — including the **final signature verdict** — runs via the agentic
 harness (`--judge-transport codex-cli`) with read-only tool access
 (`--judge-tools readonly`). The judge may Read/Grep/Glob throughout the entire
@@ -96,7 +108,8 @@ What this does NOT change:
   excerpt goes through) before it is printed or persisted.
 - `--judge-tools readonly` accepts `--judge-transport codex-cli` and the legacy
   Claude Agent SDK spelling `agent`; the OpenRouter path has no tool loop and
-  is rejected. `codex-cli` is the normal signing transport.
+  is rejected. `codex-cli` was the normal signing transport; while it is
+  disabled (note above), use `agent`.
 
 Blinded mode (`--judge-tools none`) remains available and byte-identical to the
 historical behavior; entries signed before 2026-07-09 were produced under it.
@@ -135,17 +148,23 @@ and incomplete bundles are rejected and must be re-staged.
 Registered in `.mcp.json` as `elspeth-judge`, launched as
 `python -m elspeth_lints.mcp --root src/elspeth --allowlist-dir
 config/cicd/enforce_tier_model --staged-dir .elspeth/staged-reviews` (with
-`PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra and an installed
-and authenticated Codex CLI. All six tools fail closed when the HMAC key is
-present in the environment.
+`PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra. All six tools
+fail closed when the HMAC key is present in the environment. `stage_preview` is
+the only tool that calls a judge. It judges through the `agent` transport via
+the protected judge supervisor (ADR-052). It never uses `codex-cli`, which is
+disabled (see the note under "Judging runs on the Codex CLI harness"). Until
+the supervisor is installed it refuses with "protected judge supervisor
+admission is unavailable or invalid", with no local fallback. The
+`stage_status` command it renders for the operator uses
+`--judge-transport agent`.
 
 | Tool | Key-free? | LLM? | What it does |
 | --- | --- | --- | --- |
 | `verify_signatures` | yes | no | Read-only, **always shape-only** signature diagnosis of the tier_model allowlist. The authoritative HMAC recompute is the operator CLI `diagnose`, not this tool. |
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
-| `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle (including source identity, per-lane/kind counts, preview outcomes, and which `justify` actions still lack a draft rationale) and emit the paste-ready operator command plus the `sign_bundle_plan` that prices it. Arg: `bundle_id` (required). |
+| `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle and emit its priced operator command. Args: `bundle_id` (required), `stale_key` (optional exact orphan key; selects one action and zero judge calls). |
 | `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` or `drift_repair` actions (`draft_rationale`). The operator fire-time judge receives this text; `stage_preview` judges only `justify` actions. An unannotated drift repair reuses the existing reason. Clears any existing preview on annotated actions. Refuses stale bundles, non-judge actions, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
-| `stage_preview` | yes | yes (read-only Codex CLI judge) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
+| `stage_preview` | yes | yes (read-only `agent` judge via the protected supervisor; **unavailable until installed**) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs the installed judge supervisor plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
 
 `stage_scan` feeds the rotation planner only non-judge-gated entries
@@ -185,18 +204,50 @@ Every rendered command carries `--dry-run`, so pasting one spends nothing; the
 
 ## Operator commands (key-bearing shell)
 
-Run these only in an operator-controlled shell that holds
-`ELSPETH_JUDGE_METADATA_HMAC_KEY`. The Codex transport authenticates from the
-installed CLI account and does not need a provider API key in that shell. Both
+Key-bearing operations require the separately installed absolute entrypoint
+`/usr/local/libexec/elspeth-operator`. Editable Python/console entrypoints refuse
+key custody; they cannot retroactively protect an already exposed environment.
+The static native launcher authenticates protected startup paths, starts an
+isolated interpreter with a closed environment, then authenticates the installed
+artifact before admitting selected signer values. Candidate paths remain data.
+Relative paths, UTF-8 values and explicitly named rekey variables are retained.
+
+All three judge transports use an independently started supervisor and isolated
+workers. Provider SDK imports and CLI execution occur in the worker's separate
+principal, filesystem and authentication home. Read-only mode receives a bounded
+fixed evidence copy; blinded mode receives no candidate files. The signer owns
+verdict validation, policy, timestamps, HMACs, journals and publication. Missing
+protected runtime or qualified worker profile refuses without an in-process
+fallback. Provider credentials belong in the independent worker profile, not the
+signer's `--env-file`. SDK and exact artifact/profile qualification remain pending;
+real signing remains disabled pending on-prem migration and qualification.
+
+The legacy `scripts/cicd/regen_fingerprint_baseline.py` command also refuses
+execution, including its `--env-file` and `--commit` forms. It loads no key and
+runs no checkout capture code, tests, or Git callbacks. Automatic regeneration
+after signing or rekey is already removed. Baseline regeneration still requires
+a signed enforce result bound to the current source and allowlist. Its source
+replacement is `/usr/local/libexec/elspeth-operator regenerate-fingerprint-baseline`
+under the qualified Python 3.13 build and separate maintenance profile. It
+requires externally protected checkout custody and installed first-party bytes
+matching the frozen input, verifies signatures itself, independently derives
+the raw baseline and rechecks inputs before atomic publication. Review and
+commit separately in a key-free shell. See the [operator runtime guide](../elspeth-lints/operator-runtime/README.md).
+Actual installation and qualification remain pending. Shape-only checks or a
+caller's asserted gate result do not authorize regeneration.
+
+Run these only under the separately authorized operator principal. The selected
+signer values remain within that protected runtime; provider login/API/cloud
+credentials are provisioned independently in the worker home. Both
 commands re-derive every binding from the live tree and abort on any staleness
 before touching the configured active allowlist.
 
 ### `sign-bundle` — fire a staged review bundle
 
 ```
-elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
+/usr/local/libexec/elspeth-operator sign-bundle <bundle.json> --owner <operator-id> \
   --judge-transport codex-cli --judge-tools readonly --dry-run \
-  [--lanes resign|new_judgment[,...]] [--continue-on-block] [--judge-concurrency N]
+  [--lanes resign|new_judgment[,...] | --stale-key KEY] [--continue-on-block] [--judge-concurrency N]
 ```
 
 `--judge-concurrency N` (1–8, default 1) runs up to N judge calls at once for
@@ -219,6 +270,31 @@ allowlist; the coherent publish covers the selected lanes only. The selection is
 journalled, and a resume must use the same value (omitting the flag on resume
 inherits it). `--continue-on-block` journals a judged BLOCK and keeps firing
 instead of stopping, leaving each blocked entry fail-closed and exiting 3.
+To retire one orphan, request `stage_status(bundle_id=..., stale_key=KEY)`.
+Its primary command contains `--stale-key KEY`; its plan reports one action,
+zero judge calls, the original bundle index, owning YAML and unselected count.
+`--stale-key` and `--lanes` are mutually exclusive. The CLI still requires the
+operator key for dry-run and firing, and verifies the complete unchanged v2
+bundle, source binding and census before selecting that exact stale deletion.
+Do not filter a bundle, narrow its roots or hand-edit signed YAML.
+
+Exact retirement preserves every other allowlist byte and path, including
+surviving comments, signatures, defaults and existing lock files. Removing the
+last row uses the canonical `allow_hits: []` normalization. LF-only target YAML
+is required; CRLF is refused before publication rather than silently rewritten.
+Exact mode does not regenerate the fingerprint baseline or override counters.
+Directory membership and surviving modes are also bound. The selected YAML
+uses the existing atomic writer's mode `0600`. Recovery refuses later active
+byte, mode or path changes without overwriting them; legacy recovery is unchanged.
+
+An exact transaction authenticates its original target bytes, expected complete
+snapshot, key, owner and original action index in journal schema 2. Older CLI
+versions refuse this journal; use the current CLI to resume. Omitting scope on
+resume inherits the recorded key; changing it or adding lanes is refused.
+Existing lane/all-action journals retain schema 1 and their existing behavior.
+Review-bundle schema v2 is unchanged. Staging remains key-free; only the operator
+runs the public keyed dry-run and firing command against the settled source.
+
 Prefer the forms `stage_status` renders in `sign_bundle_plan` — they are derived
 from the bundle and carry each scope's judge-call price — over hand-writing
 either flag.
@@ -314,8 +390,8 @@ Flags:
 | `--resume` | none | Resume the printed transaction directory after re-verifying bundle bytes, source/bindings, active bytes, journaled effects, and prior signatures. |
 | `--rotation-log` | `.elspeth/rotations.log` | Rotation audit JSONL finalized only with coherent publish. |
 | `--format` | `text` | Per-entry justify output (`text`/`json`). |
-| `--judge-transport` | `openrouter` | Provider that produces the verdict (`codex-cli` is the required normal signing choice; `agent` is the legacy Claude SDK path). |
-| `--judge-tools` | `none` | Judge tool configuration; use `readonly` with `codex-cli` for signing. |
+| `--judge-transport` | `openrouter` | Provider that produces the verdict (`codex-cli` is disabled; see the note under "Judging runs on the Codex CLI harness". Use `agent`, the Claude SDK path). |
+| `--judge-tools` | `none` | Judge tool configuration; use `readonly` with `agent` for signing while `codex-cli` is disabled. |
 
 Override-token environment (only when `--operator-override` is passed):
 `ELSPETH_JUDGE_OVERRIDE_TOKEN` + `ELSPETH_JUDGE_OVERRIDE_TOKEN_SHA256`.
@@ -327,7 +403,7 @@ deleting one.
 ### `rekey` — rotate the HMAC key
 
 ```
-elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NEW_VAR>
+/usr/local/libexec/elspeth-operator rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NEW_VAR>
 ```
 
 A scheme-preserving, **signature-only** swap: it verifies every judge-gated entry
@@ -415,6 +491,8 @@ In those cases re-stage; never force or edit the transaction journal.
 This seam replaces the per-release signing runbooks and the one-shot
 `scripts/cicd/sign_accept_backlog.py` driver. Instead of hand-edited ceremony
 scripts, an agent stages a bundle via `elspeth-judge` and the operator fires
-`sign-bundle` / `rekey` in a key-bearing shell. `scripts/codex_tier_model_rejudge.py`
-is retained (it belongs to a separate active workflow); the `notes/060-*` signing
+`sign-bundle` / `rekey` through the protected operator entrypoint.
+`scripts/codex_tier_model_rejudge.py` remains a key-free proposal workflow and
+refuses the signing-key variable; it never runs inside the signer runtime.
+The `notes/060-*` signing
 runbooks were gitignored scratch and have been removed.

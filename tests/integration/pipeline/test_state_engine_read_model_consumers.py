@@ -253,6 +253,7 @@ def test_rm13_barrier_intake_adopts_the_exact_pending_listing_in_order() -> None
     rows: list[object] = [SimpleNamespace(barrier_key="agg"), SimpleNamespace(barrier_key="agg")]
     scheduler = _PendingBarrierScheduler(rows)
     adopted: list[object] = []
+    context = SimpleNamespace(shutdown_event=None)
     coordinator: Any = object.__new__(BarrierIntakeCoordinator)
     coordinator._scheduler = scheduler
     coordinator._run_id = RUN_ID
@@ -267,14 +268,14 @@ def test_rm13_barrier_intake_adopts_the_exact_pending_listing_in_order() -> None
     coordinator._failed_group_notes = {}
 
     def _adopt(row: object, ctx: object) -> None:
-        assert ctx == "context-sentinel"
+        assert ctx is context
         adopted.append(row)
         return None
 
     coordinator._adopt_aggregation_row = _adopt
-    coordinator._replay_branch_losses = lambda: []
+    coordinator._fire_ready_aggregation = lambda node_id, ctx: None
 
-    assert coordinator.run_intake_pass("context-sentinel") == BarrierIntakePassOutcome(dispositions=())
+    assert coordinator.run_intake_pass(context) == BarrierIntakePassOutcome(dispositions=())
     assert scheduler.calls == [RUN_ID]
     assert adopted == rows
 

@@ -17,7 +17,8 @@
 #
 # Checks, and the incident each one encodes:
 #   in-progress    unfinished operations FAIL; commit may finish a resolved merge
-#                  only when no other operation or unmerged index entries remain
+#                  or single cherry-pick only with no other operation/unmerged
+#                  entries; every sequencer state remains refused
 #   protected      on main or release/*: commit WARNs; rebase/push FAIL unless
 #                  --allow-protected (never move release/main unless asked)
 #   staged-paths   .claude/lanes|handovers|red-team|worktrees, *.log, *.done, *.pid,
@@ -101,7 +102,7 @@ echo
 
 # --- in-progress operations --------------------------------------------------
 inprog=""
-for f in CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do [ -e "$GIT_DIR/$f" ] && inprog="$inprog $f"; done
+for f in REVERT_HEAD BISECT_LOG; do [ -e "$GIT_DIR/$f" ] && inprog="$inprog $f"; done
 for d in rebase-merge rebase-apply sequencer; do [ -d "$GIT_DIR/$d" ] && inprog="$inprog $d"; done
 if ! unmerged="$(git ls-files --unmerged)"; then
     report FAIL in-progress "could not inspect unmerged index entries" "git ls-files --unmerged"
@@ -109,6 +110,16 @@ elif [ -n "$unmerged" ]; then
     report FAIL in-progress "unmerged index entries remain" "git ls-files --unmerged"
 elif [ -n "$inprog" ]; then
     report FAIL in-progress "unfinished:$inprog" "ls $GIT_DIR"
+elif [ -e "$GIT_DIR/CHERRY_PICK_HEAD" ]; then
+    # A sequencer was already refused above. Only completion of this one pick
+    # is eligible; another pending operation or starting new work still fails.
+    if [ -e "$GIT_DIR/MERGE_HEAD" ]; then
+        report FAIL in-progress "unfinished: CHERRY_PICK_HEAD with MERGE_HEAD; overlapping operations" "ls $GIT_DIR"
+    elif [ "$INTENT" = commit ]; then
+        report PASS in-progress "resolved single cherry-pick ready for completion by commit; no other operation or sequencer" "ls $GIT_DIR; git ls-files --unmerged"
+    else
+        report FAIL in-progress "unfinished: CHERRY_PICK_HEAD; complete the single cherry-pick before $INTENT" "ls $GIT_DIR"
+    fi
 elif [ -e "$GIT_DIR/MERGE_HEAD" ]; then
     if [ "$INTENT" = commit ]; then
         report PASS in-progress "resolved merge ready for completion by commit; no other operation" "ls $GIT_DIR; git ls-files --unmerged"
@@ -155,13 +166,16 @@ if [ -n "$STAGED_FILES" ]; then
     # path must fail too. `git show :<path>` reads the index blob for every
     # added/modified/renamed/copied staged path; NULs from binary blobs are
     # dropped so bash does not warn, and grep -a keeps scanning them.
-    staged_blobs="$(git diff --cached --name-only -z --diff-filter=AMRC | xargs -0 -r -I{} git show ':{}' | tr -d '\0' || true)"
-    if grep -qaF -- "$HOME" <<<"$staged_blobs"; then
-        report FAIL home-paths "a staged blob contains $HOME; hooks and skills bind to the checkout, not a user" "git diff --cached --name-only -z --diff-filter=AMRC | xargs -0 -I{} git show ':{}' | grep -aF \$HOME"
-    elif grep -qaE '/(home|Users)/[A-Za-z0-9_.-]+' <<<"$staged_blobs"; then
-        report WARN home-paths "a staged blob mentions a /home or /Users path: $(grep -aoE '/(home|Users)/[A-Za-z0-9_.-]+' <<<"$staged_blobs" | sort -u | tr '\n' ' ')" "git show :<staged path> | grep -aE '/(home|Users)/'"
+    if ! staged_blobs="$(git diff --cached --name-only -z --diff-filter=AMRC | xargs -0 -r -I{} git show ':{}' | tr -d '\0')"; then
+        report FAIL home-paths "could not read the complete staged blob set; no clean-content claim is available" "git diff --cached --name-only -z --diff-filter=AMRC | xargs -0 -I{} git show ':{}'"
     else
-        report PASS home-paths "no user-home paths in any staged blob" "git show :<staged path> | grep -aE '/(home|Users)/'"
+        if grep -qaF -- "$HOME" <<<"$staged_blobs"; then
+            report FAIL home-paths "a staged blob contains $HOME; hooks and skills bind to the checkout, not a user" "git diff --cached --name-only -z --diff-filter=AMRC | xargs -0 -I{} git show ':{}' | grep -aF \$HOME"
+        elif grep -qaE '/(home|Users)/[A-Za-z0-9_.-]+' <<<"$staged_blobs"; then
+            report WARN home-paths "a staged blob mentions a /home or /Users path: $(grep -aoE '/(home|Users)/[A-Za-z0-9_.-]+' <<<"$staged_blobs" | sort -u | tr '\n' ' ')" "git show :<staged path> | grep -aE '/(home|Users)/'"
+        else
+            report PASS home-paths "no user-home paths in any staged blob" "git show :<staged path> | grep -aE '/(home|Users)/'"
+        fi
     fi
 
     if [ -x scripts/git-hooks/pre-commit-secret-scan.sh ]; then
@@ -170,6 +184,8 @@ if [ -n "$STAGED_FILES" ]; then
         else
             report FAIL secrets "credential-shaped strings in the staged set; run the hook for the lines" "scripts/git-hooks/pre-commit-secret-scan.sh"
         fi
+    else
+        report FAIL secrets "required staged-secret scanner is missing or not executable" "test -x scripts/git-hooks/pre-commit-secret-scan.sh"
     fi
 else
     report INFO staged-paths "nothing staged" "git diff --cached --name-only"
@@ -350,14 +366,18 @@ else
     report WARN venv "no .venv in this worktree: subprocess tests will fail as assertion errors; run scripts/worktree-cleanup.sh --link-venv" "ls -la .venv"
 fi
 if [ -x "$PY" ]; then
-    prov="$(PYTHONPATH="$ROOT/src:$ROOT/elspeth-lints/src" "$PY" -c '
+    if prov="$(PYTHONPATH="$ROOT/src:$ROOT/elspeth-lints/src" "$PY" -c '
 import elspeth, elspeth_lints
-print(elspeth.__file__); print(elspeth_lints.__file__)' 2>&1 || true)"
-    e_file="$(sed -n 1p <<<"$prov")"; l_file="$(sed -n 2p <<<"$prov")"
-    if [[ "$e_file" == "$ROOT/src/"* && "$l_file" == "$ROOT/elspeth-lints/src/"* ]]; then
-        report PASS provenance "elspeth and elspeth_lints import from THIS tree" "PYTHONPATH=\$ROOT/src:\$ROOT/elspeth-lints/src python -c 'import elspeth; print(elspeth.__file__)'"
+print(elspeth.__file__); print(elspeth_lints.__file__)' 2>&1)"; then
+        e_file="$(sed -n 1p <<<"$prov")"; l_file="$(sed -n 2p <<<"$prov")"
+        if [[ "$e_file" == "$ROOT/src/"* && "$l_file" == "$ROOT/elspeth-lints/src/"* ]]; then
+            report PASS provenance "elspeth and elspeth_lints import from THIS tree" "PYTHONPATH=\$ROOT/src:\$ROOT/elspeth-lints/src python -c 'import elspeth; print(elspeth.__file__)'"
+        else
+            report FAIL provenance "imports resolve outside this tree: $(tr '\n' ' ' <<<"$prov")" "python -c 'import elspeth; print(elspeth.__file__)'"
+        fi
     else
-        report FAIL provenance "imports resolve outside this tree: $(tr '\n' ' ' <<<"$prov")" "python -c 'import elspeth; print(elspeth.__file__)'"
+        prov_rc=$?
+        report FAIL provenance "import probe exited $prov_rc; cannot prove this tree's imports: $(tr '\n' ' ' <<<"$prov")" "python -c 'import elspeth; print(elspeth.__file__)'"
     fi
 else
     report FAIL provenance "no usable python at $PY" "ls -la $PY"

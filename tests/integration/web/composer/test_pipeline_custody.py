@@ -164,12 +164,12 @@ def test_finalize_refuses_ceiling_divergent_from_plan_time(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cancelled_common_join_leaves_blocked_custody_to_settle_exactly_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """elspeth-8607553d3b: custody settlement follows the WORKER, not the request.
 
     Block the custody worker at the filesystem write — it already holds the
     session custody lock and the pending row — then cancel the awaiting
-    planner task (deadline / request cancel). The settlement must be neither
+    common compose task (deadline / request cancel). The settlement must be neither
     released early (the task stays pending and the session lock stays held
     while the worker runs) nor retained forever (once the worker finishes,
     the row is ``ready`` exactly once, the lock is free, and the caller's
@@ -177,7 +177,7 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
     same row.
     """
     from elspeth.web.blobs import service as blobs_service
-    from elspeth.web.composer.pipeline_planner import _await_custody_settlement
+    from elspeth.web.composer.service import _await_tool_turn_with_deferred_cancellation
 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
     initialize_session_schema(engine)
@@ -233,14 +233,23 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
             session_operation_authority=sessions.session_operation_authority,
         )
 
+    cancellation_requested = asyncio.Event()
+
+    async def settle() -> BlobRecord:
+        result, cancellation = await _await_tool_turn_with_deferred_cancellation(finalize(), cancellation_requested=cancellation_requested)
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    settlement = asyncio.create_task(settle())
     try:
-        settlement = asyncio.create_task(_await_custody_settlement(finalize()))
         assert await run_sync_in_worker(blocked.wait, 5), "custody worker never reached the blocked write"
 
-        # The planner gives up on the request while the worker is mid-flight.
-        settlement.cancel()
+        # The common caller gives up while the custody worker is mid-flight.
+        settlement.cancel("cancel during blocked custody")
         await asyncio.sleep(0.2)
         assert not settlement.done(), "settlement was released before the custody worker finished"
+        assert cancellation_requested.is_set()
 
         # The session custody lock is still held by the running worker: a
         # competing same-session writer must wait, not slip in.
@@ -257,12 +266,14 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
         # Actual worker completion: settle once, free the lock, then re-raise
         # the caller's cancellation.
         release.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as caught:
             await settlement
+        assert caught.value.args == ("cancel during blocked custody",)
         assert competitor_entered.wait(5), "session lock was not released after the custody worker finished"
         competitor_thread.join(timeout=5)
     finally:
         release.set()
+        await asyncio.wait_for(asyncio.gather(settlement, return_exceptions=True), 10)
 
     with engine.connect() as conn:
         rows = conn.execute(select(blobs_table.c.id, blobs_table.c.status).where(blobs_table.c.session_id == session_id)).all()
@@ -270,7 +281,7 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
     storage = tmp_path.expanduser().resolve() / "blobs" / session_id / f"{custody.blob_id}_candidate.csv"
     assert storage.read_bytes() == custody.request.content
 
-    # The retry (next planner attempt) is idempotent: same row, no duplicate.
+    # The retry is idempotent: same row, no duplicate.
     retried = await finalize()
     sessions.session_operation_authority.release(operation_context)
     assert str(retried.id) == str(custody.blob_id)

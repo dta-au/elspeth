@@ -53,6 +53,8 @@ from elspeth_lints.core.judge import (
 # parameter is named ``arguments`` — the canonical decorator-suggestion case
 # from the prototype plan (Pillar B sketch). The model's
 # ``should_use_decorator: "arguments"`` response should fire here.
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime", "synthetic_judge_worker")
+
 _SYNTHETIC_BOUNDARY_SOURCE = '''\
 """Synthetic boundary module used in judge-decorator integration tests."""
 

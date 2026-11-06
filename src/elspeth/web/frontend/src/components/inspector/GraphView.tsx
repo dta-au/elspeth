@@ -61,6 +61,7 @@ import type { CompositionState } from "@/types/index";
 import { ConfigRows } from "./ConfigRows";
 import { OptionRows } from "./OptionRows";
 import { GraphOutputs } from "./GraphOutputs";
+import { GraphChecksum } from "./GraphChecksum";
 import { visibleGraphRoutes } from "@/lib/graphRouteVisibility";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 
@@ -2145,11 +2146,19 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   //
   if (nodes.length === 0) {
     return (
-      <div className="empty-state graph-view-empty">
-        <p className="graph-view-empty-title">No pipeline to visualise.</p>{" "}
-        <p className="graph-view-empty-hint">
-          Start a conversation to build one.
-        </p>
+      <div className="graph-view-shell">
+        {compositionState && (
+          <GraphChecksum
+            contentHash={compositionState.composition_content_hash}
+            stateIdentity={JSON.stringify([compositionState.session_id, compositionState.id, compositionState.version])}
+          />
+        )}
+        <div className="empty-state graph-view-empty">
+          <p className="graph-view-empty-title">No pipeline to visualise.</p>{" "}
+          <p className="graph-view-empty-hint">
+            Start a conversation to build one.
+          </p>
+        </div>
       </div>
     );
   }
@@ -2179,6 +2188,12 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       <div
         className="graph-view-shell"
       >
+        {compositionState && (
+          <GraphChecksum
+            contentHash={compositionState.composition_content_hash}
+            stateIdentity={JSON.stringify([compositionState.session_id, compositionState.id, compositionState.version])}
+          />
+        )}
         <div className="graph-view-toolbar">
           <Button compact aria-pressed={showFailureRoutes} onClick={() => setShowFailureRoutes((shown) => !shown)}>
             {showFailureRoutes ? "Hide" : "Show"} quarantine and discard routes

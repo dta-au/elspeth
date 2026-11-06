@@ -13,6 +13,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.protocol import ComposerPluginCrashError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import CompositionState, OutputSpec, ValidationSummary
 from elspeth.web.composer.tools import execute_tool, outputs
@@ -416,7 +417,7 @@ async def test_output_outer_schema_fault_preserves_earlier_completed_state_and_a
             {"id": "output_fault", "name": tool, "arguments": args},
         ]
     )
-    llm = create_autospec(service._provider_gateway._call_llm, return_value=response)
+    llm = create_autospec(service._provider_gateway._call_llm, return_value=_admit_composer_llm_completion(response))
     monkeypatch.setattr(service._provider_gateway, "_call_llm", llm)
     recorder = BufferingRecorder()
     monkeypatch.setattr("elspeth.web.composer.service.BufferingRecorder", lambda: recorder)

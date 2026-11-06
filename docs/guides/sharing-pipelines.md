@@ -70,15 +70,23 @@ accept this trade-off.
 ## First-deploy operator action
 
 Since 0.8.1, shareable-review state is part of the broader web session
-database contract. The unreleased 0.8.9 candidate expects `SESSION_SCHEMA_EPOCH=78`
+database contract. The unreleased 0.8.10 candidate expects `SESSION_SCHEMA_EPOCH=84`
 and `SQLITE_SCHEMA_EPOCH=50`; confirm both against the deployed service's
 live schema constants before a fresh installation.
 
 Epoch 78 retains authoritative committed graph-review facts and adds durable quota
 custody and shared rate-limit policy binding; Landscape epoch 50 binds run calls
-to provider attempts. Preserve epoch-75, both distinct epoch-76 and epoch-77 session
-store contracts and epoch-49 Landscape stores with their compatible prior application,
-and provision separate epoch-78 Sessions and epoch-50 Landscape targets for the candidate.
+to provider attempts. Preserve epoch-75, both distinct epoch-76, epoch-77, epoch-78 and epoch-79 session
+store contracts and epoch-49 Landscape stores with their compatible prior application.
+Preserve epoch-80 through epoch-83 Sessions stores unchanged too, and provision
+separate epoch-84 Sessions and epoch-50 Landscape targets for the candidate.
+Epoch 82 makes the admitted continuation policy version, hash and retained-payload
+allowance immutable in the parent operation. Epoch 83 adds the V4 paid-provider
+policy contract and provider-terminal hold table. Epoch 84 adds the distinct
+`paid_overflow` effect and private receipt contract. Existing epoch-81 through
+epoch-83 stores are refused without automatic migration or reset; V1/V2 policies
+can be created/resumed only within a compatible epoch-84 store. This change
+does not activate V3/V4 admission or change the application's policy default.
 Drain and isolate old/new workers; they must
 not share these stores. Compatibility keys do not automatically evict old
 replicas.

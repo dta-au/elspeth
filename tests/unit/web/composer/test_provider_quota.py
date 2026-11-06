@@ -36,6 +36,7 @@ from elspeth.web.composer.provider_quota import (
     composer_quota_scope,
     provider_call_scope,
     quota_provider_calls,
+    required_provider_audit_scope,
 )
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageSource
 from elspeth.web.prompt_guard_config import PromptGuardSettings
@@ -590,3 +591,552 @@ async def test_one_turn_obeys_actual_persisted_daily_cap(tmp_path: Path, first_u
     finally:
         authority.release(context)
         engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_index", [0, 1, 2])
+@pytest.mark.parametrize("bad_cost", [None, 6.0])
+async def test_actual_common_roles_share_one_settled_cost_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_index: int,
+    bad_cost: float | None,
+) -> None:
+    from decimal import Decimal
+
+    from elspeth.web.composer.provider_cost import (
+        CommonProviderCostBudget,
+        CommonProviderCostPolicy,
+        CommonProviderCostRefused,
+        CommonProviderCostSnapshot,
+    )
+
+    engine, authority, service = _quota_service(tmp_path)
+    session = authority.create_session_with_initial_fence(
+        user_id="alice", title="cost", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
+    )
+    context = authority.acquire(
+        session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    )
+    owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+    budget = CommonProviderCostBudget(
+        CommonProviderCostSnapshot(
+            str(session.id), "original-user-message", 2, "continuation_v2", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
+        )
+    )
+    owner.bind_cost_budget(budget)
+    recorder = BufferingRecorder()
+    calls: list[dict[str, Any]] = []
+
+    async def sdk(**kwargs: Any) -> SimpleNamespace:
+        assert len(_ledger(engine)) == len(calls)
+        calls.append(kwargs)
+        assert budget.snapshot().physical_calls == len(calls)
+        assert kwargs["max_tokens"] == 16384
+        index = len(calls) - 1
+        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        usage["cost"] = 0.01 if index != bad_index else "malformed-explicit-cost" if bad_cost is None else bad_cost
+        return SimpleNamespace(usage=usage)
+
+    monkeypatch.setattr("litellm.acompletion", sdk)
+    families = (ProviderInvocationFamily.PRIMARY, ProviderInvocationFamily.ADVISOR, ProviderInvocationFamily.ADVISOR)
+    with pytest.raises(CommonProviderCostRefused) as refused:
+        for family in families:
+            custody = owner.mint(family)
+            async with provider_call_scope(custody):
+                started_at, started_ns = datetime.now(UTC), time.monotonic_ns()
+                response = await _litellm_acompletion(
+                    prompt_guard_mount=None,
+                    prompt_guard_mode="debug-when-unconfigured",
+                    prompt_guard_role="composer" if family is ProviderInvocationFamily.PRIMARY else "advisor",
+                    prompt_guard_user_prompt="Actual policy boundary fixture.",
+                    provider_custody=custody,
+                    model="test/unknown-cost-model",
+                    messages=[{"role": "user", "content": "Actual policy boundary fixture."}],
+                )
+                custody.mark_cost_response_accountable(admitted_metadata=True)
+                recorder.record_llm_call(
+                    build_llm_call_record(
+                        model_requested="test/unknown-cost-model",
+                        messages=[],
+                        tools=None,
+                        status=ComposerLLMCallStatus.SUCCESS,
+                        started_at=started_at,
+                        started_ns=started_ns,
+                        temperature=None,
+                        seed=None,
+                        response=response,
+                        provider_custody=custody,
+                    ),
+                    provider_custody=custody,
+                )
+    assert refused.value.code == ("COST_UNAVAILABLE" if bad_cost is None else "COST_CAP_EXCEEDED")
+    assert len(calls) == len(_ledger(engine)) == len(recorder.llm_calls) == bad_index + 1
+    assert budget.snapshot().physical_calls == bad_index + 1
+    assert tuple(c.call_id for c in budget.snapshot().charges) == tuple(c.call_id for c in recorder.llm_calls)
+    assert recorder.llm_calls[-1].provider_cost == bad_cost
+    assert budget.snapshot().cost_known is (bad_cost is not None)
+    with pytest.raises(CommonProviderCostRefused):
+        budget.require_dispatch()
+    with pytest.raises(AuditIntegrityError, match="cannot replace"):
+        owner.bind_cost_budget(CommonProviderCostBudget(budget.snapshot()))
+
+
+@pytest.mark.parametrize(
+    ("cost", "tokens", "expected"),
+    [
+        (5.0, 5, None),
+        (5.01, 5, "COST_CAP_EXCEEDED"),
+        (0.01, 16384, None),
+        (0.01, 16385, "COMPLETION_TOKENS_EXCEEDED"),
+        (None, 5, "COST_UNAVAILABLE"),
+        (0.01, None, "MALFORMED_RESPONSE"),
+    ],
+)
+def test_common_settled_response_exact_boundaries(cost, tokens, expected):
+    from dataclasses import replace
+    from decimal import Decimal
+
+    from elspeth.web.composer.provider_cost import (
+        CommonProviderCostBudget,
+        CommonProviderCostPolicy,
+        CommonProviderCostRefused,
+        CommonProviderCostSnapshot,
+    )
+
+    budget = CommonProviderCostBudget(
+        CommonProviderCostSnapshot(
+            "session", "request", 2, "continuation_v2", CommonProviderCostPolicy(1, 2097152, 16384, Decimal("5.00"), 2)
+        )
+    )
+    budget.dispatched()
+    usage = {"prompt_tokens": 10}
+    if tokens is not None:
+        usage["completion_tokens"] = tokens
+    if cost is not None:
+        usage["cost"] = cost
+    call = build_llm_call_record(
+        model_requested="test/unknown-cost-model",
+        messages=[],
+        tools=None,
+        status=ComposerLLMCallStatus.SUCCESS,
+        started_at=datetime.now(UTC),
+        started_ns=time.monotonic_ns(),
+        temperature=None,
+        seed=None,
+        response=SimpleNamespace(usage=usage),
+    )
+    call = replace(call, call_id="unit-physical-call")
+    budget.consume_settled(call, response_accountable=True)
+    if expected is None:
+        budget.require_output()
+        with pytest.raises(CommonProviderCostRefused, match="PROVIDER_CALLS_EXHAUSTED"):
+            budget.require_dispatch()
+    else:
+        with pytest.raises(CommonProviderCostRefused, match=expected):
+            budget.require_output()
+    with pytest.raises(AuditIntegrityError, match="charged twice"):
+        budget.consume_settled(call, response_accountable=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["timeout", "cancelled"])
+async def test_failed_sdk_unknown_keeps_original_outcome_and_end_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    from decimal import Decimal
+
+    from elspeth.web.composer.provider_cost import (
+        CommonProviderCostBudget,
+        CommonProviderCostPolicy,
+        CommonProviderCostRefused,
+        CommonProviderCostSnapshot,
+    )
+
+    engine, authority, service = _quota_service(tmp_path)
+    session = authority.create_session_with_initial_fence(
+        user_id="alice", title="failed cost", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
+    )
+    context = authority.acquire(
+        session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    )
+    owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+    budget = CommonProviderCostBudget(
+        CommonProviderCostSnapshot(
+            str(session.id), "original-user-message", 2, "continuation_v2", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
+        )
+    )
+    owner.bind_cost_budget(budget)
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    recorder = BufferingRecorder()
+    failure = TimeoutError("actual transport timeout") if failure_kind == "timeout" else asyncio.CancelledError("actual cancel")
+    status = ComposerLLMCallStatus.TIMEOUT if failure_kind == "timeout" else ComposerLLMCallStatus.CANCELLED
+    physical = 0
+
+    async def sdk(**kwargs: Any):
+        nonlocal physical
+        physical += 1
+        raise failure
+
+    monkeypatch.setattr("litellm.acompletion", sdk)
+    with pytest.raises(type(failure)) as caught:
+        async with provider_call_scope(custody):
+            started_at, started_ns = datetime.now(UTC), time.monotonic_ns()
+            try:
+                await _litellm_acompletion(
+                    prompt_guard_mount=None,
+                    prompt_guard_mode="debug-when-unconfigured",
+                    prompt_guard_role="composer",
+                    prompt_guard_user_prompt="Actual failed call fixture.",
+                    provider_custody=custody,
+                    model="test/unknown-cost-model",
+                    messages=[{"role": "user", "content": "Actual failed call fixture."}],
+                )
+            finally:
+                custody.mark_cost_response_accountable(admitted_metadata=False)
+                recorder.record_llm_call(
+                    build_llm_call_record(
+                        model_requested="test/unknown-cost-model",
+                        messages=[],
+                        tools=None,
+                        status=status,
+                        started_at=started_at,
+                        started_ns=started_ns,
+                        temperature=None,
+                        seed=None,
+                        error_class=type(failure).__name__,
+                        error_message=type(failure).__name__,
+                        provider_custody=custody,
+                    ),
+                    provider_custody=custody,
+                )
+    assert caught.value is failure
+    assert physical == len(_ledger(engine)) == len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is status
+    assert recorder.llm_calls[0].provider_cost is None
+    assert recorder.llm_calls[0].prompt_tokens is None and recorder.llm_calls[0].completion_tokens is None
+    assert budget.snapshot().cost_known is False
+    assert budget.snapshot().validated_cost == Decimal("0")
+    budget.require_output()
+    budget.require_dispatch()
+    with pytest.raises(CommonProviderCostRefused, match="COST_UNAVAILABLE"):
+        budget.require_end_headroom()
+    # This fixture has a real identity token quota. Unlike the no-quota-policy
+    # HTTP retry case, an actual next admission must refuse unknown token usage.
+    next_custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    with pytest.raises(ChargeableAdmissionRefused) as refused:
+        async with provider_call_scope(next_custody):
+            await _litellm_acompletion(
+                prompt_guard_mount=None,
+                prompt_guard_mode="debug-when-unconfigured",
+                prompt_guard_role="composer",
+                prompt_guard_user_prompt="Actual failed call fixture.",
+                provider_custody=next_custody,
+                model="test/unknown-cost-model",
+                messages=[{"role": "user", "content": "Actual failed call fixture."}],
+            )
+    assert refused.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
+    assert physical == len(_ledger(engine)) == 1
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body_fails", [False, True], ids=["settlement-only", "body-and-settlement"])
+async def test_cost_charge_does_not_precede_failed_required_settlement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body_fails: bool):
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostPolicy, CommonProviderCostSnapshot
+    from elspeth.web.sessions.models import composition_proposals_table
+
+    engine, authority, service = _quota_service(tmp_path)
+    session = authority.create_session_with_initial_fence(
+        user_id="alice", title="settlement failure", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
+    )
+    context = authority.acquire(
+        session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    )
+    owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+    budget = CommonProviderCostBudget(
+        CommonProviderCostSnapshot(
+            str(session.id), "request", 2, "continuation_v2", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("5.00"), 2)
+        )
+    )
+    owner.bind_cost_budget(budget)
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    recorder = BufferingRecorder()
+    failure = AuditIntegrityError("injected required settlement failure")
+    settlement_cause = OSError("original settlement cause")
+    failure.__cause__ = settlement_cause
+    body_failure = RuntimeError("original provider body failure")
+    body_cause = ValueError("original provider body cause")
+    body_failure.__cause__ = body_cause
+    settlement_calls: list[ComposerLLMCall] = []
+    physical = 0
+
+    async def fail_settlement(**kwargs):
+        assert kwargs["call"] is custody.call
+        settlement_calls.append(kwargs["call"])
+        raise failure
+
+    async def sdk(**kwargs):
+        nonlocal physical
+        physical += 1
+        return SimpleNamespace(usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01})
+
+    monkeypatch.setattr(service, "finish_provider_attempt", fail_settlement)
+    monkeypatch.setattr("litellm.acompletion", sdk)
+    with pytest.raises(BaseException) as caught:
+        async with provider_call_scope(custody):
+            started_at, started_ns = datetime.now(UTC), time.monotonic_ns()
+            response = await _litellm_acompletion(
+                prompt_guard_mount=None,
+                prompt_guard_mode="debug-when-unconfigured",
+                prompt_guard_role="composer",
+                prompt_guard_user_prompt="Settlement failure control.",
+                provider_custody=custody,
+                model="test/unknown-cost-model",
+                messages=[{"role": "user", "content": "Settlement failure control."}],
+            )
+            custody.mark_cost_response_accountable(admitted_metadata=True)
+            recorder.record_llm_call(
+                build_llm_call_record(
+                    model_requested="test/unknown-cost-model",
+                    messages=[],
+                    tools=None,
+                    status=ComposerLLMCallStatus.SUCCESS,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    temperature=None,
+                    seed=None,
+                    response=response,
+                    provider_custody=custody,
+                ),
+                provider_custody=custody,
+            )
+            if body_fails:
+                raise body_failure
+    if body_fails:
+        assert isinstance(caught.value, ExceptionGroup)
+        assert len(caught.value.exceptions) == 2
+        assert caught.value.exceptions[0] is body_failure
+        assert caught.value.exceptions[1] is failure
+        assert body_failure.__cause__ is body_cause
+    else:
+        assert caught.value is failure
+    assert failure.__cause__ is settlement_cause
+    assert physical == 1
+    assert settlement_calls == [recorder.llm_calls[0]]
+    assert settlement_calls[0] is recorder.llm_calls[0]
+    assert custody.attempt is not None and custody.call is recorder.llm_calls[0]
+    assert _ledger(engine) == []
+    messages = await service.get_messages(session.id)
+    assert len(messages) == 1
+    assert messages[0].role == "audit"
+    assert messages[0].tool_calls is not None
+    assert messages[0].tool_calls[0]["_kind"] == "prompt_guard_audit"
+    with engine.connect() as connection:
+        assert connection.execute(select(composition_proposals_table)).all() == []
+    assert budget.snapshot().physical_calls == 1
+    assert budget.snapshot().charges == ()
+    assert budget.snapshot().cost_known is False
+
+
+@pytest.mark.parametrize("cancelled", [False, True], ids=["body-error", "body-cancellation"])
+def test_required_provider_audit_preserves_body_and_construction_failure(cancelled: bool) -> None:
+    """An owned audit scope retains both failures and leaves its neighbors exact."""
+    context = SessionOperationContext(
+        fence=SessionOperationFence(session_id=str(uuid4()), operation_id=str(uuid4()), lease_token="token", operation_epoch=1),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    )
+    owner = ProviderInvocationOwner(
+        service=cast(SessionServiceProtocol, AttemptService()),
+        required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN),
+    )
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    body = asyncio.CancelledError("body cancellation") if cancelled else RuntimeError("body failure")
+    body_cause = ValueError("body cause")
+    body.__cause__ = body_cause
+    audit_failure = AuditIntegrityError("audit construction failure")
+    audit_cause = LookupError("audit cause")
+    audit_failure.__cause__ = audit_cause
+    reached: list[str] = []
+
+    with pytest.raises(BaseException) as caught:
+        try:
+            reached.append("body")
+            raise body
+        finally:
+            with required_provider_audit_scope(custody):
+                reached.append("audit")
+                raise audit_failure
+    assert reached == ["body", "audit"]
+    assert isinstance(caught.value, BaseExceptionGroup)
+    assert len(caught.value.exceptions) == 2
+    assert caught.value.exceptions[0] is body
+    assert caught.value.exceptions[1] is audit_failure
+    assert body.__cause__ is body_cause
+    assert audit_failure.__cause__ is audit_cause
+
+    # A successfully constructed audit leaves the original body authoritative.
+    with pytest.raises(BaseException) as body_only:
+        try:
+            raise body
+        finally:
+            with required_provider_audit_scope(custody):
+                reached.append("audit-completed")
+    assert body_only.value is body
+    assert body_only.value.__cause__ is body_cause
+    assert reached == ["body", "audit", "audit-completed"]
+
+    # Audit failure without a body stays the exact original, without a group.
+    with pytest.raises(AuditIntegrityError) as audit_only, required_provider_audit_scope(custody):
+        raise audit_failure
+    assert audit_only.value is audit_failure
+    assert audit_only.value.__cause__ is audit_cause
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body_fails", [False, True], ids=["cost-only", "body-and-cost"])
+async def test_provider_body_and_cost_refusal_follow_actual_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body_fails: bool
+) -> None:
+    """Required accounting commits before monetary refusal retains both owners."""
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from elspeth.web.composer.provider_cost import (
+        CommonProviderCostBudget,
+        CommonProviderCostPolicy,
+        CommonProviderCostRefused,
+        CommonProviderCostSnapshot,
+    )
+    from elspeth.web.sessions.models import composition_proposals_table, quota_provider_attempts_table
+
+    engine, authority, service = _quota_service(tmp_path)
+    session = authority.create_session_with_initial_fence(
+        user_id="alice", title="body and cost refusal", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
+    )
+    context = authority.acquire(
+        session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    )
+    owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+    budget = CommonProviderCostBudget(
+        CommonProviderCostSnapshot(
+            str(session.id), "request", 2, "continuation_v2", CommonProviderCostPolicy(75, 2097152, 16384, Decimal("0.005"), 2)
+        )
+    )
+    owner.bind_cost_budget(budget)
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    recorder = BufferingRecorder()
+    body_failure = RuntimeError("original body before monetary refusal")
+    body_cause = ValueError("original body cause")
+    body_failure.__cause__ = body_cause
+    refusals: list[CommonProviderCostRefused] = []
+    settlement_calls: list[ComposerLLMCall] = []
+    physical = 0
+    real_finish = service.finish_provider_attempt
+    real_require_output = budget.require_output
+
+    async def finish(**kwargs):
+        assert kwargs["call"] is custody.call
+        await real_finish(**kwargs)
+        settlement_calls.append(kwargs["call"])
+
+    def require_output() -> None:
+        try:
+            real_require_output()
+        except CommonProviderCostRefused as refusal:
+            refusals.append(refusal)
+            raise
+
+    async def sdk(**kwargs):
+        nonlocal physical
+        physical += 1
+        return SimpleNamespace(usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01})
+
+    monkeypatch.setattr(service, "finish_provider_attempt", finish)
+    monkeypatch.setattr(budget, "require_output", require_output)
+    monkeypatch.setattr("litellm.acompletion", sdk)
+    with pytest.raises(BaseException) as caught:
+        async with provider_call_scope(custody):
+            started_at, started_ns = datetime.now(UTC), time.monotonic_ns()
+            response = await _litellm_acompletion(
+                prompt_guard_mount=None,
+                prompt_guard_mode="debug-when-unconfigured",
+                prompt_guard_role="composer",
+                prompt_guard_user_prompt="Body and monetary refusal control.",
+                provider_custody=custody,
+                model="test/unknown-cost-model",
+                messages=[{"role": "user", "content": "Body and monetary refusal control."}],
+            )
+            custody.mark_cost_response_accountable(admitted_metadata=True)
+            recorder.record_llm_call(
+                build_llm_call_record(
+                    model_requested="test/unknown-cost-model",
+                    messages=[],
+                    tools=None,
+                    status=ComposerLLMCallStatus.SUCCESS,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    temperature=None,
+                    seed=None,
+                    response=response,
+                    provider_custody=custody,
+                ),
+                provider_custody=custody,
+            )
+            if body_fails:
+                raise body_failure
+
+    assert len(refusals) == 1
+    assert refusals[0].code == "COST_CAP_EXCEEDED"
+    assert refusals[0].call_id == recorder.llm_calls[0].call_id
+    assert refusals[0].__cause__ is None
+    if body_fails:
+        assert isinstance(caught.value, ExceptionGroup)
+        assert len(caught.value.exceptions) == 2
+        assert caught.value.exceptions[0] is body_failure
+        assert caught.value.exceptions[1] is refusals[0]
+        assert body_failure.__cause__ is body_cause
+    else:
+        assert caught.value is refusals[0]
+    assert physical == 1
+    assert settlement_calls == [recorder.llm_calls[0]]
+    assert settlement_calls[0] is recorder.llm_calls[0]
+    assert len(_ledger(engine)) == 1
+    messages = await service.get_messages(session.id)
+    assert len(messages) == 2
+    for message in messages:
+        assert message.role == "audit"
+        assert message.tool_calls is not None
+    assert [message.tool_calls[0]["_kind"] for message in messages] == ["prompt_guard_audit", "llm_call_audit"]
+    assert custody.attempt is None and custody.call is None
+    assert budget.snapshot().physical_calls == len(budget.snapshot().charges) == 1
+    assert budget.snapshot().charges[0].call_id == recorder.llm_calls[0].call_id
+    with engine.connect() as connection:
+        attempt = connection.execute(select(quota_provider_attempts_table)).one()
+        assert connection.execute(select(composition_proposals_table)).all() == []
+    assert attempt.attempt_id == recorder.llm_calls[0].call_id
+    assert attempt.settled_at is not None and attempt.ledger_entry_id is not None
+    coordinator.assert_completed()

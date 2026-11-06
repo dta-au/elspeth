@@ -72,6 +72,7 @@ class _EarlyCompletionResume:
         _insert_failed_run(self.db, run_id)
         self.factory = MagicMock(spec=RecorderFactory)
         self.factory.scheduler.count_active_work.return_value = 0
+        self.factory.scheduler.list_unadopted_group_losses.return_value = []
         # Every token is accounted for: the resume coverage check finds nothing uncovered.
         self.factory.scheduler.leases.verify_resume_coverage.return_value = None
         self.factory.barrier_restore.pending_empty_expansion_groups.return_value = ()
@@ -176,6 +177,8 @@ def test_resume_final_heartbeat_failure_survives_release_and_flush() -> None:
     ):
         harness.drive(backstop=backstop, derive=derive)
     assert raised.value is failure
+    backstop.assert_called_once()
+    derive.assert_called_once()
     harness.factory.run_coordination.release_seat.assert_called()
     flush.assert_called_once()
     assert all(call.kwargs["status"].value != "completed" for call in summary.call_args_list)

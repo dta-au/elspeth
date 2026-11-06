@@ -1,7 +1,7 @@
-per_file_rules:
-- pattern: mcp/server.py
-  rules:
-  - FG1
-  reason: _ToolDef.schema_properties uses a direct MappingProxyType wrap over recursively copied JSON schema mappings while preserving JSON Schema list shape.
+allow_hits:
+- key: mcp/server.py:FG1:_module_:fp=3885050f76feeb11
+  owner: "@elspeth-maintainers"
+  reason: _ToolDef.schema_properties uses a direct MappingProxyType wrap over recursively copied JSON schema mappings
+    while preserving JSON Schema list shape.
+  safety: _freeze_schema_properties recursively copies and freezes the nested schema before the outer wrap.
   expires: null
-  max_hits: 1

@@ -98,6 +98,7 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import tools as tools_module
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
@@ -134,7 +135,6 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
-from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -662,9 +662,10 @@ class _FakeComposeLLM:
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _AdmittedLLMCompletion:
         del provider_custody, credential_state, prompt_guard_trusted_message_indexes
-        del prompt_guard_content_parts, prompt_guard_tool_argument_parts
+        del prompt_guard_content_parts, prompt_guard_tool_argument_parts, prepared_input
         if not self._responses:
             return _admit_composer_llm_completion(_fake_llm_response(content="Done."))
         return _admit_composer_llm_completion(self._responses.pop(0))
@@ -1334,11 +1335,3 @@ def inject_IntegrityError_on_chat_messages(monkeypatch: pytest.MonkeyPatch) -> N
         return original_insert(self, *args, **kwargs)
 
     monkeypatch.setattr(SessionServiceImpl, "_insert_chat_message", _raise_for_chat_messages)
-
-
-@pytest.fixture(autouse=True)
-def _fenced_compose_for_legacy_tests(monkeypatch):
-    """Legacy compose() / _run_one_turn_for_test callers that name a session but
-    carry no session-operation context acquire an exact, short-lived COMPOSE
-    lease (the shared adapter in tests/helpers/composer_lease.py)."""
-    install_fenced_compose_adapter(monkeypatch)

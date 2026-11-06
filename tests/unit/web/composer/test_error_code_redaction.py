@@ -108,16 +108,16 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/turn_audit.py", "_state_payload_for_compose_turn", "error.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
         ("composer/advisor_policy.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
-        # Planner / discovery feedback that projects an already-produced code,
-        # a closed ``ToolArgumentError.code`` or a closed category value.
-        ("composer/pipeline_planner.py", "_compile_candidate_feedback", "code"),
-        ("composer/pipeline_planner.py", "_allowlisted_argument_error_entry", "error.code or 'argument_error'"),
-        ("composer/pipeline_planner.py", "_plan_pipeline_inner", "entry.error_code or 'validation_error'"),
-        ("composer/pipeline_planner.py", "execute_one_discovery", "exc.category.value"),
+        # Live commit / discovery feedback forwards an already-produced code
+        # or a closed ToolArgumentError category. The retired planner-only
+        # projectors no longer produce a code and are not census exemptions.
         ("composer/pipeline_commit.py", "prepare_pipeline_proposal_commit", "exc.category.value"),
         ("composer/provider_discovery_response.py", "to_wire", "code"),
         ("composer/provider_discovery_response.py", "to_wire", "self.error_code"),
         ("composer/tools/generation.py", "_execute_explain_validation_error", "code"),
+        # Forwarded only after explain_validation_code resolved it as an exact
+        # catalogue key; the catalogue is a subset of the registry (pinned below).
+        ("composer/tools/generation.py", "_execute_explain_validation_error", "error_text"),
         # Source-proof completion retains detector-owned blocking codes (the
         # _blocking_diagnostic closed set is pinned below) and existing
         # state.validate() entries, whose producers this census already scans.
@@ -128,6 +128,11 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("sessions/routes/_helpers.py", "_message_response", "projected.rejection.error_code"),
         # Not a producer: the redaction allowlist entry for the field itself.
         ("composer/redaction.py", "<module>", "REGISTERED_ERROR_CODES"),
+        # Not producers: the continuation codec serialises an existing
+        # ValidationError's own code, and the P4 receipt hashes a persisted
+        # rejection row's stored code. Each code was censused where it was made.
+        ("composer/continuation_batch_data.py", "_members", "value.error_code"),
+        ("sessions/continuation_p4.py", "_rejection_row_hash", "row.error_code"),
         # --- Outside web/composer ---
         # Plugin-policy findings: the finding's own (censused) code, and the
         # PluginUnavailableReason members the registry holds.

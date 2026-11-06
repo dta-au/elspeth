@@ -1,0 +1,30 @@
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import (
+    operation_postgres_target as operation_postgres_target,
+)
+from tests.testcontainer.web.test_composer_operations_postgres import (
+    operation_store as operation_store,
+)
+from tests.unit.web.sessions.test_common_mutation_authority_workers import (
+    test_blob_custody_and_preferences_serialize_actual_filesystem_effects as test_blob_custody_and_preferences_serialize_actual_filesystem_effects,
+)
+from tests.unit.web.sessions.test_common_mutation_authority_workers import (
+    test_durable_stop_and_p4_obey_both_session_lock_orders as test_durable_stop_and_p4_obey_both_session_lock_orders,
+)
+from tests.unit.web.sessions.test_common_mutation_authority_workers import (
+    test_ordinary_p4_cancel_while_physically_queued_never_starts_sql as test_ordinary_p4_cancel_while_physically_queued_never_starts_sql,
+)
+from tests.unit.web.sessions.test_common_mutation_authority_workers import (
+    test_p4_cancel_before_worker_admission_retains_original_and_has_no_sql as test_p4_cancel_before_worker_admission_retains_original_and_has_no_sql,
+)
+from tests.unit.web.sessions.test_common_mutation_authority_workers import (
+    test_preferences_and_p4_obey_both_session_lock_orders as test_preferences_and_p4_obey_both_session_lock_orders,
+)
+from tests.unit.web.sessions.test_common_mutation_authority_workers import (
+    test_required_p4_queued_cancellation_keeps_actual_sql_and_original_objects as test_required_p4_queued_cancellation_keeps_actual_sql_and_original_objects,
+)
+from tests.unit.web.sessions.test_common_mutation_authority_workers import (
+    test_started_p4_joins_repeated_original_cancellations_and_actual_sql as test_started_p4_joins_repeated_original_cancellations_and_actual_sql,
+)
+
+pytestmark = pytest.mark.testcontainer

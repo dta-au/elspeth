@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from uuid import UUID
 
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.test_routes import (
     _create_test_composition_proposal,
@@ -13,15 +14,13 @@ from tests.unit.web.sessions.test_routes import (
     _save_test_composition_state,
 )
 
-from elspeth.web.sessions.protocol import CompositionStateData
-
 
 def test_stale_base_has_named_refusal_and_remains_rejectable(tmp_path: Path) -> None:
     app, service = _make_app(tmp_path)
     client = SyncASGITestClient(app)
     session = client.post("/api/sessions", json={"title": "Obsolete proposal"}).json()
     session_id = UUID(session["id"])
-    base = asyncio.run(_save_test_composition_state(service, session_id, CompositionStateData(), provenance="session_seed"))
+    base = asyncio.run(_save_test_composition_state(service, session_id, composition_state_data(), provenance="session_seed"))
     proposal = asyncio.run(
         _create_test_composition_proposal(
             service,
@@ -37,7 +36,7 @@ def test_stale_base_has_named_refusal_and_remains_rejectable(tmp_path: Path) -> 
             actor="composer-web:user:alice",
         )
     )
-    newer = asyncio.run(_save_test_composition_state(service, session_id, CompositionStateData(), provenance="session_seed"))
+    newer = asyncio.run(_save_test_composition_state(service, session_id, composition_state_data(), provenance="session_seed"))
     response = client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept")
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["error_type"] == "proposal_base_state_changed"

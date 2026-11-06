@@ -33,6 +33,7 @@ from elspeth.web.composer.yaml_generator import (
     public_export_redaction_header,
 )
 from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+from elspeth.web.composer.yaml_serializer import ComposerYamlSerializer
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY, SOURCE_AUTHORING_KEY
 
 
@@ -1684,3 +1685,61 @@ class TestPublicExportRedactionMarker:
         here rather than 500-ing the export route.
         """
         assert set(_MARKER_LABELS) == _PUBLIC_STORAGE_OPTION_KEYS | _PUBLIC_SOURCE_LINKAGE_KEYS
+
+
+@pytest.mark.parametrize(
+    "state_factory",
+    [_make_linear_pipeline, _make_gate_pipeline, _make_aggregation_pipeline, _make_fork_coalesce_pipeline],
+    ids=["linear", "gate", "aggregation", "fork-coalesce"],
+)
+def test_stateless_yaml_serializer_preserves_canonical_bytes(state_factory) -> None:
+    state = state_factory()
+    before = state.to_dict()
+    expected = generate_yaml(state)
+
+    assert ComposerYamlSerializer().generate_yaml(state) == expected
+    assert state.to_dict() == before
+
+
+def test_stateless_yaml_serializer_resolves_actual_function_and_preserves_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer import yaml_generator
+
+    state = _make_linear_pipeline()
+    serializer = ComposerYamlSerializer()
+    expected = yaml_generator.generate_yaml(state)
+    actual_function = yaml_generator.generate_yaml
+    observed: list[CompositionState] = []
+
+    def observe(actual_state: CompositionState) -> str:
+        observed.append(actual_state)
+        return actual_function(actual_state)
+
+    monkeypatch.setattr(yaml_generator, "generate_yaml", observe)
+    assert serializer.generate_yaml(state) == expected
+    assert len(observed) == 1
+    assert observed[0] is state
+
+
+def test_stateless_yaml_serializer_keeps_actual_lowering_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer import yaml_generator
+
+    base = _make_gate_pipeline()
+    state = replace(base, nodes=(replace(base.nodes[0], condition=None),))
+    actual_function = yaml_generator.generate_yaml
+    observed: list[PipelineLoweringError] = []
+
+    def observe(actual_state: CompositionState) -> str:
+        try:
+            return actual_function(actual_state)
+        except PipelineLoweringError as original:
+            observed.append(original)
+            raise
+
+    monkeypatch.setattr(yaml_generator, "generate_yaml", observe)
+    with pytest.raises(PipelineLoweringError) as caught:
+        ComposerYamlSerializer().generate_yaml(state)
+
+    assert len(observed) == 1
+    assert caught.value is observed[0]
+    assert "quality_check" in str(caught.value)
+    assert "condition" in str(caught.value)

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchRecoveryTranscript, isDefinitiveComposerRefusal, parseResponse, submitComposerOperation } from "./client";
 import type { ApiError, CompositionState } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { liveSnapshot } from "@/test/composerOperationWire";
 
 function makePartialState(): CompositionState {
   return {
@@ -68,7 +69,7 @@ describe("api/client recovery contracts", () => {
   });
 
   it("binds recompose admission to the expected last conversational user and state", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ operation_id: clientRequestId, kind: "compose_recompose", status: "queued", poll_after_ms: 1000 }), { status: 202 }));
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(liveSnapshot(clientRequestId, { kind: "compose_recompose", status: "queued", phase: "queued" })), { status: 202 }));
     await submitComposerOperation({
       mode: "submitted", scope: { principalId: "alice", authProvider: "local" },
       sessionId: "session-1", operationId: clientRequestId, kind: "compose_recompose", createdAt: Date.now(),

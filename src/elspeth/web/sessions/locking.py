@@ -8,16 +8,224 @@ import importlib.util
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
+from contextvars import ContextVar
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, final
 
 from sqlalchemy import Engine, event
 from sqlalchemy.engine import Connection
+from sqlalchemy.engine.interfaces import DBAPICursor, ExecutionContext
 
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
+from elspeth.web.sessions.continuation_sql_deadline import (
+    ContinuationPreviewResultDeadline,
+    ContinuationReadResultDeadline,
+    ContinuationSQLDeadlineOwner,
+)
+
+if TYPE_CHECKING:
+    from elspeth.web.required_work import RequiredPreviewProduced, RequiredReadProduced, RequiredWorkTicket
+
+
+class _ContinuationSQLDeadlineMode(Enum):
+    PAID_SETTLEMENT = "paid_settlement"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ContinuationPaidSettlementScope:
+    """One actual paid SQL ticket selects only its original retained reserve."""
+
+    ticket: RequiredWorkTicket
+    owner: ContinuationSQLDeadlineOwner
+
+    def __post_init__(self) -> None:
+        from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
+
+        if (
+            type(self.ticket) is not RequiredWorkTicket
+            or type(self.owner) is not ContinuationSQLDeadlineOwner
+            or self.ticket.sql_deadline_owner is not self.owner
+            or self.ticket.key.source is not RequiredWorkSource.PROVIDER_SETTLEMENT_SQL
+        ):
+            raise AuditIntegrityError("paid SQL reserve requires the actual provider settlement ticket")
+        self.owner.validate_context(
+            self.ticket.key.authority.context,
+            operation_id=self.ticket.key.authority.durable_operation_id,
+            attempt=self.ticket.key.authority.claim_attempt,
+        )
+
+
+_READ_RESULT_ISSUER_SEAL = object()
+_PREVIEW_RESULT_ISSUER_SEAL = object()
+_CONTINUATION_SQL_DEADLINE: ContextVar[
+    tuple[
+        ContinuationSQLDeadlineOwner,
+        bool | _ContinuationSQLDeadlineMode | ContinuationReadResultDeadline | ContinuationPreviewResultDeadline,
+    ]
+    | None
+] = ContextVar("continuation_sql_deadline", default=None)
+_CONTINUATION_METADATA_ENGINE: ContextVar[Engine | None] = ContextVar("continuation_metadata_engine", default=None)
+
+
+@contextlib.contextmanager
+def continuation_sql_deadline_scope(
+    owner: ContinuationSQLDeadlineOwner,
+    *,
+    lifecycle: bool = False,
+    paid_settlement: ContinuationPaidSettlementScope | None = None,
+) -> Iterator[None]:
+    if type(owner) is not ContinuationSQLDeadlineOwner:
+        raise AuditIntegrityError("physical SQL deadline scope requires its actual V2 owner")
+    if type(lifecycle) is not bool or (
+        paid_settlement is not None
+        and (
+            lifecycle
+            or type(paid_settlement) is not ContinuationPaidSettlementScope
+            or paid_settlement.owner is not owner
+            or paid_settlement.ticket.complete
+        )
+    ):
+        raise AuditIntegrityError("physical SQL deadline scope changed its exact timing mode")
+    mode = _ContinuationSQLDeadlineMode.PAID_SETTLEMENT if paid_settlement is not None else lifecycle
+    previous = _CONTINUATION_SQL_DEADLINE.get()
+    if previous is not None and previous != (owner, mode):
+        raise AuditIntegrityError("physical SQL cannot replace another operation's deadline")
+    token = _CONTINUATION_SQL_DEADLINE.set((owner, mode))
+    try:
+        yield
+    finally:
+        _CONTINUATION_SQL_DEADLINE.reset(token)
+
+
+@contextlib.contextmanager
+def continuation_read_result_deadline_scope(
+    ticket: RequiredWorkTicket,
+    produced: RequiredReadProduced,
+    clock: ContinuationReadResultDeadline,
+    *,
+    issuer: object,
+) -> Iterator[None]:
+    """Only the actual returned-read worker may enter its nested finish clock."""
+    from elspeth.web.required_work import RequiredReadProduced, RequiredWorkSource, RequiredWorkTicket
+
+    if (
+        issuer is not _READ_RESULT_ISSUER_SEAL
+        or type(ticket) is not RequiredWorkTicket
+        or ticket.key.source is not RequiredWorkSource.CONTINUATION_READ_RESULT_SQL
+        or ticket.complete
+        or type(produced) is not RequiredReadProduced
+        or type(clock) is not ContinuationReadResultDeadline
+        or ticket.sql_deadline_owner is not clock.owner
+        or _CONTINUATION_SQL_DEADLINE.get() != (clock.owner, False)
+    ):
+        raise AuditIntegrityError("Read disposition lost its actual returned-result worker")
+    produced.validate()
+    clock.owner.validate_context(
+        ticket.key.authority.context,
+        operation_id=ticket.key.authority.durable_operation_id,
+        attempt=ticket.key.authority.claim_attempt,
+    )
+    clock.owner.remaining_statement(session_id=ticket.key.authority.context.fence.session_id, read_result=clock)
+    token = _CONTINUATION_SQL_DEADLINE.set((clock.owner, clock))
+    try:
+        yield
+    finally:
+        _CONTINUATION_SQL_DEADLINE.reset(token)
+
+
+@contextlib.contextmanager
+def continuation_metadata_source_scope(engine: Engine) -> Iterator[None]:
+    """Bind related metadata to this physical callback's actual session store."""
+    if _CONTINUATION_SQL_DEADLINE.get() is None:
+        raise AuditIntegrityError("Continuation metadata requires its actual physical SQL timing owner")
+    previous = _CONTINUATION_METADATA_ENGINE.get()
+    if previous is not None and previous is not engine:
+        raise AuditIntegrityError("Continuation metadata cannot replace its actual session store")
+    token = _CONTINUATION_METADATA_ENGINE.set(engine)
+    try:
+        yield
+    finally:
+        _CONTINUATION_METADATA_ENGINE.reset(token)
+
+
+@contextlib.contextmanager
+def continuation_preview_result_deadline_scope(
+    ticket: RequiredWorkTicket,
+    produced: RequiredPreviewProduced,
+    clock: ContinuationPreviewResultDeadline,
+    *,
+    issuer: object,
+) -> Iterator[None]:
+    """Only an actual returned preview enters its original result-only tail."""
+    from elspeth.web.composer.continuation_preview_dispatch import require_preview_produced
+    from elspeth.web.required_work import RequiredPreviewProduced, RequiredWorkSource, RequiredWorkTicket
+
+    if (
+        issuer is not _PREVIEW_RESULT_ISSUER_SEAL
+        or type(ticket) is not RequiredWorkTicket
+        or ticket.key.source is not RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL
+        or ticket.complete
+        or type(produced) is not RequiredPreviewProduced
+        or type(clock) is not ContinuationPreviewResultDeadline
+        or ticket.sql_deadline_owner is not clock.owner
+        or _CONTINUATION_SQL_DEADLINE.get() != (clock.owner, False)
+        or require_preview_produced(produced.permit, produced.returned) is not clock
+    ):
+        raise AuditIntegrityError("preview disposition lost its actual returned-result worker")
+    clock.owner.validate_context(
+        ticket.key.authority.context,
+        operation_id=ticket.key.authority.durable_operation_id,
+        attempt=ticket.key.authority.claim_attempt,
+    )
+    clock.owner.remaining_statement(session_id=ticket.key.authority.context.fence.session_id, preview_result=clock)
+    token = _CONTINUATION_SQL_DEADLINE.set((clock.owner, clock))
+    try:
+        yield
+    finally:
+        _CONTINUATION_SQL_DEADLINE.reset(token)
+
+
+@contextlib.contextmanager
+def continuation_metadata_connection_deadline_scope(conn: Connection) -> Iterator[None]:
+    """Install the existing clock on a metadata connection before its SELECT.
+
+    This does not bound engine checkout or transport setup. It grants no
+    authority and does not change the original action/settlement/drain clock.
+    """
+    current = _CONTINUATION_SQL_DEADLINE.get()
+    if current is None:
+        yield
+        return
+    expected_engine = _CONTINUATION_METADATA_ENGINE.get()
+    if expected_engine is not None and conn.engine is not expected_engine:
+        raise AuditIntegrityError("Continuation metadata connection belongs to another session store")
+    owner, mode = current
+    session_id = owner.running.session_operation_context.fence.session_id
+    owner.remaining_statement(
+        session_id=session_id,
+        lifecycle=mode is True,
+        paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+        read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
+        preview_result=mode if type(mode) is ContinuationPreviewResultDeadline else None,
+    )
+    with continuation_connection_deadline_scope(conn, session_id):
+        yield
+    owner.remaining_statement(
+        session_id=session_id,
+        lifecycle=mode is True,
+        paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+        read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
+        preview_result=mode if type(mode) is ContinuationPreviewResultDeadline else None,
+    )
+
 
 _fcntl: Any
 if os.name == "posix" and importlib.util.find_spec("fcntl") is not None:
@@ -296,9 +504,81 @@ def transaction_session_lock(conn: Connection, engine: Engine, session_id: str) 
 
 
 @contextlib.contextmanager
-def locked_session_transaction(engine: Engine, session_id: str) -> Iterator[Connection]:
+def continuation_connection_deadline_scope(
+    conn: Connection, session_id: str, *, deadline: ComposerDrainDeadline | None = None
+) -> Iterator[None]:
+    """Install one canonical PG bound before the caller's first SQL/lock."""
+    current = _CONTINUATION_SQL_DEADLINE.get()
+    owner, mode = current if current is not None else (None, False)
+    if conn.dialect.name != "postgresql" or (deadline is None and owner is None):
+        yield
+        return
+
+    def bound_statement(
+        connection: Connection,
+        cursor: DBAPICursor,
+        statement: str,
+        parameters: object,
+        context: ExecutionContext,
+        executemany: bool,
+    ) -> None:
+        if owner is not None:
+            remaining = owner.remaining_statement(
+                session_id=session_id,
+                deadline=deadline,
+                lifecycle=mode is True,
+                paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+                read_result=mode if type(mode) is ContinuationReadResultDeadline else None,
+                preview_result=mode if type(mode) is ContinuationPreviewResultDeadline else None,
+            )
+        elif deadline is not None:
+            remaining = deadline.remaining_seconds(now=time.monotonic())
+        else:
+            raise AuditIntegrityError("SQL deadline listener lost its actual timing owner")
+        if remaining <= 0:
+            raise TimeoutError("Continuation transaction exhausted its absolute drain deadline")
+        # Raw cursor setup avoids re-entering this event hook. Transaction-local
+        # settings restore on commit/rollback and zero must never disable them.
+        timeout = f"{max(1, int(remaining * 1000))}ms"
+        cursor.execute(
+            "SELECT pg_catalog.set_config('lock_timeout', %s, true), pg_catalog.set_config('statement_timeout', %s, true)",
+            (timeout, timeout),
+        )
+
+    event.listen(conn, "before_cursor_execute", bound_statement)
+    try:
+        yield
+    finally:
+        event.remove(conn, "before_cursor_execute", bound_statement)
+
+
+@contextlib.contextmanager
+def locked_session_transaction(engine: Engine, session_id: str, *, deadline: ComposerDrainDeadline | None = None) -> Iterator[Connection]:
     """Acquire process exclusion before opening a same-session transaction."""
+    if engine.dialect.name == "postgresql" and (deadline is not None or _CONTINUATION_SQL_DEADLINE.get() is not None):
+        with (
+            engine.begin() as conn,
+            continuation_connection_deadline_scope(conn, session_id, deadline=deadline),
+            transaction_session_lock(conn, engine, session_id),
+        ):
+            yield conn
+        return
     with process_session_lock(engine, session_id), engine.begin() as conn, transaction_session_lock(conn, engine, session_id):
+        yield conn
+
+
+@contextlib.contextmanager
+def session_data_read_transaction(
+    engine: Engine, session_id: str, *, deadline: ComposerDrainDeadline | None = None
+) -> Iterator[Connection]:
+    """Read one coherent DATA cohort; preserve exclusion on other topologies."""
+    from elspeth.web.sessions.engine import deferred_session_data_read, session_engine_supports_deferred_data_reads
+
+    if session_engine_supports_deferred_data_reads(engine):
+        with deferred_session_data_read(engine) as conn:
+            yield conn
+        return
+    with locked_session_transaction(engine, session_id, deadline=deadline) as conn:
         yield conn
 
 

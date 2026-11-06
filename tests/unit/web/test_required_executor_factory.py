@@ -320,8 +320,8 @@ async def test_actual_http_ordinary_generation_refusal_has_fixed_safe_body_and_n
                     await asyncio.gather(response_task, return_exceptions=True)
         assert response.status_code == 503
         body = response.json()
-        assert body["detail"] == "Database is currently unavailable. Please retry in a moment."
-        assert body["error_type"] == "database_unavailable"
+        assert body["detail"] == "Server execution capacity is currently unavailable. Review the session before retrying."
+        assert body["error_type"] == "executor_unavailable"
         assert isinstance(body["request_id"], str) and body["request_id"]
         assert set(body) == {"detail", "error_type", "request_id"}
         assert calls == [] and fixture.composer.calls == 0

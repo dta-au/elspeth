@@ -2,7 +2,7 @@
 
 Legacy test identifiers remain stable; scopes are worker-owned, and HTTP
 admission/GET never owns provider cancellation. Scripted clocks control retry
-headroom; real-file SQLite cases exercise202→worker→GET and explicit Stop.
+headroom.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeoutError
 
@@ -302,16 +301,6 @@ def test_plain_cancelled_error_is_not_a_heartbeat_cancel() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dependency_teardown_503_reaches_the_http_client(tmp_path, monkeypatch):
-    await _durable_heartbeat(tmp_path, monkeypatch)
-
-
-@pytest.mark.asyncio
-async def test_send_message_heartbeat_cancel_publishes_server_fault_not_client_cancelled(tmp_path, monkeypatch):
-    await _durable_heartbeat(tmp_path, monkeypatch)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(("call_seconds", "expected_calls"), [(0.0, 3), (10.0, 2), (30.0, 1)])
 async def test_slow_failing_renewals_cancel_before_the_lease_lapses(
     monkeypatch: pytest.MonkeyPatch, call_seconds: float, expected_calls: int
@@ -424,110 +413,6 @@ async def _owned_lifecycle(registry):
         owner_task=owner,
     ):
         yield None
-
-
-async def _durable_heartbeat(tmp_path, monkeypatch, *, recompose=False, explicit_stop=False):
-    from tests.helpers.composer_operations import build_composer_operation_app, install_composer_async_worker, message_body, recompose_body
-
-    harness = await build_composer_operation_app(tmp_path)
-    app = harness.app
-    install_composer_async_worker(app)
-    registry = app.state.composer_progress_registry
-    original_renew = registry.renew_request
-
-    async def renew(lease):
-        if harness.composer.entered.is_set() and not explicit_stop:
-            raise ComposerRequestLeaseLost("lost exact worker progress lease")
-        await original_renew(lease)
-
-    async def wait(seconds):
-        while not harness.composer.entered.is_set():
-            await asyncio.sleep(0)
-        if explicit_stop:
-            await asyncio.Event().wait()
-
-    observed_metrics = []
-    monkeypatch.setattr(_helpers, "begin_composer_request_metrics", lambda *, surface: object())
-
-    def finish_metrics(token, *, status, primary_error):
-        observed_metrics.append((status, primary_error))
-
-    monkeypatch.setattr(_helpers, "finish_composer_request_metrics", finish_metrics)
-    monkeypatch.setattr(registry, "renew_request", renew)
-    monkeypatch.setattr(_helpers, "_COMPOSER_HEARTBEAT_TIMER", _helpers._ComposerHeartbeatTimer(now=lambda: 0.0, wait=wait))
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": f"Bearer {harness.token}"}
-    ) as client:
-        route = "messages"
-        body = message_body("One detached provider call")
-        if recompose:
-            from tests.helpers.session_fences import acquire_compose_context
-
-            async with acquire_compose_context(app.state.session_service, harness.session_id) as context:
-                user = await app.state.session_service.add_message(
-                    harness.session_id,
-                    "user",
-                    "Retry the same user",
-                    writer_principal="route_user_message",
-                    session_operation_context=context,
-                )
-            route = "recompose"
-            body = recompose_body(user.id)
-        accepted = await client.post(f"/api/sessions/{harness.session_id}/{route}", json=body)
-        assert accepted.status_code == 202, accepted.text
-        assert harness.composer.calls == 0
-        poll = f"/api/sessions/{harness.session_id}/operations/{body['operation_id']}"
-        assert (await client.get(poll)).json()["status"] == "queued"
-        drive = asyncio.create_task(app.state.composer_async_worker.run_until_idle())
-        try:
-            async with asyncio.timeout(10):
-                while not harness.composer.entered.is_set():
-                    await asyncio.sleep(0.001)
-                if explicit_stop:
-                    from elspeth.web.sessions.routes.composer import operations
-
-                    original_ownership = operations._verify_session_ownership
-                    observer_entered = asyncio.Event()
-
-                    async def held_observation(*args, **kwargs):
-                        await original_ownership(*args, **kwargs)
-                        observer_entered.set()
-                        await asyncio.Event().wait()
-
-                    with monkeypatch.context() as observer_patch:
-                        observer_patch.setattr(operations, "_verify_session_ownership", held_observation)
-                        observer = asyncio.create_task(client.get(poll))
-                        await observer_entered.wait()
-                        observer.cancel()
-                        with pytest.raises(asyncio.CancelledError):
-                            await observer
-                    assert not drive.done()
-                    running = await client.get(poll)
-                    assert running.json()["status"] == "running"
-                    assert running.json()["cancel_requested"] is False
-                    assert harness.composer.calls == 1
-                    cancelled = await client.post(f"{poll}/cancel")
-                    assert cancelled.status_code == 202, cancelled.text
-                await drive
-            final = await client.get(poll)
-            assert final.status_code == 200, final.text
-            snapshot = final.json()
-            assert snapshot["status"] == "failed"
-            assert snapshot["error"]["failure_code"] == ("request_cancelled" if explicit_stop else "worker_lost")
-            assert snapshot["error"]["http_status"] == (499 if explicit_stop else 503)
-            assert harness.composer.calls == 1
-            again = await client.get(poll)
-            assert again.json() == snapshot
-            assert harness.composer.calls == 1
-            progress = await registry.get_latest(str(harness.session_id))
-            assert progress.inflight_requests == 0
-            assert len(observed_metrics) == 1
-            assert observed_metrics[0][0] == ("cancelled" if explicit_stop else "failed")
-            assert progress.reason == ("client_cancelled" if explicit_stop else "service_setup_failed")
-        finally:
-            if not drive.done():
-                await client.post(f"{poll}/cancel")
-                await drive
 
 
 @pytest_asyncio.fixture(autouse=True)

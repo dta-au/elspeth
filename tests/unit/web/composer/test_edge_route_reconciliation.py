@@ -21,7 +21,6 @@ import pytest
 
 from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
-from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import (
@@ -760,10 +759,6 @@ def _assert_graph_refusal(
     )
     normalized = normalize_tool_result_validation(result, other_view)
     rejection_fixtures._assert_refusal(normalized, state, code, subject, other_standing)
-    feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"]
-    assert len(feedback) == 1
-    assert feedback[0]["error_code"] == code and feedback[0]["component"] == (subject or "rejected_mutation")
-    assert "detail" not in feedback[0]
 
 
 @pytest.mark.parametrize("surface", ["handler", "dispatch"])
@@ -793,15 +788,15 @@ def test_graph_refusal_retains_saved_findings_identity_and_static_guidance(surfa
     _assert_graph_refusal(result, state, context, surface, code, subject)
     guidance = explain_validation_code(code)
     assert guidance is not None
-    feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
-    assert (feedback["explanation"], feedback["suggested_fix"]) == guidance
     if surface == "dispatch":
-        assert result.validation_guidance is not None and code in result.validation_guidance["codes"]
+        assert result.validation_guidance is not None
+        entry = result.validation_guidance["codes"][code]
+        assert (entry["explanation"], entry["suggested_fix"]) == guidance
     redacted = redact_tool_call_response(tool, result.to_dict(), telemetry=NoopRedactionTelemetry())
     assert redacted["validation"]["errors"][0]["error_code"] == code
     if case == "missing-edge":
         assert "PRIVATE-GRAPH-EDGE-CANARY" in result.validation.errors[0].message
-        assert "PRIVATE-GRAPH-EDGE-CANARY" not in repr(feedback) + repr(redacted)
+        assert "PRIVATE-GRAPH-EDGE-CANARY" not in repr(redacted)
     assert code in serialize_tool_result(result)
     assert state.to_dict() == before
 

@@ -61,6 +61,8 @@ from elspeth_lints.core.judge_coverage import (
     check_one_directory,
 )
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
+
 _FAKE_JUDGE_METADATA_SIGNATURE = "hmac-sha256:v1:" + "0" * 64
 _TEST_JUDGE_METADATA_HMAC_KEY = "test-judge-metadata-hmac-key-2026-05-24"
 
@@ -1926,13 +1928,34 @@ def test_git_show_bad_baseline_ref_raises_judge_coverage_error(tmp_path: Path) -
 
 def test_git_commands_force_c_locale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Git subprocesses run with ``LC_ALL=C`` and do not depend on localized stderr."""
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Coverage Test",
+            "-c",
+            "user.email=coverage@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
     calls: list[dict[str, str]] = []
+    real_popen = subprocess.Popen
 
-    def fake_run(*args, **kwargs):
-        calls.append(kwargs.get("env", {}))
-        return subprocess.CompletedProcess(args[0], 0, stdout="", stderr="")
+    def record_popen(*args, **kwargs):
+        calls.append(kwargs["env"])
+        return real_popen(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", record_popen)
+    monkeypatch.setenv("LC_ALL", "an-unavailable-locale")
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", "synthetic-only-" * 4)
+    monkeypatch.setenv("ARBITRARY_REKEY_KEY", "another-synthetic-value")
 
     assert (
         _ls_tree_yaml_files(
@@ -1944,6 +1967,7 @@ def test_git_commands_force_c_locale(tmp_path: Path, monkeypatch: pytest.MonkeyP
     )
     assert calls
     assert all(call["LC_ALL"] == "C" for call in calls)
+    assert all("ELSPETH_JUDGE_METADATA_HMAC_KEY" not in call and "ARBITRARY_REKEY_KEY" not in call for call in calls)
 
 
 # =========================================================================

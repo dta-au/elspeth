@@ -23,10 +23,13 @@ SELECTION = {
         "make_required_work_key",
         "RequiredWorkCoordinator.__init__",
         "RequiredWorkCoordinator.authority",
+        "RequiredWorkCoordinator.sql_deadline_owner",
         "RequiredWorkCoordinator.reserve",
         "RequiredWorkTicket.__init__",
+        "RequiredWorkTicket.sql_deadline_owner",
         "RequiredWorkBinding",
     ),
+    "src/elspeth/web/sessions/continuation_sql_deadline.py": ("ContinuationSQLDeadlineOwner",),
     "src/elspeth/contracts/session_operation.py": (
         "SessionOperationKind",
         "_require_nonblank",
@@ -43,6 +46,8 @@ SELECTION = {
         "TelemetryInstallation.reserve",
     ),
     "src/elspeth/web/operator_telemetry_custody.py": ("OperatorTelemetryCleanupOwner.assert_process",),
+    "src/elspeth/web/sessions/state_decoder.py": ("state_record_from_row",),
+    "src/elspeth/web/sessions/chat_message_decoder.py": ("chat_message_record_from_row",),
 }
 
 

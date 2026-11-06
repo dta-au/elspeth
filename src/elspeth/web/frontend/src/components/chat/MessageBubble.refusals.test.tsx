@@ -12,3 +12,15 @@ it("unknown outcome retains Refresh action", () => {
   render(<MessageBubble message={row("compose_outcome_unconfirmed")} isComposing={false} onRetry={vi.fn()} />);
   expect(screen.getByRole("button", { name: "Refresh" })).toBeInTheDocument();
 });
+it("paid overflow keeps the failed notice without an automatic Retry", () => {
+  render(<MessageBubble message={{ ...row("paid_result_overflow"), local_error: "The call may have incurred a charge. Review the saved session." }} isComposing={false} onRetry={vi.fn()} />);
+  expect(screen.getByText("The call may have incurred a charge. Review the saved session.")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+});
+
+it("paid incomplete keeps its charge notice and offers neither Retry nor Refresh", () => {
+  render(<MessageBubble message={{ ...row("paid_result_incomplete"), local_error: "The cost is unknown; the call may have incurred a charge." }} isComposing={false} onRetry={vi.fn()} />);
+  expect(screen.getByText("The cost is unknown; the call may have incurred a charge.")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Refresh" })).not.toBeInTheDocument();
+});

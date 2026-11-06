@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import math
-import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,7 +16,6 @@ if TYPE_CHECKING:
     from elspeth.web.coordination.lifecycle import SessionOperationLease
     from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
     from elspeth.web.sessions.composer_operations import ComposerOperationRecord, ComposerOperationRunning
-    from elspeth.web.sessions.composer_turn import ComposerBudgetAnchor
 
 
 _WATCH_CREATION_SEAL = object()
@@ -40,21 +38,12 @@ class ComposerOperationWatchReader:
         worker: ComposerAsyncWorker,
         running: ComposerOperationRunning,
         lease: SessionOperationLease,
-        anchor: ComposerBudgetAnchor,
     ) -> None:
         if seal is not _WATCH_CREATION_SEAL:
             raise AuditIntegrityError("Operation observation owner is worker-issued")
         self.worker = worker
         self.running = running
         self.lease = lease
-        self.anchor = anchor
-        self.deadline = anchor.monotonic_at_running + anchor.remaining_at_running_seconds
-        if (
-            not math.isfinite(self.deadline)
-            or not math.isfinite(anchor.remaining_at_running_seconds)
-            or anchor.remaining_at_running_seconds <= 0
-        ):
-            raise AuditIntegrityError("Operation observation has invalid original budget")
         self.executor: ThreadPoolExecutor | None = None
         self.generation: RequiredExecutorGenerationCustodian | None = None
         self._issued: _NoSubmissionAdmissionRefusal | None = None
@@ -67,30 +56,34 @@ class ComposerOperationWatchReader:
         self._invocation = worker._authority.get_with_database_now
 
     @classmethod
-    def for_operation(
-        cls,
-        worker: ComposerAsyncWorker,
-        running: ComposerOperationRunning,
-        lease: SessionOperationLease,
-        anchor: ComposerBudgetAnchor,
+    def for_segment(
+        cls, worker: ComposerAsyncWorker, running: ComposerOperationRunning, lease: SessionOperationLease
     ) -> ComposerOperationWatchReader:
         from elspeth.web.coordination.lifecycle import SessionOperationLease
         from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
         from elspeth.web.sessions.composer_operations import ComposerOperationRunning
-        from elspeth.web.sessions.composer_turn import ComposerBudgetAnchor
 
         if (
             type(worker) is not ComposerAsyncWorker
             or type(running) is not ComposerOperationRunning
             or type(lease) is not SessionOperationLease
-            or type(anchor) is not ComposerBudgetAnchor
             or lease.context != running.session_operation_context
         ):
-            raise AuditIntegrityError("Operation observation lacks exact owned running authority")
-        return cls(_WATCH_CREATION_SEAL, worker, running, lease, anchor)
+            raise AuditIntegrityError("Segment observation lacks exact owned running authority")
+        return cls(_WATCH_CREATION_SEAL, worker, running, lease)
 
     def invoke(self) -> tuple[ComposerOperationRecord | None, datetime]:
-        return self._invocation(session_id=self.running.claim.session_id, operation_id=self.running.claim.operation_id)
+        from elspeth.web.sessions.locking import continuation_sql_deadline_scope
+
+        work = self.lease.required_work
+        if work is None or work.sql_deadline_owner is None:
+            raise AuditIntegrityError("Segment observation lost its actual SQL timing owner")
+        owner = work.sql_deadline_owner
+        owner.validate_context(self.lease.context, operation_id=self.running.claim.operation_id, attempt=self.running.claim.attempt)
+        # This method is the registered physical watch invocation. Install
+        # the owned scope here rather than relying on cross-thread context.
+        with continuation_sql_deadline_scope(owner, lifecycle=True):
+            return self._invocation(session_id=self.running.claim.session_id, operation_id=self.running.claim.operation_id)
 
     def pin_generation(self, executor: ThreadPoolExecutor, generation: RequiredExecutorGenerationCustodian) -> None:
         if self.executor is None and self.generation is None:
@@ -100,22 +93,52 @@ class ComposerOperationWatchReader:
             raise RequiredGenerationUnavailable("Operation observation generation changed")
 
     def check_cutoff(self) -> None:
-        from elspeth.web.sessions.composer_operations import COMPOSER_LEASE_LOST, COMPOSER_SHUTDOWN, ComposerTurnDeadlineExpired
+        from elspeth.web.sessions.composer_operations import COMPOSER_LEASE_LOST, COMPOSER_SHUTDOWN
 
         if self.lease.renewal_error is not None:
             raise self.lease.renewal_error
         if self.lease.closed:
             raise asyncio.CancelledError(COMPOSER_LEASE_LOST)
-        if self.worker._stopping or self.worker._instance_draining.is_set():
+        draining = self.worker._stopping or self.worker._instance_draining.is_set()
+        if draining and self.worker.drain_deadline is None:
             raise asyncio.CancelledError(COMPOSER_SHUTDOWN)
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise ComposerTurnDeadlineExpired(
-                session_id=self.running.claim.session_id,
-                operation_id=self.running.claim.operation_id,
-                remaining_seconds=max(0.0, remaining),
-                budget_seconds_at_running=self.anchor.remaining_at_running_seconds,
-            )
+        # Segment and action clocks own the cutoff. A process drain is observed
+        # by the stage owner, which keeps watching durable Stop until its own
+        # cutoff.
+
+    def permits_process_drain(self, instance_draining: threading.Event) -> bool:
+        """Keep this live segment's bounded Stop read inside its original drain.
+
+        A process latch alone grants nothing. The actual signal, worker,
+        registered coordinator and physical SQL clock must still be the same
+        owners, and ordinary or unavailable generations remain refused by the
+        submission owner.
+        """
+        from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+
+        deadline = self.worker.drain_deadline
+        signal = self.worker._drain_signal
+        if deadline is None or signal is None or signal.started_at is None:
+            return False
+        self.check_cutoff()
+        work = self.lease.required_work
+        key = (self.running.claim.session_id, self.running.claim.operation_id)
+        if (
+            self.worker._instance_draining is not instance_draining
+            or signal.draining is not instance_draining
+            or work is None
+            or self.worker._required_coordinators.get(key) is not work
+            or type(work.sql_deadline_owner) is not ContinuationSQLDeadlineOwner
+        ):
+            raise AuditIntegrityError("Drain observation lost its actual registered process/segment owner")
+        owner = work.sql_deadline_owner
+        if owner.running is not self.running or owner.drain_signal is not signal:
+            raise AuditIntegrityError("Drain observation changed its original physical SQL owner")
+        owner.validate_context(self.lease.context, operation_id=self.running.claim.operation_id, attempt=self.running.claim.attempt)
+        if deadline.expires_at != signal.started_at + owner.drain_seconds:
+            raise AuditIntegrityError("Drain observation changed its original signal deadline")
+        owner.remaining_statement(session_id=str(self.running.claim.session_id), deadline=deadline, lifecycle=True)
+        return True
 
     def issue_refusal(
         self,

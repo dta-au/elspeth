@@ -35,8 +35,15 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
-def _restore_web_command_environment() -> Iterator[None]:
+def _restore_web_command_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """The CLI bridges web options through process environment variables."""
+    from elspeth.web import composer_server
+
+    def run_owned(config: FakeUvicornConfig) -> None:
+        assert type(config) is FakeUvicornConfig
+        config.recorder(*config.args, **config.kwargs)
+
+    monkeypatch.setattr(composer_server, "run_composer_server", run_owned)
     with patch.dict(os.environ, os.environ.copy(), clear=True):
         yield
 
@@ -58,12 +65,22 @@ class UvicornRunRecorder:
             self.side_effect(*args, **kwargs)
 
 
+@dataclass(frozen=True)
+class FakeUvicornConfig:
+    recorder: UvicornRunRecorder
+    args: tuple[object, ...]
+    kwargs: dict[str, object]
+
+
 class FakeUvicornModule(ModuleType):
     run: UvicornRunRecorder
 
     def __init__(self, side_effect: Callable[..., None] | None = None) -> None:
         super().__init__("uvicorn")
         self.run = UvicornRunRecorder(side_effect=side_effect)
+
+    def Config(self, *args: object, **kwargs: object) -> FakeUvicornConfig:
+        return FakeUvicornConfig(self.run, args, dict(kwargs))
 
 
 class TestWebCommandImportGuard:
@@ -89,7 +106,7 @@ class TestWebCommandHappyPath:
     must also set ELSPETH_WEB__SECRET_KEY to pass validation.
     """
 
-    def test_calls_uvicorn_run_with_factory_true(self) -> None:
+    def test_passes_factory_config_to_the_owned_server(self) -> None:
         """Use default host (127.0.0.1) with custom port — avoids secret_key guard."""
         uvicorn = FakeUvicornModule()
         with patch.dict("sys.modules", {"uvicorn": uvicorn}):

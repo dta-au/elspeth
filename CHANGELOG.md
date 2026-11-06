@@ -4,6 +4,313 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## 0.8.10 - 2026-10-31
+
+This entry records source changes on the 0.8.10 assembly. The dated entry and
+package version do not establish combined-release qualification or publication.
+
+### Engine and runtime
+
+- **Cooperative shutdown preserves unstarted work.** Intake and work claims
+  honor shutdown at their next safe boundary. Explicit framework shutdown
+  during startup or readiness records `INTERRUPTED`. Resume cancellation
+  preserves checkpointed progress, and incomplete sources remain refused.
+- **Source capture observes cancellation between advances.** Partial snapshots
+  are not published. A snapshot whose publication has already completed remains
+  available for resume, including when the original input is unavailable.
+  Source and audit failures retain their existing failure precedence.
+- **Rejected sparse rows do not grow the accepted schema.** JSON, S3, Azure Blob
+  and Dataverse sources validate a row before publishing its schema growth.
+- **Fresh sink members use the configured write path.** Unfinished members with
+  no durable `COMMIT` history take their configured first-write path. Prior
+  `COMMIT` attempts, including ambiguous or unexpected whole-effect attempts,
+  retain conservative recovery. Nested coalesce merges continue through the
+  nearest enclosing bound scope, including a collector scope, during execution
+  and cold resume.
+- **Unusable LLM text retains its actual classification and audit outcome.**
+  Azure, Bedrock and Gateway require affirmative response evidence for a policy
+  refusal. Output-budget exhaustion, unsupported tool calls and other unusable
+  responses retain client-error classifications. Live SDK responses rejected
+  for null or required nonempty text record `ERROR` before error telemetry.
+  Generic SDK clients retain their existing blank-string compatibility.
+  Gateway profiles requiring the `usage` capability now require at least one
+  valid reported token count; partial usage and explicit zero remain valid.
+- **Lint and test evidence preserves its subject.** AST fingerprints use one
+  representation across Python 3.12 and 3.13. Boundary evidence is associated
+  with the asserted subject, and SQLite ownership checks follow the writer's
+  captured dialect and connection bindings. Partial-failure audit tests require
+  exact lineage for every fixture token. Frozen historical catalogs retain their
+  bytes and profile pins while maintained v3 checks current runtime policy.
+- **Payload purge remains offline-only.** CLI help, API documentation and the
+  maintenance guides state the stop-writers prerequisite and the requirement for
+  one Landscape reference domain per payload namespace. Shared-store purge across
+  independent databases is unsupported. A restored database requires an isolated
+  payload copy. The command does not acquire maintenance exclusion.
+- **`elspeth purge` derives its fallback retention from payload settings.** The
+  fallback and the `--retention-days` help text now read
+  `PayloadStoreSettings().retention_days` instead of a copied literal. The value
+  is still 90 days. The flag still overrides `settings.yaml`, which overrides
+  the default.
+
+- **Frozen records detach read-only proxy inputs.** `LLMResponse.raw_response`,
+  `ReplayedCall.response_data` and `error_data`, and `ValidationSuccess.data`
+  skipped the deep freeze when given a `MappingProxyType`. A proxy is a view
+  over the caller's dict, so the record stayed aliased to mutable data. These
+  inputs are now always deep-frozen.
+- **A session lease refuses a finish awaited from its own task.** Awaiting
+  `close`, a continuation handoff or an archive finish from inside a task the
+  lease owns used to deadlock forever with no deadline. It now raises
+  `AuditIntegrityError`. The polling EXECUTE close path is not covered.
+
+### Composer
+
+- **Composer has one operation lifecycle: Continuation.** Every Compose
+  request, freeform and tutorial alike, runs as Continuation. A long run is
+  held as versioned continuation segments with exact byte chunks, attributed
+  journal events and complete snapshots in the Sessions store. The version-1
+  lifecycle and lifecycle negotiation are removed: the client sends no
+  `Composer-Operation-Version` header, and operation records, stream frames
+  and the status endpoint carry no lifecycle or protocol version. The
+  Sessions schema moves to epoch 84 and needs fresh Sessions stores, and open
+  browser tabs must be reloaded after deploying (see Upgrade notes).
+- **Full replacements support provider-authored named and plural attachment
+  roots.** `set_pipeline` accepts `blob_id` or ordered `blob_ids` on its default
+  or named roots. The provider must choose the plugin explicitly; plural
+  selection requires `blob_rows`, including a one-member list. Public lists
+  contain 1–512 IDs; the private storage limit of 1,000 does not enlarge that
+  public bound. Duplicate identity or content within a list is refused, while
+  separate roots may reuse an attachment. Binding resolves current owned READY
+  blob metadata. An applied replacement publishes one graph version; a refused
+  root leaves the previous candidate unchanged. `APPROVAL_REQUIRED` remains a
+  proposal and leaves the saved graph unchanged until accepted.
+- **Public authoring projection strips private attachment custody.**
+  `get_pipeline_state(component="set_pipeline_arguments")` returns scalar IDs
+  or ordered plural IDs suitable for public reapplication. Reapplication
+  resolves current metadata and passes the strict authoring contract; it does
+  not reuse historical custody as clearance. Persisted private plural authority
+  revalidates every member against its current owned record and stored facts.
+  Metadata resolution does not establish byte integrity. See
+  [attachment selection and public projection](docs/reference/composer-tools.md#set_pipeline)
+  and the [versioned call contracts](docs/reference/composer-tool-contracts-0.8.10.md).
+- **Graph views given to models are bounded and carry complete-value
+  references.** Long authored values are replaced in diagnostic graph views by a
+  `complete_value_ref`. The new discovery tool `get_complete_pipeline_value`
+  reads one complete value by its exact reference, re-resolving the current
+  session and graph on every call. A reference is an identity, never inspection
+  approval: returned content remains untrusted and must pass the actual
+  request's fresh inspection. The maintained
+  [Composer Tool Reference](docs/reference/composer-tools.md) describes the
+  advertised inventory and result envelopes.
+- **Every saved graph version publishes version-bound content applicability.**
+  Each composition state records a `content_publication` binding in
+  `composer_meta`: session, state, version and a storage content hash, with
+  applicability `requires_current_inspection`. An edit or an identical revert
+  receives a fresh version binding, and stored content is never treated as
+  inspection clearance. Readers refuse a publication that does not match its
+  immutable graph version. Concurrent writers on PostgreSQL are proven to
+  publish whole, distinct versions, and a writer whose session lease was taken
+  over is refused.
+- **Worker settlement retains an actual committed terminal return before
+  watcher cleanup.** A later cleanup fault or cancellation keeps that receipt
+  available to the existing exact-authority readback path instead of losing the
+  known committed return. Existing uncertain-completion refusals remain in
+  force, and the original cleanup failure remains observable. This does not
+  skip readback or complete outstanding required work synthetically.
+- **The inspector shows the authoritative graph content checksum.** `/state`
+  responses carry `composition_content_hash`; see
+  [Composer graph checksum](docs/reference/composer-graph-checksum.md).
+- **The Advisor admits the same environment references as Compose.** EARLY and
+  END Advisor checks now receive the session owner's secret-inventory names
+  (never values), so a `${NAME}` reference the compose entry admits no longer
+  refuses the Advisor before its provider call.
+- **Waiting progress no longer guesses at the request.** The composing indicator
+  shows neutral progress instead of keyword-guessed "Working on: …" headlines.
+- **Cleanup review follows actual upstream provenance.** Review of raw-field
+  cleanup binds to the real upstream source of a field, including renames,
+  rather than to unrelated scraper fields or branches.
+- **Compound fork routing guidance matches the runtime.** The delivered guidance
+  allows the real compound call, keeps both Boolean route labels on an
+  unconditional fork, and reports the runtime's consistency error for incomplete
+  combinations.
+- **Tool contracts state what the tools actually do (#327).**
+  - `wire_secret_ref` documents exact raw component selectors and refuses an
+    ambiguous source rather than choosing one (TC-003).
+  - Recovery tool arguments state their real length limits and that
+    whitespace-only values are rejected (TC-007).
+  - `list_secret_refs` describes `available` as metadata readiness, not
+    resolution, and directs callers to `validate_secret_ref` (TC-013).
+  - `get_tool_definitions` documents a breakdown measured from the live
+    registry (DOC-001).
+  - The operator reference identifies results outside the ordinary `ToolResult`
+    envelope rather than treating every tool result as that envelope (DOC-002).
+- **The Composer MCP server admits saved content and withholds refused
+  arguments (#327).**
+  - A failed `load_session` keeps the previous diff baseline (TC-019).
+  - Content read from saved sessions is admitted for credential material before
+    `load_session` adopts it or `list_sessions` returns it. Listing admission is
+    per entry, so large session directories are not refused (TC-018).
+  - When admission refuses an argument, the tool audit record stores a
+    value-free stand-in instead of the refused value (TC-020).
+  - Registered tool names retain their identity. Unregistered caller names use
+    a SHA-256 identity in the audit, and unknown-tool errors do not echo the
+    caller name. The SDK's cache-miss and unlisted-tool diagnostic records keep
+    their records while replacing only the tool-name argument with that same
+    safe identity; this is not general SDK log suppression.
+  - Canonical argument evidence and its hash are published together only after
+    credential admission succeeds. Credential refusal retains priority over a
+    capture defect and keeps its value-free withheld evidence. Unexpected
+    capture, admission or refusal-evidence faults that propagate before input
+    evidence is admitted retain a complete value-free unavailable pair and
+    record `PLUGIN_CRASH`. Later tool faults retain the admitted canonical
+    evidence. See
+    [MCP call outcome contracts](docs/reference/composer-tool-contracts-0.8.10.md#tc-020--local-mcp-call-outcomes-preserve-safe-evidence).
+- **A crash capture no longer replaces the verified session head.** After a
+  plugin crash or a runtime preflight failure, the route saves the captured
+  graph only if its content hash equals the durable head. Two paths are
+  affected. In one, the per-turn checkpoint transaction rolled back; in the
+  other, a preflight crash escaped before any checkpoint. Both used to make an
+  uncommitted, unverified graph the session head. When the capture differs from
+  the head, the route writes no state row and the verified head stays current.
+  The plugin-crash path now also records the rolled-back turn's tool calls, so
+  the unwind keeps its evidence.
+- **Continuation PRIMARY calls are no longer refused after a same-cut
+  re-read.** With Continuation enabled, a re-read of an unchanged cut replaced
+  the phase source but left the message producers bound to the previous read.
+  As a result, every PRIMARY call after initialization was refused before it
+  reached the provider. The producers now adopt a value-equal re-read and
+  refuse one that differs.
+- **Credential classification of repeated evidence is memoized.** Continuation
+  evidence reads under the session lock re-scanned the same immutable documents
+  many times. In one measured run, 164 s of 310 s of session-lock holds went to
+  this rescanning, and the lease expired. A string the scanner found clean is now
+  remembered by its exact length and SHA-256 digest. The memo is bounded and
+  thread-safe, and it records no findings.
+
+### Security and signing
+
+- **Protected signer and judge runtime source (S1–S3) has landed but remains
+  OPEN.** Key-bearing operations are designed to run only through a separately
+  installed protected runtime entered at `/usr/local/libexec/elspeth-operator`
+  ([ADR-052](docs/architecture/adr/052-key-bearing-lint-operations-run-only-in-a-protected-operator-runtime.md)).
+  The editable `elspeth-lints` CLI refuses every key-bearing verb before any key
+  or file is read (exit 2, `Operator runtime unavailable`). Judge provider code
+  runs in separately supervised workers. Baseline generation uses a protected
+  snapshot whose symlinks are resolved as the filesystem resolves them. The
+  three findings stay open until the operator builds, installs and qualifies
+  that runtime:
+  - S1 `csf_49e6c1d4c587149b07c83516`, keyed repository maintenance;
+  - S2 `csf_652f5deeb8d970ec214048eb`, checkout-controlled startup;
+  - S3 `csf_e22b5e22120644ec52c10bfd`, provider SDK in the keyed parent.
+- **The `codex-cli` judge transport is disabled.** Its native shell could read
+  the judge worker's provider credentials, and Codex CLI cannot be shown to
+  disable that shell completely. `call_judge` and the worker both refuse it.
+  `stage_preview` and the rendered sign command use the `agent` transport,
+  whose read-only tools are confined to the evidence snapshot. Every judge
+  rationale is now secret-scrubbed.
+- **Gateway adapters are operator-trusted code by design.** The adapter
+  credential and network-authority finding (`csf_cfe54ceaf27dac2419e05855`) is
+  closed by design: adapters, like plugins, run only because the operator
+  installed them. The threat model and gateway README record this.
+- **Signing is suspended pending the on-prem migration.** Signing is not part
+  of CI. Trust-tier findings are tracked by the keyless before-and-after
+  finding-set comparison.
+- **Security-assurance documents describe received-byte body admission.** The
+  global body limit counts bytes actually received, not only the declared
+  `Content-Length`. The route-local upload limit, the complete-body envelope
+  and the binary-document ceiling are described separately. No limit changed.
+
+### Deployment
+
+- **The ACA acceptance probe reads only the state identity from `/state`.** It
+  no longer validates the whole body against the current response model, so it
+  accepts a 0.8.9 server's `/state` body and a 0.8.10 body with
+  `composition_content_hash`.
+
+### Project tooling
+
+- **`scripts/work-at-risk.sh` reports uncommitted and gitignored work.** It
+  joins the canonical scripts, and lane notes now hold notes and logs only.
+- **The lane orchestrator and the red-team trigger are removed, and the lane
+  manager no longer runs the full suite per lane** (ADR-043).
+
+### Upgrade notes
+
+**Session epoch advances from 78 to 84 (hard cut).** Epoch 79 existed only on
+pre-release 0.8.10 builds. Epoch 80 added Continuation's tables for the single
+Composer lifecycle and terminal-run database checks, removed `PLANNER` from the
+provider-family set, and dropped `sessions_cleanup_claims` and
+`composition_states.source`. Epoch 82 makes the admitted continuation policy
+version, hash and retained-payload allowance immutable in the parent operation.
+Epoch 83 adds the V4 paid-provider policy contract and provider-terminal hold
+table. Epoch 84 adds the distinct `paid_overflow` effect and private receipt
+contract; the live application still admits V2. Existing epoch-78 through
+epoch-83 Sessions stores are preserved unchanged and refused, without automatic
+upgrade, migration or reset. Deploy 0.8.10 against a fresh Sessions store on
+ECS, ACA and the dev box. V1/V2 policy creation and resume remain supported
+within a compatible epoch-84 store; earlier databases, including the published
+epoch-83 WIP schema, cannot resume under this code. This schema change does not
+activate V3/V4 admission or change the application default. Landscape epoch 50
+remains unchanged. The AWS ECS and Azure Container Apps fresh-store procedures
+are in
+[docs/release/0.8.10-upgrade-notes-draft.md](docs/release/0.8.10-upgrade-notes-draft.md).
+
+**Reload open browser tabs after deploying.** A tab loaded before the deploy
+runs the previous bundle, which expects the removed lifecycle-version fields and
+cannot read the new operation responses. The reloaded client ignores the old
+tab's stored composer custody.
+
+<!-- cost-cap note: rewritten at integration from the U-40 port -->
+**`composer_planner_repair_budget` must be `2`.** Any other value now refuses
+a Compose request on an empty graph before any provider call (HTTP
+503, `configuration_unsupported`). Startup does not report it. Before
+upgrading, confirm that `ELSPETH_WEB__COMPOSER_PLANNER_REPAIR_BUDGET` is unset
+or `2`.
+
+Framework retry-shutdown diagnostics now use `RetryShutdownRequestedError`, an
+`InterruptedError` subtype. Persisted pre-attempt `exception_type` values change
+from `InterruptedError` to `RetryShutdownRequestedError`; the shutdown reason and
+message are unchanged. Ordinary plugin-raised `InterruptedError` keeps its
+existing failure behavior.
+
+Replay remains conservative. Previously recorded Azure/Bedrock blank-text
+`SUCCESS` calls retain their recorded outcome when copied, then fail text
+admission. Newly recorded unusable SDK `ERROR` responses use the existing replay
+refusal instead of dispatching a provider request. Gateway replay of historical
+null or blank responses, or newly rejected required usage, can refuse with
+`AuditIntegrityError` when the corrected semantic result differs from the recorded
+call. History is not rewritten.
+
+Existing Python 3.13 AST identities remain compatible with the canonical form.
+Older Python 3.12 identities require reinspection where they differ; moved lint
+bindings also require operator review. This change does not refresh signatures.
+
+**`composition_content_hash` is a required `/state` field.** The key is always
+present; its value is null when the state has no metadata. Strict clients that
+enforce a closed response shape must admit it. The ACA acceptance probe already
+accepts servers on either side of this change.
+
+**New Composer refusal codes.** `complete_value_unavailable` and
+`complete_value_unsupported` report a complete-value reference that cannot be
+resolved or is outside the supported size envelope. The MCP saved-content and
+argument-admission changes use the existing credential-material refusal.
+A refused tool call's audit record carries `{"_arguments_withheld": …}` in
+place of the arguments. If owned evidence preparation or admission fails
+unexpectedly before evidence is admitted, it retains
+`{"_arguments_unavailable": "evidence_not_completed"}` instead; the fault is
+audited and propagated rather than reported as success.
+
+**`--judge-transport codex-cli` now refuses.** Use `--judge-transport agent`.
+Key-bearing `elspeth-lints` verbs refuse from an editable checkout. Signing is
+suspended until the protected runtime is installed after the on-prem migration.
+
+### Publication and acceptance
+
+These notes describe source changes on the 0.8.10 assembly. Combined-release
+qualification, operator signature clearance, publication and deployment remain
+separate. Automatic image publication from main remains held. Verify any
+release tag and container digest separately; this entry does not prove either
+has been published.
+
 ## 0.8.9 - 2026-10-21
 
 This release combines the Composer work developed under 0.8.7, Azure Container

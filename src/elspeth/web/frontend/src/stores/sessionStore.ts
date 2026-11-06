@@ -1,7 +1,7 @@
 import { currentAuthGeneration, isCurrentAuthGeneration } from "@/api/authSession";
-import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerActiveAttachment, ComposerObservationDetached, ComposerSessionMissing } from "@/api/composerOperationObserver";
-import { composerCustodySessionIds, composerCustodyRecoveryNotice, composerStopPersistenceLimited, composerCustodyScope, findComposerOperationCustody, samePrincipal } from "./composerOperationCustody";
-import type { OperationCustody, SubmittedCustody, ComposerOperationFailureNotice } from "@/types/composerOperations";
+import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerActiveAttachment, ComposerObservationDetached, ComposerObservationFault, ComposerSessionMissing } from "@/api/composerOperationObserver";
+import { adoptComposerObserver, composerCustodySessionIds, composerCustodyRecoveryNotice, composerStopPersistenceLimited, composerCustodyScope, findComposerOperationCustody, samePrincipal, composerStopRequested } from "./composerOperationCustody";
+import type { ComposerOperationStatus, OperationCustody, SubmittedCustody, ComposerOperationFailureNotice } from "@/types/composerOperations";
 // src/stores/sessionStore.ts
 import { create } from "zustand";
 import type {
@@ -31,6 +31,7 @@ import {
 import { useBlobStore } from "./blobStore";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
+import { formatRequestRejection } from "./requestRejection";
 import {
   acquireSessionOperationRetry,
   clearAllSessionOperationRetries,
@@ -50,6 +51,13 @@ const LLM_UNAVAILABLE_MESSAGE =
   "The AI service is temporarily unavailable. Please try again in a moment.";
 const LLM_AUTH_ERROR_MESSAGE =
   "The AI service configuration is invalid. Please contact your administrator.";
+const PAID_RESULT_OVERFLOW_MESSAGE =
+  "A model call was made, but its complete result or audit record could not be retained. ELSPETH stopped without using that result. The call may have incurred a charge. Review the saved session before starting another request.";
+function paidResultIncompleteMessage(error: ApiError): string {
+  const cost = error.paid_result_incomplete_cost;
+  const costText = cost?.status === "known" ? `The observed cost is ${cost.amount}.` : "The cost is unknown; the call may have incurred a charge.";
+  return `A model call returned, but its result or audit evidence could not be fully retained. ELSPETH stopped without using or retrying that result. ${costText} Review the saved session before starting another request.`;
+}
 const GRAPH_UNAVAILABLE_MESSAGE =
   "The saved graph is unavailable. You can ask Composer to recover a saved draft.";
 
@@ -399,6 +407,7 @@ function formatProviderDiagnostic(apiErr: ApiError): string {
 }
 
 function formatLlmUnavailableError(apiErr: ApiError): string {
+  if (apiErr.request_rejection !== undefined) return formatRequestRejection(apiErr.request_rejection, "composer");
   return `${apiErr.guidance ?? LLM_UNAVAILABLE_MESSAGE}${formatProviderDiagnostic(apiErr)}`;
 }
 
@@ -444,37 +453,69 @@ function mergeComposerFailureOutcomes(existing: ComposerOperationFailureNotice[]
   });
 }
 
+export const COMPOSER_STOP_UNAVAILABLE_COPY = "Stopping this request is not available in this build. Updates will continue.";
+const COMPOSER_OBSERVATION_PENDING_COPY = "Composer updates stopped before the outcome could be confirmed. Reload this session to check the same action, or use Stop to request cancellation. Your request is still pending.";
+
+function composerObservationPendingNotice(): string {
+  return [composerCustodyRecoveryNotice(), COMPOSER_OBSERVATION_PENDING_COPY].filter((notice) => notice !== null).join(" ");
+}
+function reportComposerObservationFault(fault: ComposerObservationFault): void {
+  console.warn(fault.code);
+}
+
 async function runDurableComposerTurn(descriptor: OperationCustody, localMessageId: string | null, signal: AbortSignal | undefined, submit: boolean, reconciliationOnly = false): Promise<void> {
   const sessionId = descriptor.sessionId;
   const generation = sessionPublicationGeneration;
   const authGeneration = currentAuthGeneration();
-  const current = () => isCurrentAuthGeneration(authGeneration) && sessionPublicationIsCurrent(sessionId, generation);
+  const current = () => {
+    const scope = composerCustodyScope();
+    return isCurrentAuthGeneration(authGeneration) && sessionPublicationIsCurrent(sessionId, generation) && scope !== null && samePrincipal(scope, descriptor.scope);
+  };
   const beforeVersion = useSessionStore.getState().compositionState?.version ?? null;
   let result: import("@/types/index").MessageWithStateResponse | null = null;
   let failure: unknown = null;
+  // Stop state is scoped to this operation: restored intent comes from custody.
+  if (current() && !reconciliationOnly) useSessionStore.setState({ composerOperationStatus: null, composerProgress: null, composerLiveUpdatesInterrupted: false, composerStopPendingOperationId: composerStopRequested(descriptor) ? descriptor.operationId : null });
   try {
     const options = {
-      signal, current, reconciliationOnly,
+      signal, current,
       progress: (snapshot: ComposerProgressSnapshot) => { if (current() && !reconciliationOnly) useSessionStore.setState({ composerProgress: snapshot }); },
-      timeout: () => {
-        if (!current()) return;
-        useSessionStore.setState({
-          error: [composerCustodyRecoveryNotice(), "Composer updates stopped before the outcome could be confirmed. Reload this session to check the same action, or use Stop to request cancellation. Your request is still pending."].filter((notice) => notice !== null).join(" "),
-          errorDetails: null,
-          composerProgress: null,
+      status: (status: ComposerOperationStatus) => {
+        if (current() && !reconciliationOnly) useSessionStore.setState((state) => {
+          const previous = state.composerOperationStatus;
+          const sameSegment = previous?.operation_id === status.operation_id && status.segment !== null
+            && previous.segment?.sequence === status.segment.sequence && previous.segment.generation === status.segment.generation;
+          return {
+            composerOperationStatus: status,
+            composerProgress: sameSegment ? state.composerProgress : null,
+            composerStopPendingOperationId: status.cancel_requested && state.composerStopPendingOperationId === status.operation_id ? null : state.composerStopPendingOperationId,
+          };
         });
       },
+      stopUnconfirmed: (unconfirmed: boolean) => {
+        if (current() && !reconciliationOnly) useSessionStore.setState((state) => ({ composerStopPendingOperationId: unconfirmed ? descriptor.operationId : state.composerStopPendingOperationId === descriptor.operationId ? null : state.composerStopPendingOperationId }));
+      },
+      stopUnavailable: () => {
+        if (current() && !reconciliationOnly) useSessionStore.setState({ error: COMPOSER_STOP_UNAVAILABLE_COPY, errorDetails: null });
+      },
+      interrupted: (interrupted: boolean) => { if (current() && !reconciliationOnly) useSessionStore.setState({ composerLiveUpdatesInterrupted: interrupted }); },
     };
     result = submit && descriptor.mode === "submitted"
       ? await submitAndObserveComposerOperation(descriptor, options)
       : await observeComposerOperation(descriptor, options);
   } catch (error) {
     if (!current() || error instanceof ComposerObservationDetached) return;
+    if (error instanceof ComposerObservationFault) {
+      reportComposerObservationFault(error);
+      if (!reconciliationOnly) useSessionStore.setState({ error: composerObservationPendingNotice(), errorDetails: null, composerProgress: null });
+      return;
+    }
     if (error instanceof ComposerSessionMissing) { useSessionStore.getState().unbindMissingSession(sessionId); return; }
     if (error instanceof ComposerActiveAttachment && error.terminal.status === "completed") result = error.terminal.result;
     failure = error;
   }
   if (!current()) return;
+  if (useSessionStore.getState().composerStopPendingOperationId === descriptor.operationId) useSessionStore.setState({ composerStopPendingOperationId: null });
   let messagesAtReadDispatch = useSessionStore.getState().messages;
   const proposalSnapshot = beginProposalSnapshot();
   let authoritativeMessages: ChatMessage[] | null = null;
@@ -482,9 +523,19 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   let unavailableHead: UnavailableCompositionHead | null | undefined;
   let proposals: CompositionProposal[] | null = null;
   let refreshed = false;
+  // A refused submission observes the winner. Its failed terminal carries the
+  // actual ApiError inside the attachment; the losing draft keeps its own copy.
+  const attachedTerminalError = failure instanceof ComposerActiveAttachment && failure.terminal.status === "failed"
+    ? failure.terminal.error : null;
   const error = failure as ApiError | null;
-  const errorText = error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
-  const terminalFailure = failure instanceof ComposerActiveAttachment ? failure.terminal.status === "failed" ? failure.terminal.error : null : error;
+  const incompleteError = attachedTerminalError?.error_type === "paid_result_incomplete" ? attachedTerminalError : error?.error_type === "paid_result_incomplete" ? error : null;
+  const errorText = incompleteError !== null
+    ? `${failure instanceof ComposerActiveAttachment ? `${failure.message} ` : ""}${paidResultIncompleteMessage(incompleteError)}`
+    : failure instanceof ComposerActiveAttachment
+    ? attachedTerminalError?.error_type === "paid_result_overflow"
+      ? `${failure.message} ${PAID_RESULT_OVERFLOW_MESSAGE}` : failure.message
+    : error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "paid_result_overflow" ? PAID_RESULT_OVERFLOW_MESSAGE : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
+  const terminalFailure = failure instanceof ComposerActiveAttachment ? attachedTerminalError : error;
   const terminalIdentity = terminalFailure?.composer_operation;
   const observedFailure: ComposerOperationFailureNotice | null = terminalFailure === null || terminalIdentity === undefined ? null : {
     session_id: sessionId, operation_id: terminalIdentity.operation_id, kind: terminalIdentity.kind, user_message_id: null,
@@ -516,7 +567,11 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
     }
     messages = messages.map((row, index) => {
       if (!(row.id === localMessageId || (row.role === "user" && row.operation_id === descriptor.operationId))) return row;
-      if (error && error.error_type !== "audit_integrity_error" && (failure instanceof ComposerActiveAttachment || !hasGenuineReplyForUser(messages, index))) return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: error.error_type === "stale_compose_state" ? "stale_compose_state" : error.failure_code ?? error.error_type };
+      if (error && error.error_type !== "audit_integrity_error" && (failure instanceof ComposerActiveAttachment || !hasGenuineReplyForUser(messages, index))) {
+        const failureType = attachedTerminalError?.error_type ?? error.error_type;
+        const localFailureCode = failureType === "stale_compose_state" || failureType === "paid_result_overflow" || failureType === "paid_result_incomplete" ? failureType : error.failure_code ?? error.error_type;
+        return { ...row, local_status: "failed", local_error: errorText ?? undefined, local_failure_code: localFailureCode };
+      }
       return { ...row, local_status: undefined, local_error: undefined, local_failure_code: undefined };
     });
     const savedPartial = error?.partial_state_save_failed !== true ? error?.partial_state : null;
@@ -741,6 +796,12 @@ interface SessionState {
   staleProposalIds: string[];
   proposalActionPendingIds: string[];
   composerProgress: ComposerProgressSnapshot | null;
+  /** Latest accepted state of the observed composer operation (null when none is observed). */
+  composerOperationStatus: ComposerOperationStatus | null;
+  /** True after two failed live-update connects; the request may still be running. */
+  composerLiveUpdatesInterrupted: boolean;
+  /** The operation whose Stop was pressed and not yet confirmed (null: none). */
+  composerStopPendingOperationId: string | null;
   isComposing: boolean;
   /** Ephemeral browser requests, retained across view/session navigation. */
   composeRequests: ReadonlyMap<string, ComposeRequestOwner>;
@@ -887,6 +948,9 @@ const initialState = {
   staleProposalIds: [] as string[],
   proposalActionPendingIds: [] as string[],
   composerProgress: null as ComposerProgressSnapshot | null,
+  composerOperationStatus: null as ComposerOperationStatus | null,
+  composerLiveUpdatesInterrupted: false,
+  composerStopPendingOperationId: null as string | null,
   isComposing: false,
   composeRequests: new Map<string, ComposeRequestOwner>(),
   composerModel: null as string | null,
@@ -951,6 +1015,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   cancelComposition() {
     const { activeSessionId, composeRequests } = get();
     if (activeSessionId !== null) {
+      const scope = composerCustodyScope();
+      const target = scope === null ? null : findComposerOperationCustody(scope, activeSessionId).foreground;
+      set({ composerStopPendingOperationId: target?.operationId ?? null });
       const observing = cancelObservedComposerOperation(activeSessionId);
       if (composerStopPersistenceLimited()) set({ error: "Stop requested. Keep this tab open until the action settles; this browser could not save the pending cancellation." });
       if (!observing && composerSessionHasCustody(activeSessionId)) void get().resumeComposerOperation(activeSessionId);
@@ -1037,6 +1104,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set((state) => ({
       sessions: [session, ...state.sessions],
       activeSessionId: session.id,
+      composerOperationStatus: null,
+      composerLiveUpdatesInterrupted: false,
+      composerStopPendingOperationId: null,
       messages: [],
       // A freshly created session is KNOWN to have no composition state.
       compositionState: null,
@@ -1089,6 +1159,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           ...(wasActive
             ? {
                 activeSessionId: null,
+                composerOperationStatus: null,
+                composerLiveUpdatesInterrupted: false,
+                composerStopPendingOperationId: null,
                 messages: [],
                 compositionState: null,
                 compositionStateLoaded: false,
@@ -1149,6 +1222,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     useBlobStore.getState().activateSession(id);
     set({
       activeSessionId: id,
+      composerOperationStatus: null,
+      composerLiveUpdatesInterrupted: false,
+      composerStopPendingOperationId: null,
       messages: [],
       compositionState: null,
       lastComposeChangedPipeline: null,
@@ -1197,6 +1273,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         useBlobStore.getState().activateSession(null);
         set({
           activeSessionId: null,
+          composerOperationStatus: null,
+          composerLiveUpdatesInterrupted: false,
+          composerStopPendingOperationId: null,
           messages: [],
           compositionState: null,
           compositionStateLoaded: false,
@@ -1227,6 +1306,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     useBlobStore.getState().activateSession(sessionId);
     set({
       activeSessionId: sessionId,
+      composerOperationStatus: null,
+      composerLiveUpdatesInterrupted: false,
+      composerStopPendingOperationId: null,
       messages: [],
       compositionState: null,
       compositionStateLoaded: false,
@@ -1253,6 +1335,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     useBlobStore.getState().activateSession(null);
     set({
       activeSessionId: null,
+      composerOperationStatus: null,
+      composerLiveUpdatesInterrupted: false,
+      composerStopPendingOperationId: null,
       messages: [],
       compositionState: null,
       compositionStateLoaded: false,
@@ -1296,6 +1381,18 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     } catch { return; }
     void get().loadComposerFailureOutcomes();
     const record = findComposerOperationCustody(scope, sessionId);
+    if (record.foreground === null && record.unresolvedSubmissions.size === 0) {
+      // Another tab or device may own a live request (D-8): adopt it as an
+      // observer so this tab shows it and its Stop.
+      let active: Awaited<ReturnType<typeof api.fetchActiveComposerOperation>> = null;
+      try { active = await api.fetchActiveComposerOperation(sessionId); } catch { return; }
+      if (active === null || !isCurrentAuthGeneration(authGeneration) || !sessionPublicationIsCurrent(sessionId, generation)) return;
+      const adopted = adoptComposerObserver(scope, sessionId, active);
+      if (adopted === null) return;
+      set({ isComposing: true });
+      void runDurableComposerTurn(adopted, null, undefined, false);
+      return;
+    }
     if (record.foreground !== null) {
       set({ isComposing: true });
       void runDurableComposerTurn(record.foreground, null, undefined, false);
@@ -1309,20 +1406,27 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   async reconcileInactiveComposerCustody() {
     const authGeneration = currentAuthGeneration();
+    const generation = sessionPublicationGeneration;
     const scope = composerCustodyScope();
     if (scope === null) return;
     try {
       const [principal, config] = await Promise.all([api.fetchCurrentUser({ logoutOnUnauthorized: false }), api.fetchAuthConfig()]);
       const fresh = composerCustodyScope();
-      if (!isCurrentAuthGeneration(authGeneration) || fresh === null || !samePrincipal(fresh, scope) || principal.user_id !== scope.principalId || config.provider !== scope.authProvider) return;
+      if (!isCurrentAuthGeneration(authGeneration) || sessionPublicationGeneration !== generation || fresh === null || !samePrincipal(fresh, scope) || principal.user_id !== scope.principalId || config.provider !== scope.authProvider) return;
       const notice = composerCustodyRecoveryNotice();
       if (notice !== null) set({ error: notice });
       for (const sessionId of composerCustodySessionIds(scope)) {
         if (sessionId === get().activeSessionId) continue;
         const record = findComposerOperationCustody(scope, sessionId);
         for (const descriptor of [...record.unresolvedSubmissions.values(), ...(record.foreground === null ? [] : [record.foreground])]) {
-          void observeComposerOperation(descriptor, { reconciliationOnly: true, current: () => get().activeSessionId !== sessionId }).catch(() => undefined).finally(() => {
-            if (isCurrentAuthGeneration(authGeneration) && notice !== null && get().error === notice) set({ error: composerCustodyRecoveryNotice() });
+          const current = () => {
+            const fresh = composerCustodyScope();
+            return isCurrentAuthGeneration(authGeneration) && sessionPublicationGeneration === generation && fresh !== null && samePrincipal(fresh, scope) && get().activeSessionId !== sessionId;
+          };
+          void observeComposerOperation(descriptor, { current }).catch((error: unknown) => {
+            if (current() && error instanceof ComposerObservationFault) reportComposerObservationFault(error);
+          }).finally(() => {
+            if (current() && notice !== null && get().error === notice) set({ error: composerCustodyRecoveryNotice() });
           });
         }
       }
@@ -1843,6 +1947,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         getExecutionStore().clearValidation();
         return {
           activeSessionId: result.session_id,
+          composerOperationStatus: null,
+          composerLiveUpdatesInterrupted: false,
+          composerStopPendingOperationId: null,
           messages,
           compositionState,
           compositionStateLoaded: true,

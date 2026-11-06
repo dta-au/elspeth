@@ -283,6 +283,10 @@ export function ChatPanelContent({
   const acceptProposal = useSessionStore((s) => s.acceptProposal);
   const rejectProposal = useSessionStore((s) => s.rejectProposal);
   const composerProgress = useSessionStore((s) => s.composerProgress);
+  const composerOperationStatus = useSessionStore((s) => s.composerOperationStatus);
+  const composerLiveUpdatesInterrupted = useSessionStore((s) => s.composerLiveUpdatesInterrupted);
+  const composerStopPendingOperationId = useSessionStore((s) => s.composerStopPendingOperationId);
+  const composerStopPending = composerStopPendingOperationId !== null;
   const clearError = useSessionStore((s) => s.clearError);
   const forkFromMessage = useSessionStore((s) => s.forkFromMessage);
   // Honest completion labels (elspeth-bf9c296ee5), derived from the run
@@ -425,7 +429,7 @@ export function ChatPanelContent({
   }
 
   // Track whether the user has scrolled up from the bottom
-  function handleScroll() {
+  const handleScroll = useCallback(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
     const threshold = 40; // pixels from bottom
@@ -433,7 +437,53 @@ export function ChatPanelContent({
       container.scrollHeight - container.scrollTop - container.clientHeight <
       threshold;
     setShowScrollButton(!atBottom);
-  }
+  }, []);
+
+  // Viewport resizing and transcript content changes (for example removal
+  // of the loading-history tail) can reach bottom without changing scrollTop.
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (container === null || typeof ResizeObserver === "undefined") return;
+    let disposed = false;
+    const retireStaleScrollButton = () => {
+      if (disposed) return;
+      // Content growth is not user scroll-up intent: preserve auto-follow
+      // while its smooth scroll is still travelling toward the new bottom.
+      if (container.scrollHeight - container.scrollTop - container.clientHeight < 40) {
+        setShowScrollButton(false);
+      }
+    };
+    const observer = new ResizeObserver(retireStaleScrollButton);
+    observer.observe(container);
+    const observedChildren = new Set<Element>();
+    const reconcileChildren = () => {
+      if (disposed) return;
+      for (const child of observedChildren) {
+        if (child.parentElement !== container) {
+          observer.unobserve(child);
+          observedChildren.delete(child);
+        }
+      }
+      for (const child of container.children) {
+        if (!observedChildren.has(child)) {
+          observer.observe(child);
+          observedChildren.add(child);
+        }
+      }
+    };
+    reconcileChildren();
+    const mutations = new MutationObserver(() => {
+      if (disposed) return;
+      reconcileChildren();
+      retireStaleScrollButton();
+    });
+    mutations.observe(container, { childList: true });
+    return () => {
+      disposed = true;
+      mutations.disconnect();
+      observer.disconnect();
+    };
+  }, [activeSessionId]);
 
   // The terminal snapshot is deliberately retained after a turn settles so
   // this indicator bridges the gap until the reply renders (sessionStore:
@@ -1305,6 +1355,9 @@ export function ChatPanelContent({
             completionOutcome={freeformCompletionOutcome}
             liveToolCalls={liveToolCalls}
             lastRejection={lastComposerRejection}
+            operationStatus={composerOperationStatus}
+            liveUpdatesInterrupted={composerLiveUpdatesInterrupted}
+            stopPending={composerStopPending}
             onRetryInterruptedRequest={interruptedRequest === undefined
               ? undefined
               : () => { void retryMessage(interruptedRequest.id); }}
@@ -1324,6 +1377,7 @@ export function ChatPanelContent({
         onSend={handleSend}
         disabled={isComposing}
         onCancel={isComposing ? cancelComposition : undefined}
+        stopPending={isComposing && (composerStopPending || (composerOperationStatus?.cancel_requested ?? false))}
         inputRef={inputRef}
         onToggleBlobManager={() => setShowBlobManager((v) => !v)}
         showBlobManager={showBlobManager}

@@ -699,7 +699,7 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
         assert body["request_id"] == "req-invariant-1", exc_type.__name__
         if exc_type is RequiredGenerationUnavailable:
             assert response.status_code == 503
-            assert body["error_type"] == "database_unavailable"
+            assert body["error_type"] == "executor_unavailable"
             assert "private generation detail" not in response.body.decode()
 
 

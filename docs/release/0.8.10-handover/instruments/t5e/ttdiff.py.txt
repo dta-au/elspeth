@@ -1,0 +1,14 @@
+import json, sys, re
+from collections import Counter
+def load(p, root):
+    out = Counter()
+    for f in json.load(open(p)):
+        msg = f["message"].replace(root, "<ROOT>")
+        msg = re.sub(r"\bline \d+\b", "line N", msg)
+        out[(f["rule_id"], f["file_path"].replace(root, "<ROOT>"), msg)] += 1
+    return out
+b = load(sys.argv[1], ".claude/worktrees/t5e-base")
+t = load(sys.argv[2], ".claude/worktrees/t5e")
+print("base", sum(b.values()), "tip", sum(t.values()))
+for k, v in sorted((t - b).items()): print("ADDED", v, k)
+for k, v in sorted((b - t).items()): print("REMOVED", v, k)

@@ -22,7 +22,6 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any, assert_never
 
 from elspeth.contracts.errors import TransformErrorReason
@@ -137,8 +136,9 @@ class ValidationSuccess:
     data: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.data, MappingProxyType):
-            object.__setattr__(self, "data", deep_freeze(self.data))
+        # deep_freeze detaches a MappingProxyType input (a proxy is a view over
+        # a possibly mutable dict), so no isinstance skip is sound.
+        object.__setattr__(self, "data", deep_freeze(self.data))
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,8 +19,30 @@ from elspeth.web.composer.progress import (
     advisor_checkpoint_progress_event,
     client_cancelled_progress_event,
     convergence_progress_event,
+    model_call_progress_event,
 )
 from elspeth.web.sessions.routes._helpers import _composer_progress_sink
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Convert HTML to JSON.",
+        "Do not use HTML or JSON.",
+        "Explain why HTML differs from JSON.",
+        'Explain the phrase "HTML input and JSON output" in the documentation.',
+        "Convert CSV to parquet.",
+        "PRIVATE_REQUEST_CANARY",
+    ],
+)
+def test_model_call_progress_describes_lifecycle_without_interpreting_request(message: str) -> None:
+    baseline = model_call_progress_event("Explain the current pipeline.")
+
+    event = model_call_progress_event(message)
+
+    assert event == baseline
+    assert event.phase == "calling_model"
+    assert message not in event.model_dump_json()
 
 
 class TestComposerProgressEvent:

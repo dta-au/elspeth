@@ -86,6 +86,16 @@ class _AdmissionService:
         self.operations.append(operation)
         return self.decision
 
+    async def get_composer_preferences(self, session_id: UUID) -> ComposerSessionPreferencesRecord:
+        assert str(session_id) == _SESSION_ID
+        return ComposerSessionPreferencesRecord(
+            session_id=session_id,
+            trust_mode="auto_commit",
+            density_default="medium",
+            interpretation_review_disabled=False,
+            updated_at=datetime.now(UTC),
+        )
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["compose", "diagnostics", "signoff"])
@@ -97,8 +107,6 @@ async def test_public_entry_refuses_before_provider_work(
     authority = _AdmissionService(reason)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
-    service._planning_application._sessions_service_optional = service._sessions_service
-    service._planning_application._chargeable_admission = service._chargeable_admission
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     # These later-stage dependencies deliberately fail if reached. The admission
@@ -107,7 +115,6 @@ async def test_public_entry_refuses_before_provider_work(
     with (
         patch.object(service._provider_gateway, "_call_llm", autospec=True) as tool_provider,
         patch.object(service._provider_gateway, "_call_text_llm", autospec=True) as text_provider,
-        patch("elspeth.web.composer.planning_application.plan_pipeline", autospec=True) as planner,
         patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True) as advisor,
         pytest.raises(ComposerAdmissionRefused, match=reason.value),
     ):
@@ -133,7 +140,6 @@ async def test_public_entry_refuses_before_provider_work(
     assert authority.operations == [ChargeableOperation.COMPOSER]
     tool_provider.assert_not_called()
     text_provider.assert_not_called()
-    planner.assert_not_called()
     advisor.assert_not_called()
 
 
@@ -149,8 +155,6 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
-    service._planning_application._sessions_service_optional = service._sessions_service
-    service._planning_application._chargeable_admission = service._chargeable_admission
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
 
@@ -281,14 +285,14 @@ async def test_rootless_admission_controls_actual_provider_transition(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["rootless", "signoff"])
 @pytest.mark.parametrize("allowed", [True, False])
-async def test_same_valid_request_reaches_planner_only_when_admitted(
+async def test_same_valid_request_reaches_common_or_advisor_entry_only_when_admitted(
     composer_service_with_real_sessions: ComposerServiceImpl, entry: str, allowed: bool
 ) -> None:
     service = composer_service_with_real_sessions
     sessions = service._sessions_service
     assert sessions is not None
 
-    async def assert_scoped_planner(*args: object, **kwargs: object) -> None:
+    async def assert_scoped_entry(*args: object, **kwargs: object) -> None:
         scope = provider_quota._SCOPE.get()
         assert scope is not None
         assert scope.service is sessions
@@ -308,8 +312,8 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     with (
         patch.object(sessions, "assess_chargeable_operation", new=authority.assess_chargeable_operation),
         patch.object(sessions, "get_composer_preferences", autospec=True, return_value=preferences),
-        patch("elspeth.web.composer.planning_application.plan_pipeline", autospec=True, side_effect=assert_scoped_planner) as planner,
-        patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True, side_effect=assert_scoped_planner) as advisor,
+        patch.object(service, "_compose_loop", autospec=True, side_effect=assert_scoped_entry) as common,
+        patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True, side_effect=assert_scoped_entry) as advisor,
         pytest.raises(_PlannerReached if allowed else ComposerAdmissionRefused),
     ):
         if entry == "rootless":
@@ -330,7 +334,7 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
                 session_operation_context=_CONTEXT,
             )
     assert authority.operations == [ChargeableOperation.COMPOSER]
-    assert planner.await_count == int(allowed and entry != "signoff")
+    assert common.await_count == int(allowed and entry != "signoff")
     assert advisor.await_count == int(allowed and entry == "signoff")
     assert provider_quota._SCOPE.get() is None
 
@@ -343,8 +347,6 @@ async def test_concurrent_diagnostics_restore_separate_session_scopes(
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
     service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
-    service._planning_application._sessions_service_optional = service._sessions_service
-    service._planning_application._chargeable_admission = service._chargeable_admission
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     second_context = SessionOperationContext(

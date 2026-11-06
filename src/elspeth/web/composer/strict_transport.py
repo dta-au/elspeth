@@ -246,17 +246,15 @@ class ComposerRouteToolContract:
 
 @dataclass(frozen=True, slots=True)
 class ComposerToolContract:
-    """The tool contract of both composer routes under one setting (D20).
+    """The compose loop's tool contract under one setting (D20).
 
-    ``planner`` is the compose loop and the pipeline planner's ordinary turns
-    (``composer_model`` + ``composer_endpoint_base_url``); ``hatch`` is the
-    planner's escape-hatch turn (``composer_advisor_model`` +
-    ``composer_advisor_endpoint_base_url``).
+    ``planner`` is the compose loop's primary route (``composer_model`` +
+    ``composer_endpoint_base_url``). The field keeps its historical name; the
+    pipeline planner and its escape-hatch route were retired (U-30).
     """
 
     setting: StrictToolsSetting
     planner: ComposerRouteToolContract
-    hatch: ComposerRouteToolContract
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,7 +277,7 @@ def _route_contract(*, model: str, api_base: str | None, setting: StrictToolsSet
 
 
 def resolve_composer_tool_contract(settings: ComposerSettings, *, env: Mapping[str, str]) -> ComposerToolContract:
-    """Resolve the planner route and the escape-hatch route (D20).
+    """Resolve the compose loop's primary route (D20).
 
     The composer service and the boot probe both call this, so the lists the
     probe sends and the lists production sends come from one resolution.
@@ -290,10 +288,4 @@ def resolve_composer_tool_contract(settings: ComposerSettings, *, env: Mapping[s
     return ComposerToolContract(
         setting=setting,
         planner=_route_contract(model=settings.composer_model, api_base=settings.composer_endpoint_base_url, setting=setting, env=env),
-        hatch=_route_contract(
-            model=settings.composer_advisor_model,
-            api_base=settings.composer_advisor_endpoint_base_url,
-            setting=setting,
-            env=env,
-        ),
     )

@@ -15,26 +15,20 @@ import types
 
 APP = "src/elspeth/web/app.py"
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
-TURN = "src/elspeth/web/sessions/composer_turn.py"
+DRIVER = "src/elspeth/web/sessions/continuation_driver.py"
 
 # Populated from the actual mapped source by the standalone preparation script.
 # Application grammar is the actual header and entire executable prefix through
 # the direct constructor statement. No tail or source coordinates authorize it.
 REVIEWED_GRAMMARS = {
-    "ComposerAsyncWorker.__init__": "97e2ea8a5b6b2833eff8c5cb5df2fa99380efed05c2110f25f8dfa7571fa30b4",
+    "ComposerAsyncWorker.__init__": "7675240c07be3c1db3e375b6ecb8b85aa0d7c890a4e3cfa2c1761adbe64ea402",
     "ComposerAsyncWorker._job": "ebe08f000b83f6477d3035666cce0d85aaf8f85290c8bdceebf4a91b6bc21ab2",
-    "ComposerAsyncWorker._run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
-    "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
-    "_create_app": "f624a505cbaa8c873b85d959194456c829c2d780ccbfca30bc84134aa197823e",
-    "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
+    "_create_app": "2c4a5bf83deefeaa62e0d35b1556f6542b7ecaa8e9af5b93ef27e37e41beaa98",
 }
 SELECTED = (
     (APP, "_create_app", "ORDINARY_FUNCTION"),
     (WORKER, "ComposerAsyncWorker.__init__", "ORDINARY_FUNCTION"),
     (WORKER, "ComposerAsyncWorker._job", "NATIVE_COROUTINE"),
-    (WORKER, "ComposerAsyncWorker._run_started", "NATIVE_COROUTINE"),
-    (WORKER, "ComposerAsyncWorker._run_started_under_lease", "NATIVE_COROUTINE"),
-    (TURN, "run_composer_turn", "NATIVE_COROUTINE"),
 )
 RECEIPT_KEYS = (
     "app_worker_constructor_call",
@@ -42,10 +36,8 @@ RECEIPT_KEYS = (
     "worker_app_store",
     "job_dto_factory_call",
     "job_services_store",
-    "job_turn_call",
-    "wrapper_turn_call",
-    "job_started_call",
-    "started_under_lease_call",
+    "job_segment_calls",
+    "segment_driver_call",
     "reap_dto_factory_call",
 )
 
@@ -89,9 +81,48 @@ def canonical(value):
     return value
 
 
+_YAML_ADAPTER_PREFLIGHT_CALL = "validate_pipeline(\n            state,\n            settings,\n            ComposerYamlSerializer(),\n            secret_service=app.state.scoped_secret_resolver,\n            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),\n            user_id=user_id,\n            session_id=session_id,\n            blob_get_metadata=_blob_get_metadata,\n            blob_get_content=blob_get_content,\n            plugin_snapshot=plugin_snapshot,\n            profile_registry=app.state.operator_profile_registry,\n            catalog=app.state.catalog_service,\n        )"
+
+
+def adapter_grammar_projection(node):
+    """Project only the reviewed adapter operand onto the previous grammar.
+
+    All receipts and compiler metadata still use the original input tree. This
+    disposable comparison copy preserves every other node. The complete
+    nominal-adapter receipt separately owns the class, import and lexical uses.
+    """
+    if not isinstance(node, ast.FunctionDef) or node.name != "_create_app":
+        return node
+    constructors = [child for child in ast.walk(node) if isinstance(child, ast.Call) and chain(child.func) == ("ComposerYamlSerializer",)]
+    if not constructors:
+        # Historical source remains a valid worker-only grammar; the combined
+        # adapter receipt independently requires the actual new production tuple.
+        return node
+    clone = copy.deepcopy(node)
+    functions = [child for child in clone.body if isinstance(child, ast.FunctionDef) and child.name == "_session_runtime_preflight"]
+    if len(functions) != 1:
+        raise ValueError("nominal YAML preflight owner is not unique")
+    expected = ast.dump(ast.parse(_YAML_ADAPTER_PREFLIGHT_CALL, mode="eval").body, include_attributes=False)
+    returns = [
+        child
+        for child in functions[0].body
+        if isinstance(child, ast.Return)
+        and isinstance(child.value, ast.Call)
+        and ast.dump(child.value, include_attributes=False) == expected
+    ]
+    if len(constructors) != 1 or len(returns) != 1:
+        raise ValueError("nominal YAML preflight argument delta is not exact")
+    call = returns[0].value
+    if len(call.args) != 3 or not isinstance(call.args[2], ast.Call) or call.args[2].args or call.args[2].keywords:
+        raise ValueError("nominal YAML constructor acquired an argument")
+    call.args[2] = ast.copy_location(ast.Name(id="yaml_generator_module", ctx=ast.Load()), call.args[2])
+    return clone
+
+
 def grammar(node, *, prefix=None):
     clone = copy.copy(node)
     clone.body = list(node.body if prefix is None else prefix)
+    clone = adapter_grammar_projection(clone)
     if (
         clone.body
         and isinstance(clone.body[0], ast.Expr)
@@ -165,16 +196,19 @@ def dependencies():
             "actual import/callable identity, current same-app state reads, DTO supplier and later keyword effects",
         ),
         (
-            "elspeth.web.sessions.composer_async_worker.ComposerAsyncWorker._run_started",
+            "elspeth.web.sessions.composer_async_worker.ComposerAsyncWorker._job",
             "ordinary member descriptor lookup, actual callable/code origin and receiver member stability",
         ),
         (
-            "elspeth.web.sessions.composer_async_worker.ComposerAsyncWorker._run_started_under_lease",
+            "elspeth.web.sessions.continuation_driver._SegmentDriver.run",
             "ordinary member descriptor lookup, actual callable/code origin and receiver member stability",
         ),
-        ("elspeth.web.sessions.composer_turn.run_composer_turn", "actual imported native coroutine and retained services argument effects"),
         (
-            "elspeth.web.sessions.composer_turn._run_composer_turn",
+            "elspeth.web.sessions.continuation_driver.run_continuation_segment",
+            "actual imported native coroutine and retained services argument effects",
+        ),
+        (
+            "elspeth.web.composer.continuation_live_phases.ContinuationLivePhases.advance",
             "actual imported/bound native coroutine, services/DTO member stability and provider dispatch",
         ),
         (
@@ -197,6 +231,84 @@ def dependencies():
     return [{"identity": identity, "requirement": requirement, "qualification": "UNKNOWN"} for identity, requirement in requirements]
 
 
+def worker_namespace_contract(worker_class):
+    """Keep the actual ordinary worker namespace and its one exact getter."""
+    if (
+        not isinstance(worker_class, ast.ClassDef)
+        or worker_class.bases
+        or worker_class.keywords
+        or worker_class.decorator_list
+        or worker_class.type_params
+    ):
+        return ["worker caller: unsupported worker class construction/namespace"]
+    lookup = {"__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__get__", "__set__", "__delete__"}
+    declarations = [
+        node
+        for node in worker_class.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and type(node.value.value) is str)
+    ]
+    if any(not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name in lookup for node in declarations):
+        return ["worker caller: unsupported worker member/descriptor declaration"]
+    expected_property = ast.parse(
+        "@property\ndef drain_deadline(self) -> ComposerDrainDeadline | None:\n    return self._drain_deadline"
+    ).body[0]
+    getters = [node for node in declarations if node.name == "drain_deadline"]
+    if len(getters) != 1 or ast.dump(getters[0]) != ast.dump(expected_property):
+        return ["worker caller: exact original drain deadline property changed"]
+    for member in declarations:
+        if member is getters[0]:
+            continue
+        defaults = member.args.defaults + [node for node in member.args.kw_defaults if node is not None]
+        if (
+            member.type_params
+            or any(not isinstance(node, ast.Constant) for node in defaults)
+            or any(chain(node) != ("staticmethod",) for node in member.decorator_list)
+        ):
+            return ["worker caller: unsupported worker definition-time member effect " + member.name]
+    return []
+
+
+def _drain_owner_transfer(app, init, constructor):
+    """Bind only the actual optional owner, event and worker field transfer."""
+    arguments = [keyword.value for keyword in constructor.keywords if keyword.arg == "drain_signal"]
+    events = [keyword.value for keyword in constructor.keywords if keyword.arg == "instance_draining"]
+    if (
+        len(arguments) != 1
+        or chain(arguments[0]) != ("drain_signal",)
+        or len(events) != 1
+        or chain(events[0]) != ("app", "state", "instance_draining")
+    ):
+        return ["worker caller: original drain owner/event constructor transfer changed"], None
+    expected_guard = ast.parse(
+        "if drain_signal is not None and (type(drain_signal) is not ComposerDrainSignal "
+        "or drain_signal.draining is not instance_draining):\n"
+        "    raise AuditIntegrityError('Composer worker changed its actual process drain signal')"
+    ).body[0]
+    guards = [node for node in init.body if isinstance(node, ast.If) and ast.dump(node) == ast.dump(expected_guard)]
+    expected_store = ast.parse("self._drain_signal = drain_signal").body[0]
+    stores = [node for node in init.body if ast.dump(node) == ast.dump(expected_store)]
+    state_store = [
+        node for node in app.body if ast.dump(node) == ast.dump(ast.parse("app.state.instance_draining = instance_draining").body[0])
+    ]
+    if len(guards) != 1 or len(stores) != 1 or init.body.index(guards[0]) >= init.body.index(stores[0]) or len(state_store) != 1:
+        return ["worker caller: nominal original drain owner/event guard or store changed"], None
+    for function in (app, init):
+        defaults = dict(zip((arg.arg for arg in function.args.kwonlyargs), function.args.kw_defaults, strict=True))
+        if (
+            "drain_signal" not in defaults
+            or not isinstance(defaults["drain_signal"], ast.Constant)
+            or defaults["drain_signal"].value is not None
+        ):
+            return ["worker caller: optional drain owner default changed"], None
+    return [], {
+        "argument": (APP, id(arguments[0])),
+        "event_argument": (APP, id(events[0])),
+        "guard": (WORKER, id(guards[0])),
+        "store": (WORKER, id(stores[0])),
+        "event_store": (APP, id(state_store[0])),
+    }
+
+
 def worker_caller_local_contracts(units):
     """Return failures plus conditional same-AST facts, never local admission."""
     receipt = dict.fromkeys(RECEIPT_KEYS)
@@ -208,7 +320,7 @@ def worker_caller_local_contracts(units):
     )
     units = list(units)
     index = {str(unit.path): unit for unit in units}
-    if len(index) != len(units) or not all(path in index for path in (APP, WORKER, TURN)):
+    if len(index) != len(units) or not all(path in index for path in (APP, WORKER, DRIVER)):
         return ["worker caller: missing/duplicate actual SourceUnit"], receipt
     failures = []
     selected = {}
@@ -262,31 +374,19 @@ def worker_caller_local_contracts(units):
     app = selected["_create_app"]
     init = selected["ComposerAsyncWorker.__init__"]
     job = selected["ComposerAsyncWorker._job"]
-    started = selected["ComposerAsyncWorker._run_started"]
-    under = selected["ComposerAsyncWorker._run_started_under_lease"]
-    wrapper = selected["run_composer_turn"]
     worker_class, _ = find(index[WORKER].tree, "ComposerAsyncWorker")
-    if worker_class.bases or worker_class.keywords or worker_class.decorator_list or worker_class.type_params:
-        return ["worker caller: unsupported worker class construction/namespace"], receipt
-    lookup = {"__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__get__", "__set__", "__delete__"}
-    declarations = [
-        n for n in worker_class.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and type(n.value.value) is str)
-    ]
-    if any(not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) or n.name in lookup for n in declarations):
-        return ["worker caller: unsupported worker member/descriptor declaration"], receipt
-    for member in declarations:
-        defaults = member.args.defaults + [n for n in member.args.kw_defaults if n is not None]
-        if (
-            member.type_params
-            or any(not isinstance(n, ast.Constant) for n in defaults)
-            or any(chain(n) != ("staticmethod",) for n in member.decorator_list)
-        ):
-            return ["worker caller: unsupported worker definition-time member effect " + member.name], receipt
+    namespace_failures = worker_namespace_contract(worker_class)
+    if namespace_failures:
+        return namespace_failures, receipt
     store = next(n for n in init.body if isinstance(n, ast.Assign) and chain(n.targets[0]) == ("self", "_app"))
     app_constructor = direct_call_statement(app.body, ("app", "state", "composer_async_worker"), ("ComposerAsyncWorker",)).value
     keyword_values = [n.value for n in app_constructor.keywords if n.arg == "app"]
     if len(keyword_values) != 1 or chain(keyword_values[0]) != ("app",):
         return ["worker caller: same-call exact app keyword changed"], receipt
+    drain_failures, drain = _drain_owner_transfer(app, init, app_constructor)
+    if drain_failures:
+        return drain_failures, receipt
+    receipt["drain_owner_transfer"] = drain
     # Local class namespace write forms are conservative refusals. No inference
     # about an outside alias or callback is drawn from their absence.
     for node in ast.walk(worker_class):
@@ -315,48 +415,10 @@ def worker_caller_local_contracts(units):
     factory_statement = direct_call_statement(job.body, ("services",), ("composer_app_services",))
     if factory_statement is None or not exact_call(factory_statement.value, ("composer_app_services",), [("self", "_app")], []):
         failures.append("worker caller: direct _job same-app factory binding changed")
-    hops = [
-        (job, ("self", "_run_started"), [("services",), ("running",), ("lease",)], [], "job_started_call"),
-        (
-            started,
-            ("self", "_run_started_under_lease"),
-            [("services",), ("running",), ("lease",), ("settlement",), ("setup_ticket",)],
-            [],
-            "started_under_lease_call",
-        ),
-        (
-            under,
-            ("run_composer_turn",),
-            [("services",), ("turn",)],
-            [
-                ("lease", ("lease",)),
-                ("running", ("running",)),
-                ("request_lifecycle", ("lifecycle",)),
-                ("observation", ("observation",)),
-                ("budget_anchor", ("anchor",)),
-            ],
-            "job_turn_call",
-        ),
-        (
-            wrapper,
-            ("_run_composer_turn",),
-            [("services",), ("turn",)],
-            [
-                ("lease", ("lease",)),
-                ("running", ("running",)),
-                ("request_lifecycle", ("request_lifecycle",)),
-                ("observation", ("observation",)),
-                ("budget_anchor", ("budget_anchor",)),
-            ],
-            "wrapper_turn_call",
-        ),
-    ]
-    for owner, callee, args, keywords, key in hops:
-        calls = awaited_calls(owner, callee)
-        if len(calls) != 1 or not exact_call(calls[0], callee, args, keywords):
-            failures.append("worker caller: exact awaited transfer changed " + key)
-        else:
-            receipt[key] = (TURN if owner is wrapper else WORKER, id(calls[0]))
+    flow_failures, flow = continuation_caller_contracts(units)
+    failures.extend(flow_failures)
+    if flow is not None:
+        receipt.update(flow)
     if failures:
         return failures, receipt
     receipt.update(
@@ -375,3 +437,170 @@ def worker_caller_local_contracts(units):
         if statement is not None:
             receipt["reap_dto_factory_call"] = (WORKER, id(statement.value))
     return [], receipt
+
+
+# These are current executable transport contracts, not replacements for the
+# independently retained complete worker/source grammar pins. Deleted V1
+# run-started/turn wrappers no longer transport a selected capability.
+_SEGMENT_ENTRY = """
+async def run_continuation_segment(
+    worker: ComposerAsyncWorker, services: ComposerAppServices,
+    running: ComposerOperationRunning, lease: SessionOperationLease, *,
+    adoption_failure: BaseException | None = None,
+) -> ContinuationSegmentOutcome:
+    from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+    original: BaseException | None = None
+    driver: _SegmentDriver | None = None
+    try:
+        driver = _SegmentDriver(worker, services, running, lease)
+        return await driver.run(adoption_failure)
+    except BaseException as failure:
+        original = failure
+        if driver is not None:
+            original = driver.join_failure(failure)
+        elif adoption_failure is not None:
+            original = combine_failure_objects(adoption_failure, failure)
+        if original is failure:
+            raise
+        raise original from original.__cause__
+    finally:
+        if lease.required_work is not None and lease.required_work.sql_deadline_owner is not None:
+            lease.required_work.sql_deadline_owner.begin_settlement()
+        cleanup_errors = list(driver._progress_cleanup_failures) if driver is not None else []
+        if driver is not None:
+            try:
+                await driver.close_progress()
+            except BaseException as cleanup:
+                cleanup_errors.append(cleanup)
+        try:
+            await lease.close(deadline=worker.drain_deadline)
+        except BaseException as cleanup:
+            cleanup_errors.append(cleanup)
+        if cleanup_errors:
+            cleanup_failure = cleanup_errors[0]
+            additional = (*cleanup_errors[1:], *((original,) if original is not None else ()))
+            if driver is not None:
+                combined = driver.join_failure(cleanup_failure, *additional)
+                if combined is cleanup_failure:
+                    raise cleanup_failure
+                raise combined from combined.__cause__
+            combined = combine_failure_objects(cleanup_failure, *additional)
+            if combined is cleanup_failure:
+                raise cleanup_failure
+            raise combined from combined.__cause__
+"""
+
+_JOIN_OWNED = """
+async def _join_owned[T](task: asyncio.Task[T], *, cancellation_observations: list[asyncio.CancelledError] | None = None) -> T:
+    observed: list[asyncio.CancelledError] = []
+    owner = asyncio.current_task()
+    while not task.done():
+        cancelling_before = owner.cancelling() if owner is not None else 0
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancelled:
+            if not task.cancelled() or (owner is not None and owner.cancelling() > cancelling_before):
+                observed.append(cancelled)
+        except BaseException:
+            break
+    if cancellation_observations is not None:
+        cancellation_observations.extend(observed)
+    try:
+        result = task.result()
+    except BaseException as child_failure:
+        if observed:
+            combined = _combine_operation_failures(child_failure, tuple(observed))
+            raise combined from combined.__cause__
+        raise
+    return result
+"""
+
+_OWNED = """
+async def _owned[T](awaitable: Awaitable[T], *, cancellation_observations: list[asyncio.CancelledError] | None = None) -> T:
+    return await _join_owned(asyncio.ensure_future(awaitable), cancellation_observations=cancellation_observations)
+"""
+
+_ADOPTION_TRANSFER = """
+try:
+    lease = await adoption.join()
+except BaseException as original:
+    retained_lease = adoption.lease
+    if retained_lease is None:
+        raise
+    await run_continuation_segment(self, services, running, retained_lease, adoption_failure=original)
+    raise
+"""
+
+
+def executable_shape(node):
+    """Ignore only the inert leading docstring; retain all executable nodes."""
+    clone = copy.copy(node)
+    clone.body = list(node.body)
+    if clone.body and isinstance(clone.body[0], ast.Expr):
+        value = clone.body[0].value
+        if isinstance(value, ast.Constant) and type(value.value) is str:
+            clone.body = clone.body[1:]
+    return ast.dump(clone, include_attributes=False)
+
+
+def continuation_caller_contracts(units):
+    """Actual adoption success/failure edges and one retained lease finalizer."""
+    units = tuple(units)
+    index = {str(unit.path): unit for unit in units}
+    if len(index) != len(units) or any(path not in index for path in (WORKER, DRIVER)):
+        return ["worker continuation caller: missing/duplicate units"], None
+    job, _ = find(index[WORKER].tree, "ComposerAsyncWorker._job")
+    entry, _ = find(index[DRIVER].tree, "run_continuation_segment")
+    if not isinstance(job, ast.AsyncFunctionDef):
+        return ["worker continuation caller: missing job"], None
+    definitions = []
+    for path, name, template in (
+        (WORKER, "_owned", _OWNED),
+        (WORKER, "_join_owned", _JOIN_OWNED),
+        (DRIVER, "run_continuation_segment", _SEGMENT_ENTRY),
+    ):
+        definition, _ = find(index[path].tree, name)
+        if not isinstance(definition, ast.AsyncFunctionDef) or executable_shape(definition) != executable_shape(
+            ast.parse(template).body[0]
+        ):
+            return ["worker continuation caller: exact transport/cleanup changed " + name], None
+        definitions.append((path, id(definition)))
+    # Exact exception nesting matters: a retained lease is never confused with
+    # successful adoption, and the original exception is re-raised afterward.
+    blocks = [
+        node for node in ast.walk(job) if isinstance(node, ast.Try) and ast.dump(node) == ast.dump(ast.parse(_ADOPTION_TRANSFER).body[0])
+    ]
+    if len(blocks) != 1:
+        return ["worker continuation caller: retained adoption transfer changed"], None
+    block = blocks[0]
+    parents = [value for node in ast.walk(job) for _, value in ast.iter_fields(node) if isinstance(value, list) and block in value]
+    expected = ast.parse("await run_continuation_segment(self, services, running, lease, adoption_failure=started_failure)").body[0]
+    if len(parents) != 1:
+        return ["worker continuation caller: ambiguous adoption owner"], None
+    siblings = parents[0]
+    offset = siblings.index(block)
+    if offset + 1 >= len(siblings) or ast.dump(siblings[offset + 1]) != ast.dump(expected):
+        return ["worker continuation caller: successful adoption transfer changed"], None
+    calls = awaited_calls(job, ("run_continuation_segment",))
+    expected_calls = [node for node in ast.walk(block) if isinstance(node, ast.Call) and chain(node.func) == ("run_continuation_segment",)]
+    expected_calls.append(siblings[offset + 1].value.value)
+    if len(calls) != 2 or {id(node) for node in calls} != {id(node) for node in expected_calls}:
+        return ["worker continuation caller: extra/escaped segment dispatch"], None
+    constructor = next(node for node in ast.walk(entry) if isinstance(node, ast.Call) and chain(node.func) == ("_SegmentDriver",))
+    run = next(node for node in ast.walk(entry) if isinstance(node, ast.Call) and chain(node.func) == ("driver", "run"))
+    close = next(node for node in ast.walk(entry) if isinstance(node, ast.Call) and chain(node.func) == ("lease", "close"))
+    transport = [(WORKER, node) for node in calls] + [(DRIVER, constructor), (DRIVER, run), (DRIVER, close)]
+    return [], {
+        "job_segment_calls": tuple((WORKER, id(node)) for node in calls),
+        "segment_driver_call": (DRIVER, id(constructor)),
+        "segment_run_call": (DRIVER, id(run)),
+        "segment_close_call": (DRIVER, id(close)),
+        "transport_definitions": tuple(definitions),
+        "transport_calls": frozenset((path, id(node)) for path, node in transport),
+        "supplier_arguments": frozenset(
+            (path, id(node), id(argument))
+            for path, node in transport
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+        ),
+        "adoption_transfer": (WORKER, id(block)),
+    }

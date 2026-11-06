@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from elspeth_lints.core.allowlist import _JUDGE_METADATA_SIGNATURE_ENV_VAR, JudgeVerdict
+from elspeth_lints.core.operator_runtime import OPERATOR_ENTRYPOINT
 
 __all__ = [
     "HmacKeyPresentError",
@@ -206,6 +207,7 @@ def _sign_bundle_command_text(
     *,
     lanes: str | None,
     continue_on_block: bool,
+    stale_key: str | None = None,
 ) -> str:
     """Render one paste-ready ``sign-bundle`` invocation at the given scope.
 
@@ -216,10 +218,7 @@ def _sign_bundle_command_text(
     parts = [
         "env",
         _OPERATOR_KEY_PLACEHOLDER,
-        "PYTHONPATH=elspeth-lints/src",
-        ".venv/bin/python",
-        "-m",
-        "elspeth_lints.core.cli",
+        OPERATOR_ENTRYPOINT,
         "sign-bundle",
         str(bundle_path),
         "--root",
@@ -229,10 +228,16 @@ def _sign_bundle_command_text(
         "--owner",
         '"$USER"',
         "--judge-transport",
-        "codex-cli",
+        # codex-cli is disabled: its native shell could read the judge worker's
+        # provider home. The agent transport is realpath-confined to /evidence.
+        "agent",
         "--judge-tools",
         "readonly",
     ]
+    if stale_key is not None:
+        if lanes is not None:
+            raise ValueError("stale-key selection cannot be combined with lanes")
+        parts.extend(("--stale-key", stale_key))
     if lanes is not None:
         parts.extend(("--lanes", lanes))
     if continue_on_block:
@@ -334,10 +339,7 @@ def _rekey_command(ctx: _ServerContext, bundle_path: Path, *, old_key_env: str, 
         "env",
         f"{old_key_env}=<old-operator-key>",
         f"{new_key_env}=<new-operator-key>",
-        "PYTHONPATH=elspeth-lints/src",
-        ".venv/bin/python",
-        "-m",
-        "elspeth_lints.core.cli",
+        OPERATOR_ENTRYPOINT,
         "rekey",
         "--in",
         str(bundle_path),
@@ -383,7 +385,13 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     bundle_path = _resolve_bundle_path(ctx, arguments)
     bundle = read_bundle(bundle_path)
+    stale_key = arguments.get("stale_key")
+    if "stale_key" in arguments and (not isinstance(stale_key, str) or not stale_key.strip()):
+        raise ValueError("stale_key must be a nonempty exact key")
+    exact_plan = None
     if bundle.rekey is not None and not bundle.actions:
+        if stale_key is not None:
+            raise ValueError("stale_key cannot select a rekey-only bundle")
         from elspeth_lints.core.source_snapshot import capture_source_snapshot
 
         if (
@@ -410,6 +418,19 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         verification = verify_bundle_against_tree(bundle, root=ctx.root, allowlist_dir=ctx.allowlist_dir)
         if not verification.ok:
             raise ValueError("staged bundle is stale; re-run stage_scan: " + "; ".join(verification.mismatches))
+        if stale_key is not None:
+            from elspeth_lints.core.sign_bundle_transaction import selected_action_indices
+
+            selected = selected_action_indices(bundle, verification=verification, stale_key=stale_key)
+            index = next(iter(selected))
+            exact_plan = {
+                "actions_total": 1,
+                "judge_calls_total": 0,
+                "stale_key": stale_key,
+                "original_action_index": index,
+                "source_file": bundle.actions[index].source_file,
+                "unselected_actions": len(bundle.actions) - 1,
+            }
 
     lane_counts: dict[str, int] = {}
     kind_counts: dict[str, int] = {}
@@ -439,8 +460,12 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "preview_outcomes": preview_outcomes,
         "justify_missing_rationale": justify_missing_rationale,
         "has_rekey_plan": bundle.rekey is not None,
-        "sign_bundle_command": _sign_bundle_command(ctx, bundle_path, bundle),
-        "sign_bundle_plan": _sign_bundle_plan(ctx, bundle_path, bundle),
+        "sign_bundle_command": (
+            _sign_bundle_command(ctx, bundle_path, bundle)
+            if stale_key is None
+            else _sign_bundle_command_text(ctx, bundle_path, lanes=None, continue_on_block=False, stale_key=stale_key)
+        ),
+        "sign_bundle_plan": _sign_bundle_plan(ctx, bundle_path, bundle) if exact_plan is None else exact_plan,
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
@@ -752,11 +777,11 @@ def _verdict_str(verdict: JudgeVerdict) -> str:
 
 
 def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
-    """Populate each ``new_judgment`` action with a NON-authoritative Codex verdict.
+    """Populate each ``new_judgment`` action with a NON-authoritative agent-judge verdict.
 
     [O1] ordering: ``_assert_no_hmac_key_in_env()`` is the first line, BEFORE the
-    lazy judge import -- so a key-present call fails closed even when the Codex
-    CLI is absent. ``ActionPreview.authoritative`` is
+    lazy judge import -- so a key-present call fails closed even when the judge
+    runtime is absent. ``ActionPreview.authoritative`` is
     structurally ``False``; the bundle stays signature-free. BLOCKED previews are
     surfaced so the agent can fix code/rationale before the operator step.
     """
@@ -815,11 +840,13 @@ def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
             similar_entries=similar_entries,
         )
         try:
-            response = judge_mod.call_judge(request, transport=judge_mod.TRANSPORT_CODEX_CLI, tool_scope=tool_scope)
+            # The agent transport, not codex-cli: codex is refused because its native
+            # shell could read the worker's provider credentials.
+            response = judge_mod.call_judge(request, transport=judge_mod.TRANSPORT_AGENT, tool_scope=tool_scope)
         except (ModuleNotFoundError, judge_mod.JudgeConfigurationError) as exc:
             # Convert the optional external-runtime failure to the MCP server's
             # clean ImportError outcome rather than a protocol traceback.
-            raise ImportError(f"stage_preview Codex judge unavailable: {exc}") from exc
+            raise ImportError(f"stage_preview judge unavailable: {exc}") from exc
         verdict = _verdict_str(response.verdict)
         preview = ActionPreview(
             verdict=verdict,
@@ -946,6 +973,7 @@ _TOOLS.update(
                 "type": "object",
                 "properties": {
                     "bundle_id": {"type": "string", "description": "Bundle id (file is <staged-dir>/<id>.json)"},
+                    "stale_key": {"type": "string", "minLength": 1, "description": "Plan exactly one verified orphan; zero judge calls"},
                 },
                 "required": ["bundle_id"],
             },
@@ -988,10 +1016,11 @@ _TOOLS.update(
         ),
         "stage_preview": _ToolSpec(
             description=(
-                "Fully verify the sign bundle, run the read-only Codex CLI judge over each "
+                "Fully verify the sign bundle, run the read-only agent judge (through the protected "
+                "judge supervisor) over each "
                 "new_judgment action, reverify before overwrite, and record a NON-authoritative "
                 "preview verdict (never signs; stale bundles receive no judge call). "
-                "Requires an installed + authenticated Codex CLI and the [mcp] extra."
+                "Requires the installed judge supervisor and the [mcp] extra."
             ),
             input_schema={
                 "type": "object",

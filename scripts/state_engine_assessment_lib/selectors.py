@@ -248,8 +248,12 @@ def _collect_pytest_node_ids(repository_root: Path, marker_expression: str, node
             sys.executable,
             "-m",
             "pytest",
-            "-p",
-            "no:dotenv",
+            # Load no .env during collection. Blocking the dotenv plugin would
+            # leave its env_files ini key unregistered, which strict_config
+            # rejects; an empty env_files override keeps the key known and
+            # parses no file.
+            "-o",
+            "env_files=",
             "--collect-only",
             "-q",
             "-n",

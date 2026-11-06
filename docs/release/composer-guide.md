@@ -1,7 +1,7 @@
 # ELSPETH Composer Guide
 
-**Document date:** 20 October 2026
-**Release covered:** 0.8.9 unreleased candidate
+**Document date:** 31 October 2026
+**Release covered:** 0.8.10 unreleased candidate
 **Audience:** Evaluators, program teams, operators, and technical reviewers
 **Register:** Public-facing / lightly technical
 **Status:** Current capability guide

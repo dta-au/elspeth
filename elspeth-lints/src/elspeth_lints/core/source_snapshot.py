@@ -12,20 +12,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
-import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from elspeth_lints.core.allowlist import iter_allowlist_yaml_paths
+from elspeth_lints.core.trusted_git import (
+    SourceSnapshotError as SourceSnapshotError,
+)
+from elspeth_lints.core.trusted_git import (
+    TrustedGitRepository,
+    read_regular_file,
+    repository_root,
+    require_directory,
+)
 from elspeth_lints.rules.trust_tier.tier_model.rule import iter_scannable_python_files
-
-_FULL_GIT_REVISION = re.compile(r"[0-9a-f]{40,64}")
-
-
-class SourceSnapshotError(ValueError):
-    """The scanner inputs cannot be bound safely to Git."""
 
 
 class SourceSnapshotChangedError(SourceSnapshotError):
@@ -66,14 +67,19 @@ def source_snapshot_sha256(
 
 def current_git_head(repo_root: Path) -> str:
     """Return the exact full lowercase Git HEAD or fail closed."""
-    completed = _run_git(Path(repo_root), "rev-parse", "HEAD")
-    if completed.returncode != 0:
-        diagnostic = completed.stderr.strip() or "git rev-parse returned no diagnostic"
-        raise SourceSnapshotError(f"cannot bind source snapshot to Git HEAD: {diagnostic}")
-    head = completed.stdout.strip()
-    if _FULL_GIT_REVISION.fullmatch(head) is None:
-        raise SourceSnapshotError(f"Git HEAD must be a full lowercase 40-64 hex revision; got {head!r}")
-    return head
+    try:
+        with TrustedGitRepository(repo_root) as observed:
+            return observed.head()
+    except SourceSnapshotError as exc:
+        raise SourceSnapshotError(f"cannot bind source snapshot to Git HEAD: {exc}") from exc
+
+
+def tracked_relative_paths(repo_root: Path) -> tuple[str, ...]:
+    """Return the callback-free whole-index census of safe UTF-8 relative paths."""
+    with TrustedGitRepository(repo_root) as observed:
+        if observed.repo_root != Path(os.path.abspath(repo_root)):
+            raise SourceSnapshotError("tracked path enumeration requires the canonical repository root")
+        return tuple(sorted(observed.index()))
 
 
 def capture_source_snapshot(
@@ -126,9 +132,9 @@ def observe_source_snapshot(
     temporal guarantee and needlessly doubles every Git walk and byte read.
     """
     try:
-        resolved_source_root = Path(source_root).resolve()
-        resolved_allowlist_dir = Path(allowlist_dir).resolve()
-        resolved_logical_allowlist_dir = Path(logical_allowlist_dir or allowlist_dir).resolve()
+        resolved_source_root = Path(os.path.abspath(source_root))
+        resolved_allowlist_dir = Path(os.path.abspath(allowlist_dir))
+        resolved_logical_allowlist_dir = Path(os.path.abspath(logical_allowlist_dir or allowlist_dir))
     except OSError as exc:
         raise SourceSnapshotError(f"cannot resolve source snapshot roots: {exc}") from exc
     return _observe_source_snapshot(
@@ -151,6 +157,7 @@ def _observe_source_snapshot(
     ):
         if not path.is_dir():
             raise SourceSnapshotError(f"{label} is not a directory: {path}")
+        require_directory(path)
 
     source_repo = _git_repository_root(source_root)
     allowlist_repo = _git_repository_root(logical_allowlist_dir)
@@ -158,19 +165,24 @@ def _observe_source_snapshot(
         raise SourceSnapshotError(
             f"source root and logical allowlist root must resolve inside the same Git repository: {source_repo} != {allowlist_repo}"
         )
-    source_rev = current_git_head(source_repo)
-    inputs = _snapshot_inputs(
-        source_root=source_root,
-        allowlist_dir=allowlist_dir,
-        logical_allowlist_dir=logical_allowlist_dir,
-    )
-    _require_tracked_inputs(repo_root=source_repo, inputs=inputs)
-    source_dirty = _tracked_source_dirty(repo_root=source_repo, source_root=source_root)
-    return SourceSnapshot(
-        source_rev=source_rev,
-        source_dirty=source_dirty,
-        source_snapshot_sha256=_snapshot_digest(inputs),
-    )
+    with TrustedGitRepository(source_repo) as observed:
+        try:
+            source_rev = observed.head()
+        except SourceSnapshotError as exc:
+            raise SourceSnapshotError(f"cannot bind source snapshot to Git HEAD: {exc}") from exc
+        inputs = _snapshot_inputs(
+            source_root=source_root,
+            allowlist_dir=allowlist_dir,
+            logical_allowlist_dir=logical_allowlist_dir,
+        )
+        index = observed.index()
+        _require_tracked_inputs(repo_root=source_repo, inputs=inputs, tracked=set(index))
+        source_dirty = observed.source_dirty(source_root, source_rev, index)
+        return SourceSnapshot(
+            source_rev=source_rev,
+            source_dirty=source_dirty,
+            source_snapshot_sha256=_snapshot_digest(inputs),
+        )
 
 
 def _snapshot_inputs(
@@ -216,22 +228,10 @@ def _snapshot_inputs(
 
 
 def _git_repository_root(path: Path) -> Path:
-    completed = _run_git(path, "rev-parse", "--show-toplevel")
-    if completed.returncode != 0:
-        diagnostic = completed.stderr.strip() or "git rev-parse returned no diagnostic"
-        raise SourceSnapshotError(f"cannot resolve Git repository for {path}: {diagnostic}")
-    repo_root = Path(completed.stdout.strip()).resolve()
-    if not path.is_relative_to(repo_root):
-        raise SourceSnapshotError(f"{path} does not resolve inside Git repository {repo_root}")
-    return repo_root
+    return repository_root(path)
 
 
-def _require_tracked_inputs(*, repo_root: Path, inputs: tuple[_SnapshotInput, ...]) -> None:
-    completed = _run_git(repo_root, "ls-files", "-z", "--cached")
-    if completed.returncode != 0:
-        diagnostic = completed.stderr.strip() or "git ls-files returned no diagnostic"
-        raise SourceSnapshotError(f"cannot enumerate tracked Git inputs: {diagnostic}")
-    tracked = set(completed.stdout.split("\0"))
+def _require_tracked_inputs(*, repo_root: Path, inputs: tuple[_SnapshotInput, ...], tracked: set[str]) -> None:
     for item in inputs:
         _reject_symlink_input(item)
         logical_path = item.logical_path
@@ -249,8 +249,8 @@ def _snapshot_digest(inputs: tuple[_SnapshotInput, ...]) -> str:
     for item in inputs:
         _reject_symlink_input(item)
         try:
-            payload = item.physical_path.read_bytes()
-        except OSError as exc:
+            payload = read_regular_file(item.physical_path)
+        except (OSError, SourceSnapshotError) as exc:
             raise SourceSnapshotError(f"cannot read scanner input {item.label!r} at {item.physical_path}: {exc}") from exc
         records.append({"path": item.label, "sha256": hashlib.sha256(payload).hexdigest()})
     canonical = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -267,28 +267,3 @@ def _reject_symlink_input(item: _SnapshotInput) -> None:
         raise SourceSnapshotError(
             f"scanner input {item.label!r} must not be a symbolic link (physical={item.physical_path}, logical={item.logical_path})"
         )
-
-
-def _tracked_source_dirty(*, repo_root: Path, source_root: Path) -> bool:
-    relative_source = source_root.relative_to(repo_root).as_posix()
-    completed = _run_git(repo_root, "diff", "--quiet", "HEAD", "--", relative_source)
-    if completed.returncode == 0:
-        return False
-    if completed.returncode == 1:
-        return True
-    diagnostic = completed.stderr.strip() or "git diff returned no diagnostic"
-    raise SourceSnapshotError(f"cannot determine tracked source dirty state: {diagnostic}")
-
-
-def _run_git(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    clean_env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
-    try:
-        return subprocess.run(
-            ["git", "-C", str(path), *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=clean_env,
-        )
-    except OSError as exc:
-        raise SourceSnapshotError(f"cannot execute Git while observing source snapshot: {exc}") from exc

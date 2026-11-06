@@ -19,9 +19,10 @@ references tool names from ``elspeth.web.composer.tools``.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from elspeth.contracts.composer_progress import (
@@ -29,7 +30,12 @@ from elspeth.contracts.composer_progress import (
     ComposerProgressEvent,
     ComposerProgressSink,
 )
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.tools import is_discovery_tool
+
+if TYPE_CHECKING:
+    from elspeth.web.async_workers import ProgressRequestCleanup, ProgressSQLInvocation
+    from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
 
 __all__ = [
     "ComposerProgressRegistry",
@@ -97,9 +103,44 @@ class ComposerProgressRegistry:
         self._request_generations: dict[str, int] = {}
         self._next_request_generation = 0
         self._leases: dict[str, ComposerRequestLease] = {}
+        self._pending_progress_owners: set[ContinuationProgressOwner] = set()
         self._lock = threading.Lock()
 
-    async def start_request(self, session_id: str, user_id: str) -> ComposerRequestLease:
+    @property
+    def renew_interval_seconds(self) -> float:
+        # The process-local registry has no expiring request lease.
+        return 60.0
+
+    def retain_pending_owner(self, owner: ContinuationProgressOwner) -> None:
+        from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
+
+        if type(owner) is not ContinuationProgressOwner:
+            raise TypeError("Progress custody requires the actual segment owner")
+        with self._lock:
+            self._pending_progress_owners.add(owner)
+
+    def release_pending_owner(self, owner: ContinuationProgressOwner) -> None:
+        with self._lock:
+            self._pending_progress_owners.discard(owner)
+
+    @property
+    def pending_owner_count(self) -> int:
+        with self._lock:
+            return len(self._pending_progress_owners)
+
+    def assert_pending_settled(self) -> None:
+        if self.pending_owner_count:
+            raise AuditIntegrityError("Composer Progress retains unfinished segment custody")
+
+    async def start_request(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        deadline: Callable[[], float] | None = None,
+        on_submission: Callable[[ProgressSQLInvocation], None] | None = None,
+        on_cleanup: Callable[[ProgressRequestCleanup], None] | None = None,
+    ) -> ComposerRequestLease:
         lease = ComposerRequestLease(str(uuid4()), session_id, user_id)
         with self._lock:
             self._leases[lease.request_token] = lease
@@ -107,12 +148,18 @@ class ComposerProgressRegistry:
         self.begin_request(session_id)
         return lease
 
-    async def renew_request(self, lease: ComposerRequestLease) -> None:
+    async def renew_request(self, lease: ComposerRequestLease, *, deadline: Callable[[], float] | None = None) -> None:
         with self._lock:
             if self._leases[lease.request_token] != lease:
                 raise RuntimeError("Composer request lease mismatch")
 
-    async def finish_request(self, lease: ComposerRequestLease) -> None:
+    async def finish_request(
+        self,
+        lease: ComposerRequestLease,
+        *,
+        deadline: Callable[[], float] | None = None,
+        on_cleanup: Callable[[ProgressRequestCleanup], None] | None = None,
+    ) -> None:
         with self._lock:
             if self._leases[lease.request_token] != lease:
                 raise RuntimeError("Composer request lease mismatch")
@@ -129,6 +176,7 @@ class ComposerProgressRegistry:
         operation_id: str | None = None,
         session_operation_id: str | None = None,
         session_operation_epoch: int | None = None,
+        deadline: Callable[[], float] | None = None,
     ) -> ComposerProgressSink:
         if lease.session_id != session_id or lease.user_id != user_id:
             raise RuntimeError("Composer request lease ownership mismatch")
@@ -497,13 +545,13 @@ async def emit_progress(
 
 
 def model_call_progress_event(message: str) -> ComposerProgressEvent:
-    headline = "I'm asking the model to choose the next safe pipeline update."
-    normalized = message.lower()
-    if "html" in normalized and "json" in normalized:
-        headline = "I'm asking the model to choose an HTML input and JSON output."
+    """Describe provider dispatch without inferring the requested action.
+
+    Keep ``message`` for existing callers; progress copy is independent of it.
+    """
     return ComposerProgressEvent(
         phase="calling_model",
-        headline=headline,
+        headline="I'm asking the model to respond using the prepared pipeline context.",
         evidence=("The composer is using the prepared prompt and visible pipeline state.",),
         likely_next="The model may answer directly or request safe pipeline tools.",
     )

@@ -63,6 +63,9 @@ class _HoldingCollectorExecutor:
         self.accepted: list[tuple[str, str, PluginContext]] = []
         self.setup: RecorderSetup | None = None
 
+    def has_pending_group_closes(self) -> bool:
+        return False
+
     def is_release_group(self, group_id: str) -> bool:
         assert self.setup is not None, "_build wires the recorder before any arrival"
         return self.setup.data_flow.is_release_group(run_id=self.setup.run_id, group_id=group_id)

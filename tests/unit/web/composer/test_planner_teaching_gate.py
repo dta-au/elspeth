@@ -1,9 +1,8 @@
-"""Whole-tree gate: every repair-feedback fact key the composer ships to the planner is taught or fenced.
+"""Whole-tree gate: every live tool-detail repair key is taught or fenced.
 
-Repair feedback crosses the planner's message-redaction boundary as structured
-facts keyed by a closed ``error_code`` — ``contract`` / ``row_union_schema`` /
-``coalesce_union_type`` details and ``connectivity`` facts on the freeform
-surface (``pipeline_planner._allowlisted_candidate_feedback``). A fact key is only
+Tool feedback carries structured facts keyed by a closed ``error_code`` —
+``contract`` / ``row_union_schema`` / ``coalesce_union_type`` details.
+A fact key is only
 usable if the ``(explanation, suggested_fix)`` that
 ``tools.generation.explain_validation_code(code)`` resolves names it: a key the
 model is never told how to read cannot repair anything, and
@@ -39,8 +38,7 @@ from scripts.cicd.composer_teaching import (
     is_quoted_leaf,
 )
 
-from elspeth.web.composer import pipeline_planner, state
-from elspeth.web.composer.pipeline_planner import route_destination_fact_keys
+from elspeth.web.composer import state
 from elspeth.web.composer.tools import generation
 
 FENCE_PATH = Path(__file__).with_name("planner_teaching_fence.json")
@@ -202,39 +200,9 @@ def _detail_sites(files: Iterable[Path]) -> Iterator[ShippedKey]:
                 )
 
 
-def _route_destination_shapes() -> dict[frozenset[str], int]:
-    """The distinct ``connectivity`` shapes ``state.route_destination_facts`` emits, from its own AST."""
-    tree = ast.parse(Path(state.__file__).read_text(encoding="utf-8"))
-    shapes: dict[frozenset[str], int] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "route_destination_facts":
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Dict):
-                    keys = frozenset(k for k in (_literal_str(key) for key in inner.keys) if k is not None)
-                    if "declared_sinks" in keys:
-                        shapes[keys] = shapes.get(keys, 0) + 1
-    return shapes
-
-
-def _connectivity_sites() -> Iterator[ShippedKey]:
-    # Per-code shape comes from the CONSUMER's own projection map
-    # (``pipeline_planner.route_destination_fact_keys``): the producer merges
-    # both routing fields per component, so the entry's key set is decided at
-    # the consumer, and that is the authority this gate derives from.
-    for code in sorted(pipeline_planner._ROUTE_DESTINATION_FACT_CODES):
-        allowed = route_destination_fact_keys(code)
-        yield ShippedKey("freeform", code, "connectivity", "state.py:route_destination_facts")
-        for key in _typed_keys(state.RouteDestinationFactDict, "connectivity."):
-            if key.split(".")[1] in allowed:
-                yield ShippedKey("freeform", code, key, "state.py:route_destination_facts")
-    yield ShippedKey("freeform", "coalesce_branch_unreachable", "connectivity", "state.py:coalesce_reachability_facts")
-    for key in _typed_keys(state.CoalesceReachabilityFactDict, "connectivity."):
-        yield ShippedKey("freeform", "coalesce_branch_unreachable", key, "state.py:coalesce_reachability_facts")
-
-
 def shipped_keys(files: Iterable[Path] | None = None) -> list[ShippedKey]:
     paths = composer_python_files() if files is None else list(files)
-    return [*_detail_sites(paths), *_connectivity_sites()]
+    return list(_detail_sites(paths))
 
 
 def is_taught(code: str, key: str, explain=generation.explain_validation_code) -> bool:
@@ -310,17 +278,6 @@ def test_fence_fixture_has_no_duplicates() -> None:
 
 
 # --- the gate's own derivation ------------------------------------------------------------------
-
-
-def test_route_destination_facts_emit_exactly_the_three_pinned_shapes() -> None:
-    """The producer's dict literals are exactly the three shapes the consumer projects to.
-
-    The producer MERGES shapes per component (a transform whose on_success and
-    on_error both dangle carries all four keys), so this pins the building
-    blocks; the per-entry projection is pinned in test_validation_error_codes.
-    """
-    shapes = _route_destination_shapes()
-    assert set(shapes) == {route_destination_fact_keys(code) for code in pipeline_planner._ROUTE_DESTINATION_FACT_CODES}, shapes
 
 
 def test_is_taught_requires_the_quoted_form_not_a_bare_or_super_string() -> None:
@@ -423,14 +380,18 @@ def test_gate_refuses_a_typed_detail_site_it_cannot_derive(tmp_path: Path, body:
 
 def test_gate_catches_prose_that_stops_naming_a_taught_key() -> None:
     """Deleting a key's name from its guidance turns the gate red — the taught side is derived, not listed."""
-    target = ("freeform", "source_on_success_dangling", "connectivity.dangling_on_success")
+    target = ("freeform", "schema_contract_violation", "contract.missing_fields")
+    assert target in {(item.surface, item.code, item.key) for item in shipped_keys()}
     assert target not in untaught_keys(), "precondition: the catalogue names this key today"
 
     def explain_without_the_key(code: str) -> tuple[str, str] | None:
         guidance = generation.explain_validation_code(code)
         if guidance is None or code != target[1]:
             return guidance
-        return tuple(part.replace("dangling_on_success", "the offending value") for part in guidance)  # type: ignore[return-value]
+        return (
+            guidance[0].replace("missing_fields", "the required columns"),
+            guidance[1].replace("missing_fields", "the required columns"),
+        )
 
     assert target in untaught_keys(explain=explain_without_the_key)
 
@@ -443,11 +404,3 @@ def test_typed_keys_recurse_through_nested_and_list_of_typed_dicts() -> None:
     ship to the planner exactly as the envelope does.
     """
     assert _typed_keys(_ProbeOuter, "c.") == ["c.record", "c.record.leaf", "c.records", "c.records[].leaf", "c.flat"]
-
-
-def test_connectivity_sites_enumerate_every_coalesce_reachability_key() -> None:
-    """The freeform coalesce facts are enumerated in full, derived from their TypedDict (final red-team P17)."""
-    coalesce = {s.key for s in _connectivity_sites() if s.code == "coalesce_branch_unreachable"}
-    expected = {"connectivity", *_typed_keys(state.CoalesceReachabilityFactDict, "connectivity.")}
-    assert coalesce == expected
-    assert len(expected) > 2, "the coalesce payload has nested keys; an envelope-only set means the walker regressed"

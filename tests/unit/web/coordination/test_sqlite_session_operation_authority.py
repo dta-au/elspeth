@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import delete, event, func, insert, select, text, update
 from sqlalchemy.engine import Connection, Engine, Transaction
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
@@ -39,7 +40,6 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.protocol import (
-    CompositionStateData,
     OperationReceiptFence,
     SessionArchiveDisposition,
     SessionForkAuthority,
@@ -1192,7 +1192,7 @@ def test_captured_fork_mutation_facets_fail_closed_before_sql_after_callback(eng
     receipt = captured["receipt"]
     state = SessionForkChildStateCreation(
         id=uuid4(),
-        data=CompositionStateData(),
+        data=composition_state_data(),
         created_at=datetime.now(UTC),
     )
     event.listen(engine, "before_cursor_execute", capture_statement)
@@ -1245,7 +1245,7 @@ def test_fork_child_facet_rejects_foreign_context_before_allocation_or_insert(en
             foreign_facet.insert_child_state(
                 SessionForkChildStateCreation(
                     id=uuid4(),
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     created_at=datetime.now(UTC),
                 )
             )
@@ -1310,7 +1310,7 @@ def test_fork_pair_mint_rejects_valid_live_foreign_child_and_unbound_retokenizat
                 foreign_transaction.child_mutations.insert_child_state(
                     SessionForkChildStateCreation(
                         id=uuid4(),
-                        data=CompositionStateData(),
+                        data=composition_state_data(),
                         created_at=datetime.now(UTC),
                     )
                 )
@@ -1331,7 +1331,7 @@ def test_fork_pair_mint_rejects_valid_live_foreign_child_and_unbound_retokenizat
             foreign_facet.insert_child_state(
                 SessionForkChildStateCreation(
                     id=uuid4(),
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     created_at=datetime.now(UTC),
                 )
             )
@@ -1351,7 +1351,7 @@ def test_fork_pair_mint_rejects_valid_live_foreign_child_and_unbound_retokenizat
                 unbound_facet.insert_child_state(
                     SessionForkChildStateCreation(
                         id=uuid4(),
-                        data=CompositionStateData(),
+                        data=composition_state_data(),
                         created_at=datetime.now(UTC),
                     )
                 )
@@ -1421,7 +1421,7 @@ def test_fork_callback_cannot_forge_secondary_transaction_for_unlocked_live_pair
                 foreign_transaction.child_mutations.insert_child_state(
                     SessionForkChildStateCreation(
                         id=uuid4(),
-                        data=CompositionStateData(),
+                        data=composition_state_data(),
                         created_at=datetime.now(UTC),
                     )
                 )
@@ -1496,7 +1496,7 @@ def test_fork_secondary_transaction_cannot_reverse_parent_and_child_roles(engine
             reversed_transaction.child_mutations.insert_child_state(
                 SessionForkChildStateCreation(
                     id=uuid4(),
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     created_at=datetime.now(UTC),
                 )
             )
@@ -1572,7 +1572,7 @@ def test_fork_callback_cannot_seed_fresh_token_pair_for_unlocked_live_child(engi
                 foreign_facet.insert_child_state(
                     SessionForkChildStateCreation(
                         id=uuid4(),
-                        data=CompositionStateData(),
+                        data=composition_state_data(),
                         created_at=datetime.now(UTC),
                     )
                 )
@@ -2027,7 +2027,7 @@ def test_fork_creation_mismatched_message_binding_rolls_back_fresh_child(engine)
         transaction.child_mutations.insert_child_state(
             SessionForkChildStateCreation(
                 id=state_id,
-                data=CompositionStateData(),
+                data=composition_state_data(),
                 created_at=datetime.now(UTC),
             )
         )
@@ -2129,7 +2129,7 @@ def test_fork_creation_mismatched_message_binding_rolls_back_resumed_child(engin
         transaction.child_mutations.insert_child_state(
             SessionForkChildStateCreation(
                 id=state_id,
-                data=CompositionStateData(),
+                data=composition_state_data(),
                 created_at=datetime.now(UTC),
             )
         )

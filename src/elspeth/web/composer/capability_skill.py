@@ -1,43 +1,14 @@
-"""Canonical capability guidance and per-call planner integrity manifests."""
+"""Canonical capability guidance shared by the compose loop's system prompt."""
 
 from __future__ import annotations
 
-import hashlib
 import re
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Final, cast
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.skills import load_skill_with_hash
-
-PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
-    "diff_pipeline",
-    "explain_validation_error",
-    "get_audit_info",
-    "get_expression_grammar",
-    "get_pipeline_state",
-    "get_plugin_assistance",
-    "get_plugin_schema",
-    "list_models",
-    "list_sinks",
-    "list_sources",
-    "list_transforms",
-    "preview_pipeline",
-    "get_blob_content",
-    "read_attachment",
-    "get_blob_metadata",
-    "inspect_source",
-    "list_blobs",
-    "list_composer_blobs",
-    "list_secret_refs",
-    "validate_secret_ref",
-)
-PLANNER_TERMINAL_TOOL_NAME: Final[str] = "emit_pipeline_proposal"
-PLANNER_RECOVERY_TOOL_NAMES: Final[tuple[str, ...]] = ("handoff_to_user", "restore_parked_graph")
-PLANNER_IMPLEMENTATION_ID: Final[str] = "elspeth.web.composer.pipeline_planner.plan_pipeline"
 
 # HAND-WRITTEN ON PURPOSE — the keys are the operand the capability-skill
 # identity pin CHECKS against ``COMPOSER_NODE_TYPES`` (derived from the
@@ -65,8 +36,8 @@ def documented_capability_fields(text: str) -> Mapping[str, frozenset[str]]:
     """Parse and validate the public canonical-field inventory.
 
     The inventory is the human-visible authority.  Python derives its field
-    mapping from those exact bytes, then the planner compares it with the
-    terminal schema on every call.  There is deliberately no second list of
+    mapping from those exact bytes, then the compose-loop tool builder compares
+    it with the advertised set_pipeline schema on every call. There is deliberately no second list of
     field names in code that can drift in lockstep with the schema.
     """
     if type(text) is not str:
@@ -158,107 +129,9 @@ def render_with_pipeline_capabilities(interaction_skill: str) -> str:
     return f"{load_pipeline_capability_core()}\n{interaction_skill.rstrip()}\n"
 
 
-@dataclass(frozen=True, slots=True)
-class PlannerCapabilityManifest:
-    """Hash-only audit facts derived from one exact outbound planner call."""
-
-    planner_implementation_id: str
-    capability_core_hash: str
-    canonical_schema_hash: str
-    effective_tool_hash: str
-    rendered_prompt_hash: str
-
-    def __post_init__(self) -> None:
-        if type(self.planner_implementation_id) is not str or not self.planner_implementation_id:
-            raise ValueError("planner_implementation_id must be a non-empty exact string")
-        for name, value in (
-            ("capability_core_hash", self.capability_core_hash),
-            ("canonical_schema_hash", self.canonical_schema_hash),
-            ("effective_tool_hash", self.effective_tool_hash),
-            ("rendered_prompt_hash", self.rendered_prompt_hash),
-        ):
-            if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
-
-
-def build_planner_capability_manifest(
-    *,
-    messages: Sequence[Mapping[str, Any]],
-    tools: Sequence[Mapping[str, Any]],
-    canonical_schema: Mapping[str, Any],
-    capability_schema: Mapping[str, Any] | None = None,
-    tool_surface: str = "full",
-) -> PlannerCapabilityManifest:
-    """Validate and hash the exact messages/tools used by one planner call.
-
-    ``tool_surface`` names the advertised palette: ``"full"`` accepts the
-    request-owned, order-preserving discovery subset followed by recovery
-    controls and the proposal terminal; ``"terminal_only"`` retains both
-    recovery controls and the proposal on the escape-hatch overtime turn.
-    """
-    if tool_surface not in {"full", "terminal_only"}:
-        raise ValueError("tool_surface must be 'full' or 'terminal_only'")
-    canonical_json(messages)
-    canonical_json(tools)
-    core = load_pipeline_capability_core()
-    system_contents = [message["content"] for message in messages if message["role"] == "system"]
-    if not system_contents or type(system_contents[0]) is not str or not system_contents[0].startswith(core):
-        raise AuditIntegrityError("planner capability core is missing from the first system message")
-    if any(type(content) is not str for content in system_contents):
-        raise AuditIntegrityError("planner system message content must be exact text")
-    if sum(cast(str, content).count(core) for content in system_contents) != 1:
-        raise AuditIntegrityError("planner capability core must occur exactly once")
-
-    try:
-        tool_names = tuple(cast(str, tool["function"]["name"]) for tool in tools)
-    except (KeyError, TypeError) as exc:
-        raise AuditIntegrityError("planner advertised tool definitions are malformed") from exc
-    terminal_names = (*PLANNER_RECOVERY_TOOL_NAMES, PLANNER_TERMINAL_TOOL_NAME)
-    if tool_surface == "terminal_only":
-        valid_names = tool_names == terminal_names
-    else:
-        discovery_names = tool_names[: -len(terminal_names)]
-        positions = tuple(PLANNER_DISCOVERY_TOOL_NAMES.index(name) for name in discovery_names if name in PLANNER_DISCOVERY_TOOL_NAMES)
-        valid_names = (
-            bool(tool_names)
-            and tool_names[-len(terminal_names) :] == terminal_names
-            and len(positions) == len(discovery_names)
-            and len(set(discovery_names)) == len(discovery_names)
-            and positions == tuple(sorted(positions))
-        )
-    if not valid_names:
-        raise AuditIntegrityError("planner advertised tool identities or order drifted")
-    terminal = _schema_mapping(tools[-1]["function"], path="$tools[-1].function")
-    parameters = _schema_mapping(terminal["parameters"], path="$tools[-1].function.parameters")
-    properties = _schema_mapping(parameters["properties"], path="$tools[-1].function.parameters.properties")
-    advertised_schema = _schema_mapping(properties["pipeline"], path="$tools[-1].function.parameters.properties.pipeline")
-    if stable_hash(advertised_schema) != stable_hash(canonical_schema):
-        raise AuditIntegrityError("planner terminal does not advertise the canonical pipeline schema")
-    # Restricted request terminals are projections of the canonical authoring
-    # language, so their root field inventory intentionally differs.  The
-    # static capability core still documents that full language and remains
-    # pinned against its canonical schema independently of the exact selected
-    # terminal hashed above.
-    validate_capability_field_contract(capability_schema or canonical_schema, core)
-
-    return PlannerCapabilityManifest(
-        planner_implementation_id=PLANNER_IMPLEMENTATION_ID,
-        capability_core_hash=hashlib.sha256(core.encode("utf-8")).hexdigest(),
-        canonical_schema_hash=stable_hash(advertised_schema),
-        effective_tool_hash=stable_hash(tools),
-        rendered_prompt_hash=stable_hash(messages),
-    )
-
-
 __all__ = [
     "CANONICAL_CAPABILITY_FIELDS",
     "CAPABILITY_CORE_NODE_GUIDANCE",
-    "PLANNER_DISCOVERY_TOOL_NAMES",
-    "PLANNER_IMPLEMENTATION_ID",
-    "PLANNER_RECOVERY_TOOL_NAMES",
-    "PLANNER_TERMINAL_TOOL_NAME",
-    "PlannerCapabilityManifest",
-    "build_planner_capability_manifest",
     "canonical_capability_fields",
     "documented_capability_fields",
     "load_pipeline_capability_core",

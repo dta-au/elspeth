@@ -66,7 +66,6 @@ from elspeth.web.composer._schema_response_grammar import (
     validate_json_schema_scalar,
 )
 from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure, prohibited_plugin_section
-from elspeth.web.composer.tools._generation_schema_response import PluginSchemaSnapshot
 from elspeth.web.composer.tools.generation import get_expression_grammar
 
 # The registered shield-review constants are the contract's single source of
@@ -387,14 +386,10 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     "round_trip_unavailable, never fabricate or rebind source custody: use an "
     "advertised narrow patch tool when the requested task permits, otherwise "
     "surface the named gap.",
-    "PROPOSAL PLANNER SURFACE: read the current-state context and use only "
-    "tools advertised in this request. Re-supply an existing source only "
-    "when that context carries its exact authorable source binding. If the "
-    "authoritative binding is absent, redacted, diagnostic-only, or named/"
-    "multiple blob custody cannot round-trip, surface an exact-source/"
-    "round-trip gap and stop instead of guessing; never invoke an "
-    "unadvertised inspection or mutation tool, and never fabricate or rebind "
-    "source custody.",
+    "Use only tools advertised in this request. If an authoritative source "
+    "binding is absent, redacted, diagnostic-only, or cannot round-trip, "
+    "surface an exact-source/round-trip gap and stop instead of guessing; "
+    "never invoke an unadvertised tool or fabricate or rebind source custody.",
     # Session 891b7b1e turn 1: the planner fabricated rows at the user's
     # request, then narrated its own content as 'the system auto-generated
     # placeholder content' — a provenance inversion in an audit-grade tool.
@@ -1147,11 +1142,6 @@ class _SchemaContractProjectionUnsupported(ValueError):
     """A schema carries semantics this bounded projection cannot preserve."""
 
 
-# Public name for callers that must fail closed without depending on an
-# implementation-private spelling. The private alias remains the trust-tier
-# boundary's established exception identity.
-SchemaContractProjectionUnsupported = _SchemaContractProjectionUnsupported
-
 _PLANNER_CONTRACT_MAX_DEPTH: Final[int] = 32
 _PLANNER_CONTRACT_MAX_NODES: Final[int] = 4096
 _PLANNER_CONTRACT_MAX_CANONICAL_BYTES: Final[int] = 48 * 1024
@@ -1242,20 +1232,6 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
         raise TypeError("schema must be an admitted PluginSchemaInfo")
     return _planner_plugin_contract(
         schema.plugin_type, schema.name, schema.json_schema, schema.knob_schema, schema.composer_hints, schema.aggregation_output_modes
-    )
-
-
-def planner_plugin_contract_from_snapshot(schema: PluginSchemaSnapshot) -> PlannerPluginContract:
-    """Project canonical admitted schema leaves without reopening producer data."""
-    if type(schema) is not PluginSchemaSnapshot:
-        raise TypeError("schema must be an admitted PluginSchemaSnapshot")
-    return _planner_plugin_contract(
-        schema.plugin_type,
-        schema.name,
-        schema.json_schema.to_wire(),
-        schema.knob_schema.to_wire(),
-        schema.composer_hints,
-        schema.aggregation_output_modes,
     )
 
 
@@ -1886,28 +1862,6 @@ def discovery_digest(
     if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
         raise RuntimeError("discovery_digest_budget_invariant")
     return digest
-
-
-def discovery_digest_detail_tools(authoring_aids: _PlannerAuthoringAids) -> tuple[str, ...]:
-    """Return the exact inventory tools needed to rehydrate omitted prose."""
-    digest = authoring_aids["discovery_digest"]["plugins"]
-    section_tools = (
-        (digest["sources"], "list_sources"),
-        (digest["transforms"], "list_transforms"),
-        (digest["sinks"], "list_sinks"),
-    )
-    required: set[str] = set()
-    for entries, expected_tool in section_tools:
-        for entry in entries:
-            purpose_omission = entry["purpose_omitted"] if "purpose_omitted" in entry else None
-            prohibition_omission = entry["not_for_omitted"] if "not_for_omitted" in entry else None
-            for omission in (purpose_omission, prohibition_omission):
-                if omission is None:
-                    continue
-                if omission["details_via"] != expected_tool:
-                    raise RuntimeError("discovery_digest_details_tool_invariant")
-                required.add(expected_tool)
-    return tuple(tool for tool in ("list_sinks", "list_sources", "list_transforms") if tool in required)
 
 
 _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
@@ -2793,11 +2747,9 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
 __all__ = [
     "PLACEHOLDER_BLOB_ID",
     "PlannerPluginContract",
-    "SchemaContractProjectionUnsupported",
     "build_planner_authoring_aids",
     "build_schema_contract_evidence",
     "discovery_digest",
-    "discovery_digest_detail_tools",
     "fork_coalesce_exemplar_args",
     "fork_row_union_exemplar_args",
     "planner_expression_grammar",

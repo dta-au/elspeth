@@ -8,15 +8,12 @@ from typing import TYPE_CHECKING, Literal, cast
 from pydantic import JsonValue
 
 from elspeth.contracts.errors import FrameworkBugError
-from elspeth.web.composer.audit import canonicalize_schema_violations
 from elspeth.web.composer.response_contracts import AdmittedResponse, ResponseContract
 from elspeth.web.composer.state import Severity, ValidationEntry
 from elspeth.web.composer.tools._common import ToolResult
 
 if TYPE_CHECKING:
-    from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
     from elspeth.web.composer.planner_authoring_aids import PlannerPluginContract
-    from elspeth.web.composer.protocol import SchemaViolation, ToolArgumentError
 
 
 class _UncachedProjection(AdmittedResponse):
@@ -36,33 +33,6 @@ class _ProjectedPluginContractResponse(_UncachedProjection):
 
 def projected_plugin_contract_response(contract: PlannerPluginContract) -> AdmittedResponse:
     return _ProjectedPluginContractResponse(contract)
-
-
-@dataclass(frozen=True, slots=True)
-class _ArgumentErrorResponse(_UncachedProjection):
-    component: str
-    error_code: str
-    category: ToolArgumentErrorCategory
-    schema_violations: tuple[SchemaViolation, ...]
-
-    def to_wire(self) -> dict[str, JsonValue]:
-        entry: dict[str, JsonValue] = {
-            "component": self.component,
-            "severity": "high",
-            "error_code": self.error_code,
-            "error_class": "ToolArgumentError",
-            "error_category": self.category.value,
-        }
-        violations = canonicalize_schema_violations(self.schema_violations)
-        if violations is not None:
-            # The canonicalizer emits only owned locations, codes and fixed
-            # messages, including its existing explicit over-budget marker.
-            entry["validation_errors"] = cast(JsonValue, violations)
-        return {"argument_error": entry}
-
-
-def argument_error_response(error: ToolArgumentError) -> AdmittedResponse:
-    return _ArgumentErrorResponse(error.argument, error.code or "argument_error", error.category, error.schema_violations)
 
 
 @dataclass(frozen=True, slots=True)

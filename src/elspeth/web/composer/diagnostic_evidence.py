@@ -198,7 +198,7 @@ class ComposerDiagnosticEvidence:
                 raise AuditIntegrityError("Private evidence payload is not an owned record")
         if self.authority_arguments is not None and (
             type(self.authority_arguments) is not DiagnosticPayload
-            or self.tool_name not in {"set_pipeline", "emit_pipeline_proposal"}
+            or self.tool_name != "set_pipeline"
             or self.authority_arguments.encoding != "json"
         ):
             raise AuditIntegrityError("Private evidence authority payload is invalid")
@@ -342,7 +342,7 @@ def _project(
                 len(path) >= 2
                 and path[-2] == "nodes"
                 and path[:-2] in {(), ("pipeline",), ("data",), ("data", "pipeline"), ("state",), ("data", "state")}
-                and tool_name in {"set_pipeline", "emit_pipeline_proposal", "upsert_node", "splice_transform", "patch_node_options"}
+                and tool_name in {"set_pipeline", "upsert_node", "splice_transform", "patch_node_options"}
             )
         )
         mapper = (
@@ -466,31 +466,19 @@ def build_private_tool_evidence(
     result = _canonical_payload(result_canonical, tool_name=tool_name, additional_fields=additional_credential_fields, absent_result=True)
     authority: DiagnosticPayload | None = None
     if authority_arguments_canonical is not None:
-        if tool_name not in {"set_pipeline", "emit_pipeline_proposal"}:
+        if tool_name != "set_pipeline":
             raise AuditIntegrityError("Private evidence authority belongs to a different tool")
         try:
             projection = _decode_canonical(authority_arguments_canonical)
             if type(projection) is not dict:
                 raise ValueError("Invalid authority projection")
-            if tool_name == "emit_pipeline_proposal":
-                restored = dict(projection)
-                pipeline = restored["pipeline"] if "pipeline" in restored else None
-                if type(pipeline) is dict:
-                    restored["pipeline"] = restore_composer_authority_payload(pipeline)
-            else:
-                restored = restore_composer_authority_payload(projection)
+            restored = restore_composer_authority_payload(projection)
             if arguments_canonical is None or canonical_json(restored) != arguments_canonical:
                 raise ValueError("Authority and arguments differ")
             reasons: set[str] = set()
             filtered = _project(restored, tool_name=tool_name, additional_fields=additional_credential_fields, reasons=reasons, root=True)
             assert type(filtered) is dict
-            if tool_name == "emit_pipeline_proposal":
-                filtered_pipeline = filtered["pipeline"] if "pipeline" in filtered else None
-                if type(filtered_pipeline) is dict:
-                    filtered["pipeline"] = project_composer_authority_payload(filtered_pipeline)
-                authority = _retained(filtered, reasons)
-            else:
-                authority = _retained(project_composer_authority_payload(filtered), reasons)
+            authority = _retained(project_composer_authority_payload(filtered), reasons)
         except JsonBoundaryError:
             authority = _unavailable("bounds")
         except (TypeError, ValueError) as exc:

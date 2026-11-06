@@ -292,3 +292,16 @@ def test_revalidation_checks_nested_owned_values_and_nominal_subclasses(producer
     impostor = ImpostorExplanation.model_validate(deep_thaw(producer_results["explain_exact"].data))
     with pytest.raises(FrameworkBugError):
         responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT.admit(impostor)
+
+
+def test_exact_code_survives_discovery_delivery(producer_results):
+    """TC-004 (#327): the exact result's code survives admission, serialization and readmission."""
+    from elspeth.web.composer.discovery_response import admit_discovery_result
+
+    result = producer_results["explain_exact"]
+    admitted = admit_discovery_result("explain_validation_error", result)
+    delivered = json.loads(json.dumps(admitted.to_dict()))
+    assert delivered["data"].get("error_code") == "unknown_node_type"
+    contract = responses.EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT
+    readmitted = contract.admit(delivered["data"]).readmit(contract).to_wire()
+    assert readmitted.get("error_code") == "unknown_node_type"

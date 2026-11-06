@@ -38,21 +38,9 @@ from tests.helpers.tree_gate import iter_gate_files
 
 _COMPOSER = Path(__file__).resolve().parents[4] / "src" / "elspeth" / "web" / "composer"
 
-# Planner-facing labels and redaction echoes that are not audit ``error_class``
+# Redaction echoes that are not audit ``error_class``
 # fields, keyed by (file under web/composer, enclosing function, label).
 _OUT_OF_SCOPE: dict[tuple[str, str, str], str] = {
-    ("pipeline_planner.py", "_compile_candidate_feedback", "ValidationError"): (
-        "planner feedback entry label for a closed validation code; sent to the planner, never an audit field"
-    ),
-    ("pipeline_planner.py", "_compile_planner_feedback", "SchemaValidationError"): (
-        "planner feedback entry label for a canonical-schema rejection; sent to the planner, never an audit field"
-    ),
-    ("provider_discovery_response.py", "to_wire", "ToolArgumentError"): (
-        "_ArgumentErrorResponse is built only from a ToolArgumentError (_argument_error_response); planner-facing projection"
-    ),
-    ("pipeline_planner.py", "_assistant_tool_calls_message", "ToolArgumentError"): (
-        "closed provider replay placeholder for a call with a retained wire_error; redacts rejected arguments, never an audit field"
-    ),
     ("redaction.py", "redact_failure_response", "CancelledError"): (
         "echoes the input only when it already equals CancelledError; otherwise a fixed sentinel"
     ),
@@ -108,10 +96,10 @@ _OWNED_REJECTION_CONSTRUCTORS: frozenset[str] = frozenset({"ToolArgumentError", 
 # ``type(X).__name__`` origins the binding walk cannot resolve on its own,
 # keyed by (file under web/composer, enclosing function, ``type(X)`` text).
 _REVIEWED_ORIGINS: dict[tuple[str, str, str], str] = {
-    ("tool_batch.py", "run_tool_batch", "type(canonicalization_failed)"): (
+    ("tool_batch.py", "_prepare_continuation_call_live", "type(canonicalization_failed)"): (
         "unpacked from begin_dispatch_or_arg_error, which returns the ValueError/TypeError it caught (audit.py)"
     ),
-    ("tool_batch.py", "run_tool_batch", "type(first_party_exc)"): (
+    ("tool_batch.py", "_execute_continuation_call_live", "type(first_party_exc)"): (
         "advisor_outcome.original_exc is the exception the advisor dispatch caught"
     ),
 }
@@ -190,8 +178,8 @@ def _error_class_labels(relative_path: str, source: str) -> list[_Label]:
     A literal label is backed only when it sits lexically inside an ``except``
     clause that catches that class, or in a function whose parameter is
     annotated with it. Function-wide evidence is deliberately not enough:
-    ``run_tool_batch`` is thousands of lines long and catches ``TypeError`` for
-    one site only. A ``type(X).__name__`` label is backed when ``X`` resolves to
+    ``_prepare_continuation_call_live`` is over 500 lines long and catches ``TypeError`` at
+    three handlers only. A ``type(X).__name__`` label is backed when ``X`` resolves to
     a caught exception or an owned rejection (``_backed_origin``).
     """
     labels: list[_Label] = []

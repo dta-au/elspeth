@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any, Literal, final
 from uuid import UUID
 
+from elspeth.contracts.composer_mutation import ComposerMutationRevocation
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.sessions.protocol import ChatMessageRole, CompositionStateData, CompositionStateRecord
@@ -215,8 +217,25 @@ class AuditOutcome:
     checkpoint_disposition: Literal["committed", "no_new_checkpoint", "empty", "unavailable"]
     checkpoint: CommittedCheckpointWitness | None
     current_state_id: str | None = None
+    authority_revocation: ComposerMutationRevocation | None = None
+    published_tool_rows: tuple[RedactedToolRow, ...] = ()
+    published_assistant_content: str | None = None
+    # Only the unavailable continuation receipt retry can populate this.
+    # The original plugin crash stays primary; this is its retained secondary.
+    continuation_retention_failure: AuditIntegrityError | None = None
 
     def __post_init__(self) -> None:
+        if self.continuation_retention_failure is not None and (
+            type(self.continuation_retention_failure) is not AuditIntegrityError or not self.unwind_audit_failed
+        ):
+            raise ValueError("P4 receipt retention failure requires an unavailable actual outcome")
+        if self.authority_revocation is not None:
+            if type(self.authority_revocation) is not ComposerMutationRevocation:
+                raise TypeError("P4 refusal requires an owned revocation")
+            if self.checkpoint_disposition == "committed" or self.checkpoint is not None:
+                raise ValueError("Refused graph cannot have a new committed checkpoint")
+        if self.assistant_id is None and (self.published_tool_rows or self.published_assistant_content is not None):
+            raise ValueError("Rolled-back P4 cannot expose published rows")
         # Success and unwind-failure are the only two valid shapes.
         # Reject any combination that would make the outcome ambiguous.
         if self.assistant_id is not None and self.unwind_audit_failed:

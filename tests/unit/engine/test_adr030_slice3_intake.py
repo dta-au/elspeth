@@ -39,6 +39,7 @@ from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import AggregationSettings
 from elspeth.core.landscape.schema import (
+    batches_table,
     group_losses_table,
     scheduler_events_table,
     token_work_items_table,
@@ -117,6 +118,48 @@ def _passthrough_flush_transform() -> Mock:
 
 class TestBackdatedAcceptTiming:
     """§H 476 — the trigger anchor is a pure function of durable state."""
+
+    @pytest.mark.parametrize(
+        ("trigger", "expected_reason"),
+        [
+            ({"timeout_seconds": 1000}, TriggerType.TIMEOUT),
+            ({"condition": "row['batch_age_seconds'] >= 1000"}, TriggerType.CONDITION),
+        ],
+        ids=["timeout", "condition"],
+    )
+    def test_ready_trigger_closes_accepted_batch_before_pending_adoption(
+        self, trigger: dict[str, Any], expected_reason: TriggerType
+    ) -> None:
+        clock = MockClock(start=1_700_000_000.0)
+        db, factory = _make_factory()
+        transform = _passthrough_flush_transform()
+        processor = _agg_processor(factory, trigger=trigger, transform=transform, clock=clock)
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
+        first = make_token_info(row_id="row-ready-first", token_id="tok-ready-first", data={"value": 1})
+        _persist_blocked_scheduler_work(factory, processor, first, node_id=AGG_NODE, barrier_key=str(AGG_NODE), adopted=False)
+        assert processor.run_barrier_intake(ctx) == []
+        assert processor.get_aggregation_buffer_count(AGG_NODE) == 1
+        second = make_token_info(row_id="row-ready-next", token_id="tok-ready-next", data={"value": 2})
+        second_work_id = _persist_blocked_scheduler_work(
+            factory, processor, second, node_id=AGG_NODE, barrier_key=str(AGG_NODE), adopted=False, ingest_sequence=1
+        )
+
+        # The pending row already exists when time makes the accepted batch
+        # ready. Intake observes that readiness before adopting the next row.
+        clock.advance(1001)
+        age_barrier_hold(db.engine, second_work_id, seconds_ago=1001)
+        processor.run_barrier_intake(ctx)
+        # Database time also makes the pending row old enough to close as
+        # its own batch immediately after adoption in this same pass.
+        assert [[row["value"] for row in call.args[0]] for call in transform.process.call_args_list] == [[1], [2]]
+        assert processor.get_aggregation_buffer_count(AGG_NODE) == 0
+        with db.read_only_connection() as conn:
+            reasons = conn.execute(select(batches_table.c.trigger_type).where(batches_table.c.status == "completed")).scalars().all()
+        assert reasons == [expected_reason.value, expected_reason.value]
 
     def test_timeout_anchor_is_blocked_at_even_when_adoption_is_delayed(self) -> None:
         """A takeover leader adopting a row 5 s after it blocked inherits the original anchor.

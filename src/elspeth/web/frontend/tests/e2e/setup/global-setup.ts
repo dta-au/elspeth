@@ -1,8 +1,11 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+  closeSync, constants, fchmodSync, fsyncSync, lstatSync, mkdirSync,
+  openSync, realpathSync, renameSync, rmSync, writeFileSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
-import { request } from "@playwright/test";
+import { request, type FullConfig } from "@playwright/test";
 
 // Placeholder credential consumed only by the local playwright webServer,
 // which spins up a fresh ELSPETH_WEB__data_dir per test session. Not a
@@ -156,7 +159,37 @@ async function markTutorialCompleted(apiBaseURL: string, token: string): Promise
   }
 }
 
-function writeStorageState(path: string, token: string): void {
+function preparePrivateStoragePath(path: string, root: string): void {
+  const child = relative(root, path);
+  if (child === "" || child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child) || realpathSync(root) !== root) {
+    throw new Error("Private Playwright storageState must remain under the real private run directory");
+  }
+  let directory = root;
+  for (const component of relative(root, dirname(path)).split(sep).filter(Boolean)) {
+    directory = resolve(directory, component);
+    try {
+      const stat = lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Private auth path requires real directories");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      mkdirSync(directory, { mode: 0o700 });
+    }
+  }
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error("Private auth storage must be a singly linked regular file");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const fd = openSync(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    fchmodSync(fd, 0o700);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeStorageState(path: string, token: string, privateRoot: string | undefined): void {
   const state = {
     cookies: [],
     origins: [
@@ -166,17 +199,35 @@ function writeStorageState(path: string, token: string): void {
       },
     ],
   };
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(state, null, 2), { encoding: "utf-8" });
+  if (privateRoot === undefined) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(state, null, 2), { encoding: "utf-8" });
+    return;
+  }
+  preparePrivateStoragePath(path, privateRoot);
+  const temporary = resolve(dirname(path), `.playwright-${randomUUID()}.tmp`);
+  const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    try {
+      fchmodSync(fd, 0o600);
+      writeFileSync(fd, JSON.stringify(state, null, 2), { encoding: "utf-8" });
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, path);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
-// The storageState path is resolved relative to this file rather than
-// FullConfig.rootDir or process.cwd() — both vary in confusing ways across
-// Playwright versions. import.meta.url is unambiguous.
-const HERE = dirname(fileURLToPath(import.meta.url));
-const STORAGE_STATE_PATH = resolve(HERE, "..", ".auth", "user.json");
-
-export default async function globalSetup(): Promise<void> {
+export default async function globalSetup(config: FullConfig): Promise<void> {
+  const configuredPath = config.projects[0].use.storageState;
+  if (typeof configuredPath !== "string") throw new Error("Playwright storageState must be a configured file path");
+  const storagePath = resolve(configuredPath);
+  const privateValue = process.env.PLAYWRIGHT_PRIVATE_RUN_DIR;
+  const privateRoot = privateValue === undefined ? undefined : resolve(privateValue);
+  if (privateRoot !== undefined) preparePrivateStoragePath(storagePath, privateRoot);
   const token = await obtainToken(BACKEND_BASE_URL);
   // Registration authenticates and activates the local identity, but the
   // workload boundary separately requires a live deployment-wide user role.
@@ -187,9 +238,9 @@ export default async function globalSetup(): Promise<void> {
   // composer shell. Keep the baseline tester out of tutorial mode; specs that
   // exercise the tutorial explicitly reset the preference in their own setup.
   await markTutorialCompleted(BACKEND_BASE_URL, token);
-  writeStorageState(STORAGE_STATE_PATH, token);
+  writeStorageState(storagePath, token, privateRoot);
   // Confirm to the operator that globalSetup completed — otherwise a
   // mis-pathed write looks identical to "globalSetup never ran" in the
   // failure output.
-  console.log(`[globalSetup] wrote storageState to ${STORAGE_STATE_PATH}`);
+  console.log(`[globalSetup] wrote storageState to ${storagePath}`);
 }

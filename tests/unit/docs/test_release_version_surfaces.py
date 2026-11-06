@@ -8,6 +8,8 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web._aws_ecs_acceptance import receipt_contracts
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
@@ -92,6 +94,23 @@ def test_current_public_release_surfaces_match_package_version() -> None:
     # rather than case-insensitively — tolerating both spellings would let the
     # heading drift back.
     assert _match_version("README.md", rf"^## What changed in (?P<version>{SEMVER})$") == current_version
+
+
+def test_current_release_surface_validator_rejects_unreleased_heading(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_current_public_release_surfaces_match_package_version()
+    original_text = _text
+    current_version = _project_version()
+    changelog = original_text("CHANGELOG.md")
+    current_heading = next(line for line in changelog.splitlines() if line.startswith(f"## {current_version} - "))
+    drifted = changelog.replace(current_heading, f"## Unreleased ({current_version})", 1)
+    assert drifted != changelog
+
+    def text_with_unreleased_heading(relative_path: str) -> str:
+        return drifted if relative_path == "CHANGELOG.md" else original_text(relative_path)
+
+    monkeypatch.setattr(f"{__name__}._text", text_with_unreleased_heading)
+    with pytest.raises(AssertionError):
+        test_current_public_release_surfaces_match_package_version()
 
 
 def test_release_markdown_links_resolve() -> None:

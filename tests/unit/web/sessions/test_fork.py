@@ -26,7 +26,6 @@ from elspeth.web.blobs.protocol import BlobForkWriteFence, fork_blob_id
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.config import WebSettings
-from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -38,9 +37,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
-    CompositionStateData,
     InvalidForkTargetError,
-    MessageIngressFresh,
     OperationReceiptClaimed,
     OperationReceiptTakenOver,
     SessionForkParentAuthority,
@@ -52,10 +49,12 @@ from elspeth.web.sessions.schemas import ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.composition_state import composition_state_data
+from tests.helpers.content_publication import split_content_publication
 from tests.helpers.session_fences import create_blob_under_fence, read_blob_content_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
-from tests.unit.web.sessions.test_service import _admit_durable_ingress
+from tests.unit.web.sessions.test_service import _RUNNING, _durable_ingress
 
 
 @pytest.fixture
@@ -240,7 +239,7 @@ class TestForkSession:
         # Save initial state
         state_v1 = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={"plugin": "csv", "options": {"path": "data.csv"}},
                 is_valid=True,
             ),
@@ -259,7 +258,7 @@ class TestForkSession:
         # Assistant responds and mutates state to v2
         state_v2 = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={"plugin": "json", "options": {"path": "data.json"}},
                 nodes=[{"id": "n1", "plugin": "llm"}],
                 is_valid=True,
@@ -303,7 +302,7 @@ class TestForkSession:
         }
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(sources=sources, is_valid=True),
+            composition_state_data(sources=sources, is_valid=True),
             provenance="session_seed",
         )
         fork_msg = await service.add_message(
@@ -345,7 +344,7 @@ class TestForkSession:
 
         state_in_a = await service.save_composition_state(
             session_a.id,
-            CompositionStateData(
+            composition_state_data(
                 source={"plugin": "csv", "options": {"path": "a.csv"}},
                 is_valid=True,
             ),
@@ -501,31 +500,20 @@ class TestForkSession:
     async def test_forked_history_does_not_copy_ingress_request_identity(self, engine, service) -> None:
         session = await service.create_session("alice", "Request identity", "local")
         request_id = uuid.uuid4()
-        authority, admitted, fresh = _admit_durable_ingress(
-            service, session.id, operation_id=request_id, content="first", requested_state_id=None
-        )
-        assert fresh and admitted.operation_id == str(request_id)
-        (claim,) = authority.claim_next(limit=1)
-        context = service.session_operation_authority.start_composer_async_operation(
-            claim,
-            owner_instance_id=service.session_operation_owner_instance_id,
-            lease_seconds=service.session_operation_lease_seconds,
-            auth_provider_type="local",
-        )
         try:
-            first = await service.add_message_with_transcript(
+            first = await _durable_ingress(
+                service,
                 session.id,
                 "user",
                 "first",
                 operation_id=request_id,
                 requested_state_id=None,
                 writer_principal="route_user_message",
-                session_operation_context=context,
-                running=ComposerOperationRunning(claim=claim, session_operation_context=context),
             )
         finally:
-            service.session_operation_authority.release(context)
-        assert isinstance(first, MessageIngressFresh)
+            _authority, running = _RUNNING[(str(session.id), str(request_id))]
+            service.session_operation_authority.release(running.session_operation_context)
+        assert first.disposition == "inserted"
         assert first.message.operation_id == request_id
         with engine.connect() as conn:
             parent_receipt = conn.execute(
@@ -857,7 +845,7 @@ class TestForkSession:
         session = await service.create_session("alice", "Original", "local")
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={"plugin": "csv", "options": {"path": "data.csv"}},
                 is_valid=True,
             ),
@@ -915,7 +903,7 @@ class TestForkSession:
         session = await service.create_session("alice", "Plain", "local")
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 sources={"s": {"plugin": "csv", "options": {"path": "x.csv"}}},
                 is_valid=True,
                 composer_meta={"repair_turns_used": 2},
@@ -934,7 +922,11 @@ class TestForkSession:
             auth_provider_type="local",
         )
         assert copied_state is not None
-        assert copied_state.composer_meta == {"repair_turns_used": 2}
+        publication, preserved = split_content_publication(copied_state)
+        assert preserved == {"repair_turns_used": 2}
+        # The fork re-binds applicability to the child row, never the parent's.
+        assert publication.session_id == copied_state.session_id != session.id
+        assert publication.state_id == copied_state.id != state.id
 
 
 # ── Route-level tests ───────────────────────────────────────────────────
@@ -1663,7 +1655,7 @@ class TestForkEndpoint:
         )
         source_state = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 sources={
                     "my_csv": {
                         "plugin": "csv",
@@ -1832,7 +1824,7 @@ class TestForkEndpoint:
         )
         source_state = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={
                     "plugin": "csv",
                     "options": {
@@ -1897,7 +1889,7 @@ class TestForkEndpoint:
         }
         source_state = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={
                     "plugin": "csv",
                     "options": {
@@ -1970,7 +1962,7 @@ class TestForkEndpoint:
         missing_blob_id = uuid.uuid4()
         source_state = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 nodes=[
                     {
                         "id": "classify",
@@ -2186,7 +2178,7 @@ class TestForkEndpoint:
         # or tampered source data).
         await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={
                     "plugin": "csv",
                     "options": {"blob_ref": "not-a-valid-uuid", "path": "/data/x.csv"},
@@ -2241,7 +2233,7 @@ class TestForkEndpoint:
 
         await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={
                     "plugin": "csv",
                     "options": {"blob_ref": 123, "path": "/data/x.csv"},
@@ -2349,7 +2341,7 @@ class TestForkEndpoint:
         )
         await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={
                     "plugin": "csv",
                     "options": {"blob_ref": str(blob.id), "path": blob.storage_path},
@@ -2533,7 +2525,7 @@ class TestForkEndpoint:
         missing_blob_id = uuid.uuid4()
         source_state = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 sources={
                     "my_csv": {
                         "plugin": "csv",

@@ -71,6 +71,8 @@ from elspeth.web.sessions.protocol import CompositionValidationError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
+from tests.helpers.run_terminal_checks import run_values
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -997,17 +999,20 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id_str,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: every test-side direct composition_states
+                        # insert must supply provenance after Task 3's CHECK
+                        # constraint. ``session_seed`` is the broadened-semantics
+                        # default for setup-only rows that don't model a real
+                        # compose-loop transition.
+                        provenance="session_seed",
+                        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    )
                 )
             )
             conn.execute(
@@ -1057,28 +1062,37 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id_str,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: every test-side direct composition_states
+                        # insert must supply provenance after Task 3's CHECK
+                        # constraint. ``session_seed`` is the broadened-semantics
+                        # default for setup-only rows that don't model a real
+                        # compose-loop transition.
+                        provenance="session_seed",
+                        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    )
                 )
             )
             conn.execute(
                 runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="completed",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=10,
-                    rows_failed=0,
+                    {
+                        **run_values(
+                            session_id_str,
+                            state_id,
+                            status="completed",
+                            error=None,
+                            landscape_run_id=str(uuid4()),
+                        ),
+                        "id": run_id,
+                        "started_at": datetime(2026, 1, 1, tzinfo=UTC),
+                        "rows_processed": 10,
+                        "rows_failed": 0,
+                    }
                 )
             )
             conn.execute(
@@ -1124,23 +1138,32 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    is_valid=True,
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id_str,
+                        version=1,
+                        is_valid=True,
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
             conn.execute(
                 runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="completed",
-                    started_at=now,
-                    rows_processed=10,
-                    rows_failed=0,
+                    {
+                        **run_values(
+                            session_id_str,
+                            state_id,
+                            status="completed",
+                            error=None,
+                            landscape_run_id=str(uuid4()),
+                        ),
+                        "id": run_id,
+                        "started_at": now,
+                        "rows_processed": 10,
+                        "rows_failed": 0,
+                    }
                 )
             )
             conn.execute(
@@ -1430,28 +1453,37 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id_str,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: every test-side direct composition_states
+                        # insert must supply provenance after Task 3's CHECK
+                        # constraint. ``session_seed`` is the broadened-semantics
+                        # default for setup-only rows that don't model a real
+                        # compose-loop transition.
+                        provenance="session_seed",
+                        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    )
                 )
             )
             conn.execute(
                 runs_table.insert().values(
-                    id=run_id,
-                    session_id=session_id_str,
-                    state_id=state_id,
-                    status="completed",
-                    started_at=datetime(2026, 1, 1, tzinfo=UTC),
-                    rows_processed=0,
-                    rows_failed=0,
+                    {
+                        **run_values(
+                            session_id_str,
+                            state_id,
+                            status="completed",
+                            error=None,
+                            landscape_run_id=str(uuid4()),
+                        ),
+                        "id": run_id,
+                        "started_at": datetime(2026, 1, 1, tzinfo=UTC),
+                        "rows_processed": 0,
+                        "rows_failed": 0,
+                    }
                 )
             )
 
@@ -1544,10 +1576,13 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             stored = conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(state.id))).first()
         assert stored is not None
-        assert stored.source is None, "production writes the legacy singular `source` column as NULL; the guard must not read it"
         assert isinstance(stored.sources, dict) and stored.sources.get("_version") == 1, (
             f"production wraps `sources` in a _version envelope; got {stored.sources!r}"
         )
+        assert stored.sources["data"]["source"]["options"] == {
+            "blob_ref": str(record.id),
+            "path": str(record.storage_path),
+        }
         assert str(record.id) in json.dumps(stored.sources), "the blob_ref must live inside the enveloped `sources` payload"
 
         with db_engine.begin() as conn:
@@ -4640,17 +4675,20 @@ class TestFinalizeRunOutputBlobs:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id_str,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: every test-side direct composition_states
+                        # insert must supply provenance after Task 3's CHECK
+                        # constraint. ``session_seed`` is the broadened-semantics
+                        # default for setup-only rows that don't model a real
+                        # compose-loop transition.
+                        provenance="session_seed",
+                        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    )
                 )
             )
             conn.execute(
@@ -4783,17 +4821,20 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id_str,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: every test-side direct composition_states
+                        # insert must supply provenance after Task 3's CHECK
+                        # constraint. ``session_seed`` is the broadened-semantics
+                        # default for setup-only rows that don't model a real
+                        # compose-loop transition.
+                        provenance="session_seed",
+                        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    )
                 )
             )
             conn.execute(
@@ -5610,17 +5651,20 @@ class TestFinalizeRunOutputBlobsErrorCleanup:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: every test-side direct composition_states
-                    # insert must supply provenance after Task 3's CHECK
-                    # constraint. ``session_seed`` is the broadened-semantics
-                    # default for setup-only rows that don't model a real
-                    # compose-loop transition.
-                    provenance="session_seed",
-                    created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id_str,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: every test-side direct composition_states
+                        # insert must supply provenance after Task 3's CHECK
+                        # constraint. ``session_seed`` is the broadened-semantics
+                        # default for setup-only rows that don't model a real
+                        # compose-loop transition.
+                        provenance="session_seed",
+                        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+                    )
                 )
             )
             conn.execute(
@@ -5826,13 +5870,16 @@ class TestLinkBlobToRunDirectionGuard:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
-                    id=state_id,
-                    session_id=session_id_str,
-                    version=1,
-                    is_valid=True,
-                    # Plan §2294: setup-only row; provenance required.
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id_str,
+                        version=1,
+                        is_valid=True,
+                        # Plan §2294: setup-only row; provenance required.
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
             conn.execute(

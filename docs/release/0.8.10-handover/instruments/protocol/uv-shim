@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Stand-in for `uv run` inside a worktree whose .venv is a symlink to the main
+# checkout's venv. Real uv would sync (and can delete) that shared venv. This
+# shim never creates, syncs or removes an environment: it runs the command with
+# the existing interpreter and this worktree's source on PYTHONPATH.
+set -euo pipefail
+if [ "${1:-}" != "run" ]; then echo "uv shim: only 'uv run' is supported" >&2; exit 2; fi
+shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --extra|--with|--group) shift 2 ;;
+    --extra=*|--with=*|--group=*|--frozen|--no-sync) shift ;;
+    *) break ;;
+  esac
+done
+W=.claude/worktrees/protocol-20261025
+export PYTHONPATH="$W/src:$W/elspeth-lints/src"
+case "$1" in
+  python) shift; exec "$W/.venv/bin/python" "$@" ;;
+  elspeth) shift; exec "$W/.venv/bin/python" -m elspeth.cli "$@" ;;
+  *) echo "uv shim: unsupported command $1" >&2; exit 2 ;;
+esac

@@ -4,7 +4,7 @@ Verifies:
 - Round-trip: record → CompositionState preserves all fields
 - Tier 1 crash: None metadata_ raises ValueError (database corruption)
 - None nodes/edges/outputs → empty sequences (legitimate initial state)
-- Missing sources/source → empty sources mapping (no source configured yet)
+- Missing sources → empty sources mapping (no source configured yet)
 """
 
 from __future__ import annotations
@@ -68,8 +68,8 @@ class TestStateFromRecord:
         assert state.metadata.name == "Test Pipeline"
 
     def test_missing_sources_becomes_empty_mapping(self) -> None:
-        """Missing plural and legacy source columns → empty sources mapping."""
-        record = _make_record(sources=None, source=None)
+        """Missing plural sources → empty sources mapping."""
+        record = _make_record(sources=None)
         state = state_from_record(record)
         assert state.sources == {}
 
@@ -93,7 +93,7 @@ class TestStateFromRecord:
 
     def test_all_collections_none(self) -> None:
         """All optional collections None → valid empty state."""
-        record = _make_record(sources=None, source=None, nodes=None, edges=None, outputs=None)
+        record = _make_record(sources=None, nodes=None, edges=None, outputs=None)
         state = state_from_record(record)
         assert state.sources == {}
         assert state.nodes == ()
@@ -156,6 +156,6 @@ class TestTier1MetadataCrash:
     """Tier 1: None metadata_ is database corruption — crash immediately."""
 
     def test_none_metadata_raises_valueerror(self) -> None:
-        record = _make_record(metadata_=None)
+        # The record refuses at construction, which is how every stored row is decoded.
         with pytest.raises(ValueError, match="None metadata_"):
-            state_from_record(record)
+            _make_record(metadata_=None)

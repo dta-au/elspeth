@@ -458,7 +458,6 @@ class Battery:
                         http[-1]["terminal_status"] = operation_error["http_status"]
                         r = HttpResponse(operation_error["http_status"], operation_error["body"], json.dumps(operation_error["body"]))
                         break
-                    observation_deadline = min(observation_deadline, self._clock() + observed.body["deadline_remaining_ms"] / 1000 + 30)
                     self._sleep(observed.body["poll_after_ms"] / 1000)
                 else:
                     step("cancel_composer_operation", "POST", f"{operation_path}/cancel", timeout=30)

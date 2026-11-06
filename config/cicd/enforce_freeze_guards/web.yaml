@@ -1,27 +1,24 @@
-per_file_rules:
-- pattern: web/execution/service.py
-  rules:
-  - FG3
+allow_hits:
+- key: web/execution/service.py:FG3:_module_:fp=e2b0f4248db10c3e
+  owner: "@elspeth-maintainers"
   reason: _OutputBlobFinalizationOutcome.errors is tuple[Mapping[str, str], ...] of flat
     str->str dicts built fresh at construction and consumed read-only (truthiness, len,
     and list() into a slog.error partial-failure event). Surfaced by the FG3 nested-mutable
     detector fix (elspeth-ec6749f8da). deep_freeze would convert the inner dicts to
     MappingProxyType and risks breaking the structlog serialisation of that log event, so
     the proper fix is deferred to elspeth-640168fa4b; nothing mutates the inner dicts.
+  safety: Nothing mutates the inner dicts after construction; the deferred fix is tracked as elspeth-640168fa4b.
   expires: null
-  max_hits: 1
-- pattern: web/composer/_producer_resolver.py
-  rules:
-  - FG3
+- key: web/composer/_producer_resolver.py:FG3:_module_:fp=25b19144abfcc178
+  owner: "@elspeth-maintainers"
   reason: ProducerEntry.options is intentionally not re-frozen because CompositionState
     already deep-freezes node options in __post_init__ — ProducerEntry holds a reference
     to the already-frozen Mapping from state; redundant deep-freeze would be expensive
     and creates a new object that is no longer the original frozen reference
+  safety: options always arrives as the already deep-frozen Mapping held by CompositionState.
   expires: null
-  max_hits: 1
-- pattern: web/composer/tool_batch.py
-  rules:
-  - FG3
+- key: web/composer/tool_batch.py:FG3:_module_:fp=5ae80a24b1173648
+  owner: "@elspeth-maintainers"
   reason: ToolBatchContext.discovery_cache and runtime_preflight_cache are intentionally
     NOT deep-frozen. They are driver-owned, long-lived mutable caches created once in
     _compose_loop and threaded through the frozen context by reference; run_tool_batch
@@ -31,8 +28,16 @@ per_file_rules:
     statement — the field *references* are batch-invariant — but deep-freezing the cache
     *contents* would break the cache-write behaviour that is the whole reason the caches
     are passed through the context. Documented at the field in tool_batch.py.
+  safety: Verified at the field docstring in tool_batch.py; the frozen dataclass holds only the cache references.
   expires: null
-  max_hits: 1
+
+# Kept as a per-file rule, not an exact entry: FG3 fingerprints the whole
+# ClassDef when a frozen dataclass has no __post_init__, and CompositionState is
+# a ~1,970-line class (46 commits touched its lines between 2026-08-01 and
+# 2026-11-01). An exact key would go stale on almost every edit to any of its
+# methods. Replace this with an exact entry once FG3 recognises the
+# freeze_fields call in the custom __init__ (the finding is a false positive).
+per_file_rules:
 - pattern: web/composer/state.py
   rules:
   - FG3

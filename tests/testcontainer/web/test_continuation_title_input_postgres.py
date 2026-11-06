@@ -1,0 +1,28 @@
+"""Current inserted title sources on the actual serial PostgreSQL fixture."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_title_input import (
+    test_actual_title_source_new_claim_uses_same_ingress_and_refuses_old_claim as test_actual_title_source_new_claim_uses_same_ingress_and_refuses_old_claim,
+)
+from tests.unit.web.sessions.test_continuation_title_input import (
+    test_current_inserted_title_source_preserves_real_values_without_writes as test_current_inserted_title_source_preserves_real_values_without_writes,
+)
+from tests.unit.web.sessions.test_continuation_title_input import (
+    test_original_async_graph_admission_and_same_connection_source_agree as test_original_async_graph_admission_and_same_connection_source_agree,
+)
+from tests.unit.web.sessions.test_continuation_title_input import (
+    test_title_owned_request_fault_keeps_original_parser_cause_and_closes_work as test_title_owned_request_fault_keeps_original_parser_cause_and_closes_work,
+)
+from tests.unit.web.sessions.test_continuation_title_input import (
+    test_title_source_refuses_actual_prior_quota_attempt_without_retry_or_effect_inference as test_title_source_refuses_actual_prior_quota_attempt_without_retry_or_effect_inference,
+)
+from tests.unit.web.sessions.test_continuation_title_input import (
+    test_title_source_refuses_reserved_phase_without_promoting_its_input as test_title_source_refuses_reserved_phase_without_promoting_its_input,
+)
+from tests.unit.web.sessions.test_continuation_title_input import (
+    test_title_source_requires_same_complete_current_root_and_original_title as test_title_source_requires_same_complete_current_root_and_original_title,
+)
+
+pytestmark = pytest.mark.testcontainer

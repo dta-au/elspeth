@@ -9,24 +9,34 @@ The current guidance below supersedes every legacy reset procedure later in
 this document. Those procedures are historical reference only and do not
 apply to the current candidate. They do not authorize a deployment or a reset.
 
-## Current Cutover: 0.8.9 candidate (session epoch 78, Landscape epoch 50)
+## Current Cutover: 0.8.10 candidate (session epoch 82, Landscape epoch 50)
 
-The unreleased candidate uses session epoch 78, retaining authoritative
-committed graph-review facts and strengthening quota custody, aggregate container
-storage and shared rate-limit policy binding.
+The unreleased candidate uses session epoch 82, which retains versioned Composer
+continuation segments, exact byte chunks, attributed journal events and complete
+snapshots for the single Composer lifecycle and terminal-run database checks.
+Epoch 82 makes the admitted continuation policy version, hash and retained-payload
+allowance immutable in the parent operation. It keeps epoch 78's authoritative committed graph-review facts, quota
+custody, aggregate container storage and shared rate-limit policy binding.
 Graph recovery, authentication families and bound websocket tickets remain,
 with Landscape epoch 50 recording durable provider-attempt identity on run calls.
 Epoch-75 readers ignore effective completion blockers;
-neither distinct epoch-76 predecessor nor epoch 77 has the combined contract.
-Preserve epoch-75, epoch-76 and epoch-77 Sessions stores, epoch-49 Landscape stores
-and prior compatible application access; use explicitly new epoch-78 Sessions and
-epoch-50 Landscape targets. Drain and isolate old/new deployments: they must not
+neither distinct epoch-76 predecessor nor epoch 77 has the combined contract, and
+an epoch-78 store lacks the continuation tables; the pre-release epoch-79
+shape still carries the retired version-1 lifecycle and lacks the run checks.
+Preserve epoch-75, epoch-76, epoch-77, epoch-78, epoch-79, epoch-80 and epoch-81 Sessions stores, epoch-49
+Landscape stores and prior compatible application access; use explicitly new
+epoch-82 Sessions and epoch-50 Landscape targets. Drain and isolate old/new deployments: they must not
 share either store, and compatibility keys do not automatically evict existing replicas.
 The ambiguous session epoch 73 is retired. Existing compatible stores
 may reopen after exact schema admission. Unsupported stores remain unchanged;
 a matching epoch number alone does not establish compatible table, column,
 constraint, or index shape. Startup and schema doctor must refuse incompatible
 stores before writer configuration or schema repair.
+
+Existing epoch-81 stores remain unchanged and refused; there is no automatic
+upgrade. V1/V2 policies can be created and resumed within a compatible epoch-82
+store, not by reopening an epoch-81 database. The parent-policy integrity repair
+does not activate V3 admission or change the application's policy default.
 
 Keep existing/user stores and their SQLite sidecars in place. Configure an
 explicitly new database target when a fresh store is needed, keeping the
@@ -66,12 +76,12 @@ store automatically.
    create a database:
 
 ```bash
-sqlite3 -readonly "$DB_PATH" 'PRAGMA user_version;'         # expect 78 (== SESSION_SCHEMA_EPOCH)
+sqlite3 -readonly "$DB_PATH" 'PRAGMA user_version;'         # expect 82 (== SESSION_SCHEMA_EPOCH)
 sqlite3 -readonly "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 50 (== SQLITE_SCHEMA_EPOCH)
 ```
 
 These epoch probes supplement exact shape admission; they do not replace it.
-Record the session-epoch-78/Landscape-epoch-50 result for the candidate. On a
+Record the session-epoch-82/Landscape-epoch-50 result for the candidate. On a
 mismatch, preserve both stores and refuse candidate startup against them.
 After separately authorized startup, a fresh test session can complete the
 freeform Build step, run the pipeline, and inspect its recorded audit story.
@@ -86,7 +96,7 @@ candidate or to existing/user stores under the current preservation policy.
 The .6 candidate made committed terminal graph-review facts authoritative over
 immutable snapshots. Epoch-75 readers ignore those facts and cannot preserve
 effective completion blockers. That historical boundary remains; the current
-candidate additionally requires Sessions epoch 78 and Landscape epoch 50. This history
+candidate additionally requires Sessions epoch 82 and Landscape epoch 50. This history
 does not authorize restamping, resetting or converting either predecessor.
 
 ## Prior Cutover: 0.8.3 candidate (session epoch 72, Landscape epoch 49)

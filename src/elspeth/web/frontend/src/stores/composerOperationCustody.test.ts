@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { acquireComposerOperationCustody, attachComposerObserver, authenticateComposerCustody, COMPOSER_BODY_LIMIT, COMPOSER_CUSTODY_KEY, findComposerOperationCustody, purgeComposerCustody, settleComposerCustody } from "./composerOperationCustody";
+import { acquireComposerOperationCustody, attachComposerObserver, authenticateComposerCustody, COMPOSER_BODY_LIMIT, COMPOSER_CUSTODY_KEY, COMPOSER_CUSTODY_SCHEMA, findComposerOperationCustody, purgeComposerCustody, settleComposerCustody } from "./composerOperationCustody";
 import type { SubmittedCustody } from "@/types/composerOperations";
 const scope = { principalId: "principal-1", authProvider: "local" };
 const sid = "11111111-1111-4111-8111-111111111111";
@@ -44,7 +44,7 @@ describe("immutable principal-scoped durable custody", () => {
   it("hydrates only freshly authenticated same-scope immutable descriptors", () => {
     const submitted = descriptor();
     purgeComposerCustody();
-    sessionStorage.setItem(COMPOSER_CUSTODY_KEY, JSON.stringify({ schema: "composer-operations.v1", entries: [{ foreground: submitted, unresolvedSubmissions: [] }] }));
+    sessionStorage.setItem(COMPOSER_CUSTODY_KEY, JSON.stringify({ schema: COMPOSER_CUSTODY_SCHEMA, entries: [{ foreground: submitted, unresolvedSubmissions: [] }] }));
     expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
     authenticateComposerCustody(scope);
     const restored = findComposerOperationCustody(scope, sid).foreground;
@@ -63,15 +63,47 @@ describe("immutable principal-scoped durable custody", () => {
   });
   it("purges persisted old-principal bodies on a freshly authenticated reload", () => {
     const old = descriptor(); purgeComposerCustody();
-    sessionStorage.setItem(COMPOSER_CUSTODY_KEY, JSON.stringify({ schema: "composer-operations.v1", entries: [{ foreground: old, unresolvedSubmissions: [] }] }));
+    sessionStorage.setItem(COMPOSER_CUSTODY_KEY, JSON.stringify({ schema: COMPOSER_CUSTODY_SCHEMA, entries: [{ foreground: old, unresolvedSubmissions: [] }] }));
     authenticateComposerCustody({ principalId: "other", authProvider: "local" });
     expect(sessionStorage.getItem(COMPOSER_CUSTODY_KEY)).toBeNull(); expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
   });
   it("rejects persisted observer bodies and mismatched submitted identities", () => {
     purgeComposerCustody();
-    sessionStorage.setItem(COMPOSER_CUSTODY_KEY, JSON.stringify({ schema: "composer-operations.v1", entries: [{ foreground: { ...descriptor(), mode: "observer" }, unresolvedSubmissions: [] }] }));
+    sessionStorage.setItem(COMPOSER_CUSTODY_KEY, JSON.stringify({ schema: COMPOSER_CUSTODY_SCHEMA, entries: [{ foreground: { ...descriptor(), mode: "observer" }, unresolvedSubmissions: [] }] }));
     authenticateComposerCustody(scope); expect(findComposerOperationCustody(scope, sid).foreground).toBeNull(); expect(() => acquireComposerOperationCustody(descriptor())).toThrow();
     purgeComposerCustody(); authenticateComposerCustody(scope);
     expect(() => acquireComposerOperationCustody({ ...descriptor(), kind: "compose_message", body: { operation_id: other, content: "hello", state_id: null } })).toThrow();
+  });
+});
+
+// Literal on purpose: the key a pre-0.8.10 bundle wrote, not a constant that
+// could drift with the current key.
+const RETIRED_V1_KEY = "elspeth_composer_operations_v1";
+describe("retired custody storage", () => {
+  const retired = () => JSON.stringify({ schema: "composer-operations.v1", entries: [{ foreground: { ...descriptor(), protocolVersion: 1 }, unresolvedSubmissions: [] }] });
+  it("removes a retired custody record with the current one on purge (logout)", () => {
+    acquireComposerOperationCustody(descriptor());
+    sessionStorage.setItem(RETIRED_V1_KEY, retired());
+    expect(sessionStorage.getItem(COMPOSER_CUSTODY_KEY)).not.toBeNull();
+    purgeComposerCustody();
+    expect(sessionStorage.getItem(COMPOSER_CUSTODY_KEY)).toBeNull();
+    expect(sessionStorage.getItem(RETIRED_V1_KEY)).toBeNull();
+  });
+  it("removes a retired record on principal-mismatch cleanup", () => {
+    purgeComposerCustody();
+    sessionStorage.setItem(COMPOSER_CUSTODY_KEY, JSON.stringify({ schema: COMPOSER_CUSTODY_SCHEMA, entries: [{ foreground: descriptor(), unresolvedSubmissions: [] }] }));
+    sessionStorage.setItem(RETIRED_V1_KEY, retired());
+    authenticateComposerCustody({ principalId: "other", authProvider: "local" });
+    expect(sessionStorage.getItem(COMPOSER_CUSTODY_KEY)).toBeNull();
+    expect(sessionStorage.getItem(RETIRED_V1_KEY)).toBeNull();
+  });
+  it("never reads a retired record and removes it on hydration", () => {
+    purgeComposerCustody();
+    sessionStorage.setItem(RETIRED_V1_KEY, retired());
+    authenticateComposerCustody(scope);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    expect(sessionStorage.getItem(RETIRED_V1_KEY)).toBeNull();
+    // A retired record is not a quarantine: new submissions are admitted.
+    expect(acquireComposerOperationCustody(descriptor()).operationId).toBe(id);
   });
 });

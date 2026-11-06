@@ -1,0 +1,1 @@
+tests/unit/web/sessions/test_continuation_composition_initialization.py::test_initial_capture_retains_actual_reader_and_rechecks_historical_blob_access|assert ('Historical original blob café body and REFERENCE_TAIL_CANARY' in '{"events": [{"event_id": "<uuid>", "source": "persisted_session", "sequence_no": 1, "

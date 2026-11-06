@@ -31,6 +31,8 @@ from elspeth.web.plugin_policy.models import PluginUnavailableReason
 _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "BLOB_QUOTA_EXCEEDED",
+        "CONTINUATION_CALL_NOT_ALONE",
+        "CONTINUATION_UNAVAILABLE",
         "DISCOVERY_NO_GAIN",
         "TERMINAL_CALL_NOT_ALONE",
         "advisor_signoff_blocked",
@@ -42,6 +44,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "aggregation_output_mode_invalid",
         "aggregation_trigger_invalid",
         "argument_error",
+        "auto_mutation_revoked",
         "batch_required_fields_invalid",
         "batch_transform_misplaced",
         "batch_dependency_refused",
@@ -72,6 +75,8 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "collector_on_success_dangling",
         "collector_plugin_not_batch_aware",
         "collector_scope_policy_invalid",
+        "complete_value_unavailable",
+        "complete_value_unsupported",
         "connection_sink_name_overlap",
         "contract_config_invalid",
         "credential_material_rejected",
@@ -197,6 +202,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "source_blob_encoding_invalid",
         "source_blob_identity_invalid",
         "source_blob_plugin_required",
+        "source_blob_plugin_mismatch",
         "source_blob_review_required",
         "source_blob_unavailable",
         "source_name_invalid",

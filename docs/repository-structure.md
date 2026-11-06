@@ -48,7 +48,7 @@ source tree.
 ## One level down (where it aids placement)
 
 - **`config/`** → `cicd/` (one folder per CI policy: cells, allowlists, defaults), `mcp/` (MCP server configuration).
-- **`scripts/`** → `cicd/`, `codex_lenses/`, `eval/`, `git-hooks/`, `red_team/`, `scan-groups/`, `skill_rgr/`, `state_engine_assessment_lib/`, `archive/` (superseded one-offs), plus top-level utility scripts (`generate_test_data.py`, `run_mutation_testing.py`, `validate_deployment.py`, `deploy-vm.sh`, `smoke-test.sh`).
+- **`scripts/`** → `cicd/`, `codex_lenses/`, `eval/`, `git-hooks/`, `scan-groups/`, `skill_rgr/`, `state_engine_assessment_lib/`, `archive/` (superseded one-offs), plus top-level utility scripts (`generate_test_data.py`, `run_mutation_testing.py`, `validate_deployment.py`, `deploy-vm.sh`, `smoke-test.sh`).
 - **`tools/`** → `pdf/` (Typst/Pandoc artifact builds).
 - **`evals/`** → dated run folders (`2026-05-03-composer/`, `2026-05-06-endpoint-validation/`), `composer-harness/`, `composer-rgr/`, the tracked scenario corpora `composer-battery/`, `composer-parity/` and `composer-standard-battery/`, and `lib/` (shared eval code).
 - **`data/`** → `skills/` (deployment examples of the live composer skill prompt); runtime DBs live here at deploy time (gitignored).

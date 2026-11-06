@@ -185,6 +185,22 @@ class BlobRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class VerifiedBlobPrefix:
+    """One fenced, fully hash-verified blob read that retains only a bounded prefix.
+
+    ``record`` is the metadata observed inside the same custody bracket as the
+    streamed bytes, so the record, ``prefix`` and ``verified_content_hash``
+    describe one version. ``total_size_bytes`` counts the bytes actually
+    streamed, not the recorded size.
+    """
+
+    record: BlobRecord
+    prefix: bytes
+    verified_content_hash: str
+    total_size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class InlineCustodyRequest:
     """Exact bytes and provenance for one idempotent inline-source write.
 

@@ -265,6 +265,8 @@ export interface CompositionState {
   id: string;
   session_id: string;
   version: number;
+  /** Server-authored content identity; absent only on responses from older servers. */
+  composition_content_hash?: string;
   sources: Record<string, SourceSpec>;
   nodes: NodeSpec[];
   edges: EdgeSpec[];
@@ -389,7 +391,10 @@ export type ComposerProgressReason =
   // retryable — deliberately not part of the provider_* family.
   | "planner_repair_exhausted"
   | "service_setup_failed"
+  | "mutation_authority_revoked"
   | "admission_refused"
+  // U-22 F4: prepared provider context outside the supported envelope.
+  | "context_unsupported"
   | "accounting_unavailable"
   // Required when phase === "cancelled" — distinguishes a client disconnect
   // from a future operator-initiated cancel without parsing the headline.
@@ -1181,6 +1186,8 @@ export interface ApiError {
   status: number;
   detail: string;
   error_type?: string;
+  /** Validated cost observation for a terminal paid result with incomplete evidence. */
+  paid_result_incomplete_cost?: import("./composerOperations").PaidResultIncompleteCost;
   /** Scalar identity of an unreadable graph; never a replacement empty graph. */
   unavailable_state_head?: { state_id: string; version: number };
   /** The server's current approval state when another approver won the decision race. */
@@ -1238,6 +1245,8 @@ export interface ApiError {
   secret_guard?: ExecutionSecretGuard;
   provider_detail?: string;
   provider_status_code?: number;
+  /** Closed safe evidence of a primary provider request rejection, when retained. */
+  request_rejection?: SafeRequestRejection;
   validation_errors?: ValidationError[];
   errors?: ApiStructuredError[];
   snapshot_fingerprint?: string;

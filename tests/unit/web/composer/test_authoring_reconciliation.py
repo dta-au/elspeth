@@ -43,6 +43,10 @@ from elspeth.web.interpretation_state import (
     reconcile_authoritative_reviews,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from tests.unit.web.composer import test_attachment_authoring_projection as attachment_projection
+from tests.unit.web.composer import test_reviewed_plural_authority as custody
+
+authority_harness = custody.authority_harness
 
 
 def _requirement(
@@ -234,28 +238,20 @@ def test_default_blob_source_round_trips_as_blob_id_without_storage_metadata() -
     assert not {"path", "blob_ref", "mode", SOURCE_AUTHORING_KEY} & set(result.data["source"]["options"])
 
 
-def test_named_blob_source_reports_round_trip_unavailable() -> None:
-    state = CompositionState(
-        sources={
-            "left": SourceSpec(
-                plugin="csv",
-                on_success="in",
-                options={"blob_ref": "2e9e41eb-e34d-4918-b334-3c1e9ee0f8ff", "path": "/data/blobs/left.csv"},
-                on_validation_failure="discard",
-            )
-        },
-        nodes=(_node(plugin="passthrough"),),
-        edges=(),
-        outputs=(),
-        metadata=PipelineMetadata(),
-        version=1,
-    )
+def test_named_blob_source_round_trips_current_owned_binding(authority_harness: custody._AuthorityHarness) -> None:
+    state = attachment_projection._seed_scalar(authority_harness, source_name="left")
+    before = state.to_dict()
 
-    result = _exact_arguments(state)
+    arguments = attachment_projection._projection(authority_harness, state)
 
-    assert not result.success
-    assert result.validation.errors[0].error_code == "round_trip_unavailable"
-    assert result.updated_state is state
+    assert arguments["sources"]["left"]["blob_id"] == state.sources["left"].options["blob_ref"]
+    assert not {"path", "blob_ref", "mode", SOURCE_AUTHORING_KEY} & set(arguments["sources"]["left"]["options"])
+    attachment_projection._strict_round_trip(arguments)
+    reapplied = attachment_projection.public._public_call(authority_harness, "set_pipeline", arguments, state)
+    assert reapplied.success and reapplied.validation.is_valid, reapplied.to_dict()
+    assert reapplied.updated_state.sources == state.sources
+    assert reapplied.updated_state.version == state.version + 1
+    assert state.to_dict() == before
 
 
 @pytest.mark.parametrize(

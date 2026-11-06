@@ -795,7 +795,12 @@ def extract_safe_excerpt(
     against such files.
     """
     resolved = resolve_safe_excerpt_path(root=root, target_file=target_file)
-    raw_bytes = resolved.read_bytes()
+    from elspeth_lints.core.trusted_git import SourceSnapshotError, read_regular_file
+
+    try:
+        raw_bytes = read_regular_file(resolved)
+    except SourceSnapshotError as exc:
+        raise SourceExcerptPathOutsideRootError("source excerpt path changed or cannot be read safely") from exc
     file_fingerprint = hashlib.sha256(raw_bytes).hexdigest()
     text = raw_bytes.decode("utf-8")
     lines = text.splitlines()

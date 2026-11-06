@@ -171,7 +171,8 @@ class RecordingAggregationExecutor:
 
     def check_flush_status(self, node_id: NodeID) -> tuple[bool, TriggerType | None]:
         self.calls.append("check_flush")
-        return (self.should_flush, TriggerType.COUNT if self.should_flush else None)
+        ready = self.should_flush and bool(self.accepted)
+        return (ready, TriggerType.COUNT if ready else None)
 
 
 class RecordingCoalesceExecutor:
@@ -380,7 +381,7 @@ def _make_coordinator(
 
 
 def _ctx() -> SimpleNamespace:
-    return SimpleNamespace()
+    return SimpleNamespace(shutdown_event=None)
 
 
 class TestAggregationIntakeOrdering:
@@ -402,9 +403,9 @@ class TestAggregationIntakeOrdering:
         assert [d.kind for d in outcome.dispositions] == [BarrierIntakeDispositionKind.HELD]
         assert outcome.results == []
         assert outcome.child_items == []
-        # Ordering by construction: open batch -> fenced adopt -> feed memory
-        # -> trigger evaluation, all within one intake step.
-        assert combined.index("open_batch") < combined.index("adopt") < combined.index("accept") < combined.index("check_flush")
+        # Observe any accepted ready batch before intake; an arrival then
+        # opens membership, adopts, feeds memory, and evaluates its trigger.
+        assert combined == ["check_flush", "list_pending", "open_batch", "adopt", "accept", "check_flush"]
 
     def test_idempotent_skip_arm_does_not_feed_memory(self) -> None:
         row = _blocked_row(barrier_key=str(_AGG_NODE))
@@ -416,7 +417,7 @@ class TestAggregationIntakeOrdering:
 
         assert outcome.dispositions == ()
         assert "accept" not in agg.calls
-        assert "check_flush" not in agg.calls
+        assert agg.calls == ["check_flush", "open_batch"]
 
     def test_count_trigger_fires_flush_in_same_intake_step(self) -> None:
         row = _blocked_row(barrier_key=str(_AGG_NODE))

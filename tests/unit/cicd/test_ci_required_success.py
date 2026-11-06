@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 import yaml
+from tests.unit.cicd.test_workflow_runner_isolation import _context, _expression
 from tests.unit.cicd.workflow_sources import EXECUTABLE_WORKFLOWS
 
 
@@ -17,7 +18,8 @@ def _aggregate() -> dict[str, Any]:
 
 
 def _run_results(job: dict[str, Any], results: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    assert job["if"] == "always()", "aggregate must run after a failed or skipped dependency"
+    assert job["if"].startswith("(always())"), "aggregate must run after a failed or skipped dependency"
+    assert _expression(job["if"], _context("push")), "trusted aggregate must not skip required result inspection"
     step = next(step for step in job["steps"] if step["name"] == "Check all jobs passed")
     script = step["run"]
     expressions = re.findall(r"\$\{\{ needs\.([a-z0-9-]+)\.result }}", script)

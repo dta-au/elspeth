@@ -16,9 +16,9 @@ from sqlalchemy import select
 
 from elspeth.web.sessions._persist_payload import RedactedToolRow, StatePayload
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes._helpers import _message_response
 from elspeth.web.sessions.routes.messages import register_message_routes
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.evals.composer_battery import threadgen as tg
 from tests.unit.web.sessions.test_persist_compose_turn import _make_session
 
@@ -41,7 +41,7 @@ def test_real_primary_writer_stamps_only_applied_call(service):
             RedactedToolRow(
                 tool_call_id="applied",
                 content=json.dumps({"success": True}),
-                composition_state_payload=StatePayload(data=CompositionStateData(), derived_from_state_id=None),
+                composition_state_payload=StatePayload(data=composition_state_data(), derived_from_state_id=None),
             ),
             RedactedToolRow(
                 tool_call_id="pending",

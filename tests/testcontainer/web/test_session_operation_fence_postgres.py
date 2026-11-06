@@ -131,8 +131,12 @@ async def test_advisor_only_recovery_rejects_stale_operation_fence(postgres_engi
 
 @pytest.fixture(scope="module")
 def postgres_engine(external_deployment_postgres_url: str) -> Engine:
+    from tests.fixtures.identities import ensure_test_identity
+
     engine = create_session_engine(external_deployment_postgres_url)
     initialize_session_schema(engine)
+    with engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
     try:
         yield engine
     finally:

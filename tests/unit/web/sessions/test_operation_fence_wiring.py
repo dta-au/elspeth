@@ -51,10 +51,7 @@ from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.envelope import RunExecutionInput
 from elspeth.web.execution.service import ExecutionServiceImpl, close_execute_lease_before_transfer
-from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
-from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
-from elspeth.web.sessions.composer_turn import _run_composer_turn, run_composer_turn
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import RunEventRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes import interpretation as interpretation_routes
@@ -81,198 +78,6 @@ def test_run_admission_requires_the_exact_session_context(owner: type[Any], meth
     parameter = _required_parameter(owner, method_name, "session_operation_context")
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
-
-
-def _assert_composer_turn_authority(source: str) -> None:
-    tree = ast.parse(textwrap.dedent(source))
-    function = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
-    guard = next(
-        node
-        for node in function.body
-        if isinstance(node, ast.If) and ast.unparse(node.test) == "lease.context != running.session_operation_context"
-    )
-    assert any(isinstance(node, ast.Raise) for node in ast.walk(guard))
-    state_reads = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.load_graph_recovery_context"
-    ]
-    assert len(state_reads) == 1
-    state_read = state_reads[0]
-    assert [ast.unparse(arg) for arg in state_read.args] == ["session.id"]
-    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in state_read.keywords] == [
-        ("turn_start_state_id", "request.state_id"),
-        ("session_operation_context", "lease.context"),
-    ]
-    snapshot = next(
-        node
-        for node in function.body
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Await) and node.value.value is state_read
-    )
-    start = function.body.index(snapshot)
-    assert [ast.unparse(node) for node in function.body[start : start + 4]] == [
-        "recovery_admission = await service.load_graph_recovery_context(session.id, turn_start_state_id=request.state_id, "
-        "session_operation_context=lease.context)",
-        "recovery_context = recovery_admission.context",
-        "state_record = recovery_admission.record",
-        "compose_base_state_id = UUID(recovery_context.turn_start_state_id) if recovery_context.turn_start_state_id is not None else None",
-    ]
-    head_guard = function.body[start + 4]
-    assert isinstance(head_guard, ast.If) and ast.unparse(head_guard.test) == "compose_base_state_id != request.state_id"
-    assert len(head_guard.body) == 1 and isinstance(head_guard.body[0], ast.Raise) and not head_guard.orelse
-    assert ast.unparse(function.body[start + 5]) == (
-        "state = None if recovery_context.malformed_head else _initial_composition_state() if state_record is None else _state_from_record(state_record)"
-    )
-    reads = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and ast.unparse(node.func) in {"service.get_session", "service.get_messages", "service.load_graph_recovery_context"}
-    ]
-    assert all(guard.lineno < node.lineno for node in reads)
-    assert not any(isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_current_state" for node in ast.walk(function))
-    transcript_write = next(
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.add_message_with_transcript"
-    )
-    assert guard.lineno < state_read.lineno < transcript_write.lineno
-    assert [
-        (keyword.arg, ast.unparse(keyword.value)) for keyword in transcript_write.keywords if keyword.arg == "session_operation_context"
-    ] == [("session_operation_context", "lease.context")]
-    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in transcript_write.keywords if keyword.arg == "running"] == [
-        ("running", "running")
-    ]
-    parent = next(
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and node is not transcript_write
-        and transcript_write in ast.walk(node)
-        and ast.unparse(node.func) == "lease.create_task"
-    )
-    assert parent is not None
-
-
-def test_detached_turn_checks_exact_adopted_authority_before_state_or_message_access() -> None:
-    _assert_composer_turn_authority(inspect.getsource(_run_composer_turn))
-
-
-@pytest.mark.parametrize(
-    "before,after",
-    [
-        ("lease.context != running.session_operation_context", "lease.context != other_context"),
-        ("session_operation_context=lease.context", "session_operation_context=other_context"),
-        ("running=running", "running=other_running"),
-        ("ingress = lease.create_task", "ingress = asyncio.create_task"),
-        ("turn_start_state_id=request.state_id", "turn_start_state_id=other_state_id"),
-        ("recovery_context = recovery_admission.context", "recovery_context = other_admission.context"),
-        ("state_record = recovery_admission.record", "state_record = other_admission.record"),
-        ("compose_base_state_id != request.state_id", "False"),
-    ],
-)
-def test_detached_turn_authority_control_rejects_changed_fence_or_child_owner(before: str, after: str) -> None:
-    source = inspect.getsource(_run_composer_turn)
-    assert before in source
-    _assert_composer_turn_authority(source)
-    with pytest.raises((AssertionError, StopIteration)):
-        _assert_composer_turn_authority(source.replace(before, after))
-
-
-@pytest.mark.parametrize("fault", ["read-before-guard", "unreachable-guard"])
-def test_detached_turn_rejects_misplaced_recovery_admission(fault: str) -> None:
-    source = inspect.getsource(_run_composer_turn)
-    _assert_composer_turn_authority(source)
-    tree = ast.parse(textwrap.dedent(source))
-    function = tree.body[0]
-    assert isinstance(function, ast.AsyncFunctionDef)
-    guard = next(
-        node
-        for node in function.body
-        if isinstance(node, ast.If) and ast.unparse(node.test) == "lease.context != running.session_operation_context"
-    )
-    if fault == "read-before-guard":
-        snapshot = next(
-            node
-            for node in function.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "recovery_admission" for target in node.targets)
-        )
-        function.body.remove(snapshot)
-        function.body.insert(function.body.index(guard), snapshot)
-    else:
-        index = function.body.index(guard)
-        function.body[index] = ast.If(test=ast.Constant(False), body=[guard], orelse=[])
-    ast.fix_missing_locations(tree)
-    with pytest.raises((AssertionError, StopIteration)):
-        _assert_composer_turn_authority(ast.unparse(tree))
-
-
-def _assert_worker_adopted_lease_transfer(source: str, *, outer_source: str | None = None) -> None:
-    tree = ast.parse(textwrap.dedent(source))
-    turn = next(node for node in ast.walk(tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "run_composer_turn")
-    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in turn.keywords if keyword.arg in {"lease", "running"}] == [
-        ("lease", "lease"),
-        ("running", "running"),
-    ]
-    outer = ast.parse(textwrap.dedent(outer_source or inspect.getsource(ComposerAsyncWorker._run_started)))
-    reservations = [
-        node
-        for node in ast.walk(outer)
-        if isinstance(node, ast.Assign) and [ast.unparse(target) for target in node.targets] == ["setup_ticket"]
-    ]
-    assert len(reservations) == 1
-    reservation = reservations[0].value
-    assert isinstance(reservation, ast.IfExp)
-    assert ast.unparse(reservation.test) == "coordinator is not None"
-    assert ast.unparse(reservation.body) == "coordinator.reserve(RequiredWorkSource.OWNED_TURN_SETUP_PRODUCER)"
-    assert ast.unparse(reservation.orelse) == "None"
-    transfer = next(
-        node for node in ast.walk(outer) if isinstance(node, ast.Call) and ast.unparse(node.func) == "self._run_started_under_lease"
-    )
-    assert [ast.unparse(arg) for arg in transfer.args] == ["services", "running", "lease", "settlement", "setup_ticket"]
-    scope = next(node for node in ast.walk(outer) if isinstance(node, ast.AsyncWith) and transfer in ast.walk(node))
-    assert any(ast.unparse(item.context_expr) == "lease" for item in scope.items)
-
-
-def test_worker_runs_detached_turn_inside_adopted_renewable_lease() -> None:
-    _assert_worker_adopted_lease_transfer(inspect.getsource(ComposerAsyncWorker._run_started_under_lease))
-    source = inspect.getsource(ComposerAsyncWorker._job)
-    assert "start_composer_async_operation" in source
-    assert "SessionOperationLease.adopt" in source
-    assert "await self._run_started(services, running, lease)" in source
-
-
-@pytest.mark.parametrize(
-    "before,after",
-    [
-        ("lease=lease", "lease=other_lease"),
-        ("running=running", "running=other_running"),
-        ("await run_composer_turn(", "await other_turn("),
-    ],
-)
-def test_worker_transfer_rejects_changed_turn_or_exact_authority(before: str, after: str) -> None:
-    source = inspect.getsource(ComposerAsyncWorker._run_started_under_lease)
-    assert before in source
-    _assert_worker_adopted_lease_transfer(source)
-    with pytest.raises((AssertionError, StopIteration)):
-        _assert_worker_adopted_lease_transfer(source.replace(before, after))
-
-
-@pytest.mark.parametrize(
-    "before,after",
-    [
-        ("settlement, setup_ticket)", "settlement, None)"),
-        ("coordinator.reserve(RequiredWorkSource.OWNED_TURN_SETUP_PRODUCER)", "None"),
-    ],
-)
-def test_worker_transfer_rejects_replaced_required_setup_ticket(before: str, after: str) -> None:
-    source = inspect.getsource(ComposerAsyncWorker._run_started_under_lease)
-    outer = inspect.getsource(ComposerAsyncWorker._run_started)
-    assert before in outer
-    _assert_worker_adopted_lease_transfer(source, outer_source=outer)
-    with pytest.raises(AssertionError):
-        _assert_worker_adopted_lease_transfer(source, outer_source=outer.replace(before, after))
 
 
 @pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
@@ -439,13 +244,203 @@ def test_pending_interpretation_validator_rejects_any_non_exact_input_carrier() 
     assert not hasattr(__import__("elspeth.web.sessions.pending_interpretation", fromlist=["x"]), "_forbidden_validation_dependency")
 
 
+def _batch_session_authority_sources() -> dict[str, str]:
+    return {
+        "batch": inspect.getsource(tool_batch.run_tool_batch),
+        "execution": inspect.getsource(tool_batch._execute_continuation_call_live),
+        "dispatch": inspect.getsource(SessionToolOwner._dispatch_session_aware_tool),
+        "kwargs": inspect.getsource(SessionToolOwner._build_session_aware_kwargs),
+    }
+
+
+def _assert_batch_session_authority(sources: Mapping[str, str]) -> None:
+    """Follow the actual driver, one-call suffix and session-owned writers."""
+    owners = {name: ast.parse(textwrap.dedent(source)).body[0] for name, source in sources.items()}
+    batch, execution, dispatch, kwargs = (owners[name] for name in ("batch", "execution", "dispatch", "kwargs"))
+    assert isinstance(batch, ast.AsyncFunctionDef) and batch.name == "run_tool_batch"
+    assert isinstance(execution, ast.AsyncFunctionDef) and execution.name == "_execute_continuation_call_live"
+    assert isinstance(dispatch, ast.AsyncFunctionDef) and dispatch.name == "_dispatch_session_aware_tool"
+    assert isinstance(kwargs, ast.FunctionDef) and kwargs.name == "_build_session_aware_kwargs"
+    # Bind the complete small driver, including reachable preparation, execution
+    # and projection of the same ctx/acc/batch/call. A decoy call is insufficient.
+    expected_batch = ast.parse(
+        '''async def run_tool_batch(
+    *,
+    call_model: _CallModelOutcome,
+    ctx: ToolBatchContext,
+    acc: BatchAccumulator,
+    llm_messages: list[dict[str, Any]],
+) -> tuple[_DispatchOutcome, int]:
+    """Drive the real legacy batch without continuation storage or restored owners."""
+    batch = ContinuationBatchState(
+        acc.state, acc.last_validation, acc.last_runtime_preflight, acc.advisor_calls_used, entry_state=acc.state
+    )
+    await _initialize_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch)
+    calls = call_model.completion.tool_batch.calls
+    while batch.next_tool_index < len(calls) and not batch.stop_issued_batch:
+        call = ContinuationCallState(batch.next_tool_index, calls[batch.next_tool_index], batch.state, batch.state.version)
+        batch.current_call = call
+        batch.phase = "call_active"
+        prepared = await _prepare_continuation_call_live(call_model=call_model, ctx=ctx, llm_messages=llm_messages, batch=batch, call=call)
+        if prepared == "stop":
+            break
+        if prepared == "prepared":
+            await _execute_continuation_call_live(
+                call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch, call=call
+            )
+        batch.next_tool_index += 1
+        batch.current_call = None
+        batch.phase = "call_ready"
+    batch.phase = "dispatch_ready"
+    return _finish_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, batch=batch)
+'''
+    ).body[0]
+    assert _stable_ast_bytes(batch) == _stable_ast_bytes(expected_batch)
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "ctx" and isinstance(node.ctx, (ast.Store, ast.Del)) for node in ast.walk(execution)
+    )
+    # The real call is directly in the prepared suffix's actual single-call
+    # loop, not an arbitrary ast.walk match in an unreachable nested branch.
+    execution_tries = [statement for statement in execution.body if isinstance(statement, ast.Try)]
+    assert len(execution_tries) == 1 and len(execution_tries[0].body) == 1
+    loop = execution_tries[0].body[0]
+    assert isinstance(loop, ast.For) and ast.unparse(loop.iter) == "(call.tool_call,)"
+    branches = [
+        statement
+        for statement in loop.body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "is_session_aware_tool(tool_name)"
+    ]
+    assert len(branches) == 1 and not branches[0].orelse
+    transfers = [
+        node
+        for node in ast.walk(execution)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "ctx.session_tools._dispatch_session_aware_tool"
+    ]
+    assert len(transfers) == 1
+    tries = [statement for statement in branches[0].body if isinstance(statement, ast.Try) and transfers[0] in ast.walk(statement)]
+    assert len(tries) == 1 and len(tries[0].body) == 1
+    expected_transfer = ast.parse(
+        """session_aware_outcome = await _await_started_tool_stage(
+    ctx.session_tools._dispatch_session_aware_tool(
+        tool_name=tool_name, tool_call_id=tool_call.id, arguments=arguments,
+        state=state, audit=audit, recorder=recorder, session_id=session_id,
+        session_operation_context=ctx.session_operation_context, current_state_id=current_state_id,
+        composer_model_version=provider_model_version, llm_messages=llm_messages,
+        anti_anchor=anti_anchor, policy_catalog=ctx.policy_catalog, review_preflight=review_preflight,
+        failure_observation=observation, publication=publication,
+    ),
+    audit=audit, recorder=recorder, failure_observation=observation,
+)"""
+    ).body[0]
+    assert _stable_ast_bytes(tries[0].body[0]) == _stable_ast_bytes(expected_transfer)
+
+    forwards = [
+        statement
+        for statement in dispatch.body
+        if isinstance(statement, ast.Assign) and [ast.unparse(target) for target in statement.targets] == ["kwargs"]
+    ]
+    assert len(forwards) == 1
+    expected_kwargs = ast.parse(
+        """kwargs = self._build_session_aware_kwargs(
+    tool_name=tool_name, arguments=arguments, state=state, session_id=session_id,
+    current_state_id=current_state_id, tool_call_id=tool_call_id,
+    composer_model_version=composer_model_version, session_operation_context=session_operation_context,
+)"""
+    ).body[0]
+    assert _stable_ast_bytes(forwards[0]) == _stable_ast_bytes(expected_kwargs)
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "session_operation_context" and isinstance(node.ctx, (ast.Store, ast.Del))
+        for owner in (dispatch, kwargs)
+        for node in ast.walk(owner)
+    )
+    handler_calls = [node for node in ast.walk(dispatch) if isinstance(node, ast.Call) and ast.unparse(node.func) == "handler"]
+    assert len(handler_calls) == 1 and not handler_calls[0].args
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in handler_calls[0].keywords] == [(None, "kwargs")]
+    review_branches = [
+        statement
+        for statement in kwargs.body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "tool_name == 'request_interpretation_review'"
+    ]
+    assert len(review_branches) == 1
+    pending = [
+        statement
+        for statement in review_branches[0].body
+        if isinstance(statement, ast.Assign) and [ast.unparse(target) for target in statement.targets] == ["create_pending"]
+    ]
+    expected_pending = ast.parse(
+        """create_pending = functools.partial(
+    sessions_service.create_pending_interpretation_event,
+    session_operation_context=session_operation_context,
+)"""
+    ).body[0]
+    assert len(pending) == 1 and _stable_ast_bytes(pending[0]) == _stable_ast_bytes(expected_pending)
+    pending_guards = [
+        statement
+        for statement in review_branches[0].body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "type(session_operation_context) is not SessionOperationContext"
+    ]
+    expected_pending_guard = ast.parse(
+        """if type(session_operation_context) is not SessionOperationContext:
+    raise AuditIntegrityError("request_interpretation_review requires the compose loop's exact session operation authority")
+"""
+    ).body[0]
+    assert len(pending_guards) == 1 and _stable_ast_bytes(pending_guards[0]) == _stable_ast_bytes(expected_pending_guard)
+    assert review_branches[0].body.index(pending_guards[0]) < review_branches[0].body.index(pending[0])
+    returned = review_branches[0].body[-1]
+    assert isinstance(returned, ast.Return) and isinstance(returned.value, ast.Dict)
+    assert [
+        ast.unparse(value)
+        for key, value in zip(returned.value.keys, returned.value.values, strict=True)
+        if isinstance(key, ast.Constant) and key.value == "create_pending_interpretation_event"
+    ] == ["create_pending"]
+
+    handlers = [
+        handler
+        for statement in dispatch.body
+        if isinstance(statement, ast.Try)
+        for handler in statement.handlers
+        if handler.type is not None and ast.unparse(handler.type) == "ToolArgumentError"
+    ]
+    assert len(handlers) == 1
+    caps = [
+        statement
+        for statement in handlers[0].body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "cap_type is not None"
+    ]
+    assert len(caps) == 1
+    writes = [
+        statement
+        for statement in caps[0].body
+        if isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Await)
+        and isinstance(statement.value.value, ast.Call)
+        and ast.unparse(statement.value.value.func) == "sessions_service.record_auto_interpreted_no_surfaces_event"
+    ]
+    assert len(writes) == 1
+    rate_guards = [
+        statement
+        for statement in caps[0].body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "type(session_operation_context) is not SessionOperationContext"
+    ]
+    expected_rate_guard = ast.parse(
+        """if type(session_operation_context) is not SessionOperationContext:
+    raise AuditIntegrityError("Rate-cap interpretation persistence requires exact COMPOSE authority") from None
+"""
+    ).body[0]
+    assert len(rate_guards) == 1 and _stable_ast_bytes(rate_guards[0]) == _stable_ast_bytes(expected_rate_guard)
+    assert caps[0].body.index(rate_guards[0]) < caps[0].body.index(writes[0])
+    assert [
+        (keyword.arg, ast.unparse(keyword.value))
+        for keyword in writes[0].value.value.keywords
+        if keyword.arg == "session_operation_context"
+    ] == [("session_operation_context", "session_operation_context")]
+
+
 def test_pending_interpretation_callers_forward_existing_authority() -> None:
     from elspeth.web.composer import service as composer_service
-    from elspeth.web.composer import tool_batch
     from elspeth.web.sessions.routes.composer import state as composer_state
 
-    batch_source = inspect.getsource(tool_batch.run_tool_batch)
-    assert "session_operation_context=ctx.session_operation_context" in batch_source
+    _assert_batch_session_authority(_batch_session_authority_sources())
     composer_source = inspect.getsource(composer_service.ComposerServiceImpl)
     assert "session_operation_context=session_operation_context" in composer_source
     state_source = inspect.getsource(composer_state)
@@ -475,246 +470,50 @@ def test_opt_out_route_owns_process_lock_and_compose_lease() -> None:
 
 
 def test_rate_cap_no_surfaces_write_reuses_compose_context() -> None:
-    batch_source = textwrap.dedent(inspect.getsource(tool_batch.run_tool_batch))
-    assert "session_operation_context=ctx.session_operation_context" in batch_source
-    dispatch_source = textwrap.dedent(inspect.getsource(SessionToolOwner._dispatch_session_aware_tool))
-    assert "session_operation_context=session_operation_context" in dispatch_source
-
-
-def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None:
-    import hashlib
-
-    public_tree = ast.parse(textwrap.dedent(public_source))
-    public = next(node for node in public_tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_composer_turn")
-    transfers = [node for node in ast.walk(public) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_run_composer_turn"]
-    assert len(transfers) == 1
-    transfer = transfers[0]
-    assert [(item.arg, ast.unparse(item.value)) for item in transfer.keywords if item.arg == "lease"] == [("lease", "lease")]
-    assert isinstance(public.body[-1], ast.Return)
-    assert isinstance(public.body[-1].value, ast.Await) and public.body[-1].value.value is transfer
-
-    helper_tree = ast.parse(textwrap.dedent(helper_source))
-    helper = next(node for node in helper_tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
-    assert isinstance(helper.body[-1], ast.Try)
-    main_try = helper.body[-1]
-    title_guards = [
-        node
-        for node in main_try.body
-        if isinstance(node, ast.Assign) and [ast.unparse(target) for target in node.targets] == ["should_auto_title"]
-    ]
-    assert len(title_guards) == 1
-    expected_title_guard = ast.parse(
-        "not recovery_context.malformed_head and isinstance(request, SendMessageRequest) "
-        "and len(records) == 1 and is_default_session_title(session.title)",
-        mode="eval",
-    ).body
-    assert _stable_ast_bytes(title_guards[0].value) == _stable_ast_bytes(expected_title_guard)
-    invocation_tries = [
-        node
-        for node in main_try.body
-        if isinstance(node, ast.Try)
-        and any(isinstance(child, ast.If) and ast.unparse(child.test) == "should_auto_title" for child in node.body)
-    ]
-    assert len(invocation_tries) == 1
-    invocation_try = invocation_tries[0]
-    assert main_try.body.index(title_guards[0]) < main_try.body.index(invocation_try)
-    title_branches = [node for node in invocation_try.body if isinstance(node, ast.If) and ast.unparse(node.test) == "should_auto_title"]
-    primary_branches = [
-        node for node in invocation_try.body if isinstance(node, ast.If) and ast.unparse(node.test) == "recovery_context.malformed_head"
-    ]
-    assert len(title_branches) == len(primary_branches) == 1
-    title_branch = title_branches[0]
-    primary_branch = primary_branches[0]
-    assert invocation_try.body.index(title_branch) < invocation_try.body.index(primary_branch)
-    assert len(title_branch.body) == 7
-    title_children = [node for node in title_branch.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_owned_title"]
-    assert len(title_children) == 1
-    title_child = title_children[0]
-    assert len(title_child.body) == 2 and isinstance(title_child.body[0], ast.Try)
-    child_try = title_child.body[0]
-    assert len(child_try.body) == 1 and isinstance(child_try.body[0], ast.Expr)
-    direct_title = child_try.body[0].value
-    assert isinstance(direct_title, ast.Await) and isinstance(direct_title.value, ast.Call)
-    title_call = direct_title.value
-    assert ast.unparse(title_call.func) == "maybe_auto_title_session"
-    assert [(item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg == "session_operation_context"] == [
-        ("session_operation_context", "lease.context")
-    ]
-    assert [
-        (item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg in {"prompt_guard_mount", "prompt_guard_mode"}
-    ] == [
-        ("prompt_guard_mount", "services.composer_service.composer_prompt_guard_mount"),
-        ("prompt_guard_mode", "settings.composer_prompt_guard_mode"),
-    ]
-    assert [(item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg == "provider_custody"] == [
-        ("provider_custody", "title_custody")
-    ]
-    owned_tries = [node for node in title_branch.body if isinstance(node, ast.Try)]
-    assert len(owned_tries) == 1
-    owned_try = owned_tries[0]
-    assert len(owned_try.body) == 1 and isinstance(owned_try.body[0], ast.Assign)
-    assert [ast.unparse(target) for target in owned_try.body[0].targets] == ["auto_title_task"]
-    assert ast.unparse(owned_try.body[0].value) == "lease.create_task(run_owned_title())"
-    title_joins = [
-        node
-        for node in title_branch.body
-        if isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Await)
-        and isinstance(node.value.value, ast.Call)
-        and ast.unparse(node.value.value.func) == "_join_auto_title"
-    ]
-    assert len(title_joins) == 1
-    title_join = title_joins[0]
-    assert title_branch.body.index(owned_try) < title_branch.body.index(title_join)
-    assert [ast.unparse(arg) for arg in title_join.value.value.args] == ["auto_title_task"]
-    assert [(item.arg, ast.unparse(item.value)) for item in title_join.value.value.keywords] == [
-        ("session_id", "turn.session_id"),
-        ("operation_id", "turn.operation_id"),
-        ("cancellation_observations", "auto_title_cancellations"),
-        ("wait_until_complete", "True"),
-    ]
-
-    # Direct edges alone admit earlier returns and nested unreachable guards.
-    # Bind the reviewed wrapper, helper preamble, outer prefix before provider
-    # invocation, and invocation prefix through the joined title suspension.
-    # Semantic locators close earlier-return gaps without pinning list offsets.
-    assert hashlib.sha256(_stable_ast_bytes(public)).hexdigest() == "fe4e8e57be8fd03171e86ac2516422ce4f5d2dc7e75e282ada139fb06980ce0c"
-    assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=helper.body[:-1], type_ignores=[]))).hexdigest() == (
-        "6a2ffff4fd20ec97d98e2d0bb0dc81c457af97405daf4734eea8e37ffc3cadc1"
-    )
-    assert (
-        hashlib.sha256(
-            _stable_ast_bytes(ast.Module(body=main_try.body[: main_try.body.index(invocation_try)], type_ignores=[]))
-        ).hexdigest()
-        == "e00d6b374471ab72519e2d17e8af9b0f7df4384e2d4d6473c35d6e3cd53ffe1b"
-    )
-    assert (
-        hashlib.sha256(
-            _stable_ast_bytes(ast.Module(body=invocation_try.body[: invocation_try.body.index(primary_branch)], type_ignores=[]))
-        ).hexdigest()
-        == "bfe52a9bd67375dc641dd59d0fb413b7c8c7db0602d953fe3c3d754ef1e8ab70"
-    )
-
-
-def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
-    _assert_auto_title_ownership(inspect.getsource(run_composer_turn), inspect.getsource(_run_composer_turn))
-    title_source = textwrap.dedent(inspect.getsource(_auto_title.maybe_auto_title_session))
-    assert "session_operation_context=session_operation_context" in title_source
+    _assert_batch_session_authority(_batch_session_authority_sources())
 
 
 @pytest.mark.parametrize(
     "owner,before,after",
     [
-        ("public", "lease=lease", "lease=other_lease"),
-        ("helper", "session_operation_context=lease.context", "session_operation_context=other_context"),
-        ("helper", "auto_title_task = lease.create_task(run_owned_title())", "auto_title_task = asyncio.create_task(run_owned_title())"),
-        ("helper", "not recovery_context.malformed_head", "True"),
+        ("batch", 'if prepared == "prepared":', "if False:"),
         (
-            "helper",
-            "prompt_guard_mount=services.composer_service.composer_prompt_guard_mount",
-            "prompt_guard_mount=services.composer_service.composer_advisor_prompt_guard_mount",
+            "batch",
+            "call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch, call=call",
+            "call_model=call_model, ctx=other_ctx, acc=acc, llm_messages=llm_messages, batch=batch, call=call",
         ),
-        ("helper", "prompt_guard_mode=settings.composer_prompt_guard_mode", "prompt_guard_mode='debug-when-unconfigured'"),
+        ("execution", "if is_session_aware_tool(tool_name):", "if False:"),
+        (
+            "execution",
+            "session_id=session_id,\n                            session_operation_context=ctx.session_operation_context,\n"
+            "                            current_state_id=current_state_id,",
+            "session_id=session_id,\n                            session_operation_context=other_context,\n"
+            "                            current_state_id=current_state_id,",
+        ),
+        (
+            "dispatch",
+            "composer_model_version=composer_model_version,\n            session_operation_context=session_operation_context,",
+            "composer_model_version=composer_model_version,\n            session_operation_context=other_context,",
+        ),
+        (
+            "dispatch",
+            "session_id=UUID(session_id),\n                    session_operation_context=session_operation_context,",
+            "session_id=UUID(session_id),\n                    session_operation_context=other_context,",
+        ),
+        ("dispatch", "await handler(**kwargs)", "await handler(**other_kwargs)"),
+        ("dispatch", "if type(session_operation_context) is not SessionOperationContext:", "if False:"),
+        ("kwargs", "session_operation_context=session_operation_context,", "session_operation_context=other_context,"),
+        ("kwargs", "if type(session_operation_context) is not SessionOperationContext:", "if False:"),
+        ("kwargs", '"create_pending_interpretation_event": create_pending', '"create_pending_interpretation_event": foreign_writer'),
     ],
 )
-def test_auto_title_ownership_rejects_foreign_lease_or_unowned_child(owner: str, before: str, after: str) -> None:
-    sources = {"public": inspect.getsource(run_composer_turn), "helper": inspect.getsource(_run_composer_turn)}
-    assert before in sources[owner]
-    _assert_auto_title_ownership(sources["public"], sources["helper"])
+def test_batch_session_authority_rejects_foreign_context_or_unreached_transfer(owner: str, before: str, after: str) -> None:
+    sources = _batch_session_authority_sources()
+    _assert_batch_session_authority(sources)
+    assert sources[owner].count(before) == 1
     sources[owner] = sources[owner].replace(before, after)
     with pytest.raises(AssertionError):
-        _assert_auto_title_ownership(sources["public"], sources["helper"])
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "detached_inner",
-        "unawaited_inner",
-        "unreachable_owned",
-        "early_return",
-        "arbitrary_guard",
-        "detached_join",
-        "unawaited_join",
-        "foreign_join",
-        "bounded_join",
-        "title_after_primary",
-    ],
-)
-def test_auto_title_ownership_rejects_unreached_or_unjoined_work(mutation: str) -> None:
-    public_source = inspect.getsource(run_composer_turn)
-    helper_source = inspect.getsource(_run_composer_turn)
-    _assert_auto_title_ownership(public_source, helper_source)
-    tree = ast.parse(textwrap.dedent(helper_source))
-    helper = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
-    assert isinstance(helper.body[-1], ast.Try)
-    main_try = helper.body[-1]
-    invocation_try = next(
-        node
-        for node in main_try.body
-        if isinstance(node, ast.Try)
-        and any(isinstance(statement, ast.If) and ast.unparse(statement.test) == "should_auto_title" for statement in node.body)
-    )
-    branch = next(node for node in invocation_try.body if isinstance(node, ast.If) and ast.unparse(node.test) == "should_auto_title")
-    child = next(node for node in branch.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_owned_title")
-    assert isinstance(child.body[0], ast.Try)
-    title_expr = child.body[0].body[0]
-    assert isinstance(title_expr, ast.Expr) and isinstance(title_expr.value, ast.Await)
-    if mutation in {"detached_inner", "unawaited_inner"}:
-        title_call = title_expr.value.value
-        title_expr.value = (
-            ast.Call(
-                func=ast.Attribute(value=ast.Name(id="asyncio", ctx=ast.Load()), attr="create_task", ctx=ast.Load()),
-                args=[title_call],
-                keywords=[],
-            )
-            if mutation == "detached_inner"
-            else title_call
-        )
-    elif mutation in {"unreachable_owned", "arbitrary_guard"}:
-        owned_try = next(node for node in branch.body if isinstance(node, ast.Try))
-        original = owned_try.body[0]
-        owned_try.body[0] = ast.If(
-            test=ast.Constant(False) if mutation == "unreachable_owned" else ast.Name(id="unreviewed_gate", ctx=ast.Load()),
-            body=[original],
-            orelse=[],
-        )
-    elif mutation == "early_return":
-        invocation_try.body.insert(invocation_try.body.index(branch), ast.Return(value=ast.Constant(None)))
-    elif mutation == "title_after_primary":
-        primary = next(
-            node for node in invocation_try.body if isinstance(node, ast.If) and ast.unparse(node.test) == "recovery_context.malformed_head"
-        )
-        invocation_try.body.remove(branch)
-        invocation_try.body.insert(invocation_try.body.index(primary) + 1, branch)
-    else:
-        join = next(
-            node
-            for node in branch.body
-            if isinstance(node, ast.Expr)
-            and isinstance(node.value, ast.Await)
-            and isinstance(node.value.value, ast.Call)
-            and ast.unparse(node.value.value.func) == "_join_auto_title"
-        )
-        call = join.value.value
-        if mutation == "detached_join":
-            join.value = ast.Call(
-                func=ast.Attribute(value=ast.Name(id="asyncio", ctx=ast.Load()), attr="create_task", ctx=ast.Load()),
-                args=[call],
-                keywords=[],
-            )
-        elif mutation == "unawaited_join":
-            join.value = call
-        elif mutation == "foreign_join":
-            call.args[0] = ast.Name(id="foreign_title_task", ctx=ast.Load())
-        elif mutation == "bounded_join":
-            keyword = next(item for item in call.keywords if item.arg == "wait_until_complete")
-            keyword.value = ast.Constant(False)
-        else:
-            raise AssertionError("Unknown auto-title ownership mutation")
-    ast.fix_missing_locations(tree)
-    with pytest.raises(AssertionError):
-        _assert_auto_title_ownership(public_source, ast.unparse(tree))
+        _assert_batch_session_authority(sources)
 
 
 def _resolved_signature(member: Any) -> tuple[tuple[tuple[str, inspect._ParameterKind, Any], ...], Any]:

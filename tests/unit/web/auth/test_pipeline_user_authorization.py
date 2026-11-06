@@ -41,7 +41,13 @@ _PIPELINE_USER_ROUTES: dict[str, frozenset[str]] = {
     ),
     "src/elspeth/web/sessions/routes/composer/compose.py": frozenset({"recompose"}),
     "src/elspeth/web/sessions/routes/composer/operations.py": frozenset(
-        {"get_composer_operation", "cancel_composer_operation", "stream_operation", "list_composer_operation_failures"}
+        {
+            "get_composer_operation",
+            "get_active_composer_operation",
+            "cancel_composer_operation",
+            "stream_operation",
+            "list_composer_operation_failures",
+        }
     ),
     "src/elspeth/web/sessions/routes/composer/state.py": frozenset(
         {
@@ -334,6 +340,7 @@ async def test_pipeline_user_expiry_is_checked_after_role_retrieval(engine, tmp_
     ("module_name", "function_name"),
     [
         ("operations", "get_composer_operation"),
+        ("operations", "get_active_composer_operation"),
         ("operations", "cancel_composer_operation"),
         ("operations", "stream_operation"),
         ("state", "get_composition_head"),

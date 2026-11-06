@@ -1,0 +1,25 @@
+"""The same reserved-ID ingress/current-claim/race owners on serial PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_ingress import (
+    test_actual_release_new_claim_ingress_uses_same_reserved_source_without_second_row as test_actual_release_new_claim_ingress_uses_same_reserved_source_without_second_row,
+)
+from tests.unit.web.sessions.test_continuation_ingress import (
+    test_actual_two_locked_ingress_writers_only_one_reserved_cas_succeeds as test_actual_two_locked_ingress_writers_only_one_reserved_cas_succeeds,
+)
+from tests.unit.web.sessions.test_continuation_ingress import (
+    test_ingress_root_write_failure_rolls_back_real_row_sequence_parent_receipt_and_preserves_error as test_ingress_root_write_failure_rolls_back_real_row_sequence_parent_receipt_and_preserves_error,
+)
+from tests.unit.web.sessions.test_continuation_ingress import (
+    test_inserted_replay_reproves_original_event_and_complete_sql_transcript_after_positive as test_inserted_replay_reproves_original_event_and_complete_sql_transcript_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_ingress import (
+    test_real_ingress_refuses_mismatched_current_request_source_actor_fence_or_preexisting_id as test_real_ingress_refuses_mismatched_current_request_source_actor_fence_or_preexisting_id,
+)
+from tests.unit.web.sessions.test_continuation_ingress import (
+    test_real_reserved_ingress_commits_one_user_receipt_and_complete_root_then_replays as test_real_reserved_ingress_commits_one_user_receipt_and_complete_root_then_replays,
+)
+
+pytestmark = pytest.mark.testcontainer

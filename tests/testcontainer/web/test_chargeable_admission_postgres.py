@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import Connection, Engine, event, insert, select, update
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind, StartPermitState
@@ -79,11 +80,14 @@ def _admit(engine: Engine) -> tuple[PostgresSessionOperationRepository, SessionO
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id),
-                session_id=str(session.id),
-                version=1,
-                provenance="session_seed",
-                created_at=datetime.now(UTC),
+                **stamped_state_values(
+                    metadata_=stored_default_pipeline_metadata(),
+                    id=str(state_id),
+                    session_id=str(session.id),
+                    version=1,
+                    provenance="session_seed",
+                    created_at=datetime.now(UTC),
+                )
             )
         )
     envelope = RunExecutionInput(

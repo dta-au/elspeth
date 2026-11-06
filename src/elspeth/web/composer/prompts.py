@@ -15,6 +15,8 @@ from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any, Final
 
+from elspeth.contracts.composer_content import ComposerContentScope
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
     PROMPT_GUARD_TRUST_KEY,
@@ -25,16 +27,20 @@ from elspeth.contracts.prompt_guard import (
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.capability_skill import render_with_pipeline_capabilities
+from elspeth.web.composer.content_views import BoundedCompositionView, CompositionViewUnsupported, build_bounded_composition_view
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, build_schema_contract_evidence
 from elspeth.web.composer.prompt_guard_rendering import json_content_parts
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
     COMPOSER_HISTORY_USER_MESSAGE_ID_KEY,
+    ComposerContextUnsupported,
     ComposerHistoryMessage,
 )
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.skills import load_deployment_skill, load_skill_with_hash
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
@@ -322,10 +328,9 @@ def _project_component_options(options: Any) -> Any:
 def project_server_owned_option_metadata(serialized: dict[str, Any]) -> dict[str, Any]:
     """Project server-owned option metadata out of a serialized state dict.
 
-    Applied between ``CompositionState.to_dict()`` and any planner-facing
-    surface (the per-turn state context message here; ``plan_pipeline``'s
-    ``provider_current_state`` in ``planning_application.py``) so a read-modify-write over
-    what the planner sees is round-trippable into ``set_pipeline``. Drops
+    Applied between ``CompositionState.to_dict()`` and the model-facing
+    per-turn state context message here, so a read-modify-write over what the
+    model sees is round-trippable into ``set_pipeline``. Drops
     ``source_authoring`` and ``approved_prompt_artifact_hash`` from every
     source/node/output options block. Public ``prompt_template_parts`` remain
     exact. Requirement rows retain identity and status without resolver linkage;
@@ -362,11 +367,47 @@ def project_server_owned_option_metadata(serialized: dict[str, Any]) -> dict[str
     return projected
 
 
+def project_composition_content(
+    state: CompositionState,
+    *,
+    env_ref_names: frozenset[str] = frozenset(),
+) -> object:
+    """Screen the complete graph before projecting diagnostic provider data."""
+    if type(state) is not CompositionState:
+        raise AuditIntegrityError("Composition content projection requires the owned current state")
+    require_no_credential_material_in_state(state, surface="composer_bounded_content_projection", env_ref_names=env_ref_names)
+    return redact_source_storage_path(project_server_owned_option_metadata(state.to_dict()))
+
+
+def build_composition_content_view(
+    state: CompositionState,
+    *,
+    content_scope: ComposerContentScope,
+    env_ref_names: frozenset[str] = frozenset(),
+) -> BoundedCompositionView:
+    """Project one current graph consistently across Composer and Advisor.
+
+    The caller supplies the authenticated session identity. A graph hash is
+    checked here for identity only; it cannot authorize access or dispatch.
+    Credential checks run before any complete scalar is hidden by a reference.
+    """
+    if type(state) is not CompositionState or type(content_scope) is not ComposerContentScope:
+        raise AuditIntegrityError("Composition content projection requires owned state and actual session scope")
+    if content_scope.composition_content_hash != composition_content_hash(state):
+        raise AuditIntegrityError("Composition content projection differs from its current graph scope")
+    try:
+        return build_bounded_composition_view(content_scope, project_composition_content(state, env_ref_names=env_ref_names))
+    except CompositionViewUnsupported as exc:
+        raise ComposerContextUnsupported("graph_resource_limit") from exc
+
+
 def build_context_string(
     state: CompositionState,
     catalog: PolicyCatalogView,
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
+    content_scope: ComposerContentScope,
+    env_ref_names: frozenset[str] = frozenset(),
     schemas_loaded: frozenset[tuple[str, str]] = _SCHEMAS_LOADED_UNSET,
 ) -> str:
     """Build the session-varying context message: state, progress, evidence.
@@ -411,15 +452,10 @@ def build_context_string(
         user message under ``STATE_CONTEXT_PREFIX``'s untrusted framing
         (the payload embeds user-authored strings).
     """
-    serialized = state.to_dict()
-    # Round-trippability (elspeth-c67fbbbd83): drop/reduce server-owned option
-    # metadata BEFORE the storage-path redaction so what the planner reads can
-    # be written back through set_pipeline without tripping the reserved-key
-    # gates.
-    serialized = project_server_owned_option_metadata(serialized)
-    serialized = redact_source_storage_path(serialized)  # B4: hide blob storage paths
+    view = build_composition_content_view(state, content_scope=content_scope, env_ref_names=env_ref_names)
+    serialized = json.loads(view.serialized)
     validation = catalog.validate_composition_state(state).validation
-    serialized["validation"] = {
+    validation_summary = {
         "is_valid": validation.is_valid,
         "errors": [e.to_dict() for e in validation.errors],
         "warnings": [e.to_dict() for e in validation.warnings],
@@ -487,6 +523,7 @@ def build_context_string(
 
     context = {
         "current_state": serialized,
+        "validation": validation_summary,
         "composer_progress": {
             "state_exists": state_exists,
             "schemas_loaded_this_session": schemas_loaded_view,
@@ -509,6 +546,8 @@ def build_messages(
     data_dir: str | None = None,
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
+    content_scope: ComposerContentScope,
+    env_ref_names: frozenset[str] = frozenset(),
     rendered_skill: str | None = None,
     schemas_loaded: frozenset[tuple[str, str]] = _SCHEMAS_LOADED_UNSET,
 ) -> list[dict[str, Any]]:
@@ -602,6 +641,8 @@ def build_messages(
         state,
         catalog,
         plugin_snapshot=plugin_snapshot,
+        content_scope=content_scope,
+        env_ref_names=env_ref_names,
         schemas_loaded=schemas_loaded,
     )
     prefix = STATE_CONTEXT_PREFIX + "\n"

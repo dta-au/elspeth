@@ -35,7 +35,6 @@ from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions import service as session_service_module
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -43,6 +42,7 @@ from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.fixtures.mock_audit import mock_audit_authority
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.fenced_session import seed_token_policies
 from tests.unit.plugins.clients.test_audited_llm_client import FakeExecutionRepository, FakeOpenAIClient, provider_response
 
@@ -88,7 +88,7 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
     ) as compose_lease:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_lease.context,
         )
@@ -190,7 +190,7 @@ async def test_run_refusal_stops_dispatch_and_records_owner_quota(tmp_path, monk
     ) as compose_lease:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_lease.context,
         )
@@ -315,7 +315,7 @@ async def test_committed_run_admission_lost_receipt_is_integrity_failure_without
     ) as compose_lease:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_lease.context,
         )
@@ -391,7 +391,7 @@ async def test_run_settlement_lost_receipt_replays_exact_real_landscape_call(tmp
     ) as compose_lease:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_lease.context,
         )

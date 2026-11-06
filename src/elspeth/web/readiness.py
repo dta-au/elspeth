@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextlib
 import os
 import stat
 import tempfile
@@ -128,8 +127,11 @@ def _cancel_wrapped_on_loop(
 
     if loop.is_closed():
         return
-    with contextlib.suppress(RuntimeError):
+    try:
         loop.call_soon_threadsafe(cancel_and_drain)
+    except RuntimeError:
+        # The loop may close after is_closed(); grouped failures propagate.
+        return
 
 
 def _schema_checks(kind: Literal["session", "landscape"], state: SchemaState) -> _ProbeResult:

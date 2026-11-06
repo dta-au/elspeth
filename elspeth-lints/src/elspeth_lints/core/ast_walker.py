@@ -26,6 +26,7 @@ EXCLUDED_WALK_DIRS = frozenset(
         ".cache",
         ".git",
         ".hg",
+        ".hypothesis",
         ".mypy_cache",
         ".nox",
         ".pytest_cache",

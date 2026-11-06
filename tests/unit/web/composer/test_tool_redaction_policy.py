@@ -58,17 +58,14 @@ def test_blob_continuation_requires_identity_after_zero_and_forbids_extra_fields
 
 
 @pytest.mark.parametrize("dialect_name", ["none", "openai_strict"])
-def test_blob_actual_loop_and_planner_wire_selectors_preserve_runtime_null_contract(dialect_name: str) -> None:
+def test_blob_actual_loop_wire_selectors_preserve_runtime_null_contract(dialect_name: str) -> None:
     from jsonschema import Draft202012Validator
 
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
-    from elspeth.web.composer.pipeline_planner import planner_tool_definitions
     from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     dialect = ToolContractDialect(dialect_name)
     loop = next(tool["function"] for tool in composer_loop_tool_definitions(dialect) if tool["function"]["name"] == "get_blob_content")
-    planner = next(tool["function"] for tool in planner_tool_definitions(dialect=dialect) if tool["function"]["name"] == "get_blob_content")
-    assert loop == planner
     schema = loop["parameters"]
     initial = {"blob_id": "blob", "offset_chars": 0, "expected_content_hash": None}
     Draft202012Validator(schema).validate(initial)

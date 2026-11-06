@@ -314,7 +314,12 @@ of the read example. ELSPETH hashes the canonical selected `data` separately
 from the HTTP envelope. The delivery ID is the original engine member ID,
 distinct for different members even when their data is equal.
 
-ELSPETH checks status before the initial write and during recovery. A sticky
+ELSPETH sends the initial write without a status request when the durable
+member has no COMMIT history, including when its plan was restored before
+any publication attempt. Once a COMMIT intent exists, recovery uses
+recorded results or status evidence before permitting another write.
+UNKNOWN stops publication; remote completion alone does not authorize
+automatic reinspection of an already recorded UNKNOWN result. A sticky
 rejected status leads to an idempotent write of the same member; that write
 returns the same rejection, allowing precise diversion to
 `on_write_failure`. A generic 4xx/5xx, authentication error, missing receipt,
@@ -364,7 +369,7 @@ local limit and placement of Response above are deliberate connector rules.
 | Mode | Source | Sink |
 | --- | --- | --- |
 | LIVE | Audited bounded snapshot pagination | Authoritative status and per-member publication |
-| Ordinary resume | Restores durable source data; never rereads the flow | Reconciles original delivery IDs before completing members |
+| Ordinary resume | Restores durable source data; never rereads the flow | Reuses original delivery IDs; uncertain writes require recovery before retry |
 | REPLAY | Archived rows, contracts and validation decisions; no source credentials, SDK, DNS or HTTP | Virtual sink; no credentials or target calls |
 | VERIFY | One live source read after archived configuration/request admission; compare complete canonical JSON call evidence and ordered source decisions before downstream work | Virtual sink on match or mismatch; no credentials or target calls |
 | AUDIT_EXPORT | Not applicable | Refused before lifecycle |

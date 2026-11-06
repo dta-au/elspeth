@@ -10,17 +10,31 @@ WORKER = "elspeth.web.async_workers"
 APP = "elspeth.web.app"
 OWNER = "elspeth.web.application_finalizers.ApplicationFinalizerOwner"
 RECOVERY = "elspeth.web.process_recovery.ProcessRecovery"
+DRAIN = "elspeth.web.sessions.composer_drain.ComposerDrainSignal"
+# The producer classes create_app constructs. Every class-, namespace- and
+# instance-protection check below derives from this one set, so a newly
+# protected producer cannot be added to some checks and missed by others.
+CONSTRUCTED = frozenset({OWNER, RECOVERY, DRAIN})
 CELLS = {"_APPLICATION_FINALIZER_OWNER", "_INSTANCE_DRAINING"}
-PROTECTED_MODULES = {WORKER, APP, "elspeth.web.application_finalizers", "elspeth.web.process_recovery", "threading"}
+PROTECTED_MODULES = {
+    WORKER,
+    APP,
+    "elspeth.web.application_finalizers",
+    "elspeth.web.process_recovery",
+    "elspeth.web.sessions.composer_drain",
+    "threading",
+}
 PROTECTED_BINDINGS = {
     WORKER + ".configure_required_executor_recovery",
     OWNER,
     RECOVERY,
+    DRAIN,
     "threading.Event",
     "threading.Lock",
     APP + ".configure_required_executor_recovery",
     APP + ".ApplicationFinalizerOwner",
     APP + ".ProcessRecovery",
+    APP + ".ComposerDrainSignal",
     APP + ".threading",
     "elspeth.web.application_finalizers.threading",
     "elspeth.web.process_recovery.threading",
@@ -98,7 +112,8 @@ CALL = """configure_required_executor_recovery(
 APP_PREFIX = """
 configure_process_logging = settings is None
 resolved_settings = settings_from_env() if settings is None else settings
-instance_draining = threading.Event()
+signal_owner = ComposerDrainSignal() if drain_signal is None else drain_signal
+instance_draining = signal_owner.draining
 watchdog_factory = create_process_watchdog if process_watchdog_factory is None else process_watchdog_factory
 watchdog = watchdog_factory(instance_draining)
 if not isinstance(watchdog, ProcessWatchdogControl):
@@ -111,11 +126,12 @@ finalizer_owner = ApplicationFinalizerOwner()
 # Executable source contract, not a source-file fingerprint. Every retained
 # producer, callback registration, successful return and failure path matters.
 APP_CONTRACT = """
-def create_app(settings: WebSettings | None = None, *, process_watchdog_factory: ProcessWatchdogFactory | None = None) -> FastAPI:
+def create_app(settings: WebSettings | None = None, *, process_watchdog_factory: ProcessWatchdogFactory | None = None, drain_signal: ComposerDrainSignal | None = None) -> FastAPI:
     global _FAILED_BOOTSTRAP_RECOVERY
     configure_process_logging = settings is None
     resolved_settings = settings_from_env() if settings is None else settings
-    instance_draining = threading.Event()
+    signal_owner = ComposerDrainSignal() if drain_signal is None else drain_signal
+    instance_draining = signal_owner.draining
     watchdog_factory = create_process_watchdog if process_watchdog_factory is None else process_watchdog_factory
     watchdog = watchdog_factory(instance_draining)
     if not isinstance(watchdog, ProcessWatchdogControl):
@@ -148,14 +164,17 @@ def create_app(settings: WebSettings | None = None, *, process_watchdog_factory:
             application_finalizer_owner=finalizer_owner,
         )
         telemetry_owner = OperatorTelemetryCleanupOwner.create_for_application()
-        return _create_app(
+        app = _create_app(
             resolved_settings, register_session_engine_finalizer, register_auth_audit_finalizer,
             process_recovery=process_recovery, watchdog=watchdog,
             instance_draining=instance_draining, generation_unavailable=generation_unavailable,
             mark_construction_side_effects=mark_construction_side_effects,
             configure_process_logging=configure_process_logging,
             finalizer_owner=finalizer_owner, telemetry_owner=telemetry_owner,
+            drain_signal=signal_owner,
         )
+        app.state.composer_drain_signal = signal_owner
+        return app
     except BaseException as exc:
         failures: list[BaseException] = [exc]
         try:
@@ -260,7 +279,7 @@ def _executable_shape(node):
 
 def _caller_body_contract(caller):
     expected = ast.parse(APP_CONTRACT).body[0]
-    protected = {"instance_draining", "generation_unavailable", "finalizer_owner", "process_recovery", "watchdog"}
+    protected = {"signal_owner", "instance_draining", "generation_unavailable", "finalizer_owner", "process_recovery", "watchdog"}
     expected_nodes = [n for statement in _body(expected) for n in _scope_nodes(statement)]
     reserved = {n.id for n in ast.walk(expected) if isinstance(n, ast.Name)}
     reserved.update(name for n in expected_nodes for name in _binder_names(n))
@@ -378,9 +397,7 @@ def _namespace_effects(units, configured_function):
                 if original not in PROTECTED_BINDINGS:
                     continue
                 canonical = node is configured_function
-                canonical |= (
-                    scope is unit.tree and isinstance(node, ast.ClassDef) and original in {OWNER, RECOVERY} and node in unit.tree.body
-                )
+                canonical |= scope is unit.tree and isinstance(node, ast.ClassDef) and original in CONSTRUCTED and node in unit.tree.body
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     imports = {
                         a.asname or (a.name.partition(".")[0] if isinstance(node, ast.Import) else a.name): (
@@ -393,6 +410,7 @@ def _namespace_effects(units, configured_function):
                     expected = {
                         APP + ".ApplicationFinalizerOwner": OWNER,
                         APP + ".ProcessRecovery": RECOVERY,
+                        APP + ".ComposerDrainSignal": DRAIN,
                         APP + ".configure_required_executor_recovery": WORKER + ".configure_required_executor_recovery",
                         APP + ".threading": "threading",
                         "elspeth.web.application_finalizers.threading": "threading",
@@ -413,8 +431,8 @@ def _namespace_effects(units, configured_function):
                 return env.get(value.id, frozenset({module + "." + value.id}))
             if isinstance(value, ast.Attribute):
                 roots = qualify(value.value, env)
-                if value.attr == "__dict__" and roots & (PROTECTED_MODULES | {OWNER, RECOVERY}):
-                    return frozenset(root + ".__namespace__" for root in roots & (PROTECTED_MODULES | {OWNER, RECOVERY}))
+                if value.attr == "__dict__" and roots & (PROTECTED_MODULES | CONSTRUCTED):
+                    return frozenset(root + ".__namespace__" for root in roots & (PROTECTED_MODULES | CONSTRUCTED))
                 if value.attr == "__globals__" and WORKER + ".configure_required_executor_recovery" in roots:
                     return frozenset({WORKER + ".__namespace__"})
                 return frozenset(root + "." + value.attr for root in roots if root.count(".") < 8)
@@ -424,8 +442,8 @@ def _namespace_effects(units, configured_function):
                 return qualify(value.value, env)
             if isinstance(value, ast.Call):
                 operator = qualify(value.func, env)
-                if operator & {OWNER, RECOVERY, "threading.Event"}:
-                    return frozenset(root + ".__instance__" for root in operator & {OWNER, RECOVERY, "threading.Event"})
+                if operator & (CONSTRUCTED | {"threading.Event"}):
+                    return frozenset(root + ".__instance__" for root in operator & (CONSTRUCTED | {"threading.Event"}))
                 if isinstance(value.func, ast.Name) and value.func.id in {"globals", "locals"} and not value.args and module == WORKER:
                     return frozenset({WORKER + ".__namespace__"})
                 if operator == frozenset({"builtins.vars"}) and len(value.args) == 1:
@@ -602,7 +620,7 @@ def _namespace_effects(units, configured_function):
                 or any(qualified == WORKER + "." + cell or qualified.startswith(WORKER + "." + cell + ".") for cell in CELLS)
                 or any(
                     qualified.startswith(owner + ".")
-                    for owner in {OWNER, RECOVERY, "threading.Event", WORKER + ".configure_required_executor_recovery"}
+                    for owner in CONSTRUCTED | {"threading.Event", WORKER + ".configure_required_executor_recovery"}
                 )
             )
 
@@ -624,7 +642,7 @@ def _namespace_effects(units, configured_function):
                             root.removesuffix(".__namespace__") == WORKER
                             and (selector is None or selector in CELLS or protected(WORKER + "." + str(selector)))
                         )
-                        or (root.removesuffix(".__namespace__") in {OWNER, RECOVERY})
+                        or (root.removesuffix(".__namespace__") in CONSTRUCTED)
                         or (selector is None or protected(root.removesuffix(".__namespace__") + "." + str(selector)))
                     )
                     for root in roots
@@ -649,7 +667,7 @@ def _namespace_effects(units, configured_function):
                     field = node.args[1].value if isinstance(node.args[1], ast.Constant) else None
                     roots = qualify(node.args[0], env)
                     if any(
-                        (root in PROTECTED_MODULES and (field is None or protected(root + "." + str(field)))) or root in {OWNER, RECOVERY}
+                        (root in PROTECTED_MODULES and (field is None or protected(root + "." + str(field)))) or root in CONSTRUCTED
                         for root in roots
                     ):
                         failures.append("recovery producer reflected replacement " + unit.path)
@@ -718,7 +736,12 @@ def recovery_cell_contract(units):
     if len(tries) != 1 or _dump(tries[0].body[0]) != _dump(ast.parse("watchdog.assert_watching()").body[0]):
         return ["recovery retained callback/cell call and owner witness changed"], frozenset(), frozenset()
     call = tries[0].body[1].value
-    protected_locals = {"instance_draining", "generation_unavailable", "finalizer_owner", "process_recovery", "watchdog"}
+    protected_locals = {"signal_owner", "instance_draining", "generation_unavailable", "finalizer_owner", "process_recovery", "watchdog"}
+    producers = {
+        statement.targets[0].id: statement
+        for statement in body[1 : 1 + len(expected_prefix)]
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name)
+    }
     allowed_stores = {
         id(target)
         for statement in body[1 : 1 + len(expected_prefix)]
@@ -746,7 +769,7 @@ def recovery_cell_contract(units):
             allowed = {
                 "configure_required_executor_recovery": {"instance_draining", "generation_unavailable", "finalizer_owner"},
                 "ProcessRecovery": {"instance_draining"},
-                "_create_app": {"process_recovery", "instance_draining", "generation_unavailable", "finalizer_owner"},
+                "_create_app": {"signal_owner", "process_recovery", "instance_draining", "generation_unavailable", "finalizer_owner"},
             }
             if node.id in allowed.get(name, set()):
                 continue
@@ -755,7 +778,22 @@ def recovery_cell_contract(units):
             and isinstance(parent, ast.Call)
             and isinstance(parent.func, ast.Name)
             and parent.func.id == "watchdog_factory"
-            and parent is body[5].value
+            and parent is producers["watchdog"].value
+        ):
+            continue
+        if (
+            node.id == "signal_owner"
+            and isinstance(parent, ast.Attribute)
+            and parent.value is node
+            and parent.attr == "draining"
+            and producers["instance_draining"].value is parent
+        ):
+            continue
+        if (
+            node.id == "signal_owner"
+            and isinstance(parent, ast.Assign)
+            and parent.value is node
+            and _dump(parent) == _dump(ast.parse("app.state.composer_drain_signal = signal_owner").body[0])
         ):
             continue
         if (
@@ -779,10 +817,10 @@ def recovery_cell_contract(units):
         failures.append("recovery retained caller capability has unsupported transfer " + node.id)
     for node, expected in [
         (call.func, WORKER + ".configure_required_executor_recovery"),
-        (body[3].value.func, "threading.Event"),
-        (body[7].value.func, RECOVERY),
-        (body[8].value.func, "threading.Event"),
-        (body[9].value.func, OWNER),
+        (producers["signal_owner"].value.body.func, DRAIN),
+        (producers["process_recovery"].value.func, RECOVERY),
+        (producers["generation_unavailable"].value.func, "threading.Event"),
+        (producers["finalizer_owner"].value.func, OWNER),
     ]:
         if references.get(id(node)) != frozenset({expected}):
             failures.append("recovery caller constructor/call source origin changed " + expected)

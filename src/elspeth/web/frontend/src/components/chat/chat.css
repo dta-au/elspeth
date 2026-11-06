@@ -857,6 +857,15 @@
   outline-offset: 2px;
 }
 
+/* Stop sent, not yet settled: keeps focus (aria-disabled) and shows the
+   cancel-pending pulse dot. */
+.chat-input-cancel-btn--pending {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  cursor: default;
+}
+
 .chat-input-send-btn {
   padding: var(--space-sm) var(--space-lg);
   background-color: var(--color-surface-elevated);

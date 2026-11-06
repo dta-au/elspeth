@@ -14,8 +14,10 @@ Two branches, chosen by :data:`PROVISIONED_POSTGRES_URL_ENV`:
 
 * unset — a ``PostgresContainer`` exactly as the suites constructed it
   before this seam existed (same image, same driver, the caller's own
-  container arguments), yielding the container's connection URL. CI's
-  required testcontainer job and a developer's ``pytest tests/ -m
+  container arguments), unless a paired per-run resource assignment
+  replaces the caller's existing CPU or memory cap independently. Missing
+  and zero caps remain uncapped. CI's required testcontainer job and a
+  developer's ``pytest tests/ -m
   testcontainer -n 0`` run this branch.
 * set — the provisioned server. The value is an admin-capable SQLAlchemy
   PostgreSQL URL (the suites ``CREATE DATABASE`` / ``CREATE ROLE`` and
@@ -44,6 +46,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import pytest
+from docker.utils import parse_bytes
 from sqlalchemy import create_engine
 from sqlalchemy.engine import URL, make_url
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
@@ -51,10 +54,64 @@ from testcontainers.postgres import PostgresContainer  # type: ignore[import-unt
 PROVISIONED_POSTGRES_URL_ENV = "ELSPETH_TEST_POSTGRES_URL"
 """The environment variable naming a provisioned PostgreSQL for the whole ``testcontainer`` selection."""
 
+POSTGRES_NANO_CPUS_ENV = "ELSPETH_TEST_POSTGRES_NANO_CPUS"
+POSTGRES_MEMORY_BYTES_ENV = "ELSPETH_TEST_POSTGRES_MEMORY_BYTES"
+
 POSTGRES_IMAGE = "postgres:16-alpine"
 """The image every suite used before the seam; the container branch keeps it."""
 
 _DATABASE_PREFIX = "elspeth_tc_"
+
+
+def _positive_ascii_integer(name: str, raw: str) -> int:
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise pytest.UsageError(f"{name} must be a positive ASCII integer")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise pytest.UsageError(f"{name} must be a supported positive ASCII integer") from None
+    if value <= 0:
+        raise pytest.UsageError(f"{name} must be a positive ASCII integer")
+    return value
+
+
+def postgres_container_resource_assignment() -> tuple[int, int] | None:
+    """Read an optional exact CPU/memory assignment for Docker targets only.
+
+    Both variables must be absent or carry positive ASCII decimal integers.
+    No allocation, Docker range adjustment, or per-run default is inferred.
+    """
+    cpu = os.environ.get(POSTGRES_NANO_CPUS_ENV)
+    memory = os.environ.get(POSTGRES_MEMORY_BYTES_ENV)
+    if cpu is None and memory is None:
+        return None
+    if cpu is None or memory is None:
+        raise pytest.UsageError(f"{POSTGRES_NANO_CPUS_ENV} and {POSTGRES_MEMORY_BYTES_ENV} must be set together")
+    return (
+        _positive_ascii_integer(POSTGRES_NANO_CPUS_ENV, cpu),
+        _positive_ascii_integer(POSTGRES_MEMORY_BYTES_ENV, memory),
+    )
+
+
+def _docker_container_kwargs(container_kwargs: dict[str, Any]) -> dict[str, Any]:
+    assignment = postgres_container_resource_assignment()
+    result = dict(container_kwargs)
+    if assignment is None:
+        return result
+    cpu, memory = assignment
+    previous_cpu = result.get("nano_cpus")
+    # Do not turn invalid caller types or negative limits into valid requests.
+    if isinstance(previous_cpu, int) and not isinstance(previous_cpu, bool) and previous_cpu > 0:
+        result["nano_cpus"] = cpu
+    previous_memory = result.get("mem_limit")
+    if previous_memory is not None:
+        # Match Docker's unit-string/zero semantics without parsing the new
+        # assignment through its floating-point size conversion. Invalid
+        # caller sizes retain the SDK's refusal rather than gaining a cap.
+        parsed_memory = parse_bytes(previous_memory)
+        if isinstance(parsed_memory, int) and not isinstance(parsed_memory, bool) and parsed_memory > 0:
+            result["mem_limit"] = memory
+    return result
 
 
 def provisioned_postgres_url(*, require_tls: bool = False) -> URL | None:
@@ -91,13 +148,15 @@ def postgres_test_target(*, driver: str = "psycopg2", require_tls: bool = False,
     ``driver`` is the SQLAlchemy driver name the suite connects with
     (``psycopg2`` is testcontainers' own default and what the suites that
     passed no driver were getting; ``psycopg`` for the ones that asked for
-    it). ``container_kwargs`` reach ``PostgresContainer`` unchanged on the
-    container branch and are ignored on the provisioned branch, where the
-    server is not ours to configure.
+    it). ``container_kwargs`` reach ``PostgresContainer`` unchanged unless
+    the paired assignment replaces an existing nonzero CPU or memory cap.
+    Swap and all other options are preserved. The provisioned branch ignores
+    container arguments and assignments: that server is not ours to configure.
     """
     admin = provisioned_postgres_url(require_tls=require_tls)
     if admin is None:
-        with PostgresContainer(POSTGRES_IMAGE, driver=driver, **container_kwargs) as postgres:
+        assigned_kwargs = _docker_container_kwargs(container_kwargs)
+        with PostgresContainer(POSTGRES_IMAGE, driver=driver, **assigned_kwargs) as postgres:
             yield postgres.get_connection_url()
         return
 

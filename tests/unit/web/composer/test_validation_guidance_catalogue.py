@@ -97,8 +97,6 @@ def _quarantine_rejection_state() -> CompositionState:
 
 
 def test_real_quarantine_producer_has_direct_repair_guidance() -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-
     state = _quarantine_rejection_state()
     entry = next(error for error in state.validate().errors if error.component == "source" and "on_validation_failure" in error.message)
     code = entry.error_code
@@ -109,10 +107,9 @@ def test_real_quarantine_producer_has_direct_repair_guidance() -> None:
     assert code in direct
     assert "on_validation_failure" in guidance[0]
     assert "discard" in guidance[1]
-    feedback = _allowlisted_candidate_feedback(
-        generation.ToolResult(success=False, updated_state=state, validation=state.validate(), affected_nodes=())
-    )
-    reported = next(error for error in feedback["validation"]["errors"] if error["error_code"] == code)
+    inline = generation.build_validation_guidance(error.error_code for error in state.validate().errors)
+    assert inline is not None
+    reported = inline["codes"][code]
     assert reported["explanation"] == guidance[0]
     assert reported["suggested_fix"] == guidance[1]
 
@@ -138,8 +135,7 @@ def test_real_producer_witness_detects_missing_direct_index_record(monkeypatch: 
         test_real_quarantine_producer_has_direct_repair_guidance()
 
 
-def test_real_count_rejection_reaches_planner_with_mode_choice_guidance() -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+def test_real_count_rejection_carries_mode_choice_guidance() -> None:
     from tests.unit.web.composer.test_set_pipeline_candidate import _trained_context
 
     context = _trained_context()
@@ -175,8 +171,8 @@ def test_real_count_rejection_reaches_planner_with_mode_choice_guidance() -> Non
     assert result.validation.suggestions == standing.suggestions
     assert result.validation.edge_contracts == standing.edge_contracts
     assert result.validation.semantic_contracts == standing.semantic_contracts
-    (reported,) = _allowlisted_candidate_feedback(result)["validation"]["errors"]
-    assert (reported["error_code"], reported["component"]) == (code, "node:batch")
+    assert result.validation_guidance is not None
+    reported = result.validation_guidance["codes"][code]
     guidance = generation._VALIDATION_GUIDANCE_BY_CODE[code]
     assert isinstance(guidance, generation.DirectValidationGuidance)
     assert (reported["explanation"], reported["suggested_fix"]) == (guidance.explanation, guidance.suggested_fix)
@@ -185,15 +181,15 @@ def test_real_count_rejection_reaches_planner_with_mode_choice_guidance() -> Non
     assert "different row semantics" in reported["suggested_fix"]
 
 
-def test_real_diff_without_baseline_retains_planner_guidance() -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-
+def test_real_diff_without_baseline_has_catalogue_guidance() -> None:
     result = execute_tool("diff_pipeline", {}, _empty_state(), _mock_catalog())
     assert not result.success
-    (reported,) = _allowlisted_candidate_feedback(result)["validation"]["errors"]
-    assert reported["error_code"] == "diff_baseline_unavailable"
-    assert "baseline" in reported["explanation"].lower()
-    assert reported["suggested_fix"]
+    assert result.validation.errors[0].error_code == "diff_baseline_unavailable"
+    guidance = generation.explain_validation_code("diff_baseline_unavailable")
+    assert guidance is not None
+    explanation, suggested_fix = guidance
+    assert "baseline" in explanation.lower()
+    assert suggested_fix
 
 
 @pytest.mark.parametrize(
@@ -204,9 +200,7 @@ def test_real_diff_without_baseline_retains_planner_guidance() -> None:
         ("require_all", "select", "coalesce_merge_select_unsupported"),
     ],
 )
-def test_real_coalesce_rejections_retain_planner_guidance(policy: str, merge: str, code: str) -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-
+def test_real_coalesce_rejections_have_inline_guidance(policy: str, merge: str, code: str) -> None:
     node = NodeSpec(
         id="merge",
         node_type="coalesce",
@@ -225,8 +219,9 @@ def test_real_coalesce_rejections_retain_planner_guidance(policy: str, merge: st
     state = replace(_empty_state(), nodes=(node,))
     validation = state.validate()
     assert any(entry.error_code == code for entry in validation.errors)
-    result = generation.ToolResult(success=False, updated_state=state, validation=validation, affected_nodes=())
-    reported = next(entry for entry in _allowlisted_candidate_feedback(result)["validation"]["errors"] if entry["error_code"] == code)
+    inline = generation.build_validation_guidance(entry.error_code for entry in validation.errors)
+    assert inline is not None
+    reported = inline["codes"][code]
     assert reported["explanation"]
     assert reported["suggested_fix"]
 
@@ -252,7 +247,8 @@ def test_new_policy_guidance_does_not_extend_legacy_patterns(monkeypatch: pytest
 def test_direct_exact_and_noisy_lookup_and_help_derive_from_records() -> None:
     for record in generation._DIRECT_VALIDATION_GUIDANCE:
         exact = execute_tool("explain_validation_error", {"error_text": record.code}, _empty_state(), _mock_catalog())
-        assert list(exact.data) == ["error_text", "explanation", "suggested_fix"]
+        assert list(exact.data) == ["error_text", "error_code", "explanation", "suggested_fix"]
+        assert exact.data["error_code"] == record.code
         assert exact.data["explanation"] == record.explanation
         assert exact.data["suggested_fix"] == record.suggested_fix
         noisy = execute_tool("explain_validation_error", {"error_text": f"LOG {record.code.upper()} END"}, _empty_state(), _mock_catalog())
@@ -333,3 +329,57 @@ def test_the_shared_batch_placement_code_teaches_every_arm_that_emits_it() -> No
     # The collector arm's own message gives the same remedy, never "make the collector an aggregation".
     assert "downstream of the collector" in (arms["collector"] or "")
     assert "Configure this node as node_type='aggregation'" not in (arms["collector"] or "")
+
+
+def test_exact_closed_code_emits_expected_canonical_code() -> None:
+    """TC-004 (#327): an exact closed-code lookup names the canonical code it explained.
+
+    Iterates the live catalogue rather than a hand-picked sample, so a code
+    added later is covered without editing this test.
+    """
+    codes = generation._CLOSED_VALIDATION_ERROR_CODES
+    assert codes, "the closed validation-code catalogue must not be empty"
+    for code in codes:
+        expected = generation.explain_validation_code(code)
+        assert expected is not None, code
+        result = execute_tool("explain_validation_error", {"error_text": code}, _empty_state(), _mock_catalog())
+        assert result.success is True
+        assert result.data.get("error_code") == code, code
+        assert (result.data["explanation"], result.data["suggested_fix"]) == expected, code
+        assert result.affected_nodes == ()
+
+
+def test_explanation_branch_precedence_keeps_code_only_on_closed_code_branches() -> None:
+    """Runtime reason, prose pattern and unmatched results omit the code; exact and noisy carry it.
+
+    The prose fixture also contains a different closed code whose guidance is
+    distinct, so moving the noisy-code lookup ahead of the prose patterns, or
+    classifying the runtime reason as a closed code, changes the result.
+    """
+    state = _empty_state()
+    runtime = execute_tool("explain_validation_error", {"error_text": "union_field_collision"}, state, _mock_catalog())
+    assert "error_code" not in runtime.data
+
+    prose_only = execute_tool("explain_validation_error", {"error_text": "unknown node_type. Expected a gate."}, state, _mock_catalog())
+    noisy_guidance = generation.explain_validation_code("quarantine_unknown_output")
+    assert noisy_guidance is not None
+    assert prose_only.data["explanation"] != noisy_guidance[0]
+    mixed = execute_tool(
+        "explain_validation_error",
+        {"error_text": "unknown node_type. Expected a gate. LOG QUARANTINE_UNKNOWN_OUTPUT"},
+        state,
+        _mock_catalog(),
+    )
+    assert "error_code" not in mixed.data
+    assert mixed.data["explanation"] == prose_only.data["explanation"]
+
+    unmatched = execute_tool("explain_validation_error", {"error_text": "ZZZ_UNRECOGNIZED_QQQ"}, state, _mock_catalog())
+    assert "error_code" not in unmatched.data
+
+    noisy = execute_tool("explain_validation_error", {"error_text": "LOG QUARANTINE_UNKNOWN_OUTPUT END"}, state, _mock_catalog())
+    assert noisy.data["error_code"] == "quarantine_unknown_output"
+    exact = execute_tool("explain_validation_error", {"error_text": "quarantine_unknown_output"}, state, _mock_catalog())
+    assert exact.data.get("error_code") == "quarantine_unknown_output"
+    for result in (runtime, mixed, unmatched, noisy, exact):
+        assert result.updated_state is state
+        assert result.affected_nodes == ()

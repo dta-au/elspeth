@@ -1,0 +1,842 @@
+"""Live retained phase adapters for the actual Composer batch owners.
+
+One segment keeps these objects. Current SQL reads admit each new selected
+cut; retained DATA never substitutes for dispatch authority or SDK identity.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field, replace
+from datetime import timedelta
+from functools import partial
+from typing import TYPE_CHECKING
+
+from elspeth.contracts.composer_progress import ComposerProgressSink
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome, _DispatchOutcome, _PersistOutcome
+from elspeth.web.composer.continuation import ComposeFrame, EndFrame, ToolBatchFrame
+from elspeth.web.composer.continuation_batch_data import RestoredBatchData, encode_coupled_batch_data
+from elspeth.web.composer.continuation_clock import ContinuationTimingObservation
+from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, encode_private_chunk
+from elspeth.web.composer.continuation_control_transitions import (
+    StoredContinuationControlIntent,
+    retain_control_completion,
+)
+from elspeth.web.composer.continuation_controls import ContinuationControlRefused, parse_continuation_control_batch
+from elspeth.web.composer.continuation_env_inventory import (
+    ContinuationEnvSelection,
+    CurrentContinuationEnvInventory,
+    _read_current_env_names,
+    materialize_continuation_env_inventory,
+)
+from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+from elspeth.web.composer.continuation_finished_batch_data import ColdPostBatchPersistData, project_cold_finished_batch_data
+from elspeth.web.composer.continuation_initialization import _registered
+from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+from elspeth.web.composer.continuation_message_family_recipes import ControlResultMessageRecipe
+from elspeth.web.composer.continuation_phase_transitions import BatchTransition, refuse_tool_before_dispatch, retain_batch_transition
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
+from elspeth.web.composer.continuation_runtime import (
+    CapturedContinuationRuntime,
+    RestoredContinuationRuntime,
+    _CurrentPhaseRead,
+    _registered_read,
+    _selected_chunks,
+    build_runtime_tool_batch_context,
+    capture_continuation_runtime_owners,
+    restore_continuation_runtime,
+)
+from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
+from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody, TerminalServiceCompletion
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+from elspeth.web.composer.tool_batch import (
+    BatchAccumulator,
+    ContinuationBatchState,
+    ToolBatchContext,
+    _finish_continuation_batch_live,
+    _initialize_continuation_batch_live,
+)
+from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+from elspeth.web.coordination.lifecycle import ContinuationStage, SessionOperationLease
+from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
+from elspeth.web.sessions.composer_operations import ComposerOperationCancel, ComposerOperationCancelledDuringTurn, ComposerOperationRunning
+from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
+from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
+from elspeth.web.sessions.continuation_tool_no_execution import ToolNoExecutionRefusal
+from elspeth.web.sessions.locking import locked_session_transaction
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
+    from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
+    from elspeth.web.composer.continuation_preview_observation import PreviewSourceData
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.sessions.continuation_classifier_prephysical_failure import ClassifierPrephysicalFailure
+    from elspeth.web.sessions.continuation_preview_result import PreviewValidationIncompleteTerminal
+    from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
+
+
+def _require_runtime_source_refresh(before: ContinuationRuntimeSource, fresh: ContinuationRuntimeSource) -> None:
+    """Keep exact source DATA while allowing its later database-clock read.
+
+    Both values come from the current SQL owner. Timing is an observation of
+    that owner's original deadlines, so equality of observation timestamps is
+    neither expected nor authority to renew the segment or action clocks.
+    """
+    if (
+        type(before) is not ContinuationRuntimeSource
+        or type(fresh) is not ContinuationRuntimeSource
+        or replace(fresh, timing=before.timing) != before
+    ):
+        raise AuditIntegrityError("live phase refresh returned a foreign source")
+    earlier, later = before.timing, fresh.timing
+    if (
+        type(earlier) is not ContinuationTimingObservation
+        or type(later) is not ContinuationTimingObservation
+        or (later.sequence, later.generation, later.watermark_seconds) != (earlier.sequence, earlier.generation, earlier.watermark_seconds)
+        or later.observed_at < earlier.observed_at
+    ):
+        raise AuditIntegrityError("live phase refresh changed its original timing owner or observation order")
+    for previous, remaining in (
+        (earlier.hard_remaining_seconds, later.hard_remaining_seconds),
+        (earlier.cooperative_remaining_seconds, later.cooperative_remaining_seconds),
+    ):
+        if remaining > previous or (
+            remaining > 0 and later.observed_at + timedelta(seconds=remaining) > earlier.observed_at + timedelta(seconds=previous)
+        ):
+            raise AuditIntegrityError("live phase refresh extended an original absolute deadline")
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedToolNoExecutionRefusal:
+    receipt: ToolNoExecutionRefusal
+    inventory: CurrentContinuationEnvInventory
+
+
+@dataclass(slots=True)
+class ContinuationLivePhases:
+    service: ComposerServiceImpl
+    authority: ComposerAsyncOperationAuthority
+    work: RequiredWorkBinding
+    provider_owner: ProviderInvocationOwner
+    lease: SessionOperationLease
+    progress: ComposerProgressSink | None = None
+    runtime: RestoredContinuationRuntime | None = None
+    primary: PrimaryProviderResult | RetainedPrimaryPhaseData | None = None
+    p4: ContinuationLiveP4 | None = None
+    latest_snapshot: StoredContinuationSnapshot | None = None
+    cancellation_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    business_stage: ContinuationStage[None] | ContinuationStage[ToolNoExecutionRefusal | None] | None = None
+    failure_custody: ContinuationToolFailureCustody | None = None
+    terminal_completion: TerminalServiceCompletion | None = None
+    tool_refusal: CommittedToolNoExecutionRefusal | None = None
+    preview_terminal: PreviewValidationIncompleteTerminal | None = None
+    # The warm post-batch source: this batch's dispatch fold, its committed
+    # P4 publication and the batch entry state, for the post-batch owner.
+    finished_batch: tuple[_DispatchOutcome, _PersistOutcome | ColdPostBatchPersistData, CompositionState] | None = None
+    action_clock: ContinuationActionClock | None = None
+    classifier_prephysical_failure: ClassifierPrephysicalFailure | None = None
+    _pending_semantic_review_output: tuple[SemanticAdvisorProviderResult, StoredContinuationSnapshot, AdmittedTurnEvidence] | None = None
+
+    def bind_action_clock(self, clock: ContinuationActionClock) -> None:
+        """Bind the driver's original action clock, without starting a new one."""
+        from elspeth.web.composer.continuation_clock import ContinuationActionClock
+
+        if type(clock) is not ContinuationActionClock or self.work.running is None or self.lease.closed:
+            raise AuditIntegrityError("phase action clock lost its actual driver/work/lease owner")
+        self.action_clock = clock
+
+    def observe_stop(self) -> None:
+        self._pending_semantic_review_output = None
+        self.cancellation_requested.set()
+
+    def cancel_business(self, reason: ComposerOperationCancel) -> None:
+        self.observe_stop()
+        stage = self.business_stage
+        if stage is not None and stage.task is not None and not stage.task.done():
+            stage.task.cancel(reason)
+
+    async def _tool_context(self, runtime: RestoredContinuationRuntime, *, phase_read: _CurrentPhaseRead | None = None) -> ToolBatchContext:
+        context = await build_runtime_tool_batch_context(runtime, cancellation_requested=self.cancellation_requested, phase_read=phase_read)
+        owner = self.work.coordinator.sql_deadline_owner
+        if owner is not None:
+            if owner.running is not runtime.materialization.inventory.running:
+                raise AuditIntegrityError("tool context changed its actual original timing owner")
+            now = time.monotonic()
+            remaining = owner.remaining_dispatch(monotonic_now=now)
+            if remaining <= 0:
+                raise TimeoutError("tool action exhausted its original dispatch allowance")
+            context = replace(context, deadline=min(context.deadline, now + remaining))
+        return context
+
+    def bind_initial(self, runtime: RestoredContinuationRuntime) -> None:
+        if (
+            self.runtime is not None
+            or type(runtime) is not RestoredContinuationRuntime
+            or runtime.materialization.service is not self.service
+            or runtime.materialization.authority is not self.authority
+            or runtime.bindings.required_work is not self.work
+            or runtime.bindings.provider_owner is not self.provider_owner
+            or runtime.bindings.progress is not self.progress
+        ):
+            raise AuditIntegrityError("live phase initialization changed its actual runtime owners")
+        self.runtime = runtime
+
+    def accept_primary(self, result: PrimaryProviderResult) -> None:
+        if type(result) is not PrimaryProviderResult or type(result.outcome) is not _CallModelOutcome:
+            raise AuditIntegrityError("live phases lost their actual provider result")
+        self.primary = result
+
+    async def _primary_for_phase(
+        self, runtime: RestoredContinuationRuntime, inventory: CurrentContinuationEnvInventory, selected: SelectedContinuationState
+    ) -> PrimaryProviderResult | RetainedPrimaryPhaseData:
+        compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
+        if len(compose) != 1 or compose[0].pending_response is None:
+            raise AuditIntegrityError("live phase lost its actual selected paid response")
+        if self.primary is None:
+            retained = await _registered_read(
+                self.work,
+                RetainedPrimaryPhaseData,
+                partial(
+                    self.authority.read_continuation_phase_primary,
+                    inventory.running,
+                    selected=selected,
+                    reference=compose[0].pending_response,
+                    env_ref_names=inventory.names,
+                ),
+            )
+            audit = retained.outcome.audit_call
+            if audit is None:
+                raise AuditIntegrityError("cold paid phase lost its actual physical audit DATA")
+            matching = tuple(call for call in runtime.live.recorder.llm_calls if call.call_id == audit.call_id)
+            if len(matching) != 1 or matching[0] != audit:
+                raise AuditIntegrityError("cold paid phase changed its actual restored recorder identity")
+            completion = retained.outcome.completion
+            batches = tuple(frame for frame in selected.stack.frames if type(frame) is ToolBatchFrame)
+            if batches:
+                if (
+                    len(batches) != 1
+                    or batches[0].response != compose[0].pending_response
+                    or batches[0].response != retained.response.reference
+                ):
+                    raise AuditIntegrityError("cold paid phase changed its selected batch response")
+                data = runtime.graph.batch
+                if data is None or completion.tool_batch.calls != data.calls:
+                    raise AuditIntegrityError("cold paid phase changed its actual restored issued calls")
+                # Only the current selected batch supplies its restored SDK
+                # atoms. A retired batch remains historical graph DATA.
+                completion = replace(completion, tool_batch=replace(completion.tool_batch, calls=data.calls))
+            self.primary = RetainedPrimaryPhaseData(retained.response, _CallModelOutcome(completion, matching[0]))
+        if self.primary.response.reference != compose[0].pending_response:
+            raise AuditIntegrityError("live phase replaced its original paid response")
+        return self.primary
+
+    async def current(self, selected: SelectedContinuationState) -> tuple[RestoredContinuationRuntime, CurrentContinuationEnvInventory]:
+        phase = await self._current_phase_read(selected)
+        return phase.runtime, phase.inventory
+
+    def _require_phase_read(self, selected: SelectedContinuationState, phase_read: _CurrentPhaseRead) -> _CurrentPhaseRead:
+        """Consume an explicit adjacent phase cohort, never implicit cached DATA."""
+        if type(phase_read) is not _CurrentPhaseRead or type(selected) is not SelectedContinuationState:
+            raise AuditIntegrityError("live phase handoff requires its actual nominal source cohort")
+        runtime, inventory, running = phase_read.runtime, phase_read.inventory, self.work.running
+        if (
+            type(runtime) is not RestoredContinuationRuntime
+            or type(inventory) is not CurrentContinuationEnvInventory
+            or type(running) is not ComposerOperationRunning
+            or phase_read.finish_read is not None
+        ):
+            raise AuditIntegrityError("live phase handoff changed its ordinary source owners")
+        if (
+            phase_read.selected is not selected
+            or runtime is not self.runtime
+            or runtime.source.selected is not selected
+            or runtime.materialization.selected is not selected
+            or runtime.materialization.inventory is not inventory
+            or runtime.materialization.service is not self.service
+            or runtime.materialization.authority is not self.authority
+            or runtime.bindings.required_work is not self.work
+            or runtime.bindings.provider_owner is not self.provider_owner
+            or inventory.running is not running
+            or running.session_operation_context is not self.lease.context
+            or runtime.bindings.session_operation_context is not running.session_operation_context
+            or phase_read.lease is not self.lease
+            or self.lease.closed
+        ):
+            raise AuditIntegrityError("live phase handoff replaced its exact selected/runtime/claim/lease owners")
+        self.work.validate_context(running.session_operation_context)
+        self.lease.raise_if_lost()
+        return phase_read
+
+    async def _current_phase_read(self, selected: SelectedContinuationState) -> _CurrentPhaseRead:
+        pending = self._pending_semantic_review_output
+        self._pending_semantic_review_output = None
+        prior_output: AdmittedTurnEvidence | None = None
+        try:
+            running = self.work.running
+            if type(running) is not ComposerOperationRunning or running.session_operation_context is not self.lease.context:
+                raise AuditIntegrityError("live phase lost its actual running/physical owner")
+            finish_read: ContinuationFinishRead | None = None
+            try:
+                inventory = await materialize_continuation_env_inventory(
+                    advisor=self.service._advisor_checkpoint, authority=self.authority, selected=selected, required_work=self.work
+                )
+            except ComposerOperationCancelledDuringTurn:
+                if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+                    # No issued/completed tool work is owed at this cut; the
+                    # durable Stop itself is the outcome, not an owed read.
+                    raise
+                names = await _read_current_env_names(self.service._advisor_checkpoint, selected.stack.logical.session_id)
+                inventory = CurrentContinuationEnvInventory(
+                    running,
+                    ContinuationEnvSelection(selected.checkpoint_id, selected.stack.cursor, encode_continuation_snapshot(selected.stack)),
+                    names,
+                )
+                finish_read = ContinuationFinishRead(running, selected, inventory)
+
+            frame = selected.stack.frames[-1]
+            if (
+                pending is not None
+                and self.runtime is not None
+                and finish_read is None
+                and not self.cancellation_requested.is_set()
+                and type(frame) is EndFrame
+                and frame.phase == "review_needed"
+                and pending[1].checkpoint_id == inventory.selection.checkpoint_id
+                and pending[1].cursor == inventory.selection.cursor
+                and pending[1].payload_json == inventory.selection.snapshot_json
+            ):
+                prior_output = pending[2]
+            pending = None
+
+            def read_source() -> ContinuationRuntimeSource:
+                nonlocal finish_read
+                if finish_read is not None:
+                    return finish_read.read_runtime(self.authority)
+                try:
+                    return self.authority.read_continuation_runtime(
+                        inventory.running, selected=selected, inventory=inventory, _prior_evidence=prior_output
+                    )
+                except ComposerOperationCancelledDuringTurn:
+                    if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+                        raise
+                    finish_read = ContinuationFinishRead(running, selected, inventory)
+                    return finish_read.read_runtime(self.authority)
+
+            warm_paid_response = (
+                self.runtime is not None
+                and self.runtime.source.selected != selected
+                and finish_read is None
+                and type(selected.stack.frames[-1]) is ComposeFrame
+                and selected.stack.frames[-1].phase == "response_retained"
+            )
+            warm_action_ready = (
+                self.runtime is not None
+                and self.runtime.source.selected != selected
+                and finish_read is None
+                and type(selected.stack.frames[-1]) is ComposeFrame
+                and selected.stack.frames[-1].phase == "action_ready"
+            )
+            if warm_paid_response:
+                paid_runtime = self.runtime
+                if type(paid_runtime) is not RestoredContinuationRuntime:
+                    raise AuditIntegrityError("warm paid phase lost its actual runtime")
+
+                def refresh_paid_response() -> RestoredContinuationRuntime:
+                    from elspeth.web.sessions.continuation_runtime import read_runtime_source_on_connection
+
+                    with (
+                        locked_session_transaction(self.authority._engine, str(running.claim.session_id)) as conn,
+                        retention_stage_memo_scope(),
+                    ):
+                        fresh = read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+                    paid_runtime.materialization.advance_current_from_source(selected, inventory, fresh)
+                    following = replace(paid_runtime, source=fresh)
+                    # The complete source and producer inputs came from one locked
+                    # current read; no async gap or prior-invocation cache intervenes.
+                    self.runtime = following
+                    return following
+
+                await _registered_read(self.work, RestoredContinuationRuntime, refresh_paid_response)
+            elif warm_action_ready:
+                action_runtime = self.runtime
+                if type(action_runtime) is not RestoredContinuationRuntime:
+                    raise AuditIntegrityError("warm action-ready phase lost its actual runtime")
+
+                def refresh_action_ready() -> RestoredContinuationRuntime:
+                    with retention_stage_memo_scope() as memo:
+                        fresh = self.authority.read_continuation_runtime(
+                            running, selected=selected, inventory=inventory, retention_memo=memo
+                        )
+                        action_runtime.materialization.advance_current_from_source(selected, inventory, fresh)
+                        following = replace(action_runtime, source=fresh)
+                        # Preserve the actual new bindings before bridge delivery
+                        # can defer caller cancellation; no SDK owner is rebuilt.
+                        self.runtime = following
+                        return following
+
+                await _registered_read(self.work, RestoredContinuationRuntime, refresh_action_ready)
+            else:
+                source = await _registered_read(self.work, ContinuationRuntimeSource, read_source)
+                if self.runtime is None:
+                    self.runtime = await restore_continuation_runtime(
+                        service=self.service,
+                        authority=self.authority,
+                        selected=selected,
+                        inventory=inventory,
+                        required_work=self.work,
+                        provider_owner=self.provider_owner,
+                        progress=self.progress,
+                        finish_read=finish_read,
+                    )
+                elif self.runtime.source.selected != selected:
+                    runtime = self.runtime
+
+                    def refresh() -> RestoredContinuationRuntime:
+                        if finish_read is None:
+                            # The registered current-source read already admitted
+                            # these producer inputs from this exact selected SQL
+                            # cohort. No second source or producer SQL proof is
+                            # needed before binding the same immutable DATA.
+                            runtime.materialization.advance_current_from_source(selected, inventory, source)
+                            following = replace(runtime, source=source)
+                        else:
+                            # Owed Stop must retain its separate completed-prefix
+                            # read and producer path, never adopt ordinary DATA.
+                            fresh = read_source()
+                            _require_runtime_source_refresh(source, fresh)
+                            runtime.materialization.advance_current(selected, inventory)
+                            following = replace(runtime, source=fresh)
+                        # Retain the actual fresh source before the async SQL bridge can
+                        # defer cancellation. No live messages/graph objects are rebuilt.
+                        self.runtime = following
+                        return following
+
+                    await _registered_read(self.work, RestoredContinuationRuntime, refresh)
+                else:
+                    # Same SQL cut can arrive as a fresh selected object, including a
+                    # warm owner which has just observed durable Stop. Carry that
+                    # exact read choice without replacing live owners or their clocks;
+                    # the message producers adopt the same equal cut so PRIMARY input
+                    # admission sees the selection this read now holds.
+                    _require_runtime_source_refresh(self.runtime.source, source)
+                    self.runtime.materialization.adopt_equal_cut(selected, inventory)
+                    self.runtime = replace(self.runtime, source=source)
+            if self.runtime is None:
+                raise AuditIntegrityError("live phase source lost its actual runtime")
+            if self.runtime.source.selected is not selected:
+                raise AuditIntegrityError("live phase read lost its actual fresh selection")
+            if finish_read is not None:
+                finish_read.require_selection(selected, inventory)
+            phase_read = _CurrentPhaseRead(self.runtime, selected, inventory, finish_read, self.lease)
+
+            return phase_read
+        finally:
+            # Retained worker closures share this cell; none keeps the prior.
+            pending = None
+            prior_output = None
+
+    async def restore_finished_batch(
+        self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None
+    ) -> _CurrentPhaseRead:
+        """Project clean applied P4 DATA only for an actual post-batch consumer."""
+        if phase_read is None:
+            phase_read = await self._current_phase_read(selected)
+        self._require_phase_read(selected, phase_read)
+        runtime, inventory = phase_read.runtime, phase_read.inventory
+        running = inventory.running
+        if self.finished_batch is None:
+            from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cut
+
+            if is_applied_batch_cut(selected):
+                from elspeth.web.sessions.continuation_iteration_return import (
+                    AppliedIterationP4Data,
+                    read_iteration_applied_p4_result_on_connection,
+                )
+
+                def read_applied() -> AppliedIterationP4Data:
+                    with locked_session_transaction(self.authority._engine, str(running.claim.session_id)) as conn:
+                        return read_iteration_applied_p4_result_on_connection(conn, running, selected=selected, inventory=inventory)
+
+                applied = await _registered_read(self.work, AppliedIterationP4Data, read_applied)
+                primary = await self._primary_for_phase(runtime, inventory, selected)
+                if type(primary) is not RetainedPrimaryPhaseData:
+                    raise AuditIntegrityError("cold finished batch cannot replace a live paid PRIMARY owner")
+                context = await self._tool_context(runtime, phase_read=phase_read)
+                finished = project_cold_finished_batch_data(
+                    runtime=runtime,
+                    selected=selected,
+                    primary=primary,
+                    p4_result=applied.result,
+                    iteration_stage=applied.stage,
+                    context=context,
+                )
+                self.finished_batch = finished.dispatch, finished.persist, finished.pre_batch_state
+        return phase_read
+
+    async def _retain(
+        self,
+        captured: CapturedContinuationRuntime,
+        inventory: CurrentContinuationEnvInventory,
+        transition: BatchTransition,
+        *,
+        preview_source: PreviewSourceData | None = None,
+    ) -> None:
+        def retain() -> StoredContinuationSnapshot:
+            stored = retain_batch_transition(
+                self.authority,
+                inventory.running,
+                captured=captured,
+                inventory=inventory,
+                transition=transition,
+                preview_source=preview_source,
+            )
+            # Preserve the actual committing owner's return on its physical
+            # thread before bridge delivery can surface a caller cancellation.
+            self.latest_snapshot = stored
+            return stored
+
+        stored = await _registered(
+            work=self.work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=retain,
+            expected=StoredContinuationSnapshot,
+        )
+        selected = await load_selected_continuation(
+            authority=self.authority, running=inventory.running, selected=stored, required_work=self.work
+        )
+        await self.current(selected)
+
+    async def _initialize_batch(self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None) -> None:
+        phase_read = await self._current_phase_read(selected) if phase_read is None else self._require_phase_read(selected, phase_read)
+        runtime, inventory = phase_read.runtime, phase_read.inventory
+        result, live = await self._primary_for_phase(runtime, inventory, selected), runtime.live
+        frame = selected.stack.frames[-1]
+        if type(frame) is not ComposeFrame or frame.pending_response != result.response.reference:
+            raise AuditIntegrityError("batch initialization changed its exact original paid response")
+        if await self._initialize_control(phase_read, result):
+            return
+        from elspeth.web.composer.recovery_controls import parse_recovery_tool_batch
+        from elspeth.web.sessions.continuation_end import enter_continuation_recovery_end
+
+        if parse_recovery_tool_batch(result.outcome.completion.tool_batch) is not None:
+            await enter_continuation_recovery_end(self, selected, phase_read=phase_read)
+            return
+        self.service._enforce_tool_call_cap(
+            assistant_tool_calls=result.outcome.completion.tool_batch.calls,
+            state=live.state,
+            initial_version=live.initial_version,
+            composition_turns_used=live.composition_turns_used,
+            discovery_turns_used=live.discovery_turns_used,
+            recorder=live.recorder,
+            failed_turn=live.failed_turn,
+            persisted_tool_call_turn=live.persisted_tool_call_turn,
+        )
+        accumulator = BatchAccumulator(live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used)
+        batch = ContinuationBatchState(
+            live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used, entry_state=live.state
+        )
+        data = RestoredBatchData(batch, accumulator, result.outcome.completion.tool_batch.calls)
+        context = await self._tool_context(runtime, phase_read=phase_read)
+        await _initialize_continuation_batch_live(
+            call_model=result.outcome, ctx=context, acc=accumulator, llm_messages=live.llm_messages, batch=batch
+        )
+        self.runtime = runtime = replace(runtime, graph=runtime.graph.with_batch(data))
+        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+        chunk = encode_private_chunk(
+            codec="composer.coupled-batch-data.v1",
+            canonical=encode_coupled_batch_data(batch=batch, accumulator=accumulator, calls=data.calls, env_ref_names=inventory.names),
+            env_ref_names=inventory.names,
+        )
+        tool = ToolBatchFrame(
+            phase="tool_ready", response=result.response.reference, accumulator=chunk.reference, next_tool_index=0, settled_effect_ids=()
+        )
+        root = captured.stack.model_copy(update={"frames": (*captured.stack.frames, tool)})
+        following = CapturedContinuationRuntime(selected, root, _selected_chunks(root, captured.chunks, (chunk,)))
+        await self._retain(following, inventory, "batch_initialized")
+
+    async def _initialize_control(self, phase_read: _CurrentPhaseRead, result: PrimaryProviderResult | RetainedPrimaryPhaseData) -> bool:
+        """Classify the complete paid batch before any ordinary sibling effect."""
+        from elspeth.web.composer.continuation_message_family_builders import native_assistant_message
+
+        if type(phase_read) is not _CurrentPhaseRead:
+            raise AuditIntegrityError("control initialization lost its actual paid phase read")
+        selected, runtime, inventory = phase_read.selected, phase_read.runtime, phase_read.inventory
+        if runtime is not self.runtime or runtime.source.selected is not selected or phase_read.finish_read is not None:
+            raise AuditIntegrityError("control initialization lost its actual paid phase read")
+        try:
+            request = parse_continuation_control_batch(result.outcome.completion.tool_batch)
+        except ContinuationControlRefused:
+            request = None
+        else:
+            if request is None:
+                return False
+        # The enclosing batch initializer already proved this exact selected
+        # source. Intent and result writers recheck currentness under their own
+        # SQL transactions; a second DATA read here cannot grant effect custody.
+        intent: StoredContinuationControlIntent | None = None
+        if request is not None:
+            intent = await _registered(
+                work=self.work,
+                source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+                operation=partial(
+                    self.authority.retain_continuation_control_intent, inventory.running, selected=selected, inventory=inventory
+                ),
+                expected=StoredContinuationControlIntent,
+            )
+            # A replay returns the historical accepting receipt. Recoveries
+            # have a newer current head; DATA never becomes dispatch custody.
+            current = await _registered(
+                work=self.work,
+                source=RequiredWorkSource.CONTINUATION_READ_SQL,
+                operation=partial(self.authority.load_continuation_snapshot, inventory.running),
+                expected=StoredContinuationSnapshot,
+            )
+            self.latest_snapshot = current
+            selected = await load_selected_continuation(
+                authority=self.authority, running=inventory.running, selected=current, required_work=self.work
+            )
+            runtime, inventory = await self.current(selected)
+            result = await self._primary_for_phase(runtime, inventory, selected)
+        assistant = native_assistant_message(result.outcome.completion)
+        runtime.materialization.register_tool_call_message(
+            response=result.response, completion=result.outcome.completion, message=assistant
+        )
+        runtime.live.llm_messages.append(assistant)
+        for index in range(len(result.outcome.completion.tool_batch.calls)):
+            recipe = ControlResultMessageRecipe(
+                response=result.response.reference,
+                tool_index=index,
+                intent_checkpoint_id=None if intent is None else intent.snapshot.checkpoint_id,
+            )
+            reply = await _registered_read(self.work, dict, partial(runtime.materialization.control_result_message, recipe=recipe))
+            runtime.live.llm_messages.append(reply)
+        runtime.live.turn_evidence.transcript.observe_messages(runtime.live.llm_messages)
+        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+
+        def retain() -> StoredContinuationSnapshot:
+            stored = retain_control_completion(self.authority, inventory.running, captured=captured, inventory=inventory, intent=intent)
+            # Retain the actual committing return before bridge cancellation.
+            self.latest_snapshot = stored
+            return stored
+
+        stored = await _registered(
+            work=self.work, source=RequiredWorkSource.CONTINUATION_STATE_SQL, operation=retain, expected=StoredContinuationSnapshot
+        )
+        self.primary = None
+        following = await load_selected_continuation(
+            authority=self.authority, running=inventory.running, selected=stored, required_work=self.work
+        )
+        await self.current(following)
+        return True
+
+    async def _execute_one(self, selected: SelectedContinuationState) -> ToolNoExecutionRefusal | None:
+        previous = self.business_stage
+        if previous is not None and (previous.task is None or not previous.task.done() or not previous.observed):
+            raise AuditIntegrityError("tool dispatch cannot replace its retained physical stage")
+        self.business_stage = stage = self.lease.create_continuation_stage(
+            self._execute_one_owned(selected), name="continuation-issued-tool"
+        )
+        return await self.lease.join_continuation_stage(stage)
+
+    async def _execute_one_owned(self, selected: SelectedContinuationState) -> ToolNoExecutionRefusal | None:
+        from elspeth.web.composer.continuation_metadata_admission import try_admit_metadata_tool
+        from elspeth.web.composer.continuation_preview_dispatch import try_admit_preview_tool
+        from elspeth.web.composer.continuation_value_batch_admission import try_admit_value_batch_tool
+
+        runtime, inventory = await self.current(selected)
+        if runtime.graph.batch is None or type(runtime.source.policy) is not ContinuationAdmissionPolicyV4:
+            raise AuditIntegrityError("live dispatch lost its actual batch/provider owners")
+        await self._primary_for_phase(runtime, inventory, selected)
+        if await try_admit_metadata_tool(self, runtime=runtime, selected=selected, inventory=inventory):
+            return None
+        if await try_admit_preview_tool(self, runtime=runtime, selected=selected, inventory=inventory):
+            return None
+        if await try_admit_value_batch_tool(self, runtime=runtime, selected=selected, inventory=inventory):
+            return None
+
+        def commit_refusal() -> ToolNoExecutionRefusal:
+            receipt = refuse_tool_before_dispatch(self.authority, inventory.running, selected=selected, inventory=inventory)
+            # Preserve the actual committed return before deferred cancellation.
+            self.tool_refusal = CommittedToolNoExecutionRefusal(receipt, inventory)
+            return receipt
+
+        return await _registered(
+            work=self.work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=commit_refusal,
+            expected=ToolNoExecutionRefusal,
+        )
+
+    async def _persist_batch(self, selected: SelectedContinuationState) -> None:
+        terminal = self.terminal_completion
+        if terminal is None:
+            phase_read = await self._current_phase_read(selected)
+            runtime, inventory = phase_read.runtime, phase_read.inventory
+            result = await self._primary_for_phase(runtime, inventory, selected)
+            context = await build_runtime_tool_batch_context(
+                runtime, cancellation_requested=self.cancellation_requested, phase_read=phase_read
+            )
+            call_model = result.outcome
+        else:
+            terminal.require_native()
+            if self.runtime is not terminal.runtime or selected is not terminal.runtime.source.selected or terminal.p4 is not None:
+                raise terminal.custody.failure(AuditIntegrityError("terminal P4 cannot replace or replay its actual native completion"))
+            runtime = terminal.runtime
+            inventory = runtime.materialization.inventory
+            context, call_model = terminal.context, terminal.call_model
+        data = runtime.graph.batch
+        if data is None or data.batch.phase != "dispatch_ready":
+            raise AuditIntegrityError("live P4 lost its actual completed batch/provider owners")
+        dispatch, advisor_calls = _finish_continuation_batch_live(
+            call_model=call_model,
+            ctx=context,
+            acc=data.accumulator,
+            batch=data.batch,
+            failure_custody=self.failure_custody,
+        )
+        live, bindings = runtime.live, runtime.bindings
+        self.p4 = owner = ContinuationLiveP4(
+            self.authority,
+            selected,
+            inventory,
+            self.work,
+            data,
+            runtime,
+            withheld_replies=live.recorder.withheld_replies[runtime.drained.withheld_replies :],
+        )
+        if terminal is not None:
+            terminal.bind_p4(owner)
+
+        async def publish() -> None:
+            deadline_owner = self.work.coordinator.sql_deadline_owner
+            if deadline_owner is not None:
+                if deadline_owner.running is not inventory.running:
+                    raise AuditIntegrityError("P4 finishing changed its actual original timing owner")
+                # This retained child only finishes the actual existing batch;
+                # its SQL owner still proves all current/pre-Stop authority.
+                # Spend the original action's reserve without restarting D.
+                deadline_owner.begin_settlement()
+            original: BaseException | None = None
+            try:
+                await self.service._persist_turn_audit(
+                    tool_outcomes=dispatch.tool_outcomes,
+                    mutation_ceiling=bindings.mutation_ceiling,
+                    authority_revocation=dispatch.authority_revocation,
+                    base_state=data.batch.entry_state,
+                    decoded_args_by_call_id=dispatch.decoded_args_by_call_id,
+                    private_authorings=dispatch.private_authorings,
+                    private_invocations=dispatch.private_invocations,
+                    assistant_message=dispatch.assistant_message,
+                    raw_assistant_content=dispatch.raw_assistant_content,
+                    assistant_tool_calls=dispatch.assistant_tool_calls,
+                    crash_pending=(
+                        dispatch.plugin_crash is not None
+                        or dispatch.advisor_failure is not None
+                        or dispatch.service_failure is not None
+                        or (
+                            data.batch.retained_failure is not None
+                            and data.batch.retained_failure.kind in ("plugin_crash", "advisor_failure")
+                        )
+                    ),
+                    session_id=bindings.session_id,
+                    session_operation_context=bindings.session_operation_context,
+                    current_state_id=live.current_state_id,
+                    persisted_tool_call_turn=live.persisted_tool_call_turn,
+                    persisted_assistant_message_id=live.persisted_assistant_message_id,
+                    persisted_assistant_content=live.persisted_assistant_content,
+                    ingress=bindings.ingress,
+                    chat_ingress_inputs=None if bindings.chat_ingress_inputs is None else list(bindings.chat_ingress_inputs),
+                    advisor_repair_context_introduced=live.advisor_repair_context_introduced,
+                    required_work=self.work,
+                    turn_evidence=live.turn_evidence,
+                    continuation=owner,
+                    terminal_completion=terminal,
+                )
+            except BaseException as failure:
+                original = failure if self.failure_custody is None else self.failure_custody.failure(failure)
+            finally:
+                # turn_audit retains actual committed publication before a
+                # deferred cancellation or verification failure may escape.
+                persist = owner.publication
+                if persist is not None:
+                    live.current_state_id = persist.current_state_id
+                    live.persisted_assistant_message_id = persist.persisted_assistant_message_id
+                    live.persisted_assistant_content = persist.persisted_assistant_content
+                    live.persisted_tool_call_turn, live.failed_turn = persist.persisted_tool_call_turn, persist.failed_turn
+                    live.advisor_calls_used = advisor_calls
+            if owner.publication is not None:
+                # The one checkpoint projection reconciled both actual SQL
+                # outputs before completing. Never submit a second apply here.
+                self.runtime = owner.runtime
+                if original is not None:
+                    raise original
+            elif original is not None:
+                raise original
+            try:
+                owner.raise_after_publication()
+            except BaseException as failure:
+                if self.failure_custody is not None:
+                    combined = self.failure_custody.failure(failure)
+                    if combined is failure:
+                        raise
+                    raise combined from combined.__cause__
+                raise
+            custody = self.failure_custody
+            if custody is not None and custody.completed:
+                if custody.wrapper is not None:
+                    raise custody.wrapper from custody.original
+                if custody.original is not None:
+                    raise custody.original
+
+        critical = self.lease.create_continuation_stage(publish(), name="continuation-required-p4")
+        await self.lease.join_continuation_stage(critical)
+        publication = owner.publication
+        if publication is None:
+            raise AuditIntegrityError("completed P4 lost its actual committed publication")
+        self.finished_batch = (dispatch, publication, data.batch.entry_state)
+
+    async def finish_owed_prefix(self, selected: SelectedContinuationState) -> None:
+        """Finish an actual retained prefix; the SQL owner proves durable Stop."""
+        if self.terminal_completion is not None:
+            await self._persist_batch(selected)
+            return
+        top = selected.stack.frames[-1]
+        if type(top) is not ToolBatchFrame or top.phase != "tool_ready" or top.accumulator.codec != "composer.coupled-batch-data.v1":
+            return
+        runtime, _inventory = await self.current(selected)
+        data = runtime.graph.batch
+        if data is None or not data.batch.tool_outcomes:
+            return
+        if data.batch.phase == "call_ready":
+            data.batch.stop_issued_batch = True
+            data.batch.phase = "dispatch_ready"
+        if data.batch.phase == "dispatch_ready":
+            await self._persist_batch(selected)
+
+    async def advance(
+        self, selected: SelectedContinuationState, *, phase_read: _CurrentPhaseRead | None = None
+    ) -> ToolNoExecutionRefusal | None:
+        if phase_read is not None:
+            self._require_phase_read(selected, phase_read)
+        if self.terminal_completion is not None:
+            await self._persist_batch(selected)
+            return None
+        top = selected.stack.frames[-1]
+        if type(top) is ComposeFrame and top.phase == "response_retained":
+            await self._initialize_batch(selected, phase_read=phase_read)
+            return None
+        if phase_read is not None:
+            raise AuditIntegrityError("live phase handoff belongs only to its retained PRIMARY response")
+        if type(top) is ToolBatchFrame and top.phase == "tool_ready":
+            runtime, _inventory = await self.current(selected)
+            if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "call_ready":
+                return await self._execute_one(selected)
+            if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "dispatch_ready":
+                await self._persist_batch(selected)
+                return None
+        raise AuditIntegrityError("selected phase has no matching live tool action")

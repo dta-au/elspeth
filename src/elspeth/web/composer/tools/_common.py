@@ -27,7 +27,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Final, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict, cast
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic import ValidationError as PydanticValidationError
@@ -36,7 +37,9 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_content import ComposerContentScope, MaterializedCompleteValue
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.emitted_option import emitted_option_values, env_placeholders_in
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -44,7 +47,7 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_protocols import PluginConfigProtocol
 from elspeth.contracts.secrets import WebSecretResolver
-from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import TriggerConfig
@@ -62,18 +65,21 @@ from elspeth.plugins.infrastructure.validation import (
     get_source_config_model,
     get_transform_config_model,
 )
+from elspeth.plugins.sources.blob_rows import BlobRowsEntry
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._producer_resolver import published_success_connection
 from elspeth.web.composer._validation_probe import is_inline_content_reference
+from elspeth.web.composer.content_views import build_bounded_composition_view, materialize_composition_value
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.plugin_policy_disclosure import (
     WEB_PROHIBITED_PLUGIN_EXPLANATION,
     ProhibitedPluginDisclosure,
     prohibited_plugin_section,
 )
 from elspeth.web.composer.protocol import ToolArgumentError
-from elspeth.web.composer.redaction import redact_source_storage_path
+from elspeth.web.composer.redaction import MAX_SOURCE_BLOB_IDS, redact_source_storage_path
 from elspeth.web.composer.state import (
     CandidateReviewReferenceFacts,
     CompositionState,
@@ -3674,6 +3680,11 @@ class ReviewedSourceAuthority:
         freeze_fields(self, "reviewed_sources", "verified_blob_paths")
 
 
+if TYPE_CHECKING:
+    from elspeth.web.composer.attachment_admission import AttachmentInspectionPolicy
+    from elspeth.web.sessions.continuation_owner_results import ContinuationReadObservations
+
+
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     """Immutable per-call context threaded through every ``execute_tool``
@@ -3788,7 +3799,63 @@ class ToolContext:
     tool_arguments_hash: str | None = None
     reviewed_source_authority: ReviewedSourceAuthority | None = None
     executing_proposal_id: str | None = None
+    # Selected only for approval-governed automatic execution; historical
+    # request restriction, never a replacement for current operation custody.
+    mutation_ceiling: ComposerMutationCeiling | None = None
     _interpretation_requirements_are_internal: bool = False
+    # Current continuation reads opt in as one coupled policy/observation pair.
+    attachment_inspection_policy: AttachmentInspectionPolicy | None = None
+    continuation_read_observations: ContinuationReadObservations | None = None
+
+
+def _current_composition_content_scope(state: CompositionState, context: ToolContext) -> ComposerContentScope:
+    """Bind a read to the actual current compose operation, never a supplied hash."""
+    if type(state) is not CompositionState or type(context) is not ToolContext:
+        raise AuditIntegrityError("Complete-value read requires owned current state and tool context")
+    operation, authority = context.session_operation_context, context.session_operation_authority
+    if (
+        type(operation) is not SessionOperationContext
+        or operation.operation_kind is not SessionOperationKind.COMPOSE
+        or authority is None
+        or type(context.session_id) is not str
+        or operation.fence.session_id != context.session_id
+        or type(context.user_id) is not str
+        or not context.user_id.strip()
+    ):
+        raise AuditIntegrityError("Complete-value read requires the actual authenticated compose operation")
+    try:
+        session_id = UUID(context.session_id)
+    except ValueError:
+        raise AuditIntegrityError("Complete-value read lacks a canonical session identity") from None
+    if str(session_id) != context.session_id:
+        raise AuditIntegrityError("Complete-value read lacks a canonical session identity")
+    authority.compare_and_swap(operation)
+    return ComposerContentScope(session_id, composition_content_hash(state))
+
+
+def _current_composition_content_projection(state: CompositionState, context: ToolContext) -> object:
+    # Prompt construction loads planner authoring aids, which import the tool
+    # planes. Resolve this application helper after registry initialization.
+    from elspeth.web.composer.prompts import project_composition_content
+
+    names = (
+        frozenset(item.name for item in context.secret_service.list_refs(context.user_id))
+        if context.secret_service is not None and context.user_id is not None
+        else frozenset()
+    )
+    return project_composition_content(state, env_ref_names=names)
+
+
+def materialize_pipeline_state_value(
+    reference_id: str,
+    state: CompositionState,
+    context: ToolContext,
+) -> MaterializedCompleteValue:
+    """Revalidate operation and current complete graph value on every invocation."""
+    scope = _current_composition_content_scope(state, context)
+    projection = _current_composition_content_projection(state, context)
+    view = build_bounded_composition_view(scope, projection)
+    return materialize_composition_value(view, reference_id, current_scope=scope, current_projection=projection)
 
 
 ToolHandler = Callable[
@@ -3978,19 +4045,35 @@ def _row_union_node_contract_error(
     return None
 
 
-def _serialize_set_pipeline_source(
-    source: SourceSpec,
-    *,
-    allow_blob_binding: bool,
-) -> tuple[dict[str, Any] | None, str | None]:
+def _serialize_set_pipeline_source(source: SourceSpec) -> tuple[dict[str, Any] | None, str | None]:
     options = _serialize_authoring_options(source.options)
+    if source.plugin == "blob_rows" or _SOURCE_BLOBS_OPTION_KEY in source.options:
+        if source.plugin != "blob_rows" or any(key in source.options for key in ("blob_ref", "path", "file", "mode", SOURCE_AUTHORING_KEY)):
+            return None, "the document source has contradictory scalar or plugin custody"
+        entries = options[_SOURCE_BLOBS_OPTION_KEY] if _SOURCE_BLOBS_OPTION_KEY in options else None
+        if type(entries) is not list or not 1 <= len(entries) <= MAX_SOURCE_BLOB_IDS:
+            return None, "the document source has no bounded public attachment list"
+        admitted_entries = [BlobRowsEntry.model_validate(entry, strict=True) for entry in entries]
+        blob_ids = [entry.blob_id for entry in admitted_entries]
+        if len(set(blob_ids)) != len(blob_ids) or len({entry.payload_ref for entry in admitted_entries}) != len(admitted_entries):
+            return None, "the document source repeats an attachment identity or content hash"
+        del options[_SOURCE_BLOBS_OPTION_KEY]
+        return (
+            {
+                "plugin": source.plugin,
+                "on_success": source.on_success,
+                "blob_ids": blob_ids,
+                "options": options,
+                "on_validation_failure": source.on_validation_failure,
+                "description": source.description,
+            },
+            None,
+        )
     blob_ref = source.options["blob_ref"] if "blob_ref" in source.options else None
     if blob_ref is not None:
-        if not allow_blob_binding:
-            return None, "named or multiple blob-backed sources cannot round-trip through set_pipeline v1"
         if type(blob_ref) is not str or not blob_ref.strip() or is_widened_blob_ref(blob_ref):
-            return None, "the default source has a non-scalar blob identity that set_pipeline v1 cannot bind safely"
-        for key in ("path", "blob_ref", "mode", SOURCE_AUTHORING_KEY):
+            return None, "the source has a non-scalar blob identity that set_pipeline cannot bind safely"
+        for key in ("path", "file", "blob_ref", "mode", SOURCE_AUTHORING_KEY):
             if key in options:
                 del options[key]
         return (
@@ -4011,7 +4094,7 @@ def _serialize_set_pipeline_source(
         or ("mode" in source.options and source.options["mode"] == "bind_source")
         or (type(path_value) is str and "/blobs/" in path_value)
     ):
-        return None, "the blob-backed source is missing a scalar blob identity that set_pipeline v1 can bind safely"
+        return None, "the blob-backed source is missing a scalar blob identity that set_pipeline can bind safely"
     return (
         {
             "plugin": source.plugin,
@@ -4046,10 +4129,7 @@ def _serialize_set_pipeline_arguments(state: CompositionState) -> tuple[dict[str
         return None, "resolved authoring review state is not safely reconstructible"
     if set(state.sources) == {"source"}:
         try:
-            source_payload, error = _serialize_set_pipeline_source(
-                state.sources["source"],
-                allow_blob_binding=True,
-            )
+            source_payload, error = _serialize_set_pipeline_source(state.sources["source"])
         except (KeyError, TypeError, ValueError):
             return None, "resolved authoring review state is not safely reconstructible"
         if error is not None:
@@ -4061,10 +4141,7 @@ def _serialize_set_pipeline_arguments(state: CompositionState) -> tuple[dict[str
     serialized_sources: dict[str, dict[str, Any]] = {}
     for source_name, source in state.sources.items():
         try:
-            source_payload, error = _serialize_set_pipeline_source(
-                source,
-                allow_blob_binding=False,
-            )
+            source_payload, error = _serialize_set_pipeline_source(source)
         except (KeyError, TypeError, ValueError):
             return None, "resolved authoring review state is not safely reconstructible"
         if error is not None:

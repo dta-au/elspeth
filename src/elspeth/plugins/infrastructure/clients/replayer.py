@@ -17,7 +17,6 @@ import json
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts import CallStatus, CallType
@@ -59,9 +58,10 @@ class ReplayedCall:
             raise ValueError(
                 f"ReplayedCall invariant violation: error_data provided but was_error=False (request_hash={self.request_hash!r})"
             )
-        if not isinstance(self.response_data, MappingProxyType):
-            object.__setattr__(self, "response_data", deep_freeze(self.response_data))
-        if self.error_data is not None and not isinstance(self.error_data, MappingProxyType):
+        # deep_freeze detaches a MappingProxyType input (a proxy is a view over
+        # a possibly mutable dict), so no isinstance skip is sound.
+        object.__setattr__(self, "response_data", deep_freeze(self.response_data))
+        if self.error_data is not None:
             object.__setattr__(self, "error_data", deep_freeze(self.error_data))
 
 

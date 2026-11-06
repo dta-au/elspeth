@@ -10,6 +10,7 @@ from sqlalchemy import event, select
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.blobs import BlobDeletionPlan, BlobRecord
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.blobs import service as blob_service_module
@@ -293,9 +294,14 @@ async def test_delete_recovers_each_committed_phase_after_ack_loss(
     original_mutate = authority.mutate
     injected = False
 
-    def lose_phase_ack[T](context: SessionOperationContext, mutation: Callable[[SessionOperationMutationTransaction], T]) -> T:
+    def lose_phase_ack[T](
+        context: SessionOperationContext,
+        mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
+    ) -> T:
         nonlocal injected
-        result = original_mutate(context, mutation)
+        result = original_mutate(context, mutation, auto_mutation=auto_mutation)
         matches_phase = isinstance(result, BlobDeletionPlan) and result.phase == phase
         if not injected and (matches_phase or (phase == "retired" and result is True)):
             injected = True
@@ -330,9 +336,14 @@ async def test_delete_unobservable_committed_phase_preserves_retry_obligation(
     committed = False
     observation_refused = False
 
-    def lose_committed_ack[T](context: SessionOperationContext, mutation: Callable[[SessionOperationMutationTransaction], T]) -> T:
+    def lose_committed_ack[T](
+        context: SessionOperationContext,
+        mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
+    ) -> T:
         nonlocal committed
-        result = original_mutate(context, mutation)
+        result = original_mutate(context, mutation, auto_mutation=auto_mutation)
         if isinstance(result, BlobDeletionPlan) and result.phase == "purge_pending" and not committed:
             committed = True
             raise ConnectionError("delete committed but acknowledgement lost")

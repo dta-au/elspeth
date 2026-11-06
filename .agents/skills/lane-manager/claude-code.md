@@ -14,9 +14,10 @@ the procedure or the CLI.
 
 ## The one-line return
 
-The brief tells the worker to write `.lanes/<lane-id>/report.md` and return
-one line. Claude Code truncates long subagent results and drops them entirely
-when the orchestrator is compacted — the file is the deliverable. When a
+The brief tells the worker to write `.claude/lanes/<run-id>/<lane-id>/report.md`
+and return one line. Claude Code truncates long subagent results and drops
+them entirely when the dispatching session is compacted — the file is the
+deliverable. When a
 result arrives, do not act on the line: run `verify`, then read `report.md`
 (or `report --run-id …`, which surfaces every summary line).
 
@@ -40,20 +41,21 @@ message: run `verify` before believing it.
 The previous session's agents are gone, so `ListAgents` returns none of them:
 
 ```bash
-python .agents/skills/lane-manager/lane_manager.py resume --lanes-dir .lanes --run-id <run-id> --redispatch
+python .agents/skills/lane-manager/lane_manager.py resume --lanes-dir .claude/lanes/<run-id> --run-id <run-id> --redispatch
 ```
 
 Spawn one `Agent` per brief it prints, named by lane id, and continue the
-phases from `status --run-id <run-id>`. Nothing else in `.lanes/` needs
+phases from `status --run-id <run-id>`. Nothing else in `.claude/lanes/<run-id>/` needs
 touching; a resumed worker finds the branch, worktree and partial edits where
 the killed one left them.
 
-## Standing grants on this repo (AGENTS.md)
+## Standing grants on this repo (docs/maintainer/toolchain.md)
 
-- Spawn without asking, at any depth and fan-out; idle lanes are the failure
-  mode. Brief each lane with an explicit `pytest -n` ceiling.
+- Spawn without asking, in proportion to risk: one implementer per lane, one
+  independent review per non-trivial commit group. Brief each lane with an
+  explicit `pytest -n` ceiling.
 - The `Workflow` tool is pre-authorised. A lane-manager run is deliberately
-  *not* a Workflow — the hub must hold `.lanes/` and make the ladder decisions
+  *not* a Workflow — the hub must hold `.claude/lanes/<run-id>/` and make the ladder decisions
   — but a lane may use one internally, and a post-run adversarial verify of
   every verified branch is a natural single-phase workflow.
 - Lanes never commit to the shared checkout; the hub is the sole writer there,

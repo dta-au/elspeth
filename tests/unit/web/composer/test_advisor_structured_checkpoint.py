@@ -10,7 +10,7 @@ import pytest
 import structlog
 from sqlalchemy import select
 
-from elspeth.web.composer import provider_gateway
+from elspeth.web.composer import advisor_checkpoint, provider_gateway
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.advisor_checkpoint import _AdvisorCheckpointComposeDeadlineExpired
 from elspeth.web.composer.audit import BufferingRecorder, ComposerLLMCallStatus
@@ -370,7 +370,9 @@ async def test_initial_deadline_does_not_create_pass(make_service, simple_state)
 async def test_every_invalid_contract_uses_format_retry_then_malformed(make_service, simple_state, invalid):
     service = make_service()
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(invalid, {}))
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, session_id=None)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="early", state=simple_state, recorder=None, **_fenced_session(service)
+    )
     assert verdict.ok is False
     assert verdict.failure_class == "malformed"
     assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 2
@@ -481,6 +483,19 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
     admissions = 0
     physical_calls = 0
     original_admit = ProviderCallCustody.admit
+    # blocked-retry: the compose budget must expire because the retry's admission
+    # blocks, never because attempt 1's SQL-backed preparation outlasted a fixed
+    # window on this host. Attempt 1 therefore gets a budget no host exhausts;
+    # when its reply arrives the budget clock skips forward to leave exactly the
+    # retry window, which the blocked admission then spends in real time.
+    real_time = asyncio.get_running_loop().time
+    start = real_time()
+    retry_window = 1.0
+    deadline = {"blocked-first": start + 0.2, "blocked-retry": start + 60.0}.get(scenario)
+    skipped = 0.0
+
+    def compose_budget_time() -> float:
+        return real_time() + skipped
 
     async def admission(custody: ProviderCallCustody, *, model: str) -> None:
         nonlocal admissions
@@ -493,9 +508,11 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
         await original_admit(custody, model=model)
 
     async def complete(**kwargs):
-        nonlocal physical_calls
+        nonlocal physical_calls, skipped
         physical_calls += 1
         assert "on_provider_dispatch" not in kwargs
+        if scenario == "blocked-retry":
+            skipped = deadline - retry_window - real_time()
         content = "not JSON" if scenario == "blocked-retry" else _reply(verdict="CLEAN", steps=[], findings="", note=None)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))],
@@ -505,12 +522,16 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
 
     monkeypatch.setattr(ProviderCallCustody, "admit", admission)
     monkeypatch.setattr(litellm, "acompletion", complete)
+    monkeypatch.setattr(advisor_checkpoint, "_compose_deadline_time", compose_budget_time)
+    # Only the deliberately blocked admission cases need a shared deadline; the
+    # clean/count-only cases are not deadline oracles. blocked-first expects no
+    # dispatch either way, so its short real-time budget cannot flip its outcome.
     with structlog.testing.capture_logs() as events, prompt_guard_user_scope(""):
         verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
             phase="early",
             state=simple_state,
             recorder=None,
-            deadline=asyncio.get_running_loop().time() + 0.2,
+            deadline=deadline,
             **fenced,
         )
     expected_calls = 0 if scenario == "blocked-first" else 1

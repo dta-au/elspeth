@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, final
 
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.credential_guard import require_no_credential_material
@@ -46,7 +47,7 @@ def scan_prepared_advisor_content(
         require_no_credential_material(
             witness.content,
             surface="composer_advisor_complete_content",
-            max_string_bytes=max(DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes, len(witness.content.encode("utf-8"))),
+            max_string_bytes=max(DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes, utf8_size(witness.content)),
         )
         residual[index] = dict(messages[index]) | {"content": "[complete Advisor content credential-scanned]"}
     return residual

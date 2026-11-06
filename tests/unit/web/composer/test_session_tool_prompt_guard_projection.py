@@ -40,7 +40,6 @@ from elspeth.web.sessions.models import chat_messages_table, quota_provider_atte
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.service import SessionServiceImpl
 from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
-from tests.unit.web.composer.test_pipeline_planner import _plan, _response, _ScriptedCompletion
 
 _USER = "Explain the neutral schema fields."
 _TOOL_ID = "session-feedback-call"
@@ -356,52 +355,3 @@ async def test_session_feedback_boundary_still_refuses_credentials_and_whole_ove
     if kind in {"credential", "atomic_oversize"}:
         assert current.azure_requests == []
     current.assert_settled()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mixed_discovery", [False, True], ids=["only-missing-component", "mixed-missing-component"])
-@pytest.mark.parametrize(
-    "component", ["界" * 1700, '"field",' * 800, "\x01" * 1700], ids=["cjk-countercontrol", "dense-quotes", "escaped-control"]
-)
-async def test_real_planner_missing_component_feedback_inspects_complete_authored_component(
-    tmp_path, tool_context, monkeypatch, mixed_discovery, component
-):
-    unique_evidence = "Component '" + component + "' not found."
-    inspected = []
-
-    def inspect(request):
-        body = json.loads(request.content)
-        inspected.append(body)
-        return httpx.Response(
-            200,
-            json={
-                "userPromptAnalysis": {"attackDetected": False},
-                "documentsAnalysis": [{"attackDetected": unique_evidence in document} for document in body["documents"]],
-            },
-        )
-
-    mount = PromptGuardMount(
-        AzurePromptGuardClient(
-            PromptGuardSettings(endpoint="https://planner.example.test", subscription_key="offline-planner"),
-            http_transport=httpx.MockTransport(inspect),
-        )
-    )
-    calls = [("get_pipeline_state", {"component": component})]
-    if mixed_discovery:
-        calls.append(("get_plugin_schema", {"plugin_type": "transform", "name": "field_mapper"}))
-    completion = _ScriptedCompletion(
-        _response(*calls), AssertionError("Missing-component feedback must block before the next physical SDK call")
-    )
-    with pytest.raises(PromptGuardRefused) as caught:
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=completion,
-            information_aware=True,
-            model_overrides={"prompt_guard_mount": mount, "prompt_guard_mode": "required"},
-        )
-    assert caught.value.disposition == "blocked"
-    assert caught.value._decision.reason == "policy_blocked"
-    assert len(completion.requests) == 1
-    assert "get_pipeline_state" in {tool["function"]["name"] for tool in completion.requests[0]["tools"]}
-    assert unique_evidence in "\n".join(document for request in inspected for document in request["documents"])

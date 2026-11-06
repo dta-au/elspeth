@@ -26,9 +26,9 @@ from sqlalchemy import text
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions._persist_payload import RedactedToolRow, StatePayload
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -409,7 +409,7 @@ def test_cross_allocator_save_state_serialises_with_persist_turn(service):
                     redacted_assistant_tool_calls=({"id": tool_call_id, "function": {"name": "f"}},),
                     redacted_tool_rows=(
                         # B1: no ``version=``; helper allocates under lock.
-                        RedactedToolRow(tool_call_id, "{}", StatePayload(data=CompositionStateData(), derived_from_state_id=None)),
+                        RedactedToolRow(tool_call_id, "{}", StatePayload(data=composition_state_data(), derived_from_state_id=None)),
                     ),
                     parent_composition_state_id=None,
                     expected_current_state_id=expected_current_state_id,
@@ -433,7 +433,7 @@ def test_cross_allocator_save_state_serialises_with_persist_turn(service):
                 asyncio.run(
                     service.save_composition_state(
                         session_uuid,  # ``save_composition_state`` takes UUID
-                        CompositionStateData(),
+                        composition_state_data(),
                         provenance="session_seed",
                         session_operation_context=session_operation_context,
                     )
@@ -527,7 +527,7 @@ def test_concurrent_persist_compose_turn_same_state_stale_rejects_without_integr
                         tool_call_id,
                         "{}",
                         StatePayload(
-                            data=CompositionStateData(),
+                            data=composition_state_data(),
                             derived_from_state_id=None,
                         ),
                     ),

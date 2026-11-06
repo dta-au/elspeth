@@ -6,7 +6,7 @@ import base64
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Final, Literal, Protocol, Self, final
+from typing import Final, Literal, Self, final
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
@@ -14,7 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.errors import ComposerOwnedSettlementFailure as ComposerOwnedSettlementFailure
-from elspeth.contracts.hashing import is_lower_sha256_hex
+from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions.operation_codec import session_operation_request_hash, strict_response_hash
 from elspeth.web.sessions.time_normalization import restore_utc
@@ -22,17 +22,13 @@ from elspeth.web.sessions.time_normalization import restore_utc
 type ComposerOperationKind = Literal["compose_message", "compose_recompose"]
 type ComposerOperationStatus = Literal["queued", "running", "completed", "failed"]
 type ComposerOperationFailureCode = Literal["http_error", "operation_failed", "worker_lost", "request_cancelled", "deadline_expired"]
-type ComposerOperationSettledBy = Literal[
-    "owner_terminal", "settle_unstarted", "request_cancel", "settle_lost", "settle_own_lapsed", "settle_lost_inactive_session"
-]
+type ComposerOperationSettledBy = Literal["owner_terminal", "settle_lost", "settle_lost_inactive_session"]
 COMPOSER_OPERATION_KINDS: Final[frozenset[str]] = frozenset(("compose_message", "compose_recompose"))
 COMPOSER_OPERATION_STATUSES: Final[frozenset[str]] = frozenset(("queued", "running", "completed", "failed"))
 COMPOSER_OPERATION_FAILURE_CODES: Final[frozenset[str]] = frozenset(
     ("http_error", "operation_failed", "worker_lost", "request_cancelled", "deadline_expired")
 )
-COMPOSER_OPERATION_SETTLED_BY: Final[frozenset[str]] = frozenset(
-    ("owner_terminal", "settle_unstarted", "request_cancel", "settle_lost", "settle_own_lapsed", "settle_lost_inactive_session")
-)
+COMPOSER_OPERATION_SETTLED_BY: Final[frozenset[str]] = frozenset(("owner_terminal", "settle_lost", "settle_lost_inactive_session"))
 COMPOSER_OPERATION_REQUEST_SCHEMA: Final = "composer-operation-request.v1"
 COMPOSER_OPERATION_RESULT_SCHEMA_SUCCESS: Final = "message_with_state.v1"
 COMPOSER_OPERATION_RESULT_SCHEMA_ERROR: Final = "composer_operation_error.v1"
@@ -84,7 +80,7 @@ def require_canonical_operation_id(value: object) -> str:
 
 
 class ComposerOperationError(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
     http_status: int = Field(ge=400, le=599)
     failure_code: ComposerOperationFailureCode
     error_type: str | None
@@ -132,10 +128,16 @@ type ComposerOperationPublicFailureType = Literal[
     "operation_failed",
     "audit_integrity_error",
     "database_unavailable",
+    "executor_unavailable",
     "storage_unavailable",
     "stale_compose_state",
+    "composer_mutation_authority_revoked",
     "fingerprint_key_missing",
     "secret_decryption_failed",
+    "composer_admission_refused",
+    "paid_result_overflow",
+    "paid_result_incomplete",
+    "provider_sdk_terminal",
 ]
 COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
     (
@@ -145,10 +147,16 @@ COMPOSER_OPERATION_PUBLIC_FAILURE_TYPES: Final[frozenset[str]] = frozenset(
         "operation_failed",
         "audit_integrity_error",
         "database_unavailable",
+        "executor_unavailable",
         "storage_unavailable",
         "stale_compose_state",
+        "composer_mutation_authority_revoked",
         "fingerprint_key_missing",
         "secret_decryption_failed",
+        "composer_admission_refused",
+        "paid_result_overflow",
+        "paid_result_incomplete",
+        "provider_sdk_terminal",
     )
 )
 
@@ -208,10 +216,6 @@ def decode_composer_failure_cursor(value: str) -> ComposerOperationFailureCursor
     return ComposerOperationFailureCursor.model_validate_json(encoded, strict=True)
 
 
-class ComposerOperationCancelledFailure(Protocol):
-    def __call__(self, *, request_id: str | None) -> ComposerOperationError: ...
-
-
 def composer_operation_request_hash(*, session_id: UUID, kind: ComposerOperationKind, request: BaseModel) -> str:
     from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
 
@@ -220,6 +224,11 @@ def composer_operation_request_hash(*, session_id: UUID, kind: ComposerOperation
         raise AuditIntegrityError("Composer operation kind and strict request DTO disagree")
     type(request).model_validate(request.model_dump(mode="python"), strict=True)
     return session_operation_request_hash(schema=COMPOSER_OPERATION_REQUEST_SCHEMA, session_id=session_id, kind=kind, request=request)
+
+
+def composer_operation_admission_request_hash(*, session_id: UUID, kind: ComposerOperationKind, request: BaseModel) -> str:
+    old_hash = composer_operation_request_hash(session_id=session_id, kind=kind, request=request)
+    return stable_hash({"schema": "composer-operation-request.v2", "lifecycle_version": 2, "v1_request_hash": old_hash})
 
 
 def validate_composer_operation_request_json(request_json: str) -> None:
@@ -244,6 +253,8 @@ class ComposerOperationClaim:
     operation_id: str
     claim_token: str
     attempt: int
+    segment_sequence: int
+    ownership_generation: int
 
     def __post_init__(self) -> None:
         if type(self.session_id) is not UUID:
@@ -253,6 +264,8 @@ class ComposerOperationClaim:
             raise ValueError("Composer claim token must be bounded and nonempty")
         if type(self.attempt) is not int or self.attempt < 1:
             raise ValueError("Composer claim attempt must be positive")
+        if any(type(value) is not int or value < 1 for value in (self.segment_sequence, self.ownership_generation)):
+            raise ValueError("invalid continuation segment claim")
 
 
 @final
@@ -282,15 +295,12 @@ class ComposerOperationRecord:
     actor_user_id: str
     request_id: str | None
     base_state_id: UUID | None
-    deadline_at: datetime
     created_at: datetime
     updated_at: datetime
     started_at: datetime | None
     settled_at: datetime | None
     cancel_requested_at: datetime | None
-    claim_token_present: bool
     claim_owner_instance_id: str | None
-    claim_expires_at: datetime | None
     attempt: int
     session_operation_id: str | None
     session_operation_epoch: int | None
@@ -301,6 +311,14 @@ class ComposerOperationRecord:
     result_json: str | None
     result_sha256: str | None
     request_json: str | None
+    phase: Literal["queued", "executing", "continuation_queued", "reconciling", "retry_waiting", "settled"]
+    status_revision: int
+    current_segment_sequence: int
+    ownership_generation: int
+    checkpoint_id: str
+    journal_cursor: int
+    ingress_phase: Literal["pending", "committed"]
+    reserved_user_message_id: UUID
 
     def __post_init__(self) -> None:
         try:
@@ -312,98 +330,103 @@ class ComposerOperationRecord:
         from elspeth.web.sessions.schemas import MessageWithStateResponse, RecomposeRequest, SendMessageRequest
 
         if type(self.session_id) is not UUID:
-            raise ValueError("Invalid session identity")
+            raise ValueError("continuation parent must have UUID custody")
         require_canonical_operation_id(self.operation_id)
         if self.kind not in COMPOSER_OPERATION_KINDS or self.status not in COMPOSER_OPERATION_STATUSES:
-            raise ValueError("Unknown operation discriminator")
+            raise ValueError("unknown operation discriminator")
         if not is_lower_sha256_hex(self.request_hash):
-            raise ValueError("Invalid request digest")
+            raise ValueError("invalid request digest")
         if type(self.actor_user_id) is not str or not 1 <= len(self.actor_user_id) <= 128:
-            raise ValueError("Invalid actor")
+            raise ValueError("invalid actor")
         if self.request_id is not None and (type(self.request_id) is not str or not 1 <= len(self.request_id) <= 128):
-            raise ValueError("Invalid request correlation")
-        if type(self.attempt) is not int or self.attempt < 0 or type(self.claim_token_present) is not bool:
-            raise ValueError("Invalid claim attempt")
-        for value in (self.base_state_id, self.user_message_id):
-            if value is not None and type(value) is not UUID:
-                raise ValueError("Invalid UUID locator")
-        for timestamp in (self.deadline_at, self.created_at, self.updated_at):
-            if type(timestamp) is not datetime:
-                raise ValueError("Invalid timestamp")
-        if restore_utc(self.updated_at) < restore_utc(self.created_at) or restore_utc(self.deadline_at) <= restore_utc(self.created_at):
-            raise ValueError("Invalid timestamp ordering")
-        for optional_timestamp in (self.started_at, self.settled_at, self.cancel_requested_at, self.claim_expires_at):
-            if optional_timestamp is not None and (
-                type(optional_timestamp) is not datetime or restore_utc(optional_timestamp) < restore_utc(self.created_at)
-            ):
-                raise ValueError("Invalid optional timestamp")
-        if self.settled_at is not None and self.started_at is not None and restore_utc(self.settled_at) < restore_utc(self.started_at):
-            raise ValueError("Settlement precedes start")
+            raise ValueError("invalid correlation")
         if self.claim_owner_instance_id is not None and (
             type(self.claim_owner_instance_id) is not str or not 1 <= len(self.claim_owner_instance_id) <= 128
         ):
-            raise ValueError("Invalid owner")
-        fence = (self.session_operation_id, self.session_operation_epoch, self.started_at)
-        if any(x is not None for x in fence) and any(x is None for x in fence):
-            raise ValueError("Partial started fence bundle")
-        started = self.started_at is not None
-        if started:
-            if type(self.session_operation_id) is not str or not self.session_operation_id:
-                raise ValueError("Invalid session operation id")
-            if type(self.session_operation_epoch) is not int or self.session_operation_epoch < 1 or self.attempt < 1:
-                raise ValueError("Invalid started epoch/attempt")
-            if self.claim_owner_instance_id is None:
-                raise ValueError("Started operation lost owner")
+            raise ValueError("invalid owner projection")
+        if self.session_operation_id is not None and (type(self.session_operation_id) is not str or not self.session_operation_id):
+            raise ValueError("invalid session operation projection")
+        if self.session_operation_epoch is not None and (type(self.session_operation_epoch) is not int or self.session_operation_epoch < 1):
+            raise ValueError("invalid session operation epoch projection")
+        for value in (self.base_state_id, self.user_message_id):
+            if value is not None and type(value) is not UUID:
+                raise ValueError("invalid UUID locator")
+        if (
+            type(self.status_revision) is not int
+            or self.status_revision < 0
+            or type(self.journal_cursor) is not int
+            or self.journal_cursor < 0
+        ):
+            raise ValueError("invalid continuation counters")
+        if type(self.current_segment_sequence) is not int or self.current_segment_sequence < 1:
+            raise ValueError("invalid segment sequence")
+        if type(self.ownership_generation) is not int or self.ownership_generation < 1:
+            raise ValueError("invalid ownership generation")
+        if self.checkpoint_id is None:
+            raise ValueError("missing complete snapshot pointer")
+        require_canonical_operation_id(self.checkpoint_id)
+        if type(self.reserved_user_message_id) is not UUID or self.ingress_phase not in ("pending", "committed"):
+            raise ValueError("missing ingress reservation")
+        if self.ingress_phase == "pending" and self.user_message_id is not None:
+            raise ValueError("pending ingress already has a user row")
+        if self.ingress_phase == "committed" and self.user_message_id != self.reserved_user_message_id:
+            raise ValueError("committed ingress changed reserved identity")
+        if self.kind == "compose_recompose" and self.ingress_phase != "committed":
+            raise ValueError("recompose ingress must be committed")
+        if type(self.attempt) is not int or self.attempt < 0:
+            raise ValueError("invalid parent attempt")
+        if (
+            type(self.created_at) is not datetime
+            or type(self.updated_at) is not datetime
+            or restore_utc(self.updated_at) < restore_utc(self.created_at)
+        ):
+            raise ValueError("invalid parent timestamps")
+        for timestamp in (self.started_at, self.settled_at, self.cancel_requested_at):
+            if timestamp is not None and (type(timestamp) is not datetime or restore_utc(timestamp) < restore_utc(self.created_at)):
+                raise ValueError("invalid optional timestamp")
         if self.status in ("queued", "running"):
+            if self.phase not in ("queued", "executing", "continuation_queued", "reconciling", "retry_waiting"):
+                raise ValueError("invalid active phase")
             if any(
-                x is not None
-                for x in (self.settled_at, self.result_schema, self.result_json, self.result_sha256, self.failure_code, self.settled_by)
+                value is not None
+                for value in (self.settled_at, self.result_schema, self.result_json, self.result_sha256, self.failure_code, self.settled_by)
             ):
-                raise ValueError("Live operation has terminal fields")
-            # request_json is deliberately omitted by poll reads; full reads validate it below.
-            if self.status == "queued":
-                if started or self.user_message_id is not None:
-                    raise ValueError("Queued operation has started fields")
-                claimed = (self.claim_token_present, self.claim_owner_instance_id is not None, self.claim_expires_at is not None)
-                if any(claimed) and not all(claimed):
-                    raise ValueError("Partial queued claim")
-                if self.claim_token_present and self.attempt < 1:
-                    raise ValueError("Claimed operation has no attempt")
-            elif not started or not self.claim_token_present or self.claim_expires_at is not None:
-                raise ValueError("Invalid running bundle")
+                raise ValueError("active parent contains terminal result")
             if self.request_json is not None:
                 validate_composer_operation_request_json(self.request_json)
                 model = SendMessageRequest if self.kind == "compose_message" else RecomposeRequest
                 request = model.model_validate_json(self.request_json, strict=True)
                 if request.operation_id != self.operation_id or request.state_id != self.base_state_id:
-                    raise ValueError("Request identity/base mismatch")
-                if composer_operation_request_hash(session_id=self.session_id, kind=self.kind, request=request) != self.request_hash:
-                    raise ValueError("Request digest mismatch")
+                    raise ValueError("request identity/base mismatch")
+                if isinstance(request, RecomposeRequest) and request.expected_user_message_id != self.reserved_user_message_id:
+                    raise ValueError("recompose request changed reserved original message")
                 if (
-                    self.status == "running"
-                    and isinstance(request, RecomposeRequest)
-                    and request.expected_user_message_id != self.user_message_id
+                    composer_operation_admission_request_hash(session_id=self.session_id, kind=self.kind, request=request)
+                    != self.request_hash
                 ):
-                    raise ValueError("Recompose user binding mismatch")
+                    raise ValueError("request digest mismatch")
             return
-        if self.request_json is not None or self.claim_token_present or self.claim_expires_at is not None or self.settled_at is None:
-            raise ValueError("Invalid terminal custody")
-        if self.settled_by not in COMPOSER_OPERATION_SETTLED_BY or not is_lower_sha256_hex(self.result_sha256) or self.result_json is None:
-            raise ValueError("Invalid terminal result")
+        if self.phase != "settled" or self.request_json is not None or self.settled_at is None:
+            raise ValueError("invalid terminal continuation bundle")
+        if self.settled_by not in COMPOSER_OPERATION_SETTLED_BY or self.result_json is None or not is_lower_sha256_hex(self.result_sha256):
+            raise ValueError("missing terminal receipt")
         if self.status == "completed":
-            if not started or self.cancel_requested_at is not None or self.failure_code is not None or self.user_message_id is None:
-                raise ValueError("Invalid completed bundle")
-            if self.result_schema != COMPOSER_OPERATION_RESULT_SCHEMA_SUCCESS:
-                raise ValueError("Invalid completed schema")
+            if (
+                self.cancel_requested_at is not None
+                or self.failure_code is not None
+                or self.user_message_id is None
+                or self.result_schema != COMPOSER_OPERATION_RESULT_SCHEMA_SUCCESS
+            ):
+                raise ValueError("invalid completed continuation")
             response: BaseModel = MessageWithStateResponse.model_validate_json(self.result_json, strict=True)
         else:
-            if self.failure_code not in COMPOSER_OPERATION_FAILURE_CODES or self.result_schema != COMPOSER_OPERATION_RESULT_SCHEMA_ERROR:
-                raise ValueError("Invalid failed schema/code")
+            if self.result_schema != COMPOSER_OPERATION_RESULT_SCHEMA_ERROR or self.failure_code not in COMPOSER_OPERATION_FAILURE_CODES:
+                raise ValueError("invalid failed continuation")
             response = ComposerOperationError.model_validate_json(self.result_json, strict=True)
             if response.failure_code != self.failure_code:
-                raise ValueError("Failed response disagrees with row")
+                raise ValueError("failed continuation code mismatch")
         if strict_response_hash(response) != self.result_sha256:
-            raise ValueError("Terminal digest mismatch")
+            raise ValueError("terminal continuation digest mismatch")
 
 
 @final

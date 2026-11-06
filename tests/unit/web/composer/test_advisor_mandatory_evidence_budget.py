@@ -31,10 +31,10 @@ from elspeth.web.composer.advisor_context import (
     advisor_system_instructions_for_trigger,
     advisor_user_content_parts,
     build_advisor_user_message,
-    summarize_pipeline_for_advisor,
 )
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
+from elspeth.web.composer.content_scope import composition_scope_for_operation
 from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
@@ -165,11 +165,17 @@ async def test_bound_end_preserves_mandatory_evidence_beyond_hint_allowance(
         prompt_guard_mount=PromptGuardMount(AzurePromptGuardClient(guard_settings, http_transport=httpx.MockTransport(inspect))),
     )
     await checkpoint._chargeable_admission.require(context)
-    arguments = checkpoint._build_checkpoint_arguments(phase="end", state=state, user_message=request, publication_review=review)
-    full_summary = summarize_pipeline_for_advisor(state)
-    # This replaces only the summary in a measurement copy. The runner below
-    # builds its own arguments through the actual production fitter.
-    complete = {**arguments, "schema_excerpt": full_summary}
+    scope = composition_scope_for_operation(
+        state,
+        session_id=context.fence.session_id,
+        session_operation_context=context,
+        session_operation_authority=sessions.session_operation_authority,
+    )
+    names = await checkpoint._current_env_ref_names(context.fence.session_id)
+    arguments = checkpoint._build_checkpoint_arguments(
+        phase="end", state=state, content_scope=scope, env_ref_names=names, user_message=request, publication_review=review
+    )
+    complete = dict(arguments)
     complete_text = build_advisor_user_message(complete)
     mandatory_text = build_advisor_user_message({**complete, "schema_excerpt": ""})
     allowance = settings.composer_advisor_max_prompt_tokens * ADVISOR_CHARS_PER_TOKEN
@@ -277,8 +283,10 @@ async def test_bound_end_preserves_mandatory_evidence_beyond_hint_allowance(
     assert len(sdk_calls) == len(recorder.llm_calls) == 1
     assert review.payload_json == original_private and review.provider_payload_json == original_provider
     assert (
-        checkpoint._build_checkpoint_arguments(phase="end", state=state, user_message=request, publication_review=review)["schema_excerpt"]
-        == full_summary
+        checkpoint._build_checkpoint_arguments(
+            phase="end", state=state, content_scope=scope, env_ref_names=names, user_message=request, publication_review=review
+        )["schema_excerpt"]
+        == arguments["schema_excerpt"]
     )
     parts = advisor_user_content_parts(complete)
     assert "".join(part.text for part in parts) == complete_text

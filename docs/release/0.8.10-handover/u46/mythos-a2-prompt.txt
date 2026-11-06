@@ -1,0 +1,12 @@
+Defensive security review of our own static-analysis gate (ELSPETH, maintainer-authorised, Anthropic CVP defensive scope). Read-only. Answer inline in under 900 words, citing file:line. This is a CONFIRM pass.
+
+Your previous review of the (a) design is at .claude/lanes/release-0.8.10/u46fix/mythos-a-design-review.md. It found that §8 was not landable: §8.6 proved R_fix >= R_dfs when rows come from the origin consumers; acyclic exactness was false with no collapse; rule 3 was scoped too wide; the Call override yielded two origins; the ClassDef producer edge and formal defaults were wrong; and the cache, budget and evidence obligations were missing.
+
+The engineer has revised the design. Read docs/release/0.8.10-fencing-gate-diagnosis.md §8 in this worktree (commit a40c87fda). Changes are tagged [R1]-[R7]. The evaluator is retained_enum_state and its consumers in tests/unit/architecture/test_web_landscape_mutation_fencing.py at commit 036a708f5 (`git show 036a708f5:tests/unit/architecture/test_web_landscape_mutation_fencing.py`).
+
+Questions:
+1. For each finding in your previous review, is it resolved? Answer RESOLVED / PARTIAL / NOT RESOLVED with the §8 line that resolves it.
+2. Elementwise rows: is "each consumer denies if any element denies, over the product when it combines several inputs" sound for every consumer of retained_expression, including consumers that combine two origins or test non-membership? Name any consumer where per-element evaluation, or the A-false union of retained and not-retained branches, could yield FEWER denials than the DFS, or could blow up combinatorially.
+3. Do I1-I4 together with collapse-only-at-A-true-Names give exact DFS equality on G-acyclic roots? Give a counterexample if not.
+4. Anything new the revision introduced that is unsound or unbounded.
+5. Verdict: LANDABLE AS DESIGNED (implement and verify per §8.8), or the specific remaining changes.

@@ -1,0 +1,28 @@
+"""Current genuine paid metadata integrity controls on PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_current_metadata_integrity import (
+    test_actual_driver_handover_after_metadata_commit_without_new_provider as test_actual_driver_handover_after_metadata_commit_without_new_provider,
+)
+from tests.unit.web.sessions.test_continuation_current_metadata_integrity import (
+    test_bound_refusal_preserves_sql_and_required_work as test_bound_refusal_preserves_sql_and_required_work,
+)
+from tests.unit.web.sessions.test_continuation_current_metadata_integrity import (
+    test_committed_snapshot_precedes_cancelled_delivery as test_committed_snapshot_precedes_cancelled_delivery,
+)
+from tests.unit.web.sessions.test_continuation_current_metadata_integrity import (
+    test_complete_prefixes_and_cold_graph_preserve_original_tool_result as test_complete_prefixes_and_cold_graph_preserve_original_tool_result,
+)
+from tests.unit.web.sessions.test_continuation_current_metadata_integrity import (
+    test_full_tail_capacity_counts_off_head_history_before_issue as test_full_tail_capacity_counts_off_head_history_before_issue,
+)
+from tests.unit.web.sessions.test_continuation_current_metadata_integrity import (
+    test_locked_admission_preserves_existing_review_rows as test_locked_admission_preserves_existing_review_rows,
+)
+from tests.unit.web.sessions.test_continuation_current_metadata_integrity import (
+    test_publication_failure_rolls_back_tool_and_all_prefixes as test_publication_failure_rolls_back_tool_and_all_prefixes,
+)
+
+pytestmark = pytest.mark.testcontainer

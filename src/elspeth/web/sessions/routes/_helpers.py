@@ -78,6 +78,7 @@ from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import (
     ComposerProgressRegistry,
     ComposerProgressSnapshot,
@@ -94,6 +95,7 @@ from elspeth.web.composer.protocol import (
     ComposerService,
     ComposerServiceError,
 )
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_telemetry import (
@@ -111,6 +113,7 @@ from elspeth.web.composer.telemetry_phase8 import (
 from elspeth.web.composer.tools import execute_tool
 from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.composer.yaml_serializer import ComposerYamlSerializer
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, DatabaseComposerProgressRegistry
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import (
@@ -756,6 +759,8 @@ def _litellm_error_detail(
         "error_type": error_type,
         "detail": type(exc).__name__,
     }
+    if type(exc) is _BadRequestLLMError and exc.request_rejection is not None:
+        detail["request_rejection"] = exc.request_rejection.to_wire()
     if not expose_provider_error:
         return detail
 
@@ -989,6 +994,7 @@ def _state_response(
         id=str(state.id),
         session_id=str(state.session_id),
         version=state.version,
+        composition_content_hash=composition_content_hash(_state_from_record(state)),
         sources=sources_data,
         nodes=deep_thaw(state.nodes),
         edges=deep_thaw(state.edges),
@@ -1015,16 +1021,7 @@ def _plugin_policy_findings(
 
     components: list[tuple[str, PluginId]] = []
 
-    # ``source`` is the documented bridge for rows written before the
-    # multi-source ``sources`` column. New writers always persist ``sources``;
-    # accepting both at once would make the source of truth ambiguous.
-    sources = state.sources
-    if sources is None:
-        sources = {}
-        if state.source is not None:
-            sources = {"source": state.source}
-    elif state.source is not None:
-        raise AuditIntegrityError("persisted plugin policy source projection has both source and sources")
+    sources = state.sources if state.sources is not None else {}
     for source_name, source in sources.items():
         if type(source_name) is not str or source_name == "":
             raise AuditIntegrityError("persisted plugin policy source name must be a non-empty string")
@@ -1112,6 +1109,30 @@ async def _durable_completion_gates(
     if graph.hydration_error is not None:
         raise AuditIntegrityError("Cannot carry completion gates from an unreadable composition head")
     return completion_gates_meta_from_facts(graph.effective_completion_gates)
+
+
+async def _recovery_capture_is_durable_head(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    partial_state: CompositionState,
+) -> bool:
+    """Whether a recovery capture re-projects the durable head it would replace.
+
+    A recovery persist appends a row, and the head is the highest version, so
+    every such save becomes the session head. P4 commits each mutating tool
+    turn as a ``tool_call`` checkpoint and verifies it against the dispatched
+    state. When P4 committed, ``partial_state`` is that checkpoint's graph and
+    the save re-projects it in the strict lane. When P4 rolled back (a plugin
+    crash unwind) or never started (a runtime-preflight crash inside a batch),
+    nothing committed, verified or authorized the graph. It must not become
+    the head; the carried tool invocations remain the crash evidence.
+    """
+    graph = await service.read_current_composition_graph(session_id)
+    if graph.hydration_error is not None:
+        raise AuditIntegrityError("Cannot bind a recovery capture to an unreadable composition head")
+    if graph.record is None:
+        return False
+    return composition_content_hash(_state_from_record(graph.record)) == composition_content_hash(partial_state)
 
 
 def merge_composer_meta_updates(
@@ -1949,7 +1970,7 @@ async def _runtime_preflight_for_state(
             validate_pipeline,
             state,
             settings,
-            yaml_generator,
+            ComposerYamlSerializer(),
             secret_service=secret_service,
             secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
             user_id=user_id,
@@ -3059,6 +3080,11 @@ PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
 # ``failure_code -> (http_status, safe static detail)``. The detail text is
 # provider-safe (no exception message, no provider content).
 _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
+    "configuration_unsupported": (
+        503,
+        "The configured legacy planner repair budget is not supported by the common composer. "
+        "Use the compatibility default of 2 or the direct planner library with its explicit repair policy.",
+    ),
     "cost_unavailable": (
         503,
         "The composer could not determine the model cost. Ask an administrator to configure or correct model pricing before trying again.",
@@ -3085,7 +3111,7 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
 }
 
 
-def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
+def planner_failure_is_policy_blocked(exc: PipelinePlannerError | CommonProviderCostRefused) -> bool:
     """Return whether a planner failure was a categorical deployment-policy refusal.
 
     This predicate is evaluated before mapping a planner error code because a
@@ -3109,6 +3135,7 @@ def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
 # that vocabulary is a frontend/contract change rather than an attribution fix. It therefore
 # still reads ``provider_unavailable`` — a known residual, not an oversight.
 _FREEFORM_PLANNER_PROGRESS_REASONS: Final[dict[str, ComposerProgressReason]] = {
+    "REPAIR_POLICY_UNSUPPORTED": "service_setup_failed",
     "COST_UNAVAILABLE": "service_setup_failed",
     "REPAIR_EXHAUSTED": "planner_repair_exhausted",
     "COMPOSITION_EXHAUSTED": "convergence_composition_budget",
@@ -3125,7 +3152,7 @@ def freeform_planner_progress_reason(planner_code: str) -> ComposerProgressReaso
     return "provider_unavailable"
 
 
-def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
+def _freeform_planner_failure_code(exc: PipelinePlannerError | CommonProviderCostRefused) -> str:
     """Map a ``PipelinePlannerError.code`` to a closed freeform failure code.
 
     Use closed, provider-safe codes for the HTTP response.
@@ -3136,6 +3163,8 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
         return "provider_timeout"
     if exc.code == "PROVIDER_ERROR":
         return "provider_unavailable"
+    if exc.code == "REPAIR_POLICY_UNSUPPORTED":
+        return "configuration_unsupported"
     if exc.code == "COST_UNAVAILABLE":
         return "cost_unavailable"
     if exc.code == "REPAIR_EXHAUSTED":
@@ -3148,7 +3177,7 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
 
 
 async def _handle_planner_failure(
-    exc: PipelinePlannerError,
+    exc: PipelinePlannerError | CommonProviderCostRefused,
     service: SessionServiceProtocol,
     session_id: UUID,
     llm_composition_state_id: UUID | None,
@@ -3164,12 +3193,10 @@ async def _handle_planner_failure(
     ``(status, body)`` the route raises. Shared by ``send_message`` and
     ``recompose`` so the two freeform routes cannot drift on planner-failure UX.
 
-    The planner's LLM-call audit evidence is already durable — ``plan_pipeline``
-    stamps it onto the escaping exception via ``attach_llm_calls`` and
-    ``_plan_and_stage_empty_pipeline`` persists it before re-raise (which also
-    sets ``llm_calls_durable``) — so this MUST NOT re-persist it. The
-    disposition row is a distinct ``_kind`` and carries only the closed code, no
-    provider content, usage, or model metadata.
+    The caller must complete required LLM sidecar persistence before this
+    separate disposition. The direct planner facade already drains its own
+    calls; common provider policy refusal uses the turn owner's required drain.
+    An empty call tuple is valid only when no covered SDK attempt occurred.
     """
     failure_code = _freeform_planner_failure_code(exc)
     status_code, detail = _FREEFORM_PLANNER_FAILURE_HTTP[failure_code]
@@ -3305,7 +3332,12 @@ async def _handle_convergence_error(
         response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
     required_state_failure: SQLAlchemyError | None = None
     persisted_state_id: UUID | None = None
-    if exc.partial_state is not None:
+    # Save only a re-projection of the durable checkpoint; an unverified
+    # capture is never saved, because any save becomes the session head.
+    capture = exc.partial_state
+    if capture is not None and not await _recovery_capture_is_durable_head(service, session_id, capture):
+        capture = None
+    if capture is not None:
         # Persistence guard: DB write failure should not upgrade the
         # response from 422 (convergence error) to 500 (internal).
         #
@@ -3322,7 +3354,7 @@ async def _handle_convergence_error(
         # the app-level fail-closed handler, not become a recovery detail.
         try:
             state_data, _validation = await _state_data_from_composer_state(
-                exc.partial_state,
+                capture,
                 settings=settings,
                 secret_service=secret_service,
                 user_id=user_id,
@@ -3491,7 +3523,11 @@ async def _handle_plugin_crash(
 
     required_state_failure: SQLAlchemyError | None = None
     persisted_state_id_pc: UUID | None = None
-    if exc.partial_state is not None:
+    # A P4 unwind leaves an uncommitted graph here; see the convergence sibling.
+    capture = exc.partial_state
+    if capture is not None and not await _recovery_capture_is_durable_head(service, session_id, capture):
+        capture = None
+    if capture is not None:
         # Persistence guard: DB write failure MUST NOT mask the original
         # plugin crash (response stays as the 500 below, the save failure
         # is recorded as a separate audit-system-failure slog event).
@@ -3506,7 +3542,7 @@ async def _handle_plugin_crash(
         # see the comment there for the full rationale.
         try:
             state_data, _validation = await _state_data_from_composer_state(
-                exc.partial_state,
+                capture,
                 settings=settings,
                 secret_service=secret_service,
                 user_id=user_id,
@@ -3588,14 +3624,19 @@ async def _handle_plugin_crash(
     # earlier entries are the calls that successfully ran before the
     # plugin bug fired.
     # Compose-loop plugin-crash rows commit before the carrier is raised.
-    # Retain this drain only for older/non-loop carriers with no failed_turn.
+    # Drain only carriers whose turn left no rows: older/non-loop carriers
+    # with no failed_turn, and a P4 unwind (no assistant row, no tool
+    # responses), which carries exactly its rolled-back suffix.
     # Tool rows and LLM sidecars settle as ONE cohort in a single
     # transaction (elspeth-90231248dc) despite their differing state ids.
+    unpersisted_turn = exc.failed_turn is None or (
+        exc.failed_turn.assistant_message_id is None and exc.failed_turn.tool_responses_persisted == 0
+    )
     try:
         await _persist_turn_audit_cohort(
             service,
             session_id,
-            exc.tool_invocations if exc.failed_turn is None else (),
+            exc.tool_invocations if unpersisted_turn else (),
             exc.llm_calls,
             tool_composition_state_id=persisted_state_id_pc,
             llm_composition_state_id=llm_composition_state_id,
@@ -3679,14 +3720,14 @@ async def _handle_runtime_preflight_failure(
       cache re-raise.
 
     * Recovery site (both paths) — this helper emits
-      ``source=runtime_preflight`` exactly once per invocation. When
-      ``exc.partial_state is not None``, the emission is fired
+      ``source=runtime_preflight`` exactly once per invocation. When a
+      capture re-projects the durable head, the emission is fired
       automatically by the persist_invalid arm of the re-call to
-      ``_state_data_from_composer_state``. When ``exc.partial_state is
-      None`` (the path-1 cached re-raise with no LLM mutation case), the
-      persist_invalid re-call is skipped and the helper instead fires
-      the recovery emission inline. Either way, the recovery counter
-      increments once per handler invocation.
+      ``_state_data_from_composer_state``. When there is no capture (the
+      path-1 cached re-raise with no LLM mutation case) or the capture is
+      withheld as unverified, the persist_invalid re-call is skipped and
+      the helper instead fires the recovery emission inline. Either way,
+      the recovery counter increments once per handler invocation.
 
     Operators querying primary failure rate filter on
     ``source ∈ {compose, recompose, cached_preflight, plugin_crash,
@@ -3766,7 +3807,12 @@ async def _handle_runtime_preflight_failure(
 
     required_state_failure: SQLAlchemyError | None = None
     persisted_state_id_rpf: UUID | None = None
-    if exc.partial_state is not None:
+    # A preflight crash inside a batch escapes before P4; see the convergence
+    # sibling. A withheld capture takes the no-partial telemetry branch below.
+    capture = exc.partial_state
+    if capture is not None and not await _recovery_capture_is_durable_head(service, session_id, capture):
+        capture = None
+    if capture is not None:
         # Persistence guard: DB write failure MUST NOT mask the original
         # runtime-preflight failure (response stays as the 500 below; the
         # save failure is recorded as a separate audit-system-failure
@@ -3781,7 +3827,7 @@ async def _handle_runtime_preflight_failure(
         # SQLAlchemyError width.
         try:
             state_data, _validation = await _state_data_from_composer_state(
-                exc.partial_state,
+                capture,
                 settings=settings,
                 secret_service=secret_service,
                 user_id=user_id,
@@ -3835,7 +3881,8 @@ async def _handle_runtime_preflight_failure(
     else:
         # Recovery acknowledgment (elspeth-0891e8da73). When no partial
         # state is captured (the path-1 cached re-raise with no LLM
-        # mutation case), the persist_invalid re-call above is skipped,
+        # mutation case) or the capture is withheld as unverified, the
+        # persist_invalid re-call above is skipped,
         # so its source=runtime_preflight emission inside
         # _state_data_from_composer_state never fires. The no-silent-failures
         # rule (the logging-telemetry-policy skill §Telemetry (Operational

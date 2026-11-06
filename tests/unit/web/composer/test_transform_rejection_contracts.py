@@ -9,13 +9,12 @@ from unittest.mock import create_autospec
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_cache import serialize_tool_result
-from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ComposerPluginCrashError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerAvailability
@@ -224,8 +223,6 @@ def test_transform_refusal_retains_saved_findings_code_subject_and_guidance(surf
     normalized = normalize_tool_result_validation(result, other_view)
     _assert_refusal(normalized, state, code, subject, other_view.validate_composition_state(state).validation)
     assert state.to_dict() == before
-    feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
-    assert feedback["error_code"] == code and "detail" not in feedback
     if code in {
         "node_not_found",
         "node_routing_patch_invalid",
@@ -233,7 +230,7 @@ def test_transform_refusal_retains_saved_findings_code_subject_and_guidance(surf
         "splice_topology_unsupported",
         "splice_derivation_conflict",
     }:
-        assert explain_validation_code(code) is not None and feedback["suggested_fix"]
+        assert explain_validation_code(code) is not None
         if surface == "dispatch":
             assert result.validation_guidance is not None and code in result.validation_guidance["codes"]
 
@@ -249,9 +246,11 @@ def test_splice_replay_conflict_keeps_saved_state_and_specific_guidance(surface:
     standing = state.validate() if surface == "handler" else context.catalog.validate_composition_state(state).validation
     result = _invoke(surface, tool, args, state, context)
     _assert_refusal(result, state, "splice_replay_conflict", "node:inserted", standing)
-    feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
-    assert feedback["error_code"] == "splice_replay_conflict" and "identical" in feedback["suggested_fix"]
-    assert "detail" not in feedback
+    guidance = explain_validation_code("splice_replay_conflict")
+    assert guidance is not None and "identical" in guidance[1]
+    if surface == "dispatch":
+        assert result.validation_guidance is not None
+        assert result.validation_guidance["codes"]["splice_replay_conflict"]["suggested_fix"] == guidance[1]
 
 
 @pytest.mark.parametrize("surface", ["handler", "dispatch"])
@@ -406,7 +405,7 @@ def test_transform_profile_outage_retains_distinct_owned_tuple(
         assert result.to_dict()["plugin_schemas"] == {
             f"transform/{profiled.plugin}": context.catalog.get_schema("transform", profiled.plugin).model_dump(mode="json")
         }
-    for payload in (repr(result.to_dict()), serialize_tool_result(result), repr(_allowlisted_candidate_feedback(result))):
+    for payload in (repr(result.to_dict()), serialize_tool_result(result)):
         assert "PRIVATE-TRANSFORM-PROFILE-LOWERING-CANARY" not in payload
 
 
@@ -429,7 +428,7 @@ def test_transform_unknown_authored_provider_remains_options_repair(surface: Sur
 
 @pytest.mark.parametrize("surface", ["handler", "dispatch"])
 @pytest.mark.parametrize("operation", ["upsert", "patch", "splice", "replay"])
-def test_transform_provider_path_is_static_in_response_history_redaction_and_planner(
+def test_transform_provider_path_is_static_in_response_history_and_redaction(
     tmp_path: Path, surface: Surface, operation: Operation
 ) -> None:
     private_root = tmp_path / "PRIVATE-TRANSFORM-ROOT-CANARY"
@@ -452,11 +451,9 @@ def test_transform_provider_path_is_static_in_response_history_redaction_and_pla
         "provider_config_path_policy_invalid",
         "node:after" if operation in {"upsert", "patch"} else "node:inserted",
     )
-    feedback = _allowlisted_candidate_feedback(result)
-    assert "detail" not in feedback["validation"]["errors"][0]
     redacted = redact_tool_call_response(tool, result.to_dict(), telemetry=NoopRedactionTelemetry())
     assert redacted["validation"]["errors"][0]["error_code"] == "provider_config_path_policy_invalid"
-    for payload in (repr(result.to_dict()), serialize_tool_result(result), repr(feedback), repr(redacted)):
+    for payload in (repr(result.to_dict()), serialize_tool_result(result), repr(redacted)):
         assert "PRIVATE-TRANSFORM-ROOT-CANARY" not in payload
     assert (
         entry.message
@@ -491,7 +488,7 @@ def test_transform_literal_credential_refusal_retains_complete_repair_payload(fi
     assert result.data["components"] == ({"component_id": node_id, "component_type": "node", "fields": ("api_key",)},)
     assert result.data["repair"]["inline_form"]["example_options"] == {"api_key": {"secret_ref": "<NAME>"}}
     assert result.data["repair"]["post_hoc_form"]["tool_sequence"] == ("list_secret_refs", "validate_secret_ref", "wire_secret_ref")
-    for payload in (repr(result.to_dict()), serialize_tool_result(result), repr(_allowlisted_candidate_feedback(result))):
+    for payload in (repr(result.to_dict()), serialize_tool_result(result)):
         assert literal not in payload
 
 
@@ -533,12 +530,9 @@ def test_splice_preserves_new_counterfactual_errors_before_standing_findings(sur
     assert result.validation.warnings == standing.warnings
     normalized = normalize_tool_result_validation(result, context.catalog)
     assert normalized.validation.errors == (leading, *forwarded, *prior.errors)
-    feedback = _allowlisted_candidate_feedback(normalized)["validation"]["errors"]
-    assert feedback[0]["error_code"] == "splice_validation_failed"
-    assert any(entry["component"] == "node:inserted" and entry["error_code"] == "schema_contract_violation" for entry in feedback[1:])
 
 
-def test_splice_codeless_boundary_is_preserved_and_planner_refuses_to_invent_code() -> None:
+def test_splice_codeless_boundary_is_preserved() -> None:
     tool, args, state = _operation("splice", options={"schema": {"mode": "observed"}, "required_input_fields": ["ghost_field"]})
     context = _context()
     real = _invoke("handler", tool, args, state, context)
@@ -559,8 +553,6 @@ def test_splice_codeless_boundary_is_preserved_and_planner_refuses_to_invent_cod
     assert forwarded.plugin_identity is None
     normalized = normalize_tool_result_validation(result, context.catalog)
     assert normalized.validation.errors[1].error_code is None
-    with pytest.raises(AuditIntegrityError, match="producer-owned error code"):
-        _allowlisted_candidate_feedback(normalized)
 
 
 @pytest.mark.asyncio
@@ -617,7 +609,7 @@ async def test_transform_outer_fault_keeps_earlier_success_and_intermediate_refu
             {"id": "transform_fault", "name": tool, "arguments": args},
         ]
     )
-    llm = create_autospec(service._provider_gateway._call_llm, return_value=response)
+    llm = create_autospec(service._provider_gateway._call_llm, return_value=_admit_composer_llm_completion(response))
     monkeypatch.setattr(service._provider_gateway, "_call_llm", llm)
     recorder = BufferingRecorder()
     monkeypatch.setattr("elspeth.web.composer.service.BufferingRecorder", lambda: recorder)

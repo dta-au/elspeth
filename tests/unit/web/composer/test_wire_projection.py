@@ -1,11 +1,12 @@
 """The static per-dialect wire projection W (``tools/wire_projection.py``).
 
 S (the flat registry, ``get_tool_definitions()``) stays the single authority.
-W is derived from it once, at import, per ``ToolContractDialect``:
+W is derived from it with the web naming disclosures, once at import per
+``ToolContractDialect``:
 
-* ``none`` is S exactly (plus the set_pipeline ``{"pipeline": ...}``
-  envelope), with no ``strict`` key anywhere;
-* ``openai_strict`` makes every S-optional property of the 33 strict-capable
+* ``none`` is S with set_pipeline naming disclosures and its required
+  ``{"pipeline": ...}`` envelope, with no ``strict`` key anywhere;
+* ``openai_strict`` makes every S-optional property of the 34 strict-capable
   tools required and nullable (decode strips the ``null``), moves keywords
   outside the wire allowlist into a ledger rendered as description text, and
   rewrites the 6 omission instructions into "pass null" wording.
@@ -19,7 +20,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
@@ -45,7 +45,6 @@ from elspeth.web.composer.tools.wire_projection import (
     assert_wire_projection_faithful,
     build_wire_tool_defs,
     omission_instruction_matches,
-    stamp_planner_terminal,
     wire_limits_report,
     wire_tool_definitions,
 )
@@ -107,6 +106,7 @@ _STRICT_CAPABLE: frozenset[str] = frozenset(
         "clear_source",
         "inspect_source",
         "get_pipeline_state",
+        "get_complete_pipeline_value",
         "get_plugin_schema",
         "get_expression_grammar",
         "explain_validation_error",
@@ -145,7 +145,7 @@ _OPTION_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# The 17 promoted positions: S-optional properties of the 33.
+# The 17 promoted positions: S-optional properties of the 34.
 _PROMOTED: frozenset[tuple[str, tuple[str, ...]]] = frozenset(
     {
         ("get_blob_content", ("offset_chars",)),
@@ -187,7 +187,7 @@ _UPSERT_EDGE_EXAMPLE: dict[str, Any] = {
     "label": "LLM failures",
 }
 
-# The 18 ledger entries on the 33: (tool, JSON pointer of the owner node, keyword, value).
+# The 18 ledger entries on the 34: (tool, JSON pointer of the owner node, keyword, value).
 _LEDGER: frozenset[tuple[str, str, str, Any]] = frozenset(
     {
         ("get_blob_content", "/properties/offset_chars", "default", 0),
@@ -244,7 +244,14 @@ _LEDGER_SENTENCES: frozenset[tuple[str, str, str]] = frozenset(
 
 
 def _definitions() -> list[dict[str, Any]]:
-    return get_tool_definitions()
+    # Assemble independently from the public registry and canonical schema.
+    # Reusing the module's cached W or its private assembly helper would mask
+    # a missing disclosure and miscalibrate the faithfulness/limits controls.
+    definitions = get_tool_definitions()
+    pipeline = [definition for definition in definitions if definition["name"] == "set_pipeline"]
+    assert len(pipeline) == 1, "the actual registry must contain exactly one set_pipeline definition"
+    pipeline[0]["parameters"] = schema_contract.canonical_set_pipeline_schema()
+    return definitions
 
 
 def _definition(definitions: list[dict[str, Any]], name: str) -> dict[str, Any]:
@@ -558,7 +565,7 @@ def test_limits_fail_closed_when_lowered_below_the_measured_value(limit_field: s
 
 
 def test_limits_report_counts_the_strict_tools() -> None:
-    assert wire_limits_report(STRICT).strict_tool_count == 33
+    assert wire_limits_report(STRICT).strict_tool_count == 34
     assert wire_limits_report(NONE).strict_tool_count == 0
 
 
@@ -602,7 +609,7 @@ def test_wire_tool_definitions_returns_fresh_isolated_copies() -> None:
 # ---------------------------------------------------------------- stamping
 
 
-def test_openai_strict_stamps_true_on_the_33_and_false_on_the_10() -> None:
+def test_openai_strict_stamps_true_on_the_34_and_false_on_the_10() -> None:
     for tool in wire_tool_definitions(STRICT):
         function = tool["function"]
         assert function["strict"] is (function["name"] in _STRICT_CAPABLE), function["name"]
@@ -626,18 +633,6 @@ def test_cache_markers_keep_function_strict_on_a_stamped_list() -> None:
     assert [tool["function"]["strict"] for tool in marked] == [tool["function"]["strict"] for tool in tools]
 
 
-def test_stamp_planner_terminal() -> None:
-    terminal = {"type": "function", "function": {"name": "emit_pipeline_proposal", "description": "d", "parameters": {"type": "object"}}}
-    before = deepcopy(terminal)
-    stamped = stamp_planner_terminal(terminal, STRICT)
-    assert stamped["function"]["strict"] is False
-    assert stamped["function"]["parameters"] == terminal["function"]["parameters"]
-    unchanged = stamp_planner_terminal(terminal, NONE)
-    assert unchanged == before
-    assert unchanged is not terminal
-    assert terminal == before
-
-
 # ---------------------------------------------------------------- none identity (the durable byte pin)
 
 
@@ -648,7 +643,7 @@ def _expected_none_list() -> list[dict[str, Any]]:
         if definition["name"] == "set_pipeline":
             parameters = {
                 "type": "object",
-                "properties": {"pipeline": parameters},
+                "properties": {"pipeline": schema_contract.canonical_set_pipeline_schema()},
                 "required": ["pipeline"],
                 "additionalProperties": False,
             }
@@ -671,6 +666,7 @@ def _assert_plain_json(value: Any) -> None:
 
 
 def test_none_w_is_s_plus_the_envelope() -> None:
+    """Pin independent naming disclosures and the exact NONE wire envelope."""
     tools = wire_tool_definitions(NONE)
     assert tools == _expected_none_list()
     for tool in tools:

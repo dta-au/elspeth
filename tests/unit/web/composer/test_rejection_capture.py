@@ -23,6 +23,7 @@ import pytest
 from sqlalchemy import text
 
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -126,6 +127,7 @@ async def test_failed_mutation_persists_unredacted_rejection_row(
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -170,6 +172,7 @@ async def test_argument_error_persists_rejection_row_with_raw_message(
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -207,6 +210,7 @@ async def test_successful_mutation_persists_no_rejection_row(
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         return responses.pop(0)
 

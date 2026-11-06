@@ -77,8 +77,11 @@ class _WireSecretRefArgumentsModel(BaseModel):
 
     Mirrors the JSON schema at ``_WIRE_SECRET_REF_DECLARATION`` — three
     required strings (``name``, ``target``, ``option_key``) plus optional
-    ``target_id`` for node/output targets (validated at the handler's
-    semantic layer, not the shape layer — same channel discipline as
+    ``target_id`` selecting a raw source name, node ID, or output name.
+    It is required for node/output targets and for source targets with multiple
+    roots; an unspecified selector defaults to a sole source. Requiredness is
+    validated at the handler's semantic layer, not the shape layer — same
+    channel discipline as
     ``set_pipeline``'s post-validation ``blob_id`` / ``inline_blob``
     mutual-exclusion check).
 
@@ -218,9 +221,11 @@ _LIST_SECRET_REFS_DECLARATION = ToolDeclaration(
     kind=ToolKind.SECRET_DISCOVERY,
     response_contract=_SECRET_INVENTORY_RESPONSE,
     description=(
-        "List available secret references (API keys, credentials). Each entry carries the reference `name`, its "
-        "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
-        "does not); never values."
+        "List secret-reference metadata (API keys, credentials), never values. Each entry carries `name`, "
+        "`scope`, `source_kind`, `available`, and `reason` (null when available). User-store availability "
+        "means a stored row exists and fingerprinting is configured; listing does not check decryption. "
+        "Server availability checks the allowlisted environment value and fingerprinting configuration. "
+        "Call validate_secret_ref for the selected reference's current resolvability before relying on it."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
@@ -552,7 +557,15 @@ _WIRE_SECRET_REF_DECLARATION = ToolDeclaration(
                 "enum": ["source", "node", "output"],
                 "description": "Which component to wire the secret into.",
             },
-            "target_id": {"type": "string", "description": "Node ID or output name (required for node/output targets)."},
+            "target_id": {
+                "type": "string",
+                "description": (
+                    "Raw source name (for example, 'left'), node ID, or output name. "
+                    "A selector value is required for node/output targets and for source targets when multiple sources "
+                    "are configured. For a sole source, an unspecified selector defaults to that source; follow the wire "
+                    "schema's requiredness and nullability. Do not prefix a source name with 'source:'."
+                ),
+            },
             "option_key": {"type": "string", "description": "Config option key to set (e.g. 'api_key')."},
         },
         "required": ["name", "target", "option_key"],

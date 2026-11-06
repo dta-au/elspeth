@@ -86,12 +86,13 @@ from elspeth.web.auth.sso import SsoAuthProvider, SsoDiscoveryFailed
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.routes import catalog_router
-from elspeth.web.composer import yaml_generator as yaml_generator_module
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools.wire_projection import loop_tool_count, strict_capable_tool_count
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
+from elspeth.web.composer.yaml_serializer import ComposerYamlSerializer
 from elspeth.web.composer_stream import ComposerStreamPermits
 from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
@@ -181,6 +182,7 @@ from elspeth.web.secrets.wiring_policy import runtime_secret_wiring_policy
 from elspeth.web.session_operation_handlers import register_session_operation_exception_handlers
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import EnsureIdentityOutcome
@@ -228,12 +230,12 @@ _COMPOSER_BOOT_CONFIG_PROBE_LATENCY: Histogram
 # docs/runbooks/aws-ecs-deployment.md), about 90 s of which is the database
 # budget. That leaves 60 s for boot-time provider probes.
 _BOOT_PROVIDER_PROBE_BUDGET_SECONDS = 60.0
-# One deadline shared by every composer probe request (loop list, planner
-# list, advisor), so the worst case is this value, not a sum of per-request
+# One deadline shared by every composer probe request (loop list and
+# advisor), so the worst case is this value, not a sum of per-request
 # timeouts. With the OpenRouter catalog prime's total deadline
 # (_OPENROUTER_CATALOG_PRIME_DEADLINE_SECONDS) it fits the 60 s budget. Measured advisor
 # checkpoint latency (23 archived calls): p95 11.0 s, max 50.8 s. With both
-# planner requests at their cap the advisor still has 35 s, about 3x its p95;
+# loop request at its cap the advisor has about 40 s, over 3x its p95;
 # a call as slow as the 50.8 s outlier becomes a nonfatal, logged unverified
 # boot.
 _COMPOSER_BOOT_PROBE_DEADLINE_SECONDS = 45.0
@@ -903,7 +905,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             broadcaster=broadcaster,
             settings=settings,
             session_service=session_service,
-            yaml_generator=yaml_generator_module,
+            yaml_generator=ComposerYamlSerializer(),
             telemetry=app.state.sessions_telemetry,
             blob_service=app.state.blob_service,
             secret_service=app.state.scoped_secret_resolver,
@@ -1055,8 +1057,8 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                                 max_tokens=probe_request.kwargs["max_tokens"],
                                 reason=(
                                     "the probe's max_tokens is at or below the minimum thinking budget, so LiteLLM "
-                                    "sent this request without extended thinking; the planner_tools request "
-                                    "exercises the thinking route on the same model and endpoint"
+                                    "sent this request without extended thinking; the thinking route is first "
+                                    "exercised by the first compose call on this model and endpoint"
                                 ),
                             )
                     if not ok:
@@ -1084,26 +1086,6 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                     )
                 except ComposerBootConfigError:
                     probe_status = "rejected"
-                    if probe_request.surface == "hatch_terminal":
-                        # Ruling 8 (b): a rejected escape-hatch terminal does not
-                        # stop boot; planner-route and advisor rejections stay
-                        # fatal. Owned request facts only, never the exception
-                        # text or its cause chain.
-                        slog.warning(
-                            "composer_boot_probe_rejected_nonfatal",
-                            model=probe_request.model,
-                            probed_role=role,
-                            probed_surface=probe_request.surface,
-                            tool_count=probe_request.tool_count,
-                            strict_true_count=probe_request.strict_true_count,
-                            strict_false_count=probe_request.strict_false_count,
-                            strict_key_omitted=probe_request.strict_key_omitted,
-                            action=(
-                                "booting; the escape-hatch terminal was rejected at boot; hatch turns will fail until the "
-                                "hatch route or composer_strict_tools is changed"
-                            ),
-                        )
-                        continue
                     raise
                 except asyncio.CancelledError:
                     probe_status = "cancelled"
@@ -1179,6 +1161,11 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         orphan_task.add_done_callback(_recover_process_on_orphan_failure)
         app.state.application_finalizer_owner.seal()
+
+        def begin_composer_signal_drain(started: float) -> None:
+            app.state.composer_async_worker.begin_drain(started_at=started)
+
+        app.state.composer_drain_signal.bind(asyncio.get_running_loop(), begin_composer_signal_drain)
         app.state.composer_async_worker.start()
 
         serving_started = True
@@ -1226,6 +1213,10 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         shutdown_failures.extend(await _join_execution_lifecycle(app.state.execution_lease_release_registry, execution_service))
         try:
             app.state.execution_lease_release_registry.assert_completed()
+        except BaseException as failure:
+            shutdown_failures.append(failure)
+        try:
+            app.state.composer_progress_registry.assert_pending_settled()
         except BaseException as failure:
             shutdown_failures.append(failure)
         await observe_shutdown(app.state.web_instance_membership.stop)
@@ -1580,12 +1571,18 @@ def _build_local_auth_provider(
 _FAILED_BOOTSTRAP_RECOVERY: ProcessRecovery | None = None
 
 
-def create_app(settings: WebSettings | None = None, *, process_watchdog_factory: ProcessWatchdogFactory | None = None) -> FastAPI:
+def create_app(
+    settings: WebSettings | None = None,
+    *,
+    process_watchdog_factory: ProcessWatchdogFactory | None = None,
+    drain_signal: ComposerDrainSignal | None = None,
+) -> FastAPI:
     """Create the application and synchronously clean up failed engine ownership."""
     global _FAILED_BOOTSTRAP_RECOVERY
     configure_process_logging = settings is None
     resolved_settings = settings_from_env() if settings is None else settings
-    instance_draining = threading.Event()
+    signal_owner = ComposerDrainSignal() if drain_signal is None else drain_signal
+    instance_draining = signal_owner.draining
     watchdog_factory = create_process_watchdog if process_watchdog_factory is None else process_watchdog_factory
     watchdog = watchdog_factory(instance_draining)
     if not isinstance(watchdog, ProcessWatchdogControl):
@@ -1623,7 +1620,7 @@ def create_app(settings: WebSettings | None = None, *, process_watchdog_factory:
             application_finalizer_owner=finalizer_owner,
         )
         telemetry_owner = OperatorTelemetryCleanupOwner.create_for_application()
-        return _create_app(
+        app = _create_app(
             resolved_settings,
             register_session_engine_finalizer,
             register_auth_audit_finalizer,
@@ -1635,7 +1632,10 @@ def create_app(settings: WebSettings | None = None, *, process_watchdog_factory:
             configure_process_logging=configure_process_logging,
             finalizer_owner=finalizer_owner,
             telemetry_owner=telemetry_owner,
+            drain_signal=signal_owner,
         )
+        app.state.composer_drain_signal = signal_owner
+        return app
     except BaseException as exc:
         failures: list[BaseException] = [exc]
         try:
@@ -1679,6 +1679,7 @@ def _create_app(
     configure_process_logging: bool,
     finalizer_owner: ApplicationFinalizerOwner,
     telemetry_owner: OperatorTelemetryCleanupOwner,
+    drain_signal: ComposerDrainSignal | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -1697,6 +1698,8 @@ def _create_app(
 
     resolved_state_mode = resolve_deployment_state_mode(settings)
     external_state = resolved_state_mode == "external-postgresql"
+    if external_state and settings.instance_id is not None:
+        raise ValueError("PostgreSQL recovery requires a fresh instance identity; omit instance_id")
     # One closed profile per deployment target names the startup hooks this
     # process boots through and the platform variables that carry its replica
     # identity (web/deployment_profiles.py); app.py never branches on the
@@ -2219,7 +2222,7 @@ def _create_app(
         return validate_pipeline(
             state,
             settings,
-            yaml_generator_module,
+            ComposerYamlSerializer(),
             secret_service=app.state.scoped_secret_resolver,
             secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
             user_id=user_id,
@@ -2311,13 +2314,15 @@ def _create_app(
         operator_profile_registry=app.state.operator_profile_registry,
     )
     app.state.interpretation_surfacing = app.state.composer_service._interpretation_surfacing
-    app.state.planning_application = app.state.composer_service._planning_application
     app.state.schema_disclosure = app.state.composer_service._schema_disclosure
     app.state.composer_availability = app.state.composer_service.get_availability()
     composer_async_authority = ComposerAsyncOperationAuthority(
         session_engine,
         owner_instance_id=session_service.session_operation_owner_instance_id,
         claim_lease_seconds=settings.composer_async_claim_lease_seconds,
+        # Each admitted operation retains its own copy of the policy.
+        # The sole current policy builder; null disables fresh admission.
+        continuation_policy=continuation_policy_from_settings(settings),
     )
     app.state.composer_async_operation_authority = composer_async_authority
     app.state.composer_async_worker = ComposerAsyncWorker(
@@ -2330,6 +2335,7 @@ def _create_app(
         owner_instance_id=session_service.session_operation_owner_instance_id,
         process_recovery=process_recovery,
         instance_draining=app.state.instance_draining,
+        drain_signal=drain_signal,
     )
     # Composer job admission and every composer-budget consumer share SQL quota
     # on both databases. SQLite's window intentionally survives app restarts.
@@ -2585,8 +2591,8 @@ def _create_app(
         return JSONResponse(
             status_code=503,
             content={
-                "detail": "Database is currently unavailable. Please retry in a moment.",
-                "error_type": "database_unavailable",
+                "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+                "error_type": "executor_unavailable",
                 "request_id": request_id,
             },
         )

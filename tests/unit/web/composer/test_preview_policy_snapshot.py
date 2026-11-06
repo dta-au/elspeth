@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.blobs.protocol import BlobRecord
@@ -73,6 +74,111 @@ def _service(
     )
 
 
+async def _dispatch_tool_batch(
+    service: ComposerServiceImpl,
+    *,
+    call_model: _CallModelOutcome,
+    mutation_ceiling: ComposerMutationCeiling | None,
+    state: CompositionState,
+    last_validation: Any,
+    last_runtime_preflight: ValidationResult | None,
+    llm_messages: list[dict[str, Any]],
+    recorder: BufferingRecorder,
+    anti_anchor: AntiAnchorTracker,
+    discovery_cache: dict[str, Any],
+    runtime_preflight_cache: RuntimePreflightCache,
+    session_id: str | None,
+    user_id: str | None,
+    user_message_id: str | None,
+    user_message_content: str | None,
+    current_state_id: str | None,
+    actor: str,
+    initial_version: int,
+    deadline: float,
+    progress: Any,
+    session_scope: str,
+    advisor_calls_used: int,
+    composition_turns_used: int,
+    discovery_turns_used: int,
+    failed_turn: Any,
+    cancellation_requested: asyncio.Event,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    policy_catalog: Any,
+    session_operation_context: SessionOperationContext | None = None,
+) -> tuple[_DispatchOutcome, int]:
+    """Drive the shared dispatch owner ``tool_batch.run_tool_batch`` from a service.
+
+    Builds the batch context exactly as the service did before the V1 loop
+    adapter was removed; Continuation builds the same context from its
+    restored runtime (``continuation_runtime.build_runtime_tool_batch_context``).
+    """
+    from elspeth.web.composer.tool_batch import BatchAccumulator, ToolBatchContext, ToolBatchCustody, ToolBatchProvenance, run_tool_batch
+
+    sessions = service._require_sessions_service() if session_id is not None else None
+    session_uuid = UUID(session_id) if session_id is not None else None
+    preferences = await sessions.get_composer_preferences(session_uuid) if sessions is not None and session_uuid is not None else None
+    review_required = False
+    if session_uuid is not None:
+        assert type(mutation_ceiling) is ComposerMutationCeiling and preferences is not None
+        assert mutation_ceiling.session_id == str(session_uuid)
+        if session_operation_context is not None:
+            mutation_ceiling.validate_context(session_operation_context)
+        review_required = not mutation_ceiling.permits_auto(preferences.trust_mode)
+    else:
+        assert mutation_ceiling is None
+    ctx = ToolBatchContext(
+        session_tools=service._session_tools,
+        provenance=ToolBatchProvenance(
+            model_identifier=service._model, provider=service._availability.provider, skill_hash=service._composer_skill_hash
+        ),
+        custody=ToolBatchCustody(
+            data_dir=service._data_dir,
+            session_engine=service._session_engine,
+            secret_service=service._secret_service,
+            secret_wiring_policy=service._secret_wiring_policy,
+            max_blob_storage_per_session_bytes=service._settings.max_blob_storage_per_session_bytes,
+        ),
+        redaction_telemetry=service._redaction_telemetry,
+        preflight=service._preflight,
+        schema_disclosure=service._schema_disclosure,
+        advisor_checkpoint=service._advisor_checkpoint,
+        advisor_max_calls_per_compose=service._settings.composer_advisor_max_calls_per_compose,
+        advisor_timeout_seconds=service._settings.composer_advisor_timeout_seconds,
+        recorder=recorder,
+        anti_anchor=anti_anchor,
+        discovery_cache=discovery_cache,
+        runtime_preflight_cache=runtime_preflight_cache,
+        session_id=session_id,
+        session_operation_context=session_operation_context,
+        user_id=user_id,
+        user_message_id=user_message_id,
+        user_message_content=user_message_content,
+        current_state_id=current_state_id,
+        actor=actor,
+        initial_version=initial_version,
+        deadline=deadline,
+        progress=progress,
+        session_scope=session_scope,
+        turn_sessions_service=sessions,
+        turn_session_uuid=session_uuid,
+        turn_preferences=preferences,
+        mutation_ceiling=mutation_ceiling,
+        review_required=review_required,
+        cancellation_requested=cancellation_requested,
+        plugin_snapshot=plugin_snapshot,
+        policy_catalog=policy_catalog,
+        tool_contract_dialect=service._planner_dialect,
+        session_operation_authority=sessions.session_operation_authority if sessions is not None else None,
+        composition_turns_used=composition_turns_used,
+        discovery_turns_used=discovery_turns_used,
+        failed_turn=failed_turn,
+    )
+    acc = BatchAccumulator(
+        state=state, last_validation=last_validation, last_runtime_preflight=last_runtime_preflight, advisor_calls_used=advisor_calls_used
+    )
+    return await run_tool_batch(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages)
+
+
 def _state(tmp_path: Path) -> CompositionState:
     return CompositionState(
         source=SourceSpec(
@@ -104,6 +210,7 @@ async def _preview(
     registry: OperatorProfileRegistry,
     catalog: CatalogService,
     operation_context: SessionOperationContext | None = None,
+    mutation_ceiling: ComposerMutationCeiling | None = None,
 ) -> _DispatchOutcome:
     from elspeth.web.catalog.policy_view import PolicyCatalogView
 
@@ -111,8 +218,10 @@ async def _preview(
     completion = _admit_composer_llm_completion(
         _fake_llm_response(tool_calls=({"id": "preview-call", "name": "preview_pipeline", "arguments": {}},))
     )
-    outcome, _advisor_calls = await service._dispatch_tool_batch(
+    outcome, _advisor_calls = await _dispatch_tool_batch(
+        service,
         call_model=_CallModelOutcome(completion=completion),
+        mutation_ceiling=mutation_ceiling,
         state=state,
         last_validation=None,
         last_runtime_preflight=None,
@@ -315,7 +424,9 @@ async def test_preview_reads_uploaded_reference_table_with_operation_context(
         return result
 
     monkeypatch.setattr(preflight_module, "validate_pipeline", validate)
-    await _preview(service, state, admitted, service._preflight.new_cache(), registry, catalog, context)
+    preferences = await service._require_sessions_service().get_composer_preferences(session_id)
+    mutation_ceiling = ComposerMutationCeiling(str(session_id), str(uuid4()), preferences.trust_mode)
+    await _preview(service, state, admitted, service._preflight.new_cache(), registry, catalog, context, mutation_ceiling)
     assert len(results) == 1
     assert results[0].is_valid, results[0].errors
     assert reads == [context]

@@ -670,8 +670,9 @@ class TestSuccessPathLeakGuard:
         must not leak via an f-string embedding the raw value."""
         body = _completion_body(content="   ", finish_reason=_BODY_SENTINEL)
         response = _gateway_response(body)
-        with pytest.raises(ContentPolicyError) as exc_info:
+        with pytest.raises(LLMClientError) as exc_info:
             _validate_gateway_success_response(response, usage_required=False)
+        assert type(exc_info.value) is LLMClientError
         assert _BODY_SENTINEL not in str(exc_info.value)
 
     def test_sentinel_in_usage_key_name_never_leaks(self) -> None:
@@ -680,8 +681,7 @@ class TestSuccessPathLeakGuard:
 
         Built from raw bytes (not the ``json=`` kwarg, which round-trips
         through stdlib ``json.dumps`` and rejects ``Infinity`` outright) —
-        mirrors how the provider itself parses it via
-        ``reject_nonfinite_constant``.
+        exercises the provider's ``reject_nonfinite_constant`` refusal path.
         """
         body = _completion_body()
         raw = json.dumps(body).encode()
@@ -700,11 +700,10 @@ class TestSuccessPathLeakGuard:
 
     @respx.mock
     def test_end_to_end_success_path_sentinels_never_leak(self, provider: GatewayLLMProvider) -> None:
-        """Same three sentinel placements, driven through the real
-        execute_query() HTTP path rather than the validator directly."""
+        """The finish-reason sentinel stays private through execute_query()."""
         body = _completion_body(content="   ", finish_reason=_BODY_SENTINEL)
         respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(body))
-        with pytest.raises(ContentPolicyError) as exc_info:
+        with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
@@ -717,6 +716,7 @@ class TestSuccessPathLeakGuard:
                     token_id="tok-1",
                 ),
             )
+        assert type(exc_info.value) is LLMClientError
         assert _BODY_SENTINEL not in str(exc_info.value)
 
 
@@ -841,11 +841,11 @@ class TestBlankContent:
         assert exc_info.value.retryable is False
 
     @respx.mock
-    def test_blank_content_otherwise_is_content_policy_error(self, provider: GatewayLLMProvider) -> None:
+    def test_blank_content_without_refusal_is_client_error(self, provider: GatewayLLMProvider) -> None:
         respx.post(f"{_ENDPOINT}/chat/completions").mock(
             return_value=_gateway_response(_completion_body(content="   ", finish_reason="stop"))
         )
-        with pytest.raises(ContentPolicyError):
+        with pytest.raises(LLMClientError) as exc_info:
             provider.execute_query(
                 messages=[ChatMessage(role="user", content="hi")],
                 model="standard",
@@ -858,6 +858,8 @@ class TestBlankContent:
                     token_id="tok-1",
                 ),
             )
+        assert type(exc_info.value) is LLMClientError
+        assert exc_info.value.retryable is False
 
 
 # ---------------------------------------------------------------------------

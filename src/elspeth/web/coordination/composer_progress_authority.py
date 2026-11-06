@@ -9,14 +9,24 @@ No database error is converted into process-local progress.
 from __future__ import annotations
 
 import asyncio
+import threading
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from sqlalchemy import Engine, Row, Select, delete, func, insert, select, update
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
-from elspeth.web.async_workers import run_stream_read_in_worker, run_sync_in_worker
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.async_workers import (
+    ProgressRequestCleanup,
+    ProgressSQLInvocation,
+    run_progress_cleanup_in_worker,
+    run_progress_sql_in_worker,
+    run_stream_read_in_worker,
+    run_sync_in_worker,
+)
 from elspeth.web.composer.progress import ComposerProgressSnapshot, ComposerRequestLease
 from elspeth.web.coordination.membership_authority import _database_clock_value, _ensure_utc, _require_nonblank
 from elspeth.web.sessions.models import (
@@ -27,6 +37,9 @@ from elspeth.web.sessions.models import (
 )
 
 _MAX_SNAPSHOT_BYTES = 16384
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
 
 
 def _ownership_query(session_id: str, user_id: str, *, allow_archived: bool = False, lock: bool = True) -> Select[Any]:
@@ -519,45 +532,118 @@ class DatabaseComposerProgressRegistry:
 
     def __init__(self, authority: SessionComposerProgressAuthority) -> None:
         self._authority = authority
+        self._pending_progress_owners: set[ContinuationProgressOwner] = set()
+        self._pending_lock = threading.Lock()
 
-    async def start_request(self, session_id: str, user_id: str) -> ComposerRequestLease:
+    @property
+    def renew_interval_seconds(self) -> float:
+        return self._authority._lease_seconds / 3
+
+    def retain_pending_owner(self, owner: ContinuationProgressOwner) -> None:
+        from elspeth.web.sessions.continuation_progress_owner import ContinuationProgressOwner
+
+        if type(owner) is not ContinuationProgressOwner:
+            raise TypeError("Progress custody requires the actual segment owner")
+        with self._pending_lock:
+            self._pending_progress_owners.add(owner)
+
+    def release_pending_owner(self, owner: ContinuationProgressOwner) -> None:
+        with self._pending_lock:
+            self._pending_progress_owners.discard(owner)
+
+    @property
+    def pending_owner_count(self) -> int:
+        with self._pending_lock:
+            return len(self._pending_progress_owners)
+
+    def assert_pending_settled(self) -> None:
+        if self.pending_owner_count:
+            raise AuditIntegrityError("Composer Progress retains unfinished segment custody")
+
+    async def _run_authority(
+        self,
+        method: Callable[..., Any],
+        args: tuple[Any, ...],
+        deadline: Callable[[], float] | None,
+        on_submission: Callable[[ProgressSQLInvocation], None] | None = None,
+    ) -> Any:
+        if deadline is None:
+            return await run_sync_in_worker(method, *args)
+        submission = ProgressSQLInvocation(method, args)
+        if on_submission is not None:
+            on_submission(submission)
+        return await run_progress_sql_in_worker(submission, deadline=deadline)
+
+    async def start_request(
+        self,
+        session_id: str,
+        user_id: str,
+        *,
+        deadline: Callable[[], float] | None = None,
+        on_submission: Callable[[ProgressSQLInvocation], None] | None = None,
+        on_cleanup: Callable[[ProgressRequestCleanup], None] | None = None,
+    ) -> ComposerRequestLease:
         admission = asyncio.create_task(
-            run_sync_in_worker(self._authority.begin_request, session_id, user_id),
+            self._run_authority(self._authority.begin_request, (session_id, user_id), deadline, on_submission),
             name="composer-progress-admission",
         )
         try:
             return await asyncio.shield(admission)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as original:
             # The database worker can commit after its caller is cancelled.
             # Join its result and release that exact lease before propagating
             # cancellation, including repeated cancellation during teardown.
-            lease = await _join_cancelled_request_task(admission)
-            cleanup = asyncio.create_task(
-                run_sync_in_worker(self._authority.end_request, lease),
-                name="composer-progress-cancelled-admission-cleanup",
-            )
-            await _join_cancelled_request_task(cleanup)
-            raise
+            cancellations = [original]
+            try:
+                lease = await _join_cancelled_request_task(admission, cancellations)
+                capability = ProgressRequestCleanup(self._authority.end_request, lease)
+                if on_cleanup is not None:
+                    on_cleanup(capability)
+                cleanup = asyncio.create_task(
+                    run_progress_cleanup_in_worker(capability, deadline=deadline),
+                    name="composer-progress-cancelled-admission-cleanup",
+                )
+                await _join_cancelled_request_task(cleanup, cancellations)
+            except BaseException as failure:
+                combined = _combine_request_failures(failure, *cancellations)
+                raise combined from combined.__cause__
+            combined = _combine_request_failures(cancellations[0], *cancellations[1:])
+            raise combined from combined.__cause__
 
-    async def finish_request(self, lease: ComposerRequestLease) -> None:
+    async def finish_request(
+        self,
+        lease: ComposerRequestLease,
+        *,
+        deadline: Callable[[], float] | None = None,
+        on_cleanup: Callable[[ProgressRequestCleanup], None] | None = None,
+    ) -> None:
         # Ordinary worker submissions are cancelled while still queued when
         # their caller is abandoned. This teardown is the exact-token deletion
         # the lifecycle owes regardless of how the request unwound, so it is
         # shielded and joined the same way cancelled admission cleanup is:
         # the lease row must not linger until expiry while progress keeps
         # counting the request as live.
+        capability = ProgressRequestCleanup(self._authority.end_request, lease)
+        if on_cleanup is not None:
+            on_cleanup(capability)
         cleanup = asyncio.create_task(
-            run_sync_in_worker(self._authority.end_request, lease),
+            run_progress_cleanup_in_worker(capability, deadline=deadline),
             name="composer-progress-finish",
         )
         try:
             await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await _join_cancelled_request_task(cleanup)
-            raise
+        except asyncio.CancelledError as original:
+            cancellations = [original]
+            try:
+                await _join_cancelled_request_task(cleanup, cancellations)
+            except BaseException as failure:
+                combined = _combine_request_failures(failure, *cancellations)
+                raise combined from combined.__cause__
+            combined = _combine_request_failures(cancellations[0], *cancellations[1:])
+            raise combined from combined.__cause__
 
-    async def renew_request(self, lease: ComposerRequestLease) -> None:
-        await run_sync_in_worker(self._authority.heartbeat_request, lease)
+    async def renew_request(self, lease: ComposerRequestLease, *, deadline: Callable[[], float] | None = None) -> None:
+        await self._run_authority(self._authority.heartbeat_request, (lease,), deadline)
 
     async def claim_request(
         self,
@@ -569,14 +655,17 @@ class DatabaseComposerProgressRegistry:
         operation_id: str | None = None,
         session_operation_id: str | None = None,
         session_operation_epoch: int | None = None,
+        deadline: Callable[[], float] | None = None,
     ) -> ComposerProgressSink:
         if lease.session_id != session_id or lease.user_id != user_id:
             raise ValueError("Composer request lease does not match the request")
-        generation = await run_sync_in_worker(self._authority.bind_request, lease, request_id)
+        generation = await self._run_authority(self._authority.bind_request, (lease, request_id), deadline)
 
         async def publish(event: ComposerProgressEvent) -> None:
-            await run_sync_in_worker(
-                self._authority.publish, lease, generation, request_id, event, operation_id, session_operation_id, session_operation_epoch
+            await self._run_authority(
+                self._authority.publish,
+                (lease, generation, request_id, event, operation_id, session_operation_id, session_operation_epoch),
+                deadline,
             )
 
         return publish
@@ -621,11 +710,17 @@ class DatabaseComposerProgressRegistry:
         await run_sync_in_worker(self._authority.clear, session_id, user_id)
 
 
-async def _join_cancelled_request_task[T](task: asyncio.Task[T]) -> T:
+def _combine_request_failures(original: BaseException, *others: BaseException) -> BaseException:
+    from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+
+    return combine_failure_objects(original, *others)
+
+
+async def _join_cancelled_request_task[T](task: asyncio.Task[T], cancellations: list[asyncio.CancelledError]) -> T:
     """Drain owned work despite repeated cancellation, surfacing its outcome."""
     while not task.done():
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
+        except asyncio.CancelledError as original:
+            cancellations.append(original)
     return task.result()

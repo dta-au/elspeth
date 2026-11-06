@@ -22,13 +22,13 @@ from elspeth.web.execution.provider_clock import RunProviderAttemptClock
 from elspeth.web.execution.service import _run_token_usage_entries
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers import execution_custody
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.core.landscape.test_call_recording import _setup_with_operation
 from tests.unit.plugins.clients.test_audited_llm_client import FakeOpenAIClient, empty_choices_response, provider_response
 from tests.unit.web.execution.test_session_operation_lease import _execution_service
@@ -62,7 +62,7 @@ async def test_sessions_outage_after_spend_keeps_exact_known_landscape_outcome(
         lease_seconds=30,
     ) as compose:
         state = await sessions.save_composition_state(
-            session.id, CompositionStateData(is_valid=True), provenance="session_seed", session_operation_context=compose.context
+            session.id, composition_state_data(is_valid=True), provenance="session_seed", session_operation_context=compose.context
         )
     async with await SessionOperationLease.acquire(
         sessions.session_operation_authority,

@@ -111,10 +111,19 @@ export function decodeCompositionState(value: unknown, path = "composition_state
       "validation_suggestions", "derived_from_state_id", "created_at", "composer_meta",
       "plugin_policy_findings",
     ],
+    ["composition_content_hash"],
   );
   const id = stringValue(state.id, `${path}.id`);
   const sessionId = stringValue(state.session_id, `${path}.session_id`);
   const version = integerValue(state.version, `${path}.version`);
+  const hashPresent = Object.prototype.hasOwnProperty.call(state, "composition_content_hash");
+  const hashUnavailable = state.composition_content_hash === null && state.metadata === null;
+  const contentHash = hashPresent && !hashUnavailable
+    ? stringValue(state.composition_content_hash, `${path}.composition_content_hash`)
+    : undefined;
+  if (contentHash !== undefined && (contentHash.length !== 64 || !/^[0-9a-f]{64}$/.test(contentHash))) {
+    invalid(`${path}.composition_content_hash`, "expected lowercase SHA-256 checksum");
+  }
   const isValid = booleanValue(state.is_valid, `${path}.is_valid`);
   const derivedFromStateId = nullableString(state.derived_from_state_id, `${path}.derived_from_state_id`);
   const createdAt = stringValue(state.created_at, `${path}.created_at`);
@@ -323,6 +332,7 @@ export function decodeCompositionState(value: unknown, path = "composition_state
     id,
     session_id: sessionId,
     version,
+    ...(contentHash === undefined ? {} : { composition_content_hash: contentHash }),
     sources,
     nodes,
     edges,

@@ -35,10 +35,12 @@ from elspeth.web.composer.tools.sessions import _SESSION_AWARE_TOOL_HANDLERS
 
 if TYPE_CHECKING or __package__:
     from .composer_admitted_wire import admitted_wire_rows, model_argument_keys
+    from .composer_advisor_binding import AdvisorBindingError, continuation_advisor_execution_owner
     from .composer_frontend_wire import census_frontend_wire
     from .composer_teaching import argument_teaching
 else:
     from composer_admitted_wire import admitted_wire_rows, model_argument_keys
+    from composer_advisor_binding import AdvisorBindingError, continuation_advisor_execution_owner
     from composer_frontend_wire import census_frontend_wire
     from composer_teaching import argument_teaching
 
@@ -403,20 +405,40 @@ def census_model_wire() -> dict[str, ModelWireRow]:
     return rows
 
 
+def _advisor_interception_owner() -> FunctionType:
+    """Select an owned live source only after proving any extracted handoff."""
+    from elspeth.web.composer import tool_batch
+
+    stage_names = (
+        "_initialize_continuation_batch_live",
+        "_prepare_continuation_call_live",
+        "_execute_continuation_call_live",
+    )
+    namespace = vars(tool_batch)
+    # Retain the original monolithic input contract. A partial extraction
+    # cannot fall back to a convenient decoy branch on the old entry point.
+    if not any(name in namespace for name in stage_names):
+        return tool_batch.run_tool_batch
+    try:
+        return continuation_advisor_execution_owner(tool_batch)
+    except AdvisorBindingError as exc:
+        raise CensusError(str(exc)) from exc
+
+
 def _advisor_admission_handler() -> FunctionType:
     """Bind the public interception to its called advisor admission method.
 
     This deliberately supports the one owned batch adapter, not arbitrary
     method dispatch. A changed receiver, copied subset, or missing call fails
     closed and requires an explicit provenance extension. The forwarded
-    ``arguments`` are the decoded arguments: ``run_tool_batch`` decodes the
-    provider's wire form through ``wire_projection`` before any gate, so the
-    advisor admission sees the semantic (S) form.
+    ``arguments`` are the decoded arguments: the selected live owner is
+    either the original batch or the source-proven B2 initializer/preparation/
+    execution chain. Both decode the sent wire form before MODEL admission.
     """
     from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
-    from elspeth.web.composer.tool_batch import run_tool_batch
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(run_tool_batch)))
+    owner = _advisor_interception_owner()
+    tree = ast.parse(textwrap.dedent(inspect.getsource(owner)))
     branches = [
         node for node in ast.walk(tree) if isinstance(node, ast.If) and ast.unparse(node.test) == "tool_name == 'request_advisor_hint'"
     ]
@@ -431,12 +453,26 @@ def _advisor_admission_handler() -> FunctionType:
         raise CensusError("advisor interception must call exactly one public admission")
     call = calls[0]
     assert isinstance(call.func, ast.Attribute)
-    if (
-        ast.unparse(call.func.value) != "ctx.advisor_checkpoint"
-        or call.keywords
-        or len(call.args) != 1
-        or not _input_expression(call.args[0], "arguments")
-    ):
+    from elspeth.web.composer import tool_batch
+
+    if owner is tool_batch.run_tool_batch:
+        complete_input = (
+            ast.unparse(call.func.value) == "ctx.advisor_checkpoint"
+            and not call.keywords
+            and len(call.args) == 1
+            and _input_expression(call.args[0], "arguments")
+        )
+    else:
+        # _advisor_interception_owner has already joined the actual class
+        # supplier and the complete nominal guard to this execution body.
+        complete_input = (
+            ast.unparse(call.func.value) == "AdvisorCheckpointOwner"
+            and not call.keywords
+            and len(call.args) == 2
+            and ast.unparse(call.args[0]) == "ctx.advisor_checkpoint"
+            and _input_expression(call.args[1], "arguments")
+        )
+    if not complete_input:
         raise CensusError("advisor interception does not forward the complete decoded arguments")
     handler = vars(AdvisorCheckpointOwner)[call.func.attr]
     if not isinstance(handler, FunctionType):

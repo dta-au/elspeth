@@ -105,6 +105,11 @@ assert_unique_names(_REGISTERED_TOOLS)
 _DECLARATIONS_BY_NAME: Final = MappingProxyType({decl.name: decl for decl in _REGISTERED_TOOLS})
 
 
+def continuation_declaration(tool_name: str) -> ToolDeclaration | None:
+    """Return the actual declaration for prospective continuation classification."""
+    return _DECLARATIONS_BY_NAME.get(tool_name)
+
+
 def response_contract_for(tool_name: str) -> ResponseContract | None:
     """Select a producer contract; unconverted declarations remain explicit.
 

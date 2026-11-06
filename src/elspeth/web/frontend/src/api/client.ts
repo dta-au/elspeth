@@ -1,4 +1,4 @@
-import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerOperationAck, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
+import { decodePaidResultIncompleteBody, canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerActiveOperation, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
@@ -9,7 +9,7 @@ import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwns
 // in development; same-origin serving works in production.
 // ============================================================================
 
-import { isValidationCheck, isValidationReadiness } from "./validationReadiness";
+import { isSafeRequestRejection, isValidationCheck, isValidationReadiness } from "./validationReadiness";
 import type {
   ApiError,
   ApiStructuredError,
@@ -40,6 +40,7 @@ import type {
   RunOutputsResponse,
   WebSocketTicketResponse,
   SecretInventoryItem,
+  SafeRequestRejection,
   Session,
   AdminGeneratedPassword,
   AdminUserSummary,
@@ -311,7 +312,34 @@ export async function parseResponse<T>(
   return response.json() as Promise<T>;
 }
 
+function requestRejectionFromBody(errorBody: unknown): SafeRequestRejection | undefined {
+  let retained: SafeRequestRejection | undefined;
+  for (const envelope of [errorBody, ownField(errorBody, "detail")]) {
+    if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope) ||
+        !Object.prototype.hasOwnProperty.call(envelope, "request_rejection")) continue;
+    const candidate = ownField(envelope, "request_rejection");
+    if (!isSafeRequestRejection(candidate)) throw new Error("Invalid provider request rejection descriptor");
+    // The shared guard fixes category, exception_type and retryable. Compare
+    // all remaining admitted scalar fields without depending on wire key order.
+    if (retained !== undefined && (
+      retained.reason_code !== candidate.reason_code ||
+      retained.reason_disposition !== candidate.reason_disposition ||
+      retained.reason_source !== candidate.reason_source ||
+      retained.diagnostic_reference !== candidate.diagnostic_reference
+    )) throw new Error("Conflicting provider request rejection descriptors");
+    retained = {
+      category: candidate.category, exception_type: candidate.exception_type,
+      reason_code: candidate.reason_code, reason_disposition: candidate.reason_disposition,
+      reason_source: candidate.reason_source, diagnostic_reference: candidate.diagnostic_reference,
+      retryable: candidate.retryable,
+    };
+  }
+  return retained;
+}
+
 function buildApiError(status: number, errorBody: unknown, statusText: string, snapshotHeader?: string): ApiError {
+    // A present malformed descriptor must escape the compatibility fallback.
+    const requestRejection = requestRejectionFromBody(errorBody);
     // Parse the error envelope into one ApiError contract. Canonical backend
     // fields are `error_type`, `detail`, and optional `errors`; `kind` and
     // `message` remain accepted as compatibility aliases for older execution
@@ -560,6 +588,7 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
       secret_guard: secretGuard,
       provider_detail: providerDetail,
       provider_status_code: providerStatusCode,
+      ...(requestRejection === undefined ? {} : { request_rejection: requestRejection }),
       validation_errors: validationErrors,
       errors,
       snapshot_fingerprint:
@@ -1006,6 +1035,11 @@ export async function rejectCompositionProposal(
 export function apiErrorFromBody(status: number, body: unknown): ApiError {
   validateComposerRecoveryBody(body);
   const admitted = buildApiError(status, body, "Request failed");
+  if (admitted.error_type === "paid_result_incomplete") {
+    const incomplete = decodePaidResultIncompleteBody(body);
+    if (status !== 507) throw new Error("Invalid paid incomplete HTTP status");
+    return { ...admitted, paid_result_incomplete_cost: incomplete.cost };
+  }
   return admitted.partial_state == null ? admitted : { ...admitted, partial_state: decodeCompositionState(admitted.partial_state) };
 }
 
@@ -1023,7 +1057,8 @@ export function composerActiveOperation(error: unknown): { operation_id: string;
   if (typeof error !== "object" || error === null || !("error_type" in error) || error.error_type !== "composer_operation_active" || !("operation_id" in error) || !("kind" in error)) return null;
   return { operation_id: canonicalUuid(error.operation_id), kind: operationKind(error.kind) };
 }
-export async function submitComposerOperation(descriptor: import("@/types/composerOperations").SubmittedCustody): Promise<import("@/types/composerOperations").ComposerOperationAck> {
+/** POST the submitted body; the 202 answer is the admitted operation's snapshot. */
+export async function submitComposerOperation(descriptor: import("@/types/composerOperations").SubmittedCustody): Promise<import("@/types/composerOperations").ComposerOperationSnapshot> {
   const path = descriptor.kind === "compose_message" ? "messages" : "recompose";
   const response = await authFetch(`/api/sessions/${descriptor.sessionId}/${path}`, {
     method: "POST", headers: authHeaders("application/json"), body: JSON.stringify(descriptor.body), signal: AbortSignal.timeout(15000),
@@ -1035,7 +1070,41 @@ export async function submitComposerOperation(descriptor: import("@/types/compos
     throw error;
   }
   if (response.status !== 202) throw new Error("Composer admission must return 202");
-  return decodeComposerOperationAck(await response.json());
+  return decodeComposerOperationSnapshot(await response.json(), descriptor.sessionId, descriptor.operationId);
+}
+/** The durable read of one operation: its sealed snapshot, or the exact missing answer. */
+export async function fetchComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}`, { headers: authHeaders(), signal: AbortSignal.timeout(15000), cache: "no-store" });
+  const missing = await exactMissing(response);
+  if (missing !== null) return missing;
+  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
+}
+export async function cancelComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}/cancel`, { method: "POST", headers: authHeaders(), signal: AbortSignal.timeout(15000) });
+  const missing = await exactMissing(response);
+  if (missing !== null) return missing;
+  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
+}
+export function fetchComposerOperationStream(sessionId: string, operationId: string, signal: AbortSignal, lastEventId: number | null): Promise<Response> {
+  const headers = new Headers(authHeaders());
+  headers.set("Accept", "text/event-stream");
+  if (lastEventId !== null) headers.set("Last-Event-ID", String(lastEventId));
+  return authFetch(`/api/sessions/${sessionId}/operations/${operationId}/stream`, { headers, signal, cache: "no-store" });
+}
+/** The caller's live operation in a session (204: none), for a tab without custody. */
+export async function fetchActiveComposerOperation(sessionId: string): Promise<import("@/types/composerOperations").ComposerActiveOperation | null> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/active`, { headers: authHeaders(), signal: AbortSignal.timeout(15000), cache: "no-store" });
+  if (response.status === 204) return null;
+  return decodeComposerActiveOperation(await parseResponse<unknown>(response));
+}
+async function exactMissing(response: Response): Promise<import("@/types/composerOperations").MissingOperation | null> {
+  if (response.status !== 404) return null;
+  const body: unknown = await response.json();
+  if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
+    if (body.detail === "Session not found") return { kind: "session_missing" };
+    if (body.detail === "Operation not found") return { kind: "operation_missing" };
+  }
+  throw apiErrorFromBody(404, body as Record<string, unknown>);
 }
 export async function fetchComposerOperationFailures(sessionId: string, options: { cursor?: string; operationId?: string; signal?: AbortSignal } = {}): Promise<import("@/types/composerOperations").ComposerOperationFailurePage> {
   const params = new URLSearchParams();
@@ -1045,33 +1114,6 @@ export async function fetchComposerOperationFailures(sessionId: string, options:
     headers: authHeaders(), signal: options.signal ?? AbortSignal.timeout(15000), cache: "no-store",
   });
   return decodeComposerOperationFailurePage(await parseResponse<unknown>(response), sessionId, options.operationId);
-}
-export async function fetchComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
-  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}`, { headers: authHeaders(), signal: AbortSignal.timeout(15000), cache: "no-store" });
-  if (response.status === 404) {
-    const body: unknown = await response.json();
-    if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
-      if (body.detail === "Session not found") return { kind: "session_missing" };
-      if (body.detail === "Operation not found") return { kind: "operation_missing" };
-    }
-    throw await apiErrorFromBody(404, body as Record<string, unknown>);
-  }
-  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
-}
-export async function cancelComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
-  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}/cancel`, { method: "POST", headers: authHeaders(), signal: AbortSignal.timeout(15000) });
-  if (response.status === 404) {
-    const body: unknown = await response.json();
-    if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
-      if (body.detail === "Session not found") return { kind: "session_missing" };
-      if (body.detail === "Operation not found") return { kind: "operation_missing" };
-    }
-    throw apiErrorFromBody(404, body);
-  }
-  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
-}
-export function fetchComposerOperationStream(sessionId: string, operationId: string, signal: AbortSignal): Promise<Response> {
-  return authFetch(`/api/sessions/${sessionId}/operations/${operationId}/stream`, { headers: { ...authHeaders(), Accept: "text/event-stream" }, signal, cache: "no-store" });
 }
 export async function sendMessage(sessionId: string, content: string, operationId: string, stateId: string | null = null, signal?: AbortSignal): Promise<MessageWithStateResponse> {
   const { submitAndObserveComposerOperation } = await import("./composerOperationObserver");

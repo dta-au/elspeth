@@ -83,6 +83,28 @@ class GraphRecoverySettlement:
     malformed_head: bool = False
 
 
+def graph_recovery_notice(recovery: GraphRecoverySettlement) -> str:
+    """The exact trusted notice for one frozen recovery disposition."""
+    if recovery.failure_reason is not None:
+        notice = "Graph recovery did not complete: the requested draft could not be preserved or restored. The current graph is unchanged."
+    elif recovery.intent.action == "park":
+        notice = f"Draft parked as {recovery.park_id}. The graph remains visible."
+    elif recovery.empty_fallback:
+        notice = (
+            "No eligible saved draft was available; an empty authoring workspace was opened. "
+            "Uploads and history remain. The abandoned working candidate was not captured."
+        )
+    else:
+        notice = (
+            f"Restored saved draft {recovery.target_state_id} as a new editable version. "
+            "Execution readiness and approvals require current checks. "
+            "The abandoned working candidate was not captured. Uploads and history remain."
+        )
+    if recovery.malformed_head:
+        notice += " The previous stored graph or its completion metadata could not be decoded; its historical row was preserved."
+    return notice
+
+
 def empty_recovery_state() -> CompositionState:
     return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
 
@@ -112,7 +134,6 @@ def read_editable_checkpoint(conn: Connection, session_id: UUID, state_id: UUID)
             table.c.id,
             table.c.session_id,
             table.c.version,
-            table.c.source,
             table.c.sources,
             table.c.nodes,
             table.c.edges,
@@ -127,7 +148,6 @@ def read_editable_checkpoint(conn: Connection, session_id: UUID, state_id: UUID)
         id=state_id,
         session_id=session_id,
         version=row.version,
-        source=unwrap_state_column(row.source),
         sources=unwrap_state_column(row.sources),
         nodes=unwrap_state_column(row.nodes),
         edges=unwrap_state_column(row.edges),
@@ -148,10 +168,6 @@ def read_editable_checkpoint(conn: Connection, session_id: UUID, state_id: UUID)
         "outputs": deep_thaw(record.outputs) if record.outputs is not None else [],
         "metadata": deep_thaw(record.metadata_),
     }
-    if record.source is not None:
-        if record.sources is not None:
-            raise GraphRecoveryTargetUnavailable("Recovery target has ambiguous source representation")
-        original["sources"] = {"source": deep_thaw(record.source)}
     if canonical_json(original) != canonical_json(state.to_dict()):
         raise GraphRecoveryTargetUnavailable("Recovery target cannot be reconstructed without changing content")
     if not qualify_editable_checkpoint(state).eligible:

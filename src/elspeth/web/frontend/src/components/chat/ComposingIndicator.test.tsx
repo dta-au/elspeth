@@ -58,7 +58,7 @@ describe("ComposingIndicator", () => {
     expect(screen.queryByText("Best guess from your request")).not.toBeInTheDocument();
   });
 
-  it("shows a broad-strokes read of an HTML to JSON request", () => {
+  it("shows neutral waiting facts without interpreting the request text", () => {
     render(
       <ComposingIndicator
         latestRequest="Exploit this HTML into JSON"
@@ -67,38 +67,62 @@ describe("ComposingIndicator", () => {
     );
 
     expect(screen.getByText("Working on...")).toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent("Working on: convert HTML into JSON");
+    expect(screen.getByRole("status")).toHaveTextContent("Waiting for Composer progress");
     expect(
       screen.queryByText("Request focus: turn HTML content into structured JSON."),
     ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Show details" }));
-    expect(screen.getByText("Request focus: turn HTML content into structured JSON.")).toBeInTheDocument();
+    expect(screen.getByText("No live Composer progress has been reported yet.")).toBeInTheDocument();
     expect(screen.getByText("Current setup: no input yet, no processing steps, no outputs.")).toBeInTheDocument();
     expect(
-      screen.getByText("Likely next move: choose an input, extract the useful fields, then save structured JSON."),
+      screen.getByText("Live updates will appear when Composer reports progress."),
     ).toBeInTheDocument();
   });
 
-  it("marks keyword-guessed working views as estimated, distinct from backend evidence", () => {
-    // elspeth-b189b5b3b8 part c: with no backend progress snapshot the view is
-    // keyword-guessed from the user's message and must not read as if ELSPETH
-    // reported it — visible "(estimated)" marker + the estimated section label
-    // + an italicising modifier class the CSS hangs off.
+  it.each([
+    "Convert HTML into JSON",
+    'Explain why "HTML into JSON" is only a quoted example',
+    "Do not read a database, SQL table or query",
+    "Do not scrape this website or fetch a URL",
+    "Discuss output, save, export, write and artifact terminology",
+    "Explain file, CSV, Excel, upload and input formats",
+    "An unrelated request without pipeline keywords",
+  ])("keeps the waiting view neutral for %s", (request) => {
     const { container } = render(
       <ComposingIndicator
-        latestRequest="Exploit this HTML into JSON"
+        latestRequest={request}
         compositionState={makeState()}
       />,
     );
 
-    expect(screen.getByText("(estimated)")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Waiting for Composer progress");
+    expect(screen.queryByText("(estimated)")).not.toBeInTheDocument();
     expect(screen.queryByText("Best guess from your request")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Show details" }));
-    expect(screen.getByText("Best guess from your request")).toBeInTheDocument();
-    expect(screen.queryByText("What ELSPETH can see")).not.toBeInTheDocument();
+    expect(screen.getByText("What ELSPETH can see")).toBeInTheDocument();
+    expect(screen.getByText("No live Composer progress has been reported yet.")).toBeInTheDocument();
+    expect(screen.getByText("Current setup: no input yet, no processing steps, no outputs.")).toBeInTheDocument();
+    expect(screen.getByText("Live updates will appear when Composer reports progress.")).toBeInTheDocument();
     expect(
       container.querySelector(".composing-working-view--estimated"),
-    ).not.toBeNull();
+    ).toBeNull();
+  });
+
+  it("uses the neutral waiting view for an idle backend snapshot", () => {
+    const progress: ComposerProgressSnapshot = {
+      session_id: "session-1",
+      request_id: "message-1",
+      phase: "idle",
+      headline: "This idle headline is not an active update.",
+      evidence: [],
+      likely_next: null,
+      reason: null,
+      updated_at: "2026-04-26T10:00:00Z",
+    };
+    render(<ComposingIndicator latestRequest="Convert HTML to JSON" composerProgress={progress} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("Waiting for Composer progress");
+    expect(screen.queryByText(progress.headline)).not.toBeInTheDocument();
   });
 
   it("summarizes existing pipeline shape without plugin jargon", () => {
@@ -132,7 +156,7 @@ describe("ComposingIndicator", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Show details" }));
     expect(screen.getByText("Current setup: input configured, 1 processing step, 1 output.")).toBeInTheDocument();
-    expect(screen.getByText("Request focus: produce or update saved output.")).toBeInTheDocument();
+    expect(screen.getByText("No live Composer progress has been reported yet.")).toBeInTheDocument();
   });
 
   it("keeps long-running details collapsed until requested", () => {
@@ -143,7 +167,7 @@ describe("ComposingIndicator", () => {
       />,
     );
 
-    expect(screen.getByText("Working on: saved output")).toBeInTheDocument();
+    expect(screen.getByText("Waiting for Composer progress")).toBeInTheDocument();
     expect(screen.queryByText("Likely next")).not.toBeInTheDocument();
 
     const toggle = screen.getByRole("button", { name: "Show details" });

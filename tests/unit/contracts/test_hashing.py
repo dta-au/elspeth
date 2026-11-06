@@ -1,5 +1,6 @@
 """Tests for contracts/hashing.py — NaN/Infinity rejection and primitives."""
 
+import hashlib
 import json
 from datetime import UTC, datetime
 
@@ -9,6 +10,41 @@ from elspeth.contracts import hashing as contracts_hashing
 from elspeth.contracts.hashing import CANONICAL_VERSION, canonical_json, canonical_json_loads, repr_hash, stable_hash
 from elspeth.core import canonical as core_canonical
 from elspeth.core.canonical import CANONICAL_VERSION as CORE_VERSION
+from tests.unit.contracts.test_canonical_json_native import _legacy_canonical_json
+
+
+def test_public_canonical_and_digest_match_independent_original_bytes() -> None:
+    from enum import Enum, StrEnum
+    from types import MappingProxyType
+
+    LegacyText = Enum("LegacyText", {"VALUE": "underlying string"}, type=str)
+
+    class Text(StrEnum):
+        VALUE = "native enum"
+
+    value = MappingProxyType(
+        {"😀": ('quote" slash/ backslash\\ newline\n café', Text.VALUE, LegacyText.VALUE), "\ue000": (-0.0, 1e-7, 2**53 - 1)}
+    )
+    expected = _legacy_canonical_json(value).encode("utf-8")
+    actual = canonical_json(value).encode("utf-8")
+    assert actual == expected
+    assert len(actual) == len(expected)
+    assert stable_hash(value) == hashlib.sha256(expected).hexdigest()
+    assert CANONICAL_VERSION == "sha256-rfc8785-v1"
+
+
+def test_public_canonical_keeps_one_complete_normalizer_traversal(monkeypatch: pytest.MonkeyPatch) -> None:
+    value = {"root": [1, "text", {"last": True}]}
+    original = contracts_hashing._normalize_frozen_and_reject_non_finite
+    visited = []
+
+    def observe(part):
+        visited.append(type(part))
+        return original(part)
+
+    monkeypatch.setattr(contracts_hashing, "_normalize_frozen_and_reject_non_finite", observe)
+    assert canonical_json(value) == _legacy_canonical_json(value)
+    assert visited == [dict, list, int, str, dict, bool]
 
 
 class TestCanonicalJsonNanRejection:

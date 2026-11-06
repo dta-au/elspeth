@@ -1,0 +1,13 @@
+"""The identical source/identity/current-read owners on serial PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_tool_argument_registration import (
+    test_real_b2_registers_same_assistant_and_current_sql_restores_exact_guard_positions as test_real_b2_registers_same_assistant_and_current_sql_restores_exact_guard_positions,
+)
+from tests.unit.web.sessions.test_continuation_tool_argument_registration import (
+    test_real_ordinary_registry_refuses_changed_alias_guard_source_or_nonargument_wire as test_real_ordinary_registry_refuses_changed_alias_guard_source_or_nonargument_wire,
+)
+
+pytestmark = pytest.mark.testcontainer

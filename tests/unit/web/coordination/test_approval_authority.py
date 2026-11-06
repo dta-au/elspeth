@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import event, insert, select, update
 from sqlalchemy.dialects import postgresql
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.web.coordination.approval_authority import (
@@ -37,6 +38,10 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.schema import initialize_session_schema
 
 NOW = datetime(2026, 9, 19, 12, tzinfo=UTC)
+SESSION_ID = "10000000-0000-4000-8000-000000000001"
+SECOND_SESSION_ID = "10000000-0000-4000-8000-000000000002"
+STATE_ID = "20000000-0000-4000-8000-000000000001"
+SECOND_STATE_ID = "20000000-0000-4000-8000-000000000002"
 BINDING = ApprovalBinding(
     config_hash="config",
     canonical_version="canonical",
@@ -52,7 +57,7 @@ def test_transaction_locks_session_before_participant_identity() -> None:
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="author")
-        conn.execute(insert(sessions_table).values(id="session", user_id="author", title="approval", created_at=NOW, updated_at=NOW))
+        conn.execute(insert(sessions_table).values(id=SESSION_ID, user_id="author", title="approval", created_at=NOW, updated_at=NOW))
     statements: list[str] = []
 
     def capture(_conn, statement, _multiparams, _params, _execution_options) -> None:
@@ -64,7 +69,7 @@ def test_transaction_locks_session_before_participant_identity() -> None:
 
     event.listen(engine, "before_execute", capture)
     try:
-        ApprovalTransactionAuthority(engine).run("session", mutation)
+        ApprovalTransactionAuthority(engine).run(SESSION_ID, mutation)
     finally:
         event.remove(engine, "before_execute", capture)
         engine.dispose()
@@ -100,17 +105,20 @@ def _seed(fenced_session) -> None:
         )
     conn.execute(
         insert(composition_states_table).values(
-            id="state-1",
-            session_id=fenced_session.session_id,
-            version=1,
-            is_valid=True,
-            provenance="session_seed",
-            created_at=NOW,
+            **stamped_state_values(
+                metadata_=stored_default_pipeline_metadata(),
+                id=STATE_ID,
+                session_id=fenced_session.session_id,
+                version=1,
+                is_valid=True,
+                provenance="session_seed",
+                created_at=NOW,
+            )
         )
     )
 
 
-def _request(fenced_session, events: list, *, state_id: str = "state-1"):
+def _request(fenced_session, events: list, *, state_id: str = STATE_ID):
     return RepositoryApprovalAuthority.request(
         fenced_session.connection_token,
         session_id=fenced_session.session_id,
@@ -231,7 +239,7 @@ def test_later_rejection_retires_earlier_approval_and_audits_it(fenced_session) 
     }
     assert (
         RepositoryApprovalAuthority.approved_bindings(
-            fenced_session.connection_token, session_id=fenced_session.session_id, state_id="state-1"
+            fenced_session.connection_token, session_id=fenced_session.session_id, state_id=STATE_ID
         )
         == ()
     )
@@ -261,21 +269,29 @@ def test_failed_rejection_audit_batch_rolls_back_decision_and_retirement(tmp_pat
                     granted_at=NOW,
                 )
             )
-        conn.execute(insert(sessions_table).values(id="session-1", user_id="alice", title="approval", created_at=NOW, updated_at=NOW))
+        conn.execute(insert(sessions_table).values(id=SESSION_ID, user_id="alice", title="approval", created_at=NOW, updated_at=NOW))
         conn.execute(
             insert(composition_states_table).values(
-                id="state-1", session_id="session-1", version=1, is_valid=True, provenance="session_seed", created_at=NOW
+                **stamped_state_values(
+                    metadata_=stored_default_pipeline_metadata(),
+                    id=STATE_ID,
+                    session_id=SESSION_ID,
+                    version=1,
+                    is_valid=True,
+                    provenance="session_seed",
+                    created_at=NOW,
+                )
             )
         )
     authority = ApprovalTransactionAuthority(engine)
 
     def request():
         return authority.run(
-            "session-1",
+            SESSION_ID,
             lambda token: RepositoryApprovalAuthority.request(
                 token,
-                session_id="session-1",
-                state_id="state-1",
+                session_id=SESSION_ID,
+                state_id=STATE_ID,
                 binding=BINDING,
                 requested_by="alice",
                 approver="addressed",
@@ -286,7 +302,7 @@ def test_failed_rejection_audit_batch_rolls_back_decision_and_retirement(tmp_pat
 
     first = request()
     authority.run(
-        "session-1",
+        SESSION_ID,
         lambda token: RepositoryApprovalAuthority.decide(
             token,
             approval_id=first.approval_id,
@@ -304,7 +320,7 @@ def test_failed_rejection_audit_batch_rolls_back_decision_and_retirement(tmp_pat
 
     with pytest.raises(RuntimeError, match="injected Landscape batch failure"):
         authority.run(
-            "session-1",
+            SESSION_ID,
             lambda token: RepositoryApprovalAuthority.decide(
                 token,
                 approval_id=second.approval_id,
@@ -380,6 +396,7 @@ def test_inbox_includes_role_eligible_requests_with_addressed_first(tmp_path) ->
     engine = create_session_engine(f"sqlite:///{tmp_path / 'inbox.db'}")
     initialize_session_schema(engine)
     now = datetime.now(UTC)
+    state_ids = {SESSION_ID: STATE_ID, SECOND_SESSION_ID: SECOND_STATE_ID}
     with engine.begin() as conn:
         for identity_id in ("alice", "addressed", "cover", "outsider"):
             ensure_test_identity(conn, identity_id=identity_id)
@@ -393,7 +410,7 @@ def test_inbox_includes_role_eligible_requests_with_addressed_first(tmp_path) ->
                     granted_at=now,
                 )
             )
-        for session_id in ("session-a", "session-b"):
+        for session_id, state_id in state_ids.items():
             conn.execute(
                 insert(sessions_table).values(
                     id=session_id,
@@ -405,12 +422,15 @@ def test_inbox_includes_role_eligible_requests_with_addressed_first(tmp_path) ->
             )
             conn.execute(
                 insert(composition_states_table).values(
-                    id=f"state-{session_id}",
-                    session_id=session_id,
-                    version=1,
-                    is_valid=True,
-                    provenance="session_seed",
-                    created_at=now,
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=state_id,
+                        session_id=session_id,
+                        version=1,
+                        is_valid=True,
+                        provenance="session_seed",
+                        created_at=now,
+                    )
                 )
             )
     authority = ApprovalTransactionAuthority(engine)
@@ -421,7 +441,7 @@ def test_inbox_includes_role_eligible_requests_with_addressed_first(tmp_path) ->
             lambda token: RepositoryApprovalAuthority.request(
                 token,
                 session_id=session_id,
-                state_id=f"state-{session_id}",
+                state_id=state_ids[session_id],
                 binding=BINDING,
                 requested_by="alice",
                 approver=approver,
@@ -430,8 +450,8 @@ def test_inbox_includes_role_eligible_requests_with_addressed_first(tmp_path) ->
             ),
         )
 
-    other = request("session-a", "addressed")
-    mine = request("session-b", "cover")
+    other = request(SESSION_ID, "addressed")
+    mine = request(SECOND_SESSION_ID, "cover")
     assert [row.approval_id for row in authority.inbox(approver_identity_id="cover")] == [mine.approval_id, other.approval_id]
     assert authority.inbox(approver_identity_id="outsider") == ()
     assert authority.inbox(approver_identity_id="alice") == ()

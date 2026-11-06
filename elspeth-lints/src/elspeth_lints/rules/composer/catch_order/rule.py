@@ -17,7 +17,9 @@ from elspeth_lints.rules.composer.catch_order.metadata import LEGACY_RULE_ID, RU
 _BROAD_SUPERTYPES: frozenset[str] = frozenset({"Exception", "BaseException"})
 _SUBCLASS_TO_SUPERCLASSES: dict[str, frozenset[str]] = {
     "ComposerAdmissionRefused": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
+    "ComposerMutationAuthorityRevoked": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "CredentialMaterialRefused": frozenset({"ComposerAdmissionRefused", "ComposerServiceError"}) | _BROAD_SUPERTYPES,
+    "ComposerContextUnsupported": frozenset({"ComposerAdmissionRefused", "ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerPluginCrashError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerConvergenceError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerRuntimePreflightError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,

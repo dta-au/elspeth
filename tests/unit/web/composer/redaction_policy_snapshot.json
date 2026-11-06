@@ -39,6 +39,11 @@
     "sensitive_path_count": 0,
     "shape": "declarative"
   },
+  "get_complete_pipeline_value": {
+    "hash": "e2407335916d08c38a6ed21434fbb56b8d7db3fa44e52baccdb640af1a25c0dd",
+    "sensitive_path_count": 1,
+    "shape": "declarative"
+  },
   "get_expression_grammar": {
     "hash": "94d52cd1103326fba57c1c30b55027b2564306570959791d9311c79bf06d4dbf",
     "sensitive_path_count": 0,
@@ -140,7 +145,7 @@
     "shape": "declarative"
   },
   "request_advisor_hint": {
-    "hash": "f9f515b1d4ad3c958f95adbb8be5cf559f8e41b2a39aa8eb7dee2eea618812b1",
+    "hash": "0683d061bc1ae34b0e00d155d1d7fbe689c2a4e169532450f03f2eee0ecf02ea",
     "sensitive_path_count": 5,
     "shape": "declarative"
   },
@@ -160,7 +165,7 @@
     "shape": "declarative"
   },
   "set_pipeline": {
-    "hash": "5a86f4c75613377e846f2dfd13d878ce6595c636b3602845ddb4219cdfe175df",
+    "hash": "2ce70c6b3909f6f67c42374045a68be16b4716955594423fd06d022819a67828",
     "sensitive_path_count": 15,
     "shape": "type_driven"
   },

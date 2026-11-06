@@ -30,7 +30,7 @@ AmbientCapabilities=
 """
 
 
-def _runner_layout(tmp_path: Path, *, secure: bool) -> tuple[Path, Path]:
+def _runner_layout(tmp_path: Path, *, secure: bool, count: int = 6) -> tuple[Path, Path]:
     runner_root = tmp_path / "runners"
     service_dir = tmp_path / "systemd"
     runner_root.mkdir()
@@ -38,7 +38,7 @@ def _runner_layout(tmp_path: Path, *, secure: bool) -> tuple[Path, Path]:
     owner = os.getuid()
     group = os.getgid()
 
-    for number in range(1, 5):
+    for number in range(1, count + 1):
         runner = runner_root / f"elspeth-nyx-{number}"
         runner.mkdir(mode=0o700 if secure else 0o755)
         for name in (".credentials", ".credentials_rsaparams", ".env", ".path"):
@@ -93,14 +93,26 @@ def test_runner_audit_rejects_world_readable_credentials_and_missing_hardening(t
     assert "runner_host_controls=FAIL" in result.stdout
 
 
-def test_runner_audit_accepts_four_hardened_runner_services(tmp_path: Path) -> None:
+def test_runner_audit_accepts_six_hardened_runner_services(tmp_path: Path) -> None:
     runner_root, service_dir = _runner_layout(tmp_path, secure=True)
 
     result = _audit(runner_root, service_dir)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "runner_count=4" in result.stdout
+    assert "runner_count=6" in result.stdout
     assert "runner_host_controls=PASS" in result.stdout
+
+
+def test_runner_audit_rejects_the_retired_four_runner_inventory(tmp_path: Path) -> None:
+    runner_root, service_dir = _runner_layout(tmp_path, secure=True, count=4)
+
+    result = _audit(runner_root, service_dir)
+
+    assert result.returncode == 1
+    assert "expected 6 runner directories" in result.stdout
+    assert f"missing runner directory {runner_root / 'elspeth-nyx-5'}" in result.stdout
+    assert f"missing runner directory {runner_root / 'elspeth-nyx-6'}" in result.stdout
+    assert "runner_host_controls=FAIL" in result.stdout
 
 
 def test_runner_audit_rejects_locked_directory_for_current_privileges(tmp_path: Path) -> None:

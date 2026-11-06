@@ -1960,6 +1960,42 @@ def test_advisor_checkpoint_budget_default_and_floor() -> None:
         _settings(composer_advisor_checkpoint_max_passes=0)
 
 
+def test_attachment_inspection_limit_preserves_existing_default_ceiling() -> None:
+    assert _settings().composer_attachment_inspection_max_bytes == 262_144
+
+
+@pytest.mark.parametrize("limit", [1, 65_536, 262_144])
+def test_attachment_inspection_limit_accepts_supported_integer_range(limit: int) -> None:
+    assert _settings(composer_attachment_inspection_max_bytes=limit).composer_attachment_inspection_max_bytes == limit
+
+
+@pytest.mark.parametrize("invalid", [0, -1, 262_145, True, False, 1.0, "65536", None])
+def test_attachment_inspection_limit_rejects_out_of_range_and_noninteger_values(invalid: object) -> None:
+    with pytest.raises(ValidationError, match="composer_attachment_inspection_max_bytes"):
+        _settings(composer_attachment_inspection_max_bytes=invalid)
+
+
+@pytest.mark.usefixtures("required_web_env")
+def test_attachment_inspection_limit_environment_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ELSPETH_WEB__COMPOSER_ATTACHMENT_INSPECTION_MAX_BYTES", raising=False)
+    assert web_config.settings_from_env().composer_attachment_inspection_max_bytes == 262_144
+
+
+@pytest.mark.usefixtures("required_web_env")
+@pytest.mark.parametrize("limit", [1, 65_536, 262_144])
+def test_attachment_inspection_limit_loads_integer_environment_setting(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ATTACHMENT_INSPECTION_MAX_BYTES", str(limit))
+    assert web_config.settings_from_env().composer_attachment_inspection_max_bytes == limit
+
+
+@pytest.mark.usefixtures("required_web_env")
+@pytest.mark.parametrize("invalid", ["0", "-1", "262145", "true", "false", "1.0", "null", "", "unbounded"])
+def test_attachment_inspection_limit_rejects_invalid_environment_setting(monkeypatch: pytest.MonkeyPatch, invalid: str) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_ATTACHMENT_INSPECTION_MAX_BYTES", invalid)
+    with pytest.raises(ValidationError, match="composer_attachment_inspection_max_bytes"):
+        web_config.settings_from_env()
+
+
 def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """ELSPETH_WEB__* values arrive as strings; strict int/float fields must
     still be settable from the environment (live regression 2026-07-22: setting

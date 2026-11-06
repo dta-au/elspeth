@@ -1,5 +1,6 @@
 """Adversarial controls for recovery admission before graph hydration."""
 
+import json
 from datetime import UTC, datetime
 from json import JSONDecodeError
 from sys import getrecursionlimit
@@ -11,23 +12,17 @@ from sqlalchemy import event, insert, select
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
-from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
-from elspeth.web.sessions._persist_payload import AuditMessageDraft
-from elspeth.web.sessions.composer_app_services import composer_app_services
-from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
-from elspeth.web.sessions.composer_turn import persist_cancelled_turn_audit
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.graph_recovery import empty_recovery_state
 from elspeth.web.sessions.models import chat_messages_table, composition_graph_parks_table, composition_states_table
 from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.state_envelope import envelope_state_column
+from tests.helpers.composition_state import stamped_state_values, stored_composer_meta
 from tests.unit.web.coordination.test_composer_operation_authority import admit
 from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store_fixture
 from tests.unit.web.coordination.test_graph_recovery_persistence import begin, finish
-from tests.unit.web.sessions.test_routes import _EMPTY_STATE, _make_app
-from tests.unit.web.sessions.test_run_composer_turn import _CancelCommittingComposer, _run, _running_job
 
 
 @pytest.fixture
@@ -35,31 +30,60 @@ def operation_store(tmp_path):
     yield from _operation_store_fixture.__wrapped__(tmp_path)
 
 
-def _insert_unreadable_head(engine, session_id, *, corruption: str):
-    """Corrupt only graph bytes; session and operation authority stay intact."""
+def _insert_unreadable_head(engine, session_id, *, corruption: str, before_corruption=None):
+    """Corrupt only graph bytes; session and operation authority stay intact.
+
+    The head is first written readable, with the content publication a real
+    writer stamps. ``before_corruption(state_id)`` runs against that readable
+    head (Continuation admission hydrates its bound base, so a request is
+    admitted before the damage); only then are the graph bytes corrupted,
+    bypassing the JSON encoder so corruption can fail in the result processor
+    before _row_to_state_record ever runs.
+    """
     state_id = uuid4()
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id),
-                session_id=str(session_id),
-                version=1,
-                sources=envelope_state_column(["not-a-source-map"] if corruption == "wrong-sources-shape" else {}),
-                nodes=envelope_state_column([]) if corruption == "wrong-sources-shape" else {"missing_version_envelope": True},
-                edges=envelope_state_column([]),
-                outputs=envelope_state_column([]),
-                metadata_=envelope_state_column({"name": "Draft", "description": ""}),
-                is_valid=False,
-                created_at=datetime.now(UTC),
-                provenance="session_seed",
+                **stamped_state_values(
+                    id=str(state_id),
+                    session_id=str(session_id),
+                    version=1,
+                    sources=envelope_state_column({}),
+                    nodes=envelope_state_column([]),
+                    edges=envelope_state_column([]),
+                    outputs=envelope_state_column([]),
+                    metadata_=envelope_state_column({"name": "Draft", "description": ""}),
+                    is_valid=False,
+                    created_at=datetime.now(UTC),
+                    provenance="session_seed",
+                )
             )
         )
-        if corruption not in {"invalid-envelope", "wrong-sources-shape"}:
-            # Deliberately bypass the JSON encoder: corruption can fail in the
-            # result processor before _row_to_state_record ever runs.
-            depth = getrecursionlimit() + 100
-            raw_json = "{invalid-json" if corruption == "invalid-json" else '{"_version":1,"data":' + "[" * depth + "0" + "]" * depth + "}"
-            conn.exec_driver_sql("UPDATE composition_states SET nodes = ? WHERE id = ?", (raw_json, str(state_id)))
+    if before_corruption is not None:
+        before_corruption(state_id)
+    depth = getrecursionlimit() + 100
+    column, raw_json = {
+        "invalid-envelope": ("nodes", '{"missing_version_envelope": true}'),
+        "invalid-json": ("nodes", "{invalid-json"),
+        "excessive-json-depth": ("nodes", '{"_version":1,"data":' + "[" * depth + "0" + "]" * depth + "}"),
+        "wrong-sources-shape": ("sources", '{"_version": 1, "data": ["not-a-source-map"]}'),
+    }[corruption]
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"UPDATE composition_states SET {column} = ? WHERE id = ?", (raw_json, str(state_id)))
+        if corruption == "wrong-sources-shape":
+            # Re-bind the publication to the damaged bytes, so the shape check
+            # (not the content-publication check) is what refuses the row.
+            meta = stored_composer_meta(
+                session_id=session_id,
+                state_id=state_id,
+                version=1,
+                sources=["not-a-source-map"],
+                nodes=[],
+                edges=[],
+                outputs=[],
+                metadata={"name": "Draft", "description": ""},
+            )
+            conn.exec_driver_sql("UPDATE composition_states SET composer_meta = ? WHERE id = ?", (json.dumps(meta), str(state_id)))
     return state_id
 
 
@@ -77,17 +101,24 @@ async def test_malformed_head_recovery_keeps_exact_fence_and_ignores_unsaveable_
     operation_store, corruption, decode_failure, monkeypatch
 ):
     engine, repository, authority, service, session_id = operation_store
-    state_id = _insert_unreadable_head(engine, session_id, corruption=corruption)
+    admitted = []
+
+    def admit_on_readable_head(state_id):
+        # Continuation admission hydrates the bound base, so the request is
+        # admitted while the head is readable and the damage lands afterwards.
+        request = SendMessageRequest(operation_id=str(uuid4()), content="Stop and recover the draft", state_id=state_id)
+        admitted.append(admit(authority, session_id, request))
+
+    state_id = _insert_unreadable_head(engine, session_id, corruption=corruption, before_corruption=admit_on_readable_head)
+    ((record, fresh),) = admitted
+    assert fresh and record.base_state_id == state_id
     # Positive control: this fixture actually defeats ordinary head hydration.
     with pytest.raises(decode_failure):
         broken_record = await service.get_current_state(session_id)
         assert broken_record is not None
         state_from_record(broken_record)
-    request = SendMessageRequest(operation_id=str(uuid4()), content="Stop and recover the draft", state_id=state_id)
-    record, fresh = admit(authority, session_id, request)
-    assert fresh and record.base_state_id == state_id
-    (claim,) = authority.claim_next(limit=1)
-    context = repository.start_composer_async_operation(claim, owner_instance_id="test-owner", lease_seconds=30, auth_provider_type="local")
+    (claim,) = authority.claim_segment(limit=1)
+    context = repository.start_composer_segment(claim, owner_instance_id="test-owner", lease_seconds=30, auth_provider_type="local")
     try:
         assert context.operation_kind is SessionOperationKind.COMPOSE
         assert context.fence.session_id == str(session_id)
@@ -186,17 +217,19 @@ async def test_graph_read_never_attributes_old_damage_to_newer_healthy_head(oper
             # binding independently of that SQLite-only exclusion.
             read_connections[-1].execute(
                 insert(composition_states_table).values(
-                    id=str(healthy_id),
-                    session_id=str(session_id),
-                    version=2,
-                    sources=envelope_state_column({}),
-                    nodes=envelope_state_column([]),
-                    edges=envelope_state_column([]),
-                    outputs=envelope_state_column([]),
-                    metadata_=envelope_state_column({"name": "Recovered", "description": ""}),
-                    is_valid=False,
-                    created_at=datetime.now(UTC),
-                    provenance="session_seed",
+                    **stamped_state_values(
+                        id=str(healthy_id),
+                        session_id=str(session_id),
+                        version=2,
+                        sources=envelope_state_column({}),
+                        nodes=envelope_state_column([]),
+                        edges=envelope_state_column([]),
+                        outputs=envelope_state_column([]),
+                        metadata_=envelope_state_column({"name": "Recovered", "description": ""}),
+                        is_valid=False,
+                        created_at=datetime.now(UTC),
+                        provenance="session_seed",
+                    )
                 )
             )
         return original_convert(row)
@@ -215,32 +248,3 @@ async def test_graph_read_never_attributes_old_damage_to_newer_healthy_head(oper
     assert healthy_read.hydration_error is None
     assert healthy_read.record is not None and healthy_read.record.id == healthy_id
     assert healthy_read.head.state_id == healthy_id and healthy_read.head.version == 2
-
-
-@pytest.mark.asyncio
-async def test_cancelled_recovery_preserves_extra_audit_drafts_once(tmp_path):
-    app, service = _make_app(tmp_path)
-    session = await service.create_session("alice", "Cancelled recovery", "local")
-    draft = AuditMessageDraft(role="audit", content='{"event":"recovery-cancellation-control"}')
-    result = ComposerResult(
-        message="Let's discuss.",
-        state=_EMPTY_STATE,
-        graph_recovery_intent=GraphRecoveryIntent("reset_to_safe_checkpoint", "Let's discuss.", None, "cancel-recovery"),
-        recovery_audit_drafts=(draft,),
-    )
-    jobs = []
-    app.state.composer_service = _CancelCommittingComposer(jobs, result=result)
-    async with _running_job(app, service, session.id, kind="compose_message", content="Recover") as job:
-        jobs.append(job)
-        with pytest.raises(ComposerOperationCancelledDuringTurn):
-            await _run(app, job)
-        assert job.observation.compose_result is result
-        assert not job.observation.audit_cohort_durable
-        assert not any(row.content == draft.content for row in await service.get_messages(session.id, limit=None))
-        await persist_cancelled_turn_audit(composer_app_services(app), job.running, job.observation)
-        assert job.observation.audit_cohort_durable
-        await persist_cancelled_turn_audit(composer_app_services(app), job.running, job.observation)
-    messages = await service.get_messages(session.id, limit=None)
-    assert len([row for row in messages if row.content == draft.content]) == 1
-    assert not any(row.role == "assistant" for row in messages)
-    assert await service.get_current_state(session.id) is None

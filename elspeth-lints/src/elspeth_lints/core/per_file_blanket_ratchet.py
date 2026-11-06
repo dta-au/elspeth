@@ -12,13 +12,13 @@ cleanup to replace broad coverage with precise dispositions.
 from __future__ import annotations
 
 import fnmatch
-import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from elspeth_lints.core.allowlist import iter_allowlist_root_yaml_paths
 from elspeth_lints.core.allowlist_io import AllowlistIOError, load_yaml_mapping_text, parse_per_file_rules
+from elspeth_lints.core.trusted_git import SourceSnapshotError, git_metadata_operation, run_git_metadata
 
 
 class PerFileBlanketRatchetError(RuntimeError):
@@ -64,6 +64,17 @@ class PerFileBlanketRatchetReport:
 
 
 def check_per_file_blanket_ratchet(
+    *,
+    allowlist_root: Path,
+    baseline_ref: str,
+    repo_root: Path,
+) -> PerFileBlanketRatchetReport:
+    """Compare blankets using one callback-free metadata view per operation."""
+    with git_metadata_operation(repo_root):
+        return _check_per_file_blanket_ratchet(allowlist_root=allowlist_root, baseline_ref=baseline_ref, repo_root=repo_root)
+
+
+def _check_per_file_blanket_ratchet(
     *,
     allowlist_root: Path,
     baseline_ref: str,
@@ -240,19 +251,10 @@ def _parse_blankets(
 
 
 def _run_git(args: list[str], *, repo_root: Path) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
     try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=repo_root,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-    except OSError as exc:
-        raise PerFileBlanketRatchetError(f"git command failed to start: {exc}") from exc
+        return run_git_metadata(args, repo_root=repo_root)
+    except SourceSnapshotError as exc:
+        raise PerFileBlanketRatchetError(f"git metadata observation failed: {exc}") from exc
 
 
 def _git_failure_detail(result: subprocess.CompletedProcess[str]) -> str:

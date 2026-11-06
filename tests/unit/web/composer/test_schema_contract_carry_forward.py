@@ -5,15 +5,18 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import cast
+from uuid import UUID
 
 import pytest
 from pydantic import SecretBytes
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.hashing import canonical_json
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.planner_authoring_aids import build_schema_contract_evidence
 from elspeth.web.composer.prompts import build_catalog_context_string, build_context_string, build_messages
 from elspeth.web.composer.protocol import ComposerHistoryMessage
@@ -162,6 +165,11 @@ def _payload(context: str) -> dict[str, object]:
     return cast(dict[str, object], json.loads(context.partition("\n")[2]))
 
 
+def _content_scope(state: CompositionState) -> ComposerContentScope:
+    """Explicit identity for pure schema rendering, not live session authority."""
+    return ComposerContentScope(UUID(int=1), composition_content_hash(state))
+
+
 def _schema_entries(payload: dict[str, object]) -> list[dict[str, object]]:
     evidence = cast(dict[str, object], payload["schema_contract_evidence"])
     return cast(list[dict[str, object]], evidence["schemas"])
@@ -174,6 +182,7 @@ def test_followup_request_rehydrates_whole_current_schema_contract() -> None:
         build_context_string(
             _csv_state(),
             view,
+            content_scope=_content_scope(_csv_state()),
             plugin_snapshot=snapshot,
             schemas_loaded=frozenset({("source", "csv")}),
         )
@@ -432,6 +441,7 @@ def test_injection_shaped_enum_is_exact_but_free_text_metadata_is_absent() -> No
         build_context_string(
             _csv_state(),
             view,
+            content_scope=_content_scope(_csv_state()),
             plugin_snapshot=snapshot,
             schemas_loaded=frozenset({("source", "csv")}),
         )
@@ -456,6 +466,7 @@ def test_injection_shaped_enum_is_exact_but_free_text_metadata_is_absent() -> No
         _csv_state(),
         "Continue.",
         view,
+        content_scope=_content_scope(_csv_state()),
         plugin_snapshot=snapshot,
         schemas_loaded=frozenset({("source", "csv")}),
     )
@@ -568,6 +579,7 @@ def test_schema_drift_rehydrates_new_contract_instead_of_reusing_stale_bytes() -
     view, snapshot = _policy_view(catalog)
     kwargs = {
         "state": _csv_state(),
+        "content_scope": _content_scope(_csv_state()),
         "catalog": view,
         "plugin_snapshot": snapshot,
         "schemas_loaded": frozenset({("source", "csv")}),
@@ -604,6 +616,7 @@ def test_current_policy_unavailability_removes_stale_evidence_and_reopens_gap() 
         build_context_string(
             _csv_state(),
             view,
+            content_scope=_content_scope(_csv_state()),
             plugin_snapshot=snapshot,
             schemas_loaded=frozenset({("source", "csv")}),
         )
@@ -898,6 +911,7 @@ def test_followup_evidence_does_not_duplicate_discovery_or_rewrite_history() -> 
         _csv_state(),
         "Continue.",
         view,
+        content_scope=_content_scope(_csv_state()),
         plugin_snapshot=snapshot,
         schemas_loaded=frozenset({("source", "csv")}),
     )

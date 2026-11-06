@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateToolAuthoring
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.readonly_json import JsonValue
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
@@ -19,17 +22,25 @@ from elspeth.web.composer._compose_loop_carriers import (
 from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
     unknown_tool_arguments_redaction,
 )
-from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.composer.tools._common import ToolResult, _failure_result
 from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.interpretation_state import pending_execution_interpretation_sites
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, RejectionRecord
 from elspeth.web.sessions.protocol import SessionServiceProtocol
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
+    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+    from elspeth.web.composer.withheld_replies import WithheldReply
 
 
 def _serialize_response_via_walker(
@@ -193,6 +204,10 @@ def build_rejection_records(tool_outcomes: tuple[_ToolOutcome, ...]) -> tuple[Re
         elif isinstance(outcome.response, ToolResult) and not outcome.response.success:
             errors = outcome.response.validation.errors
             primary = next((entry for entry in errors if entry.error_code), errors[0] if errors else None)
+            if primary is not None and primary.error_code == "auto_mutation_revoked":
+                # This terminal refusal is persisted as the real tool result.
+                # No subsequent model call receives planner feedback for it.
+                continue
             records.append(
                 RejectionRecord(
                     tool_call_id=outcome.call.id,
@@ -205,60 +220,72 @@ def build_rejection_records(tool_outcomes: tuple[_ToolOutcome, ...]) -> tuple[Re
     return tuple(records)
 
 
+def _revoked_graph_rows(
+    *,
+    rows: tuple[RedactedToolRow, ...],
+    outcomes: tuple[_ToolOutcome, ...],
+    base_state: CompositionState,
+    redaction_telemetry: RedactionTelemetry,
+) -> tuple[RedactedToolRow, ...]:
+    if tuple(row.tool_call_id for row in rows) != tuple(outcome.call.id for outcome in outcomes):
+        raise AuditIntegrityError("Refusal preparation lost its actual ordered tool cohort")
+    if not any(row.composition_state_payload is not None for row in rows):
+        return rows
+    result: list[RedactedToolRow] = []
+    for row, outcome in zip(rows, outcomes, strict=True):
+        if row.composition_state_payload is None:
+            result.append(row)
+            continue
+        if row.visible_event is None:
+            raise AuditIntegrityError("Graph refusal lost its original visible tool event")
+        failed = _failure_result(
+            base_state,
+            "This candidate graph was not saved because automatic mutation authority was revoked.",
+            error_code="auto_mutation_revoked",
+            with_state_validation=False,
+        )
+        display = _serialize_response_via_walker(
+            replace(outcome, response=failed, post_version=outcome.pre_version),
+            telemetry=redaction_telemetry,
+            failure_status=None,
+        )
+        result.append(
+            replace(
+                row, content=display, composition_state_payload=None, visible_event=row.visible_event.with_authority_revocation(display)
+            )
+        )
+    return tuple(result)
+
+
 if TYPE_CHECKING:
     from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord
 
 
-async def persist_turn_audit(
+@dataclass(frozen=True, slots=True)
+class PreparedTurnAuditRows:
+    redacted_calls: tuple[Mapping[str, JsonValue], ...]
+    redacted_rows: tuple[RedactedToolRow, ...]
+    revoked_rows: tuple[RedactedToolRow, ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "redacted_calls")
+
+
+def prepare_turn_audit_rows(
     *,
-    sessions_service: SessionServiceProtocol | None,
     redaction_telemetry: RedactionTelemetry,
     tool_outcomes: tuple[_ToolOutcome, ...],
-    decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
+    base_state: CompositionState,
+    decoded_args_by_call_id: Mapping[str, Mapping[str, JsonValue]],
     private_authorings: tuple[PrivateToolAuthoring, ...],
-    private_invocations: tuple[ComposerToolInvocation, ...],
-    assistant_message: _AdmittedAssistantMessage,
-    raw_assistant_content: str | None,
-    assistant_tool_calls: tuple[_AdmittedToolCall, ...],
     crash_pending: bool,
     session_id: str | None,
     session_operation_context: SessionOperationContext | None,
-    current_state_id: str | None,
-    persisted_tool_call_turn: bool,
-    persisted_assistant_message_id: str | None,
-    persisted_assistant_content: str | None,
-    assistant_row_uses_current_dispatch: bool,
     ingress: CompositionIngressRecord | None = None,
     chat_ingress_inputs: list[ChatIngressInput] | None = None,
-    required_work: RequiredWorkBinding | None = None,
     turn_evidence: TurnEvidence | None = None,
-) -> _PersistOutcome:
-    """Phase P4 of the compose loop — redact then persist the turn audit.
-
-    Two sub-steps that share an invariant (a mid-step raise must leave
-    the DB in its pre-step shape):
-
-    1. **Redaction (pure / async).** Walks ``tool_outcomes`` via the
-       redaction manifest and builds the immutable
-       ``redacted_assistant_tool_calls`` / ``redacted_tool_rows`` shapes
-       the persister expects.
-    2. **Persistence.** Calls
-       ``sessions_service.persist_compose_turn_async`` exactly once
-       when ``session_id`` is set. The AuditIntegrityError catch
-       stamps ``failed_turn`` with ``tool_responses_persisted=0`` and
-       re-raises so the route handler sees the partial-write story.
-       Unwind-audit invariants are checked after the persist returns;
-       failures raise additional AuditIntegrityError(s).
-
-    Crash propagation is intentionally *not* in this helper. P3 supplies a
-    discriminated carrier (plugin crash or first-party advisor failure), and
-    the driver raises it only after this phase publishes the closed row.
-
-    ``assistant_row_uses_current_dispatch`` is the caller-owned P4
-    disposition for whether ``assistant_message`` still contains the current
-    dispatch's model prose. It is required because the caller performs the
-    advisor-repair substitution; row presence cannot recover that fact.
-    """
+) -> PreparedTurnAuditRows:
+    """Build the ordinary complete redacted row values without persistence."""
     from pydantic import ValidationError as PydanticValidationError
 
     from elspeth.contracts.freeze import deep_thaw
@@ -419,85 +446,303 @@ async def persist_turn_audit(
             )
         )
     redacted_tool_rows = tuple(redacted_rows)
+    revoked_tool_rows = (
+        _revoked_graph_rows(
+            rows=redacted_tool_rows,
+            outcomes=tool_outcomes,
+            base_state=base_state,
+            redaction_telemetry=redaction_telemetry,
+        )
+        if session_id is not None
+        else redacted_tool_rows
+    )
+    return PreparedTurnAuditRows(redacted_assistant_tool_calls, redacted_tool_rows, revoked_tool_rows)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedTurnAuditEvidence:
+    private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...]
+    private_tool_failures: tuple[ComposerDiagnosticEvidence, ...]
+
+
+def prepare_turn_audit_evidence(
+    *,
+    tool_outcomes: tuple[_ToolOutcome, ...],
+    private_authorings: tuple[PrivateToolAuthoring, ...],
+    private_invocations: tuple[ComposerToolInvocation, ...],
+    session_id: str,
+    session_operation_context: SessionOperationContext,
+) -> PreparedTurnAuditEvidence:
+    """Retain the exact original authoring/invocation diagnostics as values."""
+    from elspeth.web.composer.audit_storage import _validated_canonical_mapping_pair, private_failure_evidence
+    from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence, diagnostic_evidence_identity
+
+    authorings = {authoring.tool_call_id: authoring for authoring in private_authorings}
+    invocations = {invocation.tool_call_id: invocation for invocation in private_invocations}
+    expected_ids = {outcome.call.id for outcome in tool_outcomes}
+    if (
+        set(authorings) != expected_ids
+        or len(authorings) != len(private_authorings)
+        or set(invocations) != expected_ids
+        or len(invocations) != len(private_invocations)
+    ):
+        raise AuditIntegrityError("private tool checkpoint lost its exact authoring or invocation set")
+    private_tool_evidence = []
+    for outcome in tool_outcomes:
+        authoring = authorings[outcome.call.id]
+        invocation = invocations[outcome.call.id]
+        if invocation.tool_name != outcome.call.function.name:
+            raise AuditIntegrityError("private tool checkpoint invocation names another tool")
+        if invocation.private_authoring is not None and invocation.private_authoring != authoring:
+            raise AuditIntegrityError("private tool checkpoint receipt differs from its invocation")
+        if invocation.result_canonical is not None:
+            if invocation.result_hash is None:
+                raise AuditIntegrityError("private tool checkpoint result has no binding")
+            _validated_canonical_mapping_pair(invocation.result_canonical, invocation.result_hash, label="private checkpoint result")
+        elif invocation.result_hash is not None:
+            raise AuditIntegrityError("private tool checkpoint absent result has a hash")
+        private_tool_evidence.append(
+            build_private_tool_evidence(
+                session_id=session_id,
+                operation_id=session_operation_context.fence.operation_id,
+                operation_epoch=session_operation_context.fence.operation_epoch,
+                tool_call_id=outcome.call.id,
+                tool_name=outcome.call.function.name,
+                status=invocation.status.value,
+                arguments_canonical=authoring.arguments_canonical,
+                authority_arguments_canonical=authoring.authority_arguments_canonical,
+                raw_arguments=authoring.raw_arguments,
+                result_canonical=invocation.result_canonical,
+                error_category=outcome.error_category.value if outcome.error_category is not None else None,
+            )
+        )
+    private_tool_failures = tuple(
+        private_failure_evidence(
+            invocation.private_failure,
+            identity=diagnostic_evidence_identity("tool-failure", invocation.tool_call_id),
+            tool_call_id=invocation.tool_call_id,
+            status="tool_failure",
+            context=session_operation_context,
+        )
+        for invocation in private_invocations
+        if invocation.private_failure is not None
+    )
+    return PreparedTurnAuditEvidence(tuple(private_tool_evidence), private_tool_failures)
+
+
+def prepare_continuation_turn_audit(
+    *,
+    rows: PreparedTurnAuditRows,
+    evidence: PreparedTurnAuditEvidence,
+    session_operation_context: SessionOperationContext,
+    assistant_message: _AdmittedAssistantMessage,
+    raw_assistant_content: str | None,
+    mutation_ceiling: ComposerMutationCeiling | None,
+    authority_revocation: ComposerMutationRevocation | None,
+    tool_outcomes: tuple[_ToolOutcome, ...],
+    private_invocations: tuple[ComposerToolInvocation, ...],
+    private_authorings: tuple[PrivateToolAuthoring, ...],
+    withheld_replies: tuple[WithheldReply, ...],
+    current_state_id: str | None,
+    assistant_row_uses_current_dispatch: bool,
+    crash_pending: bool,
+    env_ref_names: frozenset[str],
+) -> PreparedP4Value:
+    """Encode the ordinary complete P4 input without reserving or writing SQL."""
+    from elspeth.web.composer.continuation_prepared_p4 import capture_prepared_p4
+
+    return capture_prepared_p4(
+        context=session_operation_context,
+        assistant_content=assistant_message.content or "",
+        raw_content=raw_assistant_content,
+        redacted_calls=rows.redacted_calls,
+        redacted_rows=rows.redacted_rows,
+        revoked_rows=rows.revoked_rows,
+        mutation_ceiling=mutation_ceiling,
+        authority_revocation=authority_revocation,
+        private_tool_evidence=evidence.private_tool_evidence,
+        private_tool_failures=evidence.private_tool_failures,
+        rejection_records=build_rejection_records(tool_outcomes),
+        withheld_replies=withheld_replies,
+        invocations=private_invocations,
+        authorings=private_authorings,
+        parent_composition_state_id=current_state_id,
+        expected_current_state_id=current_state_id,
+        assistant_row_uses_current_dispatch=assistant_row_uses_current_dispatch,
+        crash_pending=crash_pending,
+        env_ref_names=env_ref_names,
+    )
+
+
+async def persist_turn_audit(
+    *,
+    sessions_service: SessionServiceProtocol | None,
+    redaction_telemetry: RedactionTelemetry,
+    tool_outcomes: tuple[_ToolOutcome, ...],
+    mutation_ceiling: ComposerMutationCeiling | None,
+    authority_revocation: ComposerMutationRevocation | None,
+    base_state: CompositionState,
+    decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
+    private_authorings: tuple[PrivateToolAuthoring, ...],
+    private_invocations: tuple[ComposerToolInvocation, ...],
+    assistant_message: _AdmittedAssistantMessage,
+    raw_assistant_content: str | None,
+    assistant_tool_calls: tuple[_AdmittedToolCall, ...],
+    crash_pending: bool,
+    session_id: str | None,
+    session_operation_context: SessionOperationContext | None,
+    current_state_id: str | None,
+    persisted_tool_call_turn: bool,
+    persisted_assistant_message_id: str | None,
+    persisted_assistant_content: str | None,
+    assistant_row_uses_current_dispatch: bool,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_work: RequiredWorkBinding | None = None,
+    turn_evidence: TurnEvidence | None = None,
+    continuation: ContinuationLiveP4 | None = None,
+    terminal_completion: TerminalServiceCompletion | None = None,
+) -> _PersistOutcome:
+    """Redact the complete P4 input, then persist and verify its actual rows.
+
+    Crash propagation remains with the driver after publication. The caller
+    supplies whether the assistant row contains the current dispatch's prose;
+    row presence cannot recover that fact after advisor-repair substitution.
+    """
+    if terminal_completion is not None and continuation is None:
+        raise AuditIntegrityError("terminal service publication cannot use a non-continuation writer")
+    rows = prepare_turn_audit_rows(
+        redaction_telemetry=redaction_telemetry,
+        tool_outcomes=tool_outcomes,
+        base_state=base_state,
+        decoded_args_by_call_id=decoded_args_by_call_id,
+        private_authorings=private_authorings,
+        crash_pending=crash_pending,
+        session_id=session_id,
+        session_operation_context=session_operation_context,
+        ingress=ingress,
+        chat_ingress_inputs=chat_ingress_inputs,
+        turn_evidence=turn_evidence,
+    )
+    redacted_assistant_tool_calls, redacted_tool_rows, revoked_tool_rows = rows.redacted_calls, rows.redacted_rows, rows.revoked_rows
     failed_turn: FailedTurnMetadata | None = None
     unwind_audit_failed = False
     checkpoint_projection = None
     effect_verification_failure = None
     audit_outcome: AuditOutcome | None = None
+    effects_before = turn_evidence.effects if turn_evidence is not None else None
     if session_id is not None:
         if type(session_operation_context) is not SessionOperationContext:
             raise AuditIntegrityError("Compose turn audit persistence requires exact session operation authority")
         if sessions_service is None:
             raise RuntimeError("sessions_service not wired")
-        from elspeth.web.composer.audit_storage import _validated_canonical_mapping_pair, private_failure_evidence
-        from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence, diagnostic_evidence_identity
-
-        authorings = {authoring.tool_call_id: authoring for authoring in private_authorings}
-        invocations = {invocation.tool_call_id: invocation for invocation in private_invocations}
-        expected_ids = {outcome.call.id for outcome in tool_outcomes}
-        if (
-            set(authorings) != expected_ids
-            or len(authorings) != len(private_authorings)
-            or set(invocations) != expected_ids
-            or len(invocations) != len(private_invocations)
-        ):
-            raise AuditIntegrityError("private tool checkpoint lost its exact authoring or invocation set")
-        private_tool_evidence = []
-        for outcome in tool_outcomes:
-            authoring = authorings[outcome.call.id]
-            invocation = invocations[outcome.call.id]
-            if invocation.tool_name != outcome.call.function.name:
-                raise AuditIntegrityError("private tool checkpoint invocation names another tool")
-            if invocation.private_authoring is not None and invocation.private_authoring != authoring:
-                raise AuditIntegrityError("private tool checkpoint receipt differs from its invocation")
-            if invocation.result_canonical is not None:
-                if invocation.result_hash is None:
-                    raise AuditIntegrityError("private tool checkpoint result has no binding")
-                _validated_canonical_mapping_pair(invocation.result_canonical, invocation.result_hash, label="private checkpoint result")
-            elif invocation.result_hash is not None:
-                raise AuditIntegrityError("private tool checkpoint absent result has a hash")
-            private_tool_evidence.append(
-                build_private_tool_evidence(
-                    session_id=session_id,
-                    operation_id=session_operation_context.fence.operation_id,
-                    operation_epoch=session_operation_context.fence.operation_epoch,
-                    tool_call_id=outcome.call.id,
-                    tool_name=outcome.call.function.name,
-                    status=invocation.status.value,
-                    arguments_canonical=authoring.arguments_canonical,
-                    authority_arguments_canonical=authoring.authority_arguments_canonical,
-                    raw_arguments=authoring.raw_arguments,
-                    result_canonical=invocation.result_canonical,
-                    error_category=outcome.error_category.value if outcome.error_category is not None else None,
-                )
-            )
-        private_tool_failures = tuple(
-            private_failure_evidence(
-                invocation.private_failure,
-                identity=diagnostic_evidence_identity("tool-failure", invocation.tool_call_id),
-                tool_call_id=invocation.tool_call_id,
-                status="tool_failure",
-                context=session_operation_context,
-            )
-            for invocation in private_invocations
-            if invocation.private_failure is not None
+        evidence = prepare_turn_audit_evidence(
+            tool_outcomes=tool_outcomes,
+            private_authorings=private_authorings,
+            private_invocations=private_invocations,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
         )
+        private_tool_evidence, private_tool_failures = evidence.private_tool_evidence, evidence.private_tool_failures
         checkpoint_sql = checkpoint_projection = None
         if required_work is not None:
             if type(required_work) is not RequiredWorkBinding:
                 raise AuditIntegrityError("Compose checkpoint requires a nominal required-work binding")
             required_work.validate_context(session_operation_context)
-            checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
-                RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
-            )
+            if continuation is None:
+                checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
+                    RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
+                )
         try:
-            if checkpoint_sql is None:
+            if continuation is not None:
+                from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+
+                if (
+                    type(continuation) is not ContinuationLiveP4
+                    or continuation.work is not required_work
+                    or continuation.inventory.running.session_operation_context is not session_operation_context
+                    or type(required_work) is not RequiredWorkBinding
+                ):
+                    raise AuditIntegrityError("V2 P4 publication changed its retained current phase/ticket owners")
+                prepared = prepare_continuation_turn_audit(
+                    rows=rows,
+                    evidence=evidence,
+                    session_operation_context=session_operation_context,
+                    assistant_message=assistant_message,
+                    raw_assistant_content=raw_assistant_content,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
+                    tool_outcomes=tool_outcomes,
+                    withheld_replies=continuation.withheld_replies,
+                    private_invocations=private_invocations,
+                    private_authorings=private_authorings,
+                    current_state_id=current_state_id,
+                    assistant_row_uses_current_dispatch=assistant_row_uses_current_dispatch,
+                    crash_pending=crash_pending,
+                    env_ref_names=continuation.inventory.names,
+                )
+                if terminal_completion is None:
+                    commit = await continuation.prepare(prepared)
+                else:
+                    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+
+                    if type(terminal_completion) is not TerminalServiceCompletion:
+                        raise AuditIntegrityError("terminal publication requires its exact native service completion")
+                    terminal_completion.require_p4(continuation)
+                    # The terminal P4 owner/SQL/application implementation is a
+                    # separate required join. Never encode/clear the live failure
+                    # or fall through to the legacy writer when it is unavailable.
+                    commit = await continuation.prepare_terminal(prepared, terminal_completion)
+                checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
+                    RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
+                )
+                try:
+                    continuation.bind_checkpoint_ticket(checkpoint_sql)
+                except BaseException as original:
+                    # This exact local reservation has not reached the physical
+                    # service call. Preserve its real no-submission failure;
+                    # the existing outer handler closes the paired projection.
+                    try:
+                        checkpoint_sql.complete_without_submission(original)
+                    except BaseException as cleanup:
+                        if cleanup is original:
+                            raise
+                        raise BaseExceptionGroup("P4 checkpoint binding and no-submission cleanup", (original, cleanup)) from None
+                    raise
+                physical = await sessions_service.persist_continuation_compose_turn(
+                    session_id=session_id,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                    redacted_tool_rows=redacted_tool_rows,
+                    revoked_tool_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    writer_principal="compose_loop",
+                    plugin_crash_pending=crash_pending,
+                    session_operation_context=session_operation_context,
+                    continuation=commit,
+                    continuation_prepared=prepared,
+                    continuation_env_ref_names=continuation.inventory.names,
+                    required_work=checkpoint_sql,
+                    continuation_observation=continuation.writer_observation,
+                )
+                audit_outcome = continuation.accept_physical(checkpoint_sql, physical)
+            elif checkpoint_sql is None:
                 audit_outcome = await sessions_service.persist_compose_turn_async(
                     session_id=session_id,
                     assistant_content=assistant_message.content or "",
                     raw_content=raw_assistant_content,
                     redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                     redacted_tool_rows=redacted_tool_rows,
+                    revoked_tool_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
                     private_tool_evidence=tuple(private_tool_evidence),
                     private_tool_failures=private_tool_failures,
                     rejection_records=build_rejection_records(tool_outcomes),
@@ -514,6 +759,9 @@ async def persist_turn_audit(
                     raw_content=raw_assistant_content,
                     redacted_assistant_tool_calls=redacted_assistant_tool_calls,
                     redacted_tool_rows=redacted_tool_rows,
+                    revoked_tool_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
                     private_tool_evidence=tuple(private_tool_evidence),
                     private_tool_failures=private_tool_failures,
                     rejection_records=build_rejection_records(tool_outcomes),
@@ -539,11 +787,20 @@ async def persist_turn_audit(
             raise
         if checkpoint_projection is not None:
             checkpoint_projection.begin_projection()
-            if type(audit_outcome) is not AuditOutcome:
-                failure = AuditIntegrityError("Compose checkpoint returned a foreign audit outcome")
+        if type(audit_outcome) is not AuditOutcome:
+            failure = AuditIntegrityError("Compose checkpoint returned a foreign audit outcome")
+            if checkpoint_projection is not None:
                 checkpoint_projection.complete_owned(failure)
-                raise failure
+            raise failure
+        if audit_outcome.assistant_id is not None and audit_outcome.published_assistant_content is None:
+            failure = AuditIntegrityError("Committed P4 omitted its actual publication content")
+            if checkpoint_projection is not None:
+                checkpoint_projection.complete_owned(failure)
+            raise failure
         unwind_audit_failed = audit_outcome.unwind_audit_failed
+        effect_verification_failure = audit_outcome.continuation_retention_failure
+        authority_revocation = audit_outcome.authority_revocation
+        redacted_tool_rows = audit_outcome.published_tool_rows
         current_state_id = audit_outcome.current_state_id
         failed_turn = FailedTurnMetadata(
             assistant_message_id=audit_outcome.assistant_id,
@@ -567,15 +824,9 @@ async def persist_turn_audit(
                 checkpoint_projection.complete_owned(failure)
             raise failure
         persisted_assistant_message_id = audit_outcome.assistant_id
-        # Derived here rather than by the caller because this is the only
-        # frame that knows what reached the row: the persist call above sends
-        # ``assistant_message.content or ""``, and ``assistant_message`` is
-        # already the substituted message on the advisor-repair branch. A
-        # caller reconstructing it from the turn prose would record the wrong
-        # bytes for that branch (elspeth-d581b3da7f). Rolled back (no
-        # assistant id) means no row holds anything — the pair goes to None
-        # together.
-        persisted_assistant_content = None if audit_outcome.assistant_id is None else (assistant_message.content or "")
+        # Publication selection occurs under the SQL lock. Adopt its actual
+        # committed bytes rather than inferring them from the candidate.
+        persisted_assistant_content = audit_outcome.published_assistant_content
         # The unwind-failure outcome means the transaction rolled back: no
         # assistant or tool row survived, so the driver must retain the
         # in-flight invocation evidence on the propagated plugin crash.
@@ -621,7 +872,7 @@ async def persist_turn_audit(
             persisted_assistant_content=persisted_assistant_content,
             persisted_tool_call_turn=persisted_tool_call_turn,
             persisted_assistant_matches_current_dispatch=(
-                persisted_assistant_message_id is not None and assistant_row_uses_current_dispatch
+                persisted_assistant_message_id is not None and assistant_row_uses_current_dispatch and authority_revocation is None
             ),
             unwind_audit_failed=unwind_audit_failed,
             failed_turn=failed_turn,
@@ -629,11 +880,25 @@ async def persist_turn_audit(
             redacted_tool_rows=redacted_tool_rows,
             audit_outcome=audit_outcome,
             effect_verification_failure=effect_verification_failure,
+            authority_revocation=authority_revocation,
         )
+        if continuation is not None:
+            from elspeth.web.composer.continuation_live_p4_application import finish_live_p4_application
+
+            continuation.publication = result
+            if effects_before is None:
+                raise AuditIntegrityError("continuation publication lost its actual before effects owner")
+            await finish_live_p4_application(continuation, effects_before=effects_before)
+            if terminal_completion is not None and result.unwind_audit_failed:
+                continuation.raise_after_publication(
+                    AuditIntegrityError("Service failure audit row could not be persisted", failed_turn=result.failed_turn)
+                )
     except BaseException as exc:
         if checkpoint_projection is not None:
             checkpoint_projection.complete_owned(exc)
         raise
     if checkpoint_projection is not None:
         checkpoint_projection.complete_owned(effect_verification_failure)
+    if continuation is not None:
+        continuation.raise_after_publication()
     return result

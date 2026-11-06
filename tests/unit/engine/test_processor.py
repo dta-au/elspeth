@@ -784,10 +784,16 @@ class TestTransformModeOutcomeOrdering:
         def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [captured["token"]], "batch-1"
 
+        # The fake batch is empty until intake accepts its member, and drained
+        # after its one flush. Readiness is also checked before intake now.
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
             patch.object(processor, "_emit_transform_completed"),
             patch.object(processor, "_emit_token_completed"),
@@ -837,8 +843,12 @@ class TestTransformModeOutcomeOrdering:
 
         with (
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
-            patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
-            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
+            patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect) as execute_flush,
+            patch.object(
+                processor._aggregation_executor,
+                "check_flush_status",
+                side_effect=lambda _node_id: (True, TriggerType.COUNT) if captured and not execute_flush.called else (False, None),
+            ),
             patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
             patch.object(processor, "_emit_transform_completed"),
             patch.object(processor, "_emit_token_completed"),

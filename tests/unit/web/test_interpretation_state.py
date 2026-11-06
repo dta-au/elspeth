@@ -13,7 +13,7 @@ import pytest
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.hashing import stable_hash
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
-from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SHIELD_USER_TERM,
@@ -161,7 +161,7 @@ def _state_with_web_scrape_cleanup_node(options: dict[str, object]) -> Compositi
                 id="drop_raw_html",
                 node_type="transform",
                 plugin="field_mapper",
-                input="coloured_rows",
+                input="scraped_rows",
                 on_success="clean_rows",
                 on_error="stop",
                 options=options,
@@ -2171,6 +2171,336 @@ def test_raw_html_cleanup_hash_includes_upstream_raw_field_set() -> None:
     assert hash_a != hash_b
 
 
+def _independent_scrape_and_projection_state() -> CompositionState:
+    state = _state_with_web_scrape_cleanup_node(
+        {"schema": {"mode": "observed"}, "mapping": {"customer_name": "customer_name"}, "select_only": True}
+    )
+    scrape = replace(
+        state.nodes[0],
+        on_success="scraped_output",
+        on_error="discard",
+        options={
+            **state.nodes[0].options,
+            "schema": {"mode": "observed"},
+            "http": {"abuse_contact": "ops@dta.gov.au", "scraping_reason": "User authorised public page retrieval"},
+        },
+    )
+    mapper = replace(state.nodes[1], input="customer_rows", on_success="customer_output", on_error="discard")
+    return replace(
+        state,
+        sources={
+            "urls": SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "urls.csv", "schema": {"mode": "observed", "guaranteed_fields": ["url"]}},
+                on_validation_failure="discard",
+            ),
+            "customers": SourceSpec(
+                plugin="csv",
+                on_success="customer_rows",
+                options={"path": "customers.csv", "schema": {"mode": "observed", "guaranteed_fields": ["customer_name"]}},
+                on_validation_failure="discard",
+            ),
+        },
+        nodes=(scrape, mapper),
+        outputs=tuple(
+            OutputSpec(
+                name=name,
+                plugin="json",
+                options={"path": f"{name}.json", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+            for name in ("scraped_output", "customer_output")
+        ),
+    )
+
+
+def test_cleanup_review_ignores_scraper_on_independent_valid_source_branch() -> None:
+    state = _independent_scrape_and_projection_state()
+    validation = state.validate()
+    assert validation.is_valid, validation.errors
+    assert raw_html_cleanup_review_contract_error(state) is None
+    assert not any(site.user_term == RAW_HTML_CLEANUP_USER_TERM for site in interpretation_sites(state))
+    assert isinstance(materialize_state_for_execution(state), CompositionState)
+
+
+def test_cleanup_review_hash_ignores_unrelated_scraper_fields() -> None:
+    state = _independent_scrape_and_projection_state()
+    mapper = state.nodes[1]
+    changed = replace(state.nodes[0], options={**state.nodes[0].options, "fingerprint_field": "different_hash"})
+    assert pipeline_decision_artifact_hash(mapper, state.nodes, user_term=RAW_HTML_CLEANUP_USER_TERM) == (
+        pipeline_decision_artifact_hash(mapper, (changed, mapper), user_term=RAW_HTML_CLEANUP_USER_TERM)
+    )
+
+
+def test_cleanup_review_allows_nonraw_source_renamed_to_raw_field_name() -> None:
+    options = _pipeline_decision_options()
+    options["mapping"] = {"summary": "content"}
+    state = _state_with_web_scrape_cleanup_node(options)
+    assert raw_html_cleanup_review_contract_error(state) is None
+
+
+def test_cleanup_review_follows_raw_field_rename_before_selection() -> None:
+    state = _state_with_web_scrape_cleanup_node({"mapping": {"url": "url"}, "select_only": True})
+    rename = replace(
+        state.nodes[1],
+        id="rename_body",
+        input="scraped_rows",
+        on_success="renamed_rows",
+        options={"mapping": {"content": "renamed_body"}, "select_only": False},
+    )
+    mapper = replace(state.nodes[1], input="renamed_rows", options={**_pipeline_decision_options(), "mapping": {"renamed_body": "body"}})
+    state = replace(state, nodes=(state.nodes[0], rename, mapper))
+    error = raw_html_cleanup_review_contract_error(state)
+    assert error is not None
+    assert "renamed_body" in error
+    assert "preserves raw" in error
+
+
+def test_cleanup_review_follows_original_name_alias_after_raw_field_rename() -> None:
+    from elspeth.plugins.transforms.field_mapper import FieldMapper
+    from elspeth.testing import make_pipeline_row
+    from tests.fixtures.factories import make_context
+
+    rename_options = {"schema": {"mode": "observed"}, "mapping": {"content": "renamed_body"}, "select_only": False}
+    renamed = FieldMapper(rename_options).process(
+        make_pipeline_row({"content": "<html>raw</html>", "content_fingerprint": "digest", "url": "https://dta.gov.au"}),
+        make_context(),
+    )
+    assert renamed.status == "success"
+    assert renamed.row is not None
+    assert "content" not in renamed.row.to_dict()
+    assert renamed.row["content"] == renamed.row["renamed_body"] == "<html>raw</html>"
+    selected = FieldMapper({"schema": {"mode": "observed"}, "mapping": {"content": "body"}, "select_only": True}).process(
+        renamed.row, make_context()
+    )
+    assert selected.status == "success"
+    assert selected.row is not None
+    assert selected.row.to_dict() == {"body": "<html>raw</html>"}
+
+    state = _state_with_web_scrape_cleanup_node({**_pipeline_decision_options(), "mapping": {"content": "body"}})
+    rename = replace(state.nodes[1], id="rename_body", on_success="renamed_rows", options=rename_options)
+    cleanup = replace(state.nodes[1], input="renamed_rows")
+    state = replace(state, nodes=(state.nodes[0], rename, cleanup))
+    error = raw_html_cleanup_review_contract_error(state)
+    assert error is not None
+    assert "preserves raw" in error
+    assert "content" in error
+
+
+def _cleanup_state_with_shadowed_raw_alias() -> CompositionState:
+    state = _independent_scrape_and_projection_state()
+    scrape = replace(state.nodes[0], on_success="scraped_rows")
+    base = state.nodes[1]
+    fork = replace(
+        base,
+        id="split",
+        node_type="gate",
+        plugin=None,
+        input="scraped_rows",
+        on_success=None,
+        on_error=None,
+        options={},
+        condition="True",
+        routes={"true": "fork", "false": "fork"},
+        fork_to=("raw_branch", "clean_branch"),
+    )
+    raw = replace(
+        base,
+        id="raw_rename",
+        input="raw_branch",
+        on_success="raw_out",
+        options={"schema": {"mode": "observed"}, "mapping": {"content": "renamed_body"}, "select_only": True},
+    )
+    clean = replace(
+        base,
+        id="clean_pick",
+        input="clean_branch",
+        on_success="clean_out",
+        options={**_pipeline_decision_options(), "schema": {"mode": "observed"}, "mapping": {"url": "content"}},
+    )
+    join = replace(
+        base,
+        id="join",
+        node_type="coalesce",
+        plugin=None,
+        input="",
+        on_success=None,
+        on_error=None,
+        options={},
+        branches={"raw_branch": "raw_out", "clean_branch": "clean_out"},
+        merge="union",
+        policy="require_all",
+    )
+    final = replace(
+        base, input="join", options={**_pipeline_decision_options(), "schema": {"mode": "observed"}, "mapping": {"content": "summary"}}
+    )
+    return replace(
+        state, sources={"urls": state.sources["urls"]}, nodes=(scrape, fork, raw, clean, join, final), outputs=(state.outputs[1],)
+    )
+
+
+def test_cleanup_review_honors_guaranteed_clean_current_name_shadowing_raw_alias() -> None:
+    from elspeth.contracts.schema_contract import PipelineRow
+    from elspeth.contracts.union_merge import merge_union_contracts
+    from elspeth.plugins.transforms.field_mapper import FieldMapper
+    from elspeth.testing import make_pipeline_row
+    from tests.fixtures.factories import make_context
+
+    row = make_pipeline_row({"content": "RAW", "url": "CLEAN_URL"})
+    raw = FieldMapper({"schema": {"mode": "observed"}, "mapping": {"content": "renamed_body"}, "select_only": True}).process(
+        row, make_context()
+    )
+    clean = FieldMapper({"schema": {"mode": "observed"}, "mapping": {"url": "content"}, "select_only": True}).process(row, make_context())
+    assert raw.row is not None and clean.row is not None
+    merged = PipelineRow(
+        {**raw.row.to_dict(), **clean.row.to_dict()},
+        merge_union_contracts({"raw": raw.row.contract, "clean": clean.row.contract}, require_all=True),
+    )
+    assert merged["content"] == "CLEAN_URL"
+    assert merged["renamed_body"] == "RAW"
+    selected = FieldMapper({"schema": {"mode": "observed"}, "mapping": {"content": "summary"}, "select_only": True}).process(
+        merged, make_context()
+    )
+    assert selected.row is not None
+    assert selected.row.to_dict() == {"summary": "CLEAN_URL"}
+
+    state = _cleanup_state_with_shadowed_raw_alias()
+    validation = state.validate()
+    assert validation.is_valid, validation.errors
+    assert raw_html_cleanup_review_contract_error(state) is None
+    retaining = replace(state.nodes[-1], options={**state.nodes[-1].options, "mapping": {"renamed_body": "summary"}})
+    error = raw_html_cleanup_review_contract_error(replace(state, nodes=(*state.nodes[:-1], retaining)))
+    assert error is not None and "preserves raw" in error
+
+
+@pytest.mark.parametrize("fan_in", ["queue", "row_union", "partial_coalesce"])
+def test_cleanup_review_does_not_use_one_arriving_arms_clean_name_to_shadow_another_arms_alias(fan_in: str) -> None:
+    state = _cleanup_state_with_shadowed_raw_alias()
+    scrape, fork, raw, clean, join, final = state.nodes
+    if fan_in == "queue":
+        join = replace(join, node_type="queue", input="join", branches=None, merge=None, policy=None)
+        raw = replace(raw, on_success="join")
+        clean = replace(clean, on_success="join")
+    elif fan_in == "row_union":
+        join = replace(join, node_type="row_union", on_success="joined_rows", merge=None, policy=None)
+        final = replace(final, input="joined_rows")
+    else:
+        join = replace(join, policy="best_effort")
+    error = raw_html_cleanup_review_contract_error(replace(state, nodes=(scrape, fork, raw, clean, join, final)))
+    assert error is not None and "preserves raw" in error
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"mapping": None, "select_only": True},
+        {"mapping": ["content"], "select_only": True},
+        {"mapping": {1: "content"}, "select_only": True},
+        {"mapping": {"url": 1}, "select_only": True},
+        {"mapping": {"url": "content"}, "select_only": "true"},
+    ],
+)
+def test_cleanup_review_malformed_mapper_cannot_guarantee_a_clean_shadow(options: dict[str, object]) -> None:
+    state = _cleanup_state_with_shadowed_raw_alias()
+    clean = replace(state.nodes[3], options=options)
+    error = raw_html_cleanup_review_contract_error(replace(state, nodes=(*state.nodes[:3], clean, *state.nodes[4:])))
+    assert error is not None and "preserves raw" in error
+    assert "drop_raw_html" in error
+
+
+def test_cleanup_review_does_not_credit_success_projection_on_a_mapper_error_stream() -> None:
+    state = _cleanup_state_with_shadowed_raw_alias()
+    clean = replace(
+        state.nodes[3],
+        on_success="unused_success",
+        on_error="clean_out",
+        options={
+            "mapping": {"url": "content"},
+            "select_only": True,
+        },
+    )
+    error = raw_html_cleanup_review_contract_error(replace(state, nodes=(*state.nodes[:3], clean, *state.nodes[4:])))
+    assert error is not None and "preserves raw" in error
+
+
+def test_cleanup_review_not_repeated_after_prior_projection_removed_raw_fields() -> None:
+    state = _state_with_web_scrape_cleanup_node(_pipeline_decision_options())
+    second = replace(
+        state.nodes[1],
+        id="project_again",
+        input="clean_rows",
+        on_success="final_rows",
+        options={"mapping": {"url": "url"}, "select_only": True},
+    )
+    state = replace(state, nodes=(*state.nodes, second))
+    assert raw_html_cleanup_review_contract_error(state) is None
+    assert [site.component_id for site in interpretation_sites(state) if site.user_term == RAW_HTML_CLEANUP_USER_TERM] == ["drop_raw_html"]
+
+
+def test_cleanup_review_required_when_projection_removes_last_renamed_raw_field() -> None:
+    state = _state_with_web_scrape_cleanup_node({"mapping": {"url": "url"}, "select_only": True})
+    rename = replace(
+        state.nodes[1],
+        id="keep_body",
+        on_success="renamed_rows",
+        options={"mapping": {"content": "renamed_body", "url": "url"}, "select_only": True},
+    )
+    final = replace(state.nodes[1], input="renamed_rows")
+    state = replace(state, nodes=(state.nodes[0], rename, final))
+    error = raw_html_cleanup_review_contract_error(state)
+    assert error is not None
+    assert "['content', 'renamed_body']" in error
+    assert [site.component_id for site in interpretation_sites(state) if site.user_term == RAW_HTML_CLEANUP_USER_TERM] == ["drop_raw_html"]
+
+
+@pytest.mark.parametrize("bridge_kind", ["gate", "fork", "queue", "coalesce", "nested", "row_union", "aggregation", "collector"])
+@pytest.mark.parametrize("retain_raw", [False, True], ids=["drops-raw", "preserves-raw"])
+def test_cleanup_review_tracks_raw_fields_through_structural_paths(bridge_kind: str, retain_raw: bool) -> None:
+    raw_source = "left.content" if bridge_kind == "nested" else "content"
+    options = _pipeline_decision_options() if retain_raw else {"select_only": True}
+    options["mapping"] = {raw_source: "body"} if retain_raw else {"url": "url"}
+    state = _state_with_web_scrape_cleanup_node(options)
+    bridge = replace(state.nodes[0], id="bridge", plugin=None, input="scraped_rows", on_success="bridge_rows", options={})
+    if bridge_kind in ("coalesce", "nested", "row_union"):
+        bridge = replace(
+            bridge,
+            node_type="row_union" if bridge_kind == "row_union" else "coalesce",
+            input="",
+            branches={"left": "scraped_rows", "right": "other_rows"},
+            merge="nested" if bridge_kind == "nested" else ("union" if bridge_kind == "coalesce" else None),
+        )
+    elif bridge_kind == "queue":
+        bridge = replace(bridge, node_type="queue", input="bridge", on_success=None)
+        state = replace(state, nodes=(replace(state.nodes[0], on_success="bridge"), state.nodes[1]))
+    elif bridge_kind in ("gate", "fork"):
+        bridge = replace(
+            bridge,
+            node_type="gate",
+            on_success=None,
+            condition="True",
+            routes={"true": "fork" if bridge_kind == "fork" else "bridge_rows", "false": "discard"},
+            fork_to=("bridge_rows", "other_rows") if bridge_kind == "fork" else None,
+        )
+    elif bridge_kind == "aggregation":
+        bridge = replace(bridge, node_type="aggregation", plugin="batch_stats", output_mode="passthrough", on_success=None)
+    else:
+        bridge = replace(bridge, node_type="collector", plugin="batch_stats")
+    mapper = replace(state.nodes[1], input="bridge" if bridge_kind in ("queue", "aggregation") else "bridge_rows")
+    state = replace(state, nodes=(state.nodes[0], bridge, mapper))
+
+    error = raw_html_cleanup_review_contract_error(state)
+    assert error is not None
+    if retain_raw:
+        assert "preserves raw" in error
+        assert raw_source in error
+    else:
+        assert "drops web-scrape raw field" in error
+        assert [(site.component_id, site.user_term) for site in interpretation_sites(state)] == [
+            ("drop_raw_html", RAW_HTML_CLEANUP_USER_TERM)
+        ]
+
+
 def test_pipeline_decision_artifact_hash_rejects_unknown_user_term() -> None:
     """Adding a new pipeline-decision kind requires a registered helper.
 
@@ -3556,3 +3886,45 @@ def test_reconcile_still_raises_on_a_genuinely_drifted_multi_query_review() -> N
 
     with pytest.raises(ValueError, match="hash drifted"):
         _reconcile_multi_query(previous, proposed)
+
+
+def _mapper_node(options: dict[str, object]) -> NodeSpec:
+    return _state_with_cleanup_node(options).nodes[0]
+
+
+def test_mapper_projection_absent_options_mirror_field_mapper_config_defaults() -> None:
+    """The observation boundary's R1 arm: absent keys read as the owned config's defaults.
+
+    ``_mapper_projection`` reads untyped ``NodeSpec.options`` with
+    ``.get("mapping", {})`` / ``.get("select_only", False)``. Those defaults are
+    honest only while they equal ``FieldMapperConfig``'s own defaults, so this pins
+    both the projection and the config it mirrors.
+    """
+    from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+    from elspeth.web.interpretation_state import _mapper_projection, _MapperProjection
+
+    defaults = FieldMapperConfig.model_fields
+    assert defaults["mapping"].default_factory is dict
+    assert defaults["select_only"].default is False
+    assert _mapper_projection(_mapper_node({})) == _MapperProjection(entries=(), select_only=False)
+    assert _mapper_projection(_mapper_node({"mapping": {"a": "b"}})) == _MapperProjection(entries=(("a", "b"),), select_only=False)
+    assert _mapper_projection(_mapper_node({"select_only": True})) == _MapperProjection(entries=(), select_only=True)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"mapping": ["a", "b"]}, id="mapping-not-a-mapping"),
+        pytest.param({"mapping": None}, id="mapping-null"),
+        pytest.param({"select_only": "true"}, id="select-only-not-bool"),
+        pytest.param({"select_only": 1}, id="select-only-int"),
+        pytest.param({"mapping": {"a": 1}}, id="non-string-target"),
+        pytest.param({"mapping": {" ": "b"}}, id="blank-source"),
+        pytest.param({"mapping": {"a": "  "}}, id="blank-target"),
+    ],
+)
+def test_mapper_projection_malformed_options_observe_nothing(options: dict[str, object]) -> None:
+    """Malformed authored options return None (non-raising), never a coerced projection."""
+    from elspeth.web.interpretation_state import _mapper_projection
+
+    assert _mapper_projection(_mapper_node(options)) is None

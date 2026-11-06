@@ -1,0 +1,28 @@
+"""Actual attachment result/history storage cases on PostgreSQL, serial."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_attachment_result import (
+    test_current_blob_version_change_refuses_before_history_root_write as test_current_blob_version_change_refuses_before_history_root_write,
+)
+from tests.unit.web.sessions.test_continuation_attachment_result import (
+    test_failed_real_reads_retain_only_actual_inspections as test_failed_real_reads_retain_only_actual_inspections,
+)
+from tests.unit.web.sessions.test_continuation_attachment_result import (
+    test_real_read_publishes_full_result_then_atomic_history_without_cursor_advance as test_real_read_publishes_full_result_then_atomic_history_without_cursor_advance,
+)
+from tests.unit.web.sessions.test_continuation_attachment_result import (
+    test_released_read_result_restarts_with_new_claim_and_keeps_original_creator as test_released_read_result_restarts_with_new_claim_and_keeps_original_creator,
+)
+from tests.unit.web.sessions.test_continuation_attachment_result import (
+    test_retained_source_corruption_refuses_after_positive as test_retained_source_corruption_refuses_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_attachment_result import (
+    test_same_checkpoint_changed_root_and_stale_cas_refuse_after_positive as test_same_checkpoint_changed_root_and_stale_cas_refuse_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_attachment_result import (
+    test_sql_history_application_rollback_preserves_pending_and_all_chunks as test_sql_history_application_rollback_preserves_pending_and_all_chunks,
+)
+
+pytestmark = pytest.mark.testcontainer

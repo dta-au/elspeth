@@ -30,6 +30,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.routes.workflow.approvals import create_approvals_router
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 
 _BINDING = ApprovalBinding(
     config_hash="config",
@@ -123,12 +124,15 @@ def _seed(client: TestClient) -> tuple[str, str, _Audit, _CompiledExecution]:
         )
         conn.execute(
             insert(composition_states_table).values(
-                id=state_id,
-                session_id=session_id,
-                version=1,
-                is_valid=True,
-                provenance="session_seed",
-                created_at=now,
+                **stamped_state_values(
+                    metadata_=stored_default_pipeline_metadata(),
+                    id=state_id,
+                    session_id=session_id,
+                    version=1,
+                    is_valid=True,
+                    provenance="session_seed",
+                    created_at=now,
+                )
             )
         )
         conn.execute(
@@ -302,12 +306,15 @@ def test_closed_request_reports_terminal_state_after_new_state(closed_local_app:
         assert supersede_open_approvals(conn, session_id=session_id, now=now, record=audit.record_approval_superseded) == (approval_id,)
         conn.execute(
             insert(composition_states_table).values(
-                id=str(uuid4()),
-                session_id=session_id,
-                version=2,
-                is_valid=True,
-                provenance="session_seed",
-                created_at=now,
+                **stamped_state_values(
+                    metadata_=stored_default_pipeline_metadata(),
+                    id=str(uuid4()),
+                    session_id=session_id,
+                    version=2,
+                    is_valid=True,
+                    provenance="session_seed",
+                    created_at=now,
+                )
             )
         )
 

@@ -59,6 +59,8 @@ from elspeth_lints.core.source_excerpt import (
 
 # ---------- shared fixtures ----------
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime", "synthetic_judge_worker")
+
 _SYNTHETIC_SOURCE = '''\
 """Synthetic module used in source-excerpt security tests."""
 
@@ -203,6 +205,29 @@ def _write_forged_allowlist_entry(allowlist_dir: Path, *, forged_path: str) -> P
 # =====================================================================
 # 1. Path containment — helper unit tests
 # =====================================================================
+
+
+def test_excerpt_refuses_symlink_swapped_after_path_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth_lints.core import source_excerpt
+
+    root = tmp_path / "source"
+    root.mkdir()
+    target = root / "module.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    private = tmp_path / "operator-private.txt"
+    private.write_text("synthetic-private-value-never-outbound", encoding="utf-8")
+    original = source_excerpt.resolve_safe_excerpt_path
+
+    def swap_after_validation(*, root: Path, target_file: Path) -> Path:
+        resolved = original(root=root, target_file=target_file)
+        target.unlink()
+        target.symlink_to(private)
+        return resolved
+
+    monkeypatch.setattr(source_excerpt, "resolve_safe_excerpt_path", swap_after_validation)
+
+    with pytest.raises(SourceExcerptPathOutsideRootError):
+        extract_safe_excerpt(root=root, target_file=target, line=1, context_lines=1)
 
 
 def test_resolve_safe_excerpt_path_accepts_in_root(tmp_path: Path) -> None:

@@ -20,6 +20,7 @@ from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlemen
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
+from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.pipeline_publication import (
     PipelineProposalSettlementResult,
     PipelinePublicationSQLResult,
@@ -28,7 +29,11 @@ from elspeth.web.sessions.pipeline_publication import (
 from elspeth.web.sessions.pipeline_rejection import PipelineRejectionSQLResult
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_preview_dispatch import IssuedPreviewDispatch
+    from elspeth.web.composer.tools._common import ToolResult
     from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRunning
+    from elspeth.web.sessions.continuation_owner_results import ContinuationReadOwnerResult
+    from elspeth.web.sessions.continuation_preview_result import PreviewReturned
     from elspeth.web.sessions.manual_proposal_failure import ComposerManualProposalFailure, _ClosedInvocation
     from elspeth.web.sessions.pipeline_revocation import ComposerRevocationSQLResult
     from elspeth.web.sessions.protocol import CompositionProposalRecord
@@ -40,6 +45,53 @@ class RequiredAuthorityKind(Enum):
     DURABLE_COMPOSE = "durable_compose"
     MANUAL_PROPOSAL = "manual_proposal"
     SYNCHRONOUS_COMPOSE = "synchronous_compose"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class RequiredReadProduced:
+    """The real read return and its complete retained DATA; not SQL authority."""
+
+    result: ToolResult
+    owned_result: ContinuationReadOwnerResult
+    env_ref_names: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        from elspeth.contracts.hashing import canonical_json
+        from elspeth.web.composer.continuation_tool_batch import encode_tool_result_value
+        from elspeth.web.composer.tools._common import ToolResult
+        from elspeth.web.sessions.continuation_owner_results import ContinuationReadOwnerResult, re_admit_read_owner_result
+
+        if (
+            type(self.result) is not ToolResult
+            or type(self.owned_result) is not ContinuationReadOwnerResult
+            or type(self.env_ref_names) is not frozenset
+            or any(type(name) is not str for name in self.env_ref_names)
+        ):
+            raise AuditIntegrityError("Read disposition requires the actual nominal result and retained DATA")
+        re_admit_read_owner_result(self.owned_result, env_ref_names=self.env_ref_names)
+        actual = encode_tool_result_value(self.owned_result.tool_name, self.result, env_ref_names=self.env_ref_names)
+        if canonical_json(actual.model_dump(mode="json")) != self.owned_result.tool_result_json:
+            raise AuditIntegrityError("Read disposition replaced the actual returned ToolResult")
+
+
+@dataclass(frozen=True, slots=True)
+class RequiredPreviewProduced:
+    """The actual issued preview return, never a new producer/write grant."""
+
+    permit: IssuedPreviewDispatch
+    returned: PreviewReturned
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        from elspeth.web.composer.continuation_preview_dispatch import require_preview_produced
+
+        require_preview_produced(self.permit, self.returned)
 
 
 class ComposerRequiredStage(IntEnum):
@@ -127,10 +179,49 @@ class RequiredWorkSource(IntEnum):
     PROPOSAL_REJECTION_PROJECTION = 52
     RETAINED_OPERATION_READ_SQL = 53
     RETAINED_OPERATION_READ_PROJECTION = 54
+    CONTINUATION_STATE_SQL = 55
+    CONTINUATION_STATE_PROJECTION = 56
+    CONTINUATION_READ_SQL = 57
+    CONTINUATION_READ_PROJECTION = 58
+    CONTINUATION_HANDOFF_SQL = 59
+    CONTINUATION_DISPOSITION_READ_SQL = 60
+    CONTINUATION_DISPOSITION_READ_PROJECTION = 61
+    CONTINUATION_HANDOFF_READBACK_SQL = 62
+    CONTINUATION_HANDOFF_READBACK_PROJECTION = 63
+    CONTINUATION_READ_RESULT_SQL = 64
+    CONTINUATION_READ_RESULT_PROJECTION = 65
+    CONTINUATION_PREVIEW_PRODUCER_SQL = 66
+    CONTINUATION_PREVIEW_PRODUCER_PROJECTION = 67
+    CONTINUATION_PREVIEW_RESULT_SQL = 68
+    CONTINUATION_PREVIEW_RESULT_PROJECTION = 69
 
 
 SOURCE_MAPPING = MappingProxyType(
     {
+        RequiredWorkSource.CONTINUATION_PREVIEW_PRODUCER_SQL: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.SQL_INITIAL,
+        ),
+        RequiredWorkSource.CONTINUATION_PREVIEW_PRODUCER_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
+        RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.SQL_INITIAL,
+        ),
+        RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
+        RequiredWorkSource.CONTINUATION_READ_RESULT_SQL: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.SQL_INITIAL,
+        ),
+        RequiredWorkSource.CONTINUATION_READ_RESULT_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
         RequiredWorkSource.PROPOSAL_CREATION_SQL: (ComposerRequiredStage.CREATION_BINDING, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.PROPOSAL_CREATION_PROJECTION: (ComposerRequiredStage.CREATION_BINDING, RequiredWorkSubphase.PROJECTION),
         RequiredWorkSource.PREPARATION_READ_SQL: (ComposerRequiredStage.PREPARATION_READ, RequiredWorkSubphase.SQL_INITIAL),
@@ -198,6 +289,9 @@ SOURCE_MAPPING = MappingProxyType(
         RequiredWorkSource.LEASE_RENEWAL: (ComposerRequiredStage.LEASE_RENEWAL, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.LEASE_CLOSE: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.PRODUCER),
         RequiredWorkSource.LEASE_RELEASE: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.SQL_INITIAL),
+        RequiredWorkSource.CONTINUATION_HANDOFF_SQL: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.SQL_INITIAL),
+        RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.SQL_READBACK),
+        RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_PROJECTION: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.PROJECTION),
         RequiredWorkSource.CREATION_PURE_PREPARATION: (ComposerRequiredStage.CREATION_BINDING, RequiredWorkSubphase.PURE_PREPARATION),
         RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL: (ComposerRequiredStage.TITLE_ACCOUNTING, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.TITLE_PROVIDER_ADMISSION_PROJECTION: (ComposerRequiredStage.TITLE_ACCOUNTING, RequiredWorkSubphase.PROJECTION),
@@ -219,6 +313,24 @@ SOURCE_MAPPING = MappingProxyType(
         RequiredWorkSource.PROPOSAL_REJECTION_PROJECTION: (ComposerRequiredStage.PIPELINE_PUBLICATION, RequiredWorkSubphase.PROJECTION),
         RequiredWorkSource.RETAINED_OPERATION_READ_SQL: (ComposerRequiredStage.REQUIRED_TURN_AUDIT, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.RETAINED_OPERATION_READ_PROJECTION: (ComposerRequiredStage.REQUIRED_TURN_AUDIT, RequiredWorkSubphase.PROJECTION),
+        RequiredWorkSource.CONTINUATION_STATE_SQL: (ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD, RequiredWorkSubphase.SQL_INITIAL),
+        RequiredWorkSource.CONTINUATION_STATE_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
+        RequiredWorkSource.CONTINUATION_READ_SQL: (ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD, RequiredWorkSubphase.SQL_READBACK),
+        RequiredWorkSource.CONTINUATION_READ_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
+        RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.SQL_READBACK,
+        ),
+        RequiredWorkSource.CONTINUATION_DISPOSITION_READ_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
     }
 )
 
@@ -486,8 +598,25 @@ class RequiredWorkIncomplete(AuditIntegrityError):
 class RequiredWorkTicket:
     """One prelaunch reservation; transport supplies actual executor witnesses."""
 
-    def __init__(self, key: RequiredWorkKey, *, coordinator: RequiredWorkCoordinator | None = None) -> None:
+    def __init__(
+        self,
+        key: RequiredWorkKey,
+        *,
+        coordinator: RequiredWorkCoordinator | None = None,
+        sql_deadline_owner: ContinuationSQLDeadlineOwner | None = None,
+    ) -> None:
+        if sql_deadline_owner is not None:
+            if (
+                type(sql_deadline_owner) is not ContinuationSQLDeadlineOwner
+                or coordinator is None
+                or coordinator.sql_deadline_owner is not sql_deadline_owner
+            ):
+                raise AuditIntegrityError("SQL timing requires its actual ticket coordinator")
+            sql_deadline_owner.validate_context(
+                key.authority.context, operation_id=key.authority.durable_operation_id, attempt=key.authority.claim_attempt
+            )
         self._key = key
+        self._sql_deadline_owner = sql_deadline_owner
         self._lock = RLock()
         self._future: Future[Any] | None = None
         self._complete = False
@@ -524,7 +653,34 @@ class RequiredWorkTicket:
         return self._key
 
     @property
+    def sql_deadline_owner(self) -> ContinuationSQLDeadlineOwner | None:
+        return self._sql_deadline_owner
+
+    @property
     def permits_process_drain(self) -> bool:
+        if self.key.source is RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL:
+            from elspeth.web.async_workers import require_preview_finish_admission
+
+            produced = require_preview_finish_admission(self)
+            from elspeth.web.composer.continuation_preview_dispatch import require_preview_produced
+
+            clock = require_preview_produced(produced.permit, produced.returned)
+            clock.owner.remaining_statement(session_id=self.key.authority.context.fence.session_id, preview_result=clock)
+            return True
+        if self.key.source in (
+            RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+            RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
+        ):
+            owner = self._sql_deadline_owner
+            if owner is None:
+                return False
+            owner.validate_context(
+                self.key.authority.context,
+                operation_id=self.key.authority.durable_operation_id,
+                attempt=self.key.authority.claim_attempt,
+            )
+            owner.remaining_statement(session_id=owner.running.session_operation_context.fence.session_id, lifecycle=True)
+            return True
         return self.key.source in (
             RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,
             RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,
@@ -536,6 +692,7 @@ class RequiredWorkTicket:
             RequiredWorkSource.TERMINAL_FAILURE_SQL,
             RequiredWorkSource.LEASE_RENEWAL,
             RequiredWorkSource.LEASE_RELEASE,
+            RequiredWorkSource.CONTINUATION_HANDOFF_SQL,
             RequiredWorkSource.CUSTODY_GENERATION_RECOVERY,
         )
 
@@ -911,14 +1068,25 @@ class RequiredWorkCoordinator:
         "_manual_proposal_close",
         "_proposal_children",
         "_release_prepared",
+        "_sql_deadline_owner",
         "_tickets",
         "_unused_metadata",
     )
 
-    def __init__(self, authority: RequiredWorkAuthority) -> None:
+    def __init__(self, authority: RequiredWorkAuthority, *, sql_deadline_owner: ContinuationSQLDeadlineOwner | None = None) -> None:
         if type(authority) is not RequiredWorkAuthority:
             raise AuditIntegrityError("Coordinator requires immutable owned authority")
         self._authority = authority
+        if sql_deadline_owner is not None:
+            if (
+                authority.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE
+                or type(sql_deadline_owner) is not ContinuationSQLDeadlineOwner
+            ):
+                raise AuditIntegrityError("SQL timing requires its actual V2 durable coordinator")
+            sql_deadline_owner.validate_context(
+                authority.context, operation_id=authority.durable_operation_id, attempt=authority.claim_attempt
+            )
+        self._sql_deadline_owner = sql_deadline_owner
         self._tickets: dict[RequiredWorkKey, RequiredWorkTicket] = {}
         self._lock = RLock()
         self._release_prepared = False
@@ -935,6 +1103,10 @@ class RequiredWorkCoordinator:
     @property
     def authority(self) -> RequiredWorkAuthority:
         return self._authority
+
+    @property
+    def sql_deadline_owner(self) -> ContinuationSQLDeadlineOwner | None:
+        return self._sql_deadline_owner
 
     def reserve(
         self,
@@ -958,18 +1130,31 @@ class RequiredWorkCoordinator:
         with self._lock:
             if self._release_prepared or key in self._tickets:
                 raise AuditIntegrityError("Required-work registration is duplicate or after release barrier")
-            ticket = RequiredWorkTicket(key, coordinator=self)
+            ticket = RequiredWorkTicket(key, coordinator=self, sql_deadline_owner=self._sql_deadline_owner)
             self._tickets[key] = ticket
             return ticket
 
-    def _registered(self, ticket: RequiredWorkTicket, source: RequiredWorkSource) -> None:
+    def _registered(self, ticket: RequiredWorkTicket, source: RequiredWorkSource, *, expected_sql_attempt_ordinal: int = 0) -> None:
+        if type(expected_sql_attempt_ordinal) is not int or expected_sql_attempt_ordinal not in (0, 1):
+            raise AuditIntegrityError("Required SQL expectation requires an exact bounded ordinal")
+        if type(source) is not RequiredWorkSource:
+            raise AuditIntegrityError("Unused provenance lacks exact registered source authority")
+        expected_stage, expected_phase = SOURCE_MAPPING[source]
+        if expected_sql_attempt_ordinal == 1:
+            if source is not RequiredWorkSource.TERMINAL_FAILURE_SQL or expected_phase is not RequiredWorkSubphase.SQL_INITIAL:
+                raise AuditIntegrityError("Required SQL retry expectation requires its terminal source")
+            expected_phase = RequiredWorkSubphase.SQL_RETRY
         if (
             type(ticket) is not RequiredWorkTicket
+            or type(ticket.key) is not RequiredWorkKey
             or self._tickets.get(ticket.key) is not ticket
             or ticket._coordinator is not self
             or ticket.key.authority != self.authority
             or ticket.key.source is not source
-            or ticket.key.subphase is not SOURCE_MAPPING[source][1]
+            or ticket.key.stage is not expected_stage
+            or ticket.key.subphase is not expected_phase
+            or type(ticket.key.sql_attempt_ordinal) is not int
+            or ticket.key.sql_attempt_ordinal != expected_sql_attempt_ordinal
         ):
             raise AuditIntegrityError("Unused provenance lacks exact registered source authority")
 
@@ -1045,6 +1230,76 @@ class RequiredWorkCoordinator:
                     or projection_ticket._projection_started
                 ):
                     raise AuditIntegrityError("Failure publication cannot reuse launched projection work")
+
+    def validate_continuation_sql_outcome[T](
+        self,
+        *,
+        ticket: RequiredWorkTicket,
+        expected_source: RequiredWorkSource,
+        actual_outcome: RequiredSQLFinishOnce[T],
+    ) -> None:
+        if type(expected_source) is not RequiredWorkSource or expected_source not in (
+            RequiredWorkSource.CONTINUATION_STATE_SQL,
+            RequiredWorkSource.CONTINUATION_READ_RESULT_SQL,
+            RequiredWorkSource.CONTINUATION_PREVIEW_PRODUCER_SQL,
+            RequiredWorkSource.CONTINUATION_PREVIEW_RESULT_SQL,
+            RequiredWorkSource.CONTINUATION_READ_SQL,
+            RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+            RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
+        ):
+            raise AuditIntegrityError("Continuation SQL outcome has an unsupported source")
+        with self._lock:
+            self._registered(ticket, expected_source)
+            self._verify_sql_outcome(ticket, actual_outcome)
+
+    def validate_provider_settlement_sql_outcome[T](self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]) -> None:
+        """Verify one registered provider settlement and its actual SQL handoff."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.PROVIDER_SETTLEMENT_SQL)
+            with ticket._lock:
+                if ticket._finish_once_handoff is not actual_outcome:
+                    raise AuditIntegrityError("Provider settlement replaced its actual finish-once carrier")
+                self._verify_sql_outcome(ticket, actual_outcome)
+
+    def validate_compose_checkpoint_sql_outcome[T](self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]) -> None:
+        """Verify the actual audit checkpoint bridge, including cancellations."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.COMPOSE_CHECKPOINT_SQL)
+            with ticket._lock:
+                if ticket._finish_once_handoff is not actual_outcome:
+                    raise AuditIntegrityError("Checkpoint projection replaced actual finish-once carrier")
+                self._verify_sql_outcome(ticket, actual_outcome)
+
+    def validate_undispatched_cancellation_sql_outcome[T](
+        self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]
+    ) -> None:
+        """Verify the original zero-use cancellation SQL and its exact carrier."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL)
+            with ticket._lock:
+                if ticket._finish_once_handoff is not actual_outcome:
+                    raise AuditIntegrityError("Undispatched cancellation replaced actual finish-once carrier")
+                self._verify_sql_outcome(ticket, actual_outcome)
+
+    def validate_terminal_failure_sql_outcome[T](
+        self,
+        *,
+        ticket: RequiredWorkTicket,
+        actual_outcome: RequiredSQLFinishOnce[T],
+        expected_sql_attempt_ordinal: int,
+    ) -> bool:
+        """The failed-terminal owner consumes exactly its registered physical handoff."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.TERMINAL_FAILURE_SQL, expected_sql_attempt_ordinal=expected_sql_attempt_ordinal)
+            expected = make_required_work_key(
+                self.authority, RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=expected_sql_attempt_ordinal
+            )
+            if ticket.key != expected:
+                raise AuditIntegrityError("Failed terminal crossed its exact terminal invocation")
+            with ticket._lock:
+                if ticket._finish_once_handoff is not actual_outcome:
+                    raise AuditIntegrityError("Failed terminal replaced its actual finish-once carrier")
+                return self._verify_sql_outcome(ticket, actual_outcome)
 
     def validate_joined_lifecycle_sql_outcome[T](
         self,
@@ -1517,6 +1772,26 @@ class RequiredWorkCoordinator:
             ticket = self.reserve(RequiredWorkSource.LEASE_RELEASE)
             self._release_prepared = True
             return ticket
+
+    def prepare_continuation_handoff(self) -> RequiredWorkTicket:
+        """Reserve one handoff transaction without sealing: a known refusal leaves the owner live.
+
+        The yield or handover releases the fence inside its own transaction, so
+        the release barrier is set by ``seal_after_continuation_handoff`` only
+        once that transaction commits. A refused attempt (Stop, a moved head)
+        writes nothing, and the owner may still settle or retry, each retry
+        under its own recurrence.
+        """
+        with self._lock:
+            self.assert_completed()
+            attempts = sum(1 for key in self._tickets if key.source is RequiredWorkSource.CONTINUATION_HANDOFF_SQL)
+            return self.reserve(RequiredWorkSource.CONTINUATION_HANDOFF_SQL, recurrence_ordinal=attempts)
+
+    def seal_after_continuation_handoff(self) -> None:
+        """The committed handoff ended this owner's custody: admit no further required work."""
+        with self._lock:
+            self.assert_completed()
+            self._release_prepared = True
 
 
 class RequiredWorkRole(Enum):

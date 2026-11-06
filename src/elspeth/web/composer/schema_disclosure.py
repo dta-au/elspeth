@@ -2,6 +2,24 @@
 
 from __future__ import annotations
 
+from pydantic import BaseModel, ConfigDict, model_validator
+
+from elspeth.contracts.errors import AuditIntegrityError
+
+
+class SchemaDisclosureSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    session_id: str
+    catalog_hash: str
+    policy_hash: str
+    schemas: tuple[tuple[str, str], ...]
+
+    @model_validator(mode="after")
+    def require_unique_schemas(self) -> SchemaDisclosureSnapshot:
+        if len(set(self.schemas)) != len(self.schemas):
+            raise ValueError("schema disclosure snapshot repeats a plugin")
+        return self
+
 
 class SchemaDisclosureTracker:
     """Track successful plugin-schema reads shared by planning and freeform turns.
@@ -45,3 +63,35 @@ class SchemaDisclosureTracker:
         if session_id not in self._schemas_loaded_by_session:
             self._schemas_loaded_by_session[session_id] = set()
         self._schemas_loaded_by_session[session_id].add((plugin_type, plugin_name))
+
+    def snapshot_for_continuation(
+        self,
+        *,
+        session_id: str,
+        catalog_hash: str,
+        policy_hash: str,
+    ) -> SchemaDisclosureSnapshot:
+        return SchemaDisclosureSnapshot(
+            session_id=session_id,
+            catalog_hash=catalog_hash,
+            policy_hash=policy_hash,
+            schemas=tuple(sorted(self.schemas_loaded_for_session(session_id))),
+        )
+
+    def restore_session_for_continuation(
+        self,
+        snapshot: SchemaDisclosureSnapshot,
+        *,
+        session_id: str,
+        catalog_hash: str,
+        policy_hash: str,
+    ) -> None:
+        if type(snapshot) is not SchemaDisclosureSnapshot:
+            raise TypeError("schema disclosure requires its owned snapshot")
+        if (snapshot.session_id, snapshot.catalog_hash, snapshot.policy_hash) != (
+            session_id,
+            catalog_hash,
+            policy_hash,
+        ):
+            raise AuditIntegrityError("Schema disclosure identity changed; retain history and acquire current schemas before resuming.")
+        self._schemas_loaded_by_session[session_id] = set(snapshot.schemas)

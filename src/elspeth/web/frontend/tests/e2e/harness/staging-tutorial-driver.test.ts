@@ -8,6 +8,27 @@ import {
   isComposeRequest,
   isRunRequest,
 } from "../../../scripts/staging-tutorial-driver.mjs";
+import type { DriverLocator, DriverPage } from "../../../scripts/staging-tutorial-driver.mjs";
+import type { Page } from "@playwright/test";
+
+// Compile-time proof that the narrow driver contract still admits a real Page.
+const acceptsRealPage: (page: Page) => DriverPage = (page) => page;
+void acceptsRealPage;
+
+/** A member the scenario must not reach fails loudly instead of returning undefined. */
+function unexpected(member: string): () => never {
+  return () => { throw new Error(`Unexpected driver call: ${member}`); };
+}
+/** A typed Locator double: the scenario supplies what it exercises. */
+function driverLocator(overrides: Partial<DriverLocator>): DriverLocator {
+  const self: DriverLocator = {
+    waitFor: unexpected("waitFor"), click: unexpected("click"), isEnabled: unexpected("isEnabled"),
+    isVisible: unexpected("isVisible"), textContent: unexpected("textContent"), count: unexpected("count"),
+    nth: () => self, first: () => self, evaluate: unexpected("evaluate"), getByRole: () => self,
+    ...overrides,
+  };
+  return self;
+}
 
 describe("standalone staging tutorial driver contract", () => {
   const sessionId = "00000000-0000-4000-8000-000000000000";
@@ -25,19 +46,18 @@ describe("standalone staging tutorial driver contract", () => {
       .mockResolvedValueOnce(true)
       .mockResolvedValueOnce(false)
       .mockResolvedValueOnce(true);
-    const page = {
-      getByRole: vi.fn((role: string, options: { name: string | RegExp }) => {
-        if (role === "button" && options.name === "Continue to Run") {
-          return { isEnabled: continueEnabled, click: continueClick };
-        }
-        return { waitFor, click: vi.fn(async () => undefined) };
-      }),
-    };
+    const getByRole = vi.fn((role: string, options?: { name?: string | RegExp; exact?: boolean }): DriverLocator => {
+      if (role === "button" && options?.name === "Continue to Run") {
+        return driverLocator({ isEnabled: continueEnabled, click: continueClick });
+      }
+      return driverLocator({ waitFor, click: vi.fn(async () => undefined) });
+    });
+    const page: DriverPage = { getByRole, locator: () => driverLocator({}), waitForTimeout: unexpected("waitForTimeout") };
 
     await driveFreeformTutorial(page, { timeoutMs: 5_000 });
 
     expect(continueClick).toHaveBeenCalledTimes(2);
-    expect(page.getByRole).toHaveBeenCalledWith("button", { name: "Run", exact: true });
+    expect(getByRole).toHaveBeenCalledWith("button", { name: "Run", exact: true });
   });
 
   it("treats composer messages, not a removed guided route, as the compose step", () => {

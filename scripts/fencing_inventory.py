@@ -22,6 +22,13 @@ Usage::
 
     python scripts/fencing_inventory.py <tree> [--json OUT]
     python scripts/fencing_inventory.py <tree> --baseline <other-tree>
+    python scripts/fencing_inventory.py <tree> --report-only
+
+The exit status gates: 1 when any pin, the DML write-shape set or any
+violation set fails in ``<tree>``, 0 only when every check is green, and the
+last line says ``GATE: RED`` or ``GATE: GREEN``. ``--report-only`` forces exit 0
+and says so on its own line, for scoring a burn-down without failing the
+shell. A ``--baseline`` tree is classified against, never gated.
 
 The ``--baseline`` form classifies each pinned inventory row as unchanged,
 arrived, departed, or fingerprint-moved against another tree, which is the
@@ -203,6 +210,27 @@ def classify(live_rows: Sequence[dict[str, str]], base_rows: Sequence[dict[str, 
     return out
 
 
+def gate_verdict(result: dict[str, Any]) -> list[str]:
+    """Return every reason the measured tree fails the gate; empty means green.
+
+    A pin fails when its live count or digest differs from the pinned one, the
+    write shapes fail when the live and pinned sets differ, and a violation set
+    fails when it is non-empty. These are exactly the conditions the gate's own
+    tests assert, so a green verdict here and a red test id cannot coexist.
+    """
+    reasons: list[str] = []
+    for name, entry in result["pins"].items():
+        if (entry["live_count"], entry["live_digest"]) != (entry["pinned_count"], entry["pinned_digest"]):
+            reasons.append(f"pin {name}: live={entry['live_count']} pinned={entry['pinned_count']}")
+    shapes = result["write_shapes"]
+    if {tuple(shape) for shape in shapes["live"]} != {tuple(shape) for shape in shapes["pinned"]}:
+        reasons.append("DML write shapes differ from the pinned set")
+    for name, entry in result["violations"].items():
+        if entry["count"]:
+            reasons.append(f"violations {name}: {entry['count']} ({entry['test']})")
+    return reasons
+
+
 def report(result: dict[str, Any], baseline: dict[str, Any] | None) -> None:
     print(f"tree: {result['tree']}")
     print()
@@ -248,6 +276,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("tree", type=Path, help="checkout to measure (a git archive of a commit measures that commit)")
     parser.add_argument("--baseline", type=Path, default=None, help="second checkout to classify inventory rows against")
     parser.add_argument("--json", type=Path, default=None, help="write the full measurement, rows included, here")
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="exit 0 whatever the verdict; the exit status then does not reflect the gate",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     result = measure(args.tree.resolve())
@@ -257,7 +290,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.json is not None:
         args.json.write_text(json.dumps({"live": result, "baseline": baseline}, indent=1))
         print(f"\nwrote {args.json}")
-    return 0
+
+    reasons = gate_verdict(result)
+    print()
+    if reasons:
+        print("GATE: RED")
+        for reason in reasons:
+            print(f"  {reason}")
+    else:
+        print("GATE: GREEN")
+    if args.report_only:
+        print("REPORT ONLY: exit status does not reflect the gate")
+        return 0
+    return 1 if reasons else 0
 
 
 if __name__ == "__main__":

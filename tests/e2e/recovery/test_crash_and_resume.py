@@ -629,17 +629,75 @@ class TestMultiSourceCrashResume:
         ctx.db.close()
 
     def test_interrupted_source_refusal_does_not_append_replayed_rows(self, tmp_path: Path) -> None:
+        from elspeth.contracts import TerminalPath
+        from elspeth.contracts.scheduler import TokenWorkStatus
+        from elspeth.core.landscape.schema import node_states_table, token_work_items_table
+
         ctx = _start_interrupted_multi_source_run(tmp_path)
-        _append_crashed_refund_row(ctx)
+        crashed_row_id = _append_crashed_refund_row(ctx)
+        factory = RecorderFactory(ctx.db, payload_store=ctx.payload_store)
+        expected_prefix = [
+            {"source_kind": "orders", "business_id": "order:1", "amount": 100, "schema_fields": "amount,order_id"},
+            {"source_kind": "orders", "business_id": "order:2", "amount": 125, "schema_fields": "amount,order_id"},
+        ]
+        assert _jsonl_rows(ctx.output_path) == expected_prefix
+        rows = sorted(factory.query.get_rows(ctx.run_id), key=lambda row: row.ingest_sequence)
+        assert [row.ingest_sequence for row in rows] == [0, 1, 2, 3]
+        assert [row.source_row_index for row in rows] == [0, 1, 0, 1]
+        assert rows[-1].row_id == crashed_row_id
+        expected_source_rows = [
+            {"order_id": 1, "amount": 100},
+            {"order_id": 2, "amount": 125},
+            {"refund_id": "R-1", "amount": 30},
+            {"refund_id": "R-2", "amount": 45},
+        ]
+        for row, expected in zip(rows, expected_source_rows, strict=True):
+            assert row.source_data_ref is not None
+            assert json.loads(ctx.payload_store.retrieve(row.source_data_ref)) == expected
+        refund_tokens = factory.query.get_tokens(rows[2].row_id)
+        assert len(refund_tokens) == 1
+        refund_token = refund_tokens[0]
+        assert factory.query.get_tokens(crashed_row_id) == []
+        refund_outcomes = [
+            outcome for outcome in factory.query.get_all_token_outcomes_for_run(ctx.run_id) if outcome.token_id == refund_token.token_id
+        ]
+        assert len(refund_outcomes) == 1
+        assert refund_outcomes[0].path is TerminalPath.ABANDONED
+        assert refund_outcomes[0].completed is False
+        assert refund_outcomes[0].context_json is not None
+        assert json.loads(refund_outcomes[0].context_json)["incomplete_sources"] == {"refunds": "interrupted"}
+        with ctx.db.connection() as conn:
+            # Shutdown happened before the refund transform could start. Its
+            # persisted source token and failed work item remain inspectable.
+            assert conn.execute(
+                select(node_states_table.c.node_id, node_states_table.c.status).where(node_states_table.c.token_id == refund_token.token_id)
+            ).all() == [(ctx.refunds_source_node_id, "completed")]
+            assert conn.execute(
+                select(token_work_items_table.c.status, token_work_items_table.c.pending_sink_name).where(
+                    token_work_items_table.c.token_id == refund_token.token_id
+                )
+            ).all() == [(TokenWorkStatus.FAILED.value, None)]
+            assert conn.execute(
+                select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state)
+                .where(run_sources_table.c.run_id == ctx.run_id)
+                .order_by(run_sources_table.c.source_name)
+            ).all() == [("orders", "exhausted"), ("refunds", "interrupted")]
+        assert refund_token.token_id not in {member.token_id for member in factory.execution.sink_effects.get_members_for_run(ctx.run_id)}
+
+        def persisted_bytes() -> dict[Path, bytes]:
+            # Include SQLite's WAL and every payload/output byte. SHM contains
+            # reader locks, not persisted data, and can change during reads.
+            return {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and not path.name.endswith("-shm")}
+
+        before = persisted_bytes()
+        assert tmp_path / "multi_source_resume.db" in before
+        assert ctx.output_path in before
 
         with pytest.raises(IncompleteSourceResumeError, match=r"source.*refunds.*interrupted"):
             _resume_multi_source_run(ctx)
 
-        assert [row["business_id"] for row in _jsonl_rows(ctx.output_path)] == [
-            "order:1",
-            "order:2",
-            "refund:R-1",
-        ]
+        assert persisted_bytes() == before
+        assert _jsonl_rows(ctx.output_path) == expected_prefix
         ctx.db.close()
 
     def test_resume_after_crash_during_source_iteration_records_partial_source_lifecycle(self, tmp_path: Path) -> None:

@@ -26,6 +26,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REBIND_GUIDANCE, PUBLIC_EXPORT_REDACTION_HEADER
@@ -35,12 +36,14 @@ from elspeth.web.execution.schemas import ValidationError
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
+from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.composition_state import composition_state_data, default_pipeline_metadata
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_routes import (
@@ -98,13 +101,13 @@ class TestRevertEndpoint:
         target = await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
         )
         await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
         )
         compose_lock = await registry.get_lock(str(session.id))
@@ -150,13 +153,13 @@ class TestRevertEndpoint:
         target = await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
         )
         await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
         )
         operation_id = str(uuid.uuid4())
@@ -537,8 +540,8 @@ transforms:
             client.post(f"/api/sessions/{session.id}/state/revert", json=revert_body)
 
         # NON-VACUITY PRECONDITION, one clause per way the repair can silently
-        # write nothing. (1) ``_surface_reverted_interpretation_reviews``
-        # returns early on a state whose ``metadata_`` is None. (2)
+        # write nothing. (1) The reverted state retains its required persisted
+        # pipeline metadata for review projection. (2)
         # ``only_missing_evidence=True`` makes the surfacer skip every site
         # already carrying evidence in ANY resolution status, so the debt must
         # be checked unfiltered -- a resolved or superseded row on the reverted
@@ -550,9 +553,7 @@ transforms:
         reverted_state = await service.get_current_state(session.id)
         assert reverted_state is not None
         assert reverted_state.id != uuid.UUID(imported.json()["id"])
-        assert reverted_state.metadata_ is not None, (
-            "fixture is vacuous: the surfacer returns early on a state with no metadata_, so replay would write nothing"
-        )
+        assert reverted_state.metadata_ is not None, "fixture violates the required persisted pipeline metadata contract"
         assert (await service.list_interpretation_events(session.id, composition_state_id=reverted_state.id)) == [], (
             "fixture is vacuous: the reverted state already carries evidence, so replay would write nothing"
         )
@@ -650,8 +651,8 @@ transforms:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, composition_state_data(is_valid=True), provenance="session_seed")
+        await _save_test_composition_state(service, session.id, composition_state_data(is_valid=True), provenance="session_seed")
 
         client.post(
             f"/api/sessions/{session.id}/state/revert",
@@ -714,7 +715,7 @@ transforms:
 
         # Alice creates a session with a state
         session = await service.create_session("alice", "Alice Only", "local")
-        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, composition_state_data(is_valid=True), provenance="session_seed")
 
         # Bob tries to revert -- should be 404
         resp = bob_client.post(
@@ -731,7 +732,7 @@ transforms:
 
         s1 = await service.create_session("alice", "Session 1", "local")
         s2 = await service.create_session("alice", "Session 2", "local")
-        v1_s2 = await _save_test_composition_state(service, s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1_s2 = await _save_test_composition_state(service, s2.id, composition_state_data(is_valid=True), provenance="session_seed")
 
         # Try to revert s1 using s2's state -- should fail
         resp = client.post(
@@ -796,8 +797,7 @@ transforms:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("metadata", [None, {"name": "No review sites", "description": ""}])
-    async def test_no_site_replay_keeps_unrelated_writer_and_stored_response(self, tmp_path: Path, metadata: dict[str, str] | None) -> None:
+    async def test_no_site_replay_keeps_unrelated_writer_and_stored_response(self, tmp_path: Path) -> None:
         from elspeth.web.composer import interpretation_surfacing
         from elspeth.web.sessions.routes.composer import state as state_routes
 
@@ -805,7 +805,10 @@ transforms:
         client = TestClient(app)
         session = await service.create_session("alice", "No review replay", "local")
         target = await _save_test_composition_state(
-            service, session.id, CompositionStateData(metadata_=metadata, is_valid=True), provenance="session_seed"
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "No review sites", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
         body = {"operation_id": str(uuid.uuid4()), "state_id": str(target.id)}
         first = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
@@ -832,12 +835,8 @@ transforms:
             assert replay.status_code == 200, replay.text
             assert replay.content == first.content
             acquisition.assert_not_called()
-            if metadata is None:
-                query.assert_not_called()
-                hydrate.assert_not_called()
-            else:
-                query.assert_called_once()
-                hydrate.assert_called_once()
+            query.assert_called_once()
+            hydrate.assert_called_once()
             authority.compare_and_swap(writer)
             assert await self._snapshot(service, session.id) == before
             # A different operation is a fresh revert and still needs authority.
@@ -1233,7 +1232,7 @@ sinks:
         before = await _save_test_composition_state(
             service,
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
         )
         yaml_text = """
@@ -1490,7 +1489,7 @@ sinks:
             ],
             edges=None,
             outputs=[{"name": "missing_output", "plugin": "missing_sink"}],
-            metadata_=None,
+            metadata_=default_pipeline_metadata(),
             is_valid=False,
             validation_errors=None,
             created_at=datetime.now(UTC),
@@ -1655,6 +1654,12 @@ sinks:
         assert record.sources["source"]["plugin"] == "csv"
         assert record.sources["source"]["options"]["path"] == str(blob_path)
         assert record.outputs[0]["name"] == "main"
+
+        checksum = composition_content_hash(state_from_record(record))
+        assert resp.json()["composition_content_hash"] == checksum
+        state_response = client.get(f"/api/sessions/{session.id}/state")
+        assert state_response.status_code == 200
+        assert state_response.json()["composition_content_hash"] == checksum
 
     @pytest.mark.asyncio
     async def test_post_state_yaml_surfaces_llm_review_events(self, tmp_path) -> None:

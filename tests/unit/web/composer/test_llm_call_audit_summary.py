@@ -1,39 +1,15 @@
-"""The operator-facing summary line on an LLM-call audit row.
+"""The surviving LLM audit writer uses the shared operator summary.
 
-Two things are pinned here.
-
-**The consolidation.** ``content`` for an LLM-call audit row used to be
-hand-built byte-identically at two remaining drain sites
-(``sessions/routes/_helpers._persist_llm_calls``,
-``composer/planning_application._persist_pipeline_planner_audit``). They now share one
-projection, :func:`llm_call_audit_summary`. The no-regression proof compares
-the helper against a JSON string written out literally in this file — not
-re-derived from the helper, which would pass vacuously — and the
-two-sites-agree property is asserted by driving both real drain
-sites, not by calling the helper twice.
-
-**The behaviour.** The envelope (``chat_messages.tool_calls``) already
-carries ``finish_reason`` for every call; that is the forensic record, and
-it is only visible to someone who opens the JSON column. This summary is
-what the message-list view renders, so it surfaces a finish reason exactly
-when the reason is worth an operator's attention: never for the routine
-terminal states, always otherwise — including values nobody has triaged.
-
-A note on reach, not a defect: ``litellm.types.utils.Choices`` types
-``finish_reason`` as a ``Literal`` and rewrites unmapped values to
-``"stop"`` before we see them (documented in
-``test_llm_finish_reason_audit.py``). An unrecognised reason therefore only
-reaches this projection through the Mapping-shaped provider response. The
-unknown-surfaces rule is still the right one — it is what makes a new
-provider term visible the day it starts arriving — but it is not universal
-across every response shape.
+Literal legacy JSON pins preserve field order and bytes independently of the
+writer test. Routine reasons are omitted; abnormal and unknown reasons remain
+visible. The actual surviving writer is exercised with each reason family.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -45,14 +21,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
 )
-from elspeth.contracts.composer_planner_audit import (
-    ComposerPlannerAttempt,
-    ComposerPlannerAttemptLedTo,
-    ComposerPlannerAttemptOutcome,
-    ComposerPlannerAttemptPhase,
-)
 from elspeth.web.composer.audit import llm_call_audit_summary
-from elspeth.web.composer.planning_application import PlanningApplication
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -121,23 +90,6 @@ def _call(
         max_completion_tokens_requested=8192 if planner_call_ordinal is not None else None,
         planner_policy_hash="b" * 64 if planner_call_ordinal is not None else None,
         planner_call_ordinal=planner_call_ordinal,
-    )
-
-
-def _attempt(*, planner_call_ordinal: int) -> ComposerPlannerAttempt:
-    return ComposerPlannerAttempt(
-        ordinal=1,
-        planner_call_ordinal=planner_call_ordinal,
-        phase=ComposerPlannerAttemptPhase.CANDIDATE,
-        outcome=ComposerPlannerAttemptOutcome.ACCEPTED,
-        planner_code=None,
-        selected_tools=("emit_pipeline_proposal",),
-        requested_information=(),
-        new_information=(),
-        rejection_codes=(),
-        candidate_shape_hash="a" * 64,
-        repeated_fingerprint=False,
-        led_to=ComposerPlannerAttemptLedTo.DONE,
     )
 
 
@@ -314,129 +266,19 @@ class _CapturingSessionService:
             )
 
 
-class _PlannerAuditHost:
-    """Minimal host for the real ``PlanningApplication`` drain body.
-
-    Bind the real draft builder as well as the sessions service so the
-    persistence test exercises the production cohort without reimplementing it.
-    """
-
-    _pipeline_planner_audit_drafts = PlanningApplication._pipeline_planner_audit_drafts
-
-    def __init__(self, sessions: _CapturingSessionService) -> None:
-        self._sessions = sessions
-
-    @property
-    def _sessions_service(self) -> SessionServiceProtocol:
-        return cast(SessionServiceProtocol, self._sessions)
-
-
-class TestAllThreeDrainSitesShareOneProjection:
-    """The property the consolidation exists to guarantee.
-
-    Asserted by driving the three real sites — calling the helper three
-    times would prove nothing about whether the sites still use it.
-    """
-
-    @staticmethod
-    async def _helpers_site_content(call: ComposerLLMCall) -> str:
-        service = _CapturingSessionService()
-
-        session_id = uuid4()
-        await _persist_llm_calls(
-            cast(SessionServiceProtocol, service),
-            session_id,
-            (call,),
-            None,
-            plugin_crash_pending=False,
-            session_operation_context=_compose_context(session_id),
-        )
-
-        (message,) = service.messages
-        return message.content
-
-    @staticmethod
-    async def _composer_service_site_content(call: ComposerLLMCall) -> str:
-        service = _CapturingSessionService()
-        host = _PlannerAuditHost(service)
-        planner_call = replace(
-            call,
-            max_completion_tokens_requested=8192,
-            planner_policy_hash="b" * 64,
-            planner_call_ordinal=1,
-        )
-
-        planner_session_id = uuid4()
-        await PlanningApplication._persist_pipeline_planner_audit(
-            cast(Any, host),
-            session_id=planner_session_id,
-            current_state_id=None,
-            llm_calls=(planner_call,),
-            planner_attempts=(_attempt(planner_call_ordinal=1),),
-            invocations=(),
-            withheld_replies=(),
-            private_candidates=(),
-            session_operation_context=_compose_context(planner_session_id),
-        )
-
-        message = service.messages[0]
-        return message.content
-
-    async def _both_sites(self, call: ComposerLLMCall) -> tuple[str, str]:
-        return (
-            await self._helpers_site_content(call),
-            await self._composer_service_site_content(call),
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("finish_reason", (None, *ROUTINE, *ABNORMAL, "provider_specific_halt"))
-    async def test_both_sites_emit_the_same_summary(self, finish_reason: str | None) -> None:
-        call = _call(finish_reason=finish_reason)
-
-        helpers, composer_service = await self._both_sites(call)
-
-        assert helpers == composer_service
-
-    @pytest.mark.asyncio
-    async def test_both_sites_surface_an_abnormal_reason(self) -> None:
-        """Not just equal to each other — equal to the right thing."""
-        helpers, composer_service = await self._both_sites(_call(finish_reason="length"))
-
-        for content in (helpers, composer_service):
-            assert json.loads(content)["finish_reason"] == "length"
-
-    @pytest.mark.asyncio
-    async def test_both_sites_are_unchanged_for_a_routine_call(self) -> None:
-        """Byte-identical to the pre-consolidation output at every site."""
-        helpers, composer_service = await self._both_sites(_call(finish_reason="stop"))
-
-        for content in (helpers, composer_service):
-            assert content == _LEGACY_SUMMARY_JSON
-
-
 @pytest.mark.asyncio
-async def test_freeform_planner_persistence_atomically_interleaves_physical_calls_and_semantic_attempts() -> None:
+@pytest.mark.parametrize("finish_reason", (None, *ROUTINE, *ABNORMAL, "provider_specific_halt"))
+async def test_surviving_writer_uses_shared_summary(finish_reason: str | None) -> None:
     service = _CapturingSessionService()
-    host = _PlannerAuditHost(service)
-    failed_call = _call(status=ComposerLLMCallStatus.API_ERROR, planner_call_ordinal=1)
-    response_call = _call(planner_call_ordinal=2)
-
-    planner_session_id = uuid4()
-    await PlanningApplication._persist_pipeline_planner_audit(
-        cast(Any, host),
-        session_id=planner_session_id,
-        current_state_id=None,
-        llm_calls=(failed_call, response_call),
-        planner_attempts=(_attempt(planner_call_ordinal=2),),
-        invocations=(),
-        withheld_replies=(),
-        private_candidates=(),
-        session_operation_context=_compose_context(planner_session_id),
+    session_id = uuid4()
+    call = _call(finish_reason=finish_reason)
+    await _persist_llm_calls(
+        cast(SessionServiceProtocol, service),
+        session_id,
+        (call,),
+        None,
+        plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
-
-    assert [message.kwargs["tool_calls"][0]["_kind"] for message in service.messages] == [
-        "llm_call_audit",
-        "llm_call_audit",
-        "planner_attempt_audit",
-    ]
-    assert service.atomic_calls == 1
+    (saved,) = service.messages
+    assert saved.content == llm_call_audit_summary(call)

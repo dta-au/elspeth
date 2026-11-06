@@ -1,7 +1,15 @@
 import { canonicalUuid, exactRecord, operationKind, text } from "@/api/composerOperationDecoder";
 import type { OperationCustody, PrincipalScope, SessionCustody, SubmittedCustody } from "@/types/composerOperations";
 
-export const COMPOSER_CUSTODY_KEY = "elspeth_composer_operations_v1";
+// Bumped with the single composer lifecycle (0.8.10): records written by an
+// earlier bundle live under the old key and are never read.
+export const COMPOSER_CUSTODY_KEY = "elspeth_composer_operations_v2";
+// Removal only, never read: retired records still name principal-scoped
+// operations, so they leave storage wherever the current record does.
+const RETIRED_CUSTODY_KEYS = ["elspeth_composer_operations_v1"] as const;
+function removeRetiredCustody(): void {
+  for (const retired of RETIRED_CUSTODY_KEYS) try { sessionStorage.removeItem(retired); } catch { /* Storage unavailable. */ }
+}
 export const COMPOSER_BODY_LIMIT = 512 * 1024;
 export const COMPOSER_AGGREGATE_LIMIT = 1024 * 1024;
 export const COMPOSER_CUSTODY_LIFETIME_MS = 24 * 60 * 60 * 1000;
@@ -12,7 +20,8 @@ let stopControlsQuarantined = false;
 export function composerStopPersistenceLimited(): boolean { return stopPersistenceLimited; }
 let expiredHydration = false;
 let quarantinedHydration = false;
-const schema = "composer-operations.v1";
+export const COMPOSER_CUSTODY_SCHEMA = "composer-operations.v2";
+const schema = COMPOSER_CUSTODY_SCHEMA;
 const encoder = new TextEncoder();
 const records = new Map<string, SessionCustody>();
 let authenticatedScope: PrincipalScope | null = null;
@@ -105,6 +114,7 @@ export function authenticateComposerCustody(scope: PrincipalScope): void {
 
   if (hydrated) return;
   hydrated = true;
+  removeRetiredCustody();
   let raw: string | null;
   try { raw = sessionStorage.getItem(COMPOSER_CUSTODY_KEY); } catch { return; }
   if (raw === null) return;
@@ -196,6 +206,15 @@ export function attachComposerObserver(descriptor: OperationCustody, activeId: s
   const observer = admitDescriptor({ mode: "observer", scope: descriptor.scope, sessionId: descriptor.sessionId, operationId: activeId, kind, createdAt: Date.now() }, descriptor.scope);
   records.set(key(descriptor.scope, descriptor.sessionId), { foreground: observer, unresolvedSubmissions: unresolved }); persist(); return observer;
 }
+/** A tab without custody adopts the session's live operation as an observer (no replay body). */
+export function adoptComposerObserver(scope: PrincipalScope, sessionId: string, active: Readonly<{ operation_id: string; kind: string }>): OperationCustody | null {
+  if (authenticatedScope === null || !samePrincipal(authenticatedScope, scope)) return null;
+  const existing = findComposerOperationCustody(scope, sessionId);
+  if (existing.foreground !== null || existing.unresolvedSubmissions.size > 0) return null;
+  const observer = admitDescriptor({ mode: "observer", scope, sessionId, operationId: active.operation_id, kind: active.kind, createdAt: Date.now() }, scope);
+  records.set(key(scope, sessionId), { foreground: observer, unresolvedSubmissions: new Map() }); persist();
+  return observer;
+}
 export function composerStopRequested(descriptor: OperationCustody): boolean {
   const identity = JSON.stringify([descriptor.scope.principalId, descriptor.scope.authProvider, descriptor.sessionId, descriptor.operationId]);
   if (stopped.has(identity)) return true;
@@ -206,7 +225,8 @@ export function requestComposerStop(descriptor: OperationCustody): void {
   stopped.add(JSON.stringify([descriptor.scope.principalId, descriptor.scope.authProvider, descriptor.sessionId, descriptor.operationId]));
   persistStops();
 }
-function clearComposerStop(descriptor: OperationCustody): void {
+/** Clear Stop intent without retiring custody of the operation. */
+export function clearComposerStop(descriptor: OperationCustody): void {
   composerStopRequested(descriptor);
   stopped.delete(JSON.stringify([descriptor.scope.principalId, descriptor.scope.authProvider, descriptor.sessionId, descriptor.operationId]));
   persistStops();
@@ -232,4 +252,5 @@ export function clearComposerSessionCustody(scope: PrincipalScope, sessionId: st
 export function purgeComposerCustody(): void {
   records.clear(); stopped.clear(); stopPersistenceLimited = false; stopControlsQuarantined = false; expiredHydration = false; quarantinedHydration = false; authenticatedScope = null; hydrated = false; hydrationBlocked = false;
   try { sessionStorage.removeItem(COMPOSER_CUSTODY_KEY); sessionStorage.removeItem(COMPOSER_STOP_KEY); } catch { /* No persisted credentials or fallback token. */ }
+  removeRetiredCustody();
 }

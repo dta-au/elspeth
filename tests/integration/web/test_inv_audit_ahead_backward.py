@@ -26,6 +26,10 @@ from tests.helpers.session_fences import FencedComposeTurnHarness
 # ``FencedComposeTurnHarness`` on the session's first turn.
 from .conftest import _make_session
 
+# A stored state always carries its pipeline metadata (state_from_record refuses a
+# row without it); this is the empty graph's default PipelineMetadata as serialised.
+_EMPTY_STATE_DATA = CompositionStateData(metadata_={"name": "Untitled Pipeline", "description": ""})
+
 _POPULATED_SESSION_ID = "00000000-0000-4000-8000-000000000001"
 _SUCCESS_SESSION_ID = "00000000-0000-4000-8000-000000000002"
 _ROLLBACK_SESSION_ID = "00000000-0000-4000-8000-000000000003"
@@ -81,7 +85,7 @@ def populated_audit_db(service):
                 "tc_populated_a",
                 '{"r": 1}',
                 StatePayload(
-                    data=CompositionStateData(),
+                    data=_EMPTY_STATE_DATA,
                     derived_from_state_id=None,
                 ),
             ),
@@ -112,7 +116,7 @@ def populated_audit_db(service):
                     "tc_populated_a",
                     "{}",
                     StatePayload(
-                        data=CompositionStateData(),
+                        data=_EMPTY_STATE_DATA,
                         derived_from_state_id=None,
                     ),
                 ),
@@ -147,7 +151,7 @@ def test_backward_direction_holds_after_successful_persist(service):
                 # B1 (Phase 1 plan-review synthesis): no ``version=``;
                 # ``_insert_composition_state`` allocates under the lock.
                 StatePayload(
-                    data=CompositionStateData(),
+                    data=_EMPTY_STATE_DATA,
                     derived_from_state_id=None,
                 ),
             ),
@@ -180,7 +184,7 @@ def test_backward_direction_holds_after_integrity_error_rollback(service):
                 "{}",
                 # B1: no ``version=``; helper allocates under the lock.
                 StatePayload(
-                    data=CompositionStateData(),
+                    data=_EMPTY_STATE_DATA,
                     derived_from_state_id=None,
                 ),
             ),
@@ -214,7 +218,7 @@ def test_backward_direction_holds_after_integrity_error_rollback(service):
                     "{}",
                     # B1: no ``version=``.
                     StatePayload(
-                        data=CompositionStateData(),
+                        data=_EMPTY_STATE_DATA,
                         derived_from_state_id=None,
                     ),
                 ),
@@ -262,7 +266,7 @@ def test_turn_assistant_row_state_diverges_from_post_turn_settlement_state(servi
             RedactedToolRow(
                 "tc_d1",
                 '{"r": 1}',
-                StatePayload(data=CompositionStateData(), derived_from_state_id=None),
+                StatePayload(data=_EMPTY_STATE_DATA, derived_from_state_id=None),
             ),
         ),
         parent_composition_state_id=None,
@@ -283,7 +287,7 @@ def test_turn_assistant_row_state_diverges_from_post_turn_settlement_state(servi
             RedactedToolRow(
                 "tc_d2",
                 '{"r": 2}',
-                StatePayload(data=CompositionStateData(), derived_from_state_id=None),
+                StatePayload(data=_EMPTY_STATE_DATA, derived_from_state_id=None),
             ),
         ),
         parent_composition_state_id=pre_turn_state_id,
@@ -354,17 +358,17 @@ def test_get_messages_orders_assistant_before_tool_rows_within_one_turn(service)
             RedactedToolRow(
                 "tc_a",
                 "{}",
-                StatePayload(data=CompositionStateData(), derived_from_state_id=None),
+                StatePayload(data=_EMPTY_STATE_DATA, derived_from_state_id=None),
             ),
             RedactedToolRow(
                 "tc_b",
                 "{}",
-                StatePayload(data=CompositionStateData(), derived_from_state_id=None),
+                StatePayload(data=_EMPTY_STATE_DATA, derived_from_state_id=None),
             ),
             RedactedToolRow(
                 "tc_c",
                 "{}",
-                StatePayload(data=CompositionStateData(), derived_from_state_id=None),
+                StatePayload(data=_EMPTY_STATE_DATA, derived_from_state_id=None),
             ),
         ),
         parent_composition_state_id=None,

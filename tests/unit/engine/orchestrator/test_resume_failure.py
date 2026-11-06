@@ -98,9 +98,11 @@ def _covered_factory() -> MagicMock:
     A bare mock's ``verify_resume_coverage()`` returns a truthy mock, which the
     resume reads as a refusal; tests of other resume behaviour pin "nothing
     uncovered" explicitly.
+    An empty loss ledger likewise models no remaining loss-only intake work.
     """
     factory = MagicMock(spec=RecorderFactory)
     factory.scheduler.leases.verify_resume_coverage.return_value = None
+    factory.scheduler.list_unadopted_group_losses.return_value = []
     return factory
 
 
@@ -1318,7 +1320,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"refunds_sink": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE),
+            ctx=MagicMock(spec=PluginContext, run_mode=RunMode.LIVE, shutdown_event=None),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,

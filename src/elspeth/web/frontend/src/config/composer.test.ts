@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import * as composer from "@/config/composer";
 
 describe("durable composer observation policy", () => {
-  it("adds a fixed grace to the server remaining duration", () => {
-    expect(composer.COMPOSE_CLIENT_GRACE_MS).toBe(25_000);
+  it("has no client observation deadline grace (the composer has no total deadline)", () => {
+    expect("COMPOSE_CLIENT_GRACE_MS" in composer).toBe(false);
   });
   it("has no stale deployment wall-clock default", () => {
     expect("DEFAULT_COMPOSE_TIMEOUT_MS" in composer).toBe(false);
@@ -16,6 +16,17 @@ describe("durable composer observation policy", () => {
   it("limits refresh-only recovery to uncertain or already saved outcomes", () => {
     for (const code of [composer.COMPOSE_OUTCOME_UNCONFIRMED, "recompose_saved_proposal", "recompose_already_completed"]) expect(composer.isComposeRefreshOnlyFailureCode(code)).toBe(true);
     for (const code of [undefined, "request_cancelled", "stale_compose_state", "admission_refused", "token_accounting_unavailable"]) expect(composer.isComposeRefreshOnlyFailureCode(code)).toBe(false);
+  });
+  it("treats an unsupported context as a permanent refusal (U-22 F4)", () => {
+    // Retrying the same graph can never succeed, so Retry must not be offered.
+    expect(composer.isComposePermanentRefusal("context_unsupported")).toBe(true);
+    expect(composer.isComposeRefreshOnlyFailureCode("context_unsupported")).toBe(false);
+  });
+  it("never offers an automatic paid retry after incomplete provider evidence", () => {
+    expect(composer.isComposePermanentRefusal("paid_result_incomplete")).toBe(true);
+    expect(composer.isComposeRefreshOnlyFailureCode("paid_result_incomplete")).toBe(false);
+    expect(composer.isComposePermanentRefusal("paid_result_overflow")).toBe(true);
+    expect(composer.isComposeRefreshOnlyFailureCode("paid_result_overflow")).toBe(false);
   });
   it("distinguishes observation detachment from explicit Stop", () => {
     expect(composer.COMPOSE_TIMEOUT_ABORT_REASON).toBe("compose_timeout");

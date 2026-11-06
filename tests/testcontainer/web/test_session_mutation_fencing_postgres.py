@@ -22,6 +22,7 @@ import structlog
 from sqlalchemy import Engine, event, func, insert, select, update
 from sqlalchemy.engine import Connection
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data
 
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.blobs import BlobForkWriteFence
@@ -61,7 +62,6 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
-    CompositionStateData,
     OperationReceiptClaimed,
     OperationReceiptFenceLostError,
     OperationReceiptTakenOver,
@@ -490,7 +490,7 @@ async def test_postgres_composer_proposal_accept_stale_predecessor_writes_nothin
             session_id=session_id,
             proposal_id=proposal.id,
             expected_current_state_id=None,
-            state=CompositionStateData(is_valid=True),
+            state=composition_state_data(is_valid=True),
             actor="user:alice",
             session_operation_context=predecessor,
         )
@@ -552,7 +552,7 @@ async def test_postgres_composer_proposal_accept_stale_predecessor_writes_nothin
             session_id=session_id,
             proposal_id=proposal.id,
             expected_current_state_id=None,
-            state=CompositionStateData(is_valid=True),
+            state=composition_state_data(is_valid=True),
             actor="user:alice",
             session_operation_context=successor,
         )

@@ -69,3 +69,48 @@ def elspeth_lints_subprocess_env() -> dict[str, str]:
         **os.environ,
         "PYTHONPATH": os.pathsep.join(pythonpath_entries),
     }
+
+
+@pytest.fixture
+def synthetic_operator_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Stub only OS admission for explicitly opted-in synthetic-key unit tests.
+
+    These tests exercise signing and recovery after trusted startup. Real
+    admission/refusal tests deliberately do not request this fixture.
+    """
+    from elspeth_lints.core import operator_runtime
+
+    evidence = operator_runtime.OperatorRuntimeEvidence(
+        artifact_root=tmp_path / "synthetic-runtime",
+        artifact_id="0" * 64,
+        operator_uid=2001,
+        candidate_uid=2002,
+        invocation_cwd=tmp_path,
+        argv=(),
+    )
+    monkeypatch.setattr(operator_runtime, "require_operator_runtime", lambda: evidence)
+
+
+@pytest.fixture
+def synthetic_judge_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise mocked provider SDKs downstream of the separately tested RPC.
+
+    Production routing and worker admission tests never opt into this fixture.
+    """
+    from elspeth_lints.core import judge, judge_rpc, judge_worker
+
+    def call_mock_provider(
+        request: judge.JudgeRequest,
+        *,
+        model_id: str,
+        max_tokens: int,
+        transport: str,
+        tool_scope: judge.AgentToolScope | None,
+    ) -> judge._TransportResult:
+        implementation = judge._TRANSPORTS[transport]
+        if tool_scope is not None:
+            return implementation(request, model_id, max_tokens, tool_scope=tool_scope)
+        return implementation(request, model_id, max_tokens)
+
+    monkeypatch.setattr(judge_worker, "require_worker_execution", lambda: None)
+    monkeypatch.setattr(judge_rpc, "call_worker", call_mock_provider)

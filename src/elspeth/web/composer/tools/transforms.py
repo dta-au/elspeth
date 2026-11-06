@@ -297,14 +297,19 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "type": ["object", "null"],
             "additionalProperties": {"type": "string"},
             "description": (
-                "Gate route mapping {true: ..., false: ...}; each value is a sink, a connection, or "
-                "'discard' for an audited gate_discarded terminal drop. Mutually exclusive with fork_to."
+                "Gate routes mapping; Boolean conditions require both 'true' and 'false' labels, even condition='True'. "
+                "Each value is a sink, a connection, 'discard' for an audited gate_discarded terminal drop, or 'fork'. "
+                "A 'fork' destination requires fork_to; supply both routes and fork_to for fan-out."
             ),
         },
         "fork_to": {
             "type": ["array", "null"],
             "items": {"type": "string"},
-            "description": "Fork destinations — row is copied to all listed paths (gate only, mutually exclusive with routes).",
+            "description": (
+                "Gate fork_to destinations — when a routes destination is 'fork', the row is copied to all listed paths. "
+                "Required with a 'fork' route; omit when no route targets 'fork'. "
+                "Boolean conditions still require both 'true' and 'false' routes, even condition='True'."
+            ),
         },
         "branches": {
             "type": ["array", "object", "null"],
@@ -432,7 +437,8 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "Read get_pipeline_state(component='set_pipeline_arguments') for the authoring payload. "
         "Fields are node_type-dependent: "
         "transform/aggregation use plugin+options; "
-        "gate uses condition+routes (or fork_to) and optional node-level on_error; "
+        "gate uses condition+routes and optional node-level on_error; for fan-out, route to 'fork' and supply fork_to "
+        "(Boolean conditions always need both true/false routes, even condition='True'); "
         "coalesce uses branches+policy+merge; "
         "row_union is a plugin-free require_all N-to-N barrier: provide at least "
         "two ordered branches, set input to the first branch connection, set "

@@ -33,7 +33,8 @@ from __future__ import annotations
 import math
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
@@ -75,13 +76,17 @@ from elspeth.web.credential_guard import require_no_credential_material_in_llm_m
 
 if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
+    from elspeth.web.composer.provider_result_admission import V4ProviderResultAdmission, V4ProviderSdkReturn
 
 __all__ = [
     "PROVIDER_STRING_TRUNCATION_MARKER",
+    "AnthropicCacheMarkerPlan",
     "admit_llm_provider_metadata",
+    "admit_v4_provider_result",
     "apply_anthropic_cache_markers",
     "attach_llm_calls",
     "build_llm_call_record",
+    "plan_anthropic_cache_markers",
     "safe_response_model",
     "supports_anthropic_prompt_cache_markers",
     "token_usage_from_response",
@@ -118,6 +123,30 @@ class _ReasoningMetadata(TypedDict):
     reasoning_content: str | None
     reasoning_details: Any | None
     thinking_blocks: Any | None
+
+
+def admit_v4_provider_result(
+    response: Any,
+    *,
+    choice: Any | None,
+    message: Any | None,
+    sdk_return: V4ProviderSdkReturn,
+    pricing_model: str | None = None,
+    surface: str = "composer_provider_response",
+    require_tool_calls_field: bool = True,
+) -> V4ProviderResultAdmission:
+    """Opt-in original V4 admission; legacy diagnostic callers stay unchanged."""
+    from elspeth.web.composer.provider_result_admission import admit_v4_provider_result as admit
+
+    return admit(
+        response,
+        choice=choice,
+        message=message,
+        sdk_return=sdk_return,
+        pricing_model=pricing_model,
+        surface=surface,
+        require_tool_calls_field=require_tool_calls_field,
+    )
 
 
 def token_usage_from_response(response: Any | None) -> TokenUsage:
@@ -682,6 +711,7 @@ def build_llm_call_record(
     error_class: str | None = None,
     error_message: str | None = None,
     max_completion_tokens_requested: int | None = None,
+    cost_response_accountable: bool | None = None,
     planner_policy_hash: str | None = None,
     planner_call_ordinal: int | None = None,
     credential_surface: str = "composer_provider_response",
@@ -690,6 +720,11 @@ def build_llm_call_record(
     private_request: PrivateProviderContext | None = None,
 ) -> ComposerLLMCall:
     from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
+
+    if response_metadata is not None and response_metadata.v4_completeness is not None:
+        from elspeth.web.composer.provider_result_admission import diagnostic_provider_metadata
+
+        response_metadata = diagnostic_provider_metadata(response_metadata)
 
     if response_metadata is None:
         usage = token_usage_from_response(response)
@@ -761,6 +796,7 @@ def build_llm_call_record(
         thinking_blocks=reasoning_metadata["thinking_blocks"],
         provider_cost=provider_cost,
         provider_cost_source=provider_cost_source,
+        cost_response_accountable=cost_response_accountable,
         latency_ms=elapsed_ns // 1_000_000,
         provider_request_id=provider_request_id,
         messages_hash=stable_hash(messages),
@@ -849,6 +885,55 @@ def supports_anthropic_prompt_cache_markers(model: str | None) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class AnthropicCacheMarkerPlan:
+    """The existing cache adaptation's selected positions, without a wire copy."""
+
+    message_indexes: tuple[int, ...]
+    tool_index: int | None
+
+
+def plan_anthropic_cache_markers(
+    messages: Sequence[object],
+    tools: Sequence[object] | None,
+    *,
+    mark_history_tail: bool = False,
+) -> AnthropicCacheMarkerPlan:
+    """Select the exact prospective cache markers before request allocation."""
+    from elspeth.web.composer.prompts import CATALOG_CONTEXT_PREFIX
+
+    selected: list[int] = []
+    system_marked = False
+    catalog_marked = False
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise AuditIntegrityError("Cache adaptation requires its complete owned message mappings")
+        # Role is required on the owned outbound envelope. Content remains an
+        # optional field, exactly as in the materializing adapter below.
+        if not system_marked and message["role"] == "system":
+            selected.append(index)
+            system_marked = True
+        elif (
+            not catalog_marked
+            and message["role"] == "user"
+            and "content" in message
+            and type(message["content"]) is str
+            and message["content"].startswith(CATALOG_CONTEXT_PREFIX)
+        ):
+            selected.append(index)
+            catalog_marked = True
+        if system_marked and catalog_marked:
+            break
+    if mark_history_tail and messages:
+        last_index = len(messages) - 1
+        last = messages[last_index]
+        if not isinstance(last, Mapping):
+            raise AuditIntegrityError("Cache adaptation requires its complete owned message mappings")
+        if last_index not in selected and "cache_control" not in last:
+            selected.append(last_index)
+    return AnthropicCacheMarkerPlan(tuple(selected), len(tools) - 1 if tools else None)
+
+
 def apply_anthropic_cache_markers(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
@@ -885,46 +970,10 @@ def apply_anthropic_cache_markers(
     contents are not deep-copied) — this keeps the transform cheap and
     is safe because the receiver (LiteLLM) does not mutate them.
     """
-    # Local import: prompts.py has no import back into this module, but the
-    # header contract is authored there next to the builders that emit it.
-    from elspeth.web.composer.prompts import CATALOG_CONTEXT_PREFIX
-
+    plan = plan_anthropic_cache_markers(messages, tools, mark_history_tail=mark_history_tail)
     new_messages: list[dict[str, Any]] = list(messages)
-    system_marked = False
-    catalog_marked = False
-    for index, message in enumerate(new_messages):
-        # ``messages`` is our outbound request payload built by
-        # ``build_messages()`` (prompts.py), not an external response object.
-        # Every message dict we construct carries a ``"role"`` key by
-        # contract; a missing role is a first-party bug, so access it
-        # directly and let ``KeyError`` surface it rather than masking it
-        # with ``.get()``. This is Tier-2 data we authored, not the Tier-3
-        # provider responses the rest of this module normalizes.
-        if not system_marked and message["role"] == "system":
-            new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}
-            system_marked = True
-        elif (
-            not catalog_marked
-            and message["role"] == "user"
-            # ``content`` is genuinely optional on a message we author (an
-            # assistant tool-call turn carries none), so its absence is a
-            # value fact, not the first-party bug a missing ``role`` would
-            # be. Presence is therefore asserted explicitly and the value
-            # then read in membership form, keeping the Tier-2 posture the
-            # ``role`` read above states.
-            and "content" in message
-            and type(message["content"]) is str
-            and message["content"].startswith(CATALOG_CONTEXT_PREFIX)
-        ):
-            new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}
-            catalog_marked = True
-        if system_marked and catalog_marked:
-            break
-
-    if mark_history_tail and new_messages:
-        last = new_messages[-1]
-        if "cache_control" not in last:
-            new_messages[-1] = {**last, "cache_control": {"type": "ephemeral"}}
+    for index in plan.message_indexes:
+        new_messages[index] = {**messages[index], "cache_control": {"type": "ephemeral"}}
 
     new_tools: list[dict[str, Any]] | None = None
     if tools:
@@ -936,6 +985,7 @@ def apply_anthropic_cache_markers(
         # and invalidate the prompt cache for every follow-up turn. The order
         # contract is locked by ``TestToolListOrderIsCacheKeyContract`` in
         # ``tests/unit/web/composer/test_provider_cache_markers.py``.
-        new_tools[-1] = {**new_tools[-1], "cache_control": {"type": "ephemeral"}}
+        assert plan.tool_index is not None
+        new_tools[plan.tool_index] = {**new_tools[plan.tool_index], "cache_control": {"type": "ephemeral"}}
 
     return new_messages, new_tools

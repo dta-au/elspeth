@@ -159,6 +159,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="elspeth-lints")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    baseline = subparsers.add_parser(
+        "regenerate-fingerprint-baseline",
+        help="Verify signed inputs and regenerate through an isolated maintenance worker",
+    )
+    baseline.add_argument("--repo-root", type=Path, default=Path.cwd())
+    baseline.add_argument("--env-file", type=Path)
+    baseline.add_argument("--commit", action="store_true", help="Legacy option; commit separately from key custody")
+
     check = subparsers.add_parser("check", help="Run static-analysis rules")
     check.add_argument(
         "--rules",
@@ -727,7 +735,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the interactive confirmation prompt before creating/resuming the private transaction.",
     )
-    sign_bundle.add_argument(
+    sign_bundle_scope = sign_bundle.add_mutually_exclusive_group()
+    sign_bundle_scope.add_argument(
         "--lanes",
         type=_sign_bundle_lanes,
         default=None,
@@ -742,6 +751,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "journalled in the transaction and a resume must use the same "
             "--lanes value (omitting the flag on resume inherits it). Default: "
             "all lanes."
+        ),
+    )
+    sign_bundle_scope.add_argument(
+        "--stale-key",
+        default=None,
+        metavar="KEY",
+        help=(
+            "Retire exactly one verified orphan by its full key, without judge calls. "
+            "The complete bundle is still verified. Resume inherits this immutable scope; "
+            "exact-scope journals require this version or newer."
         ),
     )
     sign_bundle.add_argument(

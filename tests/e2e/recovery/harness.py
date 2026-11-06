@@ -9,17 +9,18 @@ changes in the move; ``test_concurrent_resume.py`` imports everything back.
 
 Construction note (kept honest, same technique as
 test_eof_resume_proof.py): the crashed-mid-claim state cannot be reached
-by a graceful shutdown — the engine always finishes the in-flight row before
-honoring the shutdown event. So each test first runs the REAL pipeline (real
+by a graceful shutdown — the engine completes or durably retains the in-flight
+row before honoring the shutdown event. So each test first runs the REAL pipeline (real
 Orchestrator, real checkpoint writer, real scheduler journal) to an interrupted-but-
 checkpointed state, then crafts the kill instant through the production
 Tier-1 writers themselves: ``RecorderFactory.data_flow.create_row_with_token`` /
 ``create_token`` for the row the dead worker was carrying, and
 ``TokenSchedulerRepository.enqueue_ready`` + ``claim_ready`` for its LEASED
-journal row — the exact rows the engine writes before a hard kill. Two
-columns are flipped to the engine's own crash-classification values
-(``run_sources.lifecycle_state='loaded'`` — the completed-iteration value —
-and ``runs.status=FAILED``). The resume side is then driven exclusively
+journal row — the exact rows the engine writes before a hard kill. One
+column is flipped to the engine's own crash-classification value
+(``runs.status=FAILED``). The source reaches actual EOF before the fixture
+requests shutdown; its completed lifecycle and token outcomes are preserved.
+The resume side is then driven exclusively
 through the public production path with an injected deterministic MockClock
 (no sleeps, no monkeypatching of code under test).
 
@@ -61,6 +62,7 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import FunctionType
 from typing import Any, ClassVar, NewType, Self
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import func, select, update
@@ -673,11 +675,11 @@ def _resume_point(crashed: _CrashedRun) -> Any:
 def _run_to_interrupted_checkpoint(tmp_path: Path, clock: MockClock) -> _CrashedRun:
     """Run the REAL pipeline to an interrupted, checkpointed state.
 
-    The graceful shutdown fires while the final source row is being yielded,
-    so all three rows are fully processed (terminal outcomes + sink writes +
-    post-sink checkpoints) and the run lands FAILED-with-checkpoint — the
-    production precondition for resume. The crash instant is then crafted on
-    top via :func:`_craft_crashed_lease`.
+    Request graceful shutdown after the real source-finalization method has
+    observed EOF. All three rows are processed, and the real interruption
+    ceremony durably flushes their sinks and checkpoints without abandoning an
+    incomplete source. Classify that coherent image as FAILED-with-checkpoint
+    before crafting the kill instant via :func:`_craft_crashed_lease`.
     """
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     payload_store = FilesystemPayloadStore(tmp_path / "payloads")
@@ -685,30 +687,41 @@ def _run_to_interrupted_checkpoint(tmp_path: Path, clock: MockClock) -> _Crashed
     checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
 
     shutdown_event = threading.Event()
-    config, graph, _sink, _source = _build_pipeline(
-        _SOURCE_ROWS,
-        shutdown_event=shutdown_event,
-        interrupt_after=len(_SOURCE_ROWS),
-    )
+    config, graph, sink, _source = _build_pipeline(_SOURCE_ROWS)
     orchestrator = Orchestrator(db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config, clock=clock)
-    with pytest.raises(GracefulShutdownError) as exc_info:
+    finalize_source_iteration = orchestrator._source_driver.finalize_source_iteration
+
+    def stop_after_source_eof(*args: Any, **kwargs: Any) -> None:
+        assert kwargs["source_exhausted"] is True
+        assert kwargs["interrupted_by_shutdown"] is False
+        finalize_source_iteration(*args, **kwargs)
+        shutdown_event.set()
+
+    with (
+        patch.object(orchestrator._source_driver, "finalize_source_iteration", side_effect=stop_after_source_eof),
+        pytest.raises(GracefulShutdownError) as exc_info,
+    ):
         orchestrator.run(config, graph=graph, payload_store=payload_store, shutdown_event=shutdown_event)
     run_id = exc_info.value.run_id
     assert run_id is not None
+    assert sink.results == _SOURCE_ROWS
 
-    # The engine recorded 'interrupted' for the source because the shutdown
-    # event was honored before the iterator's StopIteration. At the simulated
-    # kill instant the source HAD fully completed iteration, so flip the one
-    # column to the engine's own completed-iteration value ('loaded' — the
-    # same value finalize_source_iteration records, and the value resume.py's
-    # SOURCE_COMPLETE_LIFECYCLE_STATES accepts). FAILED is what the failure
-    # ceremony records when the process dies abnormally.
+    # Source completion and terminal token outcomes must be real. Relabelling
+    # an interrupted source after finalization would leave an ABANDONED audit
+    # record behind and manufacture a contradictory, non-resumable image.
     with db.engine.begin() as conn:
-        conn.execute(
-            run_sources_table.update()
-            .where(run_sources_table.c.run_id == run_id, run_sources_table.c.source_name == "primary")
-            .values(lifecycle_state="loaded")
+        assert conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one() == RunStatus.INTERRUPTED.value
+        assert (
+            conn.execute(
+                select(run_sources_table.c.lifecycle_state).where(
+                    run_sources_table.c.run_id == run_id, run_sources_table.c.source_name == "primary"
+                )
+            ).scalar_one()
+            == "exhausted"
         )
+        completed = conn.execute(select(token_outcomes_table.c.completed).where(token_outcomes_table.c.run_id == run_id)).scalars().all()
+        assert completed == [True] * len(_SOURCE_ROWS)
+        # Preserve the harness's existing external crash-classification step.
         conn.execute(runs_table.update().where(runs_table.c.run_id == run_id).values(status=RunStatus.FAILED))
 
     # Mirror the journal shape the real run wrote (node_id is the queue node,

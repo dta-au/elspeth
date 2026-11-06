@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore } from "./sessionStore";
 import { useAuthStore } from "./authStore";
-import { COMPOSER_STOP_KEY, COMPOSER_CUSTODY_KEY, COMPOSER_CUSTODY_LIFETIME_MS, attachComposerObserver, settleComposerCustody, acquireComposerOperationCustody, authenticateComposerCustody, findComposerOperationCustody, purgeComposerCustody } from "./composerOperationCustody";
+import { COMPOSER_STOP_KEY, COMPOSER_CUSTODY_KEY, COMPOSER_CUSTODY_LIFETIME_MS, COMPOSER_CUSTODY_SCHEMA, attachComposerObserver, settleComposerCustody, acquireComposerOperationCustody, authenticateComposerCustody, findComposerOperationCustody, purgeComposerCustody } from "./composerOperationCustody";
 import { detachComposerObservers } from "@/api/composerOperationObserver";
 import { advanceAuthGeneration } from "@/api/authSession";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { completedSnapshot, liveSnapshot, streamUnavailable } from "@/test/composerOperationWire";
 import type { ComposerOperationSnapshot, ComposerOperationFailureOutcome, ComposerOperationFailurePage } from "@/types/composerOperations";
 import type { ChatMessage, CompositionState, CompositionProposal } from "@/types/index";
 vi.mock("@/api/client", () => ({ submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), fetchComposerOperationFailures: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(), apiErrorFromBody: vi.fn(), composerActiveOperation: vi.fn(), isDefinitiveComposerRefusal: vi.fn(), fetchMessages: vi.fn(), fetchCompositionState: vi.fn(), fetchCompositionProposals: vi.fn(), fetchComposerPreferences: vi.fn(), revertToVersion: vi.fn(), fetchStateVersions: vi.fn(), fetchSessions: vi.fn(), fetchCurrentUser: vi.fn(), fetchAuthConfig: vi.fn(), listBlobs: vi.fn(), listInterpretationEvents: vi.fn() }));
@@ -14,13 +15,14 @@ const sid = "11111111-1111-4111-8111-111111111111", userId = "22222222-2222-4222
 const scope = { principalId: "principal", authProvider: "local" };
 const assistant: ChatMessage = { id: assistantId, session_id: sid, role: "assistant", content: "done", tool_calls: null, created_at: new Date().toISOString() };
 function composition(version = 1): CompositionState { return { ...compositionStateAuthorityFields, id: stateId, session_id: sid, version, sources: {}, nodes: [], edges: [], outputs: [], metadata: { name: null, description: null } }; }
-function snapshot(operationId: string, kind: "compose_message" | "compose_recompose" = "compose_message"): ComposerOperationSnapshot { return { operation_id: operationId, kind, status: "completed", cancel_requested: false, poll_after_ms: 1000, deadline_at: new Date().toISOString(), deadline_remaining_ms: 0, result: { message: assistant, state: composition(), proposals: [] }, error: null }; }
+function snapshot(operationId: string, kind: "compose_message" | "compose_recompose" = "compose_message"): ComposerOperationSnapshot { return completedSnapshot(operationId, { message: assistant, state: composition(), proposals: [] }, { kind, poll_after_ms: 1000 }); }
 beforeEach(() => {
   vi.resetAllMocks(); useSessionStore.getState().reset(); purgeComposerCustody(); sessionStorage.clear(); authenticateComposerCustody(scope);
   useSessionStore.setState({ activeSessionId: sid, compositionStateLoaded: true, compositionState: composition() });
-  vi.mocked(api.submitComposerOperation).mockImplementation(async (descriptor) => ({ operation_id: descriptor.operationId, kind: descriptor.kind, status: "queued", poll_after_ms: 1000 }));
+  vi.mocked(api.submitComposerOperation).mockImplementation(async (descriptor) => liveSnapshot(descriptor.operationId, { kind: descriptor.kind, status: "queued", phase: "queued", poll_after_ms: 1000 }));
   vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => snapshot(operationId));
-  vi.mocked(api.fetchComposerOperationStream).mockRejectedValue(new Error("stream unavailable"));
+  // At capacity: each round reads the durable GET.
+  vi.mocked(api.fetchComposerOperationStream).mockImplementation(async () => streamUnavailable());
   vi.mocked(api.fetchComposerOperationFailures).mockImplementation(async (sessionId) => ({ session_id: sessionId, items: [], next_cursor: null }));
   vi.mocked(api.composerActiveOperation).mockReturnValue(null); vi.mocked(api.isDefinitiveComposerRefusal).mockReturnValue(false);
   vi.mocked(api.fetchMessages).mockResolvedValue([]); vi.mocked(api.fetchCompositionState).mockResolvedValue(composition()); vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]); vi.mocked(api.fetchSessions).mockResolvedValue([]); vi.mocked(api.listBlobs).mockResolvedValue([]); vi.mocked(api.listInterpretationEvents).mockResolvedValue([]);
@@ -157,6 +159,52 @@ describe("terminal publication before optional reads", () => {
       expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
       expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
     } finally { for (const finish of release) finish(); await sending; }
+  });
+
+  it("keeps an unsent draft and suppresses Retry when the attached winner has paid overflow", async () => {
+    const winnerId = "66666666-6666-4666-8666-666666666666";
+    const refusal = { status: 409, error_type: "composer_operation_active", operation_id: winnerId, kind: "compose_message" };
+    const body = { error_type: "paid_result_overflow", detail: "The paid result could not be retained.", evidence_status: "incomplete", retryable: false };
+    vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(refusal);
+    vi.mocked(api.composerActiveOperation).mockImplementation((error) => error === refusal ? { operation_id: winnerId, kind: "compose_message" } : null);
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 507, detail: body.detail, error_type: "paid_result_overflow" });
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...snapshot(winnerId), status: "failed", result: null, error: { http_status: 507, failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, body } });
+    vi.mocked(api.fetchComposerOperationFailures).mockResolvedValue({ session_id: sid, items: [{ session_id: sid, operation_id: winnerId, kind: "compose_message", user_message_id: null, settled_at: "2026-10-14T08:00:00Z", failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 } }], next_cursor: null });
+    await useSessionStore.getState().sendMessage("my unsent draft");
+    const state = useSessionStore.getState();
+    const loser = state.messages.find((row) => row.content === "my unsent draft")!;
+    expect(loser.operation_id).not.toBe(winnerId);
+    expect(loser.local_status).toBe("failed");
+    expect(loser.local_failure_code).toBe("paid_result_overflow");
+    expect(loser.local_error).toContain("unsent content remains a draft");
+    expect(loser.local_error).toContain("may have incurred a charge");
+    expect(state.composerFailureOutcomes[0].operation_id).toBe(winnerId);
+    expect(state.composerFailureOutcomes[0].saved_revisions).toEqual({ attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 });
+    await useSessionStore.getState().retryMessage(loser.id);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an unsent draft and suppresses Retry when the attached winner has paid incomplete", async () => {
+    const winnerId = "66666666-6666-4666-8666-666666666666";
+    const refusal = { status: 409, error_type: "composer_operation_active", operation_id: winnerId, kind: "compose_message" };
+    const body = { error_type: "paid_result_incomplete", detail: "The returned paid result could not be fully retained. It was not used or retried.", evidence_status: "incomplete", retryable: false, cost: { status: "unknown" as const, amount: null }, request_id: null };
+    vi.mocked(api.submitComposerOperation).mockRejectedValueOnce(refusal);
+    vi.mocked(api.composerActiveOperation).mockImplementation((error) => error === refusal ? { operation_id: winnerId, kind: "compose_message" } : null);
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 507, detail: body.detail, error_type: "paid_result_incomplete", paid_result_incomplete_cost: body.cost });
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...snapshot(winnerId), status: "failed", result: null, error: { http_status: 507, failure_code: "http_error", error_type: "paid_result_incomplete", diagnostic_id: null, body } });
+    vi.mocked(api.fetchComposerOperationFailures).mockResolvedValue({ session_id: sid, items: [{ session_id: sid, operation_id: winnerId, kind: "compose_message", user_message_id: null, settled_at: "2026-10-14T08:00:00Z", failure_code: "http_error", error_type: "paid_result_incomplete", diagnostic_id: null, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 } }], next_cursor: null });
+    await useSessionStore.getState().sendMessage("my unsent draft");
+    const state = useSessionStore.getState();
+    const loser = state.messages.find((row) => row.content === "my unsent draft")!;
+    expect(loser.operation_id).not.toBe(winnerId);
+    expect(loser.local_status).toBe("failed");
+    expect(loser.local_failure_code).toBe("paid_result_incomplete");
+    expect(loser.local_error).toContain("unsent content remains a draft");
+    expect(loser.local_error).toContain("may have incurred a charge");
+    expect(state.composerFailureOutcomes[0].operation_id).toBe(winnerId);
+    expect(state.composerFailureOutcomes[0].saved_revisions).toEqual({ attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 });
+    await useSessionStore.getState().retryMessage(loser.id);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
   });
 
   it.each([false, true])("keeps fresh same-ID tool projections; genuine intervening update=%s", async (intervening) => {
@@ -312,106 +360,6 @@ describe("unavailable graph recovery admission", () => {
     expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
   });
 });
-describe("expired live composer observation", () => {
-  function holdLiveStream(): void {
-    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (sessionId, operationId, signal) => {
-      let heartbeat: ReturnType<typeof setInterval>;
-      let sequence = 0;
-      const body = new ReadableStream<Uint8Array>({ start(controller) {
-        const emit = (event: "status" | "heartbeat", payload?: unknown) => controller.enqueue(new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify({ schema_version: "composer-operation-stream.v1", session_id: sessionId, operation_id: operationId, sequence: sequence++, event, ...(payload === undefined ? {} : { payload }) })}\n\n`));
-        emit("status", { status: "running", cancel_requested: false, deadline_remaining_ms: 0 });
-        heartbeat = setInterval(() => emit("heartbeat"), 5000);
-        signal.addEventListener("abort", () => { clearInterval(heartbeat); controller.error(new DOMException("aborted", "AbortError")); }, { once: true });
-      }, cancel() { clearInterval(heartbeat); } });
-      return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
-    });
-  }
-  it("surfaces recovery when a live stream expires without replaying or claiming failure", async () => {
-    vi.useFakeTimers(); holdLiveStream();
-    const sending = useSessionStore.getState().composeRequest("send", "hello");
-    await vi.advanceTimersByTimeAsync(24999);
-    expect(useSessionStore.getState().error).toBeNull();
-    await vi.advanceTimersByTimeAsync(1); await sending;
-    const held = findComposerOperationCustody(scope, sid).foreground!;
-    expect(useSessionStore.getState().error).not.toBeNull();
-    expect(useSessionStore.getState().error).toMatch(/Reload this session/);
-    expect(useSessionStore.getState().error).toMatch(/Stop/);
-    expect(useSessionStore.getState().isComposing).toBe(true);
-    expect(useSessionStore.getState().composeRequests.size).toBe(0);
-    expect(useSessionStore.getState().messages.find((row) => row.operation_id === held.operationId)?.local_status).toBe("pending");
-    expect(api.fetchMessages).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(60000);
-    await useSessionStore.getState().composeRequest("send", "must remain gated");
-    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
-    expect(api.fetchComposerOperationStream).toHaveBeenCalledTimes(1);
-    expect(api.fetchComposerOperation).not.toHaveBeenCalled();
-    expect(api.cancelComposerOperation).not.toHaveBeenCalled();
-  });
-  it("Stop after expiration reconciles the held ID and publishes its terminal", async () => {
-    vi.useFakeTimers(); holdLiveStream();
-    const sending = useSessionStore.getState().composeRequest("send", "hello");
-    await vi.advanceTimersByTimeAsync(25000); await sending;
-    expect(useSessionStore.getState().error).not.toBeNull();
-    expect(useSessionStore.getState().error).toMatch(/Reload this session/);
-    const held = findComposerOperationCustody(scope, sid).foreground!;
-    vi.mocked(api.fetchComposerOperationStream).mockRejectedValue(new Error("stream unavailable"));
-    vi.mocked(api.cancelComposerOperation).mockResolvedValue({ ...snapshot(held.operationId), status: "running", cancel_requested: true, result: null });
-    useSessionStore.getState().cancelComposition();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
-    expect(useSessionStore.getState().isComposing).toBe(false);
-    expect(useSessionStore.getState().error).toBeNull();
-    expect(useSessionStore.getState().messages.some((row) => row.id === assistantId)).toBe(true);
-    expect(vi.mocked(api.cancelComposerOperation).mock.calls.every(([sessionId, operationId]) => sessionId === sid && operationId === held.operationId)).toBe(true);
-    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
-  });
-  it("surfaces recovery when durable polling reaches the same deadline", async () => {
-    vi.useFakeTimers();
-    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => ({ ...snapshot(operationId), status: "running", result: null, deadline_remaining_ms: 0, poll_after_ms: 60000 }));
-    const sending = useSessionStore.getState().composeRequest("send", "hello");
-    await vi.advanceTimersByTimeAsync(25000); await sending;
-    expect(useSessionStore.getState().error).not.toBeNull();
-    expect(useSessionStore.getState().error).toMatch(/Reload this session/);
-    expect(useSessionStore.getState().isComposing).toBe(true);
-    expect(findComposerOperationCustody(scope, sid).foreground).not.toBeNull();
-    expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1);
-    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
-    expect(api.cancelComposerOperation).not.toHaveBeenCalled();
-  });
-  it("does not publish an old deadline after explicit same-session observation replacement", async () => {
-    vi.useFakeTimers(); holdLiveStream();
-    const sending = useSessionStore.getState().composeRequest("send", "hello");
-    await vi.advanceTimersByTimeAsync(24000);
-    vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, operationId) => ({ ...snapshot(operationId), status: "running", result: null, deadline_remaining_ms: 300000 }));
-    await useSessionStore.getState().resumeComposerOperation(sid);
-    await vi.advanceTimersByTimeAsync(2000); await sending;
-    expect(useSessionStore.getState().error).toBeNull();
-    expect(useSessionStore.getState().isComposing).toBe(true);
-    expect(findComposerOperationCustody(scope, sid).foreground).not.toBeNull();
-    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
-  });
-  it("does not publish timeout recovery after authentication generation changes", async () => {
-    vi.useFakeTimers(); holdLiveStream();
-    const sending = useSessionStore.getState().composeRequest("send", "hello");
-    await vi.advanceTimersByTimeAsync(24000); advanceAuthGeneration();
-    useSessionStore.setState({ error: "new authentication context" });
-    await vi.advanceTimersByTimeAsync(1000); await sending;
-    expect(useSessionStore.getState().error).toBe("new authentication context");
-    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
-    expect(api.fetchMessages).not.toHaveBeenCalled();
-  });
-  it("does not publish timeout recovery after a session switch", async () => {
-    vi.useFakeTimers(); holdLiveStream();
-    const sending = useSessionStore.getState().composeRequest("send", "hello");
-    await vi.advanceTimersByTimeAsync(24000);
-    await useSessionStore.getState().selectSession("77777777-7777-4777-8777-777777777777");
-    await vi.advanceTimersByTimeAsync(1000); await sending;
-    expect(useSessionStore.getState().activeSessionId).toBe("77777777-7777-4777-8777-777777777777");
-    expect(useSessionStore.getState().error).toBeNull();
-    expect(findComposerOperationCustody(scope, sid).foreground).not.toBeNull();
-    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
-  });
-});
 describe("durable composer store integration", () => {
   it("holds Send until the authoritative session state loaded", async () => {
     useSessionStore.setState({ compositionStateLoaded: false }); await useSessionStore.getState().sendMessage("hello"); expect(api.submitComposerOperation).not.toHaveBeenCalled();
@@ -428,6 +376,46 @@ describe("durable composer store integration", () => {
     await useSessionStore.getState().sendMessage("hello"); const row = useSessionStore.getState().messages.find((item) => item.role === "user")!; expect(row.local_failure_code).toBe("stale_compose_state");
     const first = vi.mocked(api.submitComposerOperation).mock.calls[0][0]; await useSessionStore.getState().retryMessage(row.id); const second = vi.mocked(api.submitComposerOperation).mock.calls[1][0];
     expect(second.operationId).not.toBe(first.operationId); expect(second.body.state_id).toBe(stateId);
+  });
+  it("publishes paid overflow without offering or dispatching another paid attempt", async () => {
+    const body = { error_type: "paid_result_overflow", detail: "A paid result could not be retained.", evidence_status: "incomplete", retryable: false, cost: { status: "unknown", amount: null } };
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 507, error_type: "paid_result_overflow", detail: body.detail });
+    vi.mocked(api.fetchComposerOperation).mockImplementationOnce(async (_session, operationId) => ({ ...snapshot(operationId), status: "failed", result: null, error: { http_status: 507, failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, body } }));
+    vi.mocked(api.fetchComposerOperationFailures).mockImplementationOnce(async (_session, options) => ({ session_id: sid, items: [{ session_id: sid, operation_id: options!.operationId!, kind: "compose_message", user_message_id: null, settled_at: "2026-10-14T08:00:00Z", failure_code: "http_error", error_type: "paid_result_overflow", diagnostic_id: null, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 } }], next_cursor: null }));
+    await useSessionStore.getState().sendMessage("hello");
+    const state = useSessionStore.getState();
+    const row = state.messages.find((item) => item.role === "user")!;
+    expect(row.local_status).toBe("failed");
+    expect(row.local_failure_code).toBe("paid_result_overflow");
+    expect(row.local_error).toContain("may have incurred a charge");
+    expect(state.composerFailureOutcomes[0].error_type).toBe("paid_result_overflow");
+    expect(state.composerFailureOutcomes[0].saved_revisions).toEqual({ attribution: "fenced", count: 1, latest_state_id: stateId, latest_version: 2 });
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+    await useSessionStore.getState().retryMessage(row.id);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    { status: "unknown", amount: null } as const,
+    { status: "known", amount: "0.0012300" } as const,
+  ])("stops paid incomplete with exact $status cost and no retry or resume", async (cost) => {
+    const body = { error_type: "paid_result_incomplete", detail: "The returned paid result could not be fully retained. It was not used or retried.", evidence_status: "incomplete", retryable: false, cost, request_id: null };
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 507, error_type: "paid_result_incomplete", detail: body.detail, paid_result_incomplete_cost: cost });
+    vi.mocked(api.fetchComposerOperation).mockImplementationOnce(async (_session, operationId) => ({ ...snapshot(operationId), status: "failed", result: null, error: { http_status: 507, failure_code: "http_error", error_type: "paid_result_incomplete", diagnostic_id: null, body } }));
+    await useSessionStore.getState().sendMessage("hello");
+    const state = useSessionStore.getState();
+    const row = state.messages.find((item) => item.role === "user")!;
+    expect(row.local_status).toBe("failed");
+    expect(row.local_failure_code).toBe("paid_result_incomplete");
+    expect(row.local_error).toContain("without using or retrying that result");
+    expect(row.local_error).toContain(cost.status === "known" ? "observed cost is 0.0012300" : "cost is unknown");
+    expect(state.isComposing).toBe(false);
+    expect(state.messages.some((item) => item.role === "assistant")).toBe(false);
+    expect(state.compositionProposals).toEqual([]);
+    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    await useSessionStore.getState().retryMessage(row.id);
+    await useSessionStore.getState().resumeComposerOperation(sid);
+    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
+    expect(api.fetchComposerOperation).toHaveBeenCalledTimes(1);
   });
   it("a delayed terminal reload cannot overwrite a newer state or proposal decisions", async () => {
     let release!: (messages: ChatMessage[]) => void;
@@ -541,7 +529,7 @@ it("scope recovery reaches an inactive deleted expired session without discardin
   purgeComposerCustody();
   const pending = { mode: "submitted", scope, sessionId: sid, operationId: userId, createdAt: Date.now() - COMPOSER_CUSTODY_LIFETIME_MS - 1, kind: "compose_message", body: { operation_id: userId, content: "held", state_id: null } };
   const fresh = { ...pending, sessionId: sibling, createdAt: Date.now() };
-  const raw = JSON.stringify({ schema: "composer-operations.v1", entries: [pending, fresh].map((foreground) => ({ foreground, unresolvedSubmissions: [] })) });
+  const raw = JSON.stringify({ schema: COMPOSER_CUSTODY_SCHEMA, entries: [pending, fresh].map((foreground) => ({ foreground, unresolvedSubmissions: [] })) });
   sessionStorage.setItem(COMPOSER_CUSTODY_KEY, raw); authenticateComposerCustody(scope);
   useSessionStore.setState({ activeSessionId: sibling, compositionState: { ...composition(), session_id: sibling } });
   vi.mocked(api.fetchComposerOperation).mockImplementation(async (sessionId, operationId) => sessionId === sid ? { kind: "session_missing" } : { ...snapshot(operationId), result: { message: { ...assistant, session_id: sibling }, state: { ...composition(2), session_id: sibling }, proposals: [] } });
@@ -561,7 +549,8 @@ it("actual Stop persistence denial preserves the draft and tells the user to kee
   const denied = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key: string, value: string) { if (this === sessionStorage && key === COMPOSER_STOP_KEY) throw new DOMException("denied", "QuotaExceededError"); setItem.call(this, key, value); });
   let release!: (value: ComposerOperationSnapshot) => void;
   vi.mocked(api.fetchComposerOperation).mockReturnValue(new Promise((resolve) => { release = resolve; }));
-  vi.mocked(api.cancelComposerOperation).mockResolvedValue({ kind: "operation_missing" });
+  // The server acknowledges Stop; the observer then reads the held terminal.
+  vi.mocked(api.cancelComposerOperation).mockResolvedValue(liveSnapshot(userId, { cancel_requested: true }));
   useSessionStore.getState().cancelComposition();
   expect(useSessionStore.getState().error).toMatch(/Keep this tab open/);
   expect(findComposerOperationCustody(scope, sid).foreground).toEqual(held);

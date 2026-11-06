@@ -4,29 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from unittest.mock import MagicMock
 
 import httpx
 import pytest
 from sqlalchemy import event, select
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
-from elspeth.web.composer.application_policy import PluginPolicyContextFactory
-from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.availability import ComposerAvailability
-from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
-from elspeth.web.composer.composer_preflight import ComposerPreflight
-from elspeth.web.composer.composition_completion import CompositionCompletion
 from elspeth.web.composer.pipeline_commit import PipelineCommitError
-from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.planning_application import PlanningApplication
-from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -35,11 +23,9 @@ from elspeth.web.required_work import (
     RequiredWorkRole,
     RequiredWorkSource,
 )
-from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.manual_proposal_failure import ComposerManualProposalFailure, consume_manual_proposal_failure
-from elspeth.web.sessions.models import composition_proposals_table, proposal_events_table
-from elspeth.web.sessions.routes._helpers import _initial_composition_state
+from elspeth.web.sessions.models import proposal_events_table
 from elspeth.web.sessions.routes.composer import pipeline_settlement
 from tests.fixtures.composer_fakes import install_restricted_plugin_policy, interpretation_surfacing_stub
 from tests.unit.web.sessions.test_pipeline_rejection_required import prepared_rejection
@@ -335,124 +321,6 @@ async def test_mounted_manual_reject_binds_real_lease_before_sql_and_projects_be
     assert coordinator.authority.durable_operation_id is None and coordinator.authority.claim_attempt is None
     coordinator.assert_completed()
     assert len(proposal_events(engine, expected.authority.row.id)) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("telemetry_failure", [False, True])
-async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_scope(
-    operation_store, tmp_path, monkeypatch, telemetry_failure
-):
-    engine, repository, _authority, service, sid = operation_store
-    expected, running = await prepared_rejection(operation_store)
-    from tests.unit.web.test_app import _settings
-
-    settings = _settings(tmp_path, operator_metrics_bearer_token=None)
-    advisor_checkpoint = MagicMock(spec=AdvisorCheckpointOwner)
-    completion = MagicMock(spec=CompositionCompletion)
-    planner = PlanningApplication(
-        sessions_service=service,
-        policy_context=MagicMock(spec=PluginPolicyContextFactory),
-        chargeable_admission=MagicMock(spec=ComposerChargeableAdmission),
-        preflight=MagicMock(spec=ComposerPreflight),
-        schema_disclosure=SchemaDisclosureTracker(),
-        settings=settings,
-        availability=ComposerAvailability(True, "test-model", "test"),
-        planner_dialect=ToolContractDialect.NONE,
-        hatch_dialect=ToolContractDialect.NONE,
-        advisor_provider="test",
-        composer_skill_text="fixture skill",
-        session_engine=engine,
-        secret_service=None,
-        secret_wiring_policy=SecretWiringPolicy(()),
-        endpoint_base_url=None,
-        endpoint_api_key=None,
-        advisor_endpoint_base_url=None,
-        advisor_endpoint_api_key=None,
-        advisor_checkpoint=advisor_checkpoint,
-        completion=completion,
-    )
-    telemetry_original = RuntimeError("actual creation postSQL telemetry failure")
-    if telemetry_failure:
-        from elspeth.web.sessions import service as service_module
-
-        class FailedCounter:
-            def add(self, amount, attributes):
-                raise telemetry_original
-
-        monkeypatch.setattr(service_module, "_PIPELINE_PLANNER_COUNTER", FailedCounter())
-    preferences = await service.get_composer_preferences(sid)
-    assert preferences.trust_mode == "auto_commit"
-    parent = RequiredWorkCoordinator(
-        RequiredWorkAuthority(
-            RequiredAuthorityKind.DURABLE_COMPOSE, running.session_operation_context, running.claim.operation_id, running.claim.attempt
-        )
-    )
-    binding = RequiredWorkBinding(parent, 7, 12, RequiredWorkRole.TURN, running)
-    plan = PipelinePlanResult(
-        proposal=expected.authority.proposal,
-        tool_call_id="actual-new-planner-tool-ID",
-        custody_result="not_required",
-        model_identifier="model",
-        model_version="version",
-        provider="test",
-    )
-    entered, release = threading.Event(), threading.Event()
-
-    def park_creation(_conn, _cursor, statement, _parameters, _context, _many):
-        if statement.startswith("INSERT INTO composition_proposals"):
-            entered.set()
-            assert release.wait(5)
-
-    event.listen(engine, "before_cursor_execute", park_creation)
-    task = asyncio.create_task(
-        planner._stage_pipeline_plan(
-            plan=plan,
-            state=_initial_composition_state(),
-            session_id=sid,
-            current_state_id=None,
-            user_message_id=expected.authority.row.user_message_id,
-            user_id="alice",
-            session_operation_context=running.session_operation_context,
-            preferences=preferences,
-            recorder=BufferingRecorder(),
-            planner_llm_calls=(),
-            planner_private_candidates=(),
-            planner_attempts=(),
-            planner_invocations=(),
-            planner_withheld_replies=(),
-            required_work=binding,
-        )
-    )
-    try:
-        async with asyncio.timeout(5):
-            while not entered.is_set():
-                await asyncio.sleep(0.01)
-        for index in range(3):
-            task.cancel(f"actual planner cancellation {index}")
-            await asyncio.sleep(0.03)
-            assert not task.done()
-        release.set()
-        with pytest.raises(BaseExceptionGroup) as caught:
-            await task
-        cancellations = tuple(leaf for leaf in originals(caught.value) if isinstance(leaf, asyncio.CancelledError))
-        assert [leaf.args for leaf in cancellations] == [(f"actual planner cancellation {index}",) for index in range(3)]
-        parent.assert_completed()
-        if telemetry_failure:
-            assert any(leaf is telemetry_original for leaf in originals(caught.value))
-            assert any(receipt.key.source is RequiredWorkSource.PROPOSAL_CREATION_PROJECTION for receipt in parent.failure_receipts())
-        with engine.connect() as conn:
-            row = conn.execute(
-                select(composition_proposals_table).where(composition_proposals_table.c.tool_call_id == plan.tool_call_id)
-            ).one()
-        events = proposal_events(engine, row.id)
-        assert len(events) == 1 and events[0].payload["reason_code"] == "request_cancelled"
-        assert advisor_checkpoint.mock_calls == []
-        assert completion.mock_calls == []
-    finally:
-        release.set()
-        await asyncio.gather(task, return_exceptions=True)
-        event.remove(engine, "before_cursor_execute", park_creation)
-        repository.release(running.session_operation_context)
 
 
 @pytest.mark.asyncio

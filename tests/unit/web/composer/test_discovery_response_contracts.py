@@ -13,7 +13,6 @@ from pydantic import BaseModel
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.composer.pipeline_planner import _ParsedToolCall, _serialize_provider_discovery_result
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolContext, ToolResult
 from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
@@ -163,20 +162,6 @@ def test_admitted_bytes_match_freeform_baseline(tool_name: str) -> None:
 
 
 @pytest.mark.parametrize("tool_name", TOOLS)
-def test_provider_bytes_match_immutable_baseline(tool_name: str) -> None:
-    from elspeth.web.composer.discovery_response import admit_discovery_result
-
-    golden = json.loads(GOLDEN.read_text())
-    call = _ParsedToolCall(call_id="response-golden", name=tool_name, raw_arguments="{}", arguments={})
-    admitted = admit_discovery_result(tool_name, _produce(tool_name))
-    actual = _serialize_provider_discovery_result(
-        call=call,
-        result=admitted,
-    )
-    assert actual == golden["responses"][tool_name]["freeform"]
-
-
-@pytest.mark.parametrize("tool_name", TOOLS)
 def test_original_data_is_not_serialization_authority_after_admission(tool_name: str) -> None:
     from elspeth.web.composer.discovery_cache import serialize_tool_result
     from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
@@ -189,10 +174,6 @@ def test_original_data_is_not_serialization_authority_after_admission(tool_name:
     persisted = changed_envelope.to_tool_result()
     assert persisted.to_dict() == admitted.to_dict()
     assert serialize_tool_result(persisted) == expected
-    golden = json.loads(GOLDEN.read_text())
-    call = _ParsedToolCall(call_id="response-golden", name=tool_name, raw_arguments="{}", arguments={})
-    actual = _serialize_provider_discovery_result(call=call, result=persisted)
-    assert actual == golden["responses"][tool_name]["freeform"]
 
 
 @pytest.mark.parametrize("tool_name", TOOLS)

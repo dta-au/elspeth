@@ -208,7 +208,7 @@ def _annotation_emitted_values(
         return
     origin = get_origin(annotation)
     args = get_args(annotation)
-    if origin in (Union, UnionType):
+    if origin is Union or origin is UnionType:
         for member in args:
             yield from _annotation_emitted_values(member, value, path, for_env_expansion=for_env_expansion)
     elif origin is list and args and isinstance(value, list | tuple):

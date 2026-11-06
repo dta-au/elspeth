@@ -85,6 +85,10 @@ class RowResultError(Exception):
     """Handled row result whose authoritative disposition is a failure."""
 
 
+class UnstartedWorkInterrupted(Exception):
+    """Cooperative shutdown before this claim entered an executable operation."""
+
+
 class ProcessorMode(enum.Enum):
     """Explicit processor role for the mode-gated drain policy (elspeth-577179bba1).
 
@@ -479,6 +483,14 @@ class SchedulerDrainCoordinator:
             if before_claim is not None:
                 before_claim()
 
+            # A preclaimed source-ingest item must reach its fenced
+            # disposition below, even when no operation has started. Other
+            # claims and barrier intake stop here after shutdown.
+            # Accepted results and durable READY/BLOCKED work survive together;
+            # the caller flushes results and checkpoints the remaining work.
+            if not preclaimed_queue and ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                break
+
             # Ruling 44 (R2): the intake pass's arms drain staged escalations
             # via take_pending_group_losses(), which — unlike
             # take_claim_group_losses() — has no frame authentication against
@@ -506,8 +518,8 @@ class SchedulerDrainCoordinator:
             # ADR-030 §E.2 (slice 3): per-iteration journal-first intake —
             # adopt intake-pending BLOCKED barrier rows into executor memory,
             # replay durable branch losses (§E.5), release late arrivals
-            # (§E.3a) and evaluate count/condition triggers over post-intake
-            # memory, ALL before this iteration's claim. Flush/merge outputs
+            # (§E.3a) and evaluate aggregation readiness before intake and
+            # after adoption, ALL before this iteration's claim. Flush/merge outputs
             # append to the drain's results; continuation items enqueue into
             # the current loop (their READY rows were inserted atomically by
             # complete_barrier; the enqueue reconciles idempotently).
@@ -523,6 +535,13 @@ class SchedulerDrainCoordinator:
             if iterations - maintenance_iteration >= SCHEDULER_MAINTENANCE_INTERVAL:
                 self.run_maintenance()
                 maintenance_iteration = iterations
+
+            # Intake may run a plugin that requests shutdown. Its committed
+            # outputs above still belong in results; its READY continuations
+            # must wait for the next resume rather than enter RetryManager's
+            # pre-attempt interruption conversion.
+            if not preclaimed_queue and ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                break
 
             claimed: TokenWorkItem | None
             if preclaimed_queue:
@@ -611,6 +630,10 @@ class SchedulerDrainCoordinator:
                         f"Scheduler has {len(pending_items)} in-memory continuations for run {self._run_id!r} "
                         f"but no READY work item could be claimed. Stranded: {stranded}. Active journal work: {active}."
                     )
+                break
+
+            if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                self._preserve_unstarted_claim(claimed)
                 break
 
             if claimed.work_item_id in pending_items:
@@ -704,6 +727,9 @@ class SchedulerDrainCoordinator:
                         self._pending_group_losses.clear()
                         exc.add_note("scheduler lease completion refused; in-flight token result was abandoned")
                         raise
+                    except UnstartedWorkInterrupted:
+                        self._preserve_unstarted_claim(claimed)
+                        return results
                     except Exception as processing_exc:
                         try:
                             self._scheduler.mark_failed(
@@ -846,6 +872,25 @@ class SchedulerDrainCoordinator:
                 break
 
         return results
+
+    def _preserve_unstarted_claim(self, claimed: TokenWorkItem) -> None:
+        """Keep an unstarted claim undecided for ordinary immediate resume.
+
+        FAILED without a token outcome retains the payload and is requeued by
+        resume when the run is resumable. If the run is not resumable (for
+        example an interrupted non-snapshot source), run finalization records
+        the token ABANDONED instead. No plugin ran, so this writes neither a
+        node failure nor a terminal outcome or group loss. The normal owner/member fence remains
+        authoritative if cancellation races with eviction or lease loss.
+        """
+        if self._pending_group_losses:
+            raise OrchestrationInvariantError("An unstarted scheduler claim cannot carry staged group losses")
+        self._scheduler.mark_failed(
+            work_item_id=claimed.work_item_id,
+            expected_lease_owner=self._claimed_scheduler_lease_owner(claimed),
+            group_losses=(),
+            member_token=self._member_token,
+        )
 
     def _drain_preexisting_pending_sinks(self, results: list[RowResult]) -> None:
         """Re-emit PENDING_SINK rows left durable by a prior crashed worker.

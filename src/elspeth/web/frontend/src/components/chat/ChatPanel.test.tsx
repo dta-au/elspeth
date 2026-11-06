@@ -3442,7 +3442,7 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
       ],
     });
 
-    const { container } = render(<ChatPanel />);
+    const { container, unmount } = render(<ChatPanel />);
     const scroll = container.querySelector<HTMLElement>(".chat-panel-messages");
     expect(scroll).not.toBeNull();
     // jsdom has no layout: stub geometry 560px above the bottom (> 40px).
@@ -3463,8 +3463,129 @@ describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
       },
     });
     fireEvent.scroll(scroll!);
-    return { container, scroll: scroll! };
+    return { container, scroll: scroll!, unmount };
   }
+
+  it("reconciles a resized viewport at unchanged scrollTop and disconnects on unmount", () => {
+    const originalResizeObserver = globalThis.ResizeObserver;
+    let notifyResize = () => {};
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    class TestResizeObserver {
+      constructor(callback: () => void) {
+        notifyResize = callback;
+      }
+      observe = observe;
+      unobserve = vi.fn();
+      disconnect = disconnect;
+    }
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    try {
+      const { scroll, unmount } = renderScrolledUpPanel();
+      expect(observe).toHaveBeenCalledWith(scroll);
+      // Positive control: a resize while still 600px from the bottom must
+      // retain the pill. No synthetic scroll event is sent after setup.
+      act(() => notifyResize());
+      expect(screen.getByRole("button", { name: "Scroll to bottom" })).toBeVisible();
+      Object.defineProperty(scroll, "clientHeight", {
+        configurable: true,
+        get: () => 1000,
+      });
+      act(() => notifyResize());
+      expect(screen.queryByRole("button", { name: "Scroll to bottom" })).toBeNull();
+      unmount();
+      expect(disconnect).toHaveBeenCalledTimes(1);
+      // A queued notification after cleanup must be harmless.
+      act(() => notifyResize());
+    } finally {
+      vi.stubGlobal("ResizeObserver", originalResizeObserver);
+    }
+  });
+
+  it("retires the pill when a loading tail is removed without scrolling or viewport resize", async () => {
+    const originalResizeObserver = globalThis.ResizeObserver;
+    const observe = vi.fn();
+    const unobserve = vi.fn();
+    class PassiveResizeObserver {
+      observe = observe;
+      unobserve = unobserve;
+      disconnect = vi.fn();
+    }
+    vi.stubGlobal("ResizeObserver", PassiveResizeObserver);
+    try {
+      const { scroll, unmount } = renderScrolledUpPanel();
+      const loadingTail = document.createElement("div");
+      loadingTail.textContent = "Loading saved operation outcomes…";
+      scroll.append(loadingTail);
+      Object.defineProperty(scroll, "scrollHeight", {
+        configurable: true,
+        get: () => loadingTail.isConnected ? 1060 : 1000,
+      });
+      scroll.scrollTop = 600;
+      fireEvent.scroll(scroll);
+      // Observe the new tail, but retain the pill while it still places the
+      // viewport 60px above the end. The observer emits no resize callbacks.
+      await waitFor(() => expect(observe).toHaveBeenCalledWith(loadingTail));
+      expect(screen.getByRole("button", { name: "Scroll to bottom" })).toBeVisible();
+      loadingTail.remove();
+      await waitFor(() => {
+        expect(screen.queryByRole("button", { name: "Scroll to bottom" })).toBeNull();
+      });
+      expect(unobserve).toHaveBeenCalledWith(loadingTail);
+      unmount();
+    } finally {
+      vi.stubGlobal("ResizeObserver", originalResizeObserver);
+    }
+  });
+
+  it("preserves bottom-follow through content growth during smooth scrolling but honors user scroll-up", async () => {
+    const originalResizeObserver = globalThis.ResizeObserver;
+    let notifyResize = () => {};
+    const observe = vi.fn();
+    class TestResizeObserver {
+      constructor(callback: () => void) { notifyResize = callback; }
+      observe = observe;
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    }
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    try {
+      const { scroll, unmount } = renderScrolledUpPanel();
+      // Leave the offset unchanged when a smooth scroll is requested: the
+      // browser has not completed its animation when layout is reconciled.
+      const follow = vi.spyOn(scroll, "scrollTo").mockImplementation(() => {});
+      scroll.scrollTop = 600;
+      fireEvent.scroll(scroll);
+      expect(follow).toHaveBeenCalledWith({ top: 1000, behavior: "smooth" });
+      follow.mockClear();
+      Object.defineProperty(scroll, "scrollHeight", {
+        configurable: true,
+        get: () => 1200,
+      });
+      const growingChild = document.createElement("div");
+      scroll.append(growingChild);
+      await waitFor(() => expect(observe).toHaveBeenCalledWith(growingChild));
+      act(() => notifyResize());
+      expect(screen.queryByRole("button", { name: "Scroll to bottom" })).toBeNull();
+      act(() => useSessionStore.setState((state) => ({
+        messages: [...state.messages, message("assistant-2", "assistant", "More detail.")],
+      })));
+      expect(follow).toHaveBeenCalledWith({ top: 1200, behavior: "smooth" });
+      // Real scroll events retain their authority to suspend auto-follow.
+      scroll.scrollTop = 100;
+      fireEvent.scroll(scroll);
+      expect(screen.getByRole("button", { name: "Scroll to bottom" })).toBeVisible();
+      follow.mockClear();
+      act(() => useSessionStore.setState((state) => ({
+        messages: [...state.messages, message("assistant-3", "assistant", "Another detail.")],
+      })));
+      expect(follow).not.toHaveBeenCalled();
+      growingChild.remove();
+      unmount();
+    } finally {
+      vi.stubGlobal("ResizeObserver", originalResizeObserver);
+    }
+  });
 
   it("anchors the pill inside the messages region, outside the scrolling element", () => {
     const { container, scroll } = renderScrolledUpPanel();

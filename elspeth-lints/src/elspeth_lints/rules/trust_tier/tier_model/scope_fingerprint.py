@@ -20,6 +20,8 @@ import ast
 import copy
 import hashlib
 
+from elspeth_lints.core.ast_dump import stable_ast_dump
+
 _ScopeNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
 
 
@@ -43,9 +45,10 @@ def compute_scope_fingerprint(scope_node: _ScopeNode | None, *, module: ast.Modu
 
     When ``scope_node`` is ``None`` (module-level suppression), ``module``
     must be provided and the whole module is fingerprinted instead. Comments
-    remain free through ``ast.dump(include_attributes=False)`` and empty
+    remain free through position-free ``stable_ast_dump`` and empty
     ``type_ignores`` normalization, but docstrings stay in the AST because
-    they are runtime-visible constants.
+    they are runtime-visible constants. All supported interpreters use the
+    existing Python 3.13 serialization shape.
     """
     if scope_node is None:
         if module is None:
@@ -62,5 +65,5 @@ def compute_scope_fingerprint(scope_node: _ScopeNode | None, *, module: ast.Modu
         # AST (still being walked by the visitor) is never mutated.
         target = copy.copy(scope_node)
         target.body = list(scope_node.body)
-    dump = ast.dump(target, include_attributes=False, annotate_fields=True)
+    dump = stable_ast_dump(target, annotate_fields=True)
     return hashlib.sha256(dump.encode("utf-8")).hexdigest()

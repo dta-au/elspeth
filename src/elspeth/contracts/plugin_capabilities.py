@@ -44,6 +44,10 @@ class CapabilityDeclaration:
     blocks_positive_detection: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.capability) is not PluginCapability:
+            raise TypeError("capability declaration requires a PluginCapability")
+        if type(self.blocks_positive_detection) is not bool:
+            raise TypeError("capability declaration blocking flag must be a bool")
         expected_role = {
             PluginCapability.LLM: None,
             PluginCapability.PROMPT_SHIELD: ControlRole.INPUT,

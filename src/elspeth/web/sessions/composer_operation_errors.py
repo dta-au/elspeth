@@ -4,25 +4,50 @@ from __future__ import annotations
 
 import asyncio
 import errno
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.exceptions import HTTPException
 
+from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionRefused
 from elspeth.contracts.credential_material import scrub_credential_material
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
+from elspeth.web.composer.protocol import (
+    ComposerContextUnsupported,
+    ComposerConvergenceError,
+    ComposerMutationAuthorityRevoked,
+    ComposerPluginCrashError,
+    ComposerRuntimePreflightError,
+)
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerRequiredRecoveryFailure
 from elspeth.web.sessions.protocol import StaleComposeStateError
 
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
+
 _JSON: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 _RETRYABLE_STORAGE_ERRNOS = frozenset((errno.EIO, errno.ENOSPC, errno.EROFS))
+_COST_REFUSAL_PUBLIC: dict[str, tuple[int, str, str]] = {
+    "REPAIR_POLICY_UNSUPPORTED": (503, "configuration_unsupported", "The configured composer repair budget is unsupported."),
+    "COST_UNAVAILABLE": (503, "cost_unavailable", "The composer could not determine the model cost."),
+    "COST_CAP_EXCEEDED": (422, "provider_policy_refused", "This request reached its admitted model cost limit."),
+    "PROVIDER_CALLS_EXHAUSTED": (422, "provider_policy_refused", "This request reached its admitted provider call limit."),
+    "REQUEST_BYTES_EXHAUSTED": (422, "provider_policy_refused", "This provider request exceeds its admitted byte limit."),
+    "COMPLETION_TOKENS_EXCEEDED": (502, "invalid_provider_response", "The model exceeded the admitted completion limit."),
+    "MALFORMED_RESPONSE": (502, "invalid_provider_response", "The model returned an unusable response."),
+    "RESPONSE_TRUNCATED": (502, "invalid_provider_response", "The model response was truncated."),
+}
 
 
 def _http_error(status: int, body: dict[str, JsonValue], error_type: str | None = None) -> ComposerOperationError:
@@ -65,6 +90,47 @@ def worker_lost_error(*, request_id: str | None) -> ComposerOperationError:
             "request_id": request_id,
         },
         diagnostic_id=None,
+    )
+
+
+def project_convergence_failure_data(
+    *,
+    max_turns: int,
+    budget_exhausted: Literal["composition", "discovery", "timeout"],
+    request_id: str | None,
+    diagnostic_id: str | None,
+) -> ComposerOperationError:
+    """Project only closed convergence facts, including on cold DATA readback."""
+    budget_value: object = budget_exhausted
+    if (
+        type(max_turns) is not int
+        or max_turns < 0
+        or type(budget_value) is not str
+        or budget_value not in ("composition", "discovery", "timeout")
+    ):
+        return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
+    from elspeth.web.composer.progress import convergence_progress_event
+
+    progress = convergence_progress_event(budget_exhausted=budget_exhausted)
+    cause = (
+        "The request ran out of time before the turn could be completed."
+        if budget_exhausted == "timeout"
+        else "The LLM kept making tool calls without producing a final response."
+    )
+    convergence_detail = f"Composer did not converge within {max_turns} turns (budget exhausted: {budget_exhausted}). {cause}"
+    return _http_error(
+        422,
+        {
+            "detail": {
+                "error_type": "convergence",
+                "detail": convergence_detail,
+                "turns_used": max_turns,
+                "budget_exhausted": budget_exhausted,
+                "reason": progress.reason,
+                "recovery_text": progress.likely_next,
+            }
+        },
+        "convergence",
     )
 
 
@@ -130,6 +196,42 @@ def _leaves(exc: BaseException) -> tuple[BaseException, ...]:
     return (exc,)
 
 
+def project_retained_tool_failure(
+    source: RetainedToolFailureSource, *, request_id: str | None, diagnostic_id: str
+) -> ComposerOperationError:
+    """Project proved DATA without reviving a native exception or its text."""
+    if source.audit_unavailable:
+        return _http_error(
+            500,
+            {
+                "error_type": "audit_integrity_error",
+                "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+                "request_id": request_id,
+            },
+            "audit_integrity_error",
+        )
+    refusal = source.failure.refusal_source
+    if refusal is not None:
+        payload = refusal.outcome.response
+        if not isinstance(payload, Mapping) or type(payload) not in (dict, MappingProxyType):
+            raise AuditIntegrityError("Retained refusal projection lost its actual original result")
+        if refusal.kind == "context_unsupported":
+            value = _JSON.validate_python({key: payload[key] for key in ("error_type", "failure_code", "reason", "detail")}, strict=True)
+            if type(value) is not dict:
+                raise AuditIntegrityError("Retained context refusal is not its actual public mapping")
+            return _http_error(422, {"detail": {**value, "request_id": request_id}}, "composer_context_unsupported")
+        if refusal.kind == "prompt_guard_refused":
+            value = _JSON.validate_python({key: payload[key] for key in ("error_type", "detail", "audit_id")}, strict=True)
+            if type(value) is not dict:
+                raise AuditIntegrityError("Retained guard refusal is not its actual public mapping")
+            return _http_error(
+                503 if value["error_type"] == "prompt_guard_unavailable" else 422,
+                {**value, "request_id": request_id},
+                str(value["error_type"]),
+            )
+    return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
+
+
 def _integrity_category(exc: BaseException) -> int:
     if isinstance(exc, AuditIntegrityError):
         return 0
@@ -169,7 +271,7 @@ def project_composer_operation_error(
                     "transcript_url": None,
                 }
             return _http_error(500, body, "audit_integrity_error")
-        if isinstance(leaf, (OperationalError, AsyncWorkerAdmissionTimeoutError, RequiredGenerationUnavailable)):
+        if isinstance(leaf, OperationalError):
             return _http_error(
                 503,
                 {
@@ -178,6 +280,16 @@ def project_composer_operation_error(
                     "request_id": request_id,
                 },
                 "database_unavailable",
+            )
+        if isinstance(leaf, (AsyncWorkerAdmissionTimeoutError, RequiredGenerationUnavailable)):
+            return _http_error(
+                503,
+                {
+                    "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+                    "error_type": "executor_unavailable",
+                    "request_id": request_id,
+                },
+                "executor_unavailable",
             )
         if isinstance(leaf, OSError) and leaf.errno in _RETRYABLE_STORAGE_ERRNOS:
             return _http_error(
@@ -194,6 +306,45 @@ def project_composer_operation_error(
     if len(leaves) != 1:
         return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
     leaf = leaves[0]
+    if isinstance(leaf, ChargeableAdmissionRefused):
+        if leaf.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE:
+            return _http_error(
+                503,
+                {
+                    "error_type": "composer_admission_refused",
+                    "failure_code": "token_accounting_unavailable",
+                    "detail": "Token accounting is unavailable, so a new model call cannot start. Ask an administrator to reconcile usage before retrying.",
+                    "guidance": "Ask an administrator to reconcile token accounting before retrying.",
+                    "request_id": request_id,
+                },
+                "composer_admission_refused",
+            )
+        return _http_error(
+            403,
+            {
+                "error_type": "composer_admission_refused",
+                "failure_code": "admission_refused",
+                "detail": "This request was refused by the admission policy. Ask an administrator to review access and quota settings.",
+                "request_id": request_id,
+            },
+            "composer_admission_refused",
+        )
+    if isinstance(leaf, CommonProviderCostRefused):
+        admitted = _COST_REFUSAL_PUBLIC.get(leaf.code)
+        if admitted is None:
+            return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
+        cost_status, cost_error_type, cost_detail = admitted
+        return _http_error(
+            cost_status,
+            {"error_type": cost_error_type, "detail": cost_detail, "request_id": request_id},
+            cost_error_type,
+        )
+    if isinstance(leaf, ComposerMutationAuthorityRevoked):
+        mutation_payload: dict[str, JsonValue] = {**leaf.to_payload()}
+        return _http_error(409, {"detail": mutation_payload}, "composer_mutation_authority_revoked")
+    if isinstance(leaf, ComposerContextUnsupported):
+        context_payload: dict[str, JsonValue] = {**leaf.to_payload(), "request_id": request_id}
+        return _http_error(leaf.http_status, {"detail": context_payload}, "composer_context_unsupported")
     if isinstance(leaf, PromptGuardRefused):
         payload: dict[str, JsonValue] = {**leaf.to_payload(), "request_id": request_id}
         return _http_error(leaf.http_status, payload, str(payload["error_type"]))
@@ -230,6 +381,35 @@ def project_composer_operation_error(
                 "request_id": request_id,
             },
             "secret_decryption_failed",
+        )
+    if type(leaf) is ComposerConvergenceError:
+        return project_convergence_failure_data(
+            max_turns=leaf.max_turns,
+            budget_exhausted=leaf.budget_exhausted,
+            request_id=request_id,
+            diagnostic_id=diagnostic_id,
+        )
+    if type(leaf) is ComposerPluginCrashError:
+        return _http_error(
+            500,
+            {
+                "detail": {
+                    "error_type": "composer_plugin_error",
+                    "detail": "A composer plugin crashed during a composer tool call. This is not a user-retryable error.",
+                }
+            },
+            "composer_plugin_error",
+        )
+    if type(leaf) is ComposerRuntimePreflightError:
+        return _http_error(
+            500,
+            {
+                "detail": {
+                    "error_type": "composer_plugin_error",
+                    "detail": "A composer plugin crashed during runtime preflight. This is not a user-retryable error.",
+                }
+            },
+            "composer_plugin_error",
         )
     if isinstance(leaf, HTTPException):
         try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from threading import Event
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.auth.models import UserIdentity
@@ -43,6 +44,8 @@ class DelayedComposerFake:
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        *,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ) -> ComposerResult:
         self.calls += 1
         self.messages.append(message)

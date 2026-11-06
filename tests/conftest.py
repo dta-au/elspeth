@@ -281,8 +281,8 @@ def _elspeth_tree_snapshot(root: Path) -> bytes:
     """Return a compact fingerprint of path and inode metadata beneath ``root``."""
     digest = hashlib.sha256()
 
-    def add_entry(relative_path: Path, entry_stat: os.stat_result) -> None:
-        path_bytes = os.fsencode(relative_path.as_posix())
+    def add_entry(relative_path: str, entry_stat: os.stat_result) -> None:
+        path_bytes = os.fsencode(relative_path)
         metadata = (
             entry_stat.st_dev,
             entry_stat.st_ino,
@@ -303,7 +303,7 @@ def _elspeth_tree_snapshot(root: Path) -> bytes:
     except FileNotFoundError:
         return digest.digest()
 
-    add_entry(Path("."), root_stat)
+    add_entry(".", root_stat)
     if not stat.S_ISDIR(root_stat.st_mode):
         return digest.digest()
 
@@ -313,10 +313,10 @@ def _elspeth_tree_snapshot(root: Path) -> bytes:
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=raise_walk_error):
         dirnames.sort(key=os.fsencode)
         filenames.sort(key=os.fsencode)
-        directory = Path(dirpath)
+        relative_directory = Path(dirpath).relative_to(root).as_posix()
         for name in (*dirnames, *filenames):
-            entry = directory / name
-            add_entry(entry.relative_to(root), entry.lstat())
+            relative_path = name if relative_directory == "." else f"{relative_directory}/{name}"
+            add_entry(relative_path, os.lstat(os.path.join(dirpath, name)))
 
     return digest.digest()
 

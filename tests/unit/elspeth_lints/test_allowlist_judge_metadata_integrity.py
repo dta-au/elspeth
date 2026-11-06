@@ -41,6 +41,8 @@ from elspeth_lints.core.allowlist import (
 from elspeth_lints.core.judge import JUDGE_POLICY_HASH
 from elspeth_lints.core.source_excerpt import RedactionRecord
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
+
 _TEST_JUDGE_METADATA_HMAC_KEY = "test-judge-metadata-hmac-key-2026-05-24"
 
 

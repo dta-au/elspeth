@@ -79,6 +79,7 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
+from elspeth.web.sessions.pending_interpretation import _resolve_vague_term
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
@@ -94,6 +95,7 @@ from elspeth.web.sessions.service import (
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data, default_pipeline_metadata
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
@@ -2240,7 +2242,7 @@ async def test_06_resolve_raises_when_node_removed_since_surfacing(service) -> N
     await _save_composition_state(
         service,
         session_id,
-        CompositionStateData(
+        composition_state_data(
             nodes=[{"id": "different-node", "kind": "csv", "options": {}}],
             is_valid=True,
         ),
@@ -3286,7 +3288,7 @@ def _state_with_node(node: dict) -> CompositionStateRecord:
         nodes=[node],
         edges=None,
         outputs=None,
-        metadata_=None,
+        metadata_=default_pipeline_metadata(),
         is_valid=True,
         validation_errors=None,
         created_at=datetime.now(UTC),
@@ -3345,40 +3347,61 @@ def test_11_patch_helper_rejects_multiple_placeholders() -> None:
         )
 
 
-def test_12_patch_helper_rejects_system_prefix() -> None:
-    """Spec test 12: 'system:' prefix immediately before placeholder ⇒ raise."""
-    state = _state_with_node(_llm_node(prompt_template="System: {{interpretation:cool}}"))
-    with pytest.raises(ValueError, match=r"system:|directive|prefix"):
-        _patch_llm_transform_prompt(
-            state,
-            affected_node_id="llm_transform_1",
-            user_term="cool",
-            accepted_value="Innovative",
-        )
+@pytest.mark.parametrize("structured", [False, True], ids=["legacy", "structured"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "Describe the operating system - ",
+        "Describe the operating system: ",
+        "Evaluate these guidelines: ",
+        "Evaluate these instructions: ",
+        "System: ",
+        "Role: ",
+        "Instructions: ",
+    ],
+)
+def test_vague_term_resolution_treats_prompt_labels_as_text(prefix: str, structured: bool) -> None:
+    """Approved text lands in the user template regardless of preceding labels."""
+    suffix = " for {{ row.body }}"
+    accepted = "Innovative and creative"
+    event_id = str(uuid4())
+    node = _structured_llm_node(draft=accepted) if structured else _llm_node()
+    node["options"]["system_prompt"] = "Follow the evaluator policy."
+    node["options"]["prompt_template"] = prefix + "{{interpretation:cool}}" + suffix
+    if structured:
+        node["options"][PROMPT_TEMPLATE_PARTS_KEY] = [
+            {"kind": "text", "text": prefix},
+            {"kind": "interpretation_ref", "requirement_id": "cool"},
+            {"kind": "text", "text": suffix},
+        ]
+    state = _state_with_node(node)
 
+    sources, nodes, artifact_hash = _resolve_vague_term(
+        state,
+        surfacing_state_record=state,
+        affected_node_id="llm_transform_1",
+        user_term="cool",
+        accepted_value=accepted,
+        llm_draft=accepted,
+        event_id=event_id,
+    )
 
-def test_13_patch_helper_rejects_role_prefix() -> None:
-    """Spec test 13: 'role:' prefix immediately before placeholder ⇒ raise."""
-    state = _state_with_node(_llm_node(prompt_template="Role: {{interpretation:cool}}"))
-    with pytest.raises(ValueError, match=r"role:|directive|prefix"):
-        _patch_llm_transform_prompt(
-            state,
-            affected_node_id="llm_transform_1",
-            user_term="cool",
-            accepted_value="Innovative",
-        )
-
-
-def test_13b_patch_helper_rejects_instructions_prefix() -> None:
-    """Bonus: 'instructions:' prefix is also caught by the structural-directive guard."""
-    state = _state_with_node(_llm_node(prompt_template="Instructions: {{interpretation:cool}}"))
-    with pytest.raises(ValueError, match=r"instructions:|directive|prefix"):
-        _patch_llm_transform_prompt(
-            state,
-            affected_node_id="llm_transform_1",
-            user_term="cool",
-            accepted_value="Innovative",
-        )
+    options = nodes[0]["options"]
+    assert sources == state.sources
+    assert options["prompt_template"] == prefix + accepted + suffix
+    assert options["system_prompt"] == "Follow the evaluator policy."
+    assert artifact_hash == approved_prompt_artifact_hash(
+        prompt_template=prefix + accepted + suffix,
+        system_prompt="Follow the evaluator policy.",
+    )
+    assert options["approved_prompt_artifact_hash"] == artifact_hash
+    assert node["options"]["prompt_template"] == prefix + "{{interpretation:cool}}" + suffix
+    if structured:
+        requirement = options[INTERPRETATION_REQUIREMENTS_KEY][0]
+        assert requirement["status"] == "resolved"
+        assert requirement["accepted_value"] == accepted
+        assert requirement["event_id"] == event_id
+        assert requirement["resolved_prompt_template_hash"] == stable_hash(accepted)
 
 
 def test_14_patch_helper_succeeds_on_clean_template() -> None:

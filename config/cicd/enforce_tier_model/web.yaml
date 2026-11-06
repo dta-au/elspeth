@@ -2417,44 +2417,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[50]/body[4]/orelse[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:9486a8b10d947279e9ff60f01fa04586044b7b4a734848188b3b014be470f4a6'
-- key: web/composer/pipeline_planner.py:R5:_PlannerAttemptTrail:finalize_active_exception:fp=6f0d0390f99b5dbb
-  owner: john
-  reason: |-
-    The flagged pattern is `isinstance(exc, PipelinePlannerError)`. The value is an ELSPETH-owned exception instance (Tier-1: `PipelinePlannerError` is defined in this module), not Tier-3 payload, so this is the nominal check ADR-032 sanctions for what ELSPETH owns. It protects the attempt trail: the arm reads `exc.code` to record which closed `ComposerPlannerCode` ended the attempt (MALFORMED_RESPONSE, RESPONSE_TRUNCATED, the budget-exhaustion set, DECLINED) an unrecognized planner code maps to `ComposerPlannerAttemptOutcome.GUARD_FIRED`, and anything that is not a `PipelinePlannerError` (or a cancellation) maps to `ComposerPlannerAttemptOutcome.INTERNAL_ERROR` with `planner_code=None` - the attempt trail records only that CLOSED outcome vocabulary, never a free-form class name, so a planner failure is never recorded with a code it did not carry. (The bounded `type(exc).__name__` fallback lives elsewhere: in `plan_pipeline`'s exception classifier feeding `trail.log_summary`, which emits a log summary string, not the attempt-trail outcome.) `PlannerDeclined` is declared `class PlannerDeclined(PipelinePlannerError)` in this same module, so the planner error hierarchy is OPEN by design and the exact-type idiom `type(exc) is PipelinePlannerError` would MISROUTE every decline: at `plan_pipeline` the `PlannerDeclined` arm is deliberately ordered ahead of the `PipelinePlannerError` arm precisely because the subclass must be classified first, and at `_PlannerAttemptTrail.finalize_active_exception` a decline must still fall into the `PipelinePlannerError` arm to reach `exc.code`. Converting these sites to `type(...) is` is therefore a behaviour change, not a refactor.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T02:09:34.804930+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `exc` is deliberately contracted as heterogeneous `BaseException` input, and the nominal `isinstance(exc, PipelinePlannerError)` branch classifies an ELSPETH-owned exception hierarchy before reading its owned `code`; it is not defensively rechecking Tier-2 payload shape or hiding a contract violation. The visible code preserves unknown exceptions as the closed `INTERNAL_ERROR` outcome with `planner_code=None`, while subclasses such as the stated `PlannerDeclined` must inherit the planner-error classification, so exact-type discrimination would not preserve the documented behavior. R5's defensive-shape premise therefore does not apply, and the function is not a Tier-3 parameter boundary eligible for `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: b04c7cf08988087d8d6961b1eb452bd65d72aa3dd425870b96d4bdbf3e1e1650
-  judge_transport: codex_cli
-  ast_path: 'body[121]/body[5]/body[2]/orelse[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:faa2f03476a5723664e310a88a1fc2992961bcd016d469c2fdc646e3470fcfd6'
-- key: web/composer/pipeline_planner.py:R5:_PlannerAttemptTrail:finalize_active_exception:fp=81b7243e5fd16dc4
-  owner: john
-  reason: |-
-    The flagged pattern is `isinstance(exc, asyncio.CancelledError)`. The subject is not external data at all: `finalize_active_exception(exc: BaseException)` receives the exception object that ended a planner attempt and maps it onto the closed `ComposerPlannerAttemptOutcome` vocabulary written into the attempt trail. The operand is the stdlib class `asyncio.CancelledError`, checked nominally, which is exactly the form ADR-032 prescribes for a type ELSPETH (or the stdlib) owns rather than parses. It protects the audit trail's outcome field: without this arm an externally cancelled request would be recorded under a failure outcome instead of `CANCELLED`. `type(exc) is asyncio.CancelledError` is not a substitute — the cancellation this arm sees can arrive as any `CancelledError` instance the running loop constructs, and this arm must also stay consistent with the `PipelinePlannerError` arm below it. `PlannerDeclined` is declared `class PlannerDeclined(PipelinePlannerError)` in this same module, so the planner error hierarchy is OPEN by design and the exact-type idiom `type(exc) is PipelinePlannerError` would MISROUTE every decline: at `plan_pipeline` the `PlannerDeclined` arm is deliberately ordered ahead of the `PipelinePlannerError` arm precisely because the subclass must be classified first, and at `_PlannerAttemptTrail.finalize_active_exception` a decline must still fall into the `PipelinePlannerError` arm to reach `exc.code`. Converting these sites to `type(...) is` is therefore a behaviour change, not a refactor.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T02:09:54.441223+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is nominal exception-category dispatch over a `BaseException`, not defensive shape validation or an attempt to hide a fixed-contract violation. The visible branches classify cancellation, planner errors, and other internal errors into the closed audit outcome vocabulary, and the flagged arm neither coerces malformed data nor swallows the exception. The function does not present a Tier-3 parameter boundary eligible for `@trust_boundary`, so a decorator nudge is inapplicable.
-  judge_signature_version: 2
-  scope_fingerprint: b04c7cf08988087d8d6961b1eb452bd65d72aa3dd425870b96d4bdbf3e1e1650
-  judge_transport: codex_cli
-  ast_path: 'body[121]/body[5]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:501f239d0866307b7d62f9a2d67b308352ff34a308502ef8317125e3acbfd5cd'
 - key: web/composer/pipeline_planner.py:R5:_plan_pipeline_inner:fp=f8ada7e2a183d5ad
   owner: john
   reason: |-
@@ -2550,63 +2512,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[138]/body[5]/body[1]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:9dac619eaf5b9e2ece2790c8ddde42953051257a701b2c3447634529024e7812'
-- key: web/composer/pipeline_planner.py:R6:_provider_fields:fp=77c67c0d32189bd9
-  owner: john
-  reason: |-
-    The flagged pattern is `except TypeError: return None` around `vars(value)`. The value is Tier-3 — an unpinned litellm/provider response object — and this handler is the boundary's declared sentinel path: `_provider_fields` carries an `@observation_boundary` whose recorded invariant is that it returns a field mapping "or None when the value is not a Mapping and has no accessible `__dict__`; never raises". `vars()` is the only way to ask that question, and it answers by raising `TypeError`; the alternatives are strictly worse under this same rule set (`hasattr` is R3, `getattr(value, "__dict__", None)` is R2). The control that makes the sentinel safe is named and one hop away: `_provider_field` is the sole reader and returns `None` for every field when `fields is None`, and each of its call sites in `_parse_response_tool_calls` converts a `None` field into an explicit terminal `raise PipelinePlannerError(..., code="MALFORMED_RESPONSE")` — "planner response must contain exactly one choice", "planner response choice is missing its message". Nothing downstream treats an unreadable provider object as a successful parse.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T02:17:05.515210+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    PRESCRIBED FORM — `_provider_fields` handles Tier-3 provider-controlled object shape through a declared non-raising sentinel boundary: `vars(value)` signals the absence of an accessible `__dict__` with `TypeError`, which is converted to the documented `None` result rather than fabricated data. The named control is verified: `_provider_field` preserves that sentinel at web/composer/pipeline_planner.py:1533, while `_parse_response_tool_calls` rejects absent or malformed required provider fields with typed `PipelinePlannerError` outcomes at web/composer/pipeline_planner.py:1582 and throughout its field-validation path. R6 is not suppressible by `@trust_boundary`, so no decorator nudge applies.
-  judge_signature_version: 2
-  scope_fingerprint: d7d0011e4f1d38579bb124c3f7f8ed054510a9acb67a9792c37a509f33154cdc
-  judge_transport: codex_cli
-  ast_path: 'body[133]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:69ef6cbe810e44f568a54987b50450c824daf66c9406c6f31a819c0813b190cc'
-- key: web/composer/pipeline_planner.py:R7:_await_custody_settlement:fp=57fd883484b6eecf
-  owner: john
-  reason: |-
-    The flagged pattern is `with suppress(BaseException): task.result()`. This call exists ONLY to observe the finished custody task's outcome so asyncio does not report an unretrieved task exception; its return value is discarded by construction. The suppression is what keeps that observation from replacing the cancellation the caller is entitled to see — the in-source comment states exactly this ("Observe a custody failure without replacing the active cancellation"). Both suppressions sit inside an `except asyncio.CancelledError:` arm that ends in a bare `raise`, so the original cancellation is preserved unconditionally — the control is that trailing `raise`, which no path through the handler can skip. On the NORMAL (uncancelled) path the awaited work is not wrapped in any suppression at all: `await asyncio.shield(task)` propagates a settlement/custody failure to the caller exactly as it would without this function. The suppressions therefore change behaviour only while the request task is already being torn down, where re-raising would replace the active `CancelledError` and break asyncio's cancellation contract. `BaseException` rather than `Exception` is required because the settled task may itself have been cancelled.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T02:17:32.345979+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
-  judge_rationale: |-
-    RULE MISFIRES — the suppression does not silently discard the custody task’s failure: after the drain loop, `_await_custody_settlement` explicitly reads `task.exception()` and chains any failure onto the active cancellation before the handler’s unavoidable trailing raise. The visible normal path, `await asyncio.shield(task)`, remains unsuppressed, while the cancellation path uses suppression only to prevent an intermediate task failure or repeated cancellation from replacing the original `CancelledError`. Although the rationale inaccurately describes the flagged statement as `task.result()`, its site-specific cancellation argument and the visible code independently establish the claimed behavior.
-  judge_signature_version: 2
-  scope_fingerprint: 71b6bbeab0ee3d13df5ab3001156c54b682428d0118a768783472a529dd67eb7
-  judge_transport: codex_cli
-  ast_path: 'body[224]/body[3]/handlers[0]/body[0]/body[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:e76a809ecde5d096cd3266165dbd979e1450b84132ea8e66d1f6b210caa47f06'
-- key: web/composer/pipeline_planner.py:R7:_settle_lifecycle:fp=aea1f63ae3790d6f
-  owner: john
-  reason: |-
-    The flagged pattern is `with suppress(BaseException): task.result()` — the observation call that marks the settled lifecycle task's exception as retrieved. Its value is discarded by construction; the suppression exists so observing a settlement failure cannot displace the cancellation being propagated. Both suppressions sit inside an `except asyncio.CancelledError:` arm that ends in a bare `raise`, so the original cancellation is preserved unconditionally — the control is that trailing `raise`, which no path through the handler can skip. On the NORMAL (uncancelled) path the awaited work is not wrapped in any suppression at all: `await asyncio.shield(task)` propagates a settlement/custody failure to the caller exactly as it would without this function. The suppressions therefore change behaviour only while the request task is already being torn down, where re-raising would replace the active `CancelledError` and break asyncio's cancellation contract. The uncancelled path is unaffected: `plan_pipeline`'s `finally` block awaits `_settle_lifecycle` directly and, when `primary_error is None`, attaches the settlement error as planner evidence and re-raises it, so a settlement failure on a non-cancelled request is still surfaced.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T02:18:15.865822+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the `suppress(BaseException)` only contains intermediate failures while the shielded task is drained during an already-active cancellation; it does not discard the task's final outcome. The visible code then inspects `task.exception()`, chains any settlement failure onto the preserved `CancelledError`, and unconditionally re-raises that cancellation, while the uncancelled path awaits the task without suppression. The separate `plan_pipeline` claim is not needed for this verdict because the relevant propagation and observation controls are fully visible inside `_settle_lifecycle`.
-  judge_signature_version: 2
-  scope_fingerprint: 00bbd36c0cee219d6dffc33c5a5a94472229d93250e181f233897b2fd1e3e391
-  judge_transport: codex_cli
-  ast_path: 'body[225]/body[2]/handlers[0]/body[0]/body[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:7d7479ac5c909ebc4187949b886e5ca638060991b1815b76dd9e15182d3e923f'
 - key: web/composer/pipeline_proposal.py:R1:is_owned_composition_state_authority:fp=15ae55f01a932c99
   owner: john
   reason: |-
@@ -4591,25 +4496,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[25]/body[1]/body[4]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:4960023150043fa20329755735fa86a7517e512ca22635c9150351c0d0ad5575'
-- key: web/composer/pipeline_planner.py:R5:_withheld_component_count:fp=c1e9a1380d0811f9
-  owner: john
-  reason: |-
-    `ToolResult.data` is an ELSPETH-owned union whose mappings are deep-frozen to `MappingProxyType`, so Mapping dispatch is required. Non-mapping or absent-key means the explicit 'nothing withheld' state; a present non-int value raises `AuditIntegrityError`. No corrupt count is defaulted.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T02:13:33.077275+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` discriminates among the declared variants of the ELSPETH-owned `ToolResult.data` union; it does not defensively revalidate a supposedly mapping-only contract. The contract and freezing behavior are visible at `src/elspeth/web/composer/tools/_common.py:946` and `src/elspeth/web/composer/tools/_common.py:1001-1024`, while the site explicitly defines a non-mapping or absent key as “nothing withheld.” A present count with the wrong type raises `AuditIntegrityError`, so the guard neither masks envelope corruption nor defaults a corrupt count.
-  judge_signature_version: 2
-  scope_fingerprint: c884989fb45fd8aa25499fae15defd6c16b57f7b451e42be7c9ef3d72373250a
-  judge_transport: codex_cli
-  ast_path: 'body[189]/body[2]/test/values[0]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:1e4bdbfbac45bd1b88ab3afb55f50651d09d7bcfcefd3877aa8a5298f335398c'
 - key: web/composer/planner_authoring_aids.py:R6:build_schema_contract_evidence:fp=41aaec9e394318c5
   owner: john
   reason: |-
@@ -5161,25 +5047,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[34]/body[3]/test'
   judge_metadata_signature: 'hmac-sha256:v2:bfb736cbabbaed7f5ed3378563a8ccb06c96a33b65572326430664ab6789a608'
-- key: web/sessions/routes/composer/guided_plan.py:R5:_guided_full_failure_code:fp=17b522d97319a174
-  owner: john
-  reason: |-
-    RULE MISFIRES: this check enters the explicit PipelinePlannerError taxonomy so its closed code and detail_codes can be translated without exposing exception text; unknown planner codes and all unmatched exceptions fall through to operation_failed. tests/integration/web/composer/guided/test_guided_full.py::test_guided_full_planner_failure_mapping_is_closed, tests/integration/web/composer/guided/test_guided_full.py::test_guided_full_policy_refusal_outranks_the_planner_code, and tests/integration/web/composer/test_freeform_planner_failure_translation.py::test_every_reachable_failure_code_has_an_http_envelope_on_both_surfaces pin the complete planner-code paths and the _SAFE_FAILURES envelope coverage.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-08'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-09T03:24:57.541872+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES: `_guided_full_failure_code` receives a heterogeneous `BaseException`, and the nominal check at guided_plan.py:261 discriminates the declared `PipelinePlannerError` failure taxonomy rather than defensively rechecking Tier-1/Tier-2 data or concealing a contract violation. The named controls are verified: test_guided_full.py:1163 pins known and unknown planner-code mappings, test_guided_full.py:1172 pins policy-detail precedence, and test_freeform_planner_failure_translation.py:721 proves reachable outputs are covered by `_SAFE_FAILURES`. The decorator contract is inapplicable because `exc` is an internal exception-classification input, not external Tier-3 data.
-  judge_signature_version: 2
-  scope_fingerprint: 22321b71db9ed3138b2b9406cbdabcb58aba3541670fdd592c6b50c00fa7a159
-  judge_transport: codex_cli
-  ast_path: 'body[34]/body[7]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:99b468bce6a045f1c17743b81c9403ccddb57191b9b7fbf0aa1a8b9808e48087'
 - key: web/_acceptance_common/errors.py:R1:current_acceptance_step:fp=d433ecd4aefd65e8
   owner: john
   reason: |-

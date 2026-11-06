@@ -22,6 +22,7 @@ from typing import Any, Literal
 import yaml
 from dotenv import dotenv_values
 
+from elspeth_lints.core import operator_runtime
 from elspeth_lints.core.allowlist import (
     _JUDGE_METADATA_SIGNATURE_ENV_VAR,
     _JUDGE_METADATA_SIGNATURE_VERIFY_MODE_ENV_VAR,
@@ -184,6 +185,10 @@ def load_diagnosis_env_file(env_file: Path | None) -> None:
     """
     if env_file is None:
         return
+    try:
+        operator_runtime.require_operator_runtime()
+    except operator_runtime.OperatorRuntimeUnavailableError as exc:
+        raise ValueError(str(exc)) from exc
     resolved = env_file.resolve()
     if not resolved.is_file():
         raise ValueError(f"--env-file: {resolved} is not a file")
@@ -278,9 +283,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
+        if args.env_file is not None or _JUDGE_METADATA_SIGNATURE_ENV_VAR in os.environ:
+            operator_runtime.require_operator_runtime()
         load_diagnosis_env_file(args.env_file)
         report = diagnose_judge_signatures(root=args.root, allowlist_dir=args.allowlist_dir)
-    except ValueError as exc:
+    except (ValueError, operator_runtime.OperatorRuntimeUnavailableError) as exc:
         sys.stderr.write(f"diagnose-judge-signatures error: {exc}\n")
         return 2
 
@@ -691,10 +698,7 @@ def _justify_command(*, entry: AllowlistEntry, root: Path, allowlist_dir: Path, 
     parts = [
         "env",
         _OPERATOR_KEY_PLACEHOLDER,
-        "PYTHONPATH=elspeth-lints/src",
-        ".venv/bin/python",
-        "-m",
-        "elspeth_lints.core.cli",
+        operator_runtime.OPERATOR_ENTRYPOINT,
         "justify",
         "--root",
         str(root),
@@ -720,10 +724,7 @@ def _migrate_command(*, root: Path, allowlist_dir: Path) -> str:
     parts = [
         "env",
         _OPERATOR_KEY_PLACEHOLDER,
-        "PYTHONPATH=elspeth-lints/src",
-        ".venv/bin/python",
-        "-m",
-        "elspeth_lints.core.cli",
+        operator_runtime.OPERATOR_ENTRYPOINT,
         "migrate-judge-scope",
         "--root",
         str(root),

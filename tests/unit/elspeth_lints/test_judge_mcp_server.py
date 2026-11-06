@@ -13,23 +13,25 @@ cross-test imports.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 
+from elspeth_lints.core import judge, judge_rpc
 from elspeth_lints.core.allowlist import (
     _JUDGE_METADATA_SIGNATURE_ENV_VAR,
     JudgeVerdict,
     compute_judge_metadata_signature,
 )
-from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_CODEX_CLI, JudgeConfigurationError
+from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_AGENT, TRANSPORT_CODEX_CLI
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, read_bundle
 from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.mcp import server as judge_server
@@ -44,6 +46,44 @@ _RATIONALE = "original judge said the boundary was genuine"
 def _keyless(monkeypatch: pytest.MonkeyPatch) -> None:
     # The MCP surface is structurally key-free; default every test to no key.
     monkeypatch.delenv(_JUDGE_METADATA_SIGNATURE_ENV_VAR, raising=False)
+
+
+async def _stage_status_input_schema(tmp_path: Path) -> dict[str, Any]:
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    server = judge_server.create_server(
+        root=tmp_path / "source",
+        allowlist_dir=tmp_path / "allowlist",
+        staged_dir=tmp_path / "staged",
+    )
+    async with create_connected_server_and_client_session(server, read_timeout_seconds=timedelta(seconds=5)) as session:
+        response = await session.list_tools()
+    status_tools = [tool for tool in response.tools if tool.name == "stage_status"]
+    assert len(status_tools) == 1
+    return status_tools[0].inputSchema
+
+
+def _assert_exact_stale_status_schema(schema: dict[str, Any]) -> None:
+    assert schema["type"] == "object"
+    assert schema["required"] == ["bundle_id"]
+    assert "stale_key" in schema["properties"], "stage_status tools/list omitted stale_key"
+    assert schema["properties"]["stale_key"]["type"] == "string"
+    assert schema["properties"]["stale_key"]["minLength"] == 1
+
+
+def test_stage_status_tools_list_advertises_exact_stale_key(tmp_path: Path) -> None:
+    _assert_exact_stale_status_schema(asyncio.run(_stage_status_input_schema(tmp_path)))
+
+
+def test_stage_status_tools_list_contract_detects_removed_stale_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _assert_exact_stale_status_schema(asyncio.run(_stage_status_input_schema(tmp_path)))
+    # Mutate registration only for fault injection; inspect both results over MCP.
+    monkeypatch.delitem(judge_server._TOOLS["stage_status"].input_schema["properties"], "stale_key")
+
+    advertised = asyncio.run(_stage_status_input_schema(tmp_path))
+
+    with pytest.raises(AssertionError, match="stage_status tools/list omitted stale_key"):
+        _assert_exact_stale_status_schema(advertised)
 
 
 # --------------------------------------------------------------------------- #
@@ -171,6 +211,8 @@ def _context(root: Path, allowlist_dir: Path, staged_dir: Path) -> Any:
     resolved_root = root.resolve()
     resolved_allowlist = allowlist_dir.resolve()
     repo = Path(os.path.commonpath((resolved_root, resolved_allowlist)))
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
     if (
         subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
@@ -185,6 +227,28 @@ def _context(root: Path, allowlist_dir: Path, staged_dir: Path) -> Any:
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
     return judge_server._ServerContext(root=resolved_root, allowlist_dir=resolved_allowlist, staged_dir=staged_dir.resolve())
+
+
+def test_context_keeps_fixture_git_ownership_inside_a_parent_checkout(tmp_path: Path) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "outer@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Outer Fixture"], check=True)
+    (tmp_path / "outer.txt").write_text("Preserve the parent repository.\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "outer.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "parent"], check=True)
+    parent_index = (tmp_path / ".git" / "index").read_bytes()
+    child = tmp_path / "child"
+    child.mkdir()
+    root = _build_root(child)
+    allowlist = _build_allowlist_dir(child)
+    _write_source(root, "plugins/widget.py", "owned child")
+
+    context = _context(root, allowlist, child / "staged")
+
+    observed_root = subprocess.check_output(["git", "-C", str(child), "rev-parse", "--show-toplevel"], text=True).strip()
+    assert Path(observed_root) == child
+    assert (tmp_path / ".git" / "index").read_bytes() == parent_index
+    assert _scan_and_read(context, "nested-checkout").source_dirty is False
 
 
 # --------------------------------------------------------------------------- #
@@ -277,9 +341,51 @@ def test_stage_status_reads_bundle(tmp_path: Path) -> None:
     assert "sign-bundle" in payload["sign_bundle_command"]
     assert str(written) in payload["sign_bundle_command"]
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in payload["sign_bundle_command"]
-    assert "--judge-transport codex-cli" in payload["sign_bundle_command"]
+    # codex-cli is disabled (its native shell could read the worker's provider home).
+    assert "--judge-transport agent" in payload["sign_bundle_command"]
+    assert "codex-cli" not in payload["sign_bundle_command"]
     assert "--judge-tools readonly" in payload["sign_bundle_command"]
     assert "--dry-run" in payload["sign_bundle_command"]
+
+
+def test_stage_status_stale_key_selects_one_orphan_without_judge_work(tmp_path: Path) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    assert Path(subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"], text=True).strip()) == tmp_path
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    bundle = _scan_and_read(ctx, "exact-stale-status")
+
+    outcome = judge_server._run_tool(ctx, "stage_status", {"bundle_id": bundle.bundle_id, "stale_key": key})
+
+    assert outcome.is_error is False, outcome.text
+    payload = json.loads(outcome.text)
+    assert "--stale-key" in payload["sign_bundle_command"]
+    assert key in payload["sign_bundle_command"]
+    assert "--lanes" not in payload["sign_bundle_command"]
+    assert payload["sign_bundle_plan"]["actions_total"] == 1
+    assert payload["sign_bundle_plan"]["judge_calls_total"] == 0
+    assert payload["sign_bundle_plan"]["unselected_actions"] == len(bundle.actions) - 1
+    assert payload["sign_bundle_plan"]["source_file"] == "widget.yaml"
+    _assert_exact_stale_status_schema(asyncio.run(_stage_status_input_schema(tmp_path)))
+
+
+@pytest.mark.parametrize("key", ["unknown-key", "", 42, None])
+def test_stage_status_refuses_invalid_stale_key(tmp_path: Path, key: Any) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    bundle = _scan_and_read(ctx, "invalid-exact-stale")
+    outcome = judge_server._run_tool(ctx, "stage_status", {"bundle_id": bundle.bundle_id, "stale_key": key})
+    assert outcome.is_error is True
+    assert "--dry-run" not in outcome.text
 
 
 def test_stage_status_rejects_stale_bundle_without_command(tmp_path: Path) -> None:
@@ -868,8 +974,8 @@ def _fake_response(verdict: JudgeVerdict, rationale: str) -> SimpleNamespace:
     return SimpleNamespace(
         verdict=verdict,
         judge_rationale=rationale,
-        model_id="codex-preview-model",
-        judge_transport=TRANSPORT_CODEX_CLI,
+        model_id="agent-preview-model",
+        judge_transport=TRANSPORT_AGENT,
     )
 
 
@@ -902,7 +1008,7 @@ def test_stage_preview_fills_non_authoritative_verdicts(tmp_path: Path) -> None:
     # Read-only agent posture (defense-in-depth): the patched judge was reached
     # via the agent transport with exactly the read-only tool scope.
     assert mock_scope.called
-    assert mock_call.call_args.kwargs["transport"] == TRANSPORT_CODEX_CLI
+    assert mock_call.call_args.kwargs["transport"] == TRANSPORT_AGENT
     assert mock_call.call_args.kwargs["tool_scope"] is sentinel_scope
 
     bundle = read_bundle(staged_dir / f"{bundle_id}.json")
@@ -910,7 +1016,7 @@ def test_stage_preview_fills_non_authoritative_verdicts(tmp_path: Path) -> None:
     assert previews and all(p is not None for p in previews)
     assert all(p.authoritative is False for p in previews)
     assert all(p.verdict == "ACCEPTED" for p in previews)
-    assert all(p.transport == TRANSPORT_CODEX_CLI for p in previews)
+    assert all(p.transport == TRANSPORT_AGENT for p in previews)
     # Bundle still serializes no signature.
     text = (staged_dir / f"{bundle_id}.json").read_text(encoding="utf-8")
     assert "judge_metadata_signature" not in text
@@ -1008,17 +1114,41 @@ def test_stage_preview_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in outcome.text
 
 
-def test_stage_preview_missing_codex_cli_returns_actionable_hint(tmp_path: Path) -> None:
-    """Key absent + Codex CLI absent yields an actionable configuration error."""
+def test_stage_preview_judges_through_the_agent_worker_and_never_codex(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Key-free preview keeps working under the confinement: agent transport, via the worker."""
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    observed = judge._TransportResult(
+        json.dumps({"verdict": "ACCEPTED", "rationale": "boundary is genuine", "confidence": 0.9, "should_use_decorator": None}),
+        "agent-served",
+        10,
+        None,
+    )
+    worker = create_autospec(judge_rpc.call_worker, spec_set=True, return_value=observed)
+    monkeypatch.setattr(judge_rpc, "call_worker", worker)
+    codex = create_autospec(judge._TRANSPORTS[TRANSPORT_CODEX_CLI], spec_set=True, side_effect=AssertionError("codex transport used"))
+    monkeypatch.setitem(judge._TRANSPORTS, TRANSPORT_CODEX_CLI, codex)
+    with patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()):
+        outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
+    assert outcome.is_error is False, outcome.text
+    worker.assert_called_once()
+    assert worker.call_args.kwargs["transport"] == TRANSPORT_AGENT
+    codex.assert_not_called()
+    previews = [a.preview for a in read_bundle(staged_dir / f"{bundle_id}.json").actions if a.kind == "justify"]
+    assert previews and all(p is not None and p.transport == TRANSPORT_AGENT for p in previews)
+
+
+def test_stage_preview_without_installed_supervisor_refuses_with_no_local_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supervisor absent: the real agent route refuses at admission; no local transport runs."""
     ctx, _staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
-    codex_absent = JudgeConfigurationError("The Codex CLI is required for --judge-transport codex-cli.")
-    with (
-        patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()),
-        patch("elspeth_lints.core.judge.call_judge", side_effect=codex_absent),
-    ):
+    monkeypatch.setattr(judge_rpc, "ADMISSION_PATH", tmp_path / "absent-judge-workers.json")
+    for transport in (TRANSPORT_AGENT, TRANSPORT_CODEX_CLI):
+        local = create_autospec(judge._TRANSPORTS[transport], spec_set=True, side_effect=AssertionError(f"local {transport} fallback"))
+        monkeypatch.setitem(judge._TRANSPORTS, transport, local)
+    with patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()):
         outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
     assert outcome.is_error is True
-    assert "Codex CLI" in outcome.text
+    assert "protected judge supervisor admission is unavailable or invalid" in outcome.text
+    assert "codex" not in outcome.text.lower()
 
 
 def test_stage_preview_still_fails_closed_with_judge_agent_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

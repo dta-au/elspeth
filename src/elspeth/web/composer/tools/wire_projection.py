@@ -8,6 +8,7 @@ provider. It is derived from S once, at import, by one pure walk per
 :class:`ToolContractDialect`, and is never hand-written:
 
 * ``none`` is S unchanged, except that the web ``set_pipeline`` arguments
+  disclose the runtime naming constraints and
   carry a required ``{"pipeline": <flat document>}`` envelope. LiteLLM's
   Anthropic and Bedrock adapters keep unions nested below a property but
   discard root-level ``oneOf``, so the flat set_pipeline schema would lose
@@ -61,6 +62,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.tools._dispatch import _TOOL_SCHEMA_BY_NAME, WIRE_KEYWORD_ALLOWLIST, get_tool_definitions
+from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.strict_profile import StrictViolationKind, check_openai_strict
 
 __all__ = [
@@ -81,7 +83,6 @@ __all__ = [
     "loop_tool_count",
     "omission_instruction_matches",
     "project_tool",
-    "stamp_planner_terminal",
     "strict_capable_tool_count",
     "wire_limits_report",
     "wire_tool_definitions",
@@ -819,11 +820,23 @@ def build_wire_tool_defs(
     return MappingProxyType(defs)
 
 
+def _build_loop_wire_tool_defs() -> Mapping[ToolContractDialect, Mapping[str, WireTool]]:
+    """Build owned wire contracts from the naming-disclosed registry copy.
+
+    Projection, size checks and wire-conformance validators must consume this
+    same document. Adding disclosures only after projection would leave the
+    decoder classifying against a different schema from the one sent.
+    """
+    definitions = get_tool_definitions()
+    for definition in definitions:
+        if definition["name"] == "set_pipeline":
+            definition["parameters"] = canonical_set_pipeline_schema()
+            return build_wire_tool_defs(definitions, limits=OPENAI_STRICT_LIMITS)
+    raise WireProjectionError("Compose loop must advertise set_pipeline")
+
+
 # Built once, at import, in registry order (``wire_secret_ref`` last).
-_WIRE_TOOL_DEFS: Final[Mapping[ToolContractDialect, Mapping[str, WireTool]]] = build_wire_tool_defs(
-    get_tool_definitions(),
-    limits=OPENAI_STRICT_LIMITS,
-)
+_WIRE_TOOL_DEFS: Final[Mapping[ToolContractDialect, Mapping[str, WireTool]]] = _build_loop_wire_tool_defs()
 
 _WIRE_LIMITS_REPORTS: Final[Mapping[ToolContractDialect, WireLimitsReport]] = MappingProxyType(
     {dialect: _limits_report(dialect, tools) for dialect, tools in _WIRE_TOOL_DEFS.items()}
@@ -864,18 +877,6 @@ def wire_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, Any]]:
             function["strict"] = tool.strict_capable
         tools.append({"type": "function", "function": function})
     return tools
-
-
-def stamp_planner_terminal(definition: Mapping[str, Any], dialect: ToolContractDialect) -> dict[str, Any]:
-    """Return a copy of the planner terminal tool stamped for ``dialect``.
-
-    The terminal is never strict-capable in S1: ``openai_strict`` gets an
-    explicit ``strict: false``; ``none`` gets an unchanged copy.
-    """
-    stamped = deepcopy(dict(definition))
-    if dialect == ToolContractDialect.OPENAI_STRICT:
-        stamped["function"]["strict"] = False
-    return stamped
 
 
 # ---------------------------------------------------------------- decode / encode

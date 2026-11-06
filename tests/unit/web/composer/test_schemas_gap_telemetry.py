@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from uuid import UUID
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
 from elspeth.web.composer.prompts import build_context_string as _build_context_string
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
@@ -86,6 +89,7 @@ def build_context_string(
         state,
         PolicyCatalogView.for_trained_operator(catalog, snapshot),
         plugin_snapshot=snapshot,
+        content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
         **kwargs,
     )
 

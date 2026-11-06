@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from scripts.ci_test_shards import (
     shard_index,
     validate_long_run_shards,
 )
+from tests.unit.cicd.test_workflow_runner_isolation import _context, _expression
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -83,6 +85,14 @@ def test_long_run_catalog_names_the_three_existing_cases() -> None:
     module = ast.parse((REPO_ROOT / prefix.split("::")[0]).read_text(encoding="utf-8"))
     definitions = {node.name for node in module.body if isinstance(node, ast.FunctionDef)}
     assert all(nodeid.split("::")[1] in definitions for nodeid in LONG_RUN_CASES.values())
+
+
+def test_fencing_regression_marker_is_registered(pytestconfig: pytest.Config) -> None:
+    configuration = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    markers = configuration["tool"]["pytest"]["ini_options"]["markers"]
+    assert "landscape_fencing_regression" in {marker.split(":", 1)[0] for marker in markers}
+    assert pytestconfig.getini("strict_markers") is True
+    assert pytestconfig.getini("strict_config") is True
 
 
 @pytest.mark.parametrize("reverse", [False, True])
@@ -967,7 +977,7 @@ def test_combine_binds_native_run_and_accepts_partial_rerun_attempts(
         combine_shards(artifacts, 4, tmp_path)
 
 
-def _partition_suite(tmp_path: Path, mutation: str | None = None, case: str = "no-escape") -> None:
+def _partition_suite(tmp_path: Path, mutation: str | None = None, case: str = "no-escape", *, include_regressions: bool = False) -> None:
     _init_checkout(tmp_path)
     module = tmp_path / LONG_RUN_CASES["no-escape"].split("::")[0]
     module.parent.mkdir(parents=True)
@@ -979,6 +989,8 @@ def _partition_suite(tmp_path: Path, mutation: str | None = None, case: str = "n
         name = "test_renamed_proof"
     elif mutation == "missing_marker":
         decorators = ""
+    elif mutation == "regression_marked_proof":
+        decorators = "@pytest.mark.landscape_fencing_regression\n"
     elif mutation == "extra_marker":
         extra = "@pytest.mark.landscape_long_run\ndef test_extra_proof(): assert True\n"
     elif mutation == "misflagged":
@@ -996,6 +1008,12 @@ def _partition_suite(tmp_path: Path, mutation: str | None = None, case: str = "n
         decorators += "@pytest.mark.xfail(reason='control', strict=False)\n"
     elif mutation == "failure":
         body = "assert False"
+    if include_regressions:
+        extra += (
+            "@pytest.mark.landscape_fencing_regression\n"
+            "@pytest.mark.parametrize('value', range(2))\n"
+            "def test_receipt_currentness(value): assert value >= 0\n"
+        )
     module.write_text(
         f"import pytest\n{decorators}def {name}(): {body}\n{extra}"
         + "".join(
@@ -1008,7 +1026,10 @@ def _partition_suite(tmp_path: Path, mutation: str | None = None, case: str = "n
         encoding="utf-8",
     )
     (tmp_path / "pytest.ini").write_text(
-        "[pytest]\nmarkers =\n    landscape_long_run: exhaustive proof\n    protected: omitted control\n",
+        "[pytest]\nstrict_markers = true\naddopts = --strict-markers\nmarkers =\n"
+        "    landscape_long_run: exhaustive proof\n"
+        "    landscape_fencing_regression: ordinary fencing regression\n"
+        "    protected: omitted control\n",
         encoding="utf-8",
     )
 
@@ -1085,15 +1106,19 @@ def test_active_collection_failure_publishes_terminal_without_coverage(
     assert "coverage_sha256" not in manifest
 
 
-def test_active_partitions_preserve_complete_disjoint_marker_selected_collection(tmp_path: Path) -> None:
-    _partition_suite(tmp_path)
+@pytest.mark.parametrize("include_regressions", [False, True])
+def test_active_partitions_preserve_complete_disjoint_marker_selected_collection(tmp_path: Path, include_regressions: bool) -> None:
+    _partition_suite(tmp_path, include_regressions=include_regressions)
     result, report = _partition_run(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     complete = json.loads(report.read_text(encoding="utf-8"))
     assert complete["schema_version"] == 2
     assert "proof_case" not in complete and "proof_call_passed" not in complete
     nodeids = complete["selected_nodeids"]
-    assert len(nodeids) == 43
+    prefix = LONG_RUN_CASES["no-escape"].split("::")[0] + "::"
+    regressions = {prefix + f"test_receipt_currentness[{index}]" for index in range(2)} if include_regressions else set()
+    assert len(nodeids) == 43 + len(regressions)
+    assert regressions <= set(nodeids)
     assert LONG_RUN_CASES["no-escape"] in nodeids
     assert not any("test_protected" in nodeid for nodeid in nodeids)
     ordinary: list[str] = []
@@ -1124,13 +1149,16 @@ def test_active_partitions_preserve_complete_disjoint_marker_selected_collection
         assert proof["proof_call_passed"] is True
         assert proof["exit_status"] == 0
         proofs.extend(proof["selected_nodeids"])
-    assert len(ordinary) == len(set(ordinary)) == 40
+    assert len(ordinary) == len(set(ordinary)) == 40 + len(regressions)
+    assert regressions <= set(ordinary)
     assert not set(proofs) & set(ordinary)
     assert len(ordinary + proofs) == len(set(ordinary + proofs)) == len(nodeids)
     assert set(ordinary + proofs) == set(nodeids)
 
 
-@pytest.mark.parametrize("mutation", ["missing_proof", "missing_marker", "extra_marker", "misflagged", "deselected_proof"])
+@pytest.mark.parametrize(
+    "mutation", ["missing_proof", "missing_marker", "regression_marked_proof", "extra_marker", "misflagged", "deselected_proof"]
+)
 @pytest.mark.parametrize("partition", ["ordinary", "proof"])
 @pytest.mark.parametrize("case", list(LONG_RUN_CASES))
 def test_partition_refuses_changed_proof_identity_or_marker(tmp_path: Path, mutation: str, partition: str, case: str) -> None:
@@ -1139,6 +1167,43 @@ def test_partition_refuses_changed_proof_identity_or_marker(tmp_path: Path, muta
     assert result.returncode == 4, result.stdout + result.stderr
     assert "Long-run selection requires" in result.stdout + result.stderr
     assert not report.exists()
+
+
+@pytest.mark.parametrize("partition,case", [("ordinary", None), ("proof", "no-escape")])
+def test_partition_refuses_unknown_fencing_regression_marker(tmp_path: Path, partition: str, case: str | None) -> None:
+    _partition_suite(tmp_path)
+    (tmp_path / "tests" / "test_unknown_marker.py").write_text(
+        "import pytest\n@pytest.mark.landscape_fencing_regresion\ndef test_receipt(): assert True\n", encoding="utf-8"
+    )
+    result, report = _partition_run(tmp_path, partition, case=case)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "'landscape_fencing_regresion' not found in `markers` configuration option" in result.stdout + result.stderr
+    manifest = json.loads(report.read_text(encoding="utf-8"))
+    assert manifest["exit_status"] == 2
+    if case is not None:
+        assert manifest["proof_call_passed"] is False
+
+
+@pytest.mark.parametrize("partition,case", [("ordinary", None), ("proof", "no-escape")])
+@pytest.mark.parametrize("project_strictness", [False, True], ids=["disabled-control", "project-strictness"])
+def test_partition_unknown_configuration_respects_project_strictness(
+    tmp_path: Path, partition: str, case: str | None, project_strictness: bool
+) -> None:
+    _partition_suite(tmp_path)
+    configuration = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared_strictness = configuration["tool"]["pytest"]["ini_options"]["strict_config"]
+    assert declared_strictness is True
+    strict_config = declared_strictness if project_strictness else False
+    with (tmp_path / "pytest.ini").open("a", encoding="utf-8") as stream:
+        stream.write(f"strict_config = {str(strict_config).lower()}\nunknown_partition_setting = true\n")
+    result, report = _partition_run(tmp_path, partition, case=case)
+    expected_exit = 4 if project_strictness else 0
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    assert "Unknown config option: unknown_partition_setting" in result.stdout + result.stderr
+    manifest = json.loads(report.read_text(encoding="utf-8"))
+    assert manifest["exit_status"] == expected_exit
+    if case is not None:
+        assert manifest["proof_call_passed"] is (not project_strictness)
 
 
 @pytest.mark.parametrize("mutation", ["skip", "setup_skip", "xfail", "xpass", "failure"])
@@ -1848,15 +1913,15 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
     jobs = _activation_workflow_jobs()
     matrix = jobs["test"]["strategy"]["matrix"]
     assert matrix["shard"] == list(range(8))
-    assert jobs["test"]["strategy"]["max-parallel"] == 4
+    assert jobs["test"]["strategy"]["max-parallel"] == 3
     assert jobs["test"]["env"]["PYTEST_WORKERS"] == "2"
     assert "matrix.shard" in jobs["test"]["env"]["CI_CHECKOUT_PATH"]
     aggregate = jobs["coverage"]
     assert aggregate["needs"] == ["test", "landscape-proof"]
-    assert (
-        aggregate["if"]
-        == "always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)"
-    )
+    assert aggregate["if"].startswith("(always() && ")
+    assert _expression(aggregate["if"], _context("push"))
+    assert not _expression(aggregate["if"], _context("pull_request", fork=True))
+    assert not _expression(aggregate["if"], _context("workflow_dispatch", protected=False))
     commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
     assert "needs.test.result" in commands
     assert "needs.landscape-proof.result" in commands
@@ -1881,7 +1946,10 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
     caller = jobs["landscape-proof"]
     assert set(caller) == {"name", "if", "uses"}
     assert caller["uses"] == "./.github/workflows/landscape-long-run.yml"
-    assert caller["if"] == "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+    assert _expression(caller["if"], _context("push"))
+    assert _expression(caller["if"], _context("pull_request"))
+    assert not _expression(caller["if"], _context("pull_request", fork=True))
+    assert not _expression(caller["if"], _context("workflow_dispatch", protected=False))
     for name in ("Run tests with coverage", "Run tests without coverage"):
         run = _activation_step(jobs["test"], name)["run"]
         tokens = shlex.split(run.replace("\\\n", " "), comments=True)
@@ -1940,7 +2008,8 @@ def _assert_activation_contract(jobs: dict[str, Any]) -> None:
         assert "if" not in validation and "continue-on-error" not in validation
     success = jobs["ci-success"]
     assert "landscape-proof" in success["needs"] and "coverage" in success["needs"]
-    assert success["if"] == "always()"
+    assert success["if"].startswith("(always()) && ")
+    assert _expression(success["if"], _context("push"))
     assert 'if [[ "${{ needs.landscape-proof.result }}" != "success" ]]; then' in _activation_step(success, "Check all jobs passed")["run"]
     report = _activation_step(aggregate, "Upload combined coverage report")
     assert report["if"] == "always()"

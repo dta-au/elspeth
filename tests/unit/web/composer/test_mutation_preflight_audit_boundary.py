@@ -9,12 +9,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.errors import FailedTurnMetadata
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -31,6 +32,7 @@ from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from tests.unit.web.execution.test_validation_complaint_triage import complaint_triage_state
+from tests.unit.web.sessions.test_continuation_prompt_producers import dispatch_tool_batch
 
 from .conftest import _fake_llm_response
 from .test_preview_policy_snapshot import _registry, _service
@@ -137,10 +139,14 @@ async def test_applied_mutation_is_audited_before_preflight(
     )
     deadline = asyncio.get_running_loop().time() + 60
     messages = []
+    preferences = await service._require_sessions_service().get_composer_preferences(UUID(result_session_id))
+    mutation_ceiling = ComposerMutationCeiling(result_session_id, str(uuid4()), preferences.trust_mode)
 
     async def dispatch():
-        return await service._dispatch_tool_batch(
+        return await dispatch_tool_batch(
+            service,
             call_model=_CallModelOutcome(completion=completion),
+            mutation_ceiling=mutation_ceiling,
             state=state,
             last_validation=None,
             last_runtime_preflight=None,

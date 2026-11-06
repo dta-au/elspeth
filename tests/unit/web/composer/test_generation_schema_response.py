@@ -1,4 +1,4 @@
-"""Canonical schema admission is distinct from bounded planner projection."""
+"""Canonical plugin-schema response admission preserves the catalogue wire."""
 
 import json
 from dataclasses import FrozenInstanceError
@@ -8,11 +8,6 @@ import pytest
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.catalog.schemas import PluginSchemaInfo
-from elspeth.web.composer.planner_authoring_aids import (
-    SchemaContractProjectionUnsupported,
-    planner_plugin_contract,
-    planner_plugin_contract_from_snapshot,
-)
 from elspeth.web.composer.tools._generation_schema_response import (
     PLUGIN_SCHEMA_RESPONSE_CONTRACT,
     AdmittedPluginSchemaResponse,
@@ -63,13 +58,11 @@ def test_schema_snapshot_constructor_detaches_nested_caller_containers(proxy: bo
 def test_snapshot_preserves_wire_and_detaches_producer() -> None:
     original = schema()
     expected_wire = json.dumps(original.model_dump(mode="json"))
-    expected_projection = planner_plugin_contract(original).to_dict()
     admitted = PLUGIN_SCHEMA_RESPONSE_CONTRACT.admit(original)
     assert type(admitted) is AdmittedPluginSchemaResponse
     original.json_schema["title"] = "tampered"
     original.knob_schema["fields"][0]["default"] = "tampered"
     assert json.dumps(admitted.to_wire()) == expected_wire
-    assert planner_plugin_contract_from_snapshot(admitted.snapshot).to_dict() == expected_projection
     assert json.dumps(admitted.readmit(PLUGIN_SCHEMA_RESPONSE_CONTRACT).to_wire()) == expected_wire
     with pytest.raises(FrozenInstanceError):
         admitted.snapshot.name = "tampered"
@@ -116,22 +109,18 @@ def test_corrupt_knob_field_is_framework_bug(field: dict[str, object]) -> None:
         PLUGIN_SCHEMA_RESPONSE_CONTRACT.admit(original)
 
 
-def test_valid_large_schema_keeps_projection_refusal_separate() -> None:
+def test_valid_large_schema_is_admitted_whole() -> None:
     original = schema()
     original.json_schema["description"] = "x" * (49 * 1024)
     admitted = PLUGIN_SCHEMA_RESPONSE_CONTRACT.admit(original)
     assert admitted.to_wire() == original.model_dump(mode="json")
-    with pytest.raises(SchemaContractProjectionUnsupported):
-        planner_plugin_contract_from_snapshot(admitted.snapshot)
 
 
-def test_unknown_finite_schema_extension_is_independent_projection_refusal() -> None:
+def test_unknown_finite_schema_extension_is_admitted_and_non_json_value_is_refused() -> None:
     original = schema()
     original.json_schema["vendor:constraint"] = {"odd/name": ["é", None, False]}
     admitted = PLUGIN_SCHEMA_RESPONSE_CONTRACT.admit(original)
     assert json.dumps(admitted.to_wire()) == json.dumps(original.model_dump(mode="json"))
-    with pytest.raises(SchemaContractProjectionUnsupported):
-        planner_plugin_contract_from_snapshot(admitted.snapshot)
     original.json_schema["vendor:constraint"] = object()
     with pytest.raises(FrameworkBugError):
         PLUGIN_SCHEMA_RESPONSE_CONTRACT.admit(original)

@@ -5,10 +5,11 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Final, Literal, TypedDict, get_args
+from typing import Annotated, Final, Literal, TypedDict, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
 from elspeth.web.validation import _PII_WARNING_PATTERNS
@@ -254,3 +255,133 @@ def sanitize_advisor_note(note: str | None) -> SanitizedAdvisorNote:
     if len(body) > ADVISOR_NOTE_MAX_CHARS:
         body = body[: ADVISOR_NOTE_MAX_CHARS - 1].rstrip() + "…"
     return SanitizedAdvisorNote(note=body or None, url_redactions=url_redactions, email_redactions=email_redactions)
+
+
+class ContinuationEvidenceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    receipt_id: str = Field(min_length=1)
+    source_kind: Literal["graph", "read", "provider", "validation"] = "read"
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    original_attempt_id: str | None
+    coverage_binding: str
+
+
+class ContinuationObligationProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    obligation_id: str = Field(min_length=1, max_length=128)
+    parent_id: str | None
+    description: str = Field(min_length=1)
+    original_message_id: str = Field(min_length=1)
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+    status: Literal["open", "blocked", "satisfied"]
+
+
+class ContinuationActionBase(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    obligation_ids: tuple[str, ...] = Field(min_length=1)
+    evidence_ids: tuple[str, ...]
+    input_hash: str
+    graph_hash: str
+    policy_hash: str
+    tool_manifest_hash: str
+
+    @model_validator(mode="after")
+    def require_unique_obligation_ids(self) -> ContinuationActionBase:
+        if len(set(self.obligation_ids)) != len(self.obligation_ids):
+            raise ValueError("Advisor repeated an action obligation reference")
+        return self
+
+
+class PrimaryContinuationAction(ContinuationActionBase):
+    kind: Literal["primary_turn"]
+    instruction: str = Field(min_length=1)
+
+
+class ReadContinuationAction(ContinuationActionBase):
+    kind: Literal["read_tool"]
+    tool_name: str = Field(min_length=1)
+    arguments_json: str
+
+
+class ReviewContinuationAction(ContinuationActionBase):
+    kind: Literal["review"]
+    candidate_ref: str = Field(pattern=r"^candidate:[0-9a-f]{64}$")
+    evidence_binding: str
+
+
+PrescribedContinuationAction = Annotated[
+    PrimaryContinuationAction | ReadContinuationAction | ReviewContinuationAction,
+    Field(discriminator="kind"),
+]
+
+
+class _ContinuationAdvisorAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    schema_version: Literal["composer.continuation-decision.v1"]
+    decision: Literal["CONTINUE", "CONTINUE_WITH_LIMITATION", "STOP_CONFIRMED"]
+    scope: Literal["subset", "whole_request"]
+    obligation_ids: tuple[str, ...] = Field(min_length=1)
+    obligations: tuple[ContinuationObligationProposal, ...]
+    evidence: tuple[ContinuationEvidenceRef, ...]
+    reason: str = Field(min_length=1)
+    remaining_actionable_ids: tuple[str, ...]
+    prescribed_action: PrescribedContinuationAction | None
+
+    @model_validator(mode="after")
+    def require_owned_decision_shape(self) -> _ContinuationAdvisorAnswer:
+        _require_unicode_scalars(self.reason)
+        if self.decision == "STOP_CONFIRMED":
+            if self.prescribed_action is not None:
+                raise ValueError("stop decision cannot prescribe an unattempted action")
+            if self.scope == "whole_request" and self.remaining_actionable_ids:
+                raise ValueError("whole-request stop cannot leave actionable work")
+        elif self.prescribed_action is None:
+            raise ValueError("continuation must prescribe a concrete action")
+        return self
+
+
+class ContinuationAdvisorDecision(_ContinuationAdvisorAnswer):
+    decision_id: str = Field(min_length=1)
+
+
+def parse_continuation_advisor_decision(
+    text: str,
+    *,
+    actual_advisor_call_id: str,
+) -> ContinuationAdvisorDecision | None:
+    if not actual_advisor_call_id:
+        raise AuditIntegrityError("continuation decision lacks its actual Advisor call")
+    parsed, error = parse_json_strict(text)
+    if error is not None or type(parsed) is not dict:
+        return None
+    try:
+        answer = _ContinuationAdvisorAnswer.model_validate_json(text)
+        return ContinuationAdvisorDecision(
+            **answer.model_dump(mode="python"),
+            decision_id=actual_advisor_call_id,
+        )
+    except ValidationError:
+        return None
+
+
+class ContinuationAdvisorJSONSchemaFormat(TypedDict):
+    name: Literal["composer_continuation_decision"]
+    strict: Literal[True]
+    schema: dict[str, JsonValue]
+
+
+class ContinuationAdvisorResponseFormat(TypedDict):
+    type: Literal["json_schema"]
+    json_schema: ContinuationAdvisorJSONSchemaFormat
+
+
+def continuation_advisor_response_format() -> ContinuationAdvisorResponseFormat:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "composer_continuation_decision",
+            "strict": True,
+            "schema": _ContinuationAdvisorAnswer.model_json_schema(),
+        },
+    }

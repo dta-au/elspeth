@@ -20,7 +20,7 @@ from sqlalchemy.exc import ProgrammingError
 from tests.fixtures.identities import grant_test_pipeline_user
 from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 from tests.helpers.composer_pg_http import mounted_pg_http_process, pg_http_settings
-from tests.testcontainer.web.test_external_deployment_postgres import _DatabasePair, _identifier
+from tests.testcontainer.web.test_external_deployment_postgres import _DatabasePair
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.web.app import create_app
@@ -164,32 +164,6 @@ def _read(pipe: Connection) -> ComposerProgressSnapshot:
     result = _command(pipe, "read")
     assert isinstance(result, ComposerProgressSnapshot)
     return result
-
-
-@pytest.fixture
-def composer_http_databases(external_deployment_postgres_url: str) -> Iterator[_DatabasePair]:
-    """Separate task-owned databases; owner bootstrap and DDL-denied runtime role."""
-    databases = _DatabasePair(
-        postgres_url=external_deployment_postgres_url,
-        session_database=_identifier("composer_http_session"),
-        landscape_database=_identifier("composer_http_landscape"),
-        runtime_role=_identifier("composer_http_runtime"),
-        runtime_password=uuid4().hex,
-    )
-    assert databases.session_database != databases.landscape_database
-    admin = create_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
-    try:
-        with admin.connect() as connection:
-            for name in (databases.session_database, databases.landscape_database):
-                connection.exec_driver_sql(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)).as_string())
-        yield databases
-    finally:
-        with admin.connect() as connection:
-            for name in (databases.session_database, databases.landscape_database):
-                connection.exec_driver_sql(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)).as_string())
-            if databases.role_created:
-                connection.exec_driver_sql(sql.SQL("DROP ROLE {}").format(sql.Identifier(databases.runtime_role)).as_string())
-        admin.dispose()
 
 
 def test_fastapi_abort_heartbeat_and_reload_share_durable_lifecycle_across_processes(

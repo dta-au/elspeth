@@ -12,21 +12,63 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from enum import IntEnum
 from functools import wraps
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
-from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostRefused, CommonProviderCostRequest
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.quota_authority import ProviderAttempt
+from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkRole, RequiredWorkSource, RequiredWorkTicket
 
 if TYPE_CHECKING:
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _CallModelOutcome
+    from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkIssuer
+    from elspeth.web.composer.continuation_classifier_no_sdk import ClassifierNoSdkIssuer
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
+    from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
+    from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+    from elspeth.web.composer.continuation_semantic_observation import SemanticProviderResponseObservation
+    from elspeth.web.composer.continuation_title_no_sdk import TitleNoSdkIssuer
+    from elspeth.web.composer.provider_result_admission import (
+        V4ProviderResultCompleteness,
+        V4ProviderResultIncomplete,
+        V4ProviderSdkReturn,
+    )
+    from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
+    from elspeth.web.sessions.continuation import PreparedContinuationProvider, StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider, V4CheckpointProviderAdmission
+    from elspeth.web.sessions.continuation_classifier_primary import (
+        ClassifierPrimaryResult,
+        PreparedClassifierPrimaryProvider,
+        V4ClassifierProviderAdmission,
+        VerifiedClassifierPaidOverflowTerminal,
+    )
+    from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+    from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+    from elspeth.web.sessions.continuation_primary import (
+        PrimaryNoSdkRefusalReceipt,
+        PrimaryPaidOverflowTerminal,
+        PrimaryProviderResult,
+        V4PrimaryProviderAdmission,
+    )
+    from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, VerifiedSdkTerminal
+    from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, V4SemanticProviderAdmission
+    from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
+    from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
+    from elspeth.web.sessions.continuation_title_provider import (
+        PreparedTitleProvider,
+        TitleAuditSettlementRequest,
+        V4TitleProviderAdmission,
+    )
     from elspeth.web.sessions.protocol import SessionServiceProtocol
+    from elspeth.web.sessions.service import _ProviderAdmissionRefused
 
 
 def _bind_attempt_call(call: ComposerLLMCall, attempt: ProviderAttempt, admitted_ns: int) -> ComposerLLMCall:
@@ -52,8 +94,53 @@ def _bind_attempt_call(call: ComposerLLMCall, attempt: ProviderAttempt, admitted
 class ProviderInvocationFamily(IntEnum):
     PRIMARY = 0
     ADVISOR = 1
-    PLANNER = 2
+    # 2 was the never-written PLANNER family; values are not renumbered
+    # because the ordinal is part of persisted provider effect keys.
     TITLE = 3
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticV4Finalization:
+    result: SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal
+    deferred_cancellations: tuple[asyncio.CancelledError, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class V4ReturnedIncompleteFinalization:
+    verified: VerifiedPaidIncompleteTerminal
+    deferred_cancellations: tuple[asyncio.CancelledError, ...]
+
+
+class V4PaidIncompleteCommitted(Exception):
+    """Internal bridge from committed custody to the immediate V4 family owner."""
+
+    def __init__(self, finalization: V4ReturnedIncompleteFinalization) -> None:
+        if type(finalization) is not V4ReturnedIncompleteFinalization:
+            raise AuditIntegrityError("Paid incomplete control lacks its verified custody transition")
+        super().__init__("paid_incomplete_committed")
+        self.finalization = finalization
+
+
+@dataclass(frozen=True, slots=True)
+class V4SdkFinalization:
+    verified: VerifiedSdkTerminal
+    deferred_cancellations: tuple[asyncio.CancelledError, ...]
+
+
+class V4SdkTerminalCommitted(Exception):
+    def __init__(self, finalization: V4SdkFinalization) -> None:
+        if type(finalization) is not V4SdkFinalization:
+            raise AuditIntegrityError("SDK terminal control requires its original finalization")
+        super().__init__("sdk_terminal_committed")
+        self.finalization = finalization
+
+
+@dataclass(frozen=True, slots=True)
+class _V4AdmissionProjection[T]:
+    admitted: T
+    deferred_cancellations: tuple[asyncio.CancelledError, ...]
+    original_failure: BaseException | None
+    cold_recovered: bool
 
 
 class ProviderInvocationOwner:
@@ -66,6 +153,7 @@ class ProviderInvocationOwner:
         self._service = service
         self._required_work = required_work
         self._counters = dict.fromkeys(ProviderInvocationFamily, 0)
+        self._cost_budget: CommonProviderCostBudget | None = None
 
     @property
     def service(self) -> SessionServiceProtocol:
@@ -74,6 +162,21 @@ class ProviderInvocationOwner:
     @property
     def required_work(self) -> RequiredWorkBinding:
         return self._required_work
+
+    @property
+    def cost_budget(self) -> CommonProviderCostBudget | None:
+        return self._cost_budget
+
+    def bind_cost_budget(self, budget: CommonProviderCostBudget) -> None:
+        if type(budget) is not CommonProviderCostBudget:
+            raise AuditIntegrityError("provider owner requires nominal request policy")
+        if self._cost_budget is not None:
+            if self._cost_budget is not budget:
+                raise AuditIntegrityError("provider owner cannot replace request policy")
+            return
+        if self._counters[ProviderInvocationFamily.PRIMARY] or self._counters[ProviderInvocationFamily.ADVISOR]:
+            raise AuditIntegrityError("provider policy cannot start after covered invocation")
+        self._cost_budget = budget
 
     def mint(self, family: ProviderInvocationFamily) -> ProviderCallCustody:
         if type(family) is not ProviderInvocationFamily:
@@ -88,7 +191,13 @@ class ProviderInvocationOwner:
             semantic,
             RequiredWorkRole.TITLE if family is ProviderInvocationFamily.TITLE else RequiredWorkRole.TURN,
         )
-        return ProviderCallCustody(service=self.service, context=binding.coordinator.authority.context, required_work=binding)
+        return ProviderCallCustody(
+            service=self.service,
+            context=binding.coordinator.authority.context,
+            required_work=binding,
+            cost_budget=self.cost_budget if family in (ProviderInvocationFamily.PRIMARY, ProviderInvocationFamily.ADVISOR) else None,
+            family=family,
+        )
 
 
 class ProviderCallCustody:
@@ -98,32 +207,501 @@ class ProviderCallCustody:
         "__weakref__",
         "_admitted_ns",
         "_admitting",
+        "_checkpoint_no_sdk_issuer",
+        "_classifier_no_sdk_issuer",
         "_context",
+        "_continuation_classifier_v4_finalizer",
+        "_continuation_classifier_v4_terminal",
+        "_continuation_primary_v4_finalizer",
+        "_continuation_primary_v4_sql_committed",
+        "_continuation_primary_v4_terminal",
+        "_continuation_semantic_v4_finalizer",
+        "_continuation_semantic_v4_sql_committed",
+        "_continuation_semantic_v4_terminal",
+        "_cost_budget",
+        "_cost_response_accountable",
+        "_family",
+        "_primary_no_sdk_issuer",
         "_required_work",
         "_sdk_entered",
+        "_semantic_no_sdk_issuer",
         "_service",
         "_settlements",
+        "_title_no_sdk_issuer",
         "_undispatched_recurrence",
+        "_v4_returned_incomplete_committed",
+        "_v4_returned_incomplete_finalizer",
+        "_v4_sdk_finalizer",
+        "_v4_sdk_return",
+        "_v4_sdk_return_claimed",
         "attempt",
         "call",
+        "continuation_checkpoint_v4",
+        "continuation_checkpoint_v4_admission",
+        "continuation_classifier_v4",
+        "continuation_classifier_v4_admission",
+        "continuation_classifier_v4_deferred_cancellations",
+        "continuation_classifier_v4_no_sdk_result",
+        "continuation_classifier_v4_result",
+        "continuation_primary_clock",
+        "continuation_primary_v4",
+        "continuation_primary_v4_admission",
+        "continuation_primary_v4_deferred_cancellations",
+        "continuation_primary_v4_no_sdk_result",
+        "continuation_primary_v4_result",
+        "continuation_semantic_v4",
+        "continuation_semantic_v4_admission",
+        "continuation_semantic_v4_result",
+        "continuation_title",
+        "continuation_title_result",
+        "continuation_title_selected",
+        "continuation_title_v4_admission",
+        "continuation_title_v4_terminal",
+        "v4_returned_incomplete_result",
+        "v4_sdk_failure",
+        "v4_sdk_terminal_failure",
+        "v4_sdk_terminal_result",
     )
 
-    def __init__(self, *, service: SessionServiceProtocol, context: SessionOperationContext, required_work: RequiredWorkBinding) -> None:
+    def __init__(
+        self,
+        *,
+        service: SessionServiceProtocol,
+        context: SessionOperationContext,
+        required_work: RequiredWorkBinding,
+        cost_budget: CommonProviderCostBudget | None = None,
+        family: ProviderInvocationFamily | None = None,
+    ) -> None:
         if type(required_work) is not RequiredWorkBinding:
             raise AuditIntegrityError("Provider custody requires a nominal explicit binding")
         required_work.validate_context(context)
         if context.operation_kind is not SessionOperationKind.COMPOSE:
             raise AuditIntegrityError("Provider custody requires exact COMPOSE authority")
+        if cost_budget is not None and type(cost_budget) is not CommonProviderCostBudget:
+            raise AuditIntegrityError("provider custody received foreign cost policy")
+        if family is not None and type(family) is not ProviderInvocationFamily:
+            raise AuditIntegrityError("Provider custody family requires its owned nominal discriminator")
+        self._family = family
+        self._cost_budget = cost_budget
+        self._cost_response_accountable = False
         self._service = service
         self._context = context
         self._required_work = required_work
+        self._primary_no_sdk_issuer: PrimaryNoSdkIssuer | None = None
+        self._classifier_no_sdk_issuer: ClassifierNoSdkIssuer | None = None
+        self._checkpoint_no_sdk_issuer: CheckpointNoSdkIssuer | None = None
+        self._semantic_no_sdk_issuer: SemanticAdvisorNoSdkIssuer | None = None
+        self._title_no_sdk_issuer: TitleNoSdkIssuer | None = None
         self.attempt: ProviderAttempt | None = None
         self.call: ComposerLLMCall | None = None
         self._sdk_entered = False
+        self.v4_sdk_failure: V4SdkFailureObservation | None = None
+        self._v4_sdk_finalizer: (
+            Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]] | None
+        ) = None
+        self.v4_sdk_terminal_result: V4SdkFinalization | None = None
+        self.v4_sdk_terminal_failure: SdkTerminalFailure | None = None
         self._admitting = False
         self._admitted_ns = 0
         self._undispatched_recurrence = 0
+        self._v4_sdk_return: V4ProviderSdkReturn | None = None
+        self._v4_sdk_return_claimed = False
+        self._v4_returned_incomplete_finalizer: (
+            Callable[
+                [V4ProviderResultIncomplete, RequiredWorkTicket],
+                Awaitable[RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]],
+            ]
+            | None
+        ) = None
+        self._v4_returned_incomplete_committed = False
+        self.v4_returned_incomplete_result: V4ReturnedIncompleteFinalization | None = None
         self._settlements = 0
+        self.continuation_title: PreparedTitleProvider | None = None
+        self.continuation_primary_clock: ContinuationActionClock | None = None
+        self.continuation_classifier_v4: PreparedClassifierPrimaryProvider | None = None
+        self.continuation_classifier_v4_admission: V4ClassifierProviderAdmission | None = None
+        self.continuation_classifier_v4_result: ClassifierPrimaryResult | VerifiedClassifierPaidOverflowTerminal | None = None
+        self.continuation_classifier_v4_deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
+        self.continuation_classifier_v4_no_sdk_result: ClassifierNoSdkRefusalReceipt | None = None
+        self.continuation_checkpoint_v4_admission: V4CheckpointProviderAdmission | None = None
+        self.continuation_checkpoint_v4: PreparedCheckpointProvider | None = None
+        self._continuation_classifier_v4_finalizer: (
+            Callable[
+                [_CallModelOutcome, RequiredWorkTicket],
+                Awaitable[RequiredSQLFinishOnce[ClassifierPrimaryResult | VerifiedClassifierPaidOverflowTerminal]],
+            ]
+            | None
+        ) = None
+        self._continuation_classifier_v4_terminal = False
+        self.continuation_title_selected: StoredContinuationSnapshot | None = None
+        self.continuation_title_result: TitleAuditSettlementRequest | None = None
+        self.continuation_title_v4_admission: V4TitleProviderAdmission | None = None
+        self.continuation_title_v4_terminal: VerifiedTitlePaidOverflowTerminal | None = None
+        self.continuation_primary_v4: PreparedContinuationProvider | None = None
+        self.continuation_primary_v4_admission: V4PrimaryProviderAdmission | None = None
+        self.continuation_primary_v4_deferred_cancellations: tuple[asyncio.CancelledError, ...] = ()
+        self.continuation_primary_v4_no_sdk_result: PrimaryNoSdkRefusalReceipt | None = None
+        self.continuation_primary_v4_result: PrimaryProviderResult | PrimaryPaidOverflowTerminal | None = None
+        self._continuation_primary_v4_finalizer: (
+            Callable[
+                [_CallModelOutcome, RequiredWorkTicket],
+                Awaitable[RequiredSQLFinishOnce[PrimaryProviderResult | PrimaryPaidOverflowTerminal]],
+            ]
+            | None
+        ) = None
+        self._continuation_primary_v4_sql_committed = False
+        self._continuation_primary_v4_terminal = False
+        self.continuation_semantic_v4: PreparedContinuationProvider | None = None
+        self.continuation_semantic_v4_admission: V4SemanticProviderAdmission | None = None
+        self.continuation_semantic_v4_result: SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal | None = None
+        self._continuation_semantic_v4_finalizer: (
+            Callable[
+                [SemanticProviderResponseObservation, RequiredWorkTicket],
+                Awaitable[RequiredSQLFinishOnce[SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal]],
+            ]
+            | None
+        ) = None
+        self._continuation_semantic_v4_sql_committed = False
+        self._continuation_semantic_v4_terminal = False
+
+    def bind_continuation_title(self, prepared: PreparedTitleProvider) -> None:
+        from elspeth.web.composer.continuation_clock import ContinuationActionClock
+        from elspeth.web.sessions.continuation_title_provider import PreparedTitleProvider
+
+        if (
+            type(prepared) is not PreparedTitleProvider
+            or self.continuation_title is not None
+            or self.attempt is not None
+            or self.required_work.role is not RequiredWorkRole.TITLE
+            or self.required_work.semantic_ordinal != 6
+            or self._cost_budget is not None
+            or type(prepared.clock) is not ContinuationActionClock
+            or prepared.work.coordinator is not self.required_work.coordinator
+            or prepared.work.transition_ordinal != self.required_work.transition_ordinal
+            or prepared.running.session_operation_context is not self.context
+            or prepared.composer._require_sessions_service() is not self.service
+        ):
+            raise AuditIntegrityError("Durable TITLE requires its actual first family-3 invocation and original context")
+        self.continuation_title = prepared
+        self.continuation_title_selected = prepared.selected
+
+    def bind_title_no_sdk_issuer(self, issuer: TitleNoSdkIssuer) -> None:
+        from elspeth.web.composer.continuation_title_no_sdk import TitleNoSdkIssuer
+
+        if (
+            type(issuer) is not TitleNoSdkIssuer
+            or self._title_no_sdk_issuer is not None
+            or self.continuation_title is not issuer.prepared
+            or self.attempt is not None
+            or self.call is not None
+        ):
+            raise AuditIntegrityError("TITLE no-SDK issuer lost its original prepared custody")
+        issuer.bind_custody(self)
+        self._title_no_sdk_issuer = issuer
+
+    def note_v4_title_complete(self, result: TitleAuditSettlementRequest) -> None:
+        from elspeth.web.sessions.continuation_title_provider import TitleAuditSettlementRequest
+
+        prepared, admission = self.continuation_title, self.continuation_title_v4_admission
+        if (
+            type(result) is not TitleAuditSettlementRequest
+            or prepared is None
+            or admission is None
+            or result.running is not prepared.running
+            or self.attempt is not admission.attempt
+            or not self._sdk_entered
+            or self.call is None
+            or self.call.status is not ComposerLLMCallStatus.SUCCESS
+            or result.audit_call != self.call
+            or result.selected == admission.selected
+            or self.continuation_title_v4_terminal is not None
+            or self.continuation_title_result is not None
+        ):
+            raise AuditIntegrityError("V4 TITLE complete result changed its original paid admission or settled root")
+        self.continuation_title_result = replace(result, audit_call=self.call)
+        self.continuation_title_selected = result.selected
+        self.attempt = None
+        self.call = None
+        self._sdk_entered = False
+
+    def note_v4_title_terminal(self, result: VerifiedTitlePaidOverflowTerminal) -> None:
+        from elspeth.web.sessions.continuation_title_paid_overflow_terminal import VerifiedTitlePaidOverflowTerminal
+
+        admission = self.continuation_title_v4_admission
+        if (
+            type(result) is not VerifiedTitlePaidOverflowTerminal
+            or admission is None
+            or self.attempt is not admission.attempt
+            or not self._sdk_entered
+            or self.call is None
+            or self.call.status is not ComposerLLMCallStatus.SUCCESS
+            or result.source != admission.hold
+            or result.provider_attempt_id != admission.attempt.attempt_id
+            or result.receipt.identity.attempt_id != admission.attempt.attempt_id
+            or result.receipt.identity.effect_key != admission.hold.effect_key
+            or result.hold_state != "consumed"
+            or self.continuation_title_result is not None
+            or self.continuation_title_v4_terminal is not None
+        ):
+            raise AuditIntegrityError("V4 TITLE terminal result changed its original paid admission or cold hold proof")
+        self.continuation_title_v4_terminal = result
+        self.continuation_title_selected = result.terminal
+        self.attempt = None
+        self.call = None
+        self._sdk_entered = False
+
+    def bind_continuation_primary_clock(self, clock: ContinuationActionClock) -> None:
+        from elspeth.web.composer.continuation_clock import ContinuationActionClock
+
+        if (
+            type(clock) is not ContinuationActionClock
+            or self.continuation_title is not None
+            or self.continuation_primary_clock is not None
+            or self.attempt is not None
+            or self.required_work.role is not RequiredWorkRole.TURN
+        ):
+            raise AuditIntegrityError("PRIMARY timing requires its original pre-dispatch action owner")
+        self.continuation_primary_clock = clock
+
+    def bind_primary_no_sdk_issuer(self, issuer: PrimaryNoSdkIssuer) -> None:
+        from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
+
+        if (
+            type(issuer) is not PrimaryNoSdkIssuer
+            or self._primary_no_sdk_issuer is not None
+            or self.continuation_primary_clock is not issuer.clock
+            or self.attempt is not None
+        ):
+            raise AuditIntegrityError("PRIMARY no-SDK issuer requires original unentered physical custody")
+        issuer.bind_custody(self)
+        self._primary_no_sdk_issuer = issuer
+
+    def bind_continuation_primary_v4(
+        self,
+        prepared: PreparedContinuationProvider,
+        finalizer: Callable[
+            [_CallModelOutcome, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[PrimaryProviderResult | PrimaryPaidOverflowTerminal]]
+        ],
+    ) -> None:
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.service import SessionServiceImpl
+
+        if (
+            type(prepared) is not PreparedContinuationProvider
+            or type(self.service) is not SessionServiceImpl
+            or self.family is not ProviderInvocationFamily.PRIMARY
+            or self.required_work.role is not RequiredWorkRole.TURN
+            or self._primary_no_sdk_issuer is None
+            or self.continuation_primary_clock is not self._primary_no_sdk_issuer.clock
+            or prepared.binding.running.session_operation_context is not self.context
+            or self.continuation_primary_v4 is not None
+            or self.attempt is not None
+            or not callable(finalizer)
+        ):
+            raise AuditIntegrityError("V4 PRIMARY requires its original prepared, timed and unentered custody")
+        self.continuation_primary_v4 = prepared
+        self._continuation_primary_v4_finalizer = finalizer
+
+    def bind_classifier_no_sdk_issuer(self, issuer: ClassifierNoSdkIssuer) -> None:
+        from elspeth.web.composer.continuation_classifier_no_sdk import ClassifierNoSdkIssuer
+
+        if (
+            type(issuer) is not ClassifierNoSdkIssuer
+            or self.family is not ProviderInvocationFamily.PRIMARY
+            or self.continuation_primary_clock is not issuer.clock
+            or self._classifier_no_sdk_issuer is not None
+            or self._primary_no_sdk_issuer is not None
+            or self._semantic_no_sdk_issuer is not None
+            or self.continuation_title is not None
+            or self.attempt is not None
+        ):
+            raise AuditIntegrityError("Classifier no-SDK issuer requires its original timed PRIMARY custody")
+        issuer.bind_custody(self)
+        self._classifier_no_sdk_issuer = issuer
+
+    def bind_continuation_checkpoint_v4(self, prepared: PreparedCheckpointProvider, issuer: CheckpointNoSdkIssuer) -> None:
+        from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkIssuer
+        from elspeth.web.sessions.continuation_checkpoint_paid import PreparedCheckpointProvider
+        from elspeth.web.sessions.service import SessionServiceImpl
+
+        if (
+            type(prepared) is not PreparedCheckpointProvider
+            or type(issuer) is not CheckpointNoSdkIssuer
+            or issuer.prepared is not prepared
+            or issuer.clock is not prepared.clock
+            or type(self.service) is not SessionServiceImpl
+            or self.family is not ProviderInvocationFamily.ADVISOR
+            or self.required_work.role is not RequiredWorkRole.TURN
+            or prepared.work is not self.required_work
+            or prepared.running.session_operation_context is not self.context
+            or self.continuation_checkpoint_v4 is not None
+            or self.continuation_semantic_v4 is not None
+            or self.continuation_primary_v4 is not None
+            or self.continuation_classifier_v4 is not None
+            or self.continuation_title is not None
+            or self.attempt is not None
+        ):
+            raise AuditIntegrityError("V4 checkpoint custody requires its original prepared ADVISOR invocation")
+        issuer.require_original_clock()
+        issuer.bind_custody(self)
+        self.continuation_checkpoint_v4 = prepared
+        self._checkpoint_no_sdk_issuer = issuer
+
+    def bind_continuation_classifier_v4(
+        self,
+        prepared: PreparedClassifierPrimaryProvider,
+        finalizer: Callable[
+            [_CallModelOutcome, RequiredWorkTicket],
+            Awaitable[RequiredSQLFinishOnce[ClassifierPrimaryResult | VerifiedClassifierPaidOverflowTerminal]],
+        ],
+    ) -> None:
+        from elspeth.web.sessions.continuation_classifier_primary import PreparedClassifierPrimaryProvider
+        from elspeth.web.sessions.service import SessionServiceImpl
+
+        if (
+            type(prepared) is not PreparedClassifierPrimaryProvider
+            or type(self.service) is not SessionServiceImpl
+            or self.family is not ProviderInvocationFamily.PRIMARY
+            or self.required_work.role is not RequiredWorkRole.TURN
+            or self._classifier_no_sdk_issuer is None
+            or prepared.prepared.binding.running.session_operation_context is not self.context
+            or self.continuation_primary_v4 is not None
+            or self.continuation_classifier_v4 is not None
+            or self.attempt is not None
+            or not callable(finalizer)
+        ):
+            raise AuditIntegrityError("V4 classifier requires its original prepared, timed and unentered custody")
+        self.continuation_classifier_v4 = prepared
+        self._continuation_classifier_v4_finalizer = finalizer
+
+    @property
+    def family(self) -> ProviderInvocationFamily | None:
+        return self._family
+
+    @property
+    def continuation_checkpoint_clock(self) -> ContinuationActionClock | None:
+        issuer = self._checkpoint_no_sdk_issuer
+        if issuer is None:
+            return None
+        if self.family is not ProviderInvocationFamily.ADVISOR or self.continuation_checkpoint_v4 is not issuer.prepared:
+            raise AuditIntegrityError("Checkpoint timing requires its original prepared ADVISOR custody")
+        issuer.require_original_clock()
+        return issuer.clock
+
+    @property
+    def continuation_semantic_clock(self) -> ContinuationActionClock | None:
+        issuer = self._semantic_no_sdk_issuer
+        if issuer is None:
+            return None
+        if self.family is not ProviderInvocationFamily.ADVISOR:
+            raise AuditIntegrityError("Semantic timing requires its nominal ADVISOR mint family")
+        issuer.require_original_clock()
+        return issuer.clock
+
+    def bind_semantic_no_sdk_issuer(self, issuer: SemanticAdvisorNoSdkIssuer) -> None:
+        from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
+
+        if (
+            type(issuer) is not SemanticAdvisorNoSdkIssuer
+            or self.family is not ProviderInvocationFamily.ADVISOR
+            or self._semantic_no_sdk_issuer is not None
+            or self._primary_no_sdk_issuer is not None
+            or self.continuation_primary_clock is not None
+            or self.continuation_title is not None
+            or self.continuation_semantic_clock is not None
+            or self.attempt is not None
+        ):
+            raise AuditIntegrityError("Semantic timing and no-SDK authority require original ADVISOR custody")
+        issuer.bind_custody(self)
+        self._semantic_no_sdk_issuer = issuer
+
+    def bind_continuation_semantic_v4(
+        self,
+        prepared: PreparedContinuationProvider,
+        finalizer: Callable[
+            [SemanticProviderResponseObservation, RequiredWorkTicket],
+            Awaitable[RequiredSQLFinishOnce[SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal]],
+        ],
+    ) -> None:
+        from elspeth.web.sessions.continuation import PreparedContinuationProvider
+        from elspeth.web.sessions.service import SessionServiceImpl
+
+        if (
+            type(prepared) is not PreparedContinuationProvider
+            or type(self.service) is not SessionServiceImpl
+            or self.family is not ProviderInvocationFamily.ADVISOR
+            or self.required_work.role is not RequiredWorkRole.TURN
+            or self._semantic_no_sdk_issuer is None
+            or prepared.binding.running.session_operation_context is not self.context
+            or self.continuation_primary_v4 is not None
+            or self.continuation_semantic_v4 is not None
+            or self.continuation_title is not None
+            or self.attempt is not None
+            or not callable(finalizer)
+        ):
+            raise AuditIntegrityError("V4 semantic custody requires its original prepared and unentered ADVISOR source")
+        self.continuation_semantic_v4 = prepared
+        self._continuation_semantic_v4_finalizer = finalizer
+
+    async def retain_continuation_title(self, completion: _AdmittedLLMCompletion) -> None:
+        from elspeth.web.composer.continuation_title_provider import retain_current_title_success
+
+        if self.continuation_title is None or self.call is None or not self._sdk_entered:
+            raise AuditIntegrityError("TITLE retention requires its actual physical success and original audit")
+        _, cancellations = await self._join(retain_current_title_success(self, completion))
+        self.raise_deferred_cancellations(cancellations)
+
+    def prepare_cost_request(self, kwargs: CommonProviderCostRequest) -> None:
+        if self._cost_budget is not None:
+            self._cost_budget.prepare_request(kwargs)
+
+    def cost_completion_limit(self) -> int | None:
+        if self._cost_budget is None:
+            return None
+        policy = self._cost_budget.snapshot().policy
+        return policy.max_completion_tokens if policy is not None else None
+
+    @property
+    def has_cost_budget(self) -> bool:
+        return self._cost_budget is not None
+
+    def require_cost_dispatch(self) -> None:
+        if self._cost_budget is not None:
+            self._cost_budget.require_dispatch()
+
+    def require_cost_output(self) -> None:
+        if (
+            self._v4_returned_incomplete_committed
+            or self.v4_sdk_terminal_result is not None
+            or self._continuation_primary_v4_terminal
+            or self._continuation_classifier_v4_terminal
+            or self._continuation_semantic_v4_terminal
+        ):
+            # The paid/incomplete terminal records the original known or
+            # unknown charge. It must not become a second cost refusal.
+            return
+        if (
+            self.attempt is not None
+            and self._sdk_entered
+            and (
+                self.continuation_primary_v4 is not None
+                or self.continuation_classifier_v4_admission is not None
+                or self.continuation_checkpoint_v4_admission is not None
+                or self.continuation_title_v4_admission is not None
+                or self.continuation_semantic_v4_admission is not None
+            )
+        ):
+            # A V4 result has no valid ordinary settlement until its own
+            # complete, overflow, or failure disposition commits. Preserve
+            # the original pending physical attempt and hold on failure.
+            return
+        if self._cost_budget is not None:
+            self._cost_budget.require_output()
+
+    def mark_cost_response_accountable(self, *, admitted_metadata: bool) -> None:
+        if type(admitted_metadata) is not bool or self.attempt is None or not self._sdk_entered:
+            raise AuditIntegrityError("response accountability requires actual dispatched custody")
+        self._cost_response_accountable = admitted_metadata
 
     @property
     def service(self) -> SessionServiceProtocol:
@@ -137,8 +715,8 @@ class ProviderCallCustody:
     def required_work(self) -> RequiredWorkBinding:
         return self._required_work
 
-    async def _join[R](self, operation: Coroutine[Any, Any, R]) -> tuple[R, tuple[asyncio.CancelledError, ...]]:
-        task = asyncio.create_task(operation)
+    async def _join[R](self, operation: Awaitable[R]) -> tuple[R, tuple[asyncio.CancelledError, ...]]:
+        task = asyncio.ensure_future(operation)
         cancellations: list[asyncio.CancelledError] = []
         while not task.done():
             try:
@@ -181,6 +759,71 @@ class ProviderCallCustody:
                 raise retained from failure
             raise
 
+    async def _v4_admission_result[R](
+        self,
+        operation: Coroutine[Any, Any, RequiredSQLFinishOnce[R | _ProviderAdmissionRefused]],
+        *,
+        admission_projection: RequiredWorkTicket,
+        readback: Callable[[RequiredWorkTicket], Coroutine[Any, Any, RequiredSQLFinishOnce[R | None]]] | None,
+    ) -> _V4AdmissionProjection[R]:
+        from elspeth.web.sessions.service import _ProviderAdmissionRefused
+
+        physical, outer = await self._join(operation)
+        if type(physical) is RequiredSQLRaised:
+            admission_projection.complete_without_submission()
+            read_failure: BaseException | None = None
+            recovered: R | None = None
+            read_deferred: tuple[asyncio.CancelledError, ...] = ()
+            if readback is not None:
+                read_sql, read_projection = self.required_work.reserve_pair(
+                    RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION
+                )
+                try:
+                    observed, read_outer = await self._join(readback(read_sql))
+                except BaseException as error:
+                    if read_sql.complete:
+                        read_projection.complete_without_submission()
+                    read_failure = error
+                else:
+                    if type(observed) is RequiredSQLRaised:
+                        read_projection.complete_without_submission()
+                        read_failure = observed.error
+                        read_deferred = (*observed.deferred_cancellations, *read_outer)
+                    elif type(observed) is RequiredSQLReturned:
+                        read_projection.begin_projection()
+                        read_projection.complete_owned()
+                        recovered = observed.value
+                        read_deferred = (*observed.deferred_cancellations, *read_outer)
+                    else:
+                        read_failure = AuditIntegrityError("V4 admission cold read lost its actual required SQL outcome")
+            failures: list[BaseException] = [physical.error]
+            if read_failure is not None and all(read_failure is not prior for prior in failures):
+                failures.append(read_failure)
+            deferred: list[asyncio.CancelledError] = []
+            for cancellation in (*physical.deferred_cancellations, *outer, *read_deferred):
+                if all(cancellation is not prior for prior in failures):
+                    failures.append(cancellation)
+                if all(cancellation is not prior for prior in deferred):
+                    deferred.append(cancellation)
+            if recovered is not None and read_failure is None:
+                return _V4AdmissionProjection(recovered, tuple(deferred), physical.error, True)
+            if len(failures) == 1:
+                raise physical.error
+            raise BaseExceptionGroup("V4 provider admission SQL and original cancellations", failures)
+        if type(physical) is not RequiredSQLReturned:
+            raise AuditIntegrityError("V4 provider admission lost its actual required SQL outcome")
+        returned_deferred: list[asyncio.CancelledError] = []
+        for cancellation in (*physical.deferred_cancellations, *outer):
+            if all(cancellation is not prior for prior in returned_deferred):
+                returned_deferred.append(cancellation)
+        if type(physical.value) is _ProviderAdmissionRefused:
+            if returned_deferred:
+                raise BaseExceptionGroup(
+                    "V4 provider quota refusal and original cancellations", [physical.value.refusal, *returned_deferred]
+                )
+            raise physical.value.refusal
+        return _V4AdmissionProjection(cast("R", physical.value), tuple(returned_deferred), None, False)
+
     def raise_deferred_cancellations(self, cancellations: tuple[asyncio.CancelledError, ...]) -> None:
         if len(cancellations) == 1:
             raise cancellations[0]
@@ -195,6 +838,15 @@ class ProviderCallCustody:
     async def _cancel_undispatched(self, *, model: str) -> tuple[asyncio.CancelledError, ...]:
         if self.attempt is None or self._sdk_entered:
             raise AuditIntegrityError("Undispatched disposition lacks exact no-SDK attempt evidence")
+        if (
+            self.continuation_primary_v4_admission is not None
+            or self.continuation_classifier_v4_admission is not None
+            or self.continuation_checkpoint_v4_admission is not None
+            or self.continuation_semantic_v4_admission is not None
+            or self.continuation_title_v4_admission is not None
+        ):
+            raise AuditIntegrityError("V4 undispatched hold requires its composite SQL disposition")
+        admitted = self.attempt
         binding = self.required_work
         ticket = binding.coordinator.reserve(
             RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,
@@ -211,6 +863,10 @@ class ProviderCallCustody:
                 required_work=ticket,
             )
         )
+        if self._primary_no_sdk_issuer is not None:
+            self._primary_no_sdk_issuer.note_undispatched_cancel(self, admitted, model=model)
+        if self._semantic_no_sdk_issuer is not None:
+            self._semantic_no_sdk_issuer.note_undispatched_cancel(self, admitted, model=model)
         self.attempt = None
         self.call = None
         return cancellations
@@ -225,36 +881,229 @@ class ProviderCallCustody:
         self._admitting = True
         try:
             await self.settle()
+            self.require_cost_dispatch()
+            self._cost_response_accountable = False
             title = self.required_work.role is RequiredWorkRole.TITLE
             sql, projection = self.required_work.reserve_pair(
                 RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL if title else RequiredWorkSource.PROVIDER_ADMISSION_SQL,
                 RequiredWorkSource.TITLE_PROVIDER_ADMISSION_PROJECTION if title else RequiredWorkSource.PROVIDER_ADMISSION_PROJECTION,
             )
+            cold_recovered = False
+            recovered_failure: BaseException | None = None
             try:
-                attempt, cancellations = await self._join(
-                    self.service.begin_provider_attempt(
-                        session_operation_context=self.context,
-                        source="auto_title" if title else "composer",
-                        required_work=sql,
+                if self.continuation_checkpoint_v4 is not None:
+                    from elspeth.web.async_workers import run_required_sql_finish_once
+                    from elspeth.web.sessions.continuation_checkpoint_paid import V4CheckpointProviderAdmission
+                    from elspeth.web.sessions.service import SessionServiceImpl
+
+                    checkpoint_service = self.service
+                    checkpoint_prepared = self.continuation_checkpoint_v4
+                    if type(checkpoint_service) is not SessionServiceImpl or self._checkpoint_no_sdk_issuer is None:
+                        raise AuditIntegrityError("V4 checkpoint admission requires its actual session and no-SDK owners")
+                    checkpoint_outcome, checkpoint_outer = await self._join(
+                        run_required_sql_finish_once(
+                            sql,
+                            checkpoint_service.begin_v4_checkpoint_provider_attempt_sync,
+                            prepared=checkpoint_prepared,
+                            requested_model=model,
+                        )
                     )
-                )
+                    if type(checkpoint_outcome) is RequiredSQLRaised:
+                        projection.complete_without_submission()
+                        checkpoint_failures: list[BaseException] = [checkpoint_outcome.error]
+                        checkpoint_failures.extend((*checkpoint_outcome.deferred_cancellations, *checkpoint_outer))
+                        if len(checkpoint_failures) == 1:
+                            raise checkpoint_outcome.error
+                        raise BaseExceptionGroup("V4 checkpoint admission SQL and original cancellations", checkpoint_failures)
+                    if type(checkpoint_outcome) is not RequiredSQLReturned:
+                        raise AuditIntegrityError("V4 checkpoint admission lost its actual required SQL outcome")
+                    checkpoint_admitted = checkpoint_outcome.value
+                    if type(checkpoint_admitted) is not V4CheckpointProviderAdmission:
+                        raise AuditIntegrityError("V4 checkpoint admission lost its exact physical and hold result")
+                    attempt = checkpoint_admitted.attempt
+                    cancellations = (*checkpoint_outcome.deferred_cancellations, *checkpoint_outer)
+                elif self.continuation_classifier_v4 is not None:
+                    from elspeth.web.sessions.continuation_classifier_primary import V4ClassifierProviderAdmission
+                    from elspeth.web.sessions.service import SessionServiceImpl
+
+                    classifier_service = self.service
+                    classifier_prepared = self.continuation_classifier_v4
+                    classifier_issuer = self._classifier_no_sdk_issuer
+                    if type(classifier_service) is not SessionServiceImpl or classifier_issuer is None:
+                        raise AuditIntegrityError("V4 classifier admission requires its actual session and no-SDK owners")
+                    classifier_projected = await self._v4_admission_result(
+                        classifier_service.begin_v4_continuation_classifier_attempt(
+                            prepared=classifier_prepared,
+                            requested_model=model,
+                            no_sdk_issuer=classifier_issuer,
+                            required_work=sql,
+                        ),
+                        admission_projection=projection,
+                        readback=lambda read_sql: classifier_service.read_v4_continuation_classifier_admission(
+                            prepared=classifier_prepared,
+                            no_sdk_issuer=classifier_issuer,
+                            required_work=read_sql,
+                        ),
+                    )
+                    classifier_admitted = classifier_projected.admitted
+                    cancellations = classifier_projected.deferred_cancellations
+                    cold_recovered = classifier_projected.cold_recovered
+                    recovered_failure = classifier_projected.original_failure
+                    if type(classifier_admitted) is not V4ClassifierProviderAdmission:
+                        raise AuditIntegrityError("V4 classifier admission lost its exact physical and hold result")
+                    classifier_issuer.bind_dispatched(classifier_admitted.dispatched)
+                    attempt = classifier_admitted.attempt
+                    self.continuation_classifier_v4_admission = classifier_admitted
+                elif self.continuation_primary_v4 is not None:
+                    from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission
+                    from elspeth.web.sessions.service import SessionServiceImpl
+
+                    primary_service = self.service
+                    primary_prepared = self.continuation_primary_v4
+                    primary_issuer = self._primary_no_sdk_issuer
+                    if type(primary_service) is not SessionServiceImpl or primary_issuer is None:
+                        raise AuditIntegrityError("V4 PRIMARY admission requires its actual session and no-SDK owners")
+                    primary_projected = await self._v4_admission_result(
+                        primary_service.begin_v4_continuation_primary_attempt(
+                            prepared=primary_prepared,
+                            requested_model=model,
+                            no_sdk_issuer=primary_issuer,
+                            required_work=sql,
+                        ),
+                        admission_projection=projection,
+                        readback=lambda read_sql: primary_service.read_v4_continuation_primary_admission(
+                            prepared=primary_prepared,
+                            required_work=read_sql,
+                        ),
+                    )
+                    primary_admitted = primary_projected.admitted
+                    cancellations = primary_projected.deferred_cancellations
+                    cold_recovered = primary_projected.cold_recovered
+                    recovered_failure = primary_projected.original_failure
+                    if type(primary_admitted) is not V4PrimaryProviderAdmission:
+                        raise AuditIntegrityError("V4 PRIMARY admission lost its exact physical and hold result")
+                    if cold_recovered:
+                        primary_issuer.bind_cold_recovered_dispatched(primary_admitted.selected)
+                    else:
+                        primary_issuer.bind_dispatched(primary_admitted.selected)
+                    attempt = primary_admitted.attempt
+                    self.continuation_primary_v4_admission = primary_admitted
+                elif self.continuation_semantic_v4 is not None:
+                    from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission
+                    from elspeth.web.sessions.service import SessionServiceImpl
+
+                    semantic_service = self.service
+                    semantic_prepared = self.continuation_semantic_v4
+                    semantic_issuer = self._semantic_no_sdk_issuer
+                    if type(semantic_service) is not SessionServiceImpl or semantic_issuer is None:
+                        raise AuditIntegrityError("V4 semantic admission requires its actual session and no-SDK owners")
+                    semantic_projected = await self._v4_admission_result(
+                        semantic_service.begin_v4_continuation_semantic_attempt(
+                            prepared=semantic_prepared,
+                            requested_model=model,
+                            no_sdk_issuer=semantic_issuer,
+                            required_work=sql,
+                        ),
+                        admission_projection=projection,
+                        readback=lambda read_sql: semantic_service.read_v4_continuation_semantic_admission(
+                            prepared=semantic_prepared,
+                            no_sdk_issuer=semantic_issuer,
+                            required_work=read_sql,
+                        ),
+                    )
+                    semantic_admitted = semantic_projected.admitted
+                    cancellations = semantic_projected.deferred_cancellations
+                    cold_recovered = semantic_projected.cold_recovered
+                    recovered_failure = semantic_projected.original_failure
+                    if type(semantic_admitted) is not V4SemanticProviderAdmission:
+                        raise AuditIntegrityError("V4 semantic admission lost its exact physical and hold result")
+                    semantic_issuer.bind_dispatched(semantic_admitted.selected)
+                    attempt = semantic_admitted.attempt
+                    self.continuation_semantic_v4_admission = semantic_admitted
+                elif self.continuation_title is None:
+                    attempt, cancellations = await self._join(
+                        self.service.begin_provider_attempt(
+                            session_operation_context=self.context,
+                            source="auto_title" if title else "composer",
+                            required_work=sql,
+                        )
+                    )
+                else:
+                    from elspeth.web.sessions.continuation_title_provider import V4TitleProviderAdmission
+                    from elspeth.web.sessions.service import SessionServiceImpl
+
+                    title_service = self.service
+                    title_prepared = self.continuation_title
+                    if type(title_service) is not SessionServiceImpl or self._title_no_sdk_issuer is None:
+                        raise AuditIntegrityError("TITLE admission requires its actual sessions and no-SDK owners")
+                    if title_prepared is None:
+                        raise AuditIntegrityError("TITLE admission lost its original prepared producer")
+                    title_projected = await self._v4_admission_result(
+                        title_service.begin_v4_continuation_title_attempt(
+                            prepared=title_prepared, requested_model=model, required_work=sql
+                        ),
+                        admission_projection=projection,
+                        readback=lambda read_sql: title_service.read_v4_continuation_title_admission(
+                            prepared=title_prepared, required_work=read_sql
+                        ),
+                    )
+                    title_admitted = title_projected.admitted
+                    cancellations = title_projected.deferred_cancellations
+                    cold_recovered = title_projected.cold_recovered
+                    recovered_failure = title_projected.original_failure
+                    if type(title_admitted) is not V4TitleProviderAdmission:
+                        raise AuditIntegrityError("V4 TITLE admission lost its original held physical result")
+                    attempt = title_admitted.attempt
+                    self.continuation_title_selected = title_admitted.selected
+                    self.continuation_title_v4_admission = title_admitted
             except BaseException:
-                if sql.complete:
+                if sql.complete and not projection.complete:
                     projection.complete_without_submission()
                 raise
-            projection.begin_projection()
+            if not cold_recovered:
+                projection.begin_projection()
             try:
                 if type(attempt) is not ProviderAttempt:
                     raise AuditIntegrityError("Provider admission returned a foreign attempt")
                 self.attempt = attempt
+                if self._title_no_sdk_issuer is not None:
+                    title_v4_admission = self.continuation_title_v4_admission
+                    if title_v4_admission is None:
+                        raise AuditIntegrityError("TITLE no-SDK issuer requires the original V4 physical hold")
+                    self._title_no_sdk_issuer.bind_admission(self, title_v4_admission, observed_model=model)
+                if self.continuation_checkpoint_v4 is not None:
+                    self.continuation_checkpoint_v4_admission = checkpoint_admitted
+                    if self._checkpoint_no_sdk_issuer is None:
+                        raise AuditIntegrityError("V4 checkpoint admission lost its original no-SDK owner")
+                    self._checkpoint_no_sdk_issuer.bind_admission(self, checkpoint_admitted, observed_model=model)
+                if self._primary_no_sdk_issuer is not None:
+                    self._primary_no_sdk_issuer.note_admitted_attempt(self, attempt, model=model)
+                if self._classifier_no_sdk_issuer is not None:
+                    self._classifier_no_sdk_issuer.note_admitted_attempt(self, attempt, model=model)
+                if self._semantic_no_sdk_issuer is not None:
+                    self._semantic_no_sdk_issuer.note_admitted_attempt(self, attempt, model=model)
                 self._admitted_ns = time.monotonic_ns()
                 self.call = None
                 self._sdk_entered = False
             except BaseException as failure:
-                projection.complete_owned(failure)
+                if not cold_recovered:
+                    projection.complete_owned(failure)
                 raise
-            projection.complete_owned()
+            if not cold_recovered:
+                projection.complete_owned()
+            if recovered_failure is not None:
+                failures: list[BaseException] = [recovered_failure]
+                for cancellation in cancellations:
+                    if all(cancellation is not prior for prior in failures):
+                        failures.append(cancellation)
+                if len(failures) == 1:
+                    raise recovered_failure
+                raise BaseExceptionGroup("V4 recovered admission and original cancellations", failures)
             if cancellations:
+                if self.has_v4_unentered_hold():
+                    # The original V4 hold needs its own zero-use SQL
+                    # disposition; preserve the cancellation for that owner.
+                    self.raise_deferred_cancellations(cancellations)
                 additional = await self._cancel_undispatched(model=model)
                 self.raise_deferred_cancellations((*cancellations, *additional))
         finally:
@@ -263,7 +1112,376 @@ class ProviderCallCustody:
     def mark_sdk_entered(self) -> None:
         if self.attempt is None or self._sdk_entered or self.call is not None:
             raise AuditIntegrityError("Physical provider dispatch lacks exact admitted custody")
+        if self._primary_no_sdk_issuer is not None:
+            self._primary_no_sdk_issuer.mark_sdk_entered(self)
+        if self._classifier_no_sdk_issuer is not None:
+            self._classifier_no_sdk_issuer.note_sdk_entry(self)
+        if self._semantic_no_sdk_issuer is not None:
+            self._semantic_no_sdk_issuer.mark_sdk_entered(self)
+        if self._title_no_sdk_issuer is not None:
+            self._title_no_sdk_issuer.note_sdk_entry(self)
+        if self._cost_budget is not None:
+            self._cost_budget.dispatched()
         self._sdk_entered = True
+
+    def has_undispatched_attempt(self) -> bool:
+        return self.attempt is not None and not self._sdk_entered
+
+    def has_v4_unentered_hold(self) -> bool:
+        attempt = self.attempt
+        return (
+            attempt is not None
+            and not self._sdk_entered
+            and (
+                (self.continuation_primary_v4_admission is not None and attempt is self.continuation_primary_v4_admission.attempt)
+                or (self.continuation_classifier_v4_admission is not None and attempt is self.continuation_classifier_v4_admission.attempt)
+                or (self.continuation_checkpoint_v4_admission is not None and attempt is self.continuation_checkpoint_v4_admission.attempt)
+                or (self.continuation_semantic_v4_admission is not None and attempt is self.continuation_semantic_v4_admission.attempt)
+                or (self.continuation_title_v4_admission is not None and attempt is self.continuation_title_v4_admission.attempt)
+            )
+        )
+
+    def requires_v4_original_result(self) -> bool:
+        """Select original SDK-return admission from this exact entered V4 attempt."""
+        admissions = tuple(
+            admission
+            for admission in (
+                self.continuation_checkpoint_v4_admission,
+                self.continuation_classifier_v4_admission,
+                self.continuation_primary_v4_admission,
+                self.continuation_semantic_v4_admission,
+                self.continuation_title_v4_admission,
+            )
+            if admission is not None
+        )
+        if not admissions:
+            if any(
+                prepared is not None
+                for prepared in (
+                    self.continuation_checkpoint_v4,
+                    self.continuation_classifier_v4,
+                    self.continuation_primary_v4,
+                    self.continuation_semantic_v4,
+                )
+            ):
+                raise AuditIntegrityError("V4 provider SDK return lacks its original admitted physical attempt")
+            return False
+        if len(admissions) != 1 or self.attempt is not admissions[0].attempt or not self._sdk_entered:
+            raise AuditIntegrityError("V4 provider SDK return changed its original paid attempt")
+        return True
+
+    def bind_v4_sdk_finalizer(
+        self,
+        callback: Callable[[V4SdkFailureObservation, RequiredWorkTicket], Awaitable[RequiredSQLFinishOnce[VerifiedSdkTerminal]]],
+    ) -> None:
+        if self._v4_sdk_finalizer is not None or not callable(callback) or self.attempt is not None:
+            raise AuditIntegrityError("SDK finalizer requires one original pre-admission owner")
+        self._v4_sdk_finalizer = callback
+
+    def has_v4_sdk_finalizer(self) -> bool:
+        return self._v4_sdk_finalizer is not None
+
+    async def finalize_v4_sdk_failure(self, observation: V4SdkFailureObservation, *, preserve_sdk_cancellation: bool) -> V4SdkFinalization:
+        from elspeth.web.composer.provider_sdk_observation import forget_v4_sdk_failure, require_original_v4_sdk_failure
+        from elspeth.web.sessions.continuation_sdk_terminal_result import VerifiedSdkTerminal
+
+        require_original_v4_sdk_failure(observation, custody=self)
+        finalizer = self._v4_sdk_finalizer
+        admissions = tuple(
+            item
+            for item in (
+                self.continuation_primary_v4_admission,
+                self.continuation_semantic_v4_admission,
+                self.continuation_classifier_v4_admission,
+                self.continuation_title_v4_admission,
+                self.continuation_checkpoint_v4_admission,
+            )
+            if item is not None
+        )
+        if (
+            finalizer is None
+            or len(admissions) != 1
+            or self.attempt is not admissions[0].attempt
+            or self.v4_sdk_terminal_result is not None
+        ):
+            raise AuditIntegrityError("SDK terminal lost its sole original finalizer")
+        admission = admissions[0]
+        sql, projection = self.required_work.reserve_pair(
+            RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
+        )
+        try:
+            outcome, cancellations = await self._join(finalizer(observation, sql))
+        except BaseException:
+            if sql.complete:
+                projection.complete_without_submission()
+            raise
+        if type(outcome) is RequiredSQLRaised:
+            if sql.complete:
+                projection.complete_without_submission()
+            failures: list[BaseException] = [outcome.error]
+            for cancellation in (*outcome.deferred_cancellations, *cancellations):
+                if all(cancellation is not prior for prior in failures):
+                    failures.append(cancellation)
+            if len(failures) == 1:
+                raise outcome.error
+            raise BaseExceptionGroup("SDK terminal SQL and original cancellations", failures)
+        if type(outcome) is not RequiredSQLReturned or not sql.complete:
+            raise AuditIntegrityError("SDK terminal lost its completed required SQL outcome")
+        verified = outcome.value
+        if (
+            type(verified) is not VerifiedSdkTerminal
+            or verified.source != admission.hold
+            or verified.provider_attempt_id != admission.attempt.attempt_id
+            or verified.hold_state != "consumed"
+        ):
+            raise AuditIntegrityError("SDK terminal changed its cold-proved original hold")
+        deferred: list[asyncio.CancelledError] = []
+        original_cancel = (
+            (observation.original,) if preserve_sdk_cancellation and isinstance(observation.original, asyncio.CancelledError) else ()
+        )
+        for cancellation in (*original_cancel, *outcome.deferred_cancellations, *cancellations):
+            if all(cancellation is not prior for prior in deferred):
+                deferred.append(cancellation)
+        result = V4SdkFinalization(verified, tuple(deferred))
+        self.v4_sdk_terminal_result = result
+        forget_v4_sdk_failure(observation, custody=self)
+        self.attempt = None
+        self.call = None
+        self._sdk_entered = False
+        projection.begin_projection()
+        projection.complete_owned()
+        return result
+
+    def has_v4_sdk_return(self) -> bool:
+        return self._v4_sdk_return is not None
+
+    def note_v4_sdk_returned(self, response: object) -> None:
+        from elspeth.web.composer.provider_result_admission import V4ProviderSdkReturn
+
+        if not self.requires_v4_original_result():
+            return
+        if self.attempt is None or self._v4_sdk_return is not None:
+            raise AuditIntegrityError("V4 provider returned more than one result for its original paid attempt")
+        self._v4_sdk_return = V4ProviderSdkReturn(self.attempt.attempt_id, id(response))
+
+    def claim_v4_sdk_returned(self, response: object) -> V4ProviderSdkReturn | None:
+        if not self.requires_v4_original_result():
+            return None
+        witness = self._v4_sdk_return
+        if (
+            witness is None
+            or self.attempt is None
+            or witness.attempt_id != self.attempt.attempt_id
+            or witness.response_identity != id(response)
+            or self._v4_sdk_return_claimed
+        ):
+            raise AuditIntegrityError("V4 provider parser lost its actual one-time SDK return")
+        self._v4_sdk_return_claimed = True
+        return witness
+
+    def require_v4_result_completeness(self, witness: V4ProviderResultCompleteness) -> None:
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness
+
+        if (
+            type(witness) is not V4ProviderResultCompleteness
+            or not self.requires_v4_original_result()
+            or not self._v4_sdk_return_claimed
+            or witness.sdk_return is not self._v4_sdk_return
+        ):
+            raise AuditIntegrityError("V4 result completeness lost its original one-time SDK return")
+
+    def require_v4_result_incomplete(self, incomplete: V4ProviderResultIncomplete) -> None:
+        from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete, require_issued_v4_incomplete
+
+        if (
+            type(incomplete) is not V4ProviderResultIncomplete
+            or not self.requires_v4_original_result()
+            or not self._v4_sdk_return_claimed
+            or incomplete.sdk_return is not self._v4_sdk_return
+        ):
+            raise AuditIntegrityError("V4 incomplete result lost its original one-time SDK return")
+        require_issued_v4_incomplete(incomplete, sdk_return=self._v4_sdk_return)
+
+    def bind_v4_returned_incomplete_finalizer(
+        self,
+        callback: Callable[
+            [V4ProviderResultIncomplete, RequiredWorkTicket],
+            Awaitable[RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]],
+        ],
+    ) -> None:
+        if self._v4_returned_incomplete_finalizer is not None or not callable(callback):
+            raise AuditIntegrityError("V4 returned-incomplete finalizer must have one original owner")
+        self._v4_returned_incomplete_finalizer = callback
+
+    def has_v4_returned_incomplete_finalizer(self) -> bool:
+        return self._v4_returned_incomplete_finalizer is not None
+
+    def has_v4_returned_incomplete_terminal(self) -> bool:
+        return self._v4_returned_incomplete_committed
+
+    def require_v4_paid_incomplete_committed(self, control: V4PaidIncompleteCommitted) -> V4ReturnedIncompleteFinalization:
+        if (
+            type(control) is not V4PaidIncompleteCommitted
+            or not self._v4_returned_incomplete_committed
+            or self.v4_returned_incomplete_result is not control.finalization
+        ):
+            raise AuditIntegrityError("Paid incomplete control lacks this custody's committed terminal")
+        return control.finalization
+
+    async def finalize_v4_returned_incomplete(self, incomplete: V4ProviderResultIncomplete) -> V4ReturnedIncompleteFinalization:
+        from elspeth.web.sessions.continuation_paid_incomplete_terminal import VerifiedPaidIncompleteTerminal
+
+        self.require_v4_result_incomplete(incomplete)
+        admission = tuple(
+            item
+            for item in (
+                self.continuation_checkpoint_v4_admission,
+                self.continuation_classifier_v4_admission,
+                self.continuation_primary_v4_admission,
+                self.continuation_semantic_v4_admission,
+                self.continuation_title_v4_admission,
+            )
+            if item is not None
+        )
+        finalizer = self._v4_returned_incomplete_finalizer
+        if (
+            len(admission) != 1
+            or self.attempt is not admission[0].attempt
+            or self.call is None
+            or self.call.call_id != self.attempt.attempt_id
+            or self.call.status is not ComposerLLMCallStatus.MALFORMED_RESPONSE
+            or self.v4_returned_incomplete_result is not None
+            or finalizer is None
+        ):
+            raise AuditIntegrityError("V4 returned-incomplete finalization lost its original paid audit and hold")
+        sql, projection = self.required_work.reserve_pair(
+            RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
+        )
+        try:
+            outcome, cancellations = await self._join(finalizer(incomplete, sql))
+        except BaseException:
+            if sql.complete:
+                projection.complete_without_submission()
+            raise
+        if type(outcome) is RequiredSQLRaised:
+            if sql.complete:
+                projection.complete_without_submission()
+            failures: list[BaseException] = [outcome.error]
+            for cancellation in (*outcome.deferred_cancellations, *cancellations):
+                if all(cancellation is not prior for prior in failures):
+                    failures.append(cancellation)
+            if len(failures) == 1:
+                raise outcome.error
+            raise BaseExceptionGroup("V4 returned-incomplete SQL and original cancellations", failures)
+        if type(outcome) is not RequiredSQLReturned:
+            raise AuditIntegrityError("V4 returned-incomplete finalizer lost its required SQL outcome")
+        if not sql.complete:
+            raise AuditIntegrityError("V4 returned-incomplete SQL returned without its completed work ticket")
+        self._v4_returned_incomplete_committed = True
+        verified = outcome.value
+        if (
+            type(verified) is not VerifiedPaidIncompleteTerminal
+            or verified.source != admission[0].hold
+            or verified.provider_attempt_id != self.attempt.attempt_id
+            or verified.hold_state != "consumed"
+        ):
+            raise AuditIntegrityError("V4 returned-incomplete terminal changed its original cold-proved hold")
+        projection.begin_projection()
+        projection.complete_owned()
+        deferred: list[asyncio.CancelledError] = []
+        for cancellation in (*outcome.deferred_cancellations, *cancellations):
+            if all(cancellation is not prior for prior in deferred):
+                deferred.append(cancellation)
+        result = V4ReturnedIncompleteFinalization(verified, tuple(deferred))
+        self.v4_returned_incomplete_result = result
+        self.attempt = None
+        self.call = None
+        self._sdk_entered = False
+        return result
+
+    def require_v4_primary_unentered(self, admission: V4PrimaryProviderAdmission) -> None:
+        from elspeth.web.sessions.continuation_primary import V4PrimaryProviderAdmission
+
+        if (
+            type(admission) is not V4PrimaryProviderAdmission
+            or self.continuation_primary_v4_admission is not admission
+            or self.attempt is not admission.attempt
+            or self._sdk_entered
+        ):
+            raise AuditIntegrityError("V4 PRIMARY no-SDK disposition lost its exact unentered physical hold")
+
+    def require_v4_classifier_unentered(self, admission: V4ClassifierProviderAdmission) -> None:
+        from elspeth.web.sessions.continuation_classifier_primary import V4ClassifierProviderAdmission
+
+        if (
+            type(admission) is not V4ClassifierProviderAdmission
+            or self.continuation_classifier_v4_admission is not admission
+            or self.attempt is not admission.attempt
+            or self._sdk_entered
+        ):
+            raise AuditIntegrityError("V4 classifier no-SDK disposition lost its exact unentered physical hold")
+
+    def require_v4_title_unentered(self, admission: V4TitleProviderAdmission) -> None:
+        from elspeth.web.sessions.continuation_title_provider import V4TitleProviderAdmission
+
+        prepared = self.continuation_title
+        if (
+            type(admission) is not V4TitleProviderAdmission
+            or prepared is None
+            or self.continuation_title_v4_admission is not admission
+            or self.continuation_title_selected is not admission.selected
+            or self.attempt is not admission.attempt
+            or self._sdk_entered
+            or self._v4_sdk_return is not None
+            or self.call is not None
+            or prepared.running.session_operation_context is not self.context
+        ):
+            raise AuditIntegrityError("V4 TITLE no-SDK disposition lost its exact unentered physical hold")
+
+    def require_v4_checkpoint_unentered(self, admission: V4CheckpointProviderAdmission) -> None:
+        from elspeth.web.sessions.continuation_checkpoint_paid import V4CheckpointProviderAdmission
+
+        if (
+            type(admission) is not V4CheckpointProviderAdmission
+            or self.continuation_checkpoint_v4_admission is not admission
+            or self.attempt is not admission.attempt
+            or self._sdk_entered
+        ):
+            raise AuditIntegrityError("V4 checkpoint no-SDK disposition lost its exact unentered physical hold")
+
+    def note_v4_primary_no_sdk(self, receipt: PrimaryNoSdkRefusalReceipt, admission: V4PrimaryProviderAdmission) -> None:
+        from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt
+
+        self.require_v4_primary_unentered(admission)
+        if (
+            type(receipt) is not PrimaryNoSdkRefusalReceipt
+            or receipt.effect_key != admission.hold.effect_key
+            or receipt.terminal.status != "failed"
+            or (receipt.terminal.checkpoint_id, receipt.terminal.journal_cursor) != (receipt.refused.checkpoint_id, receipt.refused.cursor)
+            or self.continuation_primary_v4_no_sdk_result is not None
+            or self.continuation_primary_v4_result is not None
+        ):
+            raise AuditIntegrityError("V4 PRIMARY no-SDK receipt lost its exact failed terminal")
+        self.continuation_primary_v4_no_sdk_result = receipt
+        self.attempt = None
+        self.call = None
+
+    def note_v4_classifier_no_sdk(self, receipt: ClassifierNoSdkRefusalReceipt, admission: V4ClassifierProviderAdmission) -> None:
+        from elspeth.web.sessions.continuation_classifier_primary_no_sdk import ClassifierNoSdkRefusalReceipt
+
+        self.require_v4_classifier_unentered(admission)
+        if (
+            type(receipt) is not ClassifierNoSdkRefusalReceipt
+            or receipt.effect_key != admission.effect_key
+            or receipt.terminal.status != "failed"
+            or (receipt.terminal.checkpoint_id, receipt.terminal.journal_cursor) != (receipt.refused.checkpoint_id, receipt.refused.cursor)
+            or self.continuation_classifier_v4_no_sdk_result is not None
+            or self.continuation_classifier_v4_result is not None
+        ):
+            raise AuditIntegrityError("V4 classifier no-SDK receipt lost its exact failed terminal")
+        self.continuation_classifier_v4_no_sdk_result = receipt
+        self.attempt = None
+        self.call = None
 
     def needs_terminal_audit(self) -> bool:
         return self.attempt is not None and self._sdk_entered and self.call is None
@@ -284,14 +1502,229 @@ class ProviderCallCustody:
             return False
         if not self._sdk_entered or call.call_id != self.attempt.attempt_id or call.started_at != self.attempt.started_at:
             raise AuditIntegrityError("Provider audit replaced actual admitted identity")
+        if (
+            self._cost_budget is not None
+            and self._cost_budget.snapshot().applicability == "continuation_v2"
+            and (call.cost_response_accountable is None or call.cost_response_accountable is not self._cost_response_accountable)
+        ):
+            raise AuditIntegrityError("Continuation audit changed its actual response accountability")
         self.call = call
         return True
 
+    async def finalize_continuation_primary_v4(self, outcome: _CallModelOutcome) -> None:
+        from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+        from elspeth.web.sessions.continuation_primary import PrimaryPaidOverflowTerminal, PrimaryProviderResult
+
+        finalizer = self._continuation_primary_v4_finalizer
+        if (
+            type(outcome) is not _CallModelOutcome
+            or finalizer is None
+            or self.continuation_primary_v4 is None
+            or self.continuation_primary_v4_admission is None
+            or self.continuation_primary_v4_result is not None
+            or self.attempt is None
+            or not self._sdk_entered
+            or self.call is None
+            or self.call.status is not ComposerLLMCallStatus.SUCCESS
+            or outcome.audit_call is not self.call
+        ):
+            raise AuditIntegrityError("V4 PRIMARY finalization requires its one actual paid success and original audit")
+        binding = self.required_work
+        sql, projection = binding.reserve_pair(
+            RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
+        )
+        try:
+            settled, cancellations = await self._join(finalizer(outcome, sql))
+        except BaseException:
+            if sql.complete:
+                projection.complete_without_submission()
+            raise
+        if type(settled) is RequiredSQLRaised:
+            if sql.complete:
+                projection.complete_without_submission()
+            failures: list[BaseException] = [settled.error]
+            for cancellation in (*settled.deferred_cancellations, *cancellations):
+                if all(cancellation is not prior for prior in failures):
+                    failures.append(cancellation)
+            if len(failures) == 1:
+                raise settled.error
+            raise BaseExceptionGroup("PRIMARY V4 required SQL and original cancellations", failures)
+        if type(settled) is not RequiredSQLReturned:
+            raise AuditIntegrityError("V4 PRIMARY finalizer lost its actual required SQL outcome")
+        result = settled.value
+        # The SQL owner has committed the complete result or terminal receipt.
+        # No later local failure may fall back to an ordinary full-audit write.
+        self._continuation_primary_v4_sql_committed = True
+        if type(result) not in (PrimaryProviderResult, PrimaryPaidOverflowTerminal):
+            raise AuditIntegrityError("V4 PRIMARY finalizer returned a foreign paid outcome")
+        self._continuation_primary_v4_terminal = type(result) is PrimaryPaidOverflowTerminal
+        projection.begin_projection()
+        projection.complete_owned()
+        if self._cost_budget is not None:
+            self._cost_budget.consume_settled(self.call, response_accountable=self._cost_response_accountable)
+        self.continuation_primary_v4_result = result
+        self.attempt = None
+        self.call = None
+        self._sdk_entered = False
+        deferred: list[asyncio.CancelledError] = []
+        for cancellation in (*settled.deferred_cancellations, *cancellations):
+            if all(cancellation is not prior for prior in deferred):
+                deferred.append(cancellation)
+        self.continuation_primary_v4_deferred_cancellations = tuple(deferred)
+
+    async def finalize_continuation_classifier_v4(self, outcome: _CallModelOutcome) -> None:
+        from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+        from elspeth.web.sessions.continuation_classifier_primary import ClassifierPrimaryResult, VerifiedClassifierPaidOverflowTerminal
+
+        finalizer = self._continuation_classifier_v4_finalizer
+        if (
+            type(outcome) is not _CallModelOutcome
+            or finalizer is None
+            or self.continuation_classifier_v4 is None
+            or self.continuation_classifier_v4_admission is None
+            or self.continuation_classifier_v4_result is not None
+            or self.attempt is None
+            or not self._sdk_entered
+            or self.call is None
+            or self.call.status is not ComposerLLMCallStatus.SUCCESS
+            or outcome.audit_call is not self.call
+        ):
+            raise AuditIntegrityError("V4 classifier finalization requires its one actual paid success and original audit")
+        sql, projection = self.required_work.reserve_pair(
+            RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
+        )
+        try:
+            settled, cancellations = await self._join(finalizer(outcome, sql))
+        except BaseException:
+            if sql.complete:
+                projection.complete_without_submission()
+            raise
+        if type(settled) is RequiredSQLRaised:
+            if sql.complete:
+                projection.complete_without_submission()
+            failures: list[BaseException] = [settled.error]
+            for cancellation in (*settled.deferred_cancellations, *cancellations):
+                if all(cancellation is not prior for prior in failures):
+                    failures.append(cancellation)
+            if len(failures) == 1:
+                raise settled.error
+            raise BaseExceptionGroup("Classifier V4 required SQL and original cancellations", failures)
+        if type(settled) is not RequiredSQLReturned:
+            raise AuditIntegrityError("V4 classifier finalizer lost its actual required SQL outcome")
+        result = settled.value
+        if type(result) not in (ClassifierPrimaryResult, VerifiedClassifierPaidOverflowTerminal):
+            raise AuditIntegrityError("V4 classifier finalizer returned a foreign paid outcome")
+        self._continuation_classifier_v4_terminal = type(result) is VerifiedClassifierPaidOverflowTerminal
+        projection.begin_projection()
+        projection.complete_owned()
+        if self._cost_budget is not None:
+            self._cost_budget.consume_settled(self.call, response_accountable=self._cost_response_accountable)
+        self.continuation_classifier_v4_result = result
+        self.attempt = None
+        self.call = None
+        self._sdk_entered = False
+        deferred: list[asyncio.CancelledError] = []
+        for cancellation in (*settled.deferred_cancellations, *cancellations):
+            if all(cancellation is not prior for prior in deferred):
+                deferred.append(cancellation)
+        self.continuation_classifier_v4_deferred_cancellations = tuple(deferred)
+
+    async def finalize_continuation_semantic_v4(self, observation: SemanticProviderResponseObservation) -> SemanticV4Finalization:
+        from elspeth.web.composer.continuation_semantic_observation import (
+            SemanticCompleteResponseObservation,
+            SemanticIncompleteResponseObservation,
+            SemanticInvalidResponseObservation,
+        )
+        from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult
+        from elspeth.web.sessions.continuation_semantic_paid_overflow_terminal import VerifiedSemanticPaidOverflowTerminal
+
+        finalizer = self._continuation_semantic_v4_finalizer
+        if (
+            type(observation)
+            not in (SemanticCompleteResponseObservation, SemanticIncompleteResponseObservation, SemanticInvalidResponseObservation)
+            or finalizer is None
+            or self.continuation_semantic_v4 is None
+            or self.continuation_semantic_v4_admission is None
+            or self.continuation_semantic_v4_result is not None
+            or self.attempt is None
+            or not self._sdk_entered
+            or self.call is None
+            or (type(observation) is SemanticCompleteResponseObservation and self.call.status is not ComposerLLMCallStatus.SUCCESS)
+            or (
+                type(observation) is SemanticInvalidResponseObservation and self.call.status is not ComposerLLMCallStatus.MALFORMED_RESPONSE
+            )
+            or self.call.status not in (ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.MALFORMED_RESPONSE)
+        ):
+            raise AuditIntegrityError("V4 semantic finalization requires its one actual returned response and original audit")
+        sql, projection = self.required_work.reserve_pair(
+            RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
+        )
+        try:
+            outcome, cancellations = await self._join(finalizer(observation, sql))
+        except BaseException:
+            if sql.complete:
+                projection.complete_without_submission()
+            raise
+        if type(outcome) is RequiredSQLRaised:
+            if sql.complete:
+                projection.complete_without_submission()
+            failures: list[BaseException] = [outcome.error]
+            for cancellation in (*outcome.deferred_cancellations, *cancellations):
+                if all(cancellation is not prior for prior in failures):
+                    failures.append(cancellation)
+            if len(failures) == 1:
+                raise outcome.error
+            raise BaseExceptionGroup("Semantic V4 required SQL and original cancellations", failures)
+        if type(outcome) is not RequiredSQLReturned:
+            raise AuditIntegrityError("V4 semantic finalizer lost its actual required SQL outcome")
+        result = outcome.value
+        self._continuation_semantic_v4_sql_committed = True
+        if type(result) not in (SemanticAdvisorProviderResult, VerifiedSemanticPaidOverflowTerminal):
+            raise AuditIntegrityError("V4 semantic finalizer returned a foreign paid outcome")
+        self._continuation_semantic_v4_terminal = type(result) is VerifiedSemanticPaidOverflowTerminal or (
+            type(result) is SemanticAdvisorProviderResult and result.original_error is not None
+        )
+        projection.begin_projection()
+        projection.complete_owned()
+        if self._cost_budget is not None:
+            self._cost_budget.consume_settled(self.call, response_accountable=self._cost_response_accountable)
+        self.continuation_semantic_v4_result = result
+        self.attempt = None
+        self.call = None
+        self._sdk_entered = False
+        deferred: list[asyncio.CancelledError] = []
+        for cancellation in (*outcome.deferred_cancellations, *cancellations):
+            if all(cancellation is not prior for prior in deferred):
+                deferred.append(cancellation)
+        return SemanticV4Finalization(result, tuple(deferred))
+
     async def settle(self) -> None:
+        if self._v4_returned_incomplete_committed:
+            return
         if self.attempt is None:
+            return
+        if self.has_v4_unentered_hold():
+            # The V4 no-SDK owner closes the physical row and H together.
+            return
+        if self.continuation_title_v4_admission is not None and self._sdk_entered:
+            # V4 TITLE success or paid overflow must prove its complete or
+            # bounded terminal SQL result before this custody can close. A
+            # different post-SDK failure remains pending for cold recovery.
+            return
+        if self.continuation_semantic_v4_admission is not None and self._sdk_entered:
+            return
+        if self.continuation_primary_v4_admission is not None and self._sdk_entered:
+            # Every SDK-entered V4 PRIMARY outcome needs its exact SQL
+            # disposition. Generic settlement would orphan its active hold.
+            return
+        if self.continuation_classifier_v4_admission is not None and self._sdk_entered:
+            return
+        if self.continuation_checkpoint_v4_admission is not None and self._sdk_entered:
             return
         if not self._sdk_entered or self.call is None:
             raise AuditIntegrityError("Required provider attempt lacks complete terminal audit")
+        if self.continuation_title is not None:
+            raise AuditIntegrityError("Continuation TITLE settlement requires its original V4 admission")
         binding = self.required_work
         projection: RequiredWorkTicket | None = None
         if binding.role is RequiredWorkRole.TITLE:
@@ -321,6 +1754,12 @@ class ProviderCallCustody:
         if projection is not None:
             projection.begin_projection()
             projection.complete_owned()
+        if self._cost_budget is not None:
+            if self._cost_budget.snapshot().applicability == "continuation_v2" and (
+                self.call.cost_response_accountable is None or self.call.cost_response_accountable is not self._cost_response_accountable
+            ):
+                raise AuditIntegrityError("Continuation settlement lost its observed response accountability")
+            self._cost_budget.consume_settled(self.call, response_accountable=self._cost_response_accountable)
         self.attempt = None
         self.call = None
         self._sdk_entered = False
@@ -355,6 +1794,16 @@ async def provider_call_scope(custody: ProviderCallCustody) -> AsyncIterator[Pro
         except BaseException as settlement:
             if body is not None and settlement is not body:
                 raise BaseExceptionGroup("Provider body and required settlement outcomes", [body, settlement]) from None
+            raise
+        try:
+            custody.require_cost_output()
+        except CommonProviderCostRefused as refusal:
+            from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
+
+            if isinstance(body, _MalformedLLMResponseError):
+                raise refusal from body
+            if body is not None:
+                raise BaseExceptionGroup("Provider body and monetary continuation refusal", [body, refusal]) from None
             raise
 
 
@@ -525,18 +1974,6 @@ async def admit_provider_attempt(*, model: str) -> None:
         raise
     except Exception as failure:
         raise ComposerOwnedSettlementFailure() from failure
-
-
-def provider_attempt_needs_terminal_audit() -> bool:
-    """Whether a completion failure belongs to an admitted, unaudited attempt.
-
-    Retry admission first settles the preceding call. If that fails, the
-    span still holds its terminal evidence and must not be rebound to the
-    retry's exception. Unscoped callers retain their own audit lifecycle.
-    Check before building a call record, which binds it into the span.
-    """
-    span = _CONTEXTVAR_GET(_SPAN)
-    return span is None or (span.attempt is not None and span.call is None)
 
 
 def bind_provider_attempt(call: ComposerLLMCall) -> ComposerLLMCall:

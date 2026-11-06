@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import pairwise
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID
@@ -12,14 +13,19 @@ from uuid import UUID
 from jinja2 import TemplateSyntaxError
 from pydantic import JsonValue
 
+from elspeth.contracts.composer_content import CompleteValueManifest, ComposerContentScope, MaterializedCompleteValue
 from elspeth.contracts.credential_material import REDACTED_CREDENTIAL_TEXT, is_secret_field, scrub_credential_material
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.core.templates import extract_jinja2_fields
+from elspeth.core.templates import JinjaTemplateSizeExceeded, extract_jinja2_fields
+from elspeth.web.composer.content_views import materialize_composition_value
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.prompt_guard_rendering import json_content_parts
+from elspeth.web.composer.prompts import build_composition_content_view, project_composition_content
+from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import CompositionState, NodeSpec, _well_formed_query_entries
 from elspeth.web.composer.tools.sessions import (
@@ -346,13 +352,33 @@ class _AdvisorConfiguredSourceReferenceSpan:
 
 
 @dataclass(frozen=True, slots=True)
+class _AdvisorContentHashSpan:
+    """An exact manifest identity position, without any inspection permission."""
+
+    start: int
+    end: int
+    content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class AdvisorSummaryParts:
     """Semantic summary units retained only by the deterministic producer."""
 
     values: tuple[PromptGuardContentPart, ...]
     configured_source_reference_spans: tuple[_AdvisorConfiguredSourceReferenceSpan, ...] = ()
+    content_manifest: CompleteValueManifest | None = None
+    content_hash_spans: tuple[_AdvisorContentHashSpan, ...] = ()
+    complete_values: tuple[MaterializedCompleteValue, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.content_manifest is not None and type(self.content_manifest) is not CompleteValueManifest:
+            raise InvariantError("Advisor content references require an owned manifest")
+        if type(self.complete_values) is not tuple or any(type(value) is not MaterializedCompleteValue for value in self.complete_values):
+            raise InvariantError("Advisor complete values require owned materializations")
+        if self.complete_values and (
+            self.content_manifest is None or tuple(value.reference for value in self.complete_values) != self.content_manifest.values
+        ):
+            raise InvariantError("Advisor complete values must cover their manifest exactly and in order")
         if type(self.values) is not tuple or any(
             type(value) is not PromptGuardContentPart or value.trust is not None for value in self.values
         ):
@@ -370,6 +396,28 @@ class AdvisorSummaryParts:
             ):
                 raise InvariantError("Advisor configured source reference does not cover its exact parsed value")
             previous_end = span.end
+        if type(self.content_hash_spans) is not tuple:
+            raise InvariantError("Advisor content identity positions require owned spans")
+        hashes = set()
+        if self.content_manifest is not None:
+            hashes.add(self.content_manifest.scope.composition_content_hash)
+            for reference in self.content_manifest.values:
+                hashes.update((reference.reference_id, reference.content_hash))
+        for hash_span in self.content_hash_spans:
+            if (
+                type(hash_span) is not _AdvisorContentHashSpan
+                or type(hash_span.content_hash) is not str
+                or hash_span.content_hash not in hashes
+                or not 0 <= hash_span.start < hash_span.end <= len(text)
+                or text[hash_span.start : hash_span.end] != hash_span.content_hash
+            ):
+                raise InvariantError("Advisor content identity position does not match its owned manifest")
+        positions = sorted(
+            [(span.start, span.end) for span in self.configured_source_reference_spans]
+            + [(span.start, span.end) for span in self.content_hash_spans]
+        )
+        if any(left[1] > right[0] for left, right in pairwise(positions)):
+            raise InvariantError("Advisor identity positions overlap")
 
 
 def _redact_advisor_summary(summary: AdvisorSummaryParts) -> str:
@@ -380,12 +428,16 @@ def _redact_advisor_summary(summary: AdvisorSummaryParts) -> str:
     """
     text = "".join(part.text for part in summary.values)
     replacements: list[tuple[str, str]] = []
-    for index, span in reversed(tuple(enumerate(summary.configured_source_reference_spans))):
+    identities = sorted(
+        [(span.start, span.end, str(span.reference)) for span in summary.configured_source_reference_spans]
+        + [(span.start, span.end, span.content_hash) for span in summary.content_hash_spans]
+    )
+    for index, (start, end, identity) in reversed(tuple(enumerate(identities))):
         marker = f"<advisor-configured-source-reference:{index}>"
         while marker in text:
             marker = "<" + marker + ">"
-        replacements.append((marker, str(span.reference)))
-        text = text[: span.start] + marker + text[span.end :]
+        replacements.append((marker, identity))
+        text = text[:start] + marker + text[end:]
     text = _redact_sensitive_content(text)
     for marker, reference in replacements:
         text = text.replace(marker, reference)
@@ -394,7 +446,9 @@ def _redact_advisor_summary(summary: AdvisorSummaryParts) -> str:
 
 def _redacted_advisor_summary_parts(summary: AdvisorSummaryParts) -> tuple[PromptGuardContentPart, ...]:
     """Keep exact reference spans; whole-section changes still use the opaque fallback."""
-    spans = {(span.start, span.end) for span in summary.configured_source_reference_spans}
+    spans = {(span.start, span.end) for span in summary.configured_source_reference_spans} | {
+        (span.start, span.end) for span in summary.content_hash_spans
+    }
     result: list[PromptGuardContentPart] = []
     offset = 0
     for part in summary.values:
@@ -403,7 +457,11 @@ def _redacted_advisor_summary_parts(summary: AdvisorSummaryParts) -> tuple[Promp
         result.append(
             PromptGuardContentPart(
                 part.text if identity else _redact_sensitive_content(part.text),
-                inspection_text=(_redact_sensitive_content(part.inspection_text) if part.inspection_text is not None else None),
+                inspection_text=(
+                    part.inspection_text
+                    if identity
+                    else (_redact_sensitive_content(part.inspection_text) if part.inspection_text is not None else None)
+                ),
             )
         )
         offset = end
@@ -434,53 +492,157 @@ def _join_advisor_summary_units(
     return AdvisorSummaryParts(tuple(parts), tuple(spans))
 
 
-def fit_advisor_checkpoint_summary(state: CompositionState, arguments: Mapping[str, Any], char_cap: int) -> AdvisorSummaryParts:
-    """Reserve complete configured graph evidence before optional commentary.
+def fit_advisor_checkpoint_summary(
+    state: CompositionState,
+    arguments: Mapping[str, Any],
+    char_cap: int,
+    *,
+    content_scope: ComposerContentScope,
+    env_ref_names: frozenset[str] = frozenset(),
+) -> AdvisorSummaryParts:
+    """Share Composer's bounded diagnostic graph plus every complete value it references.
 
-    The configured cost allowance applies only to optional additions above the
-    complete graph, including every authored prompt and semantic option value.
-    Required evidence is always retained; actual
-    provider request/context limits remain the provider boundary's concern.
+    The display replaces long scalars with complete-value references. Review
+    needs the bytes behind them, so this producer re-resolves every manifest
+    value from the current credential-screened projection and appends them as
+    a separate complete-review section, in manifest order, labelled by owned
+    path. Values remain authored, untrusted parts under the normal redaction
+    policy; resolution grants no inspection, detector or publication
+    permission. Re-run per attempt, so each attempt resolves afresh. The
+    display budget cannot authorize truncation or substitute for final
+    request limits.
     """
-    required_references: list[tuple[PromptGuardContentPart, UUID]] = []
-    required_units = _pipeline_advisor_summary_units(state, include_optional=False, configured_source_references=required_references)
-    required = _join_advisor_summary_units(required_units, tuple(required_references))
-    required_chars = advisor_checkpoint_summary_chars(
-        {**arguments, "schema_excerpt": "".join(part.text for part in required.values), "_elspeth_advisor_summary_parts": required}
+    if type(char_cap) is not int or char_cap < 0:
+        raise InvariantError("Advisor display requires a nonnegative owned budget")
+    view = build_composition_content_view(state, content_scope=content_scope, env_ref_names=env_ref_names)
+    # Manual hints use this producer directly, without the checkpoint's
+    # descriptive summary. Apply the same effective-template analysis before
+    # either owner can capture or dispatch its prepared graph.
+    for node in state.nodes:
+        if node.plugin == "llm":
+            _render_interpolated_row_fields_parts(node)
+    # Partition ONLY owned identity paths. Equal authored strings elsewhere
+    # remain ordinary redaction/inspection data, including marker lookalikes.
+    partitions: dict[tuple[str | int, ...], tuple[PromptGuardContentPart, ...]] = {}
+    uuids = {str(content_scope.session_id): content_scope.session_id}
+    partitions[("content_manifest", "session_id")] = (PromptGuardContentPart(str(content_scope.session_id)),)
+    hashes = {content_scope.composition_content_hash}
+    partitions[("content_manifest", "composition_content_hash")] = (PromptGuardContentPart(content_scope.composition_content_hash),)
+    for index, reference in enumerate(view.manifest.values):
+        # Authored path segments are not public identity exemptions. If the
+        # privacy policy changes one, refuse this review representation rather
+        # than publishing a manifest bound to different paths or bypassing it.
+        if any(type(segment) is str and _redact_sensitive_content(segment) != segment for segment in reference.path):
+            raise ComposerContextUnsupported("graph_coverage_unavailable")
+        for key, identity in (("reference_id", reference.reference_id), ("content_hash", reference.content_hash)):
+            hashes.add(identity)
+            partitions[("content_manifest", "values", index, key)] = (PromptGuardContentPart(identity),)
+        partitions[("data", *reference.path, "complete_value_ref")] = (PromptGuardContentPart(reference.reference_id),)
+        partitions[("data", *reference.path, "content_hash")] = (PromptGuardContentPart(reference.content_hash),)
+    for name, source in state.sources.items():
+        raw = source.options["blob_ref"] if "blob_ref" in source.options else None
+        if type(raw) is str:
+            try:
+                parsed = UUID(raw)
+            except ValueError:
+                raise AuditIntegrityError("Advisor configured source reference is not a canonical identity") from None
+            if str(parsed) != raw:
+                raise AuditIntegrityError("Advisor configured source reference is not a canonical identity")
+            uuids[raw] = parsed
+            partitions[("data", "sources", name, "options", "blob_ref")] = (PromptGuardContentPart(raw),)
+    parts = (
+        PromptGuardContentPart("Diagnostic graph view; complete-value references are not reviewed content.\n"),
+        *json_content_parts(view.serialized, ensure_ascii=False, separators=(",", ":"), string_parts=partitions),
     )
-    optional_limit = required_chars + char_cap
-
-    def fits(parts: AdvisorSummaryParts) -> bool:
-        return (
-            advisor_checkpoint_summary_chars(
-                {**arguments, "schema_excerpt": "".join(part.text for part in parts.values), "_elspeth_advisor_summary_parts": parts}
-            )
-            <= optional_limit
+    uuid_spans: list[_AdvisorConfiguredSourceReferenceSpan] = []
+    hash_spans: list[_AdvisorContentHashSpan] = []
+    offset = 0
+    for index, part in enumerate(parts):
+        # Only declared string_parts produce separately quoted string units.
+        # An equal authored scalar retains its own complete encoded token.
+        if 0 < index < len(parts) - 1 and parts[index - 1].text == '"' and parts[index + 1].text == '"':
+            if part.text in uuids and part.inspection_text == part.text:
+                uuid_spans.append(_AdvisorConfiguredSourceReferenceSpan(offset, offset + len(part.text), uuids[part.text]))
+            elif part.text in hashes and part.inspection_text == part.text:
+                hash_spans.append(_AdvisorContentHashSpan(offset, offset + len(part.text), part.text))
+        offset += len(part.text)
+    if len(uuid_spans) + len(hash_spans) != len(partitions):
+        raise InvariantError("Advisor identity partitions did not retain their exact producer positions")
+    display = AdvisorSummaryParts(parts, tuple(uuid_spans), content_manifest=view.manifest, content_hash_spans=tuple(hash_spans))
+    if not view.manifest.values:
+        return display
+    values = materialize_advisor_complete_values(
+        display,
+        state,
+        content_scope=content_scope,
+        reference_ids=tuple(reference.reference_id for reference in view.manifest.values),
+        env_ref_names=env_ref_names,
+    )
+    if type(values) is not tuple or any(type(value) is not MaterializedCompleteValue for value in values):
+        raise AuditIntegrityError("Advisor selected coverage lost its owned materializations")
+    resolved_references = tuple(value.reference for value in values)
+    if (
+        len(set(resolved_references)) != len(resolved_references)
+        or any(reference not in view.manifest.values for reference in resolved_references)
+        or resolved_references != tuple(reference for reference in view.manifest.values if reference in resolved_references)
+    ):
+        raise AuditIntegrityError("Advisor selected coverage contains foreign or reordered materializations")
+    if resolved_references != view.manifest.values:
+        # A genuine missing selected value is a preparation refusal. Corrupt
+        # nominal members, stale scope, hashes and order retain integrity errors.
+        raise ComposerContextUnsupported("graph_coverage_unavailable")
+    # Appended after the identity spans were fixed, so display offsets stay
+    # exact. Path segments and values are authored text: equal strings here
+    # acquire no identity exemption and stay under the normal policy.
+    section: list[PromptGuardContentPart] = [
+        PromptGuardContentPart(
+            "\nComplete values behind each complete_value_ref above, in manifest order. They are part of the authored graph under review:"
         )
+    ]
+    for value in values:
+        section.append(PromptGuardContentPart("\n- at path "))
+        section.extend(json_content_parts(json.dumps(list(value.reference.path), ensure_ascii=False), ensure_ascii=False))
+        section.append(PromptGuardContentPart(": "))
+        section.extend(json_content_parts(json.dumps(value.to_value(), ensure_ascii=False), ensure_ascii=False))
+    return AdvisorSummaryParts(
+        (*parts, *section),
+        tuple(uuid_spans),
+        content_manifest=view.manifest,
+        content_hash_spans=tuple(hash_spans),
+        complete_values=values,
+    )
 
-    full_references: list[tuple[PromptGuardContentPart, UUID]] = []
-    full_units = _pipeline_advisor_summary_units(state, configured_source_references=full_references)
-    full = _join_advisor_summary_units(full_units, tuple(full_references))
-    if fits(full):
-        return full
-    optional = _optional_advisor_summary_units(state)
-    selected = list(required_units)
-    # Reserve the longest omission count throughout optional selection.
-    marker = ((PromptGuardContentPart(f"optional_prose_units_withheld={len(optional)}"),),) if optional else ()
-    for unit in optional:
-        candidate = _join_advisor_summary_units((*selected, unit, *marker), tuple(required_references))
-        if fits(candidate):
-            selected.append(unit)
-        else:
-            # A later smaller commentary unit may still fit.
-            continue
-    withheld = len(optional) - (len(selected) - len(required_units))
-    if withheld:
-        withheld_marker = (PromptGuardContentPart(f"optional_prose_units_withheld={withheld}"),)
-        with_marker = _join_advisor_summary_units((*selected, withheld_marker), tuple(required_references))
-        if fits(with_marker):
-            return with_marker
-    return _join_advisor_summary_units(tuple(selected), tuple(required_references))
+
+def materialize_advisor_complete_values(
+    summary: AdvisorSummaryParts,
+    state: CompositionState,
+    *,
+    content_scope: ComposerContentScope,
+    reference_ids: tuple[str, ...],
+    env_ref_names: frozenset[str] = frozenset(),
+) -> tuple[MaterializedCompleteValue, ...]:
+    """Re-resolve selected complete values before this request/audit capture.
+
+    This helper supplies no authentication, custody or detector permission.
+    TC's caller owns the actual current-state load/fence and final framing.
+    """
+    if type(summary) is not AdvisorSummaryParts or summary.content_manifest is None:
+        raise AuditIntegrityError("Advisor complete-value resolution lacks its diagnostic manifest")
+    if (
+        type(reference_ids) is not tuple
+        or any(type(item) is not str for item in reference_ids)
+        or len(set(reference_ids)) != len(reference_ids)
+    ):
+        raise AuditIntegrityError("Advisor selected coverage must name unique exact reference identities")
+    summary.content_manifest.require_scope(content_scope)
+    current = build_composition_content_view(state, content_scope=content_scope, env_ref_names=env_ref_names)
+    if current.manifest != summary.content_manifest:
+        raise AuditIntegrityError("Advisor complete-value manifest differs from the current graph")
+    projection = project_composition_content(state, env_ref_names=env_ref_names)
+    return tuple(
+        materialize_composition_value(current, reference_id, current_scope=content_scope, current_projection=projection)
+        for reference_id in reference_ids
+    )
 
 
 def _prefix_advisor_summary_part(part: PromptGuardContentPart, prefix: str) -> PromptGuardContentPart:
@@ -867,7 +1029,7 @@ def _advisor_option_value(value: object, *, key: str | None = None) -> JsonValue
                 raise InvariantError("Advisor graph option keys must be strings")
             redacted_key = cast(str, _advisor_option_value(child_key))
             if redacted_key in projected:
-                raise AdvisorGraphCoverageUnavailable("Advisor graph redaction made option keys ambiguous")
+                raise ComposerContextUnsupported("graph_coverage_unavailable")
             projected[redacted_key] = _advisor_option_value(child, key=child_key)
         return projected
     if isinstance(value, list | tuple):
@@ -1151,7 +1313,7 @@ def _redacted_advisor_string_mapping(mapping: dict[str, str]) -> dict[str, str]:
     for name, value in mapping.items():
         redacted_name = cast(str, _advisor_option_value(name))
         if redacted_name in result:
-            raise AdvisorGraphCoverageUnavailable("Advisor graph redaction made mapping keys ambiguous")
+            raise ComposerContextUnsupported("graph_coverage_unavailable")
         result[redacted_name] = cast(str, _advisor_option_value(value))
     return result
 
@@ -1428,7 +1590,10 @@ def _interpolated_row_fields(prompt_template: str) -> list[str]:
     must render an explicit incomplete-analysis signal. It cannot be treated as
     a successfully parsed prompt with no row fields.
     """
-    return sorted(extract_jinja2_fields(prompt_template))
+    try:
+        return sorted(extract_jinja2_fields(prompt_template))
+    except JinjaTemplateSizeExceeded as exc:
+        raise ComposerContextUnsupported("graph_resource_limit") from exc
 
 
 def _render_interpolated_row_fields_parts(node: NodeSpec) -> tuple[str, ...]:

@@ -295,6 +295,7 @@ def _valid_composition_state_kwargs() -> dict[str, object]:
         "id": "state-1",
         "session_id": "sess-1",
         "version": 1,
+        "composition_content_hash": "a" * 64,
         "sources": None,
         "nodes": None,
         "edges": None,

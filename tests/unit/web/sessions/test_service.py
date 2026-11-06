@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 import pytest
 import structlog
-from sqlalchemy import delete, event, func, insert, select, update
+from sqlalchemy import delete, event, func, insert, literal, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
@@ -38,8 +38,9 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationConflictError,
     ComposerOperationPreconditionRefused,
     ComposerOperationRunning,
-    composer_operation_request_hash,
+    composer_operation_admission_request_hash,
 )
+from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import (
@@ -59,7 +60,6 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
     CompositionValidationError,
-    MessageIngressFresh,
     RunAlreadyActiveError,
     RunDiagnosticsAuditAuthority,
     RunDiagnosticsAuditDraft,
@@ -72,6 +72,7 @@ from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.service import QuarantineCleanupError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data, stamped_state_values, stored_default_pipeline_metadata
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -199,7 +200,7 @@ class TestSessionCRUD:
     async def test_archive_session_hides_session_with_durable_completion_history(self, engine, service) -> None:
         session = await service.create_session("alice", "To Archive", "local")
         await service.add_message(session.id, "user", "hello", writer_principal="route_user_message")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         with engine.begin() as conn:
             conn.execute(
                 insert(composer_completion_events_table).values(
@@ -400,12 +401,15 @@ class TestRunEvents:
             seed_session_operation_fence(conn, session_id, owner_instance_id=service.session_operation_owner_instance_id)
             conn.execute(
                 insert(composition_states_table).values(
-                    id=str(state_id),
-                    session_id=str(session_id),
-                    version=1,
-                    is_valid=True,
-                    provenance="session_seed",
-                    created_at=created_at,
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=str(state_id),
+                        session_id=str(session_id),
+                        version=1,
+                        is_valid=True,
+                        provenance="session_seed",
+                        created_at=created_at,
+                    )
                 )
             )
             conn.execute(
@@ -517,7 +521,7 @@ class TestCompositionStateVersioning:
     @pytest.mark.asyncio
     async def test_first_state_version_is_1(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state_data = CompositionStateData(is_valid=False)
+        state_data = composition_state_data(is_valid=False)
         state = await service.save_composition_state(session.id, state_data, provenance="session_seed")
         assert isinstance(state, CompositionStateRecord)
         assert state.version == 1
@@ -527,8 +531,8 @@ class TestCompositionStateVersioning:
     @pytest.mark.asyncio
     async def test_version_increments_monotonically(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        s1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        s2 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        s1 = await service.save_composition_state(session.id, composition_state_data(is_valid=False), provenance="session_seed")
+        s2 = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         assert s1.version == 1
         assert s2.version == 2
 
@@ -540,7 +544,7 @@ class TestCompositionStateVersioning:
         session = await service.create_session("alice", "Pipeline", "local")
         await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={"type": "csv", "path": "old.csv"},
                 is_valid=False,
             ),
@@ -548,7 +552,7 @@ class TestCompositionStateVersioning:
         )
         await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={"type": "csv", "path": "new.csv"},
                 is_valid=True,
             ),
@@ -618,7 +622,7 @@ class TestCompositionStateVersioning:
         envelope wrap/unwrap is misaligned, scoring silently ambers.
         """
         session = await service.create_session("alice", "Pipeline", "local")
-        state_data = CompositionStateData(
+        state_data = composition_state_data(
             is_valid=True,
             composer_meta={"repair_turns_used": 1},
         )
@@ -635,11 +639,11 @@ class TestCompositionStateVersioning:
         assert loaded.composer_meta["repair_turns_used"] == 1
 
     @pytest.mark.asyncio
-    async def test_composer_meta_absent_persists_as_none(
+    async def test_absent_operational_metadata_stays_absent_beside_content_publication(
         self,
         service,
     ) -> None:
-        """``composer_meta`` defaulting to ``None`` round-trips as ``None``.
+        """Content identity must not fabricate operational authoring evidence.
 
         Honest absence: revert/fork paths and historical pre-plumbing rows
         must not synthesise a fake ``repair_turns_used: 0``. The eval scorer
@@ -647,13 +651,15 @@ class TestCompositionStateVersioning:
         silent pass).
         """
         session = await service.create_session("alice", "Pipeline", "local")
-        state_data = CompositionStateData(is_valid=True)
+        state_data = composition_state_data(is_valid=True)
         saved = await service.save_composition_state(session.id, state_data, provenance="session_seed")
-        assert saved.composer_meta is None
+        assert saved.composer_meta is not None
+        assert set(saved.composer_meta) == {"content_publication"}
+        assert saved.composer_meta["content_publication"]["applicability"] == "requires_current_inspection"
 
         loaded = await service.get_current_state(session.id)
         assert loaded is not None
-        assert loaded.composer_meta is None
+        assert loaded.composer_meta == saved.composer_meta
 
     @pytest.mark.asyncio
     async def test_get_state_versions_returns_all_ascending(
@@ -661,9 +667,9 @@ class TestCompositionStateVersioning:
         service,
     ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        await service.save_composition_state(session.id, composition_state_data(is_valid=False), provenance="session_seed")
+        await service.save_composition_state(session.id, composition_state_data(is_valid=False), provenance="session_seed")
+        await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         versions = await service.get_state_versions(session.id)
         assert len(versions) == 3
         assert [v.version for v in versions] == [1, 2, 3]
@@ -688,7 +694,7 @@ class TestCompositionStateVersioning:
 @pytest.mark.parametrize("errors", [None, (), (CompositionValidationError(message="detail", error_code="known", component="node"),)])
 async def test_structured_validation_errors_persist_exactly(service, engine, errors):
     session = await service.create_session("alice", "Pipeline", "local")
-    saved = await service.save_composition_state(session.id, CompositionStateData(validation_errors=errors), provenance="session_seed")
+    saved = await service.save_composition_state(session.id, composition_state_data(validation_errors=errors), provenance="session_seed")
     loaded = await service.get_current_state(session.id)
     assert loaded is not None
     assert loaded.validation_errors == errors
@@ -707,7 +713,7 @@ async def test_structured_validation_errors_persist_exactly(service, engine, err
 @pytest.mark.asyncio
 async def test_current_epoch_state_rejects_legacy_string_errors(service, engine):
     session = await service.create_session("alice", "Pipeline", "local")
-    saved = await service.save_composition_state(session.id, CompositionStateData(), provenance="session_seed")
+    saved = await service.save_composition_state(session.id, composition_state_data(), provenance="session_seed")
     with engine.begin() as conn:
         conn.execute(
             composition_states_table.update().where(composition_states_table.c.id == str(saved.id)).values(validation_errors=["legacy"])
@@ -722,7 +728,7 @@ class TestOneActiveRunEnforcement:
     @pytest.mark.asyncio
     async def test_second_pending_run_raises(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         # First run should succeed
         await service.create_run(session.id, state.id)
         # Second run should fail
@@ -732,7 +738,7 @@ class TestOneActiveRunEnforcement:
     @pytest.mark.asyncio
     async def test_create_run_returns_run_record(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         assert isinstance(run, RunRecord)
         assert run.status == "pending"
@@ -743,7 +749,7 @@ class TestOneActiveRunEnforcement:
     @pytest.mark.asyncio
     async def test_create_run_with_pipeline_yaml(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(
             session.id,
             state.id,
@@ -754,7 +760,7 @@ class TestOneActiveRunEnforcement:
     @pytest.mark.asyncio
     async def test_completed_run_allows_new_run(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         # Transition through legal path: pending -> running -> completed
         await service.update_run_status(run.id, "running")
@@ -766,7 +772,7 @@ class TestOneActiveRunEnforcement:
     @pytest.mark.asyncio
     async def test_failed_run_allows_new_run(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         # Transition through legal path: pending -> running -> failed
         await service.update_run_status(run.id, "running")
@@ -777,7 +783,7 @@ class TestOneActiveRunEnforcement:
     @pytest.mark.asyncio
     async def test_running_run_blocks_new_run(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         with pytest.raises(RunAlreadyActiveError):
@@ -792,7 +798,7 @@ class TestGetState:
         session = await service.create_session("alice", "Pipeline", "local")
         saved = await service.save_composition_state(
             session.id,
-            CompositionStateData(
+            composition_state_data(
                 source={"type": "csv"},
                 is_valid=True,
             ),
@@ -823,7 +829,7 @@ class TestGetStateInSession:
     async def test_returns_record_when_session_matches(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         saved = await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "csv"}, is_valid=True), provenance="session_seed"
+            session.id, composition_state_data(source={"type": "csv"}, is_valid=True), provenance="session_seed"
         )
         fetched = await service.get_state_in_session(saved.id, session.id)
         assert fetched.id == saved.id
@@ -837,7 +843,7 @@ class TestGetStateInSession:
         session_a = await service.create_session("alice", "Pipeline A", "local")
         session_b = await service.create_session("alice", "Pipeline B", "local")
         state_in_a = await service.save_composition_state(
-            session_a.id, CompositionStateData(source={"type": "csv"}, is_valid=True), provenance="session_seed"
+            session_a.id, composition_state_data(source={"type": "csv"}, is_valid=True), provenance="session_seed"
         )
         with pytest.raises(AuditIntegrityError, match="Tier 1 audit anomaly"):
             await service.get_state_in_session(state_in_a.id, session_b.id)
@@ -860,7 +866,7 @@ class TestGetRun:
     @pytest.mark.asyncio
     async def test_get_run_returns_record(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         created = await service.create_run(session.id, state.id)
         fetched = await service.get_run(created.id)
         assert isinstance(fetched, RunRecord)
@@ -879,7 +885,7 @@ class TestGetActiveRun:
     @pytest.mark.asyncio
     async def test_returns_active_run(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         active = await service.get_active_run(session.id)
         assert active is not None
@@ -894,7 +900,7 @@ class TestGetActiveRun:
     @pytest.mark.asyncio
     async def test_returns_none_after_completion(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         await service.update_run_status(run.id, "completed", landscape_run_id="lscp-active-none")
@@ -908,7 +914,7 @@ class TestUpdateRunStatusExpanded:
     @pytest.mark.asyncio
     async def test_update_with_error(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         await service.update_run_status(
@@ -924,7 +930,7 @@ class TestUpdateRunStatusExpanded:
     @pytest.mark.asyncio
     async def test_update_with_landscape_run_id(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         await service.update_run_status(
@@ -989,17 +995,32 @@ class TestAdr019LegacyCounterReadCompatibility:
         )
 
     @pytest.mark.asyncio
-    async def test_get_run_normalizes_legacy_gate_routed_success_counter(self, service) -> None:
+    async def test_current_epoch_refuses_legacy_gate_routed_success_shape(self, service) -> None:
+        """Epoch 80 refuses legacy disjoint counters instead of normalizing them."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
+        before = await service.get_run(run.id)
+        with pytest.raises(IntegrityError, match="ck_runs_counter_subsets"):
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id="lscp-legacy-gate",
+                rows_processed=4,
+                rows_succeeded=0,
+                rows_failed=0,
+                rows_routed_success=4,
+                rows_routed_failure=0,
+                rows_quarantined=0,
+            )
+        assert await service.get_run(run.id) == before
         await service.update_run_status(
             run.id,
             "completed",
             landscape_run_id="lscp-legacy-gate",
             rows_processed=4,
-            rows_succeeded=0,
+            rows_succeeded=4,
             rows_failed=0,
             rows_routed_success=4,
             rows_routed_failure=0,
@@ -1012,20 +1033,43 @@ class TestAdr019LegacyCounterReadCompatibility:
         assert fetched.rows_routed_success == 4
         response = self._status_response_from_run(fetched)
         assert response.status == "completed"
+        with service._engine.connect() as conn:
+            legacy = conn.execute(
+                select(*[literal(0).label(column.name) if column.name == "rows_succeeded" else column for column in runs_table.c]).where(
+                    runs_table.c.id == str(run.id)
+                )
+            ).one()
+        with pytest.raises(AuditIntegrityError, match="rows_routed_success must be a subset of rows_succeeded"):
+            service._row_to_run_record(legacy)
 
     @pytest.mark.asyncio
-    async def test_get_run_normalizes_legacy_quarantine_failure_counter(self, service) -> None:
+    async def test_current_epoch_refuses_legacy_quarantine_failure_shape(self, service) -> None:
+        """Keep the historical shape as a write and read refusal control."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
+        before = await service.get_run(run.id)
+        with pytest.raises(IntegrityError, match="ck_runs_counter_subsets"):
+            await service.update_run_status(
+                run.id,
+                "completed_with_failures",
+                landscape_run_id="lscp-legacy-quarantine",
+                rows_processed=3,
+                rows_succeeded=1,
+                rows_failed=0,
+                rows_routed_success=0,
+                rows_routed_failure=0,
+                rows_quarantined=2,
+            )
+        assert await service.get_run(run.id) == before
         await service.update_run_status(
             run.id,
             "completed_with_failures",
             landscape_run_id="lscp-legacy-quarantine",
             rows_processed=3,
             rows_succeeded=1,
-            rows_failed=0,
+            rows_failed=2,
             rows_routed_success=0,
             rows_routed_failure=0,
             rows_quarantined=2,
@@ -1037,11 +1081,19 @@ class TestAdr019LegacyCounterReadCompatibility:
         assert fetched.rows_quarantined == 2
         response = self._status_response_from_run(fetched)
         assert response.status == "completed_with_failures"
+        with service._engine.connect() as conn:
+            legacy = conn.execute(
+                select(*[literal(0).label(column.name) if column.name == "rows_failed" else column for column in runs_table.c]).where(
+                    runs_table.c.id == str(run.id)
+                )
+            ).one()
+        with pytest.raises(AuditIntegrityError, match="rows_quarantined must be a subset of rows_failed"):
+            service._row_to_run_record(legacy)
 
     @pytest.mark.asyncio
     async def test_get_run_leaves_current_subset_counters_unchanged(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         await service.update_run_status(
@@ -1069,7 +1121,7 @@ class TestAdr019LegacyCounterReadCompatibility:
     @pytest.mark.asyncio
     async def test_completed_requires_landscape_run_id(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         with pytest.raises(ValueError, match="landscape_run_id"):
@@ -1079,7 +1131,7 @@ class TestAdr019LegacyCounterReadCompatibility:
     @pytest.mark.parametrize("status", ["completed", "completed_with_failures", "empty"])
     async def test_operator_completion_status_requires_landscape_run_id(self, service, status) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         with pytest.raises(ValueError, match="landscape_run_id"):
@@ -1089,7 +1141,7 @@ class TestAdr019LegacyCounterReadCompatibility:
     @pytest.mark.parametrize("status", ["completed_with_failures", "empty"])
     async def test_widened_operator_completion_status_stamps_finished_at(self, service, status) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         await service.update_run_status(run.id, status, landscape_run_id=f"lscp-{status}")
@@ -1102,7 +1154,7 @@ class TestAdr019LegacyCounterReadCompatibility:
     @pytest.mark.asyncio
     async def test_failed_requires_error(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         with pytest.raises(ValueError, match="requires error"):
@@ -1115,7 +1167,7 @@ class TestRunTransitionEnforcement:
     @pytest.mark.asyncio
     async def test_legal_transition_pending_to_running(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         fetched = await service.get_run(run.id)
@@ -1124,7 +1176,7 @@ class TestRunTransitionEnforcement:
     @pytest.mark.asyncio
     async def test_legal_transition_pending_to_cancelled(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "cancelled")
         fetched = await service.get_run(run.id)
@@ -1137,7 +1189,7 @@ class TestRunTransitionEnforcement:
         service,
     ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         with pytest.raises(ValueError, match=r"Illegal.*transition"):
             await service.update_run_status(run.id, "completed", landscape_run_id="lscp-illegal")
@@ -1148,7 +1200,7 @@ class TestRunTransitionEnforcement:
         service,
     ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         await service.update_run_status(run.id, "completed", landscape_run_id="lscp-finished")
@@ -1162,7 +1214,7 @@ class TestLandscapeRunIdWriteOnce:
     @pytest.mark.asyncio
     async def test_set_landscape_run_id(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(
             run.id,
@@ -1175,7 +1227,7 @@ class TestLandscapeRunIdWriteOnce:
     @pytest.mark.asyncio
     async def test_overwrite_landscape_run_id_raises(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(
             run.id,
@@ -1195,7 +1247,7 @@ class TestLandscapeRunIdWriteOnce:
         service,
     ) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(
             run.id,
@@ -1220,7 +1272,7 @@ class TestCancelAllOrphanedRuns:
         """Default (max_age_seconds=None) cancels ALL pending/running runs,
         not just old ones. Critical for single-process server restarts."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         # Create a fresh run (just created, zero age)
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
@@ -1236,7 +1288,7 @@ class TestCancelAllOrphanedRuns:
     async def test_record_returning_cleanup_preserves_landscape_run_id(self, service) -> None:
         """Startup reconciliation needs cancelled run records to update Landscape."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running", landscape_run_id="lscp-orphan-1")
 
@@ -1256,7 +1308,7 @@ class TestCancelAllOrphanedRuns:
     async def test_cancels_pending_runs_without_age_filter(self, service) -> None:
         """Pending runs (never transitioned to running) are also cancelled."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         await service.create_run(session.id, state.id)
 
         cancelled = await service.cancel_all_orphaned_runs()
@@ -1266,7 +1318,7 @@ class TestCancelAllOrphanedRuns:
     async def test_does_not_cancel_terminal_runs(self, service) -> None:
         """Completed/cancelled/failed runs are never touched."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
         await service.update_run_status(run.id, "completed", landscape_run_id="lscp-global-1")
@@ -1278,7 +1330,7 @@ class TestCancelAllOrphanedRuns:
     async def test_age_filter_still_works_when_provided(self, service) -> None:
         """When max_age_seconds is given, only old runs are cancelled."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
 
@@ -1290,7 +1342,7 @@ class TestCancelAllOrphanedRuns:
     async def test_unblocks_session_after_cancellation(self, service) -> None:
         """After cancelling orphaned runs, session can accept new runs."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         await service.create_run(session.id, state.id)
 
         await service.cancel_all_orphaned_runs()
@@ -1309,7 +1361,7 @@ class TestLandscapeReconciliationMarkers:
         session = await service.create_session(owner_id, "Pipeline", "local")
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
         )
         run = await service.create_run(session.id, state.id)
@@ -1399,7 +1451,7 @@ class TestCancelAllOrphanedRunsExcludeRunIds:
     async def test_excludes_live_run_ids_from_cancellation(self, service) -> None:
         """Runs with IDs in exclude_run_ids are skipped even if they exceed max_age."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
 
@@ -1418,7 +1470,7 @@ class TestCancelAllOrphanedRunsExcludeRunIds:
     async def test_cancels_non_excluded_runs(self, service) -> None:
         """Runs NOT in exclude_run_ids are still cancelled normally."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
 
@@ -1436,7 +1488,7 @@ class TestCancelAllOrphanedRunsExcludeRunIds:
     async def test_empty_exclude_set_cancels_all(self, service) -> None:
         """Empty exclude_run_ids (default) does not change behaviour."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
 
@@ -1454,7 +1506,7 @@ class TestCancelAllOrphanedRunsReason:
     async def test_reason_written_to_error_column(self, service) -> None:
         """When reason is provided, it's stored in the run's error field."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
 
@@ -1471,7 +1523,7 @@ class TestCancelAllOrphanedRunsReason:
     async def test_no_reason_leaves_error_null(self, service) -> None:
         """When reason is None (default), error field stays unset."""
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
 
@@ -1494,7 +1546,7 @@ class TestCancelledTerminalTransitions:
     @pytest.mark.asyncio
     async def test_illegal_transition_cancelled_to_completed_raises(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "cancelled")
         with pytest.raises(ValueError, match=r"Illegal.*transition"):
@@ -1503,7 +1555,7 @@ class TestCancelledTerminalTransitions:
     @pytest.mark.asyncio
     async def test_illegal_transition_cancelled_to_failed_raises(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "cancelled")
         with pytest.raises(ValueError, match=r"Illegal.*transition"):
@@ -1528,7 +1580,7 @@ class TestArchiveSessionWithActiveRun:
         lineage queryable.
         """
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         await service.create_run(session.id, state.id)
 
         await service.archive_session(session.id)
@@ -1559,7 +1611,7 @@ class TestRunDiagnosticsAuditMessage:
 
     async def _session_state_run(self, service):
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         return session, state, run
 
@@ -1634,7 +1686,7 @@ class TestRunDiagnosticsAuditMessage:
     @pytest.mark.asyncio
     async def test_missing_run_refused_without_consuming_sequence(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         before = await service.add_message(session.id, "user", "hello", writer_principal="route_user_message")
         authority = RunDiagnosticsAuditAuthority(run_id=uuid.uuid4(), session_id=session.id, state_id=state.id)
 
@@ -1650,7 +1702,7 @@ class TestRunDiagnosticsAuditMessage:
     @pytest.mark.asyncio
     async def test_state_rebound_refused(self, service) -> None:
         session, _state, run = await self._session_state_run(service)
-        other_state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        other_state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=other_state.id)
 
         with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
@@ -1695,7 +1747,7 @@ class TestRunDiagnosticsAuditMessagesAtomic:
 
     async def _session_state_run(self, service):
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         return session, state, run
 
@@ -1838,7 +1890,7 @@ class TestPagination:
     async def test_get_state_versions_limit(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         for _ in range(5):
-            await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
+            await service.save_composition_state(session.id, composition_state_data(is_valid=False), provenance="session_seed")
         versions = await service.get_state_versions(session.id, limit=2)
         assert len(versions) == 2
         assert versions[0].version == 1
@@ -1848,7 +1900,7 @@ class TestPagination:
     async def test_get_state_versions_offset(self, service) -> None:
         session = await service.create_session("alice", "Pipeline", "local")
         for _ in range(5):
-            await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
+            await service.save_composition_state(session.id, composition_state_data(is_valid=False), provenance="session_seed")
         versions = await service.get_state_versions(session.id, limit=2, offset=3)
         assert len(versions) == 2
         assert versions[0].version == 4
@@ -1857,9 +1909,13 @@ class TestPagination:
 
 def _admit_durable_ingress(service, session_id, *, operation_id, content, requested_state_id):
     from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission, RepositoryRateLimitAuthority
+    from tests.helpers.continuation_policy import minimal_continuation_policy
 
     authority = ComposerAsyncOperationAuthority(
-        service._engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
+        service._engine,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        claim_lease_seconds=30,
+        continuation_policy=minimal_continuation_policy(),
     )
     request = SendMessageRequest(operation_id=str(operation_id), content=content, state_id=requested_state_id)
     record, fresh = authority.admit(
@@ -1869,68 +1925,64 @@ def _admit_durable_ingress(service, session_id, *, operation_id, content, reques
         session_id=session_id,
         operation_id=request.operation_id,
         kind="compose_message",
-        request_hash=composer_operation_request_hash(session_id=session_id, kind="compose_message", request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=session_id, kind="compose_message", request=request),
         actor_user_id="alice",
         request_id=None,
         base_state_id=requested_state_id,
         request_json=request.model_dump_json(),
-        deadline_seconds=180,
         max_nonterminal=64,
         auth_provider_type="local",
     )
     return authority, record, fresh
 
 
+_RUNNING: dict[tuple[str, str], tuple[ComposerAsyncOperationAuthority, ComposerOperationRunning]] = {}
+
+
 async def _durable_ingress(
     service, session_id, role, content, *, operation_id, requested_state_id, writer_principal, composition_state_id=None
 ):
-    authority, _record, fresh = _admit_durable_ingress(
+    """Admit, claim and start one segment, then write its reserved user row through Continuation ingress.
+
+    A failed ingress transaction leaves the same running segment with no bound
+    user row, so a same-key retry reuses that segment instead of starting another.
+    A replayed admission that nobody started yet claims and starts it here.
+    """
+    from elspeth.web.required_work import RequiredWorkSource
+    from tests.helpers.continuation_inventory import inventory_work
+
+    key = (str(session_id), str(operation_id))
+    authority, _record, _fresh = _admit_durable_ingress(
         service, session_id, operation_id=operation_id, content=content, requested_state_id=requested_state_id
     )
-    if fresh:
-        (claim,) = authority.claim_next(limit=1)
-        context = service.session_operation_authority.start_composer_async_operation(
+    if key not in _RUNNING:
+        (claim,) = authority.claim_segment(limit=1)
+        context = service.session_operation_authority.start_composer_segment(
             claim, owner_instance_id=service.session_operation_owner_instance_id, lease_seconds=30, auth_provider_type="local"
         )
-        running = ComposerOperationRunning(claim=claim, session_operation_context=context)
-    else:
-        # A failed ingress transaction leaves the same running identity with
-        # no bound user, so its owner can retry this write without starting a job.
-        from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence
-        from elspeth.web.sessions.composer_operations import ComposerOperationClaim
-        from elspeth.web.sessions.models import composer_async_operations_table
-
-        with service._engine.connect() as conn:
-            row = conn.execute(
-                select(composer_async_operations_table).where(
-                    composer_async_operations_table.c.session_id == str(session_id),
-                    composer_async_operations_table.c.operation_id == str(operation_id),
-                )
-            ).one()
-        claim = ComposerOperationClaim(
-            session_id=session_id, operation_id=str(operation_id), claim_token=row.claim_token, attempt=row.attempt
+        _RUNNING[key] = (authority, ComposerOperationRunning(claim=claim, session_operation_context=context))
+    authority, running = _RUNNING[key]
+    selected = authority.load_continuation_snapshot(running)
+    sql, projection = inventory_work(running).reserve_pair(RequiredWorkSource.INGRESS_SQL, RequiredWorkSource.INGRESS_PROJECTION)
+    try:
+        result = await service.add_message_with_transcript(
+            session_id,
+            role,
+            content,
+            operation_id=operation_id,
+            requested_state_id=requested_state_id,
+            writer_principal=writer_principal,
+            composition_state_id=composition_state_id,
+            session_operation_context=running.session_operation_context,
+            running=running,
+            required_work=sql,
+            continuation=selected,
         )
-        context = SessionOperationContext(
-            fence=SessionOperationFence(
-                session_id=str(session_id),
-                operation_id=row.session_operation_id,
-                lease_token=row.session_operation_lease_token,
-                operation_epoch=row.session_operation_epoch,
-            ),
-            operation_kind=SessionOperationKind.COMPOSE,
-        )
-        running = ComposerOperationRunning(claim=claim, session_operation_context=context)
-    return await service.add_message_with_transcript(
-        session_id,
-        role,
-        content,
-        operation_id=operation_id,
-        requested_state_id=requested_state_id,
-        writer_principal=writer_principal,
-        composition_state_id=composition_state_id,
-        session_operation_context=context,
-        running=running,
-    )
+    except BaseException as error:
+        projection.complete_owned(error)
+        raise
+    projection.complete_owned()
+    return result
 
 
 class TestAddMessageWithTranscript:
@@ -1972,7 +2024,7 @@ class TestAddMessageWithTranscript:
             operation_kind=SessionOperationKind.COMPOSE,
         )
         await service.save_composition_state(
-            session.id, CompositionStateData(is_valid=True), provenance="session_seed", session_operation_context=context
+            session.id, composition_state_data(is_valid=True), provenance="session_seed", session_operation_context=context
         )
         _, replay, fresh = _admit_durable_ingress(
             service, session.id, operation_id=operation_id, content="same text", requested_state_id=None
@@ -2053,7 +2105,7 @@ class TestAddMessageWithTranscript:
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(result, MessageIngressFresh)
+        assert isinstance(result, ContinuationIngressCheckpoint)
         record, transcript = result.message, result.transcript
         assert isinstance(transcript, tuple)
 
@@ -2100,7 +2152,7 @@ class TestAddMessageWithTranscript:
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(retry, MessageIngressFresh)
+        assert isinstance(retry, ContinuationIngressCheckpoint)
         assert retry.message.sequence_no == 1
 
     @pytest.mark.asyncio
@@ -2117,7 +2169,7 @@ class TestAddMessageWithTranscript:
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(fresh, MessageIngressFresh)
+        assert isinstance(fresh, ContinuationIngressCheckpoint)
         with engine.begin() as conn:
             with pytest.raises(IntegrityError), conn.begin_nested():
                 conn.execute(
@@ -2172,14 +2224,14 @@ class TestAddMessageWithTranscript:
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(first_result, MessageIngressFresh)
-        assert isinstance(second_result, MessageIngressFresh)
+        assert isinstance(first_result, ContinuationIngressCheckpoint)
+        assert isinstance(second_result, ContinuationIngressCheckpoint)
         assert first_result.message.id != second_result.message.id
 
     @pytest.mark.asyncio
     async def test_persists_pre_send_state_provenance(self, service) -> None:
         session = await service.create_session("alice", "Provenance", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
 
         result = await _durable_ingress(
             service,
@@ -2191,7 +2243,7 @@ class TestAddMessageWithTranscript:
             composition_state_id=state.id,
             writer_principal="route_user_message",
         )
-        assert isinstance(result, MessageIngressFresh)
+        assert isinstance(result, ContinuationIngressCheckpoint)
         record, transcript = result.message, result.transcript
 
         assert record.composition_state_id == state.id
@@ -2202,7 +2254,7 @@ class TestAddMessageWithTranscript:
         """Parity with add_message: the _assert_state_in_session guard fires."""
         s1 = await service.create_session("alice", "One", "local")
         s2 = await service.create_session("alice", "Two", "local")
-        foreign_state = await service.save_composition_state(s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        foreign_state = await service.save_composition_state(s2.id, composition_state_data(is_valid=True), provenance="session_seed")
 
         with pytest.raises(ComposerOperationPreconditionRefused):
             await _durable_ingress(
@@ -2280,7 +2332,7 @@ class TestAddMessageWithTranscript:
                     requested_state_id=None,
                     writer_principal="route_user_message",
                 )
-                assert isinstance(result, MessageIngressFresh)
+                assert isinstance(result, ContinuationIngressCheckpoint)
                 record, transcript = result.message, result.transcript
 
                 # The pinned snapshot still cannot see the committed
@@ -2343,7 +2395,7 @@ class TestAddMessageWithTranscript:
                     requested_state_id=None,
                     writer_principal="route_user_message",
                 )
-                assert isinstance(result, MessageIngressFresh)
+                assert isinstance(result, ContinuationIngressCheckpoint)
                 record, transcript = result.message, result.transcript
             finally:
                 event.remove(engine, "before_cursor_execute", record_statement)
@@ -2351,33 +2403,50 @@ class TestAddMessageWithTranscript:
 
             assert transcript[-1].id == record.id  # sanity: the outcome still holds
 
-            insert_indices = [
-                index
-                for index, (kind, _conn_id, statement) in enumerate(events)
-                if kind == "execute" and statement.lstrip().upper().startswith("INSERT INTO CHAT_MESSAGES")
-            ]
-            assert len(insert_indices) == 1, [entry[2] for entry in events]
-            insert_index = insert_indices[0]
-            transcript_select_indices = [
-                index
-                for index, (kind, _conn_id, statement) in enumerate(events)
-                if kind == "execute"
-                and statement.lstrip().upper().startswith("SELECT")
-                and "chat_messages" in statement
-                and "ORDER BY chat_messages.sequence_no" in statement
-            ]
-            assert len(transcript_select_indices) == 1, [entry[2] for entry in events]
-            select_index = transcript_select_indices[0]
+            def prove_atomic_transcript(observed):
+                insert_indices = [
+                    index
+                    for index, (kind, _conn_id, statement) in enumerate(observed)
+                    if kind == "execute" and statement.lstrip().upper().startswith("INSERT INTO CHAT_MESSAGES")
+                ]
+                assert len(insert_indices) == 1, [entry[2] for entry in observed]
+                insert_index = insert_indices[0]
+                commit_indices = [
+                    index for index, (kind, _conn_id, _statement) in enumerate(observed) if index > insert_index and kind == "commit"
+                ]
+                assert commit_indices, "actual ingress transaction did not commit"
+                commit_index = commit_indices[0]
+                # Continuation reads the inserted transcript, then validates
+                # it again while retaining ingress. Both reads must stay in
+                # the insert's own transaction and on its DBAPI connection.
+                transcript_select_indices = [
+                    index
+                    for index, (kind, _conn_id, statement) in enumerate(observed)
+                    if insert_index < index < commit_index
+                    and kind == "execute"
+                    and statement.lstrip().upper().startswith("SELECT")
+                    and "chat_messages" in statement
+                    and "ORDER BY chat_messages.sequence_no" in statement
+                ]
+                assert len(transcript_select_indices) == 2, {"insert": insert_index, "transcript_reads": transcript_select_indices}
+                for select_index in transcript_select_indices:
+                    assert observed[insert_index][1] == observed[select_index][1]
+                    between = observed[insert_index + 1 : select_index]
+                    assert all(kind != "commit" for kind, _conn_id, _statement in between)
+                return insert_index, transcript_select_indices
 
-            # The read follows the write...
-            assert insert_index < select_index
-            # ...on the SAME DBAPI connection...
-            assert events[insert_index][1] == events[select_index][1]
-            # ...with no commit in between: the SELECT ran inside the
-            # insert's own transaction, which is the read-your-own-write
-            # guarantee the docstring claims.
-            between = events[insert_index + 1 : select_index]
-            assert all(kind != "commit" for kind, _conn_id, _statement in between), [entry[:2] for entry in between]
+            insert_index, select_indices = prove_atomic_transcript(events)
+            for select_index in select_indices:
+                wrong_connection = list(events)
+                kind, connection_id, statement = wrong_connection[select_index]
+                wrong_connection[select_index] = (kind, connection_id + 1, statement)
+                early_read = [events[select_index], *events[:select_index], *events[select_index + 1 :]]
+                for opponent in (wrong_connection, early_read):
+                    with pytest.raises(AssertionError):
+                        prove_atomic_transcript(opponent)
+            early_commit = [*events[: insert_index + 1], ("commit", events[insert_index][1], "COMMIT"), *events[insert_index + 1 :]]
+            with pytest.raises(AssertionError):
+                prove_atomic_transcript(early_commit)
         finally:
             engine.dispose()
 
@@ -2408,7 +2477,7 @@ class TestCreateRunSessionLockDomain:
         state = asyncio.run(
             service.save_composition_state(
                 session.id,
-                CompositionStateData(is_valid=True),
+                composition_state_data(is_valid=True),
                 provenance="session_seed",
             )
         )

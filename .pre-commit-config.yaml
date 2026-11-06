@@ -191,40 +191,26 @@ repos:
         pass_filenames: false
 
       - id: elspeth-lints-trust-tier
-        name: elspeth-lints trust-tier (ratchet against HEAD)
-        entry: .venv/bin/python -m scripts.trust_tier_ratchet
+        name: elspeth-lints keyless trust-tier delta report (review required)
+        entry: .venv/bin/python -m scripts.trust_tier_ratchet --report-only
         language: system
-        # RATCHET, not the fail-closed CLI gate. The trust_tier.tier_model
-        # corpus is deliberately non-empty until the operator signs the package
-        # (AGENTS.md "Operator signature verification"), so `elspeth-lints check` exits 1
-        # on every tree and as a direct entry would refuse every commit touching
-        # this hook's trigger paths, including ones that shrink the corpus.
-        # scripts/trust_tier_ratchet.py runs the same rule with the
-        # same arguments over the working tree and over `git archive HEAD`
-        # (HEAD's rule code, src and allowlists together) and fails only when
-        # the commit ADDS a failing finding HEAD does not carry, comparing
-        # line-insensitive (path, rule, message) keys as a multiset. This is
-        # AGENTS.md's own obligation ("compare the corpus before and after your
-        # change, not to zero") made executable. CI does not run the signed
-        # trust-tier gate; this local hook ratchets.
-        # The script pins ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE to
-        # shape-only-when-key-missing for both runs. The mode is ADAPTIVE: with
-        # the operator's
-        # ELSPETH_JUDGE_METADATA_HMAC_KEY present in the shell env, the load
-        # does FULL judge-metadata signature verification; with the key absent
-        # (keyless agents, or an operator shell without the key after the .env
-        # O1 removal) it DOWNGRADES to shape-only and prints a prominent
-        # load-time warning rather than hard-failing the commit. Without this,
-        # the default `required` mode makes the hook raise on EVERY keyless
-        # local commit that touches the allowlist. CI does not perform
-        # required-mode signature verification.
-        # Authoritative signature verification runs in the trusted operator
-        # context; Actions must never receive the HMAC key.
+        verbose: true
+        # Root-adopted measurement policy: successful comparison exits zero,
+        # reports complete raw occurrence additions/removals, and prints
+        # REVIEW REQUIRED for additions. Unreviewed additions still block
+        # release/landing under master-plan A4; this hook does not adjudicate.
+        # Compares actual working source/policy (including unstaged bytes) with
+        # exact HEAD source/policy using the same unchanged current engine.
+        # Both imports and per-tree policy paths are checked. This single-rule
+        # report is not A4's complete --rules all comparison. Default/--strict
+        # remains a normalized multiplicity ratchet. Invalid scans stay nonzero.
+        # Both runs use keyless shape verification. Signing is suspended;
+        # agents must never hold an operator key, and the reporter refuses one.
         # NO `types:` filter. pre-commit ANDs `types` with `files`; adding
         # `types: [python]` here made the intersection near-empty — allowlist
         # YAMLs under config/cicd/enforce_tier_model/ matched `files` but were
         # excluded as non-python, so the gate Skipped on the most common way
-        # tier_model state changes. This is a whole-repo policy gate
+        # tier_model state changes. This is a whole-repo rule measurement
         # (pass_filenames: false, scans --root src/elspeth regardless of which
         # file triggered it); the `files` regex is purely the trigger condition
         # and matches every sibling policy gate above (freeze-guards,

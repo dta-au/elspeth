@@ -1,0 +1,35 @@
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_actual_failure_and_revocation_outcomes_are_retained_as_data as test_actual_failure_and_revocation_outcomes_are_retained_as_data,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_actual_owed_result_reads_after_cancel_or_segment_without_repeating_writer as test_actual_owed_result_reads_after_cancel_or_segment_without_repeating_writer,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_final_owed_read_binds_full_supplied_selected_root as test_final_owed_read_binds_full_supplied_selected_root,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_final_owed_read_classifies_each_coherent_storage_utf8_failure as test_final_owed_read_classifies_each_coherent_storage_utf8_failure,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_final_owed_read_rechecks_inventory_live_authority_and_actual_rows as test_final_owed_read_rechecks_inventory_live_authority_and_actual_rows,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_names_lookup_is_bracketed_by_actual_pending_result_selection as test_names_lookup_is_bracketed_by_actual_pending_result_selection,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_owed_inventory_requires_live_lease_before_names_lookup as test_owed_inventory_requires_live_lease_before_names_lookup,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_owed_names_refuse_unselected_result_families_before_lookup as test_owed_names_refuse_unselected_result_families_before_lookup,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_owed_read_admission_cancel_keeps_original_and_closes_projection as test_owed_read_admission_cancel_keeps_original_and_closes_projection,
+)
+from tests.unit.web.sessions.test_continuation_owed_p4_read import (
+    test_pending_result_effect_binding_is_checked_before_metadata as test_pending_result_effect_binding_is_checked_before_metadata,
+)
+
+pytestmark = pytest.mark.testcontainer

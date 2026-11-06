@@ -561,7 +561,7 @@ class TestBedrockProvider:
     def test_execute_query_content_filter_raises_content_policy_error(self) -> None:
         with (
             patch("litellm.completion", return_value=_response(content="", finish_reason="content_filter")),
-            pytest.raises(ContentPolicyError, match="empty content"),
+            pytest.raises(ContentPolicyError, match="Bedrock LLM request failed"),
         ):
             _execute(_provider())
 
@@ -576,10 +576,11 @@ class TestBedrockProvider:
         )
         client = SimpleNamespace(chat_completion=lambda **_kwargs: response)
 
-        with patch.object(provider, "_get_llm_client", return_value=client), pytest.raises(ContentPolicyError) as exc_info:
+        with patch.object(provider, "_get_llm_client", return_value=client), pytest.raises(LLMClientError) as exc_info:
             _execute(provider)
 
-        assert str(exc_info.value) == "Bedrock LLM returned empty content (finish_reason=unrecognized)"
+        assert type(exc_info.value) is LLMClientError
+        assert str(exc_info.value) == "Bedrock LLM request failed"
         assert sentinel not in str(exc_info.value)
         assert sentinel not in repr(exc_info.value)
 

@@ -137,7 +137,8 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         ],
         "transform:batch_duplicate_annotator": [
             {"first_text": "alpha", "second_text": "beta"},
-            {"first_text": "alpha", "second_text": "gamma"},
+            {"first_text": "unique", "second_text": "different"},
+            {"first_text": "beta", "second_text": "alpha"},
         ],
         "transform:batch_effect_size": [
             {"prompt_variant": "control", "score": 0.2},
@@ -299,7 +300,9 @@ def _materialize_pipeline(
             aggregation = yaml.safe_load(cast(str, plugin_type.example_use))["aggregations"][0]
             aggregation["input"] = "subject_input"
             aggregation["on_success"] = "output"
-            if not plugin_type.requires_complete_source_batch:
+            if plugin_type.requires_complete_source_batch:
+                aggregation.pop("trigger", None)
+            else:
                 aggregation["trigger"] = {"count": len(rows)}
             aggregation["options"] = options
             pipeline["aggregations"] = [aggregation]
@@ -490,7 +493,8 @@ def test_local_first_party_plugin_crosses_the_production_lifecycle(
                 assert [request["operation"] for request in lifecycle_flow.requests()] == ["read"]
                 assert lifecycle_flow.actions() == []
             else:
-                assert [request["operation"] for request in lifecycle_flow.requests()] == ["status", "write"]
+                # A fresh member has no prior COMMIT history to reconcile.
+                assert [request["operation"] for request in lifecycle_flow.requests()] == ["write"]
                 assert [action["data"] for action in lifecycle_flow.actions()] == _rows_for(case.plugin_key)
 
         with db.engine.connect() as connection:
@@ -797,7 +801,7 @@ def test_public_resume_reconciles_the_subject_pipeline_after_a_finalized_effect_
             )
         assert checkpoints.get_latest_checkpoint(run_id) is not None
         if lifecycle_flow is not None:
-            expected_operations = ["read"] if case.plugin_key == "source:power_automate" else ["status", "write"]
+            expected_operations = ["read"] if case.plugin_key == "source:power_automate" else ["write"]
             assert [request["operation"] for request in lifecycle_flow.requests()] == expected_operations
     finally:
         rate_limits.close()

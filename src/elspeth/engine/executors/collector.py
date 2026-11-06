@@ -223,6 +223,10 @@ class CollectorExecutor:
         """Total in-memory buffered members across open groups (EOF diagnostics)."""
         return sum(len(g.arrived) for g in self._pending.values())
 
+    def has_pending_group_closes(self) -> bool:
+        """Whether complete groups or undelivered outcomes still need a sweep."""
+        return bool(self._restored_complete_keys or self._undelivered_sweep_outcomes)
+
     def is_release_group(self, group_id: str) -> bool:
         """META-38: the written release fact for ``group_id``, through this
         executor's own TokenManager memo (durable read, once per group)."""
@@ -442,7 +446,7 @@ class CollectorExecutor:
             self._run_id, [record.opener_token_id], node_id=str(node_id)
         )
         flush_attempt = max_attempts[record.opener_token_id] + 1 if record.opener_token_id in max_attempts else 0
-        return _PendingGroup(
+        pending = _PendingGroup(
             roster=roster,
             opener_token_id=record.opener_token_id,
             ordinals=ordinals,
@@ -455,6 +459,19 @@ class CollectorExecutor:
             # codebase (e.g. scheduler_drain.py's sink attempt-offset guard).
             flush_resume_checkpoint_id=resume_checkpoint_id if flush_attempt > 0 else None,
         )
+        # A prior leader can adopt a loss while every surviving member is
+        # still READY upstream. Such a group has no arrival hold to restore.
+        # Fresh opens therefore hydrate the authoritative full ledger too;
+        # adoption epochs are live intake cursors, not loss-retention bounds.
+        losses = self._barrier_restore_reads.get_group_member_losses(run_id=self._run_id, closer_name=collector_name, group_id=group_id)
+        for member_key, reason in losses.items():
+            if member_key not in roster:
+                raise AuditIntegrityError(
+                    f"Ledger loss for member {member_key!r} of group {group_id!r} at collector "
+                    f"'{collector_name}' names a member outside the durable roster {sorted(roster)!r}."
+                )
+            pending.lost[member_key] = reason
+        return pending
 
     def has_recorded_member_loss(self, collector_name: str, group_id: str, member_key: str) -> bool:
         """§5 loss dedup guard: checks in-memory state first, then the
@@ -514,6 +531,7 @@ class CollectorExecutor:
         if key in self._completed_keys or self._check_landscape_for_completion(collector_name, group_id):
             return None
         pending = self._pending[key] if key in self._pending else None
+        opened_here = pending is None
         if pending is None:
             pending = self._open_group(collector_name, group_id, first_arrival=self._clock.monotonic())
         if member_key not in pending.roster:
@@ -522,18 +540,22 @@ class CollectorExecutor:
             raise OrchestrationInvariantError(
                 f"Lost member {member_key!r} not in group {group_id!r} roster at collector '{collector_name}': {sorted(pending.roster)!r}"
             )
-        if key not in self._pending:
-            self._pending[key] = pending
         if member_key in pending.arrived:
             raise OrchestrationInvariantError(
                 f"Member {member_key!r} already arrived at collector '{collector_name}' but was reported lost — processor bug."
             )
         if member_key in pending.lost:
-            raise OrchestrationInvariantError(
-                f"Member {member_key!r} already marked lost at collector '{collector_name}' — "
-                f"duplicate loss notification (the replay must dedup with has_replayed_member_loss first)."
-            )
-        pending.lost[member_key] = reason
+            if not opened_here:
+                raise OrchestrationInvariantError(
+                    f"Member {member_key!r} already marked lost at collector '{collector_name}' — "
+                    f"duplicate loss notification (the replay must dedup with has_replayed_member_loss first)."
+                )
+            if pending.lost[member_key] != reason:
+                raise AuditIntegrityError(f"Collector loss notification for {group_id!r}/{member_key!r} disagrees with its durable reason.")
+        else:
+            pending.lost[member_key] = reason
+        if key not in self._pending:
+            self._pending[key] = pending
         if self._roster_settled(pending):
             return self._close_group(collector_name, key, pending, ctx)
         return None
@@ -761,25 +783,15 @@ class CollectorExecutor:
                 pending.arrived[member.member_key] = _MemberEntry(
                     token=member.token, arrival_time=restore_now, state_id=member.state_id, ordinal=ordinal
                 )
-            # Fix round 2 (b): rebuild pending.lost from the FULL group_losses
-            # ledger, adopted losses INCLUDED. A loss the crashed leader
-            # already adopted is absent from list_unadopted_group_losses, so
-            # the journal-first replay can never re-stage it — this read is
-            # the only way it reaches the rebuilt roster. Cross-checked
-            # exactly as notify_member_lost checks a live loss.
-            losses = self._barrier_restore_reads.get_group_member_losses(run_id=self._run_id, closer_name=collector_name, group_id=group_id)
-            for member_key, reason in losses.items():
-                if member_key not in pending.roster:
-                    raise AuditIntegrityError(
-                        f"Ledger loss for member {member_key!r} of group {group_id!r} at collector "
-                        f"'{collector_name}' names a member outside the durable roster {sorted(pending.roster)!r}."
-                    )
+            # _open_group hydrated and roster-validated the full loss ledger.
+            # Restored arrivals still have to prove they do not also name a
+            # lost member before any group is installed.
+            for member_key in pending.lost:
                 if member_key in pending.arrived:
                     raise OrchestrationInvariantError(
                         f"Member {member_key!r} of group {group_id!r} at collector '{collector_name}' is both a "
                         "journaled arrival and a ledger loss — a token cannot both arrive and be error-routed."
                     )
-                pending.lost[member_key] = reason
             if self._roster_settled(pending):
                 # I-8 (complete-roster restore, journal-before-dispatch):
                 # park for the post-restore flush-trigger sweep — see the
@@ -808,12 +820,11 @@ class CollectorExecutor:
         )
 
     def flush_restored_complete_groups(self, ctx: PluginContext) -> tuple[CollectorOutcome, ...]:
-        """Post-restore flush-trigger sweep (I-8): close every group
-        :meth:`restore_from_journal` installed with an already-complete roster.
+        """Close complete rosters parked by restore or cooperative cancellation.
 
         The ``PluginContext``-bearing follow-up call that restore itself
-        cannot make. Call once per resume, after the ``restore_from_journal``
-        that parked the keys, from a ctx-bearing intake pass (the order
+        cannot make. Call from a ctx-bearing intake pass after restore, or
+        when a live close was deferred by cancellation (the order
         against the group-loss replay is NOT load-bearing — a roster
         completed by ledger-rebuilt losses is parked by restore itself) —
         the returned outcomes carry the same ``consumed_tokens`` a
@@ -854,8 +865,13 @@ class CollectorExecutor:
         outcomes, self._undelivered_sweep_outcomes = self._undelivered_sweep_outcomes, []
         try:
             while self._restored_complete_keys:
+                if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                    break
                 key = self._restored_complete_keys[0]
-                outcomes.append(self._close_group(key[0], key, self._pending[key], ctx))
+                outcome = self._close_group(key[0], key, self._pending[key], ctx)
+                if outcome.held:
+                    break
+                outcomes.append(outcome)
                 del self._restored_complete_keys[0]
         except BaseException:
             self._undelivered_sweep_outcomes = outcomes
@@ -907,6 +923,15 @@ class CollectorExecutor:
                 group_id=group_id,
                 closed_without_plugin=GroupSettlementReason.ALL_MEMBERS_LOST.value,
             )
+        # Finish committed adoption/notification bookkeeping, including
+        # plugin-free verdicts above, but preserve a complete arrived group
+        # instead of starting a fresh plugin after shutdown. Its OPEN holds
+        # reconstruct this close on public resume; the queue also supports
+        # continuing this executor after its caller clears the event.
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            if key not in self._restored_complete_keys:
+                self._restored_complete_keys.append(key)
+            return CollectorOutcome(held=True, collector_name=collector_name, group_id=group_id)
         return self._execute_flush(collector_name, key, pending, ctx)
 
     def _fail_group(

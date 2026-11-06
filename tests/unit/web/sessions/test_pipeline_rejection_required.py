@@ -12,7 +12,7 @@ from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkAuthority, RequiredWorkCoordinator, RequiredWorkSource
-from elspeth.web.sessions.models import composition_proposals_table, proposal_events_table
+from elspeth.web.sessions.models import composition_proposals_table, composition_states_table, proposal_events_table
 from elspeth.web.sessions.pipeline_rejection import PipelineRejectionExpected
 from elspeth.web.sessions.pipeline_rejection_finish_once import (
     PipelineRejectionRaised,
@@ -380,6 +380,331 @@ async def test_creation_finish_once_preserves_actual_row_and_all_cancellations(o
         await asyncio.gather(task, return_exceptions=True)
         event.remove(engine, "before_cursor_execute", park)
         repository.release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("telemetry_failure", [False, True])
+@pytest.mark.parametrize(
+    "rejection_fails",
+    [False, True],
+    ids=["rejection-commits", "rejection-rolls-back"],
+)
+async def test_creation_then_rejection_retains_actual_originals_at_nonzero_scope(
+    operation_store, monkeypatch, telemetry_failure, rejection_fails
+):
+    from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+    from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
+    from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkRole
+    from elspeth.web.sessions import service as service_module
+    from elspeth.web.sessions.pipeline_rejection import PipelineRejectionSQLResult
+    from elspeth.web.sessions.pipeline_rejection_custody import (
+        original_outcome_group,
+        project_creation_handoff,
+        reject_pipeline_with_required_custody,
+    )
+    from elspeth.web.sessions.pipeline_rejection_finish_once import PipelineCreationReturned
+
+    engine, repository, _authority, service, sid = operation_store
+    existing, running = await prepared_rejection(operation_store)
+    context = running.session_operation_context
+    old = existing.authority.row
+    assert old.user_message_id is not None
+    creation_owner = RequiredWorkCoordinator(
+        RequiredWorkAuthority(
+            RequiredAuthorityKind.DURABLE_COMPOSE,
+            context,
+            durable_operation_id=running.claim.operation_id,
+            claim_attempt=running.claim.attempt,
+        )
+    )
+    creation_binding = RequiredWorkBinding(creation_owner, 7, 12, RequiredWorkRole.TURN, running)
+    creation, creation_projection = creation_binding.reserve_pair(
+        RequiredWorkSource.PROPOSAL_CREATION_SQL,
+        RequiredWorkSource.PROPOSAL_CREATION_PROJECTION,
+    )
+    plan = PipelinePlanResult(
+        proposal=existing.authority.proposal,
+        tool_call_id="lower-level-new-provider-call",
+        custody_result="not_required",
+        model_identifier="model",
+        model_version="version",
+        provider="test",
+    )
+    telemetry_original = RuntimeError("actual creation post-SQL telemetry failure")
+    if telemetry_failure:
+
+        class FailedCounter:
+            def add(self, amount, attributes):
+                raise telemetry_original
+
+        monkeypatch.setattr(service_module, "_PIPELINE_PLANNER_COUNTER", FailedCounter())
+
+    create_entered, create_release = threading.Event(), threading.Event()
+    reject_entered, reject_release = threading.Event(), threading.Event()
+    sql_original = OperationalError("actual rejection SQL failure", {}, RuntimeError("actual driver"))
+    created_cancellations = []
+    rejected_cancellations = []
+    creation_outcomes = []
+    rejection_outcomes = []
+    creation_handoffs = []
+    creation_projection_failures = []
+    observed_rejection = []
+    rejection_owners = []
+    actual_finish = service_module.run_required_sql_finish_once
+
+    async def observe_finish(ticket, func):
+        outcome = await actual_finish(ticket, func)
+        if ticket.key.source is RequiredWorkSource.PROPOSAL_CREATION_SQL:
+            creation_outcomes.append((ticket, outcome))
+            created_cancellations.extend(outcome.deferred_cancellations)
+        if ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL:
+            rejection_outcomes.append((ticket, outcome))
+            rejected_cancellations.extend(outcome.deferred_cancellations)
+        return outcome
+
+    monkeypatch.setattr(service_module, "run_required_sql_finish_once", observe_finish)
+
+    def hold_sql(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.startswith("INSERT INTO composition_proposals"):
+            create_entered.set()
+            assert create_release.wait(10)
+        if statement.startswith("UPDATE composition_proposals"):
+            reject_entered.set()
+            assert reject_release.wait(10)
+            if rejection_fails:
+                raise sql_original
+
+    event.listen(engine, "before_cursor_execute", hold_sql)
+
+    async def workflow():
+        handoff = await service.create_pipeline_composition_proposal_finish_once(
+            session_id=sid,
+            plan=plan,
+            summary=old.summary,
+            rationale=old.rationale,
+            affects=old.affects,
+            arguments_redacted_json=RedactedPipelineArguments(old.arguments_redacted_json),
+            actor="composer-web:user:alice",
+            composer_model_identifier="model",
+            composer_model_version="version",
+            composer_provider="test",
+            user_message_id=old.user_message_id,
+            session_operation_context=context,
+            required_work=creation,
+            running=running,
+        )
+        creation_handoffs.append(handoff)
+        row, failures, cancellations = project_creation_handoff(creation_binding, creation, creation_projection, handoff)
+        creation_projection_failures.extend(failures)
+        assert row is not None and row.status == "pending"
+        assert row.id != old.id and row.tool_call_id == plan.tool_call_id
+        assert row.session_id == sid and row.user_message_id == old.user_message_id
+        actual = await service.get_authoritative_pipeline_proposal(session_id=sid, proposal_id=row.id)
+        assert actual.row.audit_event_id == actual.creation_event_id
+        expected = PipelineRejectionExpected(
+            actual,
+            "request_cancelled",
+            None,
+            "system:auto_reject_request_cancelled",
+            "alice",
+            context,
+            running,
+        )
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(
+                RequiredAuthorityKind.DURABLE_COMPOSE,
+                context,
+                durable_operation_id=running.claim.operation_id,
+                claim_attempt=running.claim.attempt,
+                proposal_id=str(row.id),
+                tool_call_id=row.tool_call_id,
+            )
+        )
+        rejection_owners.append(coordinator)
+        binding = RequiredWorkBinding(coordinator, 7, 12, RequiredWorkRole.TURN, running)
+        observed_rejection.append(expected)
+        try:
+            await reject_pipeline_with_required_custody(service, expected=expected, binding=binding)
+        except BaseException as rejection:
+            raise original_outcome_group(
+                "Actual creation and cancellation cleanup originals",
+                *cancellations,
+                *failures,
+                rejection,
+            ) from rejection
+        raise AssertionError("actual rejection completion lost its deferred cancellation")
+
+    def leaves(error):
+        if isinstance(error, BaseExceptionGroup):
+            return tuple(leaf for child in error.exceptions for leaf in leaves(child))
+        return (error,)
+
+    task = asyncio.create_task(workflow())
+    try:
+        assert await asyncio.to_thread(create_entered.wait, 10)
+        task.cancel("initial creation cancellation")
+        await asyncio.sleep(0)
+        assert not task.done()
+        create_release.set()
+        assert await asyncio.to_thread(reject_entered.wait, 10)
+        task.cancel("later cleanup cancellation")
+        await asyncio.sleep(0)
+        assert not task.done()
+        reject_release.set()
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await asyncio.wait_for(task, 10)
+        assert type(caught.value) is BaseExceptionGroup
+        originals = leaves(caught.value)
+        assert len(created_cancellations) == len(rejected_cancellations) == 1
+        assert type(created_cancellations[0]) is type(rejected_cancellations[0]) is asyncio.CancelledError
+        assert created_cancellations[0].args == ("initial creation cancellation",)
+        assert rejected_cancellations[0].args == ("later cleanup cancellation",)
+        projected_originals = tuple(leaf for failure in creation_projection_failures for leaf in leaves(failure))
+        expected_originals = (
+            created_cancellations[0],
+            *projected_originals,
+            *((sql_original,) if rejection_fails else ()),
+            rejected_cancellations[0],
+        )
+        assert len(originals) == len(expected_originals)
+        assert all(actual is expected for actual, expected in zip(originals, expected_originals, strict=True))
+        assert len({id(original) for original in originals}) == len(originals)
+
+        ((creation_ticket, creation_outcome),) = creation_outcomes
+        assert creation_ticket is creation
+        assert type(creation_outcome) is RequiredSQLReturned
+        (creation_handoff,) = creation_handoffs
+        assert type(creation_handoff) is PipelineCreationReturned
+        assert creation_handoff.sql_outcome is creation_outcome
+        assert creation_outcome.value.tool_call_id == plan.tool_call_id
+        assert creation_outcome.value.id != old.id
+        if telemetry_failure:
+            (post_sql_original,) = creation_handoff.post_sql_failures
+            assert post_sql_original is telemetry_original
+            assert any(original is telemetry_original for original in projected_originals)
+        else:
+            assert creation_handoff.post_sql_failures == ()
+            assert creation_projection_failures == []
+            assert len(originals) == (3 if rejection_fails else 2)
+
+        creation_owner.assert_completed()
+        assert len(creation_owner.tickets) == 2
+        assert {ticket.key.source for ticket in creation_owner.tickets} == {
+            RequiredWorkSource.PROPOSAL_CREATION_SQL,
+            RequiredWorkSource.PROPOSAL_CREATION_PROJECTION,
+        }
+        (rejection_owner,) = rejection_owners
+        rejection_owner.assert_completed()
+        assert len(rejection_owner.tickets) == 2
+        assert {ticket.key.source for ticket in rejection_owner.tickets} == {
+            RequiredWorkSource.PROPOSAL_REJECTION_SQL,
+            RequiredWorkSource.PROPOSAL_REJECTION_PROJECTION,
+        }
+        for owner in (creation_owner, rejection_owner):
+            for ticket in owner.tickets:
+                assert ticket.complete
+                assert ticket.key.transition_ordinal == 7 and ticket.key.semantic_ordinal == 12
+                assert ticket.key.authority.context == context
+                assert ticket.key.authority.durable_operation_id == running.claim.operation_id
+                assert ticket.key.authority.claim_attempt == running.claim.attempt
+        if telemetry_failure:
+            receipts = creation_owner.failure_receipts()
+            assert any(
+                receipt.key.source is RequiredWorkSource.PROPOSAL_CREATION_PROJECTION
+                and any(original is telemetry_original for original in leaves(receipt.original_root))
+                for receipt in receipts
+            )
+
+        (expected,) = observed_rejection
+        assert expected.reason == "request_cancelled" and expected.dispatch is None
+        assert expected.actor == "system:auto_reject_request_cancelled"
+        assert expected.actor_user_id == "alice"
+        assert expected.context == context and expected.running is running
+        assert rejection_owner.authority.proposal_id == str(expected.authority.row.id)
+        assert rejection_owner.authority.tool_call_id == plan.tool_call_id
+        ((rejection_ticket, rejection_outcome),) = rejection_outcomes
+        assert rejection_ticket in rejection_owner.tickets
+        assert rejection_ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL
+        assert rejection_outcome.deferred_cancellations[0] is rejected_cancellations[0]
+
+        with engine.connect() as conn:
+            actual_row = (
+                conn.execute(
+                    select(composition_proposals_table).where(
+                        composition_proposals_table.c.session_id == str(sid),
+                        composition_proposals_table.c.id == str(expected.authority.row.id),
+                        composition_proposals_table.c.tool_call_id == plan.tool_call_id,
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            terminal_rows = (
+                conn.execute(
+                    select(proposal_events_table).where(
+                        proposal_events_table.c.session_id == str(sid),
+                        proposal_events_table.c.proposal_id == actual_row["id"],
+                        proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")),
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            assert conn.execute(select(composition_states_table).where(composition_states_table.c.session_id == str(sid))).all() == []
+        assert actual_row["committed_state_id"] is None
+        assert actual_row["user_message_id"] == str(old.user_message_id)
+        reloaded = await asyncio.wait_for(
+            service.get_authoritative_pipeline_proposal(session_id=sid, proposal_id=expected.authority.row.id),
+            2,
+        )
+        assert reloaded.proposal == expected.authority.proposal
+        assert reloaded.creation_event_id == expected.authority.creation_event_id
+        if rejection_fails:
+            assert type(rejection_outcome) is RequiredSQLRaised
+            assert rejection_outcome.error is sql_original
+            assert actual_row["status"] == "pending" and terminal_rows == []
+            assert actual_row["audit_event_id"] == str(expected.authority.creation_event_id)
+            assert reloaded.row == expected.authority.row
+        else:
+            assert type(rejection_outcome) is RequiredSQLReturned
+            result = rejection_outcome.value
+            assert type(result) is PipelineRejectionSQLResult
+            assert result.expected is expected and result.transitioned is True
+            assert result.record == reloaded.row
+            assert actual_row["status"] == reloaded.row.status == "rejected"
+            (terminal,) = terminal_rows
+            expected_payload = {
+                "schema": "pipeline_proposal_rejected.v1",
+                "tool_call_id": plan.tool_call_id,
+                "tool_name": "set_pipeline",
+                "status": "rejected",
+                "outcome": "failed",
+                "reason_code": "request_cancelled",
+                "draft_hash": plan.proposal.draft_hash,
+                "dispatch": None,
+            }
+            assert terminal["event_type"] == result.event.event_type == "proposal.rejected"
+            assert terminal["actor"] == result.event.actor == "system:auto_reject_request_cancelled"
+            assert terminal["payload"] == result.event.payload == expected_payload
+            assert terminal["id"] == str(result.event.id) == actual_row["audit_event_id"]
+            assert terminal["id"] == str(reloaded.row.audit_event_id)
+            assert terminal["proposal_id"] == str(result.record.id) == str(expected.authority.row.id)
+            assert terminal["session_id"] == str(result.record.session_id) == str(sid)
+            assert (
+                replace(
+                    reloaded.row,
+                    status=expected.authority.row.status,
+                    audit_event_id=expected.authority.row.audit_event_id,
+                    updated_at=expected.authority.row.updated_at,
+                )
+                == expected.authority.row
+            )
+    finally:
+        create_release.set()
+        reject_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        event.remove(engine, "before_cursor_execute", hold_sql)
+        repository.release(context)
 
 
 @pytest.mark.asyncio

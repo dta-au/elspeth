@@ -1,10 +1,9 @@
 """The composer's per-route tool-contract resolution (S1 T8, D20, D24).
 
-``resolve_composer_tool_contract(settings, *, env)`` resolves the planner
-route (``composer_model`` + ``composer_endpoint_base_url``) and the
-escape-hatch route (``composer_advisor_model`` +
-``composer_advisor_endpoint_base_url``) under ``composer_strict_tools`` and
-returns one owned, frozen contract. ``ComposerServiceImpl.__init__`` and the
+``resolve_composer_tool_contract(settings, *, env)`` resolves the compose
+loop's primary route (``composer_model`` + ``composer_endpoint_base_url``)
+under ``composer_strict_tools`` and returns one owned, frozen contract; the
+advisor model and endpoint never move it. ``ComposerServiceImpl.__init__`` and the
 boot probe both call it, so the service's sent lists and the probe's lists
 come from one resolution.
 
@@ -56,21 +55,19 @@ def _service(settings: WebSettings) -> ComposerServiceImpl:
     return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
 
 
-# ---------------------------------------------------------------- the two-route helper
+# ---------------------------------------------------------------- the route helper
 
 
 @pytest.mark.parametrize(
-    ("overrides", "planner", "hatch"),
+    ("overrides", "planner"),
     [
-        ({}, (StrictTransport.NONE, _NONE), (StrictTransport.NONE, _NONE)),
+        ({}, (StrictTransport.NONE, _NONE)),
         (
             {"composer_model": _OPENROUTER_PLANNER, "composer_advisor_model": _OPENROUTER_ADVISOR},
-            (StrictTransport.FORWARDING, _STRICT),
             (StrictTransport.FORWARDING, _STRICT),
         ),
         (
             {"composer_model": _OPENROUTER_PLANNER, "composer_advisor_model": _OPENROUTER_ADVISOR, "composer_strict_tools": "off"},
-            (StrictTransport.NONE, _NONE),
             (StrictTransport.NONE, _NONE),
         ),
         (
@@ -81,7 +78,6 @@ def _service(settings: WebSettings) -> ComposerServiceImpl:
                 "composer_advisor_endpoint_api_key": "advisor-proxy-key",  # secret-scan: allow-this-line
             },
             (StrictTransport.FORWARDING, _STRICT),
-            (StrictTransport.NONE, _NONE),
         ),
         (
             {
@@ -91,25 +87,21 @@ def _service(settings: WebSettings) -> ComposerServiceImpl:
                 "composer_advisor_model": _OPENROUTER_ADVISOR,
             },
             (StrictTransport.NONE, _NONE),
-            (StrictTransport.FORWARDING, _STRICT),
         ),
-        ({"composer_strict_tools": "forward_to_endpoint"}, (StrictTransport.ENFORCING, _STRICT), (StrictTransport.NONE, _NONE)),
+        ({"composer_strict_tools": "forward_to_endpoint"}, (StrictTransport.ENFORCING, _STRICT)),
     ],
-    ids=["defaults", "openrouter_both", "off", "proxy_hatch", "proxy_planner", "forward_hosted_openai"],
+    ids=["defaults", "openrouter_both", "off", "proxy_advisor", "proxy_planner", "forward_hosted_openai"],
 )
-def test_each_route_resolves_from_its_own_model_and_endpoint(
+def test_primary_route_resolves_from_its_own_model_and_endpoint(
     overrides: dict[str, Any],
     planner: tuple[StrictTransport, ToolContractDialect],
-    hatch: tuple[StrictTransport, ToolContractDialect],
 ) -> None:
     settings = _settings(**overrides)
     contract = resolve_composer_tool_contract(settings, env={})
 
     assert contract.setting == settings.composer_strict_tools
     assert (contract.planner.resolution.transport, contract.planner.dialect) == planner
-    assert (contract.hatch.resolution.transport, contract.hatch.dialect) == hatch
     assert contract.planner.resolution.diagnostic is None
-    assert contract.hatch.resolution.diagnostic is None
 
 
 # ---------------------------------------------------------------- the service's one resolution point
@@ -118,10 +110,10 @@ def test_each_route_resolves_from_its_own_model_and_endpoint(
 @pytest.mark.parametrize(
     ("overrides", "dialect", "strict_true"),
     [
-        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 35),
+        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 36),
         ({"composer_model": _OPENROUTER_PLANNER, "composer_strict_tools": "off"}, _NONE, 0),
         ({}, _NONE, 0),
-        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 35),
+        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 36),
     ],
     ids=["openrouter", "openrouter_off", "defaults", "forward_hosted_openai"],
 )
@@ -134,8 +126,7 @@ def test_service_resolves_its_dialects_and_summary_from_settings(
 
     assert summary.contract == resolve_composer_tool_contract(settings, env={})
     assert service._planner_dialect is summary.contract.planner.dialect is dialect
-    assert service._hatch_dialect is summary.contract.hatch.dialect
-    assert (summary.loop_strict_tool_count, summary.loop_tool_count) == (strict_true, 45)
+    assert (summary.loop_strict_tool_count, summary.loop_tool_count) == (strict_true, 46)
     sent = composer_loop_tool_definitions(service._planner_dialect)
     assert sum(1 for tool in sent if "strict" in tool["function"] and tool["function"]["strict"] is True) == strict_true
 
@@ -150,11 +141,8 @@ def test_resolution_event_carries_closed_values_and_counts_only() -> None:
         "planner_transport": "forwarding",
         "planner_dialect": "openai_strict",
         "planner_diagnostic": None,
-        "hatch_transport": "forwarding",
-        "hatch_dialect": "openai_strict",
-        "hatch_diagnostic": None,
-        "loop_strict_tool_count": 35,
-        "loop_tool_count": 45,
+        "loop_strict_tool_count": 36,
+        "loop_tool_count": 46,
     }
 
 
@@ -203,14 +191,13 @@ def test_a_malformed_env_base_never_stops_construction_and_is_never_logged(monke
     with capture_logs() as logs:
         service = _service(settings)
 
-    contract = service.tool_contract_summary.contract
-    for route in (contract.planner, contract.hatch):
-        assert route.resolution.transport is StrictTransport.NONE
-        assert route.resolution.diagnostic is StrictTransportDiagnostic.UNPARSEABLE_OPENROUTER_API_BASE
-        assert route.dialect is _NONE
+    route = service.tool_contract_summary.contract.planner
+    assert route.resolution.transport is StrictTransport.NONE
+    assert route.resolution.diagnostic is StrictTransportDiagnostic.UNPARSEABLE_OPENROUTER_API_BASE
+    assert route.dialect is _NONE
     assert all("strict" not in tool["function"] for tool in composer_loop_tool_definitions(service._planner_dialect))
     [event] = [entry for entry in logs if entry["event"] == "composer_tool_contract_resolved"]
-    assert event["planner_diagnostic"] == event["hatch_diagnostic"] == "unparseable_openrouter_api_base"
+    assert event["planner_diagnostic"] == "unparseable_openrouter_api_base"
     assert "http://[" not in repr(logs)
 
 
@@ -219,6 +206,7 @@ def test_a_malformed_env_base_never_stops_the_probe_builder() -> None:
 
     requests = build_composer_probe_requests(settings, env={"OPENROUTER_API_BASE": "http://["})
 
-    assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
-    for request in requests[:2]:
-        assert request.strict_true_count == request.strict_false_count == 0
+    assert [request.surface for request in requests] == ["loop_tools", "advisor"]
+    [loop_request] = [request for request in requests if request.surface == "loop_tools"]
+    assert loop_request.tool_count > 0
+    assert loop_request.strict_true_count == loop_request.strict_false_count == 0

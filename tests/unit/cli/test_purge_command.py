@@ -6,9 +6,12 @@ from unittest.mock import patch
 
 import pytest
 import typer
+from pydantic import Field
 from typer.testing import CliRunner
 
+import elspeth.cli as cli_module
 from elspeth.cli import _validate_existing_sqlite_db_url, app
+from elspeth.core.config import PayloadStoreSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.retention.purge import PurgeResult
 
@@ -538,13 +541,89 @@ class TestPurgeRetentionDays:
 
         mock_pm.find_expired_payload_refs.assert_called_once_with(30)
 
-    def test_default_retention_days(self, tmp_path: Path) -> None:
-        """Without --retention-days, defaults to 90."""
+    def test_default_retention_days(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without --retention-days or settings, the PayloadStoreSettings default applies (90)."""
+        monkeypatch.chdir(tmp_path)
         mock_db, mock_ps, mock_pm = _make_purge_mocks(expired_refs=[])
 
         _invoke_purge_with_mocks(tmp_path, mock_db, mock_ps, mock_pm)
 
-        mock_pm.find_expired_payload_refs.assert_called_once_with(90)
+        assert PayloadStoreSettings().retention_days == 90
+        mock_pm.find_expired_payload_refs.assert_called_once_with(PayloadStoreSettings().retention_days)
+
+    def test_fallback_retention_days_is_derived_from_payload_store_settings(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The fallback is read from the settings model, not a literal copy of its default.
+
+        A witness model whose default differs from 90 must be honoured, in both
+        the confirmed and the dry-run path, so a restored literal fails here.
+        """
+
+        class _WitnessPayloadStoreSettings(PayloadStoreSettings):
+            retention_days: int = Field(default=17, gt=0)
+
+        monkeypatch.chdir(tmp_path)
+        # raising=False: if the CLI stops reading the model, the witness is not
+        # honoured and the day-count assertions below fail.
+        monkeypatch.setattr(cli_module, "PayloadStoreSettings", _WitnessPayloadStoreSettings, raising=False)
+
+        mock_db, mock_ps, mock_pm = _make_purge_mocks(expired_refs=[])
+        result = _invoke_purge_with_mocks(tmp_path, mock_db, mock_ps, mock_pm)
+        assert result.exit_code == 0, result.output
+        mock_pm.find_expired_payload_refs.assert_called_once_with(17)
+        assert "No payloads older than 17 days found." in result.output
+
+        mock_db, mock_ps, mock_pm = _make_purge_mocks(expired_refs=["a" * 64])
+        dry = _invoke_purge_with_mocks(tmp_path, mock_db, mock_ps, mock_pm, extra_args=["--dry-run"])
+        assert dry.exit_code == 0, dry.output
+        mock_pm.find_expired_payload_refs.assert_called_once_with(17)
+        assert "Would delete 1 payload(s) older than 17 days:" in dry.output
+        mock_pm.purge_payloads.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("extra_args", "expected"),
+        [([], 45), (["--retention-days", "30"], 30)],
+        ids=["config-overrides-default", "flag-overrides-config"],
+    )
+    def test_retention_precedence_flag_then_config_then_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_args: list[str], expected: int
+    ) -> None:
+        settings_path = tmp_path / "settings.yaml"
+        _write_minimal_settings(settings_path, landscape_url=f"sqlite:///{tmp_path / 'unused.db'}")
+        with settings_path.open("a") as handle:
+            handle.write(f"payload_store:\n  backend: filesystem\n  base_path: {tmp_path / 'payloads'}\n  retention_days: 45\n")
+        monkeypatch.chdir(tmp_path)
+        mock_db, mock_ps, mock_pm = _make_purge_mocks(expired_refs=[])
+
+        result = _invoke_purge_with_mocks(tmp_path, mock_db, mock_ps, mock_pm, extra_args=extra_args)
+
+        assert result.exit_code == 0, result.output
+        mock_pm.find_expired_payload_refs.assert_called_once_with(expected)
+        assert ("Using retention_days from config: 45" in result.output) is (not extra_args)
+
+    @pytest.mark.parametrize(
+        ("payload_store_block", "message"),
+        [
+            ("  retention_days: 0\n", "Configuration errors in settings.yaml"),
+            ("  backend: s3\n", "is not supported for purge"),
+        ],
+        ids=["malformed-retention", "unsupported-backend"],
+    )
+    def test_malformed_payload_store_settings_still_refuse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload_store_block: str, message: str
+    ) -> None:
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        LandscapeDB.from_url(f"sqlite:///{state_dir / 'audit.db'}").close()
+        settings_path = tmp_path / "settings.yaml"
+        _write_minimal_settings(settings_path, landscape_url="sqlite:///./state/audit.db")
+        with settings_path.open("a") as handle:
+            handle.write("payload_store:\n" + payload_store_block)
+        monkeypatch.chdir(tmp_path)
+
+        result = runner.invoke(app, ["purge", "--dry-run"])
+
+        assert result.exit_code == 1
+        assert message in result.output
 
 
 class TestPurgePayloadPath:

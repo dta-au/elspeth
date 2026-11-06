@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import monotonic, sleep
+from typing import Any, BinaryIO, cast
 from uuid import uuid4
 
 import pytest
@@ -134,7 +135,7 @@ def blob_read_race_deployment(
         writer_engine.dispose()
 
 
-@pytest.mark.parametrize("contender", ["public_read", "get_blob_content", "update_blob", "delete_blob"])
+@pytest.mark.parametrize("contender", ["public_read", "get_blob_content", "inspect_source", "update_blob", "delete_blob"])
 def test_postgres_content_reader_waits_for_live_deletion_before_reconciliation(
     blob_read_race_deployment: tuple[Engine, Engine, SessionServiceImpl, Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -341,3 +342,100 @@ def test_postgres_atomic_cleanup_producer_is_recoverable_by_public_delete(
         assert asyncio.run(recovery.read_blob_content(neighbor.id, session_operation_context=context)) == b"x\n2\n"
     finally:
         authority.release(context)
+
+
+def test_postgres_inspect_source_rejects_revocation_after_stream(
+    blob_read_race_deployment: tuple[Engine, Engine, SessionServiceImpl, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TC-006 (#327): authority released while the stream is at EOF must not publish facts.
+
+    The shared reader holds BLOB_CUSTODY, but no SESSIONS lock, during file
+    I/O. An independent PostgreSQL connection therefore can release the
+    exact operation while the stream is parked at EOF. The post-read fenced
+    metadata comparison must then raise ``SessionOperationFenceLost``.
+    """
+    from elspeth.web.coordination.contracts import SessionOperationFenceLost
+
+    writer_engine, reader_engine, sessions, shared = blob_read_race_deployment
+    writer = BlobServiceImpl(writer_engine, shared)
+    owner_id = f"inspect-revoke-{uuid4()}"
+    with writer_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id=owner_id)
+    session = asyncio.run(sessions.create_session(owner_id, "Inspect revocation", "local"))
+    authority = sessions.session_operation_authority
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=60,
+    )
+    released = False
+    try:
+        blob = asyncio.run(
+            writer.create_blob(session.id, "orders.csv", b"order_id,price\nO-1,1.5\n", "text/csv", session_operation_context=context)
+        )
+        storage = Path(blob.storage_path)
+        catalog = _mock_catalog()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        policy_catalog = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+
+        def inspect() -> ToolResult:
+            return execute_tool(
+                "inspect_source",
+                {"blob_id": str(blob.id)},
+                _empty_state(),
+                policy_catalog,
+                plugin_snapshot=snapshot,
+                session_engine=reader_engine,
+                session_id=str(session.id),
+                data_dir=str(shared),
+                session_operation_context=context,
+                session_operation_authority=authority,
+            )
+
+        # Positive control: the live operation inspects the file.
+        assert inspect().success is True
+
+        at_eof = threading.Event()
+        resume = threading.Event()
+        original_open = Path.open
+
+        class _PausingHandle:
+            def __init__(self, handle: BinaryIO) -> None:
+                self._handle = handle
+
+            def __enter__(self) -> _PausingHandle:
+                return self
+
+            def __exit__(self, *exc_info: object) -> None:
+                self._handle.close()
+
+            def read(self, size: int = -1) -> bytes:
+                chunk = self._handle.read(size)
+                if not chunk and not at_eof.is_set():
+                    at_eof.set()
+                    assert resume.wait(timeout=15), "revocation barrier was never released"
+                return chunk
+
+        def pausing_open(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if path == storage and mode == "rb":
+                return _PausingHandle(cast(BinaryIO, original_open(path, mode, *args, **kwargs)))
+            return original_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", pausing_open)
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            inspection = workers.submit(inspect)
+            try:
+                assert at_eof.wait(timeout=10), "inspection never reached the end of the stream"
+                authority.release(context)
+                released = True
+                with writer_engine.connect() as observer:
+                    assert observer.execute(text("SELECT 1")).scalar_one() == 1
+            finally:
+                resume.set()
+            with pytest.raises(SessionOperationFenceLost):
+                inspection.result(timeout=15)
+    finally:
+        if not released:
+            authority.release(context)

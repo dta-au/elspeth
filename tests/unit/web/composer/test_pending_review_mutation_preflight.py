@@ -7,10 +7,11 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
@@ -18,6 +19,7 @@ from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.tool_batch import BatchAccumulator, ToolBatchContext, ToolBatchCustody, ToolBatchProvenance, run_tool_batch
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools.sessions import _SESSION_AWARE_TOOL_HANDLERS
 from elspeth.web.dependencies import create_catalog_service
@@ -26,6 +28,79 @@ from tests.unit.web.execution.test_validation_complaint_triage import complaint_
 
 from .conftest import _fake_llm_response
 from .test_preview_policy_snapshot import _registry, _service
+
+
+async def _run_shared_tool_batch(
+    service: ComposerServiceImpl,
+    *,
+    call_model: _CallModelOutcome,
+    mutation_ceiling: ComposerMutationCeiling,
+    state: Any,
+    llm_messages: list[dict[str, Any]],
+    session_id: str,
+    current_state_id: str,
+    deadline: float,
+    session_scope: str,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    policy_catalog: PolicyCatalogView,
+    session_operation_context: SessionOperationContext,
+) -> Any:
+    """Drive the shared dispatch owner ``tool_batch.run_tool_batch``.
+
+    Builds the batch context the way Continuation does from its restored
+    runtime (``continuation_runtime.build_runtime_tool_batch_context``) and the
+    deleted V1 ``ComposerServiceImpl._dispatch_tool_batch`` did before it.
+    """
+    sessions = service._require_sessions_service()
+    session_uuid = UUID(session_id)
+    preferences = await sessions.get_composer_preferences(session_uuid)
+    mutation_ceiling.validate_context(session_operation_context)
+    ctx = ToolBatchContext(
+        session_tools=service._session_tools,
+        provenance=ToolBatchProvenance(
+            model_identifier=service._model, provider=service._availability.provider, skill_hash=service._composer_skill_hash
+        ),
+        custody=ToolBatchCustody(
+            data_dir=service._data_dir,
+            session_engine=service._session_engine,
+            secret_service=service._secret_service,
+            secret_wiring_policy=service._secret_wiring_policy,
+            max_blob_storage_per_session_bytes=service._settings.max_blob_storage_per_session_bytes,
+        ),
+        redaction_telemetry=service._redaction_telemetry,
+        preflight=service._preflight,
+        schema_disclosure=service._schema_disclosure,
+        advisor_checkpoint=service._advisor_checkpoint,
+        advisor_max_calls_per_compose=service._settings.composer_advisor_max_calls_per_compose,
+        advisor_timeout_seconds=service._settings.composer_advisor_timeout_seconds,
+        recorder=BufferingRecorder(),
+        anti_anchor=AntiAnchorTracker(),
+        discovery_cache={},
+        runtime_preflight_cache={},
+        session_id=session_id,
+        session_operation_context=session_operation_context,
+        user_id=None,
+        user_message_id=None,
+        user_message_content=None,
+        current_state_id=current_state_id,
+        actor="test",
+        initial_version=state.version,
+        deadline=deadline,
+        progress=None,
+        session_scope=session_scope,
+        turn_sessions_service=sessions,
+        turn_session_uuid=session_uuid,
+        turn_preferences=preferences,
+        mutation_ceiling=mutation_ceiling,
+        review_required=not mutation_ceiling.permits_auto(preferences.trust_mode),
+        cancellation_requested=asyncio.Event(),
+        plugin_snapshot=plugin_snapshot,
+        policy_catalog=policy_catalog,
+        tool_contract_dialect=service._planner_dialect,
+        session_operation_authority=sessions.session_operation_authority,
+    )
+    acc = BatchAccumulator(state=state, last_validation=None, last_runtime_preflight=None, advisor_calls_used=0)
+    return await run_tool_batch(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages)
 
 
 @pytest.mark.anyio
@@ -144,31 +219,18 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
         _fake_llm_response(tool_calls=({"id": "request", "name": tool_name, "arguments": arguments},))
     )
     messages = []
-    dispatch, _ = await service._dispatch_tool_batch(
+    preferences = await service._require_sessions_service().get_composer_preferences(UUID(session_id))
+    mutation_ceiling = ComposerMutationCeiling(session_id, str(uuid4()), preferences.trust_mode)
+    dispatch, _ = await _run_shared_tool_batch(
+        service,
         call_model=_CallModelOutcome(completion=completion),
+        mutation_ceiling=mutation_ceiling,
         state=state,
-        last_validation=None,
-        last_runtime_preflight=None,
         llm_messages=messages,
-        recorder=BufferingRecorder(),
-        anti_anchor=AntiAnchorTracker(),
-        discovery_cache={},
-        runtime_preflight_cache={},
         session_id=session_id,
-        user_id=None,
-        user_message_id=None,
-        user_message_content=None,
         current_state_id=str(uuid4()),
-        actor="test",
-        initial_version=state.version,
         deadline=asyncio.get_running_loop().time() + 60,
-        progress=None,
         session_scope="pending-mutation",
-        advisor_calls_used=0,
-        composition_turns_used=0,
-        discovery_turns_used=0,
-        failed_turn=None,
-        cancellation_requested=asyncio.Event(),
         plugin_snapshot=snapshot,
         policy_catalog=PolicyCatalogView(catalog, snapshot, registry),
         session_operation_context=SessionOperationContext(
