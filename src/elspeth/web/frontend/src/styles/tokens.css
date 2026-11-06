@@ -58,8 +58,8 @@
      hits (elspeth-dae08efdc9). ARGO's #a9b9c4 clears every surface family:
      bg 8.54, surface 7.02, elevated/raised 6.39, input 5.78, inspector 7.18,
      paper 6.54, nav-raised 5.50, and on the 4%-white hover wash 5.68 over
-     elevated and 4.94 over nav-raised. Gated by the muted-on-panel-surface composition tests in
-     colorContrast.test.ts. The website mirror (website/tokens/colors.css)
+     elevated and 4.94 over nav-raised. Gated by the muted-on-panel-surface
+     composition tests in colorContrast.test.ts. The website mirror (website/tokens/colors.css)
      still carries the pre-ARGOnite #93b3b3: per the ARGOnite design doc the
      marketing site's tokens follow later, separately. */
   --color-text-muted:        #a9b9c4;
@@ -370,7 +370,6 @@
   /* Fixed app-header row height (desktop); the <=960px wrap rule reuses it as
      a min-height so a wrapped header never renders shorter than the fixed row. */
   --size-header-height:   40px;
-  --size-workspace-band:  53px;
 
   /* ── Icon sizes (elspeth-7f63055e06) ─────────────────────────────────────── */
   --size-icon-sm: 16px;

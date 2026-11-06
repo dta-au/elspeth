@@ -290,15 +290,17 @@ describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () =>
   // control row" and broke when the block-reason line made it 87px
   // (elspeth-97db9c22e5), then a measured height that a ResizeObserver kept
   // publishing. The restructure retires the seam itself: ONE grid item spans
-  // both columns and paints the rule and the fill once, and its height is its
-  // content because it is a content-sized grid row. These pins are the shape
-  // of that guarantee as it reads in the stylesheet; the rendered facts — the
-  // rule spanning the full width, the collapse control registered with the
-  // bar's controls through a wrap — are asserted in
-  // composer-workspace-geometry.spec.ts.
+  // both columns and owns the bottom edge, and its height is its content
+  // because it is a content-sized grid row. ARGOnite then retired the row's
+  // rule and fill (it is transparent on the canvas), but the single owner
+  // stays. These pins are the shape of that guarantee as it reads in the
+  // stylesheet; the rendered facts — the row spanning the full width, the
+  // collapse control registered with the bar's controls through a wrap — are
+  // asserted in composer-workspace-geometry.spec.ts.
   const slot = ".workspace-action-bar-slot";
 
-  it("paints the rule and the fill once, on one item spanning both columns", () => {
+  // ARGOnite: the slot no longer paints a rule or fill; it stays the one owner.
+  it("owns the bottom edge as one item spanning both columns", () => {
     expect(declaration(slot, "grid-column")).toBe("1 / -1");
     expect(declaration(slot, "grid-template-columns")).toBe("subgrid");
     // ARGOnite: the bar is transparent on the --color-bg canvas between and
