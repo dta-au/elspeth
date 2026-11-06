@@ -501,6 +501,12 @@ export function ArtifactWorkspaceSurface({
   return (
     <div className="artifact-workspace">
       <div className="artifact-workspace-toolbar">
+        {/* ARGOnite: the toolbar is the pipeline pane's title bar. The title
+            is visually hidden when the pane is too narrow for title, track
+            and catalog together (workspace.css @container), never removed. */}
+        <h2 className="workspace-pane-title workspace-pane-title--collapsible">
+          Pipeline
+        </h2>
         <div role="tablist" aria-label="Pipeline artifacts">
           {ARTIFACT_TABS.map((tab) => {
             const available = availableArtifactTabs.includes(tab);

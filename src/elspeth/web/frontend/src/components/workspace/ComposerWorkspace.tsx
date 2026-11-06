@@ -341,6 +341,11 @@ export function ComposerWorkspace({
             hidden={authoringHidden}
             tabIndex={-1}
           >
+            {/* ARGOnite title bar: the pane's name only. The collapse and
+                restore controls stay in the bar row below (design doc). */}
+            <header className="workspace-pane-header">
+              <h2 className="workspace-pane-title">Conversation</h2>
+            </header>
             <div
               id={narrow ? "workspace-authoring-panel" : undefined}
               className="workspace-authoring-body"
