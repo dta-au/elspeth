@@ -48,19 +48,36 @@ const XYFLOW_CSS_PATH = "node_modules/@xyflow/react/dist/style.css";
 // reproduces the class names and nesting @xyflow actually renders, and the
 // "vendor stylesheet" describe block below pins those names against the
 // shipped stylesheet so a library rename cannot leave this file green.
+// The node/edge models GraphView last handed <ReactFlow>. Captured, not
+// rendered: their inline colours are what the ARGOnite token-reference block
+// below inspects (inline style is the only place React Flow takes them).
+const flowProps = vi.hoisted(() => ({
+  nodes: [] as Array<{ id: string; style?: Record<string, unknown> }>,
+  edges: [] as Array<{
+    id: string;
+    data?: { flowType?: string };
+    style?: Record<string, unknown>;
+    markerEnd?: { color?: string };
+  }>,
+}));
+
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
 vi.mock("@xyflow/react", () => ({
   MarkerType: { ArrowClosed: "arrowclosed" },
   Position: { Top: "top", Bottom: "bottom", Left: "left", Right: "right" },
   ReactFlowProvider: ({ children }: any) => <div className="rfp">{children}</div>,
-  ReactFlow: ({ children }: any) => (
+  ReactFlow: ({ children, nodes, edges }: any) => {
+    flowProps.nodes = nodes ?? [];
+    flowProps.edges = edges ?? [];
     // The real flow root carries `react-flow` (plus `react-flow__container`
-    // descendants). Nodes/edges are irrelevant here: this file asks where
-    // elements sit, not what they render.
-    <div className="react-flow" data-testid="react-flow">
-      <div className="react-flow__renderer">{children}</div>
-    </div>
-  ),
+    // descendants). Nodes/edges are not rendered here: the reachability
+    // probes ask where elements sit, not what they render.
+    return (
+      <div className="react-flow" data-testid="react-flow">
+        <div className="react-flow__renderer">{children}</div>
+      </div>
+    );
+  },
   Background: () => <div className="react-flow__background" />,
   Handle: () => <div className="react-flow__handle" />,
   BaseEdge: () => <g className="react-flow__edge" />,
@@ -185,6 +202,13 @@ describe("React Flow theming reaches the elements it themes", () => {
       testId: "minimap-mask",
       property: "--xy-minimap-mask-background-color-default",
     },
+    // ARGOnite: edges render inside .react-flow, so the edge-stroke default
+    // must reach the flow root (closest() includes the element itself).
+    {
+      label: "the flow root that owns every edge",
+      testId: "react-flow",
+      property: "--xy-edge-stroke-default",
+    },
   ];
 
   for (const probe of PROBES) {
@@ -243,6 +267,70 @@ describe("React Flow theming reaches the elements it themes", () => {
       expect(rule.selectorList).toMatch(/\.graph-view-canvas\b/);
       expect(rule.selectorList).toMatch(/\.react-flow\.react-flow\b/);
     }
+  });
+});
+
+// ARGOnite graph roles, asserted BY TOKEN REFERENCE for the same reason the
+// file header gives: jsdom resolves no var(), so a computed colour would be ""
+// whatever the theme said. What is testable is which role token each surface
+// names — the theme blocks in tokens.css then decide the hex per mode (and the
+// design doc's contrast floors were measured against those hexes).
+describe("ARGOnite graph colours name their role tokens", () => {
+  beforeEach(() => {
+    useSessionStore.setState({
+      compositionState: makeState({
+        sources: {
+          source: { plugin: "csv", options: {}, on_success: "rows" },
+        },
+        nodes: [
+          makeNode({ id: "step", input: "rows", on_success: "out", on_error: "bad" }),
+        ],
+        outputs: [
+          { name: "out", plugin: "csv", options: {} },
+          { name: "bad", plugin: "csv", options: {} },
+        ],
+      }),
+      compositionProposals: [],
+    });
+    useSessionStore.setState({ selectedNodeId: "step" } as never);
+    useExecutionStore.setState({ validationResult: null } as never);
+  });
+
+  it("strokes ordinary edges and their arrowheads with --color-graph-edge", () => {
+    render(<GraphView />);
+    const ordinary = flowProps.edges.filter((edge) => edge.data?.flowType !== "error");
+    const failure = flowProps.edges.filter((edge) => edge.data?.flowType === "error");
+    expect(ordinary.length).toBeGreaterThan(0);
+    expect(failure.length).toBeGreaterThan(0);
+    for (const edge of ordinary) {
+      expect(edge.style?.stroke, edge.id).toBe("var(--color-graph-edge)");
+      expect(edge.markerEnd?.color, edge.id).toBe("var(--color-graph-edge)");
+    }
+    // Semantic routes keep their own colour: only the ordinary role moved.
+    for (const edge of failure) {
+      expect(edge.style?.stroke, edge.id).toBe("var(--color-error)");
+      expect(edge.markerEnd?.color, edge.id).toBe("var(--color-error)");
+    }
+    // The CSS default for any edge that brings no inline stroke agrees.
+    for (const rule of rulesDeclaring("--xy-edge-stroke-default")) {
+      expect(rule.declarations).toMatch(
+        /--xy-edge-stroke-default:\s*var\(--color-graph-edge\)/,
+      );
+    }
+  });
+
+  it("rings the selected node with --color-selected-ring and edges the rest with --color-node-border", () => {
+    render(<GraphView />);
+    const selected = flowProps.nodes.find((node) => node.id === "step");
+    const resting = flowProps.nodes.find((node) => node.id === "out");
+    expect(selected).toBeDefined();
+    expect(resting).toBeDefined();
+    expect(selected!.style?.boxShadow).toMatch(
+      /^0 0 0 2px var\(--color-selected-ring\)(,|$)/,
+    );
+    expect(resting!.style?.border).toBe("1px solid var(--color-node-border)");
+    expect(resting!.style?.boxShadow).toBe("var(--shadow-card)");
+    expect(resting!.style?.borderRadius).toBe("var(--radius-node)");
   });
 });
 
