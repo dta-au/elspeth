@@ -301,10 +301,11 @@ describe("workspace bottom edge (elspeth-215c989bed, elspeth-9c94a58500)", () =>
   it("paints the rule and the fill once, on one item spanning both columns", () => {
     expect(declaration(slot, "grid-column")).toBe("1 / -1");
     expect(declaration(slot, "grid-template-columns")).toBe("subgrid");
-    expect(declaration(slot, "border-top")).toBe(
-      "1px solid var(--color-border, currentcolor)",
-    );
-    expect(declaration(slot, "background")).toBe("var(--color-surface, Canvas)");
+    // ARGOnite: the bar is transparent on the --color-bg canvas between and
+    // below the pane cards; the top rule and the surface fill are retired.
+    // The slot stays the single owner of the bottom edge.
+    expect(declaration(slot, "background")).toBe("transparent");
+    expect(ruleFor(slot)).not.toMatch(/(?:^|;)\s*border[a-z-]*:/);
 
     // The bar itself must NOT draw them too, or the bottom edge is back to
     // having two owners — the exact shape being retired.

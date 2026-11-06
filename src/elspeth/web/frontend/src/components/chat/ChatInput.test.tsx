@@ -1342,8 +1342,10 @@ describe("ChatInput composer well CSS (ARGOnite Task 8)", () => {
 
   it("moves the keyboard focus indication onto the well", () => {
     expect(css).toMatch(
-      /\.chat-input-row:focus-within\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/s,
+      /\.chat-input-row:has\(\.chat-input-textarea:focus-visible\)\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/s,
     );
+    // Buttons inside the well must not light it (double ring, mouse clicks).
+    expect(css).not.toMatch(/\.chat-input-row:focus-within/);
   });
 
   it("rounds the icon buttons into circles and the send button into a pill", () => {

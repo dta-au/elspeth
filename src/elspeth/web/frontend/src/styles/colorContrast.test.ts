@@ -142,6 +142,16 @@ function contrastRatio(foreground: string, background: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
+describe("action bar reason text on the canvas (ARGOnite Task 8)", () => {
+  it("keeps body and muted text at AA on --color-bg in both themes", () => {
+    for (const extract of [extractRootToken, extractLightThemeToken]) {
+      const background = extract("--color-bg");
+      expect(contrastRatio(extract("--color-text"), background)).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(extract("--color-text-muted"), background)).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+});
+
 describe("light theme colour contrast", () => {
   it("keeps muted body text at WCAG AA contrast against the light background", () => {
     const background = extractLightThemeToken("--color-bg");
