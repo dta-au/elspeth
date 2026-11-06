@@ -325,8 +325,10 @@ describe("ARGOnite graph colours name their role tokens", () => {
     const resting = flowProps.nodes.find((node) => node.id === "out");
     expect(selected).toBeDefined();
     expect(resting).toBeDefined();
+    // ARGOnite: the selected ring is a gap ring, well colour first, then the
+    // ring (final review I5).
     expect(selected!.style?.boxShadow).toMatch(
-      /^0 0 0 2px var\(--color-selected-ring\)(,|$)/,
+      /^0 0 0 2px var\(--color-well\), 0 0 0 4px var\(--color-selected-ring\)(,|$)/,
     );
     expect(resting!.style?.border).toBe("1px solid var(--color-node-border)");
     expect(resting!.style?.boxShadow).toBe("var(--shadow-card)");

@@ -321,6 +321,10 @@ it("toggles quarantine routes with the keyboard, retains shared sinks and restor
   expect(screen.getByText(/Selected route:/)).toBeInTheDocument();
   // ARGOnite: a selected route's endpoint carries the forced-colours class too.
   expect(screen.getByTestId("node-quarantine")).toHaveClass("graph-node--selected");
+  // ARGOnite: and the same gap ring as a selected node (final review I5).
+  expect(JSON.parse(screen.getByTestId("node-quarantine").getAttribute("data-node-style") ?? "null").boxShadow).toBe(
+    "0 0 0 2px var(--color-well), 0 0 0 4px var(--color-selected-ring), var(--shadow-card)",
+  );
   await user.click(screen.getByRole("button", { name: /^sink: quarantine/ }));
   expect(useSessionStore.getState().selectedNodeId).toBe("quarantine");
   toggle.focus();
@@ -3665,11 +3669,11 @@ describe("GraphView", () => {
       expect(styleOf("classify").border).toBe(
         "1px solid var(--color-selected-ring)",
       );
-      // ARGOnite: a solid 2px selected ring, no translucent 3px halo (design
-      // doc "Colour and boundary fixes"); still heavier than the 1px
-      // validation ring, so selection never reads by hue alone.
+      // ARGOnite: a solid 2px selected ring set off by a 2px gap in the well
+      // colour (final review I5). Selected and valid greens are close in
+      // tone, so the gap and the 4px reach, not hue, mark selection.
       expect(styleOf("classify").boxShadow).toBe(
-        "0 0 0 2px var(--color-selected-ring), var(--shadow-card)",
+        "0 0 0 2px var(--color-well), 0 0 0 4px var(--color-selected-ring), var(--shadow-card)",
       );
       expect(styleOf("other").boxShadow).toBe("var(--shadow-card)");
       // ARGOnite: forced colours drops the ring, so selection also carries a
