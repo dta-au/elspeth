@@ -66,6 +66,12 @@ import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 
 const NODE_WIDTH = 260;
 const NODE_HEIGHT = 80;
+// ARGOnite: selection is a solid 2px ring set off from the card by a 2px gap
+// in the graph well's colour, the same gap-ring shape as the focus ring
+// (final review I5). Selected and valid greens are close in tone, so the gap
+// and the 4px reach (the pre-ARGOnite outer extent) carry selection, not hue.
+// Shared by selected nodes and a selected route's endpoints.
+const SELECTED_NODE_RING = `0 0 0 2px var(--color-well), 0 0 0 4px ${SELECTED_RING_COLOR}`;
 const FALLBACK_MINIMAP_NODE_COLOR_VAR = "--color-text-muted";
 const MINIMAP_NODE_STROKE_COLOR_VAR = "--color-border-strong";
 // Interim UX threshold: avoid MiniMap noise on small graphs until we can
@@ -1116,12 +1122,11 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
       // ARGOnite: the resting edge is the node-border role (>= 3:1 on the
       // graph well), so the card never relies on its shadow for a boundary.
       const borderStyle = `1px solid ${ringColor ?? NODE_BORDER_COLOR}`;
-      // ARGOnite: selection is a solid 2px ring (design doc "Colour and
-      // boundary fixes"), still heavier than the 1px validation ring, which
-      // matches the 2px total weight the old 2px border drew. The ring is the
-      // first shadow layer so it paints over the card's soft drop shadow.
+      // ARGOnite: selection is the gap ring (SELECTED_NODE_RING above), far
+      // heavier than the 1px validation ring. The ring layers come first so
+      // they paint over the card's soft drop shadow.
       const ringShadow = isSelected
-        ? `0 0 0 2px ${SELECTED_RING_COLOR}`
+        ? SELECTED_NODE_RING
         : ringColor
           ? `0 0 0 1px ${ringColor}`
           : undefined;
@@ -2063,10 +2068,10 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
     zIndex: edge.id === activeEdge?.id ? 10 : 0,
     style: edge.id === activeEdge?.id ? { ...edge.style, strokeWidth: 4 } : edge.style,
   }));
-  // ARGOnite: a selected route's endpoints take the same solid 2px ring as a
+  // ARGOnite: a selected route's endpoints take the same gap ring as a
   // selected node, over the card shadow.
   const renderedNodes = visibleGraph.nodes.map((node) => activeEdge && (node.id === activeEdge.source || node.id === activeEdge.target)
-    ? { ...node, className: "graph-node--selected", style: { ...node.style, boxShadow: `0 0 0 2px ${SELECTED_RING_COLOR}, var(--shadow-card)` } }
+    ? { ...node, className: "graph-node--selected", style: { ...node.style, boxShadow: `${SELECTED_NODE_RING}, var(--shadow-card)` } }
     : node);
 
   // Accessible, keyboard-operable equivalent of the visual DAG. The React Flow
