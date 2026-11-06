@@ -252,7 +252,7 @@ Run stays red. No control was removed or moved further away.
 
 ### Waiting on the owner
 
-These two need your decision. Nothing else waits on you.
+These two need your decision. Nothing else needs a decision from you right now.
 
 1. **The checksum in a narrow pane.** It may be cut short with "…". Copy and Match
    still use the whole value. The other choice: let the checksum wrap onto its own
