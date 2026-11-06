@@ -910,6 +910,21 @@ describe("muted text on every panel surface (elspeth-dae08efdc9)", () => {
     }
   });
 
+  it("keeps the '+ New session' row at AA on the popover ground and its hover wash in both themes", () => {
+    // ARGOnite: accent text on nav-raised was 3.50:1 dark (3.14 hovered), so
+    // the row takes body ink; its weight/separator still set it apart.
+    const rule = extractCssRule(".header-session-switcher-item-new");
+    const token = /color:\s*var\((--[a-z-]+)\)/.exec(rule)?.[1];
+    expect(token).toBeDefined();
+    for (const theme of themes) {
+      const ground = resolveHex(theme, "--color-surface-nav-raised");
+      const washed = resolveTintOver(theme, "--color-surface-hover", "--color-surface-nav-raised");
+      const text = resolveHex(theme, token as string);
+      expect(contrastRatio(text, ground), `new-session on nav-raised (${theme})`).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(text, washed), `new-session on hover wash (${theme})`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
   it("keeps muted text visually quieter than secondary text in both themes", () => {
     // The token raise must not collapse the muted/secondary hierarchy: muted
     // stays the quieter register (lower contrast against the page background
