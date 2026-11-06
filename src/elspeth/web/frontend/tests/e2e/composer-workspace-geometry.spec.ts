@@ -165,8 +165,9 @@ async function assertScenario(
 
 /**
  * The workspace's bottom bar row (elspeth-9c94a58500): ONE grid item spanning
- * both columns that paints the bottom rule and fill once, hosting the collapse
- * control in the authoring column and the action bar in the artifact column.
+ * both columns that owns the bottom edge, hosting the collapse control in the
+ * authoring column and the action bar in the artifact column. ARGOnite retired
+ * its top rule and fill (it is transparent on the canvas below the pane cards).
  * It replaced a mirrored band the authoring pane painted as a ::before to meet
  * the bar across the seam — first token-sized, then observer-sized
  * (elspeth-215c989bed, elspeth-97db9c22e5). Returned as boxes so a test can
@@ -221,9 +222,10 @@ async function workspaceBottomRow(page: ComposerPage["page"]): Promise<{
 /**
  * The bottom-row contract, stated once and asserted at every step of a
  * geometry change: the row spans the workspace's full width and sits on its
- * bottom edge; the action bar starts directly under the row's rule and ends on
- * the row's bottom (the row IS the bar's height — nothing above it, nothing
- * below it, so no rule that could have derived that height exists); the
+ * bottom edge; the row draws no top rule (ARGOnite), so the action bar starts
+ * at the row's top and ends on the row's bottom (the row IS the bar's height —
+ * nothing above it, nothing below it, so no rule that could have derived that
+ * height exists); the
  * collapse control is centred on the bar across the seam — which is where every
  * control in the bar sits, since the bar centres its groups and the completion
  * group centres its members (elspeth-b4e88f0f8c), so on a one-line bar the
@@ -237,7 +239,10 @@ function expectBottomRowContract(
   expect(Math.abs(edges.row.left - edges.workspace.left)).toBeLessThanOrEqual(1);
   expect(Math.abs(edges.row.right - edges.workspace.right)).toBeLessThanOrEqual(1);
   expect(Math.abs(edges.row.bottom - edges.workspace.bottom)).toBeLessThanOrEqual(1);
-  expect(edges.row.borderTop).toBeGreaterThanOrEqual(1);
+  // ARGOnite: the row is transparent on the canvas with no top rule (design
+  // doc; workspaceChrome.test.ts pins the stylesheet side). The bar still
+  // starts at the row's top, which the next assertion keeps.
+  expect(edges.row.borderTop).toBe(0);
   expect(
     Math.abs(edges.row.top + edges.row.borderTop - edges.bar.top),
   ).toBeLessThanOrEqual(1);
