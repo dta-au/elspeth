@@ -5,13 +5,15 @@ checks physical bridge/owner propagation without changing its busy semantics.
 """
 
 import asyncio
+import json
 import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
+from hashlib import sha256
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
@@ -24,8 +26,14 @@ from elspeth.web.sessions import continuation_sql_deadline as deadline_module
 from elspeth.web.sessions import locking
 from elspeth.web.sessions.composer_drain import ComposerDrainDeadline, ComposerDrainSignal
 from elspeth.web.sessions.composer_finalization import ContinuationFinalizationBudget
+from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import sessions_table
+from tests.helpers.continuation_policy import minimal_continuation_policy
+from tests.unit.web.coordination.test_composer_continuation_claim_start import queued, start_segment
 from tests.unit.web.coordination.test_composer_continuation_handover import _running
 from tests.unit.web.coordination.test_composer_operation_authority import _wait_for_thread_event
 from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store
@@ -173,3 +181,108 @@ async def test_actual_required_sql_installs_and_resets_scope_on_its_same_physica
     control = ordinary.reserve(RequiredWorkSource.CONTINUATION_READ_SQL)
     outcome = await run_required_sql_finish_once(control, locking._CONTINUATION_SQL_DEADLINE.get)
     assert type(outcome) is RequiredSQLReturned and outcome.value is None
+
+
+def test_reused_policy_keeps_equal_roles_and_original_deadline_owners_distinct(operation_store):
+    engine, repository, _authority, _service, session_id = operation_store
+    base = minimal_continuation_policy()
+    policy = base.model_copy(update={"actions": base.actions.model_copy(update={"blob": base.actions.read})})
+    authority, _record = queued(operation_store, policy=policy)
+    (claim,) = authority.claim_segment(limit=1)
+    context = start_segment(repository, claim)
+    try:
+        running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+        with engine.connect() as conn:
+            stored = load_snapshot(conn, session_id=str(session_id), operation_id=claim.operation_id)
+        root = decode_continuation_snapshot(stored.payload_json)
+        shared = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+        assert shared == policy
+        assert shared.actions.read == shared.actions.blob
+        assert shared.actions.read is not shared.actions.blob
+        started = time.monotonic()
+        first, second = (
+            ContinuationSQLDeadlineOwner(
+                running,
+                policy=decode_continuation_policy(root.admission_policy_json, root.policy_hash),
+                drain_signal=ComposerDrainSignal(),
+                drain_seconds=10.0,
+                hard_expires_at=started + 100.0,
+            )
+            for _ in range(2)
+        )
+        assert first.policy is second.policy is shared
+        first.begin_action(shared.actions.blob, started_at=started)
+        with pytest.raises(AuditIntegrityError, match=r"^Read result timing requires the original begun read action$"):
+            first.capture_read_result_deadline()
+        first.begin_action(shared.actions.read, started_at=started)
+        second.begin_action(shared.actions.read, started_at=started)
+        original_read = first.capture_read_result_deadline()
+        original_preview = first.capture_preview_result_deadline()
+        assert first.remaining_statement(session_id=str(session_id), read_result=original_read) > 0
+        assert first.remaining_statement(session_id=str(session_id), preview_result=original_preview) > 0
+        with pytest.raises(AuditIntegrityError, match=r"^Read disposition changed its original action timing$"):
+            second.remaining_statement(session_id=str(session_id), read_result=original_read)
+        with pytest.raises(AuditIntegrityError, match=r"^Preview disposition changed its original action timing$"):
+            second.remaining_statement(session_id=str(session_id), preview_result=original_preview)
+        assert second.remaining_statement(session_id=str(session_id), read_result=second.capture_read_result_deadline()) > 0
+        assert second.remaining_statement(session_id=str(session_id), preview_result=second.capture_preview_result_deadline()) > 0
+    finally:
+        repository.release(context)
+
+
+@pytest.mark.parametrize("corruption", ("chunk_hash", "policy_text"))
+def test_warm_policy_reuse_does_not_skip_fresh_retained_source_validation(operation_store, corruption):
+    engine, repository, _authority, _service, session_id = operation_store
+    running, owner, _signal = _owners(operation_store)
+    try:
+        with engine.begin() as conn:
+            stored = load_snapshot(conn, session_id=str(session_id), operation_id=running.claim.operation_id)
+            root = decode_continuation_snapshot(stored.payload_json)
+            assert decode_continuation_policy(root.admission_policy_json, root.policy_hash) is owner.policy
+            key = conn.execute(
+                select(checkpoints.c.snapshot_chunk_key).where(
+                    checkpoints.c.session_id == str(session_id),
+                    checkpoints.c.operation_id == running.claim.operation_id,
+                    checkpoints.c.checkpoint_id == stored.checkpoint_id,
+                )
+            ).scalar_one()
+            source = select(chunks).where(
+                chunks.c.session_id == str(session_id),
+                chunks.c.operation_id == running.claim.operation_id,
+                chunks.c.chunk_key == key,
+            )
+            original = conn.execute(source).one()
+            if corruption == "chunk_hash":
+                payload = b"!" + original.payload[1:]
+                assert payload != original.payload and len(payload) == len(original.payload)
+                digest = original.sha256
+                refusal = "continuation chunk exceeded its original bound or lost its SQL binding"
+            else:
+                changed_root = json.loads(stored.payload_json)
+                changed_policy = json.loads(root.admission_policy_json)
+                changed_policy["max_retained_payload_bytes"] += 1
+                changed_root["admission_policy_json"] = json.dumps(changed_policy)
+                payload = json.dumps(changed_root).encode("utf-8")
+                digest = sha256(payload).hexdigest()
+                refusal = "continuation policy hash mismatch"
+            savepoint = conn.begin_nested()
+            try:
+                changed = conn.execute(
+                    update(chunks)
+                    .where(
+                        chunks.c.session_id == str(session_id),
+                        chunks.c.operation_id == running.claim.operation_id,
+                        chunks.c.chunk_key == key,
+                    )
+                    .values(payload=payload, byte_length=len(payload), sha256=digest)
+                )
+                assert changed.rowcount == 1
+                with pytest.raises(AuditIntegrityError, match=rf"^{refusal}$"):
+                    load_snapshot(conn, session_id=str(session_id), operation_id=running.claim.operation_id)
+            finally:
+                savepoint.rollback()
+            assert conn.execute(source).one() == original
+            assert load_snapshot(conn, session_id=str(session_id), operation_id=running.claim.operation_id) == stored
+            assert decode_continuation_policy(root.admission_policy_json, root.policy_hash) is owner.policy
+    finally:
+        repository.release(running.session_operation_context)

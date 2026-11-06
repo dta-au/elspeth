@@ -233,7 +233,18 @@ def _restore_request(stored: object, blocks: _RecorderBlocks) -> object:
         "messages": [blocks.resolve(key) for key in stored["messages"]],
         "tools": None if stored["tools"] is None else blocks.resolve(stored["tools"]),
     }
-    return {"disposition": "retained", "canonical": canonical_json(context), "reasons": []}
+    memo = current_retention_stage_memo()
+    canonical = None
+    if memo is not None and current_v4_preparation_memo() is not None:
+        canonical = memo.v4_restored_recorder_request_text(
+            canonical_json(stored),
+            CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+            RecorderRequestTextDependencies(parse_json_strict, canonical_json, hashlib.sha256, _CONTEXT_KEYS),
+            _prepared_request_text,
+        )
+    if canonical is None:
+        canonical = canonical_json(context)
+    return {"disposition": "retained", "canonical": canonical, "reasons": []}
 
 
 def recorder_snapshot_json(snapshot: RecorderSnapshot) -> str:

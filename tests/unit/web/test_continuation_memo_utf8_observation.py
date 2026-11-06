@@ -2,6 +2,7 @@
 
 import ctypes
 import dis
+import hashlib
 import sys
 from dataclasses import replace
 
@@ -13,6 +14,41 @@ from elspeth.web import credential_guard as guard
 from elspeth.web.composer import continuation_clock as clock
 from tests.helpers.continuation_memo import RetentionMemoTrace
 from tests.unit.web.test_continuation_memo_accounting import _native_byte_limits, _native_scan_budget
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("orphan_on_close", (False, True))
+async def test_reverse_request_observation_counts_one_parent_and_detects_orphan(monkeypatch, orphan_on_close):
+    from elspeth.web import continuation_retention_memo as memo
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+
+    def produce(_key):
+        return memo.RecorderRequestTextProof("original-reference-document", ())
+
+    deps = memo.RecorderRequestTextDependencies(produce, produce, hashlib.sha256, frozenset())
+    actual_close = memo.RetentionStageMemo.close
+
+    def close_with_orphan(owner):
+        aliases = dict(owner._v4_recorder_request_reverse)
+        actual_close(owner)
+        owner._v4_recorder_request_reverse.update(aliases)
+
+    if orphan_on_close:
+        monkeypatch.setattr(memo.RetentionStageMemo, "close", close_with_orphan)
+    observation = EndTextMemoObservation()
+    with observation.install(monkeypatch), memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
+        with memo.borrow_v4_preparation_memo_scope() as child:
+            child.v4_recorder_request_text(memo.RecorderRequestTextKey("actual-source", 4096), deps, produce)
+            assert child.v4_restored_recorder_request_text("original-reference-document", 4096, deps, produce) == "actual-source"
+            assert child.v4_restored_recorder_request_text("changed-reference-document", 4096, deps, produce) is None
+        assert parent.cached_entry_count == 1
+        actual_weight = parent._v4_recorder_request_bytes
+    result = observation.snapshot()
+    assert result["reverse_request_lookup"] == {"requests": 2, "hits": 1, "misses": 1, "errors": 0}
+    assert result["families"]["request"]["requests"] == 1
+    assert result["peak_retained_bytes"] == actual_weight
+    assert result["parents"] == [{"budget": parent._shared_text_budget_bytes, "closed_empty": not orphan_on_close}]
 
 
 @pytest.mark.parametrize(

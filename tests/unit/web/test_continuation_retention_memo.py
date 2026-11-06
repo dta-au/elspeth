@@ -1107,7 +1107,17 @@ async def test_four_family_insertions_account_every_retained_entry(monkeypatch: 
             )
             assert actual == charged <= bound
             for entry in parent._v4_recorder_requests.values():
-                assert entry.retained_bytes == 400_000 + len(str(bound)) + len("shape")
+                forward = parent._v4_recorder_request_reverse[entry.reverse_key]
+                assert forward in parent._v4_recorder_requests
+                assert entry.retained_bytes == (
+                    400_000
+                    + len(str(bound))
+                    + len("shape")
+                    + getsizeof(entry.reverse_key)
+                    + getsizeof({entry.reverse_key: forward})
+                    + getsizeof(entry)
+                )
+            assert all(key in parent._v4_recorder_requests for key in parent._v4_recorder_request_reverse.values())
 
         for family in order:
             admit(family)
@@ -1118,6 +1128,7 @@ async def test_four_family_insertions_account_every_retained_entry(monkeypatch: 
         admit("request", "z")
         assert max(calls.values()) > 1
     assert parent.cached_entry_count == parent._v4_recorder_request_bytes == 0
+    assert not parent._v4_recorder_request_reverse
 
 
 @pytest.mark.asyncio
@@ -1161,6 +1172,144 @@ async def test_v4_request_lru_key_bound_producer_oversize_and_late_close(monkeyp
             release.set()
             assert future.result(timeout=5) == RecorderRequestTextProof("{}", ())
         assert parent.cached_entry_count == parent._v4_recorder_request_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_request_inverse_uses_same_entry_namespace_lru_and_charge(monkeypatch):
+    def produce(key):
+        return RecorderRequestTextProof(key.canonical + "-refs", ())
+
+    def other(key):
+        return produce(key)
+
+    deps = RecorderRequestTextDependencies(produce, produce, hashlib.sha256, frozenset({"shape"}))
+    first, second, third = (RecorderRequestTextKey(text, 4096) for text in ("first", "second", "third"))
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        with borrow_v4_preparation_memo_scope() as child:
+            proof = child.v4_recorder_request_text(first, deps, produce)
+            assert proof is not None
+            assert child.v4_restored_recorder_request_text(proof.ref_document_json, 4096, deps, produce) == "first"
+            assert not child._v4_recorder_requests and not child._v4_recorder_request_reverse
+        weight = parent._v4_recorder_request_bytes
+        assert weight > len("firstfirst-refsshape4096")
+        for text, bound, dependencies, producer in (
+            ("second-refs", 4096, deps, produce),
+            ("first-refs", 4095, deps, produce),
+            ("first-refs", 4096, replace(deps, renderer=other), produce),
+            ("first-refs", 4096, replace(deps, context_keys=[]), produce),
+            ("first-refs", 4096, deps, other),
+        ):
+            assert parent.v4_restored_recorder_request_text(text, bound, dependencies, producer) is None
+        # Two entries fit; a reverse hit must rescue the first from eviction.
+        parent._shared_text_budget_bytes = weight * 2 + 4
+        parent.v4_recorder_request_text(second, deps, produce)
+        assert parent.v4_restored_recorder_request_text("first-refs", 4096, deps, produce) == "first"
+        parent.v4_recorder_request_text(third, deps, produce)
+        assert parent.v4_restored_recorder_request_text("second-refs", 4096, deps, produce) is None
+        assert parent.v4_restored_recorder_request_text("first-refs", 4096, deps, produce) == "first"
+    assert not parent._v4_recorder_request_reverse and parent._v4_recorder_request_bytes == 0
+    assert parent.v4_restored_recorder_request_text("first-refs", 4096, deps, produce) is None
+
+    # This fits the original payload charge but cannot fit the added index.
+    # It detects an omitted bookkeeping charge without reproducing its math.
+    with v4_preparation_memo_scope(_advisor_clock()) as small:
+        small.v4_recorder_request_text(replace(first, cache_bound_bytes=100), deps, produce)
+        assert not small._v4_recorder_requests and not small._v4_recorder_request_reverse
+        small._shared_text_budget_bytes = 100
+        small.v4_recorder_request_text(first, deps, produce)
+        assert not small._v4_recorder_requests and small._v4_recorder_request_bytes == 0
+
+    # Ordinary stages never expose the V4 inverse lookup.
+    with retention_stage_memo_scope() as ordinary:
+        ordinary.v4_recorder_request_text(first, deps, produce)
+        assert ordinary.v4_restored_recorder_request_text("first-refs", 4096, deps, produce) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_during_compute", (False, True))
+async def test_request_inverse_competing_publication_and_close(close_during_compute):
+    barrier = threading.Barrier(3)
+    release = threading.Event()
+
+    def produce(key):
+        barrier.wait(timeout=5)
+        assert release.wait(5)
+        return RecorderRequestTextProof("refs", ())
+
+    deps = RecorderRequestTextDependencies(produce, produce, hashlib.sha256, frozenset())
+    key = RecorderRequestTextKey("original", 4096)
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(parent.v4_recorder_request_text, key, deps, produce) for _ in range(2)]
+            barrier.wait(timeout=5)
+            if close_during_compute:
+                parent.close()
+            release.set()
+            assert all(future.result(timeout=5) == RecorderRequestTextProof("refs", ()) for future in futures)
+        assert len(parent._v4_recorder_request_reverse) == len(parent._v4_recorder_requests) == (0 if close_during_compute else 1)
+        if not close_during_compute:
+            assert parent._v4_recorder_request_bytes == next(iter(parent._v4_recorder_requests.values())).retained_bytes
+            assert parent.v4_restored_recorder_request_text("refs", 4096, deps, produce) == "original"
+    assert not parent._v4_recorder_request_reverse
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_family", ("category", "evidence"))
+@pytest.mark.parametrize("request_first", (False, True))
+async def test_request_inverse_mixed_pressure_removes_only_live_aliases(monkeypatch, other_family, request_first):
+    monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", 1_048_576)
+
+    def produce(_key):
+        return RecorderRequestTextProof("r" * 325_000, ())
+
+    def category(_text):
+        return None
+
+    def evidence(_text):
+        return ()
+
+    deps = RecorderRequestTextDependencies(produce, produce, hashlib.sha256, frozenset())
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for request in (request_first, not request_first, request_first):
+            if request:
+                parent.v4_recorder_request_text(RecorderRequestTextKey("q" * 325_000, 1_048_576), deps, produce)
+            elif other_family == "category":
+                parent.credential_string_category("s" * 650_000, category)
+            else:
+                parent.evidence_references(_evidence_key('"' + "e" * 650_000 + '"'), evidence)
+            assert parent.cached_entry_count == 1
+            assert bool(parent._v4_recorder_request_reverse) is request
+            assert all(key in parent._v4_recorder_requests for key in parent._v4_recorder_request_reverse.values())
+    assert not parent._v4_recorder_request_reverse
+
+
+@pytest.mark.asyncio
+async def test_request_inverse_rebound_alias_and_singleton_reset():
+    def produce(_key):
+        return RecorderRequestTextProof("shared-reference", ())
+
+    def encode(key):
+        return key.canonical.encode()
+
+    deps = RecorderRequestTextDependencies(produce, produce, hashlib.sha256, frozenset())
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for text in ("first", "second"):
+            parent.v4_recorder_request_text(RecorderRequestTextKey(text, 4096), deps, produce)
+        with parent._lock:
+            parent._discard_oldest_recorder_request()
+        assert parent.v4_restored_recorder_request_text("shared-reference", 4096, deps, produce) == "second"
+        # Deliberately transplant a real charged entry into an ordinary stage
+        # to exercise its singleton-reset cleanup. Normal V4 scopes cannot
+        # acquire that ordinary-stage state through their public API.
+        ordinary = RetentionStageMemo()
+        ordinary._v4_recorder_requests.update(parent._v4_recorder_requests)
+        ordinary._v4_recorder_request_reverse.update(parent._v4_recorder_request_reverse)
+        ordinary._v4_recorder_request_bytes = parent._v4_recorder_request_bytes
+        ordinary.canonical_text_encoding(CanonicalTextEncodingKey("reset", 100), encode)
+        assert not ordinary._v4_recorder_requests and not ordinary._v4_recorder_request_reverse
+        assert ordinary._v4_recorder_request_bytes == 0
+        assert parent.v4_restored_recorder_request_text("shared-reference", 4096, deps, produce) == "second"
+        ordinary.close()
 
 
 def _evidence_key(canonical: str = '{"source":true}') -> PrivateChunkVerificationKey:

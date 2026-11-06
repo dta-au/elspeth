@@ -1,3 +1,5 @@
+import json
+from copy import deepcopy
 from datetime import UTC, datetime
 
 import pytest
@@ -32,6 +34,87 @@ from elspeth.web.composer.continuation_audit_buffer import (
 from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from tests.unit.web.composer.test_continuation_physical_outcomes import actual_record
+
+
+@pytest.mark.asyncio
+async def test_actual_recorder_reverse_lookup_preserves_fresh_blocks_and_cold_bytes(monkeypatch):
+    from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope, v4_preparation_memo_scope
+    from tests.unit.web.composer.test_continuation_audit_buffer_blocks import _snapshot
+    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+
+    snapshot = _snapshot(2)
+    render, block_key = audit_buffer.canonical_json, audit_buffer._block_key
+    contexts, blocks_checked = [], []
+
+    def observe(value):
+        if type(value) is dict and set(value) == audit_buffer._CONTEXT_KEYS:
+            contexts.append(value)
+        return render(value)
+
+    def block(value):
+        blocks_checked.append(value)
+        return block_key(value)
+
+    monkeypatch.setattr(audit_buffer, "canonical_json", observe)
+    monkeypatch.setattr(audit_buffer, "_block_key", block)
+    with v4_preparation_memo_scope(_advisor_clock()) as parent:
+        with borrow_v4_preparation_memo_scope():
+            chunk = encode_recorder_snapshot(snapshot)
+        document = json.loads(chunk.canonical)
+        contexts.clear()
+        blocks_checked.clear()
+        with borrow_v4_preparation_memo_scope():
+            assert decode_recorder_snapshot(chunk) == snapshot
+        assert contexts == []
+        assert len(blocks_checked) == len(document["blocks"])
+        assert parent._v4_recorder_request_reverse
+
+        # Complete vectors, not prefixes/sets, determine a restored request.
+        stored = document["snapshot"]["llm_calls"][0]["private_request"]
+        for change in ("order", "repeat", "tools", "header"):
+            changed = deepcopy(stored)
+            if change == "order":
+                changed["messages"].reverse()
+            elif change == "repeat":
+                changed["messages"].append(changed["messages"][0])
+            elif change == "tools":
+                changed["tools"] = None
+            else:
+                changed["capture_boundary"] = "different-boundary"
+            admitted = audit_buffer._RecorderBlocks.admit(document["blocks"])
+            contexts.clear()
+            actual = audit_buffer._restore_request(changed, admitted)
+            assert len(contexts) == 1
+            expected = {
+                "schema_version": changed["schema_version"],
+                "capture_boundary": changed["capture_boundary"],
+                "messages": [document["blocks"][key] for key in changed["messages"]],
+                "tools": None if changed["tools"] is None else document["blocks"][changed["tools"]],
+            }
+            assert actual["canonical"] == render(expected)
+
+        for damage, message in (("missing", "absent block"), ("tamper", "content address"), ("unused", "unreferenced block")):
+            damaged = deepcopy(document)
+            key = damaged["snapshot"]["llm_calls"][1]["private_request"]["messages"][-1]
+            if damage == "missing":
+                del damaged["blocks"][key]
+            elif damage == "tamper":
+                damaged["blocks"][key] = {"role": "user", "content": "changed actual block"}
+            else:
+                value = {"role": "user", "content": "unused actual block"}
+                damaged["blocks"][block_key(value)] = value
+            # Real document admission still visits another call's block even
+            # when the first request's reverse association is already warm.
+            with pytest.raises(AuditIntegrityError, match=message):
+                audit_buffer._decode_recorder_document(render(damaged))
+
+        admitted = audit_buffer._RecorderBlocks.admit(document["blocks"])
+        first = audit_buffer._restore_request(stored, admitted)
+        second = audit_buffer._restore_request(stored, admitted)
+        assert first == second and first is not second and first["reasons"] is not second["reasons"]
+    contexts.clear()
+    assert decode_recorder_snapshot(chunk) == snapshot
+    assert contexts  # Cold standalone control detects disabling the inverse path.
 
 
 def test_recorder_projection_selects_native_writer_and_reader_preserves_public_canonical_bytes(monkeypatch):

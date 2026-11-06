@@ -137,9 +137,18 @@ class RecorderRequestTextDependencies:
 
 
 @dataclass(frozen=True, slots=True)
+class _RecorderRequestReverseKey:
+    producer: Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None]
+    dependencies: RecorderRequestTextDependencies
+    ref_document_json: str
+    cache_bound_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class _RecorderRequestTextEntry:
     proof: RecorderRequestTextProof
     retained_bytes: int
+    reverse_key: _RecorderRequestReverseKey
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +311,14 @@ class RetentionStageMemo:
             _RecorderRequestTextEntry,
         ] = OrderedDict()
         self._v4_recorder_request_bytes = 0
+        self._v4_recorder_request_reverse: dict[
+            _RecorderRequestReverseKey,
+            tuple[
+                Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None],
+                RecorderRequestTextDependencies,
+                RecorderRequestTextKey,
+            ],
+        ] = {}
         self._credential_strings: OrderedDict[tuple[Callable[[str], CredentialCategory | None], str], _CredentialStringEntry] = (
             OrderedDict()
         )
@@ -357,8 +374,8 @@ class RetentionStageMemo:
             self._canonical_verification_bytes = 0
             self._recorder_block_hashes.clear()
             self._recorder_block_hash_bytes = 0
-            self._v4_recorder_requests.clear()
-            self._v4_recorder_request_bytes = 0
+            while self._v4_recorder_requests:
+                self._discard_oldest_recorder_request()
             self._credential_strings.clear()
             self._credential_string_bytes = 0
             self._evidence_references.clear()
@@ -424,8 +441,8 @@ class RetentionStageMemo:
                 self._canonical_verification_bytes = 0
                 self._recorder_block_hashes.clear()
                 self._recorder_block_hash_bytes = 0
-                self._v4_recorder_requests.clear()
-                self._v4_recorder_request_bytes = 0
+                while self._v4_recorder_requests:
+                    self._discard_oldest_recorder_request()
                 self._credential_strings.clear()
                 self._credential_string_bytes = 0
                 self._evidence_references.clear()
@@ -515,8 +532,7 @@ class RetentionStageMemo:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
                 elif self._v4_recorder_requests:
-                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
-                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                    self._discard_oldest_recorder_request()
                 elif self._credential_strings:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes
@@ -590,8 +606,7 @@ class RetentionStageMemo:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
                 elif self._v4_recorder_requests:
-                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
-                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                    self._discard_oldest_recorder_request()
                 elif self._credential_strings:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes
@@ -645,8 +660,7 @@ class RetentionStageMemo:
                     _, evicted_proof = self._canonical_proofs.popitem(last=False)
                     self._canonical_proof_bytes -= evicted_proof.retained_bytes
                 elif self._v4_recorder_requests:
-                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
-                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                    self._discard_oldest_recorder_request()
                 elif self._credential_strings:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes
@@ -699,7 +713,14 @@ class RetentionStageMemo:
         ):
             raise TypeError("Recorder request memo requires exact immutable text proof")
         bound = min(key.cache_bound_bytes, CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
-        remaining = bound - len(str(key.cache_bound_bytes))
+        reverse_key = _RecorderRequestReverseKey(producer, dependencies, value.ref_document_json, key.cache_bound_bytes)
+        # The inverse index borrows the existing payload strings and forward
+        # key. Charge its key object and a conservative whole one-item dict
+        # allocation, not another copy of the already charged request text.
+        index_bytes = (
+            getsizeof(reverse_key) + getsizeof({reverse_key: cache_key}) + getsizeof(_RecorderRequestTextEntry(value, 0, reverse_key))
+        )
+        remaining = bound - len(str(key.cache_bound_bytes)) - index_bytes
         for item in (
             *cast(frozenset[str], dependencies.context_keys),
             key.canonical,
@@ -711,7 +732,9 @@ class RetentionStageMemo:
             remaining -= utf8_size(item, limit=remaining)
         if remaining < 0:
             return value
-        entry = _RecorderRequestTextEntry(value, bound - remaining)
+        entry = _RecorderRequestTextEntry(value, bound - remaining, reverse_key)
+        if entry.retained_bytes > self._shared_text_budget_bytes:
+            return value
         with self._lock:
             if self._closed:
                 return value
@@ -731,8 +754,7 @@ class RetentionStageMemo:
                 > self._shared_text_budget_bytes
             ):
                 if self._v4_recorder_requests:
-                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
-                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                    self._discard_oldest_recorder_request()
                 elif self._canonical_verifications:
                     _, evicted_size = self._canonical_verifications.popitem(last=False)
                     self._canonical_verification_bytes -= evicted_size
@@ -749,8 +771,45 @@ class RetentionStageMemo:
                     _, evicted_references = self._evidence_references.popitem(last=False)
                     self._evidence_reference_bytes -= evicted_references.retained_bytes
             self._v4_recorder_requests[cache_key] = entry
+            self._v4_recorder_request_reverse[reverse_key] = cache_key
             self._v4_recorder_request_bytes += entry.retained_bytes
         return value
+
+    def _discard_oldest_recorder_request(self) -> None:
+        """Remove one request and its owned inverse alias under the memo lock."""
+        key, entry = self._v4_recorder_requests.popitem(last=False)
+        if self._v4_recorder_request_reverse.get(entry.reverse_key) == key:
+            del self._v4_recorder_request_reverse[entry.reverse_key]
+        self._v4_recorder_request_bytes -= entry.retained_bytes
+
+    def v4_restored_recorder_request_text(
+        self,
+        ref_document_json: str,
+        cache_bound_bytes: int,
+        dependencies: RecorderRequestTextDependencies,
+        producer: Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None],
+    ) -> str | None:
+        """Look up existing inverse DATA after the caller admits actual blocks."""
+        if type(ref_document_json) is not str or type(cache_bound_bytes) is not int or cache_bound_bytes < 1:
+            raise TypeError("Recorder restoration requires its exact bounded reference document")
+        _require_function_producer(producer)
+        if type(dependencies) is not RecorderRequestTextDependencies or not dependencies.cacheable():
+            return None
+        with self._lock:
+            parent = self._text_parent if not self._closed else None
+        if parent is not None and parent._v4_preparation_owner is not None:
+            return parent.v4_restored_recorder_request_text(ref_document_json, cache_bound_bytes, dependencies, producer)
+        if self._v4_preparation_owner is None:
+            return None
+        reverse_key = _RecorderRequestReverseKey(producer, dependencies, ref_document_json, cache_bound_bytes)
+        with self._lock:
+            if self._closed:
+                return None
+            key = self._v4_recorder_request_reverse.get(reverse_key)
+            if key is None or key not in self._v4_recorder_requests:
+                return None
+            self._v4_recorder_requests.move_to_end(key)
+            return key[2].canonical
 
     def recorder_request_text(
         self, key: RecorderRequestTextKey, producer: Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None]
@@ -862,8 +921,7 @@ class RetentionStageMemo:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
                 elif self._v4_recorder_requests:
-                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
-                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                    self._discard_oldest_recorder_request()
                 else:
                     _, evicted_references = self._evidence_references.popitem(last=False)
                     self._evidence_reference_bytes -= evicted_references.retained_bytes
@@ -942,8 +1000,7 @@ class RetentionStageMemo:
                     _, evicted_size = self._recorder_block_hashes.popitem(last=False)
                     self._recorder_block_hash_bytes -= evicted_size
                 elif self._v4_recorder_requests:
-                    _, evicted_request = self._v4_recorder_requests.popitem(last=False)
-                    self._v4_recorder_request_bytes -= evicted_request.retained_bytes
+                    self._discard_oldest_recorder_request()
                 else:
                     _, evicted_category = self._credential_strings.popitem(last=False)
                     self._credential_string_bytes -= evicted_category.retained_bytes

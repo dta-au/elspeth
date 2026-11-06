@@ -157,6 +157,7 @@ class EndTextMemoObservation:
         self.budget_violations = 0
         self.observer_ns = 0
         self.peak_retained_bytes = 0
+        self.reverse_requests = {"requests": 0, "hits": 0, "misses": 0, "errors": 0}
         self.counts = {
             family: {
                 "requests": 0,
@@ -272,6 +273,7 @@ class EndTextMemoObservation:
         original_canonical = RetentionStageMemo.canonical_text_verification
         original_block = RetentionStageMemo.recorder_block_hash
         original_request = RetentionStageMemo.v4_recorder_request_text
+        original_reverse = RetentionStageMemo.v4_restored_recorder_request_text
         original_credential = RetentionStageMemo.credential_string_category
         original_evidence = RetentionStageMemo.evidence_references
         original_close = RetentionStageMemo.close
@@ -293,6 +295,23 @@ class EndTextMemoObservation:
         def credential(memo, text, classifier):
             return self._observe(memo, "credential", text, classifier, None, lambda: original_credential(memo, text, classifier))
 
+        def reverse(memo, document, bound, dependencies, producer):
+            if memo._v4_preparation_owner is None or (self.include is not None and not self.include(memo, "request")):
+                return original_reverse(memo, document, bound, dependencies, producer)
+            try:
+                result = original_reverse(memo, document, bound, dependencies, producer)
+            except BaseException:
+                with self._lock:
+                    self.reverse_requests["requests"] += 1
+                    self.reverse_requests["errors"] += 1
+                raise
+            before_ns = time.monotonic_ns()
+            with self._lock:
+                self.reverse_requests["requests"] += 1
+                self.reverse_requests["misses" if result is None else "hits"] += 1
+                self.observer_ns += time.monotonic_ns() - before_ns
+            return result
+
         def evidence(memo, key, producer):
             return self._observe(memo, "evidence", key, producer, None, lambda: original_evidence(memo, key, producer))
 
@@ -303,7 +322,11 @@ class EndTextMemoObservation:
                 ordinal = self._parents.get(memo)
                 if ordinal is not None:
                     self._parent_states[ordinal]["closed_empty"] = (
-                        not memo.active and memo.cached_entry_count == 0 and not any(state[2]) and not any(state[3])
+                        not memo.active
+                        and memo.cached_entry_count == 0
+                        and not any(state[2])
+                        and not any(state[3])
+                        and not memo._v4_recorder_request_reverse
                     )
 
         with monkeypatch.context() as patch:
@@ -311,6 +334,7 @@ class EndTextMemoObservation:
             patch.setattr(RetentionStageMemo, "canonical_text_verification", canonical)
             patch.setattr(RetentionStageMemo, "recorder_block_hash", block)
             patch.setattr(RetentionStageMemo, "v4_recorder_request_text", request)
+            patch.setattr(RetentionStageMemo, "v4_restored_recorder_request_text", reverse)
             patch.setattr(RetentionStageMemo, "credential_string_category", credential)
             patch.setattr(RetentionStageMemo, "evidence_references", evidence)
             patch.setattr(RetentionStageMemo, "close", close)
@@ -320,6 +344,7 @@ class EndTextMemoObservation:
         with self._lock:
             return {
                 "families": {family: dict(counts) for family, counts in self.counts.items()},
+                "reverse_request_lookup": dict(self.reverse_requests),
                 "parents": [dict(state) for state in self._parent_states.values()],
                 "peak_retained_bytes": self.peak_retained_bytes,
                 "observed_key_weight_estimate": None if self.fingerprint_drops else sum(self._fingerprints.values()),

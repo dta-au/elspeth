@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal
+from functools import lru_cache
 from typing import Annotated, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -127,6 +128,20 @@ class ContinuationAdmissionPolicyV4(BaseModel):
 
 
 def decode_continuation_policy(encoded: str, expected_hash: str) -> ContinuationAdmissionPolicyV4:
+    """Reuse bounded frozen configuration DATA, never current execution custody."""
+    if type(encoded) is str and type(expected_hash) is str and len(encoded) <= 8192 and encoded.isascii() and len(expected_hash) == 64:
+        return _decode_continuation_policy_cached(encoded, expected_hash)
+    return _decode_continuation_policy_uncached(encoded, expected_hash)
+
+
+@lru_cache(maxsize=16)
+def _decode_continuation_policy_cached(encoded: str, expected_hash: str) -> ContinuationAdmissionPolicyV4:
+    # Eligibility bounds retained text, not accepted policy size. Exceptions are
+    # not cached; each successful value contains only owned frozen scalar models.
+    return _decode_continuation_policy_uncached(encoded, expected_hash)
+
+
+def _decode_continuation_policy_uncached(encoded: str, expected_hash: str) -> ContinuationAdmissionPolicyV4:
     value, error = parse_json_strict(encoded)
     if error is not None:
         raise AuditIntegrityError("continuation policy is not strict JSON")
