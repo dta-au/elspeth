@@ -877,7 +877,7 @@ def test_early_cpu_profile_is_disabled_by_default_and_does_not_replace_evidence_
         snapshot = profile.snapshot()
         assert snapshot["cpu_profile_enabled"] is False and snapshot["cpu_profiles"] == []
         assert snapshot["text_memo"] is not None
-        assert set(snapshot["text_memo"]["families"]) == {"full", "canonical", "block", "request", "credential", "evidence"}
+        assert set(snapshot["text_memo"]["families"]) == {"full", "canonical", "block", "request", "credential", "evidence", "recorder"}
     finally:
         engine.dispose()
 

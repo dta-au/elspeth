@@ -267,10 +267,9 @@ class EarlyPreparationProfile:
                     # would disable the very reuse being measured.
                     for module, name in (
                         (physical, "prepare_checkpoint_phase_owner"),
-                        (physical, "capture_continuation_runtime_owners"),
+                        (physical, "capture_continuation_runtime_data"),
                         (physical, "bind_checkpoint_early_physical_request"),
-                        (detached, "restore_prepared_end_runtime"),
-                        (detached, "capture_continuation_runtime_owners"),
+                        (detached, "restore_captured_checkpoint_runtime"),
                     ):
                         patch.setattr(
                             module,

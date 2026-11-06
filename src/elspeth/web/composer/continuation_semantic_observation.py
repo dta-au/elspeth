@@ -40,8 +40,8 @@ from elspeth.web.composer.provider_audit_source import (
     capture_provider_audit_source,
     provider_attempt_audit_drafts,
 )
-from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError, _require_no_credential_material_in_completion_fields
-from elspeth.web.composer.provider_result_admission import diagnostic_provider_metadata, require_v4_provider_metadata_credentials
+from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError, _require_no_credential_material_in_completion
+from elspeth.web.composer.provider_result_admission import diagnostic_provider_metadata
 from elspeth.web.coordination.quota_authority import ProviderAttempt
 from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowCost, encode_paid_overflow_cost_amount
@@ -239,16 +239,11 @@ def observe_semantic_provider_response(
         env_ref_names=env_ref_names,
         max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
     )
-    tool_identities = tuple((tool_call.id, tool_call.function.name) for tool_call in calls)
+    completion = _AdmittedLLMCompletion(message, _AdmittedToolBatch(calls, frozenset(call.id for call in calls)), metadata)
+    _require_no_credential_material_in_completion(completion, surface="composer_advisor_response")
     if require_v4_completeness:
-        require_v4_provider_metadata_credentials(
-            metadata, content=message.content, tool_calls=tool_identities, surface="composer_advisor_response"
-        )
         audit_metadata = diagnostic_provider_metadata(metadata)
     else:
-        _require_no_credential_material_in_completion_fields(
-            content=message.content, tool_calls=tool_identities, provider_metadata=metadata, surface="composer_advisor_response"
-        )
         audit_metadata = metadata
     parsed = (
         parse_continuation_advisor_decision(message.content, actual_advisor_call_id=attempt.attempt_id)
@@ -269,7 +264,6 @@ def observe_semantic_provider_response(
     # call starts later on the worker clock. Their timestamps are distinct.
     require_audit = require_malformed_response_audit if invalid else require_successful_response_audit
     require_audit(call, audit_metadata, attempt_id=attempt.attempt_id, started_at=call.started_at, finished_at=call.finished_at)
-    completion = _AdmittedLLMCompletion(message, _AdmittedToolBatch(calls, frozenset(call.id for call in calls)), metadata)
     measure_continuation_response_size(completion)
     source_data = capture_provider_audit_source(context)
     require_no_credential_material(

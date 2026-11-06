@@ -229,15 +229,15 @@ RECORDER_BODY_BINDINGS = {
     (APPLICATION, "_require_source_environment"): "4250c1045487039b3734a80304e3ca551c6b449356536ceda11eb7c3473c9e21",
     (AUDIT_BUFFER, "_decode_recorder_document"): "c82da319a93b783453c2e1e4cf5534f52e4ce34094a5f3b2f501a1fbdcb7352d",
     (AUDIT_BUFFER, "recorder_snapshot_json"): "dbbd8b3115dc359543289e89bc97c3791e100c48afcb7f512b8a3f21bcc9b838",
-    (AUDIT_BUFFER, "DecodedRecorderData"): "13aa76a64bca1030afcc8b41b2e8c0a98bb13f39a501b69ec1216fb03139b0de",
+    (AUDIT_BUFFER, "RecorderDocumentData"): "8d28ffcae14753b2c9787097107c50719035a8f7ffa75cf6c90111ee51ee7441",
     (APPLICATION, "ApplicationRecorderSource"): "585afad9a522381756da08ea149216dd5e1d2abdaf1f86975ca4d839e651577b",
     (APPLICATION, "_require_source_chunk_shape"): "acc903e0df2fc2295c2de87061ef77c87436a04879115771b1111ac4110656e3",
     (APPLICATION, "_require_source_chunk"): "36a023caaf94c71b4e2efd568cc9042192b8c77ff85041f2f641328e3316a1c6",
     (APPLICATION, "require_application_recorder_source"): "83db90660d4dc919332d65f63e8451593cf68af852ebb031c226890f04274be3",
-    (AUDIT_BUFFER, "_encode_and_decode_recorder_document"): "b78ea9302dfb7c70a107699abdab9b5b1f1a7adfb20ce80c4a33ec50f7edd087",
-    (AUDIT_BUFFER, "decode_recorder_snapshot"): "a1980197afdd07e1abb4c64d32693aa723c60a8254a4f149f2f9f60ea37b9d79",
-    (AUDIT_BUFFER, "_decode_recorder_data"): "14567e4295ff25dcee9051d3fa8f770e13c162f2e1aa1966a5efeaea4e06da3f",
-    (AUDIT_BUFFER, "_admit_recorder_data"): "3cc7ae76b0bb4e73534604fe5ae508d35495c730621b9d1a1bbc45fb4d986075",
+    (AUDIT_BUFFER, "_encode_and_decode_recorder_document"): "9a7fc1767f949bbb34ff74c6f09a0d7eec6bbcaf53ef2dc7b261c6c23b5fa084",
+    (AUDIT_BUFFER, "decode_recorder_snapshot"): "4750c14f798a858e64813b0f12219f630ff570149a1747ec475177b508ff6ef2",
+    (AUDIT_BUFFER, "_construct_recorder_document"): "a3a588746755ca7537cdffcb2555aaacb4252f7689581ac14ba3fde8d42b82fe",
+    (AUDIT_BUFFER, "_require_recorder_document_capacity"): "93f7254d2a8b3652ef83b8d10f3053a29ba9d1301dcb3f108d7de98ba706b2a3",
 }
 
 # Ordered executable admission statements: mutations must fail even after a
@@ -267,19 +267,19 @@ RECORDER_ADMISSION_BODIES = {
     (
         AUDIT_BUFFER,
         "_encode_and_decode_recorder_document",
-    ): "chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)\nkey = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)\n\ndef admit(source: PrivateChunkVerificationKey, data: DecodedRecorderData) -> None:\n    if data.canonical != chunk.canonical:\n        _admit_recorder_data(source, data)\nmemo = current_retention_stage_memo()\nif memo is not None:\n    data = memo.recorder_data(key, _decode_recorder_data, admit)\nelse:\n    data = _decode_recorder_data(chunk.canonical)\n    admit(key, data)\nreturn (chunk, data.snapshot)",
+    ): "_require_recorder_document_capacity(canonical)\nencoded = canonical.encode('utf-8')\nreference = PrivateChunkRef(codec=RECORDER_CODEC, digest=hashlib.sha256(encoded).hexdigest(), byte_length=len(encoded))\nkey = PrivateChunkVerificationKey(reference, canonical)\ndef construct() -> RecorderDocumentData:\n    return _construct_recorder_document(canonical)\nmemo = current_retention_stage_memo()\ndata = memo.recorder_data(key, construct) if memo is not None else construct()\nverify_private_chunk(reference, canonical)\nif data.chunk.reference != reference or data.chunk.canonical != canonical:\n    raise AuditIntegrityError('recorder document differs from its actual source')\nreturn (data.chunk, data.snapshot)",
     (
         AUDIT_BUFFER,
         "decode_recorder_snapshot",
-    ): "if type(chunk) is not PrivateChunk or chunk.reference.codec != RECORDER_CODEC:\n    raise AuditIntegrityError('audit buffer has the wrong codec')\nverify_private_chunk(chunk.reference, chunk.canonical)\nkey = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)\nmemo = current_retention_stage_memo()\nif memo is not None:\n    data = memo.recorder_data(key, _decode_recorder_data, _admit_recorder_data)\nelse:\n    data = _decode_recorder_data(chunk.canonical)\n    _admit_recorder_data(key, data)\nreturn data.snapshot",
+    ): "if type(chunk) is not PrivateChunk or chunk.reference.codec != RECORDER_CODEC:\n    raise AuditIntegrityError('audit buffer has the wrong codec')\nverify_private_chunk(chunk.reference, chunk.canonical)\nkey = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)\ndef construct() -> RecorderDocumentData:\n    return _construct_recorder_document(chunk)\nmemo = current_retention_stage_memo()\ndata = memo.recorder_data(key, construct) if memo is not None else construct()\n_require_recorder_document_capacity(chunk.canonical)\nif data.chunk != chunk:\n    raise AuditIntegrityError('recorder document differs from its actual source')\nreturn data.snapshot",
     (
         AUDIT_BUFFER,
-        "_decode_recorder_data",
-    ): "snapshot = _decode_recorder_document(canonical)\nreturn DecodedRecorderData(snapshot, recorder_snapshot_json(snapshot))",
+        "_construct_recorder_document",
+    ): "if isinstance(source, str):\n    chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=source)\n    snapshot = _decode_recorder_document(source)\n    projected = recorder_snapshot_json(snapshot)\n    if projected != source:\n        encode_private_chunk(codec=RECORDER_CODEC, canonical=projected)\n        raise AuditIntegrityError('audit buffer omitted or normalized a retained field')\nelse:\n    snapshot = _decode_recorder_document(source.canonical)\n    chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=recorder_snapshot_json(snapshot))\n    if chunk != source:\n        raise AuditIntegrityError('audit buffer omitted or normalized a retained field')\nreturn RecorderDocumentData(chunk, snapshot)",
     (
         AUDIT_BUFFER,
-        "_admit_recorder_data",
-    ): "if encode_private_chunk(codec=RECORDER_CODEC, canonical=data.canonical).canonical != key.canonical:\n    raise AuditIntegrityError('audit buffer omitted or normalized a retained field')",
+        "_require_recorder_document_capacity",
+    ): "if utf8_size(canonical, limit=continuation_codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) > continuation_codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:\n    encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)",
 }
 
 SITE_KEYS = (

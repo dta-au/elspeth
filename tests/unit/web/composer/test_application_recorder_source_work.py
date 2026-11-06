@@ -71,9 +71,9 @@ async def test_recorder_capture_admits_original_once_and_keeps_detached_roundtri
     assert sum(value is snapshot for value in rendered) == 2
     assert len(decoded) == (1 if memo_used else 2)
     assert [value for value in rendered if value is not snapshot] == decoded
-    assert len(encoded) == 2
+    assert len(encoded) == (1 if memo_used else 2)
     # These observe admission entries, not classifier work hidden by its memo.
-    assert guarded == [(baseline.chunk.canonical, "composer_continuation_private_chunk", frozenset())] * 2
+    assert guarded == [(baseline.chunk.canonical, "composer_continuation_private_chunk", frozenset())] * (1 if memo_used else 2)
 
 
 def test_fresh_fitting_capture_preserves_actual_credential_refusal():

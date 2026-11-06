@@ -8,6 +8,7 @@ from pydantic import ConfigDict, TypeAdapter, ValidationError
 from pydantic.dataclasses import dataclass
 
 from elspeth.contracts._canonical_json_native import canonical_json_native_strings
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateFailureFacts, PrivateReceivedDiagnostic, PrivateToolAuthoring
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
@@ -15,7 +16,9 @@ from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
+from elspeth.web.composer import continuation_codec
 from elspeth.web.composer.audit import PrivatePlannerCandidate
+from elspeth.web.composer.continuation import PrivateChunkRef
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
     encode_private_chunk,
@@ -85,11 +88,11 @@ class RecorderSnapshot:
 
 
 @stdlib_dataclass(frozen=True, slots=True)
-class DecodedRecorderData:
-    """Actual reconstructed DATA and roundtrip text, without current admission."""
+class RecorderDocumentData:
+    """Actual admitted source and its detached immutable recorder DATA."""
 
+    chunk: PrivateChunk
     snapshot: RecorderSnapshot
-    canonical: str
 
 
 def _recorder_data_children(value: object) -> tuple[object, ...] | None:
@@ -99,8 +102,10 @@ def _recorder_data_children(value: object) -> tuple[object, ...] | None:
     Unknown future record types decline retention instead of changing admission.
     The field-completeness control checks these actual direct attribute reads.
     """
-    if type(value) is DecodedRecorderData:
-        return (value.snapshot, value.canonical)
+    if type(value) is RecorderDocumentData:
+        return (value.chunk, value.snapshot)
+    if type(value) is PrivateChunk:
+        return (value.reference, value.canonical)
     if type(value) is RecorderSnapshot:
         return (
             value.invocations,
@@ -449,22 +454,44 @@ def encode_recorder_snapshot(snapshot: RecorderSnapshot) -> PrivateChunk:
 
 def _encode_and_decode_recorder_document(canonical: str) -> tuple[PrivateChunk, RecorderSnapshot]:
     """Admit fresh text and return its original chunk with detached DATA."""
-    chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)
-    key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    _require_recorder_document_capacity(canonical)
+    encoded = canonical.encode("utf-8")
+    reference = PrivateChunkRef(codec=RECORDER_CODEC, digest=hashlib.sha256(encoded).hexdigest(), byte_length=len(encoded))
+    key = PrivateChunkVerificationKey(reference, canonical)
 
-    def admit(source: PrivateChunkVerificationKey, data: DecodedRecorderData) -> None:
-        # Equal text has just passed this invocation's complete admission.
-        # A changed projection still owes its own admission before field loss.
-        if data.canonical != chunk.canonical:
-            _admit_recorder_data(source, data)
+    def construct() -> RecorderDocumentData:
+        return _construct_recorder_document(canonical)
 
     memo = current_retention_stage_memo()
-    if memo is not None:
-        data = memo.recorder_data(key, _decode_recorder_data, admit)
+    data = memo.recorder_data(key, construct) if memo is not None else construct()
+    verify_private_chunk(reference, canonical)
+    if data.chunk.reference != reference or data.chunk.canonical != canonical:
+        raise AuditIntegrityError("recorder document differs from its actual source")
+    return data.chunk, data.snapshot
+
+
+def _require_recorder_document_capacity(canonical: str) -> None:
+    if utf8_size(canonical, limit=continuation_codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) > (
+        continuation_codec.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+    ):
+        # Preserve the encoder's original exact overflow witness and refusal.
+        encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)
+
+
+def _construct_recorder_document(source: str | PrivateChunk) -> RecorderDocumentData:
+    if isinstance(source, str):
+        chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=source)
+        snapshot = _decode_recorder_document(source)
+        projected = recorder_snapshot_json(snapshot)
+        if projected != source:
+            encode_private_chunk(codec=RECORDER_CODEC, canonical=projected)
+            raise AuditIntegrityError("audit buffer omitted or normalized a retained field")
     else:
-        data = _decode_recorder_data(chunk.canonical)
-        admit(key, data)
-    return chunk, data.snapshot
+        snapshot = _decode_recorder_document(source.canonical)
+        chunk = encode_private_chunk(codec=RECORDER_CODEC, canonical=recorder_snapshot_json(snapshot))
+        if chunk != source:
+            raise AuditIntegrityError("audit buffer omitted or normalized a retained field")
+    return RecorderDocumentData(chunk, snapshot)
 
 
 def validate_recorder_projection(snapshot: RecorderSnapshot) -> tuple[str, RecorderSnapshot]:
@@ -485,25 +512,16 @@ def decode_recorder_snapshot(chunk: PrivateChunk) -> RecorderSnapshot:
         raise AuditIntegrityError("audit buffer has the wrong codec")
     verify_private_chunk(chunk.reference, chunk.canonical)
     key = PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+
+    def construct() -> RecorderDocumentData:
+        return _construct_recorder_document(chunk)
+
     memo = current_retention_stage_memo()
-    if memo is not None:
-        data = memo.recorder_data(key, _decode_recorder_data, _admit_recorder_data)
-    else:
-        data = _decode_recorder_data(chunk.canonical)
-        _admit_recorder_data(key, data)
+    data = memo.recorder_data(key, construct) if memo is not None else construct()
+    _require_recorder_document_capacity(chunk.canonical)
+    if data.chunk != chunk:
+        raise AuditIntegrityError("recorder document differs from its actual source")
     return data.snapshot
-
-
-def _decode_recorder_data(canonical: str) -> DecodedRecorderData:
-    snapshot = _decode_recorder_document(canonical)
-    return DecodedRecorderData(snapshot, recorder_snapshot_json(snapshot))
-
-
-def _admit_recorder_data(key: PrivateChunkVerificationKey, data: DecodedRecorderData) -> None:
-    # Current size/canonical/credential admission still runs on every hit.
-    # Its refusal precedes roundtrip mismatch, just as in the cold decoder.
-    if encode_private_chunk(codec=RECORDER_CODEC, canonical=data.canonical).canonical != key.canonical:
-        raise AuditIntegrityError("audit buffer omitted or normalized a retained field")
 
 
 def _decode_recorder_document(canonical: str) -> RecorderSnapshot:

@@ -1132,7 +1132,13 @@ async def capture_continuation_runtime_data(
             captured = _capture_owner_data(runtime, source=source, inventory=inventory)
         except ComposerContextUnsupported as refused:
             try:
-                authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
+                authority.read_continuation_runtime(
+                    running,
+                    selected=selected,
+                    inventory=inventory,
+                    retention_memo=memo,
+                    _prior_evidence=source.admitted_evidence,
+                )
             except BaseException as failure:
                 raise BaseExceptionGroup("Retention refusal and final current-source admission", [refused, failure]) from None
             # Carry only work the actual recorder has not drained. Prior
@@ -1145,7 +1151,13 @@ async def capture_continuation_runtime_data(
                 llm_calls=live.recorder.llm_calls[runtime.drained.llm_calls :],
                 failed_turn=live.failed_turn,
             ) from refused
-        authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
+        authority.read_continuation_runtime(
+            running,
+            selected=selected,
+            inventory=inventory,
+            retention_memo=memo,
+            _prior_evidence=source.admitted_evidence,
+        )
         return captured
 
     def capture() -> _CapturedRuntimeData:

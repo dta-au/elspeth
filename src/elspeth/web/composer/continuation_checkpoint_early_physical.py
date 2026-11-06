@@ -25,7 +25,11 @@ from elspeth.web.composer.continuation_env_inventory import require_current_env_
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash
-from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, capture_continuation_runtime_owners
+from elspeth.web.composer.continuation_runtime import (
+    CapturedContinuationRuntime,
+    _CapturedRuntimeData,
+    capture_continuation_runtime_data,
+)
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.required_work import RequiredWorkRole, RequiredWorkSource
@@ -76,6 +80,7 @@ class _OriginalEarlySource:
     captured: CapturedContinuationRuntime
     clock: ContinuationActionClock
     capture: _AdvisorInvocationCapture
+    capture_data: _CapturedRuntimeData
     prepared_input: PreparedProviderInput | None = None
     prepared: PreparedCheckpointProvider | None = None
     custody: ProviderCallCustody | None = None
@@ -176,6 +181,7 @@ def require_original_checkpoint_early_physical_source(source: CheckpointEarlyPhy
         or owner.phase_source.phase != "early"
         or owner.phase_source.kind != "iteration_early"
         or source.captured.selected is not owner.selected
+        or original.capture_data.captured is not source.captured
         or owner.phases.action_clock is not source.clock
         or source.clock.policy != owner.runtime.source.policy.actions.advisor
     ):
@@ -247,10 +253,13 @@ async def prepare_checkpoint_early_physical_source(
                 return result
 
         retry = await _registered_read(phases.work, VerifiedEarlyFormatRetry, read_retry)
-    captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=runtime.materialization.inventory)
+    capture_data = await capture_continuation_runtime_data(runtime, selected=selected, inventory=runtime.materialization.inventory)
+    captured = capture_data.captured
     capture = _AdvisorInvocationCapture()
     source = CheckpointEarlyPhysicalSource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture)
-    original = _OriginalEarlySource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture, retry=retry)
+    original = _OriginalEarlySource(
+        owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture, capture_data, retry=retry
+    )
     object.__setattr__(source, "_issued_record", original)
     _issued[source] = ref(original)
     require_original_checkpoint_early_physical_source(source)
@@ -371,15 +380,14 @@ async def bind_checkpoint_early_physical_request(
         operation=lambda: sessions.prepare_v4_checkpoint_source_sync(prepared=preparation),
         expected=CheckpointPreparedSource,
     )
-    # Restore and prove the retained warm graph before quota/SDK admission.
-    # This existing restoration helper verifies complete capture bytes and
-    # independent mutable owners; it derives no provider authority.
-    from elspeth.web.composer.continuation_checkpoint_end_detached import restore_prepared_end_runtime
+    # Join this attempt's actual captured admission to the fresh prepared
+    # closure and construct independent owners before quota/SDK admission.
+    from elspeth.web.composer.continuation_checkpoint_end_detached import restore_captured_checkpoint_runtime
 
-    detached, detached_capture = await restore_prepared_end_runtime(
+    detached, detached_capture = await restore_captured_checkpoint_runtime(
         phase_owner=owner,
         prepared=prepared_source,
-        captured=source.captured,
+        capture_data=original.capture_data,
     )
     original.detached, original.detached_capture = detached, detached_capture
     prepared = PreparedCheckpointProvider(

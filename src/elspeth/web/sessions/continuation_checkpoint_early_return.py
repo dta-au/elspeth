@@ -675,7 +675,14 @@ def _expected_child_frames(
     retry_pending: bool,
 ) -> tuple[ComposeFrame, ToolBatchFrame, tuple[PrivateChunk, ...]]:
     from elspeth.web.composer.advisor_checkpoint import early_checkpoint_injection
+    from elspeth.web.composer.advisor_transcript import observe_retained_message_shelf
     from elspeth.web.composer.continuation_audit_buffer import RECORDER_CODEC, decode_recorder_snapshot, validate_recorder_projection
+    from elspeth.web.composer.continuation_caches import (
+        RetainedCacheCreator,
+        capture_empty_continuation_cache_observation,
+        decode_continuation_caches,
+        encode_continuation_caches,
+    )
     from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence
     from elspeth.web.composer.continuation_evidence_application_data import append_call_to_evidence, refresh_selected_applied_batch_chunk
     from elspeth.web.composer.continuation_message_shelf import decode_message_shelf, encode_message_shelf
@@ -699,7 +706,7 @@ def _expected_child_frames(
     canonical, _restored = validate_recorder_projection(extended_recorder)
     recorder = encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical, env_ref_names=owed.source.env_ref_names)
     previous_shelf = decode_message_shelf(_held_chunk(conn, owed, frame.transcript))
-    shelf = _expected_shelf(previous_shelf, injection)
+    shelf = _expected_shelf(observe_retained_message_shelf(previous_shelf), injection)
     transcript = encode_message_shelf(shelf, env_ref_names=owed.source.env_ref_names)
     messages = encode_private_chunk(
         codec="composer.messages.v1",
@@ -730,16 +737,28 @@ def _expected_child_frames(
         env_ref_names=owed.source.env_ref_names,
     )
     expected_batch = batch.model_copy(update={"accumulator": applied.reference})
+    previous_caches = decode_continuation_caches(_held_chunk(conn, owed, frame.caches), env_ref_names=owed.source.env_ref_names)
+    caches = encode_continuation_caches(
+        capture_empty_continuation_cache_observation(
+            previous_caches,
+            creator=RetainedCacheCreator(
+                operation_id=owed.new_hold.session_operation_id, operation_epoch=owed.new_hold.session_operation_epoch
+            ),
+            env_ref_names=owed.source.env_ref_names,
+        ),
+        env_ref_names=owed.source.env_ref_names,
+    )
     expected = frame.model_copy(
         update={
             "messages": messages.reference,
             "audit_buffer": recorder.reference,
             "transcript": transcript.reference,
             "evidence": evidence.reference,
+            "caches": caches.reference,
             "advisor_repair_context_introduced": frame.advisor_repair_context_introduced or injection is not None,
         }
     )
-    return expected, expected_batch, (recorder, transcript, messages, evidence, applied)
+    return expected, expected_batch, (recorder, transcript, messages, evidence, applied, caches)
 
 
 def _child_event(

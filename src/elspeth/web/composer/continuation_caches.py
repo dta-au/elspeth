@@ -251,21 +251,61 @@ def capture_continuation_caches(
             failure=failure,
         )
         retained_preflight.append(preflight_entry)
-    snapshot = ContinuationCachesSnapshot(
+    snapshot = _cache_observation_snapshot(
         session_id=creator.fence.session_id,
+        creator=RetainedCacheCreator(operation_id=creator.fence.operation_id, operation_epoch=creator.fence.operation_epoch),
+        prior=prior,
+        discovery=tuple(retained_discovery),
+        preflight=tuple(retained_preflight),
+        last_preflight_json=(canonical_json(last_preflight.model_dump(mode="json")) if last_preflight is not None else None),
+        last_preflight_identity=_identity(identities, last_preflight) if last_preflight is not None else None,
+    )
+    require_cache_history(snapshot, env_ref_names=env_ref_names)
+    return snapshot
+
+
+def _cache_observation_snapshot(
+    *,
+    session_id: str,
+    creator: RetainedCacheCreator,
+    prior: ContinuationCachesSnapshot | None,
+    discovery: tuple[RetainedDiscoveryCacheEntry, ...],
+    preflight: tuple[RetainedPreflightCacheEntry, ...],
+    last_preflight_json: str | None,
+    last_preflight_identity: int | None,
+) -> ContinuationCachesSnapshot:
+    return ContinuationCachesSnapshot(
+        session_id=session_id,
         capture_creators=(
             *(prior.capture_creators if prior is not None else ()),
-            RetainedCacheCreator(operation_id=creator.fence.operation_id, operation_epoch=creator.fence.operation_epoch),
+            creator,
         ),
-        capture_count=capture_number,
-        last_preflight_identity=_identity(identities, last_preflight) if last_preflight is not None else None,
+        capture_count=1 if prior is None else prior.capture_count + 1,
+        last_preflight_identity=last_preflight_identity,
         previous_last_preflight_identities=(*prior.previous_last_preflight_identities, prior.last_preflight_identity)
         if prior is not None
         else (),
-        discovery=tuple(retained_discovery),
-        preflight=tuple(retained_preflight),
+        discovery=discovery,
+        preflight=preflight,
         previous_last_preflight_json=(*prior.previous_last_preflight_json, prior.last_preflight_json) if prior is not None else (),
-        last_preflight_json=(canonical_json(last_preflight.model_dump(mode="json")) if last_preflight is not None else None),
+        last_preflight_json=last_preflight_json,
+    )
+
+
+def capture_empty_continuation_cache_observation(
+    prior: ContinuationCachesSnapshot, *, creator: RetainedCacheCreator, env_ref_names: frozenset[str] = frozenset()
+) -> ContinuationCachesSnapshot:
+    """Project one observation after cold restore's empty active cache maps."""
+    if type(prior) is not ContinuationCachesSnapshot or type(creator) is not RetainedCacheCreator:
+        raise TypeError("empty cache observation requires its actual retained history and creator DATA")
+    snapshot = _cache_observation_snapshot(
+        session_id=prior.session_id,
+        creator=creator,
+        prior=prior,
+        discovery=prior.discovery,
+        preflight=prior.preflight,
+        last_preflight_json=None,
+        last_preflight_identity=None,
     )
     require_cache_history(snapshot, env_ref_names=env_ref_names)
     return snapshot

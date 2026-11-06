@@ -166,7 +166,7 @@ async def test_complete_recorder_charge_uses_expanded_requests_and_oversize_keep
     snapshot = _snapshot(20)
     chunk = encode_recorder_snapshot(snapshot)
     assert chunk.reference.byte_length < 1_048_576
-    actual_producer = audit_buffer._decode_recorder_data
+    actual_producer = audit_buffer._construct_recorder_document
     produced = []
 
     def produce(text):
@@ -174,7 +174,7 @@ async def test_complete_recorder_charge_uses_expanded_requests_and_oversize_keep
         produced.append(result)
         return result
 
-    monkeypatch.setattr(audit_buffer, "_decode_recorder_data", produce)
+    monkeypatch.setattr(audit_buffer, "_construct_recorder_document", produce)
     monkeypatch.setattr(memo, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", allocation)
     with memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
         first = decode_recorder_snapshot(chunk)

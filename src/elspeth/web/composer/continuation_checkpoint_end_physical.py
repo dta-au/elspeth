@@ -262,9 +262,11 @@ async def prepare_checkpoint_end_physical_source(
         operation=lambda: sessions.prepare_v4_checkpoint_source_sync(prepared=preparation),
         expected=CheckpointPreparedSource,
     )
-    from elspeth.web.composer.continuation_checkpoint_end_detached import restore_captured_end_runtime
+    from elspeth.web.composer.continuation_checkpoint_end_detached import restore_captured_checkpoint_runtime
 
-    detached, detached_capture = await restore_captured_end_runtime(phase_owner=phase_owner, prepared=prepared, capture_data=capture_data)
+    detached, detached_capture = await restore_captured_checkpoint_runtime(
+        phase_owner=phase_owner, prepared=prepared, capture_data=capture_data
+    )
     capture = _AdvisorInvocationCapture()
     source = CheckpointEndPhysicalSource(phase_owner, gate_locals, captured, end_input, prepared, capture, detached, clock)
     original = _OriginalPhysicalSource(phase_owner, gate_locals, captured, end_input, prepared, capture, detached, detached_capture, clock)

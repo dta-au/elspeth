@@ -67,15 +67,15 @@ async def test_actual_early_prepared_source_failure_proves_input_and_original_re
         reached = []
         failure = TimeoutError("controlled original prepared-source restore failure")
 
-        async def fail_actual_prepared_restore(*, phase_owner, prepared, captured):
+        async def fail_actual_prepared_restore(*, phase_owner, prepared, capture_data):
             assert phase_owner.phases is owner and phase_owner.runtime is owner.runtime
             assert prepared.source.checkpoint_id == selected.checkpoint_id
             assert prepared.prepared_selected.cursor == selected.stack.cursor + 1
-            assert captured.selected is selected
+            assert capture_data.captured.selected is selected
             reached.append(prepared)
             raise failure
 
-        monkeypatch.setattr(detached, "restore_prepared_end_runtime", fail_actual_prepared_restore)
+        monkeypatch.setattr(detached, "restore_captured_checkpoint_runtime", fail_actual_prepared_restore)
         async with _early_attempt(owner, selected) as source:
             with pytest.raises(TimeoutError) as caught:
                 await _invoke_early(source)
@@ -269,7 +269,7 @@ async def test_supported_review_end_prepared_failure_preserves_original_and_reje
 
     operation_id = str(uuid4())
     failure = TimeoutError("controlled original unpaid END preparation failure")
-    original_restore = detached.restore_prepared_end_runtime
+    original_restore = detached.restore_captured_checkpoint_runtime
     original_project = driver_module.project_composer_operation_error
     reached, projected, rejected = [], [], []
 
@@ -292,8 +292,8 @@ async def test_supported_review_end_prepared_failure_preserves_original_and_reje
                 for table in (chunks, events, effects, physical, ledger, holds)
             )
 
-        async def restore_then_fail(*, phase_owner, prepared, captured):
-            restored = await original_restore(phase_owner=phase_owner, prepared=prepared, captured=captured)
+        async def restore_then_fail(*, phase_owner, prepared, capture_data):
+            restored = await original_restore(phase_owner=phase_owner, prepared=prepared, capture_data=capture_data)
             running = phase_owner.phases.work.running
             if running is None or running.claim.operation_id != operation_id or prepared.phase != "end":
                 return restored
@@ -403,7 +403,7 @@ async def test_supported_review_end_prepared_failure_preserves_original_and_reje
                 assert cancelled is not None and cancelled.cancel_requested_at is not None
             raise failure
 
-        monkeypatch.setattr(detached, "restore_prepared_end_runtime", restore_then_fail)
+        monkeypatch.setattr(detached, "restore_captured_checkpoint_runtime", restore_then_fail)
         sdk = ScriptedSDK(
             [
                 (

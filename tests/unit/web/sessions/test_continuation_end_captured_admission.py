@@ -1,5 +1,6 @@
-"""Actual END capture DATA, independent mutable owners and fresh source checks."""
+"""Actual checkpoint capture DATA, independent owners and fresh source checks."""
 
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from hashlib import sha256
@@ -9,6 +10,7 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer import continuation_checkpoint_early_physical as early_module
 from elspeth.web.composer import continuation_checkpoint_end_detached as detached_module
 from elspeth.web.composer import continuation_checkpoint_end_physical as physical_module
 from elspeth.web.composer import continuation_runtime as runtime_module
@@ -17,6 +19,7 @@ from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.continuation import load_snapshot
@@ -30,9 +33,213 @@ from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_continuation_semantic_advisor import _reply
 from tests.unit.web.coordination import test_composer_operation_authority
 from tests.unit.web.sessions import test_continuation_initialization as initialization_fixture
+from tests.unit.web.sessions.test_continuation_checkpoint_early_physical import _early_attempt, _early_case, _invoke_early
+from tests.unit.web.sessions.test_continuation_checkpoint_early_return_shapes import _CLEAN, _admit_original_retry, _complete_original
 from tests.unit.web.sessions.test_continuation_primary_result import initialized_primary_input
 
 operation_store = test_composer_operation_authority.operation_store
+
+
+def test_retained_shelf_observation_preserves_alias_recipes_and_pending_adoption():
+    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner, observe_retained_message_shelf
+    from elspeth.web.composer.continuation_prompt_recipes import InitialMessageRecipe
+
+    received = {
+        "role": "assistant",
+        "content": "Inspecting",
+        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "get_pipeline_state", "arguments": "{}"}}],
+    }
+    current = json.loads(json.dumps(received))
+    first = {"role": "user", "content": "same text"}
+    second = dict(first)
+    messages = [current, first, second]
+    owner = AdvisorTranscriptOwner(request="inspect")
+    owner.record_provider_reply(provider_call_id="physical-1", message=received)
+    before = owner.snapshot_for_continuation(messages)
+    recipes = tuple(InitialMessageRecipe(index=index) for index in range(len(before.messages_json)))
+    retained = before.model_copy(update={"producer_recipes": recipes})
+    projected = observe_retained_message_shelf(retained)
+    owner.observe_messages(messages)
+    expected = owner.snapshot_for_continuation(messages)
+    assert projected.model_copy(update={"producer_recipes": ()}) == expected
+    assert projected.producer_recipes == recipes[:3]
+    assert projected.current_indexes == (0, 1, 2)
+    assert projected.messages_json[1] == projected.messages_json[2]
+    assert projected.observed[0].message_index == 0 and not projected.observed[0].pending_adoption
+    assert before.observed[0].pending_adoption
+    assert projected.history is retained.history
+    ambiguous = retained.model_copy(update={"observed": (*retained.observed, retained.observed[0])})
+    with pytest.raises(AuditIntegrityError, match="ambiguous tool-call identities"):
+        observe_retained_message_shelf(ambiguous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_pending,opponent", ((False, None), (True, None), (False, "caches"), (False, "transcript")))
+async def test_actual_early_cold_projection_preserves_history_and_exact_observation(
+    operation_store, tmp_path, monkeypatch, retry_pending, opponent
+):
+    """Actual completion agrees exactly; a changed observation still refuses."""
+    from elspeth.web.composer.continuation_caches import (
+        capture_empty_continuation_cache_observation,
+        decode_continuation_caches,
+        encode_continuation_caches,
+    )
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+    from elspeth.web.composer.continuation_message_shelf import decode_message_shelf, encode_message_shelf
+    from elspeth.web.sessions import continuation_checkpoint_early_return as writer
+
+    async with _early_case(operation_store, tmp_path, monkeypatch) as (_store, owner, _running, selected, primary_sdk):
+
+        async def complete(**_arguments):
+            return _reply(None if retry_pending else _CLEAN)
+
+        monkeypatch.setattr(litellm, "acompletion", complete)
+        admitted = []
+        observed = []
+        original_admit = writer.require_original_early_checkpoint_projection
+        original_expected = writer._expected_child_frames
+
+        def admit(*args, **kwargs):
+            captured = original_admit(*args, **kwargs)
+            admitted.append(captured)
+            return captured
+
+        def expected(conn, owed, **kwargs):
+            result = original_expected(conn, owed, **kwargs)
+            frame, batch, chunks = result
+            captured = admitted[-1]
+            assert captured.stack.frames == (frame, batch)
+            assert all(chunk in captured.chunks for chunk in chunks)
+            prior_frame = decode_continuation_snapshot(owed.selected.payload_json).frames[0]
+            names = owed.source.env_ref_names
+            prior_caches = decode_continuation_caches(writer._held_chunk(conn, owed, prior_frame.caches), env_ref_names=names)
+            cache_chunk = next(chunk for chunk in chunks if chunk.reference == frame.caches)
+            caches = decode_continuation_caches(cache_chunk, env_ref_names=names)
+            assert caches.capture_count == prior_caches.capture_count + 1
+            assert caches.capture_creators[:-1] == prior_caches.capture_creators
+            assert caches.capture_creators[-1].operation_id == owed.new_hold.session_operation_id
+            assert caches.capture_creators[-1].operation_epoch == owed.new_hold.session_operation_epoch
+            assert caches.discovery == prior_caches.discovery and caches.preflight == prior_caches.preflight
+            prior_shelf = decode_message_shelf(writer._held_chunk(conn, owed, prior_frame.transcript))
+            transcript_chunk = next(chunk for chunk in chunks if chunk.reference == frame.transcript)
+            shelf = decode_message_shelf(transcript_chunk)
+            assert shelf.observed[: len(prior_shelf.observed)] == prior_shelf.observed
+            assert len(shelf.observed) == len(prior_shelf.observed) + 1
+            observed.append(result)
+            if opponent == "caches":
+                changed = encode_continuation_caches(
+                    capture_empty_continuation_cache_observation(caches, creator=caches.capture_creators[-1], env_ref_names=names),
+                    env_ref_names=names,
+                )
+                return frame.model_copy(update={"caches": changed.reference}), batch, (*chunks, changed)
+            if opponent == "transcript":
+                changed = encode_message_shelf(shelf.model_copy(update={"observed": shelf.observed[:-1]}), env_ref_names=names)
+                return frame.model_copy(update={"transcript": changed.reference}), batch, (*chunks, changed)
+            return result
+
+        monkeypatch.setattr(writer, "require_original_early_checkpoint_projection", admit)
+        monkeypatch.setattr(writer, "_expected_child_frames", expected)
+        async with _early_attempt(owner, selected) as source:
+            if retry_pending:
+                with pytest.raises(_MalformedLLMResponseError):
+                    await _invoke_early(source)
+            else:
+                await _invoke_early(source)
+            if opponent is None:
+                completed, _returned, _projected = await _complete_original(source)
+                assert (completed.retry is not None) is retry_pending
+            else:
+                with pytest.raises(AuditIntegrityError, match="EARLY completion substituted its exact cold-derived projection"):
+                    await _complete_original(source)
+        assert len(primary_sdk) == 1 and observed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", (False, True))
+async def test_actual_early_capture_pair_preserves_isolation_and_rejects_late_mutation(operation_store, tmp_path, monkeypatch, retry):
+    async with _early_case(operation_store, tmp_path, monkeypatch) as (_store, owner, running, selected, primary_sdk):
+        requests = []
+
+        async def complete(**arguments):
+            requests.append(arguments)
+            return _reply(None if retry and len(requests) == 1 else _CLEAN)
+
+        monkeypatch.setattr(litellm, "acompletion", complete)
+        first_admission = None
+        if retry:
+            async with _early_attempt(owner, selected) as first:
+                with pytest.raises(_MalformedLLMResponseError):
+                    await _invoke_early(first)
+                first_admission = early_module.checkpoint_early_detached_runtime(first).source.admitted_evidence
+                completed, _returned, _projected = await _complete_original(first)
+                assert completed.retry is not None
+            selected = await _admit_original_retry(owner, running, completed.completed)
+
+        pairs, bodies, final_reads = [], [], []
+        original_capture = early_module.capture_continuation_runtime_data
+        original_body = runtime_module._capture_owner_data
+        original_read = owner.authority.read_continuation_runtime
+        original_baseline = early_module.require_checkpoint_early_detached_source
+        baseline_stages = []
+
+        async def capture(*args, **kwargs):
+            result = await original_capture(*args, **kwargs)
+            pairs.append(result)
+            return result
+
+        def body(runtime, **kwargs):
+            bodies.append(runtime)
+            return original_body(runtime, **kwargs)
+
+        def read(running, **kwargs):
+            result = original_read(running, **kwargs)
+            if pairs and kwargs["selected"].stack.cursor == pairs[0].captured.stack.cursor + 1:
+                final_reads.append(result)
+            return result
+
+        def baseline(*args, **kwargs):
+            baseline_stages.append("entered")
+            result = original_baseline(*args, **kwargs)
+            baseline_stages.append("accepted")
+            return result
+
+        with monkeypatch.context() as observe:
+            observe.setattr(early_module, "capture_continuation_runtime_data", capture)
+            observe.setattr(runtime_module, "_capture_owner_data", body)
+            observe.setattr(owner.authority, "read_continuation_runtime", read)
+            observe.setattr(early_module, "require_checkpoint_early_detached_source", baseline)
+            async with _early_attempt(owner, selected) as source:
+                await _invoke_early(source)
+                detached = early_module.checkpoint_early_detached_runtime(source)
+                warm = source.phase_owner.runtime
+                assert len(pairs) == 1 and bodies == [warm]
+                assert source.captured is pairs[0].captured
+                assert detached.source.admitted_evidence is pairs[0].admitted_evidence
+                assert detached.source.admitted_evidence is not first_admission
+                assert len(final_reads) == 1 and final_reads[0].selected is detached.source.selected
+                assert final_reads[0].admitted_evidence is not pairs[0].admitted_evidence
+                detached_module.require_detached_end_owners(detached, warm)
+                early_module.require_checkpoint_early_detached_source(source, detached=detached, original=warm)
+
+                state = detached.live.state
+                detached.live.state = replace(state, version=state.version + 1)
+                assert warm.live.state.version == state.version
+                with pytest.raises(AuditIntegrityError):
+                    await _complete_original(source)
+                assert baseline_stages[-1] == "entered"
+                detached.live.state = state
+                early_module.require_checkpoint_early_detached_source(source, detached=detached, original=warm)
+
+                warm_messages = list(warm.live.llm_messages)
+                detached.live.llm_messages.append({"role": "user", "content": "late detached-only change"})
+                assert warm.live.llm_messages == warm_messages
+                with pytest.raises(AuditIntegrityError):
+                    await _complete_original(source)
+                assert baseline_stages[-1] == "entered"
+                detached.live.llm_messages.pop()
+                completed, _returned, _projected = await _complete_original(source)
+                assert completed.retry is None
+        assert len(primary_sdk) == 1 and len(requests) == 1 + int(retry)
 
 
 class _PreparedEndObserved(Exception):

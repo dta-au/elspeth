@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from decimal import Decimal
 
 import litellm
 import pytest
@@ -13,6 +14,8 @@ from sqlalchemy import select
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+from elspeth.web.composer.continuation_checkpoint_early_adoption import adopt_committed_early
+from elspeth.web.composer.continuation_checkpoint_early_live import EarlyCheckpointLiveAdvanced
 from elspeth.web.composer.continuation_checkpoint_early_observation import observe_v4_early_checkpoint_returned_response
 from elspeth.web.composer.continuation_checkpoint_early_physical import (
     checkpoint_early_detached_runtime,
@@ -33,7 +36,8 @@ from elspeth.web.composer.continuation_selection import load_selected_continuati
 from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
 from elspeth.web.sessions import continuation_iteration_return as stages
 from elspeth.web.sessions.continuation import load_snapshot
-from elspeth.web.sessions.continuation_checkpoint_early_sql import complete_early_checkpoint_sync, retain_early_complete_return_sync
+from elspeth.web.sessions.continuation_checkpoint_early_owed_overflow import complete_early_checkpoint_or_overflow
+from elspeth.web.sessions.continuation_checkpoint_early_sql import retain_early_complete_return_sync
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -58,7 +62,7 @@ def _pass_rows(conn, session_id):
 
 
 async def _complete_original(source, *, reject_copied_return=False):
-    """Use only the original audited SDK result, issued projection and SQL owners."""
+    """Deliver actual completion/cost and adopt its graph before another action."""
     owner = source.phase_owner
     runtime, phases = owner.runtime, owner.phases
     custody = checkpoint_early_physical_custody(source)
@@ -118,7 +122,34 @@ async def _complete_original(source, *, reject_copied_return=False):
         assert conn.execute(select(holds.c.state).where(holds.c.effect_key == admission.effect_key)).scalar_one() == "active"
         assert conn.execute(select(physical.c.settled_at).where(physical.c.attempt_id == admission.attempt.attempt_id)).scalar_one() is None
         assert not _pass_rows(conn, sid)
-    advanced = complete_early_checkpoint_sync(service=service, prepared=prepared, owed=owed, returned=returned, projected=projected)
+    budget = phases.provider_owner.cost_budget
+    assert budget is not None
+    before_cost = budget.snapshot()
+    assert before_cost.physical_calls == len(before_cost.charges) + 1
+    assert all(charge.call_id != returned.audit_call.call_id for charge in before_cost.charges)
+    delivered = await complete_early_checkpoint_or_overflow(
+        service=service, prepared=prepared, owed=owed, returned=returned, projected=projected
+    )
+    assert type(delivered) is EarlyCheckpointLiveAdvanced
+    assert delivered.source is source and delivered.returned is returned
+    advanced = delivered.advanced
+    assert phases.provider_owner.cost_budget is budget
+    after_cost = budget.snapshot()
+    assert after_cost.physical_calls == before_cost.physical_calls == len(after_cost.charges)
+    assert after_cost.charges[:-1] == before_cost.charges
+    charge = after_cost.charges[-1]
+    assert charge.call_id == returned.audit_call.call_id
+    assert charge.cost == Decimal(str(returned.audit_call.provider_cost))
+    assert charge.cost_source == returned.audit_call.provider_cost_source
+    assert charge.response_accountable is returned.audit_call.cost_response_accountable
+    assert after_cost == replace(before_cost, charges=(*before_cost.charges, charge))
+    adopted = await adopt_committed_early(source, advanced=advanced, returned=returned)
+    assert phases.runtime is adopted and adopted is not runtime
+    assert phases.latest_snapshot is advanced.completed
+    assert adopted.source.selected.checkpoint_id == advanced.completed.checkpoint_id
+    assert adopted.bindings.provider_owner is phases.provider_owner and phases.provider_owner.cost_budget is budget
+    assert budget.snapshot() == adopted.source.cost_snapshot == after_cost
+    assert phases.action_clock is source.clock
     with locked_session_transaction(service._engine, sid) as conn:
         assert load_snapshot(conn, session_id=sid, operation_id=operation) == advanced.completed
         assert advanced.completed.cursor == owed.owed_selected.cursor + 2
@@ -146,6 +177,12 @@ async def _complete_original(source, *, reject_copied_return=False):
 
 async def _admit_original_retry(owner, running, completed):
     """Run the driver's policy/fit/clock sequence against the actual R head."""
+    adopted = owner.runtime
+    budget = owner.provider_owner.cost_budget
+    assert adopted is not None and budget is not None
+    assert owner.latest_snapshot == completed and adopted.source.selected.checkpoint_id == completed.checkpoint_id
+    assert budget.snapshot() == adopted.source.cost_snapshot
+    assert budget.snapshot().physical_calls == len(budget.snapshot().charges)
     selected = await load_selected_continuation(authority=owner.authority, running=running, selected=completed, required_work=owner.work)
     runtime, _inventory = await owner.current(selected)
     with locked_session_transaction(owner.authority._engine, str(running.claim.session_id)) as conn:
@@ -276,13 +313,13 @@ async def test_actual_early_complete_malformed_first_result_consumes_h_before_re
             assert second_source.clock is owner.action_clock and checkpoint_early_format_retry(second_source) is not None
             text, _metadata = await _invoke_early(second_source)
             assert text == _CLEAN
+            second_custody = checkpoint_early_physical_custody(second_source)
+            assert second_custody.continuation_checkpoint_v4.retry_ordinal == 1
             final, second_returned, second_projected = await _complete_original(second_source)
             assert final.retry is None and not second_projected.retry_pending
             assert second_projected.accounting == CheckpointPassAccounting(
                 0, 2, schema_valid, False if content is not None else None, reprompt
             )
-            second_custody = checkpoint_early_physical_custody(second_source)
-            assert second_custody.continuation_checkpoint_v4.retry_ordinal == 1
             assert second_returned.audit_call.call_id != returned.audit_call.call_id
             assert second_returned.audit_call.status is ComposerLLMCallStatus.SUCCESS
             assert len(requests) == 2 and len(primary_sdk) == 1

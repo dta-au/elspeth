@@ -782,7 +782,7 @@ files:
     Mapping[str, object]: 1
     dict[str, object]: 3
   src/elspeth/web/composer/advisor_transcript.py:
-    Mapping[str, Any]: 11
+    Mapping[str, Any]: 14
     dict[str, Any]: 15
   src/elspeth/web/composer/audit.py:
     Mapping[str, Any]: 9
@@ -1140,10 +1140,10 @@ files:
     Mapping[str, Any]: 16
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 804
+  Mapping[str, Any]: 807
   Mapping[str, object]: 327
   MutableMapping[str, Any]: 8
   boundary: 60
   dict[str, Any]: 1191
   dict[str, object]: 408
-  soft: 2738
+  soft: 2741

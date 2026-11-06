@@ -276,7 +276,8 @@ def test_buffer_snapshot_refuses_a_drain_past_the_retained_prefix():
 
 def test_retained_record_field_dispatch_is_complete_and_detects_a_real_omission():
     records = (
-        audit_buffer.DecodedRecorderData,
+        audit_buffer.RecorderDocumentData,
+        audit_buffer.PrivateChunk,
         audit_buffer.RecorderSnapshot,
         audit_buffer.RecorderDrainCursors,
         audit_buffer.RetainedVisibleLink,

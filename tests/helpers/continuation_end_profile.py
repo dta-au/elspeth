@@ -144,7 +144,8 @@ def driver_end_preparation_profile(monkeypatch, engine, *, session_id, operation
 class EndTextMemoObservation:
     """Bounded test-only cache accounting; no payloads or producer replacements.
 
-    Fingerprints use Python's cached text/key hash and producer identities.
+    Fingerprints use Python's cached text/key hash and producer identities,
+    except recorder DATA, whose complete source key is its cache identity.
     Collisions can overcount recomputations or undercount distinct text weight;
     these observations never authorize cache hits or product behavior.
     """
@@ -218,10 +219,10 @@ class EndTextMemoObservation:
         if memo._v4_preparation_owner is None:
             return operation()
         before_ns = time.monotonic_ns()
-        cache_key = (producer, digest_producer, key) if family in {"full", "request"} else (producer, key)
+        cache_key = key if family == "recorder" else (producer, digest_producer, key) if family in {"full", "request"} else (producer, key)
         try:
             dependency_fingerprint = hash(digest_producer) if family == "request" else id(digest_producer)
-            fingerprint = (family, id(producer), dependency_fingerprint, hash(key))
+            fingerprint = (family, hash(key)) if family == "recorder" else (family, id(producer), dependency_fingerprint, hash(key))
             with self._lock:
                 # Lock order is observer bookkeeping, then the short memo
                 # snapshot lock. Product operations/close never run under
@@ -358,8 +359,8 @@ class EndTextMemoObservation:
         def evidence(memo, key, producer):
             return self._observe(memo, "evidence", key, producer, None, lambda: original_evidence(memo, key, producer))
 
-        def recorder(memo, key, producer, admit):
-            return self._observe(memo, "recorder", key, producer, None, lambda: original_recorder(memo, key, producer, admit))
+        def recorder(memo, key, factory):
+            return self._observe(memo, "recorder", key, factory, None, lambda: original_recorder(memo, key, factory))
 
         def close(memo):
             original_close(memo)
@@ -953,9 +954,7 @@ class EndPreparationProfile:
             (AdvisorCheckpointOwner, "_run_advisor_checkpoint", AdvisorCheckpointOwner._run_advisor_checkpoint),
             (AdvisorCheckpointOwner, "_call_advisor_with_audit_body", AdvisorCheckpointOwner._call_advisor_with_audit_body),
             (physical, "capture_continuation_runtime_data", physical.capture_continuation_runtime_data),
-            (detached, "capture_continuation_runtime_owners", detached.capture_continuation_runtime_owners),
-            (detached, "restore_captured_end_runtime", detached.restore_captured_end_runtime),
-            (detached, "restore_prepared_end_runtime", detached.restore_prepared_end_runtime),
+            (detached, "restore_captured_checkpoint_runtime", detached.restore_captured_checkpoint_runtime),
             (first_return, "prepare_checkpoint_end_physical_source", first_return.prepare_checkpoint_end_physical_source),
             (runtime, "_restore_runtime", runtime._restore_runtime),
         )

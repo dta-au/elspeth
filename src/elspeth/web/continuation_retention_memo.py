@@ -42,7 +42,7 @@ from elspeth.web.composer.continuation_limits import (
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation import ContinuationFrameStack, PrivateChunkRef
-    from elspeth.web.composer.continuation_audit_buffer import DecodedRecorderData
+    from elspeth.web.composer.continuation_audit_buffer import RecorderDocumentData
     from elspeth.web.composer.continuation_clock import ContinuationActionClock
 
 
@@ -168,14 +168,13 @@ class _EvidenceReferencesEntry:
 
 @dataclass(frozen=True, slots=True)
 class _RecorderDataEntry:
-    data: DecodedRecorderData
+    data: RecorderDocumentData
     retained_bytes: int
 
 
 def recorder_data_retained_bytes(
     key: PrivateChunkVerificationKey,
-    data: DecodedRecorderData,
-    producer: Callable[[str], DecodedRecorderData],
+    data: RecorderDocumentData,
     *,
     limit: int,
 ) -> int | None:
@@ -214,11 +213,11 @@ def recorder_data_retained_bytes(
     # A whole one-entry index allocation per entry conservatively includes
     # OrderedDict nodes/table spare capacity. A fresh proxy backing dictionary
     # gets an empty table plus a general-key one-entry allocation per real key.
-    size = getsizeof(OrderedDict(((None, None),))) + getsizeof(producer)
+    size = getsizeof(OrderedDict(((None, None),)))
     dictionary_base, dictionary_entry = getsizeof({}), getsizeof({None: None})
     entry = _RecorderDataEntry(data, limit)
-    frames: list[Iterator[object]] = [iter(((producer, key), entry))]
-    seen = {id(producer)}
+    frames: list[Iterator[object]] = [iter((key, entry))]
+    seen: set[int] = set()
     while frames:
         if size > limit:
             return limit + 1
@@ -432,9 +431,7 @@ class RetentionStageMemo:
             tuple[Callable[[str], tuple[PrivateChunkRef, ...]], PrivateChunkVerificationKey], _EvidenceReferencesEntry
         ] = OrderedDict()
         self._evidence_reference_bytes = 0
-        self._recorder_data: OrderedDict[tuple[Callable[[str], DecodedRecorderData], PrivateChunkVerificationKey], _RecorderDataEntry] = (
-            OrderedDict()
-        )
+        self._recorder_data: OrderedDict[PrivateChunkVerificationKey, _RecorderDataEntry] = OrderedDict()
         self._recorder_data_bytes = 0
         self._recorder_request: (
             tuple[Callable[[RecorderRequestTextKey], RecorderRequestTextProof | None], RecorderRequestTextKey, RecorderRequestTextProof]
@@ -1149,49 +1146,49 @@ class RetentionStageMemo:
     def recorder_data(
         self,
         key: PrivateChunkVerificationKey,
-        producer: Callable[[str], DecodedRecorderData],
-        admit: Callable[[PrivateChunkVerificationKey, DecodedRecorderData], None],
-    ) -> DecodedRecorderData:
-        """Reuse complete frozen recorder DATA; admit this invocation every time."""
+        factory: Callable[[], RecorderDocumentData],
+    ) -> RecorderDocumentData:
+        """Reuse successful recorder documents within one fixed-policy action."""
         from elspeth.web.composer.continuation import PrivateChunkRef
-        from elspeth.web.composer.continuation_audit_buffer import DecodedRecorderData, RecorderSnapshot
+        from elspeth.web.composer.continuation_audit_buffer import RecorderDocumentData, RecorderSnapshot
+        from elspeth.web.composer.continuation_codec import PrivateChunk
 
         if type(key) is not PrivateChunkVerificationKey or type(key.reference) is not PrivateChunkRef or type(key.canonical) is not str:
             raise TypeError("Recorder DATA memo requires its exact immutable input")
-        _require_function_producer(producer)
-        _require_function_producer(admit)
+        _require_function_producer(factory)
         with self._lock:
             parent = self._text_parent if not self._closed else None
             retaining = not self._closed and self._v4_preparation_owner is not None
         if parent is not None:
-            return parent.recorder_data(key, producer, admit)
-        cache_key = (producer, key)
+            return parent.recorder_data(key, factory)
         with self._lock:
-            hit = self._recorder_data.get(cache_key) if retaining and not self._closed else None
+            hit = self._recorder_data.get(key) if retaining and not self._closed else None
             if hit is not None:
-                self._recorder_data.move_to_end(cache_key)
-        if hit is not None:
-            admit(key, hit.data)
-            return hit.data
-        data = producer(key.canonical)
-        if type(data) is not DecodedRecorderData or type(data.snapshot) is not RecorderSnapshot or type(data.canonical) is not str:
+                self._recorder_data.move_to_end(key)
+        data = hit.data if hit is not None else factory()
+        if (
+            type(data) is not RecorderDocumentData
+            or type(data.snapshot) is not RecorderSnapshot
+            or type(data.chunk) is not PrivateChunk
+            or type(data.chunk.reference) is not PrivateChunkRef
+            or type(data.chunk.canonical) is not str
+        ):
             raise TypeError("Recorder DATA memo requires its owned immutable result")
-        admit(key, data)
-        if not retaining:
+        if data.chunk.reference != key.reference or data.chunk.canonical != key.canonical:
+            raise AuditIntegrityError("recorder document differs from its actual source")
+        if hit is not None or not retaining:
             return data
-        # Admission has finished. Retain one equal canonical string within
-        # this entry, while preserving the callback's original DATA and key.
-        storage_key = PrivateChunkVerificationKey(key.reference, data.canonical) if data.canonical == key.canonical else key
-        size = recorder_data_retained_bytes(storage_key, data, producer, limit=self._shared_text_budget_bytes)
+        # Keep the complete key and useful chunk on the same retained objects.
+        storage_key = PrivateChunkVerificationKey(data.chunk.reference, data.chunk.canonical)
+        size = recorder_data_retained_bytes(storage_key, data, limit=self._shared_text_budget_bytes)
         if size is None or size > self._shared_text_budget_bytes:
             return data
         entry = _RecorderDataEntry(data, size)
-        cache_key = (producer, storage_key)
         with self._lock:
             if self._closed:
                 return data
-            if cache_key in self._recorder_data:
-                self._recorder_data.move_to_end(cache_key)
+            if storage_key in self._recorder_data:
+                self._recorder_data.move_to_end(storage_key)
                 return data  # This invocation returns the actual DATA it admitted.
             self._canonical_text = None
             while (
@@ -1225,7 +1222,7 @@ class RetentionStageMemo:
                 else:
                     _, evicted_references = self._evidence_references.popitem(last=False)
                     self._evidence_reference_bytes -= evicted_references.retained_bytes
-            self._recorder_data[cache_key] = entry
+            self._recorder_data[storage_key] = entry
             self._recorder_data_bytes += size
         return data
 

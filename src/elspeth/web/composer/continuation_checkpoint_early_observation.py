@@ -35,7 +35,7 @@ from elspeth.web.composer.continuation_provider_outcomes import (
     require_v4_successful_response_audit,
 )
 from elspeth.web.composer.provider_audit_source import audit_drafts_json, capture_provider_audit_source, provider_attempt_audit_drafts
-from elspeth.web.composer.provider_gateway import _require_no_credential_material_in_completion_fields
+from elspeth.web.composer.provider_gateway import _require_no_credential_material_in_completion
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.composer.provider_result_admission import V4ProviderResultCompleteness, project_v4_provider_diagnostic_metadata
 from elspeth.web.coordination.quota_authority import ProviderAttempt
@@ -167,12 +167,7 @@ def observe_v4_early_checkpoint_returned_response(
     witness.require_result(metadata, content=observation.message.content, tool_calls=observation.tool_batch.calls)
     completion = _AdmittedLLMCompletion(observation.message, observation.tool_batch, metadata)
     call = observation.audit_call
-    _require_no_credential_material_in_completion_fields(
-        content=completion.message.content,
-        tool_calls=tuple((item.function.name, item.function.arguments) for item in completion.tool_batch.calls),
-        provider_metadata=metadata,
-        surface="composer_advisor_response",
-    )
+    _require_no_credential_material_in_completion(completion, surface="composer_advisor_response")
     require_no_credential_material(
         _physical_audit_json_value(call),
         surface="composer_checkpoint_overflow_physical_audit",

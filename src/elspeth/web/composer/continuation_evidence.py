@@ -425,6 +425,11 @@ def _require_retained_evidence_envelope(
         raise AuditIntegrityError("retained evidence changed its complete original call extension")
 
 
+@dataclass(frozen=True, slots=True)
+class _CopiedEvidenceGraph:
+    graph: ApplicationGraph | None
+
+
 @dataclass(frozen=True, slots=True, init=False, eq=False)
 class AdmittedTurnEvidence:
     """Source-admitted DATA for one fixed reconstruction, never current authority.
@@ -459,9 +464,8 @@ class AdmittedTurnEvidence:
             _verify_evidence_source(source)
             # The original verifier proved strict canonical JSON. The owned
             # model below separately requires its complete object schema.
-            # Only the prior immutable schema value is reusable on complete
-            # source equality. Dependencies, semantics and graph custody below
-            # are reconstructed for this admission, even after a match.
+            # Equal source can retain its actual prior schema value. The
+            # dependency and graph ownership join below remains separate.
             snapshot = (
                 _prior_evidence.snapshot
                 if _prior_evidence is not None and source == _prior_evidence.source_chunk
@@ -474,25 +478,37 @@ class AdmittedTurnEvidence:
         sources = P4ApplicationSources(snapshot.application_entry, source_chunks)
         recorder_chunk = _select_recorder_chunk(snapshot, source_chunks)
         if type(source) is PrivateChunk:
-            # This model was just decoded from the verified original bytes and
-            # has not escaped. Admit its meaning without manufacturing a new
-            # chunk and reading that new representation back again.
-            graph = _require_evidence_field_semantics(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+            copied = (
+                None
+                if _prior_evidence is None
+                else _prior_evidence._copy_original_graph_for_source(
+                    source, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk
+                )
+            )
+            # An adjacent reader can consume the actual unchanged admission.
+            # Independent reads and transferred graphs retain cold admission.
+            graph = (
+                _require_evidence_field_semantics(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+                if copied is None
+                else copied.graph
+            )
             from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
             from elspeth.web.composer.continuation_message_shelf import _require_message_shelf_semantics
 
-            _require_message_shelf_semantics(snapshot.transcript, env_ref_names=env_ref_names)
+            if copied is None:
+                _require_message_shelf_semantics(snapshot.transcript, env_ref_names=env_ref_names)
             _require_evidence_pair_capacity(
                 evidence_bytes=source.reference.byte_length,
                 recorder_chunk=recorder_chunk,
                 mandatory_retention=mandatory_retention,
             )
-            require_no_credential_material(
-                source.canonical,
-                surface="composer_continuation_private_chunk",
-                env_ref_names=env_ref_names,
-                max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
-            )
+            if copied is None:
+                require_no_credential_material(
+                    source.canonical,
+                    surface="composer_continuation_private_chunk",
+                    env_ref_names=env_ref_names,
+                    max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+                )
             chunk = source
         else:
             chunk, graph = _encode_turn_evidence_source(
@@ -537,6 +553,34 @@ class AdmittedTurnEvidence:
         with self._graph_lock:
             self._require_original_graph()
             return None if self._graph is None else copy_application_graph(self._graph)
+
+    def _copy_original_graph_for_source(
+        self,
+        source: PrivateChunk,
+        *,
+        env_ref_names: frozenset[str],
+        sources: P4ApplicationSources,
+        recorder_chunk: PrivateChunk,
+    ) -> _CopiedEvidenceGraph | None:
+        """Copy matching prior DATA; callers still owe every fresh SQL proof.
+
+        A taken graph belongs to its live consumer and requires cold admission.
+        A matching but accidentally mutated graph must fail its original-source
+        projection, not disappear behind a successful replacement decode.
+        """
+        from elspeth.web.composer.continuation_application_copy import copy_application_graph
+
+        with self._graph_lock:
+            if (
+                self._graph_taken
+                or source != self.source_chunk
+                or env_ref_names != self.env_ref_names
+                or sources.chunks != self.sources.chunks
+                or recorder_chunk != self.recorder_chunk
+            ):
+                return None
+            self._require_original_graph()
+            return _CopiedEvidenceGraph(None if self._graph is None else copy_application_graph(self._graph))
 
     def _require_original_graph(self) -> None:
         """Called under the graph lock before transfer or independent copying."""

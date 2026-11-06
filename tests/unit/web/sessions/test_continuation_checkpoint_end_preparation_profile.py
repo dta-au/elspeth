@@ -231,10 +231,9 @@ async def test_actual_end_review_preparation_profile(operation_store, tmp_path, 
 async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_ordinary_negative(monkeypatch, budget_mib):
     from elspeth.contracts.credential_material import _classify_string
     from tests.unit.web.test_continuation_retention_memo import (
-        _admit_uncached_recorder_data,
         _evidence_key,
-        _produce_uncached_recorder_data,
         _recorder_data_chunk,
+        _recorder_factory,
     )
 
     monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", budget_mib * 1_048_576)
@@ -287,7 +286,7 @@ async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_
                 )
                 assert parent.credential_string_category("ordinary calibration text", _classify_string) is None
                 parent.evidence_references(evidence_key, evidence)
-                parent.recorder_data(recorder_key, _produce_uncached_recorder_data, _admit_uncached_recorder_data)
+                parent.recorder_data(recorder_key, _recorder_factory(recorder_key))
             with pytest.raises(RuntimeError) as raised:
                 parent.canonical_text_verification(CanonicalTextVerificationKey("fails", 100), fails)
             assert raised.value is original_error

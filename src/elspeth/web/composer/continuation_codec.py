@@ -36,7 +36,9 @@ from elspeth.web.composer.continuation_capture_overflow import (
     ContinuationMandatoryCaptureOverflow,
     require_capture_retention_capacity,
 )
-from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.composer.continuation_limits import (
+    CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES as CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+)
 from elspeth.web.continuation_retention_memo import (
     CanonicalTextEncodingKey,
     CanonicalTextVerificationKey,

@@ -1,4 +1,4 @@
-"""Restore and prove an isolated END graph before its physical admission."""
+"""Restore isolated checkpoint graphs from their actual captured admission."""
 
 from __future__ import annotations
 
@@ -25,8 +25,6 @@ from elspeth.web.composer.continuation_runtime import (
     _restore_runtime_from_inputs,
     _RuntimeRestorationInputs,
     _selected_chunks,
-    capture_continuation_runtime_owners,
-    restore_checkpoint_projection_runtime,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
@@ -173,7 +171,7 @@ def _prepared_capture_inputs(
         or admitted.env_ref_names != inventory.names
         or runtime_chunk(selected, frame.evidence) != admitted.source_chunk
     ):
-        raise AuditIntegrityError("END prepared evidence changed its actual capture or environment")
+        raise AuditIntegrityError("checkpoint prepared evidence changed its actual capture or environment")
     original = phase_owner.runtime.source
     iteration = decode_continuation_iteration(runtime_chunk(selected, frame.iteration), env_ref_names=inventory.names)
     inputs = _CurrentProducerInputs(
@@ -191,14 +189,14 @@ def _prepared_capture_inputs(
             load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
             != prepared.prepared_selected
         ):
-            raise AuditIntegrityError("END prepared capture lost its current SQL head")
+            raise AuditIntegrityError("checkpoint prepared capture lost its current SQL head")
         # This factory freshly loads and compares the COMPLETE selected closure,
         # then reads current cost, clock and attachments. The admission owns only
         # its evidence/recorder/application subset, joined by actual references.
         source = _runtime_source_from_inputs_on_connection(conn, running, selected=selected, inventory=inventory, inputs=inputs)
         for dependency in admitted.dependency_chunks:
             if runtime_chunk(selected, dependency.reference) != dependency:
-                raise AuditIntegrityError("END prepared evidence changed an actual captured dependency")
+                raise AuditIntegrityError("checkpoint prepared evidence changed an actual captured dependency")
     producers = current_message_producers_from_runtime_source(
         service=phases.service,
         authority=phases.authority,
@@ -209,22 +207,27 @@ def _prepared_capture_inputs(
     return _RuntimeRestorationInputs(source, producers)
 
 
-async def restore_captured_end_runtime(
+async def restore_captured_checkpoint_runtime(
     *, phase_owner: CheckpointPhaseOwner, prepared: CheckpointPreparedSource, capture_data: _CapturedRuntimeData
 ) -> tuple[RestoredContinuationRuntime, CapturedContinuationRuntime]:
     """Read the retained warm source, before any physical binding/attempt/H."""
     phases = phase_owner.phases
     running = phases.work.running
     captured = capture_data.captured
-    if running is None or prepared.phase != "end" or prepared.source.checkpoint_id != phase_owner.selected.checkpoint_id:
-        raise AuditIntegrityError("END detached restore changed its original source-prepared transition")
+    if (
+        running is None
+        or prepared.phase not in ("early", "end")
+        or prepared.phase != phase_owner.phase_source.phase
+        or prepared.source.checkpoint_id != phase_owner.selected.checkpoint_id
+    ):
+        raise AuditIntegrityError("checkpoint detached restore changed its original source-prepared transition")
     selected = await load_selected_continuation(
         authority=phases.authority, running=running, selected=prepared.prepared_selected, required_work=phases.work
     )
     if selected.stack != decode_continuation_snapshot(
         prepared.prepared_selected.payload_json
     ) or selected.stack != captured.stack.model_copy(update={"cursor": selected.stack.cursor}):
-        raise AuditIntegrityError("END prepared root is not its exact captured warm source")
+        raise AuditIntegrityError("checkpoint prepared root is not its exact captured warm source")
     inventory = await materialize_continuation_env_inventory(
         advisor=phases.service._advisor_checkpoint,
         authority=phases.authority,
@@ -232,7 +235,7 @@ async def restore_captured_end_runtime(
         required_work=phases.work,
     )
     if inventory.names != phase_owner.inventory.names:
-        raise AuditIntegrityError("END prepared source changed its current credential-reference inventory")
+        raise AuditIntegrityError("checkpoint prepared source changed its current credential-reference inventory")
     monotonic_before_read = time.monotonic()
     inputs = await _registered_read(
         phases.work,
@@ -261,44 +264,3 @@ async def restore_captured_end_runtime(
     # detached graph against this baseline before using it after provider return.
     expected = expected_prepared_end_capture(phase_owner=phase_owner, selected=selected)
     return detached, expected
-
-
-async def restore_prepared_end_runtime(
-    *, phase_owner: CheckpointPhaseOwner, prepared: CheckpointPreparedSource, captured: CapturedContinuationRuntime
-) -> tuple[RestoredContinuationRuntime, CapturedContinuationRuntime]:
-    """Read the retained warm source, before any physical binding/attempt/H."""
-    phases = phase_owner.phases
-    running = phases.work.running
-    if running is None or prepared.source.checkpoint_id != phase_owner.selected.checkpoint_id:
-        raise AuditIntegrityError("END detached restore changed its original source-prepared transition")
-    selected = await load_selected_continuation(
-        authority=phases.authority, running=running, selected=prepared.prepared_selected, required_work=phases.work
-    )
-    if selected.stack != decode_continuation_snapshot(
-        prepared.prepared_selected.payload_json
-    ) or selected.stack != captured.stack.model_copy(update={"cursor": selected.stack.cursor}):
-        raise AuditIntegrityError("END prepared root is not its exact captured warm source")
-    inventory = await materialize_continuation_env_inventory(
-        advisor=phases.service._advisor_checkpoint,
-        authority=phases.authority,
-        selected=selected,
-        required_work=phases.work,
-    )
-    if inventory.names != phase_owner.inventory.names:
-        raise AuditIntegrityError("END prepared source changed its current credential-reference inventory")
-    detached = await restore_checkpoint_projection_runtime(
-        service=phases.service,
-        authority=phases.authority,
-        selected=selected,
-        inventory=inventory,
-        required_work=phases.work,
-        provider_owner=phases.provider_owner,
-    )
-    require_detached_end_owners(detached, phase_owner.runtime)
-    detached_capture = await capture_continuation_runtime_owners(detached, selected=selected, inventory=inventory)
-    expected = expected_prepared_end_capture(phase_owner=phase_owner, selected=selected)
-    if detached_capture.stack != expected.stack or sorted(
-        (chunk.reference.codec, chunk.reference.digest, chunk.canonical) for chunk in detached_capture.chunks
-    ) != sorted((chunk.reference.codec, chunk.reference.digest, chunk.canonical) for chunk in expected.chunks):
-        raise AuditIntegrityError("END detached restore changed the retained warm graph")
-    return detached, detached_capture

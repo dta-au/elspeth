@@ -667,6 +667,24 @@ class _ObservedMessage:
     pending_adoption: bool = False
 
 
+def _continuation_shelf_inventory(
+    messages: Sequence[Mapping[str, Any]], excluded_messages: Sequence[Mapping[str, Any]], observed: Sequence[_ObservedMessage]
+) -> tuple[list[Mapping[str, Any]], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    shelf: list[Mapping[str, Any]] = []
+
+    def intern(message: Mapping[str, Any]) -> int:
+        for index, existing in enumerate(shelf):
+            if existing is message:
+                return index
+        shelf.append(message)
+        return len(shelf) - 1
+
+    current = tuple(intern(message) for message in messages)
+    excluded = tuple(intern(message) for message in excluded_messages)
+    observed_positions = tuple(intern(entry.message) for entry in observed)
+    return shelf, current, excluded, observed_positions
+
+
 @final
 class AdvisorTranscriptOwner:
     """One request's append-only event ledger, separate from prompt retention."""
@@ -860,17 +878,7 @@ class AdvisorTranscriptOwner:
         materialization: CurrentContinuationMessageProducers | None = None,
         mandatory_retention: bool = False,
     ) -> MessageShelfSnapshot:
-        shelf: list[Mapping[str, Any]] = []
-
-        def intern(message: Mapping[str, Any]) -> int:
-            for index, existing in enumerate(shelf):
-                if existing is message:
-                    return index
-            shelf.append(message)
-            return len(shelf) - 1
-
-        current = tuple(intern(message) for message in messages)
-        excluded = tuple(intern(message) for message in self._excluded)
+        shelf, current, excluded, observed_positions = _continuation_shelf_inventory(messages, self._excluded, self._observed)
         expected_bytes: int | None = None
         if mandatory_retention:
             from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
@@ -885,7 +893,6 @@ class AdvisorTranscriptOwner:
             )
 
             # Intern all event aliases before measuring the complete shelf.
-            observed_positions = tuple(intern(entry.message) for entry in self._observed)
             if type(self.request) is not str or any(type(entry.pending_adoption) is not bool for entry in self._observed):
                 raise AuditIntegrityError("fresh transcript retention changed its owned scalar fields")
             if materialization is not None and type(materialization) is not CurrentContinuationMessageProducers:
@@ -957,11 +964,11 @@ class AdvisorTranscriptOwner:
             expected_bytes = require_retention_capacity(measured, reason="retained_history_bytes")
         observed = tuple(
             RetainedObservedMessage(
-                message_index=intern(entry.message),
+                message_index=position,
                 event_json=encode_transcript_object_json(entry.event),
                 pending_adoption=entry.pending_adoption,
             )
-            for entry in self._observed
+            for position, entry in zip(observed_positions, self._observed, strict=True)
         )
         forbidden = PROMPT_GUARD_PROVENANCE_KEYS
         from elspeth.web.composer.continuation_prompt_recipes import ContinuationMessageRecipe
@@ -1073,3 +1080,38 @@ class AdvisorTranscriptOwner:
             for entry in snapshot.observed
         ]
         return owner, [shelf[index] for index in snapshot.current_indexes]
+
+
+def observe_retained_message_shelf(snapshot: MessageShelfSnapshot) -> MessageShelfSnapshot:
+    """Project current-message observations from retained DATA, not live producers.
+
+    Reuse the actual transcript observation and identity-interning rules. Saved
+    message text, recipes and history remain DATA; this grants no prompt guard
+    or current producer authority.
+    """
+    if type(snapshot) is not MessageShelfSnapshot:
+        raise TypeError("retained transcript observation requires its nominal shelf")
+    original_shelf = [json.loads(text) for text in snapshot.messages_json]
+    owner, messages = AdvisorTranscriptOwner._from_continuation_shelf(
+        snapshot, request=snapshot.request, history=None, shelf=original_shelf
+    )
+    owner.observe_messages(messages)
+    shelf, current, excluded, positions = _continuation_shelf_inventory(messages, owner._excluded, owner._observed)
+    original_positions = {id(message): index for index, message in enumerate(original_shelf)}
+    indexes = tuple(original_positions[id(message)] for message in shelf)
+    return snapshot.model_copy(
+        update={
+            "messages_json": tuple(snapshot.messages_json[index] for index in indexes),
+            "producer_recipes": tuple(snapshot.producer_recipes[index] for index in indexes) if snapshot.producer_recipes else (),
+            "current_indexes": current,
+            "excluded_indexes": excluded,
+            "observed": tuple(
+                RetainedObservedMessage(
+                    message_index=position,
+                    event_json=encode_transcript_object_json(entry.event),
+                    pending_adoption=entry.pending_adoption,
+                )
+                for position, entry in zip(positions, owner._observed, strict=True)
+            ),
+        }
+    )

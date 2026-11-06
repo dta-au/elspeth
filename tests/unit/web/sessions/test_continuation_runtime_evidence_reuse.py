@@ -4,10 +4,18 @@ import asyncio
 from dataclasses import replace
 
 import pytest
+from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer import continuation_evidence as evidence_codec
 from elspeth.web.composer import continuation_prompt_producers as producers
+from elspeth.web.composer import continuation_runtime as runtime_owner
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.composer.protocol import ComposerContextUnsupported
+from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+from elspeth.web.sessions.models import quota_provider_attempts_table as physical
+from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import recovery_rows
 from tests.unit.web.sessions import test_continuation_runtime as runtime_cases
 
@@ -15,7 +23,7 @@ operation_store = runtime_cases.operation_store
 
 
 @pytest.mark.asyncio
-async def test_restore_final_read_reuses_only_prior_snapshot_with_fresh_source_admission(operation_store, monkeypatch):
+async def test_restore_final_read_copies_prior_data_with_fresh_source_admission(operation_store, monkeypatch):
     from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
 
     arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
@@ -23,6 +31,13 @@ async def test_restore_final_read_reuses_only_prior_snapshot_with_fresh_source_a
     authority = arguments["authority"]
     original_read = authority.read_continuation_runtime
     reads = []
+    original_copy = evidence_codec.AdmittedTurnEvidence._copy_original_graph_for_source
+    copies = []
+
+    def copy_source(self, *args, **kwargs):
+        result = original_copy(self, *args, **kwargs)
+        copies.append((self, result))
+        return result
 
     def observed_read(*args, **kwargs):
         result = original_read(*args, **kwargs)
@@ -30,6 +45,7 @@ async def test_restore_final_read_reuses_only_prior_snapshot_with_fresh_source_a
         return result
 
     monkeypatch.setattr(authority, "read_continuation_runtime", observed_read)
+    monkeypatch.setattr(evidence_codec.AdmittedTurnEvidence, "_copy_original_graph_for_source", copy_source)
     try:
         restored = await restore_continuation_runtime(**arguments)
         repeated = [(prior, result) for prior, result in reads if prior is not None]
@@ -40,6 +56,8 @@ async def test_restore_final_read_reuses_only_prior_snapshot_with_fresh_source_a
         assert final_source.admitted_evidence is not prior
         assert final_source.evidence is prior.snapshot
         assert final_source.admitted_evidence._graph_lock is not prior._graph_lock
+        matching = [copied for original, copied in copies if original is prior]
+        assert len(matching) == 1 and matching[0] is not None
         assert len(reads) >= 2
         with pytest.raises(AuditIntegrityError, match="runtime read requires its actual current and selected owners"):
             await asyncio.to_thread(
@@ -52,6 +70,78 @@ async def test_restore_final_read_reuses_only_prior_snapshot_with_fresh_source_a
         arguments["required_work"].coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault,refused", (("ledger", False), ("source", False), ("ledger", True)))
+async def test_capture_prior_data_keeps_final_actual_sql_proof_and_refusal_group(operation_store, tmp_path, monkeypatch, fault, refused):
+    from tests.unit.web.sessions.test_continuation_semantic_advisor import _semantic_case
+
+    async with _semantic_case(operation_store, tmp_path, monkeypatch, end_candidate=True) as case:
+        runtime = case["runtime"]
+        selected, inventory = runtime.source.selected, runtime.materialization.inventory
+        authority, running = runtime.materialization.authority, inventory.running
+        actual_read = authority.read_continuation_runtime
+        actual_capture = runtime_owner._capture_owner_data
+        reads = []
+
+        def read_source(*args, **kwargs):
+            reads.append(kwargs.get("_prior_evidence"))
+            return actual_read(*args, **kwargs)
+
+        monkeypatch.setattr(authority, "read_continuation_runtime", read_source)
+        positive = await runtime_owner.capture_continuation_runtime_data(runtime, selected=selected, inventory=inventory)
+        assert positive.captured.selected is selected
+        assert reads == [runtime.source.admitted_evidence]
+        assert positive.admitted_evidence is not runtime.source.admitted_evidence
+        reads.clear()
+        sid = str(running.claim.session_id)
+        with operation_store[0].connect() as conn:
+            attempts_before = tuple(conn.execute(select(physical.c.attempt_id).where(physical.c.session_id == sid)).scalars())
+        refusal = ComposerContextUnsupported("retained_chunk_bytes")
+        captured = []
+
+        def change_after_capture(*args, **kwargs):
+            result = actual_capture(*args, **kwargs)
+            captured.append(result)
+            with locked_session_transaction(operation_store[0], sid) as conn:
+                if fault == "ledger":
+                    entry = conn.execute(select(usage).where(usage.c.session_id == sid)).one()
+                    changed = conn.execute(
+                        update(usage).where(usage.c.entry_id == entry.entry_id).values(prompt_tokens=entry.prompt_tokens + 1)
+                    )
+                else:
+                    reference = selected.stack.frames[0].tools
+                    assert reference is not None
+                    assert reference not in {chunk.reference for chunk in runtime.source.admitted_evidence.dependency_chunks}
+                    changed = conn.execute(
+                        update(chunks)
+                        .where(
+                            chunks.c.session_id == sid,
+                            chunks.c.operation_id == running.claim.operation_id,
+                            chunks.c.chunk_key == f"value:{reference.codec}:{reference.digest}",
+                        )
+                        .values(sha256="0" * 64)
+                    )
+                assert changed.rowcount == 1
+            if refused:
+                raise refusal
+            return result
+
+        monkeypatch.setattr(runtime_owner, "_capture_owner_data", change_after_capture)
+        if refused:
+            with pytest.raises(BaseExceptionGroup, match="Retention refusal and final current-source admission") as caught:
+                await runtime_owner.capture_continuation_runtime_data(runtime, selected=selected, inventory=inventory)
+            assert len(caught.value.exceptions) == 2
+            assert caught.value.exceptions[0] is refusal
+            assert isinstance(caught.value.exceptions[1], AuditIntegrityError)
+        else:
+            with pytest.raises(AuditIntegrityError):
+                await runtime_owner.capture_continuation_runtime_data(runtime, selected=selected, inventory=inventory)
+        assert len(captured) == 1 and reads == [runtime.source.admitted_evidence]
+        with operation_store[0].connect() as conn:
+            after = tuple(conn.execute(select(physical.c.attempt_id).where(physical.c.session_id == sid)).scalars())
+        assert after == attempts_before
 
 
 @pytest.mark.asyncio
