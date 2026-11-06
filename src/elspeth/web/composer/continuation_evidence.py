@@ -375,6 +375,56 @@ def _decode_evidence_snapshot(source: PrivateChunk) -> TurnEvidenceSnapshot:
     return snapshot
 
 
+def _verify_evidence_source(source: PrivateChunk) -> None:
+    if type(source) is not PrivateChunk or source.reference.codec != "composer.evidence.v2":
+        raise AuditIntegrityError("evidence chunk has the wrong codec")
+    if not 0 <= source.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
+        utf8_size(source.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != source.reference.byte_length
+    ):
+        raise AuditIntegrityError("evidence source exceeds its original complete document bound")
+    verify_private_chunk(source.reference, source.canonical)
+
+
+def _require_retained_evidence_envelope(
+    source: PrivateChunk,
+    *,
+    expected: TurnEvidenceSnapshot,
+    recorder_chunk: PrivateChunk,
+    env_ref_names: frozenset[str],
+) -> None:
+    """Compare an actual closed envelope with an owner-local recorder delta.
+
+    The caller owns the original graph admission and its exact allowed append.
+    This operation admits the retained envelope without rebuilding that graph.
+    """
+    from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
+    from elspeth.web.composer.continuation_message_shelf import _require_message_shelf_semantics
+
+    _verify_evidence_source(source)
+    snapshot = _decode_evidence_snapshot(source)
+    require_no_credential_material_in_state(
+        state_from_evidence_json(snapshot.effects.initial_state_json),
+        surface="composer_continuation_evidence_initial_state",
+        env_ref_names=env_ref_names,
+    )
+    require_no_credential_material_in_state(
+        state_from_evidence_json(snapshot.effects.latest_verified_state_json),
+        surface="composer_continuation_evidence_latest_state",
+        env_ref_names=env_ref_names,
+    )
+    _require_evidence_metadata(snapshot, env_ref_names=env_ref_names)
+    _require_message_shelf_semantics(snapshot.transcript, env_ref_names=env_ref_names)
+    _require_evidence_pair_capacity(evidence_bytes=source.reference.byte_length, recorder_chunk=recorder_chunk, mandatory_retention=False)
+    require_no_credential_material(
+        source.canonical,
+        surface="composer_continuation_private_chunk",
+        env_ref_names=env_ref_names,
+        max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+    )
+    if canonical_json_native_strings(expected.model_dump(mode="json")) != source.canonical:
+        raise AuditIntegrityError("retained evidence changed its complete original call extension")
+
+
 @dataclass(frozen=True, slots=True, init=False, eq=False)
 class AdmittedTurnEvidence:
     """Source-admitted DATA for one fixed reconstruction, never current authority.
@@ -406,13 +456,7 @@ class AdmittedTurnEvidence:
         if _prior_evidence is not None and (type(_prior_evidence) is not AdmittedTurnEvidence or type(source) is not PrivateChunk):
             raise TypeError("repeated evidence decode requires its actual prior admission and fresh source chunk")
         if type(source) is PrivateChunk:
-            if source.reference.codec != "composer.evidence.v2":
-                raise AuditIntegrityError("evidence chunk has the wrong codec")
-            if not 0 <= source.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
-                utf8_size(source.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != source.reference.byte_length
-            ):
-                raise AuditIntegrityError("evidence source exceeds its original complete document bound")
-            verify_private_chunk(source.reference, source.canonical)
+            _verify_evidence_source(source)
             # The original verifier proved strict canonical JSON. The owned
             # model below separately requires its complete object schema.
             # Only the prior immutable schema value is reusable on complete

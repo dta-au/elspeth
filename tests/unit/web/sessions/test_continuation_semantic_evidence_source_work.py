@@ -1,5 +1,6 @@
 """Real paid semantic reads retain fresh SQL closure and lexical evidence work."""
 
+import asyncio
 import json
 
 import litellm
@@ -42,67 +43,74 @@ async def test_paid_semantic_read_reuses_original_admission_but_reads_complete_c
         sid, operation = str(operation_store[4]), case["running"].claim.operation_id
         root = decode_continuation_snapshot(retained.snapshot.payload_json)
         before = _rows(operation_store[0])
-        with locked_session_transaction(operation_store[0], sid) as conn:
-            expected = semantic_sql._paid_result_data(conn, sid, operation, retained.snapshot, root, prepared.binding.effect_key)
-            source = expected[1].source
-            actual_load = semantic_sql.load_private_chunks
-            actual_decode = semantic_sql.decode_turn_evidence
-            actual_document = semantic_sql._require_retained_input_document
-            actual_admit = application_data.admit_turn_evidence
-            loads, decodes, documents, extensions = [], [], [], []
 
-            def load(*args, **kwargs):
-                result = actual_load(*args, **kwargs)
-                if encode_continuation_snapshot(kwargs["stack"]) == source.selected_snapshot_json:
-                    loads.append(result)
-                return result
+        def read_and_assert():
+            with locked_session_transaction(operation_store[0], sid) as conn:
+                expected = semantic_sql._paid_result_data(conn, sid, operation, retained.snapshot, root, prepared.binding.effect_key)
+                source = expected[1].source
+                actual_load = semantic_sql.load_private_chunks
+                actual_decode = semantic_sql.decode_turn_evidence
+                actual_document = semantic_sql._require_retained_input_document
+                actual_compare = application_data.require_retained_call_extension
+                loads, decodes, documents, extensions = [], [], [], []
 
-            def decode(chunk, **kwargs):
-                result = actual_decode(chunk, **kwargs)
-                if chunk == source.evidence:
-                    decodes.append(result)
-                return result
+                def load(*args, **kwargs):
+                    result = actual_load(*args, **kwargs)
+                    if encode_continuation_snapshot(kwargs["stack"]) == source.selected_snapshot_json:
+                        loads.append(result)
+                    return result
 
-            def document(*args, **kwargs):
-                result = actual_document(*args, **kwargs)
-                documents.append(result)
-                return result
+                def decode(chunk, **kwargs):
+                    result = actual_decode(chunk, **kwargs)
+                    if chunk == source.evidence:
+                        decodes.append(result)
+                    return result
 
-            def admit(*args, **kwargs):
-                result = actual_admit(*args, **kwargs)
-                extensions.append(result)
-                return result
+                def document(*args, **kwargs):
+                    result = actual_document(*args, **kwargs)
+                    documents.append(result)
+                    return result
 
-            monkeypatch.setattr(semantic_sql, "load_private_chunks", load)
-            monkeypatch.setattr(semantic_sql, "decode_turn_evidence", decode)
-            monkeypatch.setattr(semantic_sql, "_require_retained_input_document", document)
-            monkeypatch.setattr(application_data, "admit_turn_evidence", admit)
-            actual = semantic_sql._paid_result_data(conn, sid, operation, retained.snapshot, root, prepared.binding.effect_key)
-            assert actual == expected and actual[0] == retained
-            assert actual[0].snapshot.payload_json == retained.snapshot.payload_json
-            assert encode_continuation_snapshot(actual[2]) == retained.snapshot.payload_json
-            assert len(loads) == 2 and loads[0] == loads[1]
-            assert len(decodes) == len(documents) == len(extensions) == 1
-            assert documents[0].admitted is decodes[0]
-            assert documents[0].source_snapshot_json == source.selected_snapshot_json
-            assert extensions[0].source_chunk != source.evidence
-            assert extensions[0].recorder_chunk == retained.recorder
-            assert _rows_on_connection(conn) == before
+                def compare(*args, **kwargs):
+                    result = actual_compare(*args, **kwargs)
+                    extensions.append(result)
+                    return result
 
-            # Independent callers still decode, and projection-only DATA cannot
-            # supply the actual graph owned by the earlier document admission.
-            projection = semantic_sql._SemanticEvidenceDocument(
-                source.evidence,
-                loads[0],
-                source.env_ref_names,
-                canonical_json(decodes[0].snapshot.model_dump(mode="json", by_alias=True, exclude={"transcript"})),
-            )
-            for prior in (None, projection):
-                original, admitted = semantic_sql._original_evidence_data(conn, sid, operation, actual[1], original_evidence=prior)
-                assert encode_continuation_snapshot(original) == source.selected_snapshot_json
-                assert admitted.source_chunk == source.evidence and admitted is not decodes[0]
-            assert len(loads) == 4 and len(decodes) == 3 and len(extensions) == 1
-            assert _rows_on_connection(conn) == before
+                with monkeypatch.context() as patch:
+                    patch.setattr(semantic_sql, "load_private_chunks", load)
+                    patch.setattr(semantic_sql, "decode_turn_evidence", decode)
+                    patch.setattr(semantic_sql, "_require_retained_input_document", document)
+                    patch.setattr(application_data, "require_retained_call_extension", compare)
+                    actual = semantic_sql._paid_result_data(conn, sid, operation, retained.snapshot, root, prepared.binding.effect_key)
+                    assert actual == expected and actual[0] == retained
+                    assert actual[0].snapshot.payload_json == retained.snapshot.payload_json
+                    assert encode_continuation_snapshot(actual[2]) == retained.snapshot.payload_json
+                    assert len(loads) == 2 and loads[0] == loads[1]
+                    assert len(decodes) == len(documents) == len(extensions) == 1
+                    assert documents[0].admitted is decodes[0]
+                    assert documents[0].source_snapshot_json == source.selected_snapshot_json
+                    assert extensions[0].evidence != source.evidence
+                    assert extensions[0].recorder == retained.recorder
+                    assert _rows_on_connection(conn) == before
+
+                    # Independent callers still decode; projection-only DATA
+                    # cannot supply the earlier document's actual owned graph.
+                    projection = semantic_sql._SemanticEvidenceDocument(
+                        source.evidence,
+                        loads[0],
+                        source.env_ref_names,
+                        canonical_json(decodes[0].snapshot.model_dump(mode="json", by_alias=True, exclude={"transcript"})),
+                    )
+                    for prior in (None, projection):
+                        original, admitted = semantic_sql._original_evidence_data(conn, sid, operation, actual[1], original_evidence=prior)
+                        assert encode_continuation_snapshot(original) == source.selected_snapshot_json
+                        assert admitted.source_chunk == source.evidence and admitted is not decodes[0]
+                    assert len(loads) == 4 and len(decodes) == 3 and len(extensions) == 1
+                    assert _rows_on_connection(conn) == before
+
+        # Keep the complete transaction and all connection-bound assertions in
+        # one worker while the actual lease/event-loop tasks remain runnable.
+        await asyncio.to_thread(read_and_assert)
         assert len(sdk) == 1 and _rows(operation_store[0]) == before
 
 
@@ -160,10 +168,14 @@ async def test_paid_semantic_late_closure_corruption_keeps_fresh_read_and_physic
         monkeypatch.setattr(semantic_sql, "load_private_chunks", load)
         monkeypatch.setattr(semantic_sql, "_original_input_data", original_input)
         message = "original complete ledger" if corrupt_ledger else "private chunk complete byte bound or SQL binding mismatch"
-        with (
-            pytest.raises(AuditIntegrityError, match=message),
-            locked_session_transaction(operation_store[0], sid) as conn,
-        ):
-            semantic_sql._paid_result_data(conn, sid, operation, retained.snapshot, root, prepared.binding.effect_key)
+
+        def read_corrupt_source():
+            with (
+                pytest.raises(AuditIntegrityError, match=message),
+                locked_session_transaction(operation_store[0], sid) as conn,
+            ):
+                semantic_sql._paid_result_data(conn, sid, operation, retained.snapshot, root, prepared.binding.effect_key)
+
+        await asyncio.to_thread(read_corrupt_source)
         assert len(mutations) == 1 and len(loads) == (1 if corrupt_ledger else 2)
         assert len(sdk) == 1 and _rows(operation_store[0]) == before

@@ -20,6 +20,7 @@ from elspeth.web.composer.continuation_application_graph import (
     ApplicationGraph,
     ApplicationGraphCut,
     ApplicationRecorderSource,
+    _application_graph_projection,
     admit_application_recorder_source,
     application_recorder_chunk,
     capture_application_recorder_source,
@@ -38,6 +39,7 @@ from elspeth.web.composer.continuation_evidence import (
     RetainedTurnEffects,
     TurnEvidenceFields,
     TurnEvidenceSnapshot,
+    _require_retained_evidence_envelope,
     admit_turn_evidence,
     encode_turn_evidence,
     require_admitted_turn_evidence,
@@ -346,6 +348,60 @@ def require_evidence_application_links(
     if type(snapshot) not in (TurnEvidenceFields, TurnEvidenceSnapshot):
         raise TypeError("evidence application admission requires its actual snapshot source")
     return _admit_application_source(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_source=recorder_source)
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedCallExtensionData:
+    evidence: PrivateChunk
+    recorder: PrivateChunk
+    graph_json: str | None
+
+
+def require_retained_call_extension(
+    original: AdmittedTurnEvidence,
+    *,
+    call: ComposerLLMCall,
+    recorder: RecorderSnapshot,
+    retained_evidence: PrivateChunk,
+    env_ref_names: frozenset[str],
+) -> RetainedCallExtensionData:
+    """Compare a cold stored append without constructing another live graph."""
+    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+
+    admitted = require_admitted_turn_evidence(original, env_ref_names=env_ref_names)
+    if type(call) is not ComposerLLMCall or type(recorder) is not RecorderSnapshot:
+        raise TypeError("evidence extension requires its complete actual nominal sources")
+    before = decode_recorder_snapshot(admitted.recorder_chunk)
+    if (
+        call.call_id is None
+        or replace(before, llm_calls=(*before.llm_calls, call)) != recorder
+        or not recorder.llm_calls
+        or recorder.llm_calls[-1] is not call
+        or any(item.call_id == call.call_id for item in before.llm_calls)
+    ):
+        raise AuditIntegrityError("evidence extension changed its exact original recorder prefix")
+    recorder_source = capture_application_recorder_source(recorder, env_ref_names=env_ref_names)
+    audit = recorder_source.chunk
+    with admitted._graph_lock:
+        if admitted._graph_taken:
+            raise AuditIntegrityError("admitted graph was already transferred to its mutable owner")
+        snapshot, graph = admitted.snapshot, admitted._graph
+        updated = snapshot.model_copy(update={"recorder": audit.reference})
+        graph_json = None
+        if graph is not None:
+            extended = replace(graph.recorder, llm_calls=(*graph.recorder.llm_calls, call))
+            _require_recorder_extension(graph.recorder, extended)
+            if encode_recorder_snapshot(extended) != audit:
+                raise AuditIntegrityError("evidence extension differs from its complete actual recorder")
+            changed_graph = replace(graph, recorder=extended)
+            graph_json = _application_graph_projection(changed_graph, env_ref_names=env_ref_names, recorder_source=recorder_source)
+            if snapshot.application_entry is not None:
+                entry = snapshot.application_entry.model_copy(update={"graph_json": graph_json})
+                updated = updated.model_copy(update={"application_entry": entry})
+            else:
+                updated = updated.model_copy(update={"joint_graph_json": graph_json})
+        _require_retained_evidence_envelope(retained_evidence, expected=updated, recorder_chunk=audit, env_ref_names=env_ref_names)
+    return RetainedCallExtensionData(retained_evidence, audit, graph_json)
 
 
 def append_primary_call_to_evidence(

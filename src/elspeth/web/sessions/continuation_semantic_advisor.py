@@ -1640,7 +1640,28 @@ def _paid_result_data(
     # above. The complete original SQL closure is still read here before the
     # unexposed document admission can supply this call's original graph.
     original, admitted = _original_evidence_data(conn, sid, operation, data, original_evidence=original_input.original_evidence)
-    extended = _extend_admitted_evidence(data, original, admitted, call, captured)
+    from elspeth.web.composer.continuation_evidence_application_data import require_retained_call_extension
+    from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
+
+    retained_evidence = _ref(conn, sid, operation, _parent(root).evidence)
+    compared = require_retained_call_extension(
+        admitted, call=call, recorder=captured, retained_evidence=retained_evidence, env_ref_names=data.source.env_ref_names
+    )
+    applied: PrivateChunk | None = None
+    if len(original.frames) == 2 and type(original.frames[1]) is ToolBatchFrame:
+        applied_batch_cut(original.frames)
+        graph = admitted.graph
+        if (
+            admitted.snapshot.application_entry is None
+            or graph is None
+            or graph.selected.batch.phase != "complete"
+            or compared.graph_json is None
+        ):
+            raise AuditIntegrityError("Semantic paid applied source lost its actual extended application graph")
+        applied = encode_private_chunk(
+            codec="composer.applied-p4-batch.v2", canonical=compared.graph_json, env_ref_names=data.source.env_ref_names
+        )
+    extended = _ExtendedSemanticEvidence(compared.evidence, applied)
     evidence = extended.evidence
     if extended.applied_batch is not None and _ref(conn, sid, operation, extended.applied_batch.reference) != extended.applied_batch:
         raise AuditIntegrityError("Semantic cold paid application changed its exact extended graph companion")

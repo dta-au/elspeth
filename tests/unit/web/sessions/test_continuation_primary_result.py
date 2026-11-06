@@ -145,14 +145,21 @@ async def initialized_primary_input(
     from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, seed_token_policies
     from tests.unit.web.sessions.test_continuation_composition_initialization import construct, ready_case
 
+    settings, requests = _required_guard_settings(tmp_path, monkeypatch)
+    initial_settings = {
+        "composer_prompt_guard": settings.composer_prompt_guard,
+        "composer_advisor_prompt_guard": settings.composer_advisor_prompt_guard,
+        "composer_prompt_guard_mode": settings.composer_prompt_guard_mode,
+        **(settings_overrides if settings_overrides is not None else {}),
+    }
     if base_state_data is None and prior_operation_id is None:
-        running, service, work, ready, title_sdk = await ready_case(store, tmp_path, monkeypatch, settings_overrides=settings_overrides)
+        running, service, work, ready, title_sdk = await ready_case(store, tmp_path, monkeypatch, settings_overrides=initial_settings)
     else:
         running, service, work, ready, title_sdk = await ready_case(
             store,
             tmp_path,
             monkeypatch,
-            settings_overrides=settings_overrides,
+            settings_overrides=initial_settings,
             base_state_data=base_state_data,
             prior_operation_id=prior_operation_id,
         )
@@ -213,7 +220,6 @@ async def initialized_primary_input(
                     None,
                 ),
             }
-    settings, requests = _required_guard_settings(tmp_path, monkeypatch)
     service._provider_gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
     return runtime, work, requests
 
@@ -300,12 +306,20 @@ async def handover_to_next_primary(store, owner, running, monkeypatch, *, expect
         capture.setattr(litellm, "acompletion", completion)
         async with _claimed_driver(driver):
             handover = await driver.run(None)
-    assert type(handover) is ContinuationSegmentHandedOver and len(ready_cuts) == 1, tuple(
-        (
-            type(original).__name__,
-            tuple((frame.filename, frame.lineno, frame.name) for frame in traceback.extract_tb(original.__traceback__)),
+    assert type(handover) is ContinuationSegmentHandedOver and len(ready_cuts) == 1, (
+        f"observed_roles={roles!r}; expected_roles={expected_roles!r}; original_failures="
+        + repr(
+            tuple(
+                (
+                    type(original).__name__,
+                    tuple(
+                        (frame.filename.rsplit("/", 1)[-1], frame.lineno, frame.name)
+                        for frame in traceback.extract_tb(original.__traceback__)[-4:]
+                    ),
+                )
+                for original in driver._consumed_native
+            )
         )
-        for original in driver._consumed_native
     )
     store[1].verify_recovery(handover.receipt)
     assert roles == list(expected_roles)

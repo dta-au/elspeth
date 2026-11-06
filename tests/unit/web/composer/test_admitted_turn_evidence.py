@@ -73,9 +73,9 @@ def _require_owed_joint_final_transfer_work(counts):
 def _require_owed_joint_final_transfer_recorder_work(counts):
     # Received only for this owed-reader joint/no-history transfer, including
     # its source-context preparation. Historical shapes need their own measure.
-    # R44: one decoder self-check, one selected-recorder capture and one exit
-    # projection; the already admitted immutable source is reused.
-    expected = {"decode_recorder_snapshot": 1, "encode_recorder_snapshot": 3}
+    # Closed recorder-source construction retains one public decoder call and
+    # performs its captures without re-entering encode_recorder_snapshot.
+    expected = {"decode_recorder_snapshot": 1, "encode_recorder_snapshot": 0}
     actual = dict(counts)
     assert actual.keys() == expected.keys(), f"final_transfer_recorder_keys: {actual}"
     assert all(type(value) is int and value >= 0 for value in actual.values()), f"final_transfer_recorder_types: {actual}"
@@ -579,8 +579,10 @@ async def test_final_transfer_contract_rejects_real_extra_public_decoder(operati
         assert actual["decode_application_graph"] == 1
         with pytest.raises(AssertionError, match=r"^decode_application_graph:"):
             _require_owed_joint_final_transfer_work(actual)
-        with pytest.raises(AssertionError, match=r"^encode_recorder_snapshot:"):
-            _require_owed_joint_final_transfer_recorder_work(recorder_counts)
+        # This extra graph decode reuses the admitted recorder source: graph
+        # work increases while public recorder codec counts stay unchanged.
+        assert recorder_counts == required_recorder
+        _require_owed_joint_final_transfer_recorder_work(recorder_counts)
         # Explain the observed surplus using an independently executed real
         # primitive. The gate above receives the full unmodified observation.
         assert actual == {key: required[key] + primitive[key] for key in required}
