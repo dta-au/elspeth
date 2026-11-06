@@ -243,6 +243,113 @@ def test_history_insert_failure_rolls_back_actual_fence_and_segment_start(operat
     assert start_segment(repository, claim).fence.session_id == str(claim.session_id)
 
 
+@pytest.mark.parametrize("changed", ["action", "policy", "claim_expiry", "fence_expiry", "parent_cas", "segment_cas", "proof_error"])
+def test_post_insert_source_or_final_cas_refusal_rolls_back_whole_start(operation_store, monkeypatch, changed):
+    from elspeth.web.sessions import continuation as module
+
+    engine, repository, _, _, _ = operation_store
+    authority, _ = queued(operation_store)
+    (claim,) = authority.claim_segment(limit=1)
+    observation = module.ComposerSegmentStartObservation(claim)
+    before = _admission_rows(engine)
+    original = module._select_segment_start_on_connection
+    reached = []
+    injected = RuntimeError("controlled original startup proof failure")
+
+    def select_after_real_insert(conn, actual_claim, **kwargs):
+        assert actual_claim is claim
+        attempt = conn.execute(select(attempts)).one()
+        segment = conn.execute(select(segments)).one()
+        parent = conn.execute(select(jobs)).one()
+        fence = conn.execute(select(fences)).one()
+        assert segment.state == parent.status == "queued"
+        assert observation.context is not None
+        assert attempt.session_operation_id == fence.operation_id == observation.context.fence.operation_id
+        assert attempt.session_operation_epoch == fence.operation_epoch == observation.context.fence.operation_epoch
+        assert attempt.session_operation_lease_token == fence.lease_token == observation.context.fence.lease_token
+        assert attempt.generation == claim.ownership_generation and attempt.claim_attempt == claim.attempt
+        reached.append(attempt)
+        if changed == "action":
+            conn.execute(update(segments).values(next_action_json=minimal_continuation_policy().actions.primary.model_dump_json()))
+        elif changed == "policy":
+            conn.execute(update(segments).values(policy_sha256="b" * 64))
+        selected = original(conn, actual_claim, **kwargs)
+        if changed == "proof_error":
+            raise injected
+        if changed == "claim_expiry":
+            conn.execute(update(segments).values(claim_expires_at=database_now(conn) - timedelta(seconds=1)))
+        elif changed == "fence_expiry":
+            conn.execute(update(fences).values(lease_expires_at=database_now(conn) - timedelta(seconds=1)))
+        elif changed == "parent_cas":
+            conn.execute(update(jobs).values(attempt=claim.attempt + 1))
+        elif changed == "segment_cas":
+            conn.execute(update(segments).values(claim_token="changed-after-original-proof"))
+        return selected
+
+    expected = (
+        AuditIntegrityError if changed in ("action", "policy") else RuntimeError if changed == "proof_error" else ComposerOperationFenceLost
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(module, "_select_segment_start_on_connection", select_after_real_insert)
+        with pytest.raises(expected) as caught:
+            start_segment(repository, claim, observation=observation)
+    assert len(reached) == 1
+    if changed == "proof_error":
+        assert caught.value is injected
+    assert _admission_rows(engine) == before
+    assert observation.context is not None and not observation.committed
+    assert repository.reconcile_composer_segment_start(observation) is None
+    assert _admission_rows(engine) == before
+    assert start_segment(repository, claim).fence.session_id == str(claim.session_id)
+
+
+@pytest.mark.parametrize("expired", [False, True], ids=("original-anchor", "expired-during-proof"))
+def test_start_source_proof_keeps_original_clock_anchor(operation_store, monkeypatch, expired):
+    from elspeth.web.sessions import continuation as module
+
+    engine, repository, _, _, _ = operation_store
+    authority, _ = queued(operation_store)
+    (claim,) = authority.claim_segment(limit=1)
+    before = _admission_rows(engine)
+    original = module._select_segment_start_on_connection
+    real_clock = module.database_now
+    starts = []
+    final_times = []
+
+    def prove_then_advance_clock(conn, actual_claim, **kwargs):
+        selected = original(conn, actual_claim, **kwargs)
+        started = restore_utc(conn.execute(select(attempts.c.started_at)).scalar_one())
+        duration = size_segment(selected.action, selected.policy.segment)
+        final_now = started + timedelta(seconds=duration + 1 if expired else 1)
+        if expired:
+            # Keep both real lease predicates live so the original segment
+            # interval, rather than an earlier claim/owner expiry, must refuse.
+            conn.execute(update(fences).values(lease_expires_at=final_now + timedelta(seconds=30)))
+            conn.execute(update(segments).values(claim_expires_at=final_now + timedelta(seconds=30)))
+        starts.append(started)
+        final_times.append(final_now)
+        monkeypatch.setattr(module, "database_now", lambda _conn: final_now)
+        return selected
+
+    monkeypatch.setattr(module, "_select_segment_start_on_connection", prove_then_advance_clock)
+    if expired:
+        with pytest.raises(ComposerOperationFenceLost):
+            start_segment(repository, claim)
+        assert _admission_rows(engine) == before
+    else:
+        start_segment(repository, claim)
+        with engine.connect() as conn:
+            segment = conn.execute(select(segments)).one()
+            attempt = conn.execute(select(attempts)).one()
+            parent = conn.execute(select(jobs)).one()
+        assert restore_utc(segment.started_at) == restore_utc(attempt.started_at) == restore_utc(parent.started_at) == starts[0]
+        assert restore_utc(segment.started_at) < final_times[0]
+        policy = minimal_continuation_policy()
+        assert restore_utc(segment.deadline_at) == starts[0] + timedelta(seconds=size_segment(policy.actions.session_sql, policy.segment))
+    assert len(starts) == 1
+    monkeypatch.setattr(module, "database_now", real_clock)
+
+
 def _claim_from_process(url: str, owner: str, rendezvous):
     from elspeth.web.sessions.engine import create_session_engine
 
@@ -482,7 +589,6 @@ def test_exact_selection_omission_has_real_refusal_witness_and_fresh_positive(op
     import inspect
     from textwrap import dedent
 
-    from elspeth.web.coordination import repository as repository_module
     from elspeth.web.sessions import continuation as module
 
     if guard == "action":
@@ -502,7 +608,6 @@ def test_exact_selection_omission_has_real_refusal_witness_and_fresh_positive(op
     exec(compile("from __future__ import annotations\n" + source.replace(fragment, ""), "<exact-selection-omission>", "exec"), namespace)
     if guard == "action":
         monkeypatch.setattr(module, "_select_segment_start_on_connection", namespace[original.__name__])
-        monkeypatch.setattr(repository_module, "_select_segment_start_on_connection", namespace[original.__name__])
     else:
         monkeypatch.setattr(module, "_initial_segment_action", namespace[original.__name__])
     if positive:

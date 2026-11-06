@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import litellm
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import PromptGuardDecision
@@ -30,6 +31,7 @@ from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_end import enter_continuation_end, execute_continuation_end_review
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 from tests.helpers.continuation_inventory import inventory_work
 from tests.helpers.continuation_policy import continuation_test_settings
 from tests.unit.web.composer.test_advisor_checkpoint import _checkpoint_reply
@@ -162,12 +164,30 @@ async def test_cold_malformed_end_closes_h_and_restores_one_original_format_retr
                         auth_provider_type="local",
                     )
                     (claim,) = current_authority.claim_segment(limit=1)
+                    with locked_session_transaction(store[0], sid) as conn:
+                        previous_attempts = conn.execute(
+                            select(attempts).where(attempts.c.session_id == sid, attempts.c.operation_id == operation)
+                        ).all()
+                    assert all(row.generation < claim.ownership_generation for row in previous_attempts)
+                    assert len(sdk_calls) == 1
                     context = current_repository.start_composer_segment(
                         claim,
                         owner_instance_id=current_authority._owner_instance_id,
                         lease_seconds=30,
                         auth_provider_type="local",
                     )
+                    with locked_session_transaction(store[0], sid) as conn:
+                        successor = conn.execute(
+                            select(attempts).where(
+                                attempts.c.session_id == sid,
+                                attempts.c.operation_id == operation,
+                                attempts.c.generation == claim.ownership_generation,
+                            )
+                        ).one()
+                    assert successor.claim_attempt == claim.attempt
+                    assert successor.session_operation_id == context.fence.operation_id
+                    assert successor.session_operation_epoch == context.fence.operation_epoch
+                    assert len(sdk_calls) == 1
                     replacement = ComposerOperationRunning(claim=claim, session_operation_context=context)
                     assert claim.ownership_generation == running.claim.ownership_generation + 1
                     assert context.fence.operation_id != running.session_operation_context.fence.operation_id

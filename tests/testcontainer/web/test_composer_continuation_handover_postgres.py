@@ -22,7 +22,13 @@ from tests.unit.web.coordination.test_composer_continuation_handover import (
     test_lease_consume_marks_consumed_and_close_makes_no_second_release as test_lease_consume_marks_consumed_and_close_makes_no_second_release,
 )
 from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_recovered_start_refuses_corrupt_actual_attempt_pair_and_rolls_back as test_recovered_start_refuses_corrupt_actual_attempt_pair_and_rolls_back,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
     test_settle_lost_segment_pairs_revocation_and_settles_never_started_parents as test_settle_lost_segment_pairs_revocation_and_settles_never_started_parents,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_start_readback_recovers_actual_commit_after_return_failure as test_start_readback_recovers_actual_commit_after_return_failure,
 )
 from tests.unit.web.coordination.test_composer_continuation_handover import (
     test_stop_wins_over_a_handover as test_stop_wins_over_a_handover,
@@ -107,6 +113,9 @@ from tests.unit.web.sessions.test_composer_continuation_yield import (
 )
 from tests.unit.web.sessions.test_composer_continuation_yield import (
     test_yield_refuses_when_the_composition_head_moved as test_yield_refuses_when_the_composition_head_moved,
+)
+from tests.unit.web.sessions.test_continuation_checkpoint_end_cold_format_retry import (
+    test_cold_malformed_end_closes_h_and_restores_one_original_format_retry as test_cold_malformed_end_closes_h_and_restores_one_original_format_retry,
 )
 
 pytestmark = pytest.mark.testcontainer

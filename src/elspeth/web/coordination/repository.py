@@ -109,7 +109,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationRunning,
 )
 from elspeth.web.sessions.content_publication import prepare_content_publication, read_content_publication
-from elspeth.web.sessions.continuation import _select_segment_start_on_connection, start_segment_on_connection
+from elspeth.web.sessions.continuation import _read_segment_start_data_on_connection, start_segment_on_connection
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
@@ -5786,9 +5786,12 @@ class _SessionOperationAuthorityRepository:
             if parent is None:
                 raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
             _require_owner(conn, session_id=claim.session_id, actor_user_id=parent.actor_user_id, auth_provider_type=auth_provider_type)
-            selected_start = _select_segment_start_on_connection(
+            from elspeth.web.composer.continuation_clock import size_segment
+
+            provisional, _, _ = _read_segment_start_data_on_connection(
                 conn, claim, owner_instance_id=owner_instance_id, segment_policy=segment_policy
             )
+            size_segment(provisional.action, provisional.policy.segment)
             context = self._advance_exclusive_fence_on_connection(
                 conn,
                 session_id_text=str(claim.session_id),
@@ -5798,12 +5801,15 @@ class _SessionOperationAuthorityRepository:
                 composer_operation_id=claim.operation_id,
             )
             if observation is not None:
-                from elspeth.web.composer.continuation_clock import size_segment
-
                 observation.context = context
+            _, selected_start = start_segment_on_connection(
+                conn, claim, context=context, owner_instance_id=owner_instance_id, segment_policy=segment_policy
+            )
+            if selected_start != provisional:
+                raise AuditIntegrityError("segment startup DATA changed after its original retained read")
+            if observation is not None:
                 observation.policy = selected_start.policy
                 observation.hard_expires_at = monotonic_before_start + size_segment(selected_start.action, selected_start.policy.segment)
-            start_segment_on_connection(conn, claim, context=context, owner_instance_id=owner_instance_id, segment_policy=segment_policy)
         if observation is not None:
             observation.committed = True
         return context

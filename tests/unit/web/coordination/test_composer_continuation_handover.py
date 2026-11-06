@@ -53,7 +53,9 @@ def _cancel(authority, record):
     return authority.request_cancel(session_id=record.session_id, operation_id=record.operation_id)
 
 
-def test_handover_keeps_sequence_advances_generation_and_releases_fence(operation_store):
+def test_handover_keeps_sequence_advances_generation_and_releases_fence(operation_store, monkeypatch):
+    from elspeth.web.sessions import continuation as module
+
     engine, repository, _authority, _service, sid = operation_store
     authority, record, running = _running(operation_store)
 
@@ -78,6 +80,53 @@ def test_handover_keeps_sequence_advances_generation_and_releases_fence(operatio
     # Claimable at commit, with no lease-expiry wait.
     (claim,) = authority.claim_segment(limit=1)
     assert (claim.segment_sequence, claim.ownership_generation) == (1, 2)
+    original = module._select_segment_start_on_connection
+    proved = []
+
+    def prove_actual_successor_before_running(conn, actual_claim, **kwargs):
+        predecessor, successor = conn.execute(select(attempts).order_by(attempts.c.generation)).all()
+        assert predecessor.outcome == "interrupted" and predecessor.revoked_at is not None
+        assert successor.generation == claim.ownership_generation and successor.revoked_at is None
+        assert successor.claim_attempt == claim.attempt > predecessor.claim_attempt
+        assert successor.session_operation_epoch > predecessor.session_operation_epoch
+        assert conn.execute(select(segments.c.state)).scalar_one() == "interrupted"
+        selected = original(conn, actual_claim, **kwargs)
+        proved.append(successor)
+        return selected
+
+    monkeypatch.setattr(module, "_select_segment_start_on_connection", prove_actual_successor_before_running)
+    successor = start_segment(repository, claim)
+    assert len(proved) == 1
+    assert proved[0].session_operation_id == successor.fence.operation_id
+    assert successor.fence.operation_epoch > running.session_operation_context.fence.operation_epoch
+
+
+@pytest.mark.parametrize("changed", ["predecessor_outcome", "predecessor_claim"])
+def test_recovered_start_refuses_corrupt_actual_attempt_pair_and_rolls_back(operation_store, monkeypatch, changed):
+    from elspeth.web.sessions import continuation as module
+
+    engine, repository, *_ = operation_store
+    authority, _record, running = _running(operation_store)
+    repository.suspend_composer_segment(running)
+    (claim,) = authority.claim_segment(limit=1)
+    before = _admission_rows(engine)
+    original = module._select_segment_start_on_connection
+    reached = []
+
+    def corrupt_actual_predecessor(conn, actual_claim, **kwargs):
+        pair = conn.execute(select(attempts).order_by(attempts.c.generation)).all()
+        assert len(pair) == 2 and pair[1].generation == claim.ownership_generation
+        reached.append(pair)
+        values = {"outcome": "settled"} if changed == "predecessor_outcome" else {"claim_attempt": claim.attempt}
+        conn.execute(update(attempts).where(attempts.c.generation == running.claim.ownership_generation).values(**values))
+        return original(conn, actual_claim, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(module, "_select_segment_start_on_connection", corrupt_actual_predecessor)
+        with pytest.raises(AuditIntegrityError, match="actual interrupted/reclaimed attempt pair"):
+            start_segment(repository, claim)
+    assert len(reached) == 1
+    assert _admission_rows(engine) == before
     successor = start_segment(repository, claim)
     assert successor.fence.operation_epoch > running.session_operation_context.fence.operation_epoch
 
@@ -146,6 +195,40 @@ def test_start_readback_proves_unstarted_without_minting_a_context(operation_sto
     assert repository.reconcile_composer_segment_start(observation) is None
     assert observation.context is None and observation.reconciled and not observation.committed
     assert _admission_rows(engine) == before
+
+
+def test_start_readback_recovers_actual_commit_after_return_failure(operation_store, monkeypatch):
+    from contextlib import contextmanager
+
+    from elspeth.web.coordination import repository as module
+
+    engine, repository, *_ = operation_store
+    authority, _record = queued(operation_store)
+    (claim,) = authority.claim_segment(limit=1)
+    observation = ComposerSegmentStartObservation(claim)
+    original = module.locked_session_transaction
+    injected = RuntimeError("controlled failure after actual startup commit")
+
+    @contextmanager
+    def commit_then_fail(*args, **kwargs):
+        with original(*args, **kwargs) as conn:
+            yield conn
+        raise injected
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(module, "locked_session_transaction", commit_then_fail)
+        with pytest.raises(RuntimeError) as caught:
+            start_segment(repository, claim, observation=observation)
+    assert caught.value is injected
+    assert observation.context is not None and not observation.committed
+    assert observation.policy is not None and observation.hard_expires_at is not None
+    committed = _admission_rows(engine)
+    assert repository.reconcile_composer_segment_start(observation) is observation.context
+    assert observation.reconciled
+    assert _admission_rows(engine) == committed
+    with engine.connect() as conn:
+        history = conn.execute(select(attempts)).one()
+        assert history.session_operation_id == observation.context.fence.operation_id
 
 
 @pytest.mark.parametrize("changed", ("generation", "cursor", "checkpoint", "release"))

@@ -1244,7 +1244,9 @@ def append_complete_snapshot(
 
 
 @dataclass(frozen=True, slots=True)
-class _SegmentStartSelection:
+class _SegmentStartData:
+    """Retained startup DATA; only the full selector proves its action source."""
+
     snapshot: StoredContinuationSnapshot
     policy: ContinuationAdmissionPolicyV4
     action: ContinuationActionPolicy
@@ -2425,13 +2427,13 @@ def read_yield_outcome_on_connection(conn: Connection, running: ComposerOperatio
     return receipt
 
 
-def _select_segment_start_on_connection(
+def _read_segment_start_data_on_connection(
     conn: Connection,
     claim: ComposerOperationClaim,
     *,
     owner_instance_id: str,
     segment_policy: ContinuationSegmentPolicy | None = None,
-) -> _SegmentStartSelection:
+) -> tuple[_SegmentStartData, Row[Any], Row[Any]]:
     if type(claim) is not ComposerOperationClaim:
         raise TypeError("continuation start requires its nominal segment claim")
     if segment_policy is not None and type(segment_policy) is not ContinuationSegmentPolicy:
@@ -2520,14 +2522,35 @@ def _select_segment_start_on_connection(
         raise AuditIntegrityError("start substituted current defaults for retained segment policy")
     if segment.policy_sha256 != stack.policy_hash:
         raise AuditIntegrityError("segment policy pointer differs from the retained complete policy")
-    expected = _selected_segment_action(conn, parent=parent, segment=segment, snapshot=snapshot, stack=stack, policy=policy)
     try:
         action = ContinuationActionPolicy.model_validate_json(segment.next_action_json, strict=True)
     except ValueError as exc:
         raise AuditIntegrityError("segment action violates its retained owned contract") from exc
+    return _SegmentStartData(snapshot, policy, action, segment.next_action_json), parent, segment
+
+
+def _select_segment_start_on_connection(
+    conn: Connection,
+    claim: ComposerOperationClaim,
+    *,
+    owner_instance_id: str,
+    segment_policy: ContinuationSegmentPolicy | None = None,
+) -> _SegmentStartData:
+    data, parent, segment = _read_segment_start_data_on_connection(
+        conn, claim, owner_instance_id=owner_instance_id, segment_policy=segment_policy
+    )
+    expected = _selected_segment_action(
+        conn,
+        parent=parent,
+        segment=segment,
+        snapshot=data.snapshot,
+        stack=decode_continuation_snapshot(data.snapshot.payload_json),
+        policy=data.policy,
+    )
+    action = data.action
     if action != expected:
         raise AuditIntegrityError("segment allowance differs from its selected retained action")
-    return _SegmentStartSelection(snapshot, policy, expected, segment.next_action_json)
+    return data
 
 
 def start_segment_on_connection(
@@ -2537,7 +2560,7 @@ def start_segment_on_connection(
     context: SessionOperationContext,
     owner_instance_id: str,
     segment_policy: ContinuationSegmentPolicy | None = None,
-) -> ComposerOperationRunning:
+) -> tuple[ComposerOperationRunning, _SegmentStartData]:
     if type(claim) is not ComposerOperationClaim:
         raise TypeError("continuation start requires its nominal claim")
     if (
@@ -2546,8 +2569,11 @@ def start_segment_on_connection(
         or context.fence.session_id != str(claim.session_id)
     ):
         raise AuditIntegrityError("continuation start requires its exact same-session COMPOSE context")
-    selected = _select_segment_start_on_connection(conn, claim, owner_instance_id=owner_instance_id, segment_policy=segment_policy)
+    provisional, _, _ = _read_segment_start_data_on_connection(
+        conn, claim, owner_instance_id=owner_instance_id, segment_policy=segment_policy
+    )
     now = database_now(conn)
+    started_at = now
     f = context.fence
     owner = conn.execute(
         select(fences.c.lease_expires_at).where(
@@ -2563,9 +2589,45 @@ def start_segment_on_connection(
     ).one_or_none()
     if owner is None:
         raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-    duration = size_segment(selected.action, selected.policy.segment)
+    duration = size_segment(provisional.action, provisional.policy.segment)
     deadline = now + timedelta(seconds=duration)
-    cooperative = now + timedelta(seconds=min(selected.policy.segment.quantum, duration - selected.policy.segment.watermark))
+    cooperative = now + timedelta(seconds=min(provisional.policy.segment.quantum, duration - provisional.policy.segment.watermark))
+    # Recovery source proof needs this actual successor, while initial-source
+    # proof still needs the unchanged queued parent and segment. All writes are
+    # provisional until the caller's locked transaction commits.
+    conn.execute(
+        insert(attempts).values(
+            session_id=str(claim.session_id),
+            operation_id=claim.operation_id,
+            sequence=claim.segment_sequence,
+            generation=claim.ownership_generation,
+            claim_attempt=claim.attempt,
+            session_operation_id=f.operation_id,
+            session_operation_epoch=f.operation_epoch,
+            session_operation_lease_token=f.lease_token,
+            owner_instance_id=owner_instance_id,
+            started_at=started_at,
+            claim_expires_at=restore_utc(owner.lease_expires_at),
+        )
+    )
+    selected = _select_segment_start_on_connection(conn, claim, owner_instance_id=owner_instance_id, segment_policy=segment_policy)
+    if selected != provisional:
+        raise AuditIntegrityError("segment startup DATA changed during original source proof")
+    now = database_now(conn)
+    owner = conn.execute(
+        select(fences.c.lease_expires_at).where(
+            fences.c.session_id == f.session_id,
+            fences.c.operation_id == f.operation_id,
+            fences.c.operation_epoch == f.operation_epoch,
+            fences.c.lease_token == f.lease_token,
+            fences.c.operation_kind == SessionOperationKind.COMPOSE.value,
+            fences.c.owner_instance_id == owner_instance_id,
+            fences.c.released_at.is_(None),
+            fences.c.lease_expires_at > now,
+        )
+    ).one_or_none()
+    if owner is None or deadline <= now:
+        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
     changed = conn.execute(
         update(segments)
         .where(
@@ -2584,7 +2646,7 @@ def start_segment_on_connection(
         )
         .values(
             state="running",
-            started_at=now,
+            started_at=started_at,
             cooperative_at=cooperative,
             deadline_at=deadline,
             session_operation_id=f.operation_id,
@@ -2594,21 +2656,6 @@ def start_segment_on_connection(
     )
     if changed.rowcount != 1:
         raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-    conn.execute(
-        insert(attempts).values(
-            session_id=str(claim.session_id),
-            operation_id=claim.operation_id,
-            sequence=claim.segment_sequence,
-            generation=claim.ownership_generation,
-            claim_attempt=claim.attempt,
-            session_operation_id=f.operation_id,
-            session_operation_epoch=f.operation_epoch,
-            session_operation_lease_token=f.lease_token,
-            owner_instance_id=owner_instance_id,
-            started_at=now,
-            claim_expires_at=restore_utc(owner.lease_expires_at),
-        )
-    )
     parent = conn.execute(
         update(jobs)
         .where(
@@ -2624,7 +2671,7 @@ def start_segment_on_connection(
         .values(
             status="running",
             phase="executing",
-            started_at=func.coalesce(jobs.c.started_at, now),
+            started_at=func.coalesce(jobs.c.started_at, started_at),
             session_operation_id=f.operation_id,
             session_operation_lease_token=f.lease_token,
             session_operation_epoch=f.operation_epoch,
@@ -2635,7 +2682,7 @@ def start_segment_on_connection(
     )
     if parent.rowcount != 1:
         raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-    return ComposerOperationRunning(claim=claim, session_operation_context=context)
+    return ComposerOperationRunning(claim=claim, session_operation_context=context), selected
 
 
 def private_chunk_key(chunk: PrivateChunk) -> str:
