@@ -879,8 +879,10 @@
 }
 
 .chat-input-send-btn:not(:disabled) {
-  background-color: var(--color-accent);
-  color: var(--color-text-inverse);
+  /* ARGOnite: the primary-button pair (navy on DTA green). White on the dark
+     accent #29b480 is ~2.65:1; gated in colorContrast.test.ts. */
+  background-color: var(--color-btn-primary-bg);
+  color: var(--color-btn-primary-text);
   cursor: pointer;
 }
 
@@ -1382,8 +1384,10 @@
 
 .message-edit-fork {
   border: none;
-  background-color: var(--color-accent);
-  color: var(--color-text-inverse);
+  /* ARGOnite: the primary-button pair (navy on DTA green). White on the dark
+     accent #29b480 is ~2.65:1; gated in colorContrast.test.ts. */
+  background-color: var(--color-btn-primary-bg);
+  color: var(--color-btn-primary-text);
   border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: var(--font-size-xs);
@@ -2582,7 +2586,9 @@
 .ack-card-view-toggle--next {
   background: var(--color-btn-primary-bg);
   border-color: var(--color-btn-primary-bg);
-  color: var(--color-text-inverse);
+  /* ARGOnite: navy primary text on DTA green, matching .btn-primary. White
+     on #29b480 is ~2.65:1; gated in colorContrast.test.ts. */
+  color: var(--color-btn-primary-text);
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-medium);
 }
@@ -2590,7 +2596,7 @@
 .ack-card-view-toggle--next:hover {
   background: var(--color-btn-primary-bg-hover);
   border-color: var(--color-btn-primary-bg-hover);
-  color: var(--color-text-inverse);
+  color: var(--color-btn-primary-text);
 }
 
 .ack-card-prompt-template {
