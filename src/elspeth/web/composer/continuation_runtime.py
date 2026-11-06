@@ -862,13 +862,11 @@ def _capture_owner_data(
     if encode_recorder_snapshot(current_prefix) != recorder_chunk:
         raise AuditIntegrityError("runtime capture changed its complete current SQL recorder prefix")
     service = runtime.materialization.service
-    current_snapshot, current_catalog = service._policy_context.build(source.bootstrap.actor_user_id)
+    current_snapshot, _current_catalog = service._policy_context.build(source.bootstrap.actor_user_id)
     if (
         current_snapshot.snapshot_hash != bindings.plugin_snapshot.snapshot_hash
         or current_snapshot.policy_hash != bindings.plugin_snapshot.policy_hash
         or canonical_json(live.tools) != canonical_json(composer_loop_tool_definitions(service._planner_dialect))
-        or canonical_json(current_catalog.validate_composition_state(live.state).authored_state.to_dict())
-        != canonical_json(live.state.to_dict())
     ):
         raise AuditIntegrityError("runtime capture requires current policy/tools/state reacquisition")
     composition_scope_for_operation(

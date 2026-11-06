@@ -404,7 +404,7 @@ async def test_late_costed_runtime_source_refusal_leaves_provider_and_disclosure
     before = rows()
     try:
         assert provider.cost_budget is None
-        with pytest.raises(AuditIntegrityError, match="cold evidence storage differs from its selected bytes") as refused:
+        with pytest.raises(AuditIntegrityError, match="private chunk complete byte bound or SQL binding mismatch") as refused:
             await restore_continuation_runtime(**arguments)
         assert refusals == [(True, refused.value)] and len(corrupted_rows) == 1
         assert provider.cost_budget is None

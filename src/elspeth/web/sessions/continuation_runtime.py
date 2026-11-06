@@ -26,7 +26,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicyV4,
     decode_continuation_policy,
 )
-from elspeth.web.composer.continuation_prompt_producers import _CurrentProducerInputs, _read_current_inputs
+from elspeth.web.composer.continuation_prompt_producers import _CurrentProducerInputs, _read_runtime_inputs_on_connection
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.provider_cost import CommonProviderCostSnapshot
 from elspeth.web.coordination.database_clock import database_now
@@ -112,8 +112,12 @@ def read_runtime_source_on_connection(
     # checks. A pending attachment is proved by the actual attachment SQL owner
     # inside this current evidence boundary before its original graph restores.
     # No historical authorization class or second bootstrap grant.
-    inputs = _read_current_inputs(conn, selected=selected, inventory=inventory, _prior_evidence=_prior_evidence)
-    return _runtime_source_from_inputs_on_connection(conn, running, selected=selected, inventory=inventory, inputs=inputs)
+    inputs, current_chunks = _read_runtime_inputs_on_connection(
+        conn, selected=selected, inventory=inventory, _prior_evidence=_prior_evidence
+    )
+    return _runtime_source_from_inputs_on_connection(
+        conn, running, selected=selected, inventory=inventory, inputs=inputs, _current_chunks=current_chunks
+    )
 
 
 def _runtime_source_from_inputs_on_connection(
@@ -125,6 +129,7 @@ def _runtime_source_from_inputs_on_connection(
     inputs: _CurrentProducerInputs,
     owed_tool_prefix: tuple[str, ...] | None = None,
     owed_tool_issue: str | None = None,
+    _current_chunks: tuple[PrivateChunk, ...] | None = None,
 ) -> ContinuationRuntimeSource:
     """Finish the same current SQL read using its already admitted DATA."""
     # Keep the later live claim/lease/CAS and explicit running-owner check.
@@ -172,8 +177,16 @@ def _runtime_source_from_inputs_on_connection(
             conn, running, selected=selected, evidence=inputs.admitted_evidence, env_ref_names=inventory.names
         )
     current = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
-    if load_selected_private_chunks_on_connection(conn, running, current) != selected.chunks:
-        raise AuditIntegrityError("runtime read changed its complete current SQL chunk cohort")
+    if _current_chunks is None:
+        if load_selected_private_chunks_on_connection(conn, running, current) != selected.chunks:
+            raise AuditIntegrityError("runtime read changed its complete current SQL chunk cohort")
+    elif (
+        current.checkpoint_id != selected.checkpoint_id
+        or current.cursor != selected.stack.cursor
+        or current.payload_json != inventory.selection.snapshot_json
+        or _current_chunks != selected.chunks
+    ):
+        raise AuditIntegrityError("runtime read changed its acquired root or complete chunk cohort")
     frames = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
     if len(frames) != 1:
         raise AuditIntegrityError("runtime requires its one complete Compose owner")

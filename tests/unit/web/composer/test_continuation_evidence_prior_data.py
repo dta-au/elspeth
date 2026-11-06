@@ -6,6 +6,7 @@ import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import continuation_evidence as evidence
+from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors
 from elspeth.web.composer.continuation_evidence_graph import capture_turn_evidence
 from tests.unit.web.composer.test_continuation_active_evidence_graph import active_graph
@@ -41,6 +42,43 @@ def _repeat(prior, *, source=None, names=frozenset(), chunks=None):
         source_chunks=prior.dependency_chunks if chunks is None else chunks,
         _prior_evidence=prior,
     )
+
+
+@pytest.mark.parametrize("construction", ("model_copy", "model_construct"))
+def test_direct_snapshot_admission_retains_checked_decision_independent_of_caller_mapping(monkeypatch, record_property, construction):
+    prior = _original(monkeypatch, graph=False)
+    assert prior.graph is None and prior.snapshot.decision_shelf
+    checked = evidence.TurnEvidenceSnapshot.model_validate_json(prior.source_chunk.canonical)
+    assert checked == prior.snapshot
+    decision_values = tuple(decision.model_dump() for decision in prior.snapshot.decision_shelf)
+    assert tuple(AdvisorAbandonmentResponse.model_validate(value) for value in decision_values) == checked.decision_shelf
+    if construction == "model_copy":
+        candidate = prior.snapshot.model_copy(update={"decision_shelf": decision_values})
+    else:
+        candidate = evidence.TurnEvidenceSnapshot.model_construct(**{**prior.snapshot.__dict__, "decision_shelf": decision_values})
+
+    admitted = evidence.admit_turn_evidence(
+        candidate,
+        env_ref_names=prior.env_ref_names,
+        source_chunks=prior.dependency_chunks,
+    )
+    assert admitted.source_chunk == prior.source_chunk and admitted.graph is None
+    admitted._require_original_graph()
+    record_property("direct_decision_mapping_retained", admitted.snapshot.decision_shelf[0] is decision_values[0])
+    record_property("direct_decision_retained_type", type(admitted.snapshot.decision_shelf[0]).__name__)
+
+    # This changes ordinary caller-owned input after successful admission;
+    # neither frozen-model backing storage nor an application graph is edited.
+    changed_reason = "Changed caller-owned decision after admission"
+    assert changed_reason != checked.decision_shelf[0].reason
+    decision_values[0]["reason"] = changed_reason
+    assert admitted.source_chunk == prior.source_chunk and admitted.graph is None
+    assert admitted.snapshot == checked, "admitted snapshot retained mutable caller input instead of its checked DATA"
+    assert type(admitted.snapshot.decision_shelf[0]) is AdvisorAbandonmentResponse
+    repeated = _repeat(admitted)
+    assert repeated.snapshot is admitted.snapshot and repeated.source_chunk == prior.source_chunk
+    assert repeated.take_graph() is None
+    assert admitted.take_graph() is None
 
 
 @pytest.mark.parametrize("graph", (False, True), ids=("graphless", "active-graph"))

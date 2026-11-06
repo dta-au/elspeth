@@ -717,12 +717,16 @@ def test_early_profile_preserves_actual_witness_callable_gate_result_and_error(m
                 witness = RequiredInvocationWitness(1)
                 original_bound = witness.invoke
                 future = executor.submit(original_bound, successful)
-                wait_until = time.monotonic() + 5
-                while not witness.snapshot().entered and time.monotonic() < wait_until:
-                    time.sleep(0.001)
-                assert witness.snapshot().entered and witness.snapshot().gate is InvocationGate.WAITING
-                assert not witness.snapshot().callable_started and not future.done() and len(calls) == 1
-                witness.arm()
+                try:
+                    wait_until = time.monotonic() + 5
+                    while not witness.snapshot().entered and time.monotonic() < wait_until:
+                        time.sleep(0.001)
+                    assert witness.snapshot().entered and witness.snapshot().gate is InvocationGate.WAITING
+                    assert not witness.snapshot().callable_started and not future.done() and len(calls) == 1
+                    witness.arm()
+                finally:
+                    if witness.snapshot().gate is InvocationGate.WAITING:
+                        witness.abort()
                 assert future.result(timeout=5) is marker
                 failed = RequiredInvocationWitness(1)
                 failed_bound = failed.invoke
@@ -766,6 +770,29 @@ def test_early_profile_preserves_actual_witness_callable_gate_result_and_error(m
         assert ThreadPoolExecutor.submit is actual_submit
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("enabled", (False, True), ids=("inclusive-only", "selected-spans"))
+def test_early_profile_prearm_refusal_aborts_actual_waiting_worker_and_preserves_error(monkeypatch, enabled):
+    original_arm = RequiredInvocationWitness.arm
+    original_error = RuntimeError("original refusal before witness arm")
+    refused = []
+
+    def refuse_first_arm(witness):
+        if not refused:
+            actual = witness.snapshot()
+            assert actual.entered and actual.gate is InvocationGate.WAITING and not actual.callable_started
+            refused.append(witness)
+            raise original_error
+        return original_arm(witness)
+
+    monkeypatch.setattr(RequiredInvocationWitness, "arm", refuse_first_arm)
+    with pytest.raises(RuntimeError) as raised:
+        test_early_profile_preserves_actual_witness_callable_gate_result_and_error(monkeypatch, enabled)
+    assert raised.value is original_error and len(refused) == 1
+    actual = refused[0].snapshot()
+    assert actual.valid_aborted_exit and actual.gate is InvocationGate.ABORTED
+    assert not actual.callable_started and not actual.callable_finished
 
 
 def test_early_profile_flush_keeps_original_exception_and_reports_output_failure(tmp_path):

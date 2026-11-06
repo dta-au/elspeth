@@ -1,7 +1,10 @@
 """Actual checkpoint capture DATA, independent owners and fresh source checks."""
 
+import asyncio
 import json
-from contextlib import asynccontextmanager
+import threading
+import time
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import replace
 from hashlib import sha256
 
@@ -22,11 +25,13 @@ from elspeth.web.composer.continuation_selection import load_selected_continuati
 from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
+from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_end import enter_continuation_end, execute_continuation_end_review
 from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
 from elspeth.web.sessions.models import quota_provider_attempts_table as physical
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.helpers.continuation_policy import continuation_test_settings
@@ -245,6 +250,168 @@ async def test_actual_early_capture_pair_preserves_isolation_and_rejects_late_mu
 
 class _PreparedEndObserved(Exception):
     """Stop this source-only control before any END provider request."""
+
+
+async def _wait_for_original_preparation_expiry(clock):
+    clock.require_preparation_time()
+    await asyncio.sleep(max(0.0, clock.preparation_deadline_monotonic - time.monotonic()) + 0.01)
+    with pytest.raises(TimeoutError, match="continuation preparation allowance expired"):
+        clock.require_preparation_time()
+
+
+def _paid_preparation_rows(engine):
+    with engine.connect() as conn:
+        return tuple(tuple(conn.execute(select(table).order_by(*table.primary_key.columns)).all()) for table in (physical, usage, holds))
+
+
+@contextmanager
+def _observe_preparation_boundaries(monkeypatch, module, sessions, clock, boundary):
+    """Observe real capture/SQL, stopping at the next detached entry only."""
+    observed = []
+    source_calls = []
+    worker_threads = []
+    loop_thread = threading.get_ident()
+    original_capture = module.capture_continuation_runtime_data
+    original_registered = module._registered
+    original_source = sessions.prepare_v4_checkpoint_source_sync
+
+    async def capture(*args, **kwargs):
+        observed.append("capture")
+        result = await original_capture(*args, **kwargs)
+        if boundary == "after_capture":
+            await _wait_for_original_preparation_expiry(clock)
+        return result
+
+    def prepare_source(*, prepared):
+        source_calls.append(prepared)
+        return original_source(prepared=prepared)
+
+    async def registered(*, work, source, operation, expected):
+        def invoke():
+            worker_threads.append(threading.get_ident())
+            assert worker_threads[-1] != loop_thread
+            observed.append("worker")
+            if boundary == "worker_entry":
+                # Delay the actual worker handoff, with no transaction open.
+                # The original callable must check before invoking source SQL.
+                clock.require_preparation_time()
+                time.sleep(max(0.0, clock.preparation_deadline_monotonic - time.monotonic()) + 0.01)
+            return operation()
+
+        result = await original_registered(work=work, source=source, operation=invoke, expected=expected)
+        observed.append("source")
+        if boundary == "after_source":
+            await _wait_for_original_preparation_expiry(clock)
+        return result
+
+    async def detached(**_arguments):
+        observed.append("detached")
+        raise _PreparedEndObserved
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "capture_continuation_runtime_data", capture)
+        patch.setattr(module, "_registered", registered)
+        patch.setattr(sessions, "prepare_v4_checkpoint_source_sync", prepare_source)
+        patch.setattr(detached_module, "restore_captured_checkpoint_runtime", detached)
+        yield observed, source_calls, worker_threads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ("unexpired", "before_capture", "after_capture", "worker_entry", "after_source"))
+async def test_early_preparation_expiry_stops_next_unpaid_phase(operation_store, tmp_path, monkeypatch, boundary):
+    async with _early_case(operation_store, tmp_path, monkeypatch) as (_store, owner, running, selected, primary_sdk):
+        clock = owner.action_clock
+        assert type(clock) is ContinuationActionClock and clock.policy.preparation == 5.0
+        clock.require_preparation_time()
+        started = clock.started_monotonic
+        deadline = clock.preparation_deadline_monotonic
+        paid_before = _paid_preparation_rows(operation_store[0])
+        sdk = []
+
+        async def unexpected_sdk(**_arguments):
+            sdk.append(1)
+            pytest.fail("unpaid preparation control entered a new SDK call")
+
+        monkeypatch.setattr(litellm, "acompletion", unexpected_sdk)
+        with _observe_preparation_boundaries(monkeypatch, early_module, owner.service._sessions_service, clock, boundary) as observed:
+            if boundary == "before_capture":
+                await _wait_for_original_preparation_expiry(clock)
+            expected = _PreparedEndObserved if boundary == "unexpired" else TimeoutError
+            with pytest.raises(expected) as caught:
+                async with _early_attempt(owner, selected) as source:
+                    await _invoke_early(source)
+        calls, source_calls, worker_threads = observed
+        expected_calls = {
+            "unexpired": ["capture", "worker", "source", "detached"],
+            "before_capture": [],
+            "after_capture": ["capture"],
+            "worker_entry": ["capture", "worker"],
+            "after_source": ["capture", "worker", "source"],
+        }
+        assert calls == expected_calls[boundary]
+        assert len(source_calls) == int(boundary in ("unexpired", "after_source"))
+        assert len(worker_threads) == int(boundary in ("unexpired", "worker_entry", "after_source"))
+        assert owner.action_clock is clock and (clock.started_monotonic, clock.preparation_deadline_monotonic) == (started, deadline)
+        assert len(primary_sdk) == 1 and sdk == []
+        assert _paid_preparation_rows(operation_store[0]) == paid_before
+        if boundary != "unexpired":
+            assert str(caught.value) == "continuation preparation allowance expired"
+            assert owner.runtime is not None
+            error = project_composer_operation_error(caught.value, request_id=None)
+            terminal = owner.authority.settle_continuation_owner(running, outcome=error, env_ref_names=owner.runtime.env_ref_names)
+            assert terminal.status == "failed" and terminal.failure_code == error.failure_code
+            assert _paid_preparation_rows(operation_store[0]) == paid_before and sdk == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ("unexpired", "before_capture", "after_capture", "worker_entry", "after_source"))
+async def test_end_preparation_expiry_stops_next_unpaid_phase(operation_store, tmp_path, monkeypatch, boundary):
+    async with _actual_end(operation_store, tmp_path, monkeypatch) as (phases, selected, _primary):
+        clock = phases.action_clock
+        assert type(clock) is ContinuationActionClock and clock.policy.preparation == 5.0
+        clock.require_preparation_time()
+        started = clock.started_monotonic
+        deadline = clock.preparation_deadline_monotonic
+        paid_before = _paid_preparation_rows(operation_store[0])
+        observed = []
+
+        async def gate(**arguments):
+            owner = arguments["checkpoint_phase_owner"]
+            assert owner.phases is phases and phases.action_clock is clock
+            with _observe_preparation_boundaries(monkeypatch, physical_module, phases.service._sessions_service, clock, boundary) as actual:
+                observed.append(actual)
+                if boundary == "before_capture":
+                    await _wait_for_original_preparation_expiry(clock)
+                await physical_module.prepare_checkpoint_end_physical_source(
+                    phase_owner=owner, gate_locals=arguments["checkpoint_end_input"]
+                )
+
+        monkeypatch.setattr(phases.service._advisor_checkpoint, "_run_advisor_checkpoint", gate)
+        expected = _PreparedEndObserved if boundary == "unexpired" else TimeoutError
+        with pytest.raises(expected) as caught:
+            await execute_continuation_end_review(phases, selected)
+        assert len(observed) == 1
+        calls, source_calls, worker_threads = observed[0]
+        expected_calls = {
+            "unexpired": ["capture", "worker", "source", "detached"],
+            "before_capture": [],
+            "after_capture": ["capture"],
+            "worker_entry": ["capture", "worker"],
+            "after_source": ["capture", "worker", "source"],
+        }
+        assert calls == expected_calls[boundary]
+        assert len(source_calls) == int(boundary in ("unexpired", "after_source"))
+        assert len(worker_threads) == int(boundary in ("unexpired", "worker_entry", "after_source"))
+        assert phases.action_clock is clock and (clock.started_monotonic, clock.preparation_deadline_monotonic) == (started, deadline)
+        assert _paid_preparation_rows(operation_store[0]) == paid_before
+        if boundary != "unexpired":
+            assert str(caught.value) == "continuation preparation allowance expired"
+            running = phases.work.running
+            assert running is not None and phases.runtime is not None
+            error = project_composer_operation_error(caught.value, request_id=None)
+            terminal = phases.authority.settle_continuation_owner(running, outcome=error, env_ref_names=phases.runtime.env_ref_names)
+            assert terminal.status == "failed" and terminal.failure_code == error.failure_code
+            assert _paid_preparation_rows(operation_store[0]) == paid_before
 
 
 @asynccontextmanager

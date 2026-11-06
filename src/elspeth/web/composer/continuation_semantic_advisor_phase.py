@@ -186,57 +186,81 @@ async def _finish_physical(
 
 
 async def _consume_current_decision(phases: ContinuationLivePhases, selected: SelectedContinuationState) -> None:
-    running = phases.work.running
-    frame = selected.stack.frames[-1]
-    if type(running) is not ComposerOperationRunning or type(frame) is not AdvisorFrame or frame.provider_effect_key is None:
-        raise AuditIntegrityError("Semantic consumer lost its exact current decision source")
-    if frame.phase not in ("response_retained", "decision_ready"):
-        raise AuditIntegrityError("Semantic consumer cannot replay unresolved prepared/begun provider work")
-    effect_key = frame.provider_effect_key
-    stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
+    pending = phases._pending_semantic_review_output
+    phases._pending_semantic_review_output = None
+    try:
+        running = phases.work.running
+        frame = selected.stack.frames[-1]
+        if type(running) is not ComposerOperationRunning or type(frame) is not AdvisorFrame or frame.provider_effect_key is None:
+            raise AuditIntegrityError("Semantic consumer lost its exact current decision source")
+        if frame.phase not in ("response_retained", "decision_ready"):
+            raise AuditIntegrityError("Semantic consumer cannot replay unresolved prepared/begun provider work")
+        effect_key = frame.provider_effect_key
+        stored = StoredContinuationSnapshot(encode_continuation_snapshot(selected.stack), selected.stack.cursor, selected.checkpoint_id)
 
-    def consume(conn: Connection) -> StoredContinuationSnapshot:
-        current = stored
-        if frame.phase == "response_retained":
-            current = install_current_semantic_decision_on_connection(conn, running, selected=current, effect_key=effect_key)
-        root = decode_continuation_snapshot(current.payload_json)
-        action = decode_prescribed_continuation_action(root.active_action_json) if root.active_action_json is not None else None
-        if type(action) is PrimaryContinuationAction:
-            return consume_semantic_advisor_primary_on_connection(conn, running, selected=current, effect_key=effect_key)
-        if type(action) is ReviewContinuationAction:
-            return consume_semantic_advisor_review_on_connection(conn, running, selected=current, effect_key=effect_key)
-        if type(action) is ReadContinuationAction:
-            # The following real read action receives the original read policy.
-            return current
-        from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
+        def consume(conn: Connection) -> StoredContinuationSnapshot:
+            current = stored
+            if frame.phase == "response_retained":
+                current = install_current_semantic_decision_on_connection(conn, running, selected=current, effect_key=effect_key)
+            root = decode_continuation_snapshot(current.payload_json)
+            action = decode_prescribed_continuation_action(root.active_action_json) if root.active_action_json is not None else None
+            if type(action) is PrimaryContinuationAction:
+                return consume_semantic_advisor_primary_on_connection(conn, running, selected=current, effect_key=effect_key)
+            if type(action) is ReviewContinuationAction:
+                return consume_semantic_advisor_review_on_connection(conn, running, selected=current, effect_key=effect_key)
+            if type(action) is ReadContinuationAction:
+                # The following real read action receives the original read policy.
+                return current
+            from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
-        original = semantic_recovery_source(conn, str(running.claim.session_id), running.claim.operation_id, current).snapshot
+            original = semantic_recovery_source(conn, str(running.claim.session_id), running.claim.operation_id, current).snapshot
+            if (
+                _semantic_checkpoint_kind_data(conn, str(running.claim.session_id), running.claim.operation_id, original.cursor)
+                == "semantic_read_committed"
+            ):
+                return consume_committed_semantic_read_on_connection(conn, running, selected=current, effect_key=effect_key)
+            if len(root.frames) == 3 and type(root.frames[1]) is ToolBatchFrame:
+                return consume_semantic_advisor_terminal_iteration_stop_on_connection(
+                    conn, running, selected=current, effect_key=effect_key
+                )
+            return consume_semantic_advisor_end_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
+
+        def transaction() -> StoredContinuationSnapshot:
+            with borrow_v4_preparation_memo_scope():
+                return _transaction(phases, consume)
+
+        clock = phases.action_clock
+        if clock is None:
+            raise AuditIntegrityError("Semantic consume lost its original driver SQL action clock")
+        # This is the new SQL action's lexical owner, not the preceding provider's
+        # preparation. Joining the registered outcome closes it without finishing
+        # or changing the original SQL clock.
+        with v4_preparation_memo_scope(clock):
+            phases.latest_snapshot = await _registered(
+                work=phases.work,
+                source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+                operation=transaction,
+                expected=StoredContinuationSnapshot,
+            )
         if (
-            _semantic_checkpoint_kind_data(conn, str(running.claim.session_id), running.claim.operation_id, original.cursor)
-            == "semantic_read_committed"
+            pending is not None
+            and pending[1] == stored
+            and pending[0].decision is not None
+            and type(pending[0].decision.prescribed_action) is ReviewContinuationAction
+            and not phases.cancellation_requested.is_set()
         ):
-            return consume_committed_semantic_read_on_connection(conn, running, selected=current, effect_key=effect_key)
-        if len(root.frames) == 3 and type(root.frames[1]) is ToolBatchFrame:
-            return consume_semantic_advisor_terminal_iteration_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
-        return consume_semantic_advisor_end_stop_on_connection(conn, running, selected=current, effect_key=effect_key)
-
-    def transaction() -> StoredContinuationSnapshot:
-        with borrow_v4_preparation_memo_scope():
-            return _transaction(phases, consume)
-
-    clock = phases.action_clock
-    if clock is None:
-        raise AuditIntegrityError("Semantic consume lost its original driver SQL action clock")
-    # This is the new SQL action's lexical owner, not the preceding provider's
-    # preparation. Joining the registered outcome closes it without finishing
-    # or changing the original SQL clock.
-    with v4_preparation_memo_scope(clock):
-        phases.latest_snapshot = await _registered(
-            work=phases.work,
-            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-            operation=transaction,
-            expected=StoredContinuationSnapshot,
-        )
+            ready = decode_continuation_snapshot(phases.latest_snapshot.payload_json)
+            paid = decode_continuation_snapshot(pending[0].snapshot.payload_json)
+            if (
+                len(ready.frames) == 2
+                and type(ready.frames[-1]) is EndFrame
+                and ready.frames[0] == paid.frames[0]
+                and ready.active_action_json is not None
+                and type(decode_prescribed_continuation_action(ready.active_action_json)) is ReviewContinuationAction
+            ):
+                phases._pending_semantic_review_output = pending[0], phases.latest_snapshot, pending[2]
+    finally:
+        pending = None
 
 
 async def run_prescribed_semantic_read(phases: ContinuationLivePhases, selected: SelectedContinuationState) -> None:
@@ -416,169 +440,182 @@ async def _run_semantic_advisor_preparation(
         input_sha256=request.request_sha256,
         clock=clock,
     )
-    prepared = await _registered(
-        work=phases.work,
-        source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-        operation=lambda: _transaction(
-            phases,
-            lambda conn: prepare_semantic_advisor_on_connection(
-                conn,
-                running,
-                selected=selected,
-                invocation=invocation,
-                request=request,
-                inventory=inventory,
-                no_sdk_issuer=issuer,
-            ),
-        ),
-        expected=PreparedContinuationProvider,
-    )
-    issuer.bind_prepared(prepared)
-    if type(policy) is ContinuationAdmissionPolicyV4:
-        if type(phases.service._sessions_service) is not SessionServiceImpl:
-            raise AuditIntegrityError("V4 semantic Advisor requires the original session SQL owner")
-        session_service = phases.service._sessions_service
-
-        async def finalize_paid(
-            observation: SemanticProviderResponseObservation, ticket: RequiredWorkTicket
-        ) -> RequiredSQLFinishOnce[SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal]:
-            deadline_owner = phases.work.coordinator.sql_deadline_owner
-            if deadline_owner is not None:
-                deadline_owner.begin_settlement()
-            outcome = await run_required_sql_finish_once(
-                ticket,
-                lambda: session_service.complete_v4_semantic_result_sync(
-                    prepared=prepared,
-                    admission=issuer.require_original_v4_admission(prepared),
-                    observation=observation,
-                    recorder=runtime.live.recorder,
-                    no_sdk_issuer=issuer,
-                ),
-            )
-            phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
-            return outcome
-
-        async def finalize_incomplete(
-            incomplete: V4ProviderResultIncomplete, ticket: RequiredWorkTicket
-        ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
-            deadline_owner = phases.work.coordinator.sql_deadline_owner
-            if deadline_owner is not None:
-                deadline_owner.begin_settlement()
-            outcome = await run_required_sql_finish_once(
-                ticket,
-                lambda: session_service.complete_v4_semantic_paid_incomplete_sync(
-                    prepared=prepared,
-                    admission=issuer.require_original_v4_admission(prepared),
-                    incomplete=incomplete,
-                    no_sdk_issuer=issuer,
-                ),
-            )
-            phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
-            return outcome
-
-        async def finalize_sdk(
-            observation: V4SdkFailureObservation, ticket: RequiredWorkTicket
-        ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
-            deadline_owner = phases.work.coordinator.sql_deadline_owner
-            if deadline_owner is not None:
-                deadline_owner.begin_settlement()
-            custody = issuer.require_original_sdk_custody(prepared, observation)
-            outcome = await session_service.finalize_v4_sdk_terminal(observation=observation, custody=custody, required_work=ticket)
-            phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
-            return outcome
-
-        observed_v4: SemanticAdvisorInvocationV4Finalized | SemanticAdvisorInvocationRaised | None = None
-        try:
-            remaining = clock.deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise TimeoutError("Semantic action exhausted its original allowance before physical dispatch")
-            observed_v4 = await observe_semantic_advisor_invocation(
-                request,
-                provider_owner=phases.provider_owner,
-                recorder=runtime.live.recorder,
-                timeout=remaining,
-                no_sdk_issuer=issuer,
-                v4_prepared=prepared,
-                v4_env_ref_names=runtime.env_ref_names,
-                v4_finalizer=finalize_paid,
-                v4_incomplete_finalizer=finalize_incomplete,
-                v4_sdk_finalizer=finalize_sdk,
-            )
-            if type(observed_v4) is SemanticAdvisorInvocationV4Finalized:
-                paid_finalization = observed_v4.finalization
-                if type(paid_finalization.result) is VerifiedSemanticPaidOverflowTerminal:
-                    return SemanticAdvisorPaidTerminal(paid_finalization.result, paid_finalization.deferred_cancellations)
-                if type(paid_finalization.result) is not SemanticAdvisorProviderResult:
-                    raise AuditIntegrityError("V4 semantic Advisor lost its exact paid result variant")
-                if paid_finalization.result.original_error is not None:
-                    return SemanticAdvisorPaidInvalidTerminal(
-                        paid_finalization.result,
-                        paid_finalization.result.original_error,
-                        paid_finalization.deferred_cancellations,
-                    )
-                phases.latest_snapshot = paid_finalization.result.snapshot
-                retained_parent = decode_continuation_snapshot(paid_finalization.result.snapshot.payload_json).frames[0]
-                if type(retained_parent) is not ComposeFrame:
-                    raise AuditIntegrityError("V4 semantic paid finish lost its Compose counter owner")
-                runtime.live.advisor_calls_used = retained_parent.advisor_calls
-                if paid_finalization.deferred_cancellations:
-                    raise combine_failure_objects(
-                        paid_finalization.deferred_cancellations[0], *paid_finalization.deferred_cancellations[1:]
-                    )
-                return None
-            if type(observed_v4) is not SemanticAdvisorInvocationRaised:
-                raise AuditIntegrityError("V4 semantic Advisor lost its original physical observation")
-            sdk_terminal = issuer.require_v4_sdk_outcome(prepared, observed_v4)
-            if sdk_terminal is not None:
-                return sdk_terminal
-            if type(observed_v4.error) is V4PaidIncompleteCommitted:
-                finalized_incomplete = issuer.require_v4_paid_incomplete_committed(prepared, observed_v4)
-                return SemanticAdvisorPaidIncompleteTerminal(finalized_incomplete.verified, finalized_incomplete.deferred_cancellations)
-            if observed_v4.observation.sdk_entered:
-                # Preserve unrelated original failures. Complete invalid SDK
-                # returns and their paid terminal are handled above.
-                raise observed_v4.error
-            original = observed_v4.observation.original_failure
-            reason = None if original is None else _refusal_reason(original)
-            admission = issuer.original_v4_admission_or_none(prepared)
-            if reason is None or original is None or admission is None:
-                raise observed_v4.error
-            no_sdk_reason = reason
-            no_sdk_original = original
-            sql, projection = phases.work.reserve_pair(
-                RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
-            )
-            deadline_owner = phases.work.coordinator.sql_deadline_owner
-            if deadline_owner is not None:
-                deadline_owner.begin_settlement()
-            closed, deferred = await _finish_physical(
+    output = None
+    try:
+        prepared = await _registered(
+            work=phases.work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=lambda: _transaction(
                 phases,
-                sql,
-                projection,
-                lambda: _transaction(
-                    phases,
-                    lambda conn: _PhysicalFinish(
-                        terminal=close_v4_semantic_no_sdk_on_connection(
-                            conn,
-                            service=session_service,
-                            prepared=prepared,
-                            admission=admission,
-                            issuer=issuer,
-                            reason=no_sdk_reason,
-                            original_failure=no_sdk_original,
-                        )
-                    ),
+                lambda conn: prepare_semantic_advisor_on_connection(
+                    conn,
+                    running,
+                    selected=selected,
+                    invocation=invocation,
+                    request=request,
+                    inventory=inventory,
+                    no_sdk_issuer=issuer,
                 ),
-            )
-            if closed.terminal is None:
-                raise AuditIntegrityError("V4 semantic no-SDK finish lost its failed terminal")
-            cancellations = list(_native_cancellations(observed_v4.error))
-            cancellations.extend(item for item in deferred if all(item is not prior for prior in cancellations))
-            return SemanticAdvisorNoSdkTerminal(closed.terminal, observed_v4.error, tuple(cancellations))
-        except BaseException as failure:
-            if type(observed_v4) is SemanticAdvisorInvocationRaised:
-                combined = combine_failure_objects(observed_v4.error, failure)
-                if combined is not failure:
-                    raise combined from combined.__cause__
-            raise
-    raise AuditIntegrityError("Semantic preparation requires the current admitted policy")
+            ),
+            expected=PreparedContinuationProvider,
+        )
+        issuer.bind_prepared(prepared)
+        if type(policy) is ContinuationAdmissionPolicyV4:
+            if type(phases.service._sessions_service) is not SessionServiceImpl:
+                raise AuditIntegrityError("V4 semantic Advisor requires the original session SQL owner")
+            session_service = phases.service._sessions_service
+
+            async def finalize_paid(
+                observation: SemanticProviderResponseObservation, ticket: RequiredWorkTicket
+            ) -> RequiredSQLFinishOnce[SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal]:
+                deadline_owner = phases.work.coordinator.sql_deadline_owner
+                if deadline_owner is not None:
+                    deadline_owner.begin_settlement()
+                outcome = await run_required_sql_finish_once(
+                    ticket,
+                    lambda: session_service.complete_v4_semantic_result_sync(
+                        prepared=prepared,
+                        admission=issuer.require_original_v4_admission(prepared),
+                        observation=observation,
+                        recorder=runtime.live.recorder,
+                        no_sdk_issuer=issuer,
+                    ),
+                )
+                phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
+                return outcome
+
+            async def finalize_incomplete(
+                incomplete: V4ProviderResultIncomplete, ticket: RequiredWorkTicket
+            ) -> RequiredSQLFinishOnce[VerifiedPaidIncompleteTerminal]:
+                deadline_owner = phases.work.coordinator.sql_deadline_owner
+                if deadline_owner is not None:
+                    deadline_owner.begin_settlement()
+                outcome = await run_required_sql_finish_once(
+                    ticket,
+                    lambda: session_service.complete_v4_semantic_paid_incomplete_sync(
+                        prepared=prepared,
+                        admission=issuer.require_original_v4_admission(prepared),
+                        incomplete=incomplete,
+                        no_sdk_issuer=issuer,
+                    ),
+                )
+                phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
+                return outcome
+
+            async def finalize_sdk(
+                observation: V4SdkFailureObservation, ticket: RequiredWorkTicket
+            ) -> RequiredSQLFinishOnce[VerifiedSdkTerminal]:
+                deadline_owner = phases.work.coordinator.sql_deadline_owner
+                if deadline_owner is not None:
+                    deadline_owner.begin_settlement()
+                custody = issuer.require_original_sdk_custody(prepared, observation)
+                outcome = await session_service.finalize_v4_sdk_terminal(observation=observation, custody=custody, required_work=ticket)
+                phases.work.coordinator.validate_provider_settlement_sql_outcome(ticket=ticket, actual_outcome=outcome)
+                return outcome
+
+            observed_v4: SemanticAdvisorInvocationV4Finalized | SemanticAdvisorInvocationRaised | None = None
+            try:
+                remaining = clock.deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("Semantic action exhausted its original allowance before physical dispatch")
+                observed_v4 = await observe_semantic_advisor_invocation(
+                    request,
+                    provider_owner=phases.provider_owner,
+                    recorder=runtime.live.recorder,
+                    timeout=remaining,
+                    no_sdk_issuer=issuer,
+                    v4_prepared=prepared,
+                    v4_env_ref_names=runtime.env_ref_names,
+                    v4_finalizer=finalize_paid,
+                    v4_incomplete_finalizer=finalize_incomplete,
+                    v4_sdk_finalizer=finalize_sdk,
+                )
+                if type(observed_v4) is SemanticAdvisorInvocationV4Finalized:
+                    paid_finalization = observed_v4.finalization
+                    if type(paid_finalization.result) is VerifiedSemanticPaidOverflowTerminal:
+                        return SemanticAdvisorPaidTerminal(paid_finalization.result, paid_finalization.deferred_cancellations)
+                    if type(paid_finalization.result) is not SemanticAdvisorProviderResult:
+                        raise AuditIntegrityError("V4 semantic Advisor lost its exact paid result variant")
+                    if paid_finalization.result.original_error is not None:
+                        return SemanticAdvisorPaidInvalidTerminal(
+                            paid_finalization.result,
+                            paid_finalization.result.original_error,
+                            paid_finalization.deferred_cancellations,
+                        )
+                    phases.latest_snapshot = paid_finalization.result.snapshot
+                    retained_parent = decode_continuation_snapshot(paid_finalization.result.snapshot.payload_json).frames[0]
+                    if type(retained_parent) is not ComposeFrame:
+                        raise AuditIntegrityError("V4 semantic paid finish lost its Compose counter owner")
+                    runtime.live.advisor_calls_used = retained_parent.advisor_calls
+                    if paid_finalization.deferred_cancellations:
+                        raise combine_failure_objects(
+                            paid_finalization.deferred_cancellations[0], *paid_finalization.deferred_cancellations[1:]
+                        )
+                    if (
+                        paid_finalization.result.decision is not None
+                        and type(paid_finalization.result.decision.prescribed_action) is ReviewContinuationAction
+                        and not phases.cancellation_requested.is_set()
+                    ):
+                        output = issuer.take_committed_output(prepared, observed_v4)
+                        if output is not None:
+                            phases._pending_semantic_review_output = (paid_finalization.result, paid_finalization.result.snapshot, output)
+                    return None
+                if type(observed_v4) is not SemanticAdvisorInvocationRaised:
+                    raise AuditIntegrityError("V4 semantic Advisor lost its original physical observation")
+                sdk_terminal = issuer.require_v4_sdk_outcome(prepared, observed_v4)
+                if sdk_terminal is not None:
+                    return sdk_terminal
+                if type(observed_v4.error) is V4PaidIncompleteCommitted:
+                    finalized_incomplete = issuer.require_v4_paid_incomplete_committed(prepared, observed_v4)
+                    return SemanticAdvisorPaidIncompleteTerminal(finalized_incomplete.verified, finalized_incomplete.deferred_cancellations)
+                if observed_v4.observation.sdk_entered:
+                    # Preserve unrelated original failures. Complete invalid SDK
+                    # returns and their paid terminal are handled above.
+                    raise observed_v4.error
+                original = observed_v4.observation.original_failure
+                reason = None if original is None else _refusal_reason(original)
+                admission = issuer.original_v4_admission_or_none(prepared)
+                if reason is None or original is None or admission is None:
+                    raise observed_v4.error
+                no_sdk_reason = reason
+                no_sdk_original = original
+                sql, projection = phases.work.reserve_pair(
+                    RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+                )
+                deadline_owner = phases.work.coordinator.sql_deadline_owner
+                if deadline_owner is not None:
+                    deadline_owner.begin_settlement()
+                closed, deferred = await _finish_physical(
+                    phases,
+                    sql,
+                    projection,
+                    lambda: _transaction(
+                        phases,
+                        lambda conn: _PhysicalFinish(
+                            terminal=close_v4_semantic_no_sdk_on_connection(
+                                conn,
+                                service=session_service,
+                                prepared=prepared,
+                                admission=admission,
+                                issuer=issuer,
+                                reason=no_sdk_reason,
+                                original_failure=no_sdk_original,
+                            )
+                        ),
+                    ),
+                )
+                if closed.terminal is None:
+                    raise AuditIntegrityError("V4 semantic no-SDK finish lost its failed terminal")
+                cancellations = list(_native_cancellations(observed_v4.error))
+                cancellations.extend(item for item in deferred if all(item is not prior for prior in cancellations))
+                return SemanticAdvisorNoSdkTerminal(closed.terminal, observed_v4.error, tuple(cancellations))
+            except BaseException as failure:
+                if type(observed_v4) is SemanticAdvisorInvocationRaised:
+                    combined = combine_failure_objects(observed_v4.error, failure)
+                    if combined is not failure:
+                        raise combined from combined.__cause__
+                raise
+        raise AuditIntegrityError("Semantic preparation requires the current admitted policy")
+    finally:
+        issuer.discard_committed_output()
+        output = None

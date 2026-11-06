@@ -237,9 +237,11 @@ async def prepare_checkpoint_end_physical_source(
         if sql_deadline.running is not running:
             raise AuditIntegrityError("END source changed its original SQL timing owner")
         sql_deadline.require_action_clock(clock)
+    clock.require_preparation_time()
     capture_data = await capture_continuation_runtime_data(
         phase_owner.runtime, selected=phase_owner.selected, inventory=phase_owner.inventory
     )
+    clock.require_preparation_time()
     captured = capture_data.captured
     if len(phase_owner.phase_source.completed_children) > 1:
         raise AuditIntegrityError("END physical source exceeded its one original format retry")
@@ -256,12 +258,19 @@ async def prepare_checkpoint_end_physical_source(
         authority=phases.authority,
         end_input=end_input,
     )
+
+    def prepare_source() -> CheckpointPreparedSource:
+        clock.require_preparation_time()
+        return sessions.prepare_v4_checkpoint_source_sync(prepared=preparation)
+
+    clock.require_preparation_time()
     prepared = await _registered(
         work=phases.work,
         source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-        operation=lambda: sessions.prepare_v4_checkpoint_source_sync(prepared=preparation),
+        operation=prepare_source,
         expected=CheckpointPreparedSource,
     )
+    clock.require_preparation_time()
     from elspeth.web.composer.continuation_checkpoint_end_detached import restore_captured_checkpoint_runtime
 
     detached, detached_capture = await restore_captured_checkpoint_runtime(

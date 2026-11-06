@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 from contextlib import AsyncExitStack
 from dataclasses import replace
 from datetime import timedelta
 from hashlib import sha256
+from threading import Lock
 
 import litellm
 import pytest
@@ -19,21 +22,25 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer import continuation_semantic_advisor as semantic_physical
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.bounded_json import PROVIDER_ARTIFACT_UNAVAILABLE
-from elspeth.web.composer.continuation import AdvisorFrame
+from elspeth.web.composer.continuation import AdvisorFrame, EndFrame
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import (
     decode_continuation_response,
     decode_continuation_snapshot,
     encode_continuation_snapshot,
 )
+from elspeth.web.composer.continuation_end_values import continuation_candidate_id, decode_end_candidate
+from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
+from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.continuation_semantic_advisor_phase import (
     SemanticAdvisorNoSdkTerminal,
     SemanticAdvisorPaidIncompleteTerminal,
     run_continuation_semantic_advisor,
 )
+from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource
 from elspeth.web.composer.provider_quota import ProviderCallCustody
@@ -44,12 +51,14 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.sessions import continuation_primary as primary_sql
 from elspeth.web.sessions import continuation_semantic_advisor as semantic_sql
+from elspeth.web.sessions import continuation_semantic_v4_complete as semantic_complete_sql
 from elspeth.web.sessions.continuation import load_snapshot, read_chunk
 from elspeth.web.sessions.continuation_cost import _closed_call
 from elspeth.web.sessions.continuation_semantic_advisor import read_semantic_advisor_outcome_on_connection
 from elspeth.web.sessions.continuation_semantic_paid_incomplete_terminal import read_v4_semantic_paid_incomplete_terminal_on_connection
 from elspeth.web.sessions.continuation_semantic_paid_overflow_no_sdk import reconstruct_semantic_no_sdk_tail_batch
 from elspeth.web.sessions.continuation_semantic_v4_no_sdk_terminal import read_v4_semantic_no_sdk_terminal_on_connection
+from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
@@ -135,6 +144,7 @@ async def test_v4_semantic_success_is_one_original_complete_result_and_consumed_
         phases = _phases(case)
         result = await run_continuation_semantic_advisor(phases, case["runtime"].source.selected)
         assert result is None and len(sdk) == 1
+        assert phases._pending_semantic_review_output is None
         running = case["running"]
         sid, operation = str(running.claim.session_id), running.claim.operation_id
         with store[0].connect() as conn:
@@ -146,6 +156,207 @@ async def test_v4_semantic_success_is_one_original_complete_result_and_consumed_
         assert physical.settled_at is not None and physical.ledger_entry_id == entries[0].entry_id
         assert effect.requested_model == sdk[0]
         assert len(entries) == 1 and entries[0].model == "test/model"
+
+
+def test_output_owner_lock_weakref_control():
+    lock = Lock()
+    observed = weakref.ref(lock)
+    retained = lock
+    assert observed() is lock
+    del lock
+    assert observed() is retained
+    del retained
+    assert observed() is None
+    replacement = Lock()
+    assert weakref.ref(replacement)() is replacement
+    assert observed() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ("read", "taken_prior", "stop", "disposed_before_stage", "late_ledger", "write_failure"))
+async def test_v4_semantic_review_delivers_actual_output_once_with_receipts_alive(operation_store, tmp_path, monkeypatch, finish):
+    store = _v4_store(operation_store, monkeypatch)
+    async with _semantic_case(store, tmp_path, monkeypatch, end_candidate=True) as case:
+        selected = case["runtime"].source.selected
+        end = selected.stack.frames[1]
+        assert type(end) is EndFrame
+        candidate = decode_end_candidate(next(chunk for chunk in selected.chunks if chunk.reference == end.candidate))
+        answer = _answer(case["request"])
+        action = answer["prescribed_action"]
+        del action["instruction"]
+        action.update(
+            kind="review",
+            candidate_ref=continuation_candidate_id(candidate),
+            evidence_binding=case["request"].source.coverage_binding,
+        )
+
+        async def completion(**_kwargs):
+            return _reply(json.dumps(answer))
+
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        produced_ids, output_locks, issuers, reads, stages = [], [], [], [], []
+        append_output = semantic_sql.append_primary_call_to_evidence
+        bind_prepared = SemanticAdvisorNoSdkIssuer.bind_prepared
+        stage_output = SemanticAdvisorNoSdkIssuer.stage_committed_output
+        take_output = SemanticAdvisorNoSdkIssuer.take_committed_output
+
+        def observe_append(*args, **kwargs):
+            actual = append_output(*args, **kwargs)
+            produced_ids.append(id(actual))
+            output_locks.append(weakref.ref(actual._graph_lock))
+            assert output_locks[-1]() is actual._graph_lock
+            return actual
+
+        def observe_bind(self, prepared):
+            bind_prepared(self, prepared)
+            issuers.append(self)
+
+        def observe_stage(self, prepared, result, output):
+            assert id(output) == produced_ids[-1]
+            stages.append(id(output))
+            # Reopen a fresh connection: staging must follow the real commit.
+            with store[0].connect() as conn:
+                actual = load_snapshot(conn, session_id=str(store[4]), operation_id=case["running"].claim.operation_id)
+            assert actual == result.snapshot
+            if finish == "disposed_before_stage":
+                self.discard_committed_output()
+            stage_output(self, prepared, result, output)
+
+        def observe_take(self, prepared, finalized):
+            if not self._output_closed:
+                with pytest.raises(AuditIntegrityError, match="original finalized delivery"):
+                    take_output(self, prepared, replace(finalized))
+            return take_output(self, prepared, finalized)
+
+        monkeypatch.setattr(semantic_sql, "append_primary_call_to_evidence", observe_append)
+        monkeypatch.setattr(SemanticAdvisorNoSdkIssuer, "bind_prepared", observe_bind)
+        monkeypatch.setattr(SemanticAdvisorNoSdkIssuer, "stage_committed_output", observe_stage)
+        monkeypatch.setattr(SemanticAdvisorNoSdkIssuer, "take_committed_output", observe_take)
+        phases = _phases(case)
+        if finish == "write_failure":
+            persist = semantic_complete_sql.persist_v4_semantic_complete_on_connection
+            failure = AuditIntegrityError("injected complete write failure before commit")
+            receipts = []
+
+            def fail_after_readback(*args, **kwargs):
+                receipts.append(persist(*args, **kwargs))
+                raise failure
+
+            monkeypatch.setattr(semantic_complete_sql, "persist_v4_semantic_complete_on_connection", fail_after_readback)
+            with pytest.raises((AuditIntegrityError, BaseExceptionGroup)) as rejected:
+                await run_continuation_semantic_advisor(phases, selected)
+            assert rejected.value is failure or (isinstance(rejected.value, BaseExceptionGroup) and failure in rejected.value.exceptions)
+            assert len(produced_ids) == len(issuers) == len(receipts) == 1
+            assert stages == [] and phases._pending_semantic_review_output is None
+            assert issuers[0]._committed_output is None and issuers[0]._output_closed
+            gc.collect()
+            assert output_locks[0]() is None
+            assert failure.__traceback__ is not None and receipts[0].snapshot is not None
+            return
+        assert await run_continuation_semantic_advisor(phases, selected) is None
+        assert len(produced_ids) == len(issuers) == 1
+        assert stages == produced_ids
+        output_id = produced_ids[0]
+        output_lock = output_locks[0]
+        issuer = issuers[0]
+        finalized = issuer._v4_finalized
+        custody = issuer._custody
+        assert finalized is not None and custody is not None
+        result = finalized.finalization.result
+        assert custody.continuation_semantic_v4_result is result
+        assert issuer._committed_output is None and issuer._output_closed
+        assert take_output(issuer, issuer.prepared_candidate, finalized) is None
+
+        if finish == "disposed_before_stage":
+            assert phases._pending_semantic_review_output is None
+        else:
+            assert phases._pending_semantic_review_output is not None
+            assert phases._pending_semantic_review_output[0] is result
+            assert id(phases._pending_semantic_review_output[2]) == output_id
+            assert output_lock() is phases._pending_semantic_review_output[2]._graph_lock
+            if finish == "stop":
+                phases.observe_stop()
+            else:
+                paid = await load_selected_continuation(
+                    authority=phases.authority, running=case["running"], selected=phases.latest_snapshot, required_work=case["work"]
+                )
+                phases.bind_action_clock(ContinuationActionClock(case["runtime"].source.policy.actions.session_sql))
+                assert await run_continuation_semantic_advisor(phases, paid) is None
+                assert phases._pending_semantic_review_output is not None
+                assert id(phases._pending_semantic_review_output[2]) == output_id
+                ready = await load_selected_continuation(
+                    authority=phases.authority, running=case["running"], selected=phases.latest_snapshot, required_work=case["work"]
+                )
+                read_runtime = phases.authority.read_continuation_runtime
+                copy_original = AdmittedTurnEvidence._copy_original_graph_for_source
+                copies = []
+
+                def observe_copy(self, source, *, env_ref_names, sources, recorder_chunk):
+                    # Observe the actual reuse decision, not just delivery of
+                    # the optional argument to the authority facade.
+                    matching = (
+                        not self._graph_taken,
+                        source == self.source_chunk,
+                        env_ref_names == self.env_ref_names,
+                        sources.chunks == self.sources.chunks,
+                        recorder_chunk == self.recorder_chunk,
+                    )
+                    copied = copy_original(self, source, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+                    if output_lock() is self._graph_lock:
+                        copies.append((*matching, copied is not None))
+                    return copied
+
+                def observe_read(running, **kwargs):
+                    prior = kwargs.get("_prior_evidence")
+                    reads.append(None if prior is None else id(prior))
+                    try:
+                        return read_runtime(running, **kwargs)
+                    finally:
+                        # The instrument must not retain a failed read's DATA.
+                        prior = None
+                        kwargs.clear()
+
+                monkeypatch.setattr(phases.authority, "read_continuation_runtime", observe_read)
+                monkeypatch.setattr(AdmittedTurnEvidence, "_copy_original_graph_for_source", observe_copy)
+                if finish == "late_ledger":
+                    with locked_session_transaction(store[0], str(store[4])) as conn:
+                        physical = conn.execute(select(attempts).where(attempts.c.attempt_id == result.audit_call.call_id)).one()
+                        row = conn.execute(select(usage).where(usage.c.entry_id == physical.ledger_entry_id)).one()
+                        changed = conn.execute(
+                            update(usage).where(usage.c.entry_id == row.entry_id).values(prompt_tokens=row.prompt_tokens + 1)
+                        )
+                        assert changed.rowcount == 1
+                    with pytest.raises(AuditIntegrityError):
+                        await phases.current(ready)
+                else:
+                    if finish == "taken_prior":
+                        # A real prior owner whose graph has transferred must
+                        # miss despite matching all immutable source bindings.
+                        phases._pending_semantic_review_output[2].take_graph()
+                    runtime, _inventory = await phases.current(ready)
+                    assert id(runtime.source.admitted_evidence) != output_id
+                    expected = (False, True, True, True, True, False) if finish == "taken_prior" else (True,) * 6
+                    assert copies == [expected]
+                    assert phases._pending_semantic_review_output is None
+                    await phases.current(ready)
+                    assert reads == [output_id, None]
+                    assert copies == [expected]
+                assert reads[0] == output_id
+
+        assert phases._pending_semantic_review_output is None
+        if finish != "late_ledger":
+            gc.collect()
+            # Each admitted owner allocates its own lock. A weak reference to
+            # that exclusive descendant cannot mistake a reused object id for
+            # survival of the original output owner.
+            assert output_lock() is None
+        # A failed ordinary source read can retain its invocation arguments in
+        # the original exception traceback. Only the new delivery edges must
+        # drain there; this change does not erase existing failure evidence.
+        # Ordinary receipts deliberately remain alive after the actual output
+        # is gone; disposing the issuer/custody cycle is not the release proof.
+        assert issuer._v4_finalized is finalized
+        assert custody.continuation_semantic_v4_result is result
 
 
 @pytest.mark.asyncio

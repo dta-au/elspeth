@@ -14,6 +14,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
 from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot, encode_recorder_snapshot, recorder_snapshot_json
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_snapshot, encode_continuation_snapshot
+from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
 from elspeth.web.composer.continuation_limits import (
     CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES,
     CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
@@ -26,6 +27,7 @@ from elspeth.web.composer.continuation_semantic_observation import (
     SemanticInvalidResponseObservation,
     observe_semantic_retained_tail_overflow,
 )
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.coordination.composer_operation_authority import _select_failure_on_connection, settle_composer_operation_on_connection
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import (
@@ -99,7 +101,7 @@ def prepare_v4_semantic_complete_on_connection(
     admission: V4SemanticProviderAdmission,
     observation: SemanticCompleteResponseObservation | SemanticInvalidResponseObservation,
     recorder: BufferingRecorder,
-) -> V4SemanticCompletePrepared | SemanticIncompleteResponseObservation:
+) -> tuple[V4SemanticCompletePrepared, AdmittedTurnEvidence] | SemanticIncompleteResponseObservation:
     if (
         type(prepared) is not PreparedContinuationProvider
         or type(admission) is not V4SemanticProviderAdmission
@@ -115,6 +117,10 @@ def prepare_v4_semantic_complete_on_connection(
     original_input = _original_input_data(conn, sid, operation, root, effect)
     data, physical_input = original_input.data, original_input.physical_input
     call = observation.audit_call
+    # Publication admits the actual original wire even though later paid
+    # readers compare retained request bytes without repeating content policy.
+    if call.private_request != capture_provider_context(messages=list(physical_input.messages), tools=None):
+        raise AuditIntegrityError("Semantic physical audit changed its exact original physical request")
     invalid = isinstance(observation, SemanticInvalidResponseObservation)
     expected_status = ComposerLLMCallStatus.MALFORMED_RESPONSE if invalid else ComposerLLMCallStatus.SUCCESS
     if (
@@ -167,113 +173,121 @@ def prepare_v4_semantic_complete_on_connection(
             representation="evidence_pair",
             limit_bytes=CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES,
         )
-    receipt_key = str(uuid4())
-    manifest = _Outcome(
-        effect_key=prepared.binding.effect_key,
-        input_sha256=prepared.binding.input_sha256,
-        receipt_key=receipt_key,
-        creator_sequence=effect.creator_sequence,
-        creator_generation=effect.creator_generation,
-        source_checkpoint_id=selected.checkpoint_id,
-        source_cursor=selected.cursor,
-        outcome=SemanticAdvisorProviderOutcome.PAID_INVALID if invalid else SemanticAdvisorProviderOutcome.SUCCESS,
-        audit_call_json=encode_physical_audit_call(call),
-        response=observation.response.reference,
-        recorder=record.reference,
-        decision_json=(
-            canonical_json(observation.decision.model_dump(mode="json"))
-            if isinstance(observation, SemanticCompleteResponseObservation)
-            else None
-        ),
-        original_failure_class=type(observation.original_failure).__name__
-        if isinstance(observation, SemanticInvalidResponseObservation)
-        else None,
-    )
-    manifest_json = _canonical(manifest)
-    result_key = f"semantic-provider-outcome:{sha256(manifest_json.encode('utf-8')).hexdigest()}"
-    chunks = (
-        record,
-        extended.evidence,
-        *((extended.applied_batch,) if extended.applied_batch is not None else ()),
-        observation.response,
-    )
-    result_chunks = (
-        *(
-            ProspectiveContinuationChunk(private_chunk_key(chunk), chunk.canonical.encode("utf-8"), chunk.reference.codec)
-            for chunk in chunks
-        ),
-        ProspectiveContinuationChunk(result_key, manifest_json.encode("utf-8"), "composer.semantic-provider-outcome.v1"),
-    )
-    parent = original_parent.model_copy(
-        update={
-            "audit_buffer": record.reference,
-            "evidence": extended.evidence.reference,
-            "advisor_calls": original_parent.advisor_calls + 1,
-        }
-    )
-    advisor = _advisor(root).model_copy(update={"phase": "response_retained", "response": observation.response.reference})
-    snapshot_json = _effect_snapshot(
-        encode_continuation_snapshot(_paid_evidence_root(root, parent, advisor, extended)),
-        effect_key=effect.effect_key,
-        disposition="refused" if invalid else "committed",
-        receipt_id=receipt_key,
-    )
-    event = ContinuationEvent("response_retained", _outcome_event(manifest, result_key))
-    append = prepare_snapshot_append(selected, snapshot_json=snapshot_json, events=(event,), published_at=database_now(conn))
-    terminal: PreparedSegmentSettlement | None = None
-    original_failure: BaseException | None = None
-    if isinstance(observation, SemanticInvalidResponseObservation):
-        original_failure = observation.original_failure
-        parent_row = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
-        segment = conn.execute(
-            select(segments).where(
-                segments.c.session_id == sid,
-                segments.c.operation_id == operation,
-                segments.c.sequence == parent_row.current_segment_sequence,
-            )
-        ).one()
-        history = conn.execute(
-            select(attempts).where(
-                attempts.c.session_id == sid,
-                attempts.c.operation_id == operation,
-                attempts.c.sequence == parent_row.current_segment_sequence,
-                attempts.c.generation == parent_row.ownership_generation,
-            )
-        ).one()
-        failure = _select_failure_on_connection(
-            parent_row, project_composer_operation_error(original_failure, request_id=parent_row.request_id), authoritative_failure=False
+    try:
+        receipt_key = str(uuid4())
+        manifest = _Outcome(
+            effect_key=prepared.binding.effect_key,
+            input_sha256=prepared.binding.input_sha256,
+            receipt_key=receipt_key,
+            creator_sequence=effect.creator_sequence,
+            creator_generation=effect.creator_generation,
+            source_checkpoint_id=selected.checkpoint_id,
+            source_cursor=selected.cursor,
+            outcome=SemanticAdvisorProviderOutcome.PAID_INVALID if invalid else SemanticAdvisorProviderOutcome.SUCCESS,
+            audit_call_json=encode_physical_audit_call(call),
+            response=observation.response.reference,
+            recorder=record.reference,
+            decision_json=(
+                canonical_json(observation.decision.model_dump(mode="json"))
+                if isinstance(observation, SemanticCompleteResponseObservation)
+                else None
+            ),
+            original_failure_class=type(observation.original_failure).__name__
+            if isinstance(observation, SemanticInvalidResponseObservation)
+            else None,
         )
-        terminal = prepare_segment_settlement_on_connection(
-            conn,
-            session_id=sid,
-            operation_id=operation,
-            parent=parent_row,
-            segment=segment,
-            history=history,
-            outcome=failure,
-            settled_by="owner_terminal",
-            attempt_outcome="settled",
-            prospective_append=append,
+        manifest_json = _canonical(manifest)
+        result_key = f"semantic-provider-outcome:{sha256(manifest_json.encode('utf-8')).hexdigest()}"
+        chunks = (
+            record,
+            extended.evidence,
+            *((extended.applied_batch,) if extended.applied_batch is not None else ()),
+            observation.response,
         )
-    prospective = (
-        *result_chunks,
-        ProspectiveContinuationChunk(f"event:{selected.cursor + 1}", event.payload_json.encode("utf-8"), "event.v2"),
-        ProspectiveContinuationChunk(f"snapshot:{append.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
-    )
-    quota_entry = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(call))
-    if quota_entry is None or quota_entry.call_id != admission.attempt.attempt_id:
-        raise AuditIntegrityError("V4 semantic complete lost original accounting projection")
-    return V4SemanticCompletePrepared(
-        V4SemanticResultBatch(admission.hold, selected, result_chunks, append, prospective),
-        result_chunks,
-        observation.response,
-        record,
-        call,
-        quota_entry,
-        receipt_key,
-        terminal,
-        original_failure,
-    )
+        result_chunks = (
+            *(
+                ProspectiveContinuationChunk(private_chunk_key(chunk), chunk.canonical.encode("utf-8"), chunk.reference.codec)
+                for chunk in chunks
+            ),
+            ProspectiveContinuationChunk(result_key, manifest_json.encode("utf-8"), "composer.semantic-provider-outcome.v1"),
+        )
+        parent = original_parent.model_copy(
+            update={
+                "audit_buffer": record.reference,
+                "evidence": extended.evidence.reference,
+                "advisor_calls": original_parent.advisor_calls + 1,
+            }
+        )
+        advisor = _advisor(root).model_copy(update={"phase": "response_retained", "response": observation.response.reference})
+        snapshot_json = _effect_snapshot(
+            encode_continuation_snapshot(_paid_evidence_root(root, parent, advisor, extended)),
+            effect_key=effect.effect_key,
+            disposition="refused" if invalid else "committed",
+            receipt_id=receipt_key,
+        )
+        event = ContinuationEvent("response_retained", _outcome_event(manifest, result_key))
+        append = prepare_snapshot_append(selected, snapshot_json=snapshot_json, events=(event,), published_at=database_now(conn))
+        terminal: PreparedSegmentSettlement | None = None
+        original_failure: BaseException | None = None
+        if isinstance(observation, SemanticInvalidResponseObservation):
+            original_failure = observation.original_failure
+            parent_row = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
+            segment = conn.execute(
+                select(segments).where(
+                    segments.c.session_id == sid,
+                    segments.c.operation_id == operation,
+                    segments.c.sequence == parent_row.current_segment_sequence,
+                )
+            ).one()
+            history = conn.execute(
+                select(attempts).where(
+                    attempts.c.session_id == sid,
+                    attempts.c.operation_id == operation,
+                    attempts.c.sequence == parent_row.current_segment_sequence,
+                    attempts.c.generation == parent_row.ownership_generation,
+                )
+            ).one()
+            failure = _select_failure_on_connection(
+                parent_row,
+                project_composer_operation_error(original_failure, request_id=parent_row.request_id),
+                authoritative_failure=False,
+            )
+            terminal = prepare_segment_settlement_on_connection(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                parent=parent_row,
+                segment=segment,
+                history=history,
+                outcome=failure,
+                settled_by="owner_terminal",
+                attempt_outcome="settled",
+                prospective_append=append,
+            )
+        prospective = (
+            *result_chunks,
+            ProspectiveContinuationChunk(f"event:{selected.cursor + 1}", event.payload_json.encode("utf-8"), "event.v2"),
+            ProspectiveContinuationChunk(f"snapshot:{append.checkpoint_id}", append.snapshot_json.encode("utf-8"), "snapshot.v2"),
+        )
+        quota_entry = token_usage_entry_from_llm_call_envelope(llm_call_audit_envelope(call))
+        if quota_entry is None or quota_entry.call_id != admission.attempt.attempt_id:
+            raise AuditIntegrityError("V4 semantic complete lost original accounting projection")
+        batch = V4SemanticCompletePrepared(
+            V4SemanticResultBatch(admission.hold, selected, result_chunks, append, prospective),
+            result_chunks,
+            observation.response,
+            record,
+            call,
+            quota_entry,
+            receipt_key,
+            terminal,
+            original_failure,
+        )
+        if type(extended.admitted_output) is not AdmittedTurnEvidence:
+            raise AuditIntegrityError("V4 semantic complete lost its actual admitted output")
+        return batch, extended.admitted_output
+    finally:
+        del extended
 
 
 def preflight_v4_semantic_complete_capacity(conn: Connection, *, prepared: V4SemanticCompletePrepared) -> bool:

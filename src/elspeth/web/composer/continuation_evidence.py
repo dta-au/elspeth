@@ -290,10 +290,12 @@ class TurnEvidenceFields(ContinuationValue):
         from elspeth.web.composer.turn_effects import authored_state_hash
 
         initial = state_from_evidence_json(self.effects.initial_state_json)
-        latest = state_from_evidence_json(self.effects.latest_verified_state_json)
+        same_state_bytes = self.effects.latest_verified_state_json == self.effects.initial_state_json
+        latest = initial if same_state_bytes else state_from_evidence_json(self.effects.latest_verified_state_json)
+        initial_hash = authored_state_hash(initial)
         if (
-            authored_state_hash(initial) != self.effects.initial_authored_state_hash
-            or authored_state_hash(latest) != self.effects.latest_authored_state_hash
+            initial_hash != self.effects.initial_authored_state_hash
+            or (initial_hash if same_state_bytes else authored_state_hash(latest)) != self.effects.latest_authored_state_hash
         ):
             raise ValueError("evidence altered its actual authored graph hashes")
         if self.retained_history is not None:
@@ -332,6 +334,21 @@ def state_from_evidence_json(text: str) -> CompositionState:
     if canonical_json(state.to_dict()) != text:
         raise ValueError("retained evidence state is not a lossless canonical owned state")
     return state
+
+
+def _require_evidence_state_credentials(effects: RetainedTurnEffects, *, env_ref_names: frozenset[str]) -> None:
+    """Admit both state roles, reusing success only for identical source text."""
+    require_no_credential_material_in_state(
+        state_from_evidence_json(effects.initial_state_json),
+        surface="composer_continuation_evidence_initial_state",
+        env_ref_names=env_ref_names,
+    )
+    if effects.latest_verified_state_json != effects.initial_state_json:
+        require_no_credential_material_in_state(
+            state_from_evidence_json(effects.latest_verified_state_json),
+            surface="composer_continuation_evidence_latest_state",
+            env_ref_names=env_ref_names,
+        )
 
 
 def recorder_from_evidence_json(encoded: str) -> RecorderSnapshot:
@@ -402,16 +419,7 @@ def _require_retained_evidence_envelope(
 
     _verify_evidence_source(source)
     snapshot = _decode_evidence_snapshot(source)
-    require_no_credential_material_in_state(
-        state_from_evidence_json(snapshot.effects.initial_state_json),
-        surface="composer_continuation_evidence_initial_state",
-        env_ref_names=env_ref_names,
-    )
-    require_no_credential_material_in_state(
-        state_from_evidence_json(snapshot.effects.latest_verified_state_json),
-        surface="composer_continuation_evidence_latest_state",
-        env_ref_names=env_ref_names,
-    )
+    _require_evidence_state_credentials(snapshot.effects, env_ref_names=env_ref_names)
     _require_evidence_metadata(snapshot, env_ref_names=env_ref_names)
     _require_message_shelf_semantics(snapshot.transcript, env_ref_names=env_ref_names)
     _require_evidence_pair_capacity(evidence_bytes=source.reference.byte_length, recorder_chunk=recorder_chunk, mandatory_retention=False)
@@ -511,7 +519,7 @@ class AdmittedTurnEvidence:
                 )
             chunk = source
         else:
-            chunk, graph = _encode_turn_evidence_source(
+            chunk, snapshot, graph = _encode_turn_evidence_source(
                 snapshot,
                 env_ref_names=env_ref_names,
                 mandatory_retention=mandatory_retention,
@@ -591,8 +599,9 @@ class AdmittedTurnEvidence:
 
         if self._graph_taken:
             raise AuditIntegrityError("admitted graph cannot be transferred twice")
-        if canonical_json_native_strings(self.snapshot.model_dump(mode="json")) != self.source_chunk.canonical:
-            raise AuditIntegrityError("admitted evidence snapshot changed its original immutable source")
+        # Every constructor retains its strict JSON-decoded frozen snapshot,
+        # including direct model inputs. Only the exposed graph has mutable
+        # descendants whose values and alias partition require a fresh proof.
         if self._graph is not None:
             original = (
                 self.snapshot.joint_graph_json if self.snapshot.application_entry is None else self.snapshot.application_entry.graph_json
@@ -658,7 +667,7 @@ def _capture_fresh_turn_evidence(
         require_message_shelf_integrity(transcript_snapshot, env_ref_names=env_ref_names)
         require_application_recorder_capacity(recorder_source)
     measured = bounded_canonical_json_size(retained_model_json_view(snapshot), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
-    chunk = _encode_admitted_turn_evidence_snapshot(
+    chunk, snapshot = _encode_admitted_turn_evidence_snapshot(
         snapshot,
         measured=measured,
         recorder_chunk=recorder_chunk,
@@ -783,16 +792,7 @@ def _require_evidence_field_semantics(
             or recorder_source.chunk.reference != snapshot.recorder
         ):
             raise AuditIntegrityError("fresh evidence recorder differs from its complete original source")
-    require_no_credential_material_in_state(
-        state_from_evidence_json(snapshot.effects.initial_state_json),
-        surface="composer_continuation_evidence_initial_state",
-        env_ref_names=env_ref_names,
-    )
-    require_no_credential_material_in_state(
-        state_from_evidence_json(snapshot.effects.latest_verified_state_json),
-        surface="composer_continuation_evidence_latest_state",
-        env_ref_names=env_ref_names,
-    )
+    _require_evidence_state_credentials(snapshot.effects, env_ref_names=env_ref_names)
     from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
 
     graph = require_evidence_application_links(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_source=recorder_source)
@@ -807,7 +807,7 @@ def _encode_turn_evidence_source(
     mandatory_retention: bool = False,
     sources: P4ApplicationSources,
     recorder_chunk: PrivateChunk,
-) -> tuple[PrivateChunk, ApplicationGraph | None]:
+) -> tuple[PrivateChunk, TurnEvidenceSnapshot, ApplicationGraph | None]:
     if type(snapshot) is not TurnEvidenceSnapshot:
         raise TypeError("evidence requires its owned closed snapshot")
     from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
@@ -815,14 +815,14 @@ def _encode_turn_evidence_source(
 
     measured = bounded_canonical_json_size(retained_model_json_view(snapshot), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
     graph = require_evidence_fields_admission(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
-    chunk = _encode_admitted_turn_evidence_snapshot(
+    chunk, checked = _encode_admitted_turn_evidence_snapshot(
         snapshot,
         measured=measured,
         recorder_chunk=recorder_chunk,
         env_ref_names=env_ref_names,
         mandatory_retention=mandatory_retention,
     )
-    return chunk, graph
+    return chunk, checked, graph
 
 
 def _encode_admitted_turn_evidence_snapshot(
@@ -832,8 +832,8 @@ def _encode_admitted_turn_evidence_snapshot(
     recorder_chunk: PrivateChunk,
     env_ref_names: frozenset[str],
     mandatory_retention: bool,
-) -> PrivateChunk:
-    """Finish the original full encoding after field/graph admission."""
+) -> tuple[PrivateChunk, TurnEvidenceSnapshot]:
+    """Return the actual checked immutable snapshot with its admitted bytes."""
     from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
     from elspeth.web.composer.continuation_capture_overflow import require_capture_retention_capacity
     from elspeth.web.composer.continuation_message_shelf import require_message_shelf_integrity
@@ -872,7 +872,10 @@ def _encode_admitted_turn_evidence_snapshot(
         canonical=encoded,
         env_ref_names=env_ref_names,
     )
-    return chunk
+    # Keep the normalized closure we actually validated. An unchecked
+    # model_copy/model_construct input may still contain caller dictionaries
+    # in nested model fields even when its serialized document is valid.
+    return chunk, checked
 
 
 def _require_evidence_pair_capacity(*, evidence_bytes: int, recorder_chunk: PrivateChunk, mandatory_retention: bool) -> None:

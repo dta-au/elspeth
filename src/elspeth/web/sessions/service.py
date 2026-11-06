@@ -12231,7 +12231,10 @@ class SessionServiceImpl:
         no_sdk_issuer: SemanticAdvisorNoSdkIssuer,
     ) -> SemanticAdvisorProviderResult | VerifiedSemanticPaidOverflowTerminal:
         """Commit original semantic paid output or incomplete terminal atomically."""
+        from elspeth.web.composer.advisor_output import ReviewContinuationAction
         from elspeth.web.composer.audit import BufferingRecorder
+        from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+        from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
         from elspeth.web.composer.continuation_semantic_no_sdk import SemanticAdvisorNoSdkIssuer
         from elspeth.web.composer.continuation_semantic_observation import (
             SemanticCompleteResponseObservation,
@@ -12247,8 +12250,11 @@ class SessionServiceImpl:
             require_snapshot_cas,
         )
         from elspeth.web.sessions.continuation_semantic_advisor import (
+            SemanticAdvisorProviderOutcome,
             V4SemanticProviderAdmission,
             _descriptor_data,
+            _parent,
+            _ref,
         )
         from elspeth.web.sessions.continuation_semantic_paid_overflow_settlement import (
             settle_v4_semantic_paid_overflow_on_connection,
@@ -12278,98 +12284,131 @@ class SessionServiceImpl:
         running = prepared.binding.running
         sid, operation = str(running.claim.session_id), running.claim.operation_id
         context = running.session_operation_context
-        with (
-            self._session_process_locked_begin(sid) as conn,
-            self._session_write_lock(conn, sid),
-            self._session_composer_mutation_transaction(
-                conn,
-                session_id=sid,
-                session_operation_context=context,
-                expected_kind=SessionOperationKind.COMPOSE,
-                audit_only=True,
-            ),
-        ):
-            _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
-            selected = require_snapshot_cas(
-                conn,
-                session_id=sid,
-                operation_id=operation,
-                expected_checkpoint_id=admission.selected.checkpoint_id,
-                expected_cursor=admission.selected.cursor,
-            )
-            if selected != admission.selected:
-                raise AuditIntegrityError("V4 semantic result changed its original dispatched complete root")
-            effect = conn.execute(
-                select(semantic_effects).where(
-                    semantic_effects.c.session_id == sid,
-                    semantic_effects.c.operation_id == operation,
-                    semantic_effects.c.effect_key == prepared.binding.effect_key,
-                )
-            ).one()
-            source = _descriptor_data(conn, sid, operation, effect).data
-            original = no_sdk_issuer.require_original_v4_response_observation(prepared, admission.selected)
-            if original.source != source.invocation or original.request_sha256 != prepared.binding.input_sha256:
-                raise AuditIntegrityError("V4 semantic SQL result changed its original prepared invocation")
-            reobserved = observe_semantic_provider_response(
-                original,
-                source=original.source,
-                request_sha256=prepared.binding.input_sha256,
-                attempt=admission.attempt,
-                context=context,
-                env_ref_names=source.source.env_ref_names,
-                require_v4_completeness=True,
-            )
-            if reobserved != observation:
-                raise AuditIntegrityError("V4 semantic SQL result differs from the genuine original provider observation")
-            physical = conn.execute(select(semantic_physical).where(semantic_physical.c.attempt_id == admission.attempt.attempt_id)).one()
-            parent = conn.execute(
-                select(semantic_jobs).where(semantic_jobs.c.session_id == sid, semantic_jobs.c.operation_id == operation)
-            ).one()
-            incomplete: SemanticIncompleteResponseObservation | None
-            complete: V4SemanticCompletePrepared | None = None
-            if isinstance(observation, SemanticIncompleteResponseObservation):
-                incomplete = observation
-            else:
-                candidate = prepare_v4_semantic_complete_on_connection(
-                    conn, prepared=prepared, admission=admission, observation=observation, recorder=recorder
-                )
-                if type(candidate) is SemanticIncompleteResponseObservation:
-                    incomplete = candidate
-                elif type(candidate) is V4SemanticCompletePrepared:
-                    complete = candidate
-                    if preflight_v4_semantic_complete_capacity(conn, prepared=complete):
-                        incomplete = None
-                    else:
-                        incomplete = observe_semantic_retained_tail_overflow(
-                            observation,
-                            context=context,
-                            representation="retained_history",
-                            limit_bytes=admission.hold.allowance_bytes,
-                        )
-                else:
-                    raise AuditIntegrityError("V4 semantic result builder returned a foreign complete/overflow sum")
-            if incomplete is not None:
-                return settle_v4_semantic_paid_overflow_on_connection(
+        output: AdmittedTurnEvidence | None = None
+        candidate: tuple[V4SemanticCompletePrepared, AdmittedTurnEvidence] | SemanticIncompleteResponseObservation | None = None
+        try:
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
                     conn,
-                    admission=admission,
-                    observation=incomplete,
-                    running=running,
-                    effect=effect,
-                    physical_row=physical,
-                    parent=parent,
+                    session_id=sid,
+                    session_operation_context=context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                    audit_only=True,
+                ),
+            ):
+                _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+                selected = require_snapshot_cas(
+                    conn,
+                    session_id=sid,
+                    operation_id=operation,
+                    expected_checkpoint_id=admission.selected.checkpoint_id,
+                    expected_cursor=admission.selected.cursor,
                 )
-            if complete is None or not isinstance(observation, (SemanticCompleteResponseObservation, SemanticInvalidResponseObservation)):
-                raise AuditIntegrityError("V4 semantic complete result lost its exact original paid response")
-            self._write_audit_cohort_on_connection(
-                conn,
-                session_id=running.claim.session_id,
-                drafts=provider_attempt_audit_drafts(observation.audit_call, context),
-                writer_principal="compose_loop",
-                composition_state_id=None,
-                session_operation_context=context,
-                audit_only=True,
-            )
-            return persist_v4_semantic_complete_on_connection(conn, prepared=prepared, admission=admission, batch=complete)
+                if selected != admission.selected:
+                    raise AuditIntegrityError("V4 semantic result changed its original dispatched complete root")
+                effect = conn.execute(
+                    select(semantic_effects).where(
+                        semantic_effects.c.session_id == sid,
+                        semantic_effects.c.operation_id == operation,
+                        semantic_effects.c.effect_key == prepared.binding.effect_key,
+                    )
+                ).one()
+                source = _descriptor_data(conn, sid, operation, effect).data
+                original = no_sdk_issuer.require_original_v4_response_observation(prepared, admission.selected)
+                if original.source != source.invocation or original.request_sha256 != prepared.binding.input_sha256:
+                    raise AuditIntegrityError("V4 semantic SQL result changed its original prepared invocation")
+                reobserved = observe_semantic_provider_response(
+                    original,
+                    source=original.source,
+                    request_sha256=prepared.binding.input_sha256,
+                    attempt=admission.attempt,
+                    context=context,
+                    env_ref_names=source.source.env_ref_names,
+                    require_v4_completeness=True,
+                )
+                if reobserved != observation:
+                    raise AuditIntegrityError("V4 semantic SQL result differs from the genuine original provider observation")
+                physical = conn.execute(
+                    select(semantic_physical).where(semantic_physical.c.attempt_id == admission.attempt.attempt_id)
+                ).one()
+                parent = conn.execute(
+                    select(semantic_jobs).where(semantic_jobs.c.session_id == sid, semantic_jobs.c.operation_id == operation)
+                ).one()
+                incomplete: SemanticIncompleteResponseObservation | None
+                complete: V4SemanticCompletePrepared | None = None
+                if isinstance(observation, SemanticIncompleteResponseObservation):
+                    incomplete = observation
+                else:
+                    candidate = prepare_v4_semantic_complete_on_connection(
+                        conn, prepared=prepared, admission=admission, observation=observation, recorder=recorder
+                    )
+                    if type(candidate) is SemanticIncompleteResponseObservation:
+                        incomplete = candidate
+                    elif type(candidate) is tuple:
+                        complete, output = candidate
+                        candidate = None
+                        if preflight_v4_semantic_complete_capacity(conn, prepared=complete):
+                            incomplete = None
+                        else:
+                            incomplete = observe_semantic_retained_tail_overflow(
+                                observation,
+                                context=context,
+                                representation="retained_history",
+                                limit_bytes=admission.hold.allowance_bytes,
+                            )
+                    else:
+                        raise AuditIntegrityError("V4 semantic result builder returned a foreign complete/overflow sum")
+                if incomplete is not None:
+                    return settle_v4_semantic_paid_overflow_on_connection(
+                        conn,
+                        admission=admission,
+                        observation=incomplete,
+                        running=running,
+                        effect=effect,
+                        physical_row=physical,
+                        parent=parent,
+                    )
+                if complete is None or not isinstance(
+                    observation, (SemanticCompleteResponseObservation, SemanticInvalidResponseObservation)
+                ):
+                    raise AuditIntegrityError("V4 semantic complete result lost its exact original paid response")
+                self._write_audit_cohort_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    drafts=provider_attempt_audit_drafts(observation.audit_call, context),
+                    writer_principal="compose_loop",
+                    composition_state_id=None,
+                    session_operation_context=context,
+                    audit_only=True,
+                )
+                actual = persist_v4_semantic_complete_on_connection(conn, prepared=prepared, admission=admission, batch=complete)
+                if (
+                    actual.outcome is SemanticAdvisorProviderOutcome.SUCCESS
+                    and actual.decision is not None
+                    and type(actual.decision.prescribed_action) is ReviewContinuationAction
+                    and actual.original_error is None
+                ):
+                    retained_parent = _parent(decode_continuation_snapshot(actual.snapshot.payload_json))
+                    if (
+                        output is None
+                        or output.source_chunk != _ref(conn, sid, operation, retained_parent.evidence)
+                        or output.recorder_chunk != actual.recorder
+                        or retained_parent.audit_buffer != actual.recorder.reference
+                        or output.env_ref_names != source.source.env_ref_names
+                    ):
+                        raise AuditIntegrityError("V4 semantic output changed its actual complete result source")
+                else:
+                    output = None
+            # Only a successfully exited transaction can offer committed DATA.
+            if output is not None:
+                no_sdk_issuer.stage_committed_output(prepared, actual, output)
+            return actual
+        finally:
+            # Completed worker failures may retain this frame via traceback.
+            output = None
+            candidate = None
 
     def complete_v4_semantic_paid_incomplete_sync(
         self,

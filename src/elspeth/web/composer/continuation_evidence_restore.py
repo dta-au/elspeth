@@ -19,13 +19,16 @@ from elspeth.web.composer.continuation_codec import PrivateChunk, encode_continu
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, decode_turn_evidence, require_admitted_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, _restore_current_evidence
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
+from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
-from elspeth.web.sessions.continuation import read_chunk
+from elspeth.web.sessions.continuation import load_snapshot, read_chunk
+from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
 from elspeth.web.sessions.converters import state_from_record, state_record_from_row
 from elspeth.web.sessions.models import (
     chat_messages_table as messages,
@@ -58,8 +61,52 @@ def read_turn_evidence_on_connection(
     _prior_evidence: AdmittedTurnEvidence | None = None,
 ) -> AdmittedTurnEvidence:
     names = _require_ordinary_evidence_read_on_connection(conn, running, selected=selected, inventory=inventory)
+    return _read_current_turn_evidence_on_connection(conn, running, selected=selected, names=names, _prior_evidence=_prior_evidence)
+
+
+def read_turn_evidence_with_current_chunks_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    _prior_evidence: AdmittedTurnEvidence | None = None,
+) -> tuple[AdmittedTurnEvidence, tuple[PrivateChunk, ...] | None]:
+    """Read evidence and its complete SQL closure for one ordinary runtime read."""
+    names = _require_ordinary_evidence_read_on_connection(conn, running, selected=selected, inventory=inventory)
+    current = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+    if (
+        current.checkpoint_id != selected.checkpoint_id
+        or current.cursor != selected.stack.cursor
+        or current.payload_json != inventory.selection.snapshot_json
+    ):
+        raise AuditIntegrityError("runtime read changed its complete current selected root")
+    # load_snapshot binds the selected policy to the actual persisted contract.
+    # Below the fixed document cap, keep each member's original SQL CASE bound
+    # before materialization; the complete loader alone has a larger allowance.
+    policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
+    current_chunks: tuple[PrivateChunk, ...] | None = None
+    if policy.max_retained_payload_bytes >= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+        current_chunks = load_selected_private_chunks_on_connection(conn, running, current)
+        if current_chunks != selected.chunks:
+            raise AuditIntegrityError("runtime read changed its complete current SQL chunk cohort")
+    evidence = _read_current_turn_evidence_on_connection(
+        conn, running, selected=selected, names=names, _prior_evidence=_prior_evidence, _current_chunks=current_chunks
+    )
+    return evidence, current_chunks
+
+
+def _read_current_turn_evidence_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    names: frozenset[str],
+    _prior_evidence: AdmittedTurnEvidence | None,
+    _current_chunks: tuple[PrivateChunk, ...] | None = None,
+) -> AdmittedTurnEvidence:
     snapshot = read_selected_turn_evidence_graph_on_connection(
-        conn, running, selected=selected, names=names, _prior_evidence=_prior_evidence
+        conn, running, selected=selected, names=names, _prior_evidence=_prior_evidence, _current_chunks=_current_chunks
     )
     if snapshot.snapshot.application_entry is not None:
         from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection
@@ -111,6 +158,7 @@ def read_selected_turn_evidence_graph_on_connection(
     selected: SelectedContinuationState,
     names: frozenset[str],
     _prior_evidence: AdmittedTurnEvidence | None = None,
+    _current_chunks: tuple[PrivateChunk, ...] | None = None,
 ) -> AdmittedTurnEvidence:
     """Validate selected evidence DATA after the caller proves current admission."""
     principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(running.claim.session_id))).one()
@@ -123,6 +171,7 @@ def read_selected_turn_evidence_graph_on_connection(
         selected=selected,
         names=names,
         _prior_evidence=_prior_evidence,
+        _current_chunks=_current_chunks,
     )
 
 
@@ -134,6 +183,7 @@ def read_selected_turn_evidence_graph_data_on_connection(
     selected: SelectedContinuationState,
     names: frozenset[str],
     _prior_evidence: AdmittedTurnEvidence | None = None,
+    _current_chunks: tuple[PrivateChunk, ...] | None = None,
 ) -> AdmittedTurnEvidence:
     """Immutable graph/principal DATA after a separate locked admission proof.
 
@@ -156,6 +206,11 @@ def read_selected_turn_evidence_graph_data_on_connection(
         candidates = tuple(item for item in selected.chunks if item.reference == reference)
         if len(candidates) != 1:
             raise AuditIntegrityError("cold evidence lost its selected chunk")
+        if _current_chunks is not None:
+            actual = tuple(item for item in _current_chunks if item.reference == reference)
+            if len(actual) != 1 or actual[0] != candidates[0]:
+                raise AuditIntegrityError("cold evidence differs from its current complete chunk cohort")
+            return actual[0]
         raw = read_chunk(conn, session_id=sid, operation_id=operation_id, key=f"value:{reference.codec}:{reference.digest}")
         if raw != candidates[0].canonical.encode("utf-8"):
             raise AuditIntegrityError("cold evidence storage differs from its selected bytes")

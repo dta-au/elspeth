@@ -2726,6 +2726,8 @@ async def run_continuation_segment(
             raise
         raise original from original.__cause__
     finally:
+        if driver is not None:
+            driver.phases._pending_semantic_review_output = None
         if lease.required_work is not None and lease.required_work.sql_deadline_owner is not None:
             lease.required_work.sql_deadline_owner.begin_settlement()
         cleanup_errors = list(driver._progress_cleanup_failures) if driver is not None else []

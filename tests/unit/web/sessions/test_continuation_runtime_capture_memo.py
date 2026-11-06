@@ -52,7 +52,7 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
     # A complete equal selection is valid DATA and exercises the existing full
     # initial acquisition rather than the same-object env-only optimization.
     arguments = {**arguments, "selected": replace(arguments["selected"])}
-    original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owners
+    original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owner_data
     sql_reads, captures, lookups, computations = [], [], [], []
     original_lookup = RetentionStageMemo._lookup
     entered, release = Event(), Event()
@@ -89,7 +89,7 @@ async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and
         return result
 
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
-    monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
+    monkeypatch.setattr(runtime_owner, "_capture_owner_data", capture)
     monkeypatch.setattr(RetentionStageMemo, "_lookup", lookup)
     before = recovery_rows(operation_store[0])
     try:
@@ -218,7 +218,7 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
     runtime = await runtime_owner.restore_continuation_runtime(**arguments)
     await _capture(runtime, arguments)
     arguments = {**arguments, "selected": replace(arguments["selected"])}
-    original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owners
+    original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owner_data
     reads, capture_memos, after_mutation = [], [], []
 
     def read(*args, **kwargs):
@@ -277,7 +277,8 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
                 )
                 assert changed.rowcount == 1
             else:
-                for chunk in result.chunks:
+                captured = result.captured
+                for chunk in captured.chunks:
                     put_chunk(
                         conn,
                         session_id=str(running.claim.session_id),
@@ -290,9 +291,9 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
                     conn,
                     session_id=str(running.claim.session_id),
                     operation_id=running.claim.operation_id,
-                    expected_checkpoint_id=result.selected.checkpoint_id,
-                    expected_cursor=result.selected.stack.cursor,
-                    snapshot_json=encode_continuation_snapshot(result.stack),
+                    expected_checkpoint_id=captured.selected.checkpoint_id,
+                    expected_cursor=captured.selected.stack.cursor,
+                    snapshot_json=encode_continuation_snapshot(captured.stack),
                     event_batch=(ContinuationEvent("checkpoint", '{"test_scope":"actual capture changes current selection"}'),),
                     handoff=False,
                 )
@@ -300,7 +301,7 @@ async def test_capture_memo_does_not_replace_final_current_sql_validation(operat
         return result
 
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
-    monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
+    monkeypatch.setattr(runtime_owner, "_capture_owner_data", capture)
     try:
         with pytest.raises(AuditIntegrityError):
             await _capture(runtime, arguments)
@@ -329,7 +330,7 @@ async def test_final_capture_rechecks_nonselected_historical_witness(operation_s
         arguments = {"selected": selected, "inventory": inventory}
         await _capture(runtime, arguments)
         assert len(sdk) == 1
-        actual_capture = runtime_owner._capture_owners
+        actual_capture = runtime_owner._capture_owner_data
         actual_read = sql_owner.read_runtime_source_on_connection
         mutated, final_errors = [], []
 
@@ -367,7 +368,7 @@ async def test_final_capture_rechecks_nonselected_historical_witness(operation_s
                 final_errors.append(error)
                 raise
 
-        monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
+        monkeypatch.setattr(runtime_owner, "_capture_owner_data", capture)
         monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
         with pytest.raises(AuditIntegrityError) as refused:
             await _capture(runtime, arguments)
@@ -383,7 +384,7 @@ async def test_final_capture_preserves_actual_retention_refusal_and_final_failur
     running = arguments["inventory"].running
     runtime = await runtime_owner.restore_continuation_runtime(**arguments)
     await _capture(runtime, arguments)
-    actual_capture, actual_read = runtime_owner._capture_owners, sql_owner.read_runtime_source_on_connection
+    actual_capture, actual_read = runtime_owner._capture_owner_data, sql_owner.read_runtime_source_on_connection
     refusals, failures, checked, after_mutation = [], [], [], []
 
     def capture(*args, **values):
@@ -423,7 +424,7 @@ async def test_final_capture_preserves_actual_retention_refusal_and_final_failur
             failures.append(error)
             raise
 
-    monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
+    monkeypatch.setattr(runtime_owner, "_capture_owner_data", capture)
     monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
     try:
         if final_failure:

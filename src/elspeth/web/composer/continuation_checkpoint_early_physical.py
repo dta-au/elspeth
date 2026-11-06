@@ -215,6 +215,7 @@ async def prepare_checkpoint_early_physical_source(
         or type(phases.action_clock) is not ContinuationActionClock
     ):
         raise AuditIntegrityError("EARLY issuance requires its original paid iteration transition")
+    phases.action_clock.require_preparation_time()
     owner = await prepare_checkpoint_phase_owner(phases, runtime, selected, superseded_reply_index=None, elide_advisor_exchange=False)
     if len(owner.phase_source.completed_children) > 1:
         raise AuditIntegrityError("EARLY source exceeded its one original format retry")
@@ -253,7 +254,9 @@ async def prepare_checkpoint_early_physical_source(
                 return result
 
         retry = await _registered_read(phases.work, VerifiedEarlyFormatRetry, read_retry)
+    phases.action_clock.require_preparation_time()
     capture_data = await capture_continuation_runtime_data(runtime, selected=selected, inventory=runtime.materialization.inventory)
+    phases.action_clock.require_preparation_time()
     captured = capture_data.captured
     capture = _AdvisorInvocationCapture()
     source = CheckpointEarlyPhysicalSource(owner, dispatch, persist, pre_batch_state, captured, phases.action_clock, capture)
@@ -324,6 +327,7 @@ async def bind_checkpoint_early_physical_request(
         or request_options["model"] != prepared_input.model
     ):
         raise AuditIntegrityError("EARLY physical binding changed its actual prepared invocation")
+    source.clock.require_preparation_time()
     prepared_input.verify(
         model=prepared_input.model,
         role="advisor",
@@ -374,12 +378,19 @@ async def bind_checkpoint_early_physical_request(
         authority=owner.phases.authority,
         early_input=early_input,
     )
+
+    def prepare_source() -> CheckpointPreparedSource:
+        source.clock.require_preparation_time()
+        return sessions.prepare_v4_checkpoint_source_sync(prepared=preparation)
+
+    source.clock.require_preparation_time()
     prepared_source = await _registered(
         work=owner.phases.work,
         source=RequiredWorkSource.CONTINUATION_STATE_SQL,
-        operation=lambda: sessions.prepare_v4_checkpoint_source_sync(prepared=preparation),
+        operation=prepare_source,
         expected=CheckpointPreparedSource,
     )
+    source.clock.require_preparation_time()
     # Join this attempt's actual captured admission to the fresh prepared
     # closure and construct independent owners before quota/SDK admission.
     from elspeth.web.composer.continuation_checkpoint_end_detached import restore_captured_checkpoint_runtime

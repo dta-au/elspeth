@@ -38,7 +38,10 @@ from elspeth.web.composer.continuation_bootstrap import (
 from elspeth.web.composer.continuation_codec import PrivateChunk, verify_private_chunk
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
 from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, require_admitted_turn_evidence
-from elspeth.web.composer.continuation_evidence_restore import read_turn_evidence_on_connection
+from elspeth.web.composer.continuation_evidence_restore import (
+    read_turn_evidence_on_connection,
+    read_turn_evidence_with_current_chunks_on_connection,
+)
 from elspeth.web.composer.continuation_iteration import (
     ContinuationProducerInputs,
     capture_admitted_schema_inputs,
@@ -240,7 +243,11 @@ def _read_current_input_evidence(
     # original actor/request/base and transcript/evidence/recorder links.
     if finish_read is None:
         evidence = read_turn_evidence_on_connection(
-            conn, inventory.running, selected=selected, inventory=inventory, _prior_evidence=_prior_evidence
+            conn,
+            inventory.running,
+            selected=selected,
+            inventory=inventory,
+            _prior_evidence=_prior_evidence,
         )
     else:
         from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
@@ -261,9 +268,30 @@ def _read_current_inputs(
     _prior_evidence: AdmittedTurnEvidence | None = None,
 ) -> _CurrentProducerInputs:
     evidence = _read_current_input_evidence(
-        conn, selected=selected, inventory=inventory, finish_read=finish_read, _prior_evidence=_prior_evidence
+        conn,
+        selected=selected,
+        inventory=inventory,
+        finish_read=finish_read,
+        _prior_evidence=_prior_evidence,
     )
     return _inputs_from_current_evidence_on_connection(conn, selected=selected, inventory=inventory, evidence=evidence)
+
+
+def _read_runtime_inputs_on_connection(
+    conn: Connection,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    _prior_evidence: AdmittedTurnEvidence | None = None,
+) -> tuple[_CurrentProducerInputs, tuple[PrivateChunk, ...] | None]:
+    """Keep one runtime read's evidence and actual complete closure together."""
+    evidence, current_chunks = read_turn_evidence_with_current_chunks_on_connection(
+        conn, inventory.running, selected=selected, inventory=inventory, _prior_evidence=_prior_evidence
+    )
+    inputs = _inputs_from_current_evidence_on_connection(
+        conn, selected=selected, inventory=inventory, evidence=evidence, _current_chunks=current_chunks
+    )
+    return inputs, current_chunks
 
 
 def _read_current_inputs_with_tool_sources(
@@ -278,14 +306,26 @@ def _read_current_inputs_with_tool_sources(
 
 
 def _inputs_from_current_evidence_on_connection(
-    conn: Connection, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory, evidence: AdmittedTurnEvidence
+    conn: Connection,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    evidence: AdmittedTurnEvidence,
+    _current_chunks: tuple[PrivateChunk, ...] | None = None,
 ) -> _CurrentProducerInputs:
     """Shared DATA projection; its caller owns the actual SQL evidence read."""
-    return _inputs_with_tool_sources_on_connection(conn, selected=selected, inventory=inventory, evidence=evidence).inputs
+    return _inputs_with_tool_sources_on_connection(
+        conn, selected=selected, inventory=inventory, evidence=evidence, _current_chunks=_current_chunks
+    ).inputs
 
 
 def _inputs_with_tool_sources_on_connection(
-    conn: Connection, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory, evidence: AdmittedTurnEvidence
+    conn: Connection,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    evidence: AdmittedTurnEvidence,
+    _current_chunks: tuple[PrivateChunk, ...] | None = None,
 ) -> _CurrentProducerRead:
     """Retain the actual recipe results only for paired lexical assembly."""
     from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
@@ -302,6 +342,11 @@ def _inputs_with_tool_sources_on_connection(
         if len(matches) != 1:
             raise AuditIntegrityError("message inputs lost their exact selected private chunk")
         chunk = matches[0]
+        if _current_chunks is not None:
+            actual = tuple(item for item in _current_chunks if item.reference == ref)
+            if len(actual) != 1 or actual[0] != chunk:
+                raise AuditIntegrityError("message inputs differ from their current complete chunk cohort")
+            return actual[0]
         raw = read_chunk(
             conn,
             session_id=selected.stack.logical.session_id,

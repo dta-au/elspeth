@@ -18,7 +18,7 @@ from sqlalchemy import Connection, Row, insert, select, update
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.readonly_json import JsonValue
 from elspeth.web.composer.advisor_output import (
@@ -30,6 +30,7 @@ from elspeth.web.composer.advisor_output import (
     parse_continuation_advisor_decision,
 )
 from elspeth.web.composer.audit import llm_call_audit_envelope
+from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation import (
     AdvisorFrame,
     ComposeFrame,
@@ -1044,25 +1045,44 @@ def _physical_source(
     _physical_source_data(conn, str(running.claim.session_id), running.claim.operation_id, effect, call, physical_input)
 
 
-def _physical_source_data(
-    conn: Connection, sid: str, operation: str, effect: Row[Any], call: ComposerLLMCall, physical_input: _PhysicalInput
-) -> None:
-    if type(call) is not ComposerLLMCall or call.call_id is None:
-        raise AuditIntegrityError("Semantic retention requires its actual original paid audit")
-    # Restore the original JSON array after immutable descriptor decoding;
-    # the physical context owner deliberately refuses Python tuple carriers.
+def _require_historical_request_comparison(call: ComposerLLMCall, physical_input: _PhysicalInput) -> None:
+    """Compare complete paid request DATA after the actual descriptor read.
+
+    Retained history does not repeat protocol/credential/traversal admission.
+    Fresh SDK dispatch and complete-result preparation keep their full capture;
+    non-retained historical contexts keep their original capture comparison.
+    """
     wire = list(physical_input.messages)
+    messages_json = canonical_json(wire)
     options = physical_input.options
     if (
         call.model_requested != options["model"]
         or call.max_completion_tokens_requested != options["max_tokens"]
         or call.temperature != options.get("temperature")
         or call.seed != options.get("seed")
-        or call.messages_hash != stable_hash(wire)
+        or call.messages_hash != sha256(messages_json.encode("utf-8")).hexdigest()
         or call.tools_spec_hash is not None
-        or call.private_request != capture_provider_context(messages=wire, tools=None)
     ):
         raise AuditIntegrityError("Semantic physical audit changed its exact original physical request")
+    context = call.private_request
+    if context is not None and context.disposition == "retained":
+        expected = (
+            '{"capture_boundary":"prepared_litellm_messages_and_tools","messages":'
+            + messages_json
+            + ',"schema_version":"composer.provider-context.v1","tools":null}'
+        )
+        if len(expected.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES or context.reasons or context.canonical != expected:
+            raise AuditIntegrityError("Semantic physical audit changed its exact original physical request")
+    elif context != capture_provider_context(messages=wire, tools=None):
+        raise AuditIntegrityError("Semantic physical audit changed its exact original physical request")
+
+
+def _physical_source_data(
+    conn: Connection, sid: str, operation: str, effect: Row[Any], call: ComposerLLMCall, physical_input: _PhysicalInput
+) -> None:
+    if type(call) is not ComposerLLMCall or call.call_id is None:
+        raise AuditIntegrityError("Semantic retention requires its actual original paid audit")
+    _require_historical_request_comparison(call, physical_input)
     creator = _creator_data(conn, sid, operation, effect)
     actual = conn.execute(select(physical).where(physical.c.attempt_id == call.call_id)).one_or_none()
     v4_hold = conn.execute(
@@ -1478,6 +1498,7 @@ def read_semantic_advisor_no_sdk_refusal_on_connection(
 class _ExtendedSemanticEvidence:
     evidence: PrivateChunk
     applied_batch: PrivateChunk | None
+    admitted_output: AdmittedTurnEvidence | None = field(default=None, repr=False, compare=False)
 
 
 def _extended_evidence(
@@ -1536,17 +1557,21 @@ def _extend_admitted_evidence(
     extended = append_primary_call_to_evidence(
         admitted, call=snapshot.llm_calls[-1], recorder=snapshot, env_ref_names=data.source.env_ref_names
     )
-    applied: PrivateChunk | None = None
-    if len(original.frames) == 2 and type(original.frames[1]) is ToolBatchFrame:
-        applied_batch_cut(original.frames)
-        entry = extended.snapshot.application_entry
-        if entry is None:
-            raise AuditIntegrityError("Semantic paid applied source lost its actual extended application graph")
-        applied = encode_private_chunk(
-            codec="composer.applied-p4-batch.v2", canonical=entry.graph_json, env_ref_names=data.source.env_ref_names
-        )
-        require_selected_applied_batch_chunk(applied, evidence=extended, env_ref_names=data.source.env_ref_names)
-    return _ExtendedSemanticEvidence(encode_turn_evidence(extended, env_ref_names=data.source.env_ref_names), applied)
+    try:
+        applied: PrivateChunk | None = None
+        if len(original.frames) == 2 and type(original.frames[1]) is ToolBatchFrame:
+            applied_batch_cut(original.frames)
+            entry = extended.snapshot.application_entry
+            if entry is None:
+                raise AuditIntegrityError("Semantic paid applied source lost its actual extended application graph")
+            applied = encode_private_chunk(
+                codec="composer.applied-p4-batch.v2", canonical=entry.graph_json, env_ref_names=data.source.env_ref_names
+            )
+            require_selected_applied_batch_chunk(applied, evidence=extended, env_ref_names=data.source.env_ref_names)
+        return _ExtendedSemanticEvidence(encode_turn_evidence(extended, env_ref_names=data.source.env_ref_names), applied, extended)
+    finally:
+        # A retained failure traceback must not become a delivery owner.
+        del extended
 
 
 def _paid_evidence_root(

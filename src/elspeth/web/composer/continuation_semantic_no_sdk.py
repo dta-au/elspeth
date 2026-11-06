@@ -27,6 +27,7 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import PreparedContinuationProvider, StoredContinuationSnapshot
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
     from elspeth.web.composer.continuation_semantic_advisor import PreparedSemanticAdvisorRequest, SemanticAdvisorResult
     from elspeth.web.composer.continuation_semantic_advisor_outcome import (
         SemanticAdvisorInvocationObservation,
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.provider_result_admission import V4ProviderResultIncomplete
     from elspeth.web.composer.provider_sdk_observation import V4SdkFailureObservation
     from elspeth.web.sessions.continuation_sdk_terminal_result import SdkTerminalFailure, SdkTerminalResult
-    from elspeth.web.sessions.continuation_semantic_advisor import V4SemanticProviderAdmission
+    from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderResult, V4SemanticProviderAdmission
 
 
 class SemanticAdvisorNoSdkRefusalReason(Enum):
@@ -112,6 +113,66 @@ class SemanticAdvisorNoSdkIssuer:
         self._outcome: SemanticAdvisorInvocationRaised | None = None
         self._v4_finalized: SemanticAdvisorInvocationV4Finalized | None = None
         self._v4_response: SemanticProviderResponseObservation | None = None
+        self._committed_output: tuple[PreparedContinuationProvider, SemanticAdvisorProviderResult, AdmittedTurnEvidence] | None = None
+        self._output_closed = False
+
+    def stage_committed_output(
+        self, prepared: PreparedContinuationProvider, result: SemanticAdvisorProviderResult, output: AdmittedTurnEvidence
+    ) -> None:
+        """Hold one actual post-commit output until normal finalization delivery."""
+        from elspeth.web.composer.advisor_output import ReviewContinuationAction
+        from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
+        from elspeth.web.sessions.continuation_semantic_advisor import SemanticAdvisorProviderOutcome, SemanticAdvisorProviderResult
+
+        try:
+            with self._lock:
+                # Required SQL can finish after the caller was cancelled. Its
+                # paid result still stands; optional DATA cannot reopen delivery.
+                if self._output_closed:
+                    return
+                if (
+                    prepared is not self._prepared
+                    or self._state != "sdk_entered"
+                    or self._committed_output is not None
+                    or type(result) is not SemanticAdvisorProviderResult
+                    or result.outcome is not SemanticAdvisorProviderOutcome.SUCCESS
+                    or result.original_error is not None
+                    or result.effect_key != prepared.binding.effect_key
+                    or result.decision is None
+                    or type(result.decision.prescribed_action) is not ReviewContinuationAction
+                    or type(output) is not AdmittedTurnEvidence
+                    or output.recorder_chunk != result.recorder
+                ):
+                    raise AuditIntegrityError("Semantic output changed its original committed Review owner")
+                self._committed_output = prepared, result, output
+        finally:
+            del output
+
+    def take_committed_output(
+        self, prepared: PreparedContinuationProvider, finalized: SemanticAdvisorInvocationV4Finalized
+    ) -> AdmittedTurnEvidence | None:
+        """Drain DATA only through its exact sealed, cancellation-free result."""
+        pending: tuple[PreparedContinuationProvider, SemanticAdvisorProviderResult, AdmittedTurnEvidence] | None = None
+        try:
+            with self._lock:
+                if self._output_closed:
+                    return None
+                if prepared is not self._prepared or finalized is not self._v4_finalized or finalized.finalization.deferred_cancellations:
+                    raise AuditIntegrityError("Semantic output lost its original finalized delivery")
+                pending = self._committed_output
+                if pending is not None and (pending[0] is not prepared or pending[1] is not finalized.finalization.result):
+                    raise AuditIntegrityError("Semantic output changed its exact committed result")
+                self._committed_output = None
+                self._output_closed = True
+                return None if pending is None else pending[2]
+        finally:
+            pending = None
+
+    def discard_committed_output(self) -> None:
+        """Close delivery permanently, including before a late SQL completion."""
+        with self._lock:
+            self._committed_output = None
+            self._output_closed = True
 
     @property
     def prepared_candidate(self) -> PreparedContinuationProvider | None:

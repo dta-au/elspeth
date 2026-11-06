@@ -11,10 +11,12 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence
 from elspeth.web.composer import continuation_evidence as evidence_codec
+from elspeth.web.composer import turn_effects as effects_module
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_success
 from elspeth.web.composer.continuation import LogicalRequestBinding
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, encode_recorder_snapshot
+from elspeth.web.composer.continuation_codec import encode_private_chunk
 from elspeth.web.composer.continuation_evidence import admit_turn_evidence, decode_turn_evidence, encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import _restore_current_evidence, capture_turn_evidence
 from elspeth.web.composer.protocol import RetainedOperationContext
@@ -238,7 +240,7 @@ def test_fresh_capture_keeps_first_admitted_graph_and_original_capture_order(mon
         fresh.take_graph()
 
 
-def test_native_evidence_projections_keep_public_bytes_and_recheck_changed_source(monkeypatch):
+def test_native_evidence_projections_keep_public_bytes_without_reencoding_immutable_transfer(monkeypatch):
     owner, messages, recorder, logical, _ = rich_evidence()
     messages.append({"role": "user", "content": 'Retain "quotes", \\ slash,\n\t café 😀', "retained_numbers": {"tiny": 1e-7}})
     owner.transcript.observe_messages(messages)
@@ -261,15 +263,11 @@ def test_native_evidence_projections_keep_public_bytes_and_recheck_changed_sourc
     assert chunk.reference.digest == sha256(public_bytes).hexdigest()
     decoded = decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=admitted.dependency_chunks)
     assert decoded.snapshot == admitted.snapshot and calls == [True] * 3
-    # Frozen model assignment is not the source check: hostile nested storage
-    # mutation must still be compared with the original chunk before transfer.
-    decoded.snapshot.__dict__["actor_user_id"] = "changed-retained-source"
-    with pytest.raises(AuditIntegrityError, match="changed its original immutable source"):
-        decoded.take_graph()
-    assert calls == [True] * 4
+    assert decoded.take_graph() is None
+    assert calls == [True] * 3
 
 
-@pytest.mark.parametrize("stage", ("emit", "self_roundtrip", "decode", "transfer"))
+@pytest.mark.parametrize("stage", ("emit", "self_roundtrip", "decode"))
 def test_changed_evidence_writer_is_refused_at_each_original_document_check(monkeypatch, stage):
     owner, messages, recorder, logical, _ = rich_evidence()
     admitted = snapshot(owner, messages, recorder, logical)
@@ -289,13 +287,10 @@ def test_changed_evidence_writer_is_refused_at_each_original_document_check(monk
         "emit": "private chunk encoding differs from its complete retention preflight",
         "self_roundtrip": "evidence capture changed fields during complete admission",
         "decode": "evidence chunk changed fields during its owned decode",
-        "transfer": "admitted evidence snapshot changed its original immutable source",
     }
     with pytest.raises(AuditIntegrityError, match=refusal[stage]):
         if stage == "decode":
             decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=admitted.dependency_chunks)
-        elif stage == "transfer":
-            admitted.take_graph()
         else:
             admit_turn_evidence(admitted.snapshot, env_ref_names=frozenset(), source_chunks=admitted.dependency_chunks)
     assert calls == [True] * changed_call
@@ -374,6 +369,125 @@ def test_new_metadata_credentials_refuse_after_real_positive():
     bad = retained.snapshot.model_copy(update={"actor_user_id": "postgresql://user:secret@host/db"})  # secret-scan: allow-this-line
     with pytest.raises(CredentialMaterialRefused):
         admit_turn_evidence(bad, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks)
+
+
+def test_equal_evidence_states_reuse_parse_and_hash_but_check_both_retained_hashes(monkeypatch):
+    evidence, messages, recorder, logical, _policy = rich_evidence()
+    retained = snapshot(evidence, messages, recorder, logical)
+    original_read = evidence_codec.state_from_evidence_json
+    original_hash = effects_module.authored_state_hash
+    states, hashes = [], []
+
+    def read(text):
+        state = original_read(text)
+        states.append((text, state))
+        return state
+
+    def hash_state(state):
+        result = original_hash(state)
+        hashes.append(result)
+        return result
+
+    monkeypatch.setattr(evidence_codec, "state_from_evidence_json", read)
+    monkeypatch.setattr(effects_module, "authored_state_hash", hash_state)
+    checked = evidence_codec.TurnEvidenceSnapshot.model_validate_json(retained.source_chunk.canonical)
+    assert checked == retained.snapshot
+    assert checked.effects.initial_state_json == checked.effects.latest_verified_state_json
+    assert len(states) == 1 and states[0][0] == checked.effects.initial_state_json
+    assert canonical_json(states[0][1].to_dict()) == checked.effects.initial_state_json
+    assert hashes == [checked.effects.initial_authored_state_hash]
+    assert checked.effects.latest_authored_state_hash == hashes[0]
+
+    # Each hash is independently authoritative even when the state bytes agree.
+    for field in ("initial_authored_state_hash", "latest_authored_state_hash"):
+        changed = checked.model_dump(mode="json")
+        changed["effects"][field] = "0" * 64
+        assert changed["effects"][field] != hashes[0]
+        source = encode_private_chunk(codec="composer.evidence.v2", canonical=canonical_json(changed))
+        with pytest.raises(AuditIntegrityError, match="closed owned codec") as refused:
+            decode_turn_evidence(source, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks)
+        assert "authored graph hashes" in str(refused.value.__cause__)
+
+
+def test_evidence_state_credentials_reuse_equal_bytes_preserving_distinct_versions_and_roles(monkeypatch):
+    evidence, messages, recorder, logical, _policy = rich_evidence()
+    retained = snapshot(evidence, messages, recorder, logical)
+    effects = retained.snapshot.effects
+    original_read = evidence_codec.state_from_evidence_json
+    original_guard = evidence_codec.require_no_credential_material_in_state
+    parsed, scanned = [], []
+
+    def read(text):
+        parsed.append(text)
+        return original_read(text)
+
+    def guard(state, *, surface, env_ref_names):
+        scanned.append((canonical_json(state.to_dict()), surface))
+        original_guard(state, surface=surface, env_ref_names=env_ref_names)
+
+    monkeypatch.setattr(evidence_codec, "state_from_evidence_json", read)
+    monkeypatch.setattr(evidence_codec, "require_no_credential_material_in_state", guard)
+    initial_surface = "composer_continuation_evidence_initial_state"
+    latest_surface = "composer_continuation_evidence_latest_state"
+    evidence_codec._require_evidence_state_credentials(effects, env_ref_names=frozenset())
+    assert parsed == [effects.initial_state_json]
+    assert scanned == [(effects.initial_state_json, initial_surface)]
+
+    initial = original_read(effects.initial_state_json)
+    latest = replace(initial, version=initial.version + 1)
+    latest_text = canonical_json(latest.to_dict())
+    assert latest_text != effects.initial_state_json
+    assert effects_module.authored_state_hash(initial) == effects_module.authored_state_hash(latest)
+    distinct = effects.model_copy(update={"latest_verified_state_json": latest_text})
+    parsed.clear()
+    scanned.clear()
+    evidence_codec._require_evidence_state_credentials(distinct, env_ref_names=frozenset())
+    assert parsed == [effects.initial_state_json, latest_text]
+    assert scanned == [(effects.initial_state_json, initial_surface), (latest_text, latest_surface)]
+
+    # Hash equality cannot relax the independent initial/latest relationship.
+    candidate = retained.snapshot.model_copy(update={"effects": distinct})
+    with pytest.raises(AuditIntegrityError, match="retention preflight") as refused:
+        admit_turn_evidence(candidate, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks)
+    assert "shared initial/latest state" in str(refused.value.__cause__)
+
+    secret_state = replace(initial, metadata=replace(initial.metadata, description="sk-" + "syntheticcredential" * 3))
+    secret_text = canonical_json(secret_state.to_dict())
+    for initial_text, expected_surface in ((effects.initial_state_json, latest_surface), (secret_text, initial_surface)):
+        secret_pair = effects.model_copy(update={"initial_state_json": initial_text, "latest_verified_state_json": secret_text})
+        with pytest.raises(CredentialMaterialRefused) as credential_refused:
+            evidence_codec._require_evidence_state_credentials(secret_pair, env_ref_names=frozenset())
+        assert credential_refused.value.surface == expected_surface
+
+    # Latest bytes must still receive losslessness validation after a clean initial state.
+    dropped_field = canonical_json(latest.to_dict() | {"undeclared_state_field": "cannot disappear"})
+    invalid = effects.model_copy(update={"latest_verified_state_json": dropped_field})
+    with pytest.raises(ValueError, match="lossless canonical owned state"):
+        evidence_codec._require_evidence_state_credentials(invalid, env_ref_names=frozenset())
+
+
+def test_equal_state_credentials_refuse_at_initial_role_on_actual_evidence_admission():
+    evidence, messages, recorder, logical, _policy = rich_evidence()
+    retained = snapshot(evidence, messages, recorder, logical)
+    assert decode_turn_evidence(retained.source_chunk, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks).snapshot == (
+        retained.snapshot
+    )
+    state = evidence_codec.state_from_evidence_json(retained.snapshot.effects.initial_state_json)
+    state = replace(state, metadata=replace(state.metadata, description="sk-" + "syntheticcredential" * 3))
+    encoded = canonical_json(state.to_dict())
+    state_hash = effects_module.authored_state_hash(state)
+    changed_effects = retained.snapshot.effects.model_copy(
+        update={
+            "initial_state_json": encoded,
+            "latest_verified_state_json": encoded,
+            "initial_authored_state_hash": state_hash,
+            "latest_authored_state_hash": state_hash,
+        }
+    )
+    candidate = retained.snapshot.model_copy(update={"effects": changed_effects})
+    with pytest.raises(CredentialMaterialRefused) as refused:
+        admit_turn_evidence(candidate, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks)
+    assert refused.value.surface == "composer_continuation_evidence_initial_state"
 
 
 def test_committed_history_refuses_without_erasing_its_actual_ids():

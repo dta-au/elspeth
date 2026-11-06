@@ -19,23 +19,27 @@ from uuid import UUID
 import httpx
 import litellm
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, update
 
 from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.advisor_output import parse_continuation_advisor_decision
+from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation import AdvisorFrame, ComposeFrame
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import (
+    decode_continuation_response,
     decode_continuation_snapshot,
     encode_continuation_snapshot,
     encode_continuation_text_response,
 )
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_provider_outcomes import decode_physical_audit_call, encode_physical_audit_call
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.continuation_semantic_advisor import prepare_semantic_advisor_request
 from elspeth.web.composer.continuation_semantic_advisor_outcome import (
@@ -46,12 +50,14 @@ from elspeth.web.composer.continuation_semantic_source import capture_semantic_a
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+from elspeth.web.composer.provider_audit_source import ProviderAuditSource, provider_attempt_audit_drafts_for_source
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.coordination.quota_authority import _usage_entry_id
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
-from elspeth.web.sessions.continuation import ContinuationCASConflict, private_chunk_key, put_chunk
+from elspeth.web.sessions.continuation import ContinuationCASConflict, load_snapshot, private_chunk_key, put_chunk
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import chat_messages_table as messages
@@ -845,6 +851,362 @@ async def test_semantic_prepare_refuses_same_locator_with_changed_complete_root_
                 no_sdk_issuer=_issuer(case),
             )
         assert _rows(operation_store[0]) == before
+
+
+def _rewrite_actual_semantic_request(conn, sid, operation, effect, wire):
+    """Deliberate coherent fixture repair, with actual chunk constraints enabled."""
+    import elspeth.web.sessions.continuation_semantic_advisor as semantic_sql
+
+    descriptor = semantic_sql._decode(
+        semantic_sql._Input,
+        semantic_sql._blob(conn, sid, operation, f"semantic-provider-input:{effect.input_sha256}", "composer.semantic-provider-input.v1"),
+    )
+    physical_body = json.loads(descriptor.physical_request_json)
+    physical_body["messages"] = wire
+    physical_json = canonical_json(physical_body)
+    digest = sha256(physical_json.encode("utf-8")).hexdigest()
+    changed = descriptor.model_copy(update={"physical_request_json": physical_json})
+    payload = semantic_sql._canonical(changed).encode("utf-8")
+    conn.execute(
+        insert(chunks).values(
+            session_id=sid,
+            operation_id=operation,
+            chunk_key=f"semantic-provider-input:{digest}",
+            codec="composer.semantic-provider-input.v1",
+            payload=payload,
+            sha256=sha256(payload).hexdigest(),
+            byte_length=len(payload),
+        )
+    )
+    conn.execute(
+        update(effects)
+        .where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == effect.effect_key)
+        .values(input_sha256=digest)
+    )
+    return conn.execute(
+        select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == effect.effect_key)
+    ).one()
+
+
+@pytest.mark.asyncio
+async def test_semantic_historical_request_compares_actual_unsafe_sql_and_keeps_physical_facts(operation_store, tmp_path, monkeypatch):
+    import elspeth.web.sessions.continuation_semantic_advisor as semantic_sql
+
+    async with _semantic_case(operation_store, tmp_path, monkeypatch) as case:
+        sdk = []
+
+        async def completion(**kwargs):
+            sdk.append(kwargs)
+            return _reply(json.dumps(_answer(case["request"])))
+
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        prepared, retained = await _run_paid_semantic(case, monkeypatch)
+        sid, operation = str(operation_store[4]), case["running"].claim.operation_id
+        captures = []
+
+        def observe_capture(*, messages, tools):
+            context = capture_provider_context(messages=messages, tools=tools)
+            captures.append(context)
+            return context
+
+        monkeypatch.setattr(semantic_sql, "capture_provider_context", observe_capture)
+        before = _rows(operation_store[0])
+        with locked_session_transaction(operation_store[0], sid) as conn:
+            assert (
+                semantic_sql.read_semantic_advisor_outcome_on_connection(
+                    conn, case["running"], selected=retained.snapshot, effect_key=prepared.binding.effect_key
+                )
+                == retained
+            )
+            assert captures == []
+            original_effect = conn.execute(select(effects).where(effects.c.effect_key == prepared.binding.effect_key)).one()
+            original_input = semantic_sql._descriptor_data(conn, sid, operation, original_effect).physical_input
+            original_call = retained.audit_call
+            semantic_sql._physical_source_data(conn, sid, operation, original_effect, original_call, original_input)
+            physical_body = json.loads(semantic_sql._canonical(original_input))
+            parity_wire = json.loads(canonical_json(list(original_input.messages)))
+            parity_wire[0]["content"] += '\nCafé 😀 \\ "quoted"\n},"tools":null,{'
+            parity_wire[0]["cache_control"] = {"\ue000": [None, True, -0.0, 1.0, 1.5, 1e-7, 1e30], "😀": "text"}
+            parity_context = capture_provider_context(messages=parity_wire, tools=None)
+            assert parity_context.disposition == "retained"
+            parity_body = {**physical_body, "messages": parity_wire}
+            parity_input = semantic_sql._decode(semantic_sql._PhysicalInput, canonical_json(parity_body))
+            semantic_sql._require_historical_request_comparison(
+                replace(original_call, messages_hash=stable_hash(parity_wire), private_request=parity_context), parity_input
+            )
+            encoded_input = semantic_sql._canonical(original_input)
+            for malformed in ("{", " " + encoded_input, encoded_input[:-1] + ',"unexpected":null}', encoded_input + "{}"):
+                with pytest.raises(AuditIntegrityError):
+                    semantic_sql._decode(semantic_sql._PhysicalInput, malformed)
+            envelope = {
+                "schema_version": "composer.provider-context.v1",
+                "capture_boundary": "prepared_litellm_messages_and_tools",
+                "messages": list(original_input.messages),
+                "tools": None,
+            }
+            original_size = len(canonical_json(envelope).encode("utf-8"))
+            for offset in (-1, 0, 1):
+                wire_at_bound = json.loads(canonical_json(list(original_input.messages)))
+                additional_bytes = JSON_MAX_TOTAL_UTF8_BYTES + offset - original_size
+                assert additional_bytes > 0
+                wire_at_bound[0]["content"] += "é" * (additional_bytes // 2) + "x" * (additional_bytes % 2)
+                expected = canonical_json({**envelope, "messages": wire_at_bound})
+                assert len(expected.encode("utf-8")) == JSON_MAX_TOTAL_UTF8_BYTES + offset
+                bounded_input = semantic_sql._decode(
+                    semantic_sql._PhysicalInput, canonical_json({**physical_body, "messages": wire_at_bound})
+                )
+                bounded_call = replace(original_call, messages_hash=stable_hash(wire_at_bound))
+                if offset > 0:
+                    with pytest.raises(AuditIntegrityError, match="exact original physical request"):
+                        semantic_sql._require_historical_request_comparison(bounded_call, bounded_input)
+                else:
+                    semantic_sql._require_historical_request_comparison(
+                        replace(bounded_call, private_request=PrivateProviderContext(disposition="retained", canonical=expected)),
+                        bounded_input,
+                    )
+            for changed_call in (
+                replace(original_call, model_requested="different/model"),
+                replace(original_call, max_completion_tokens_requested=original_call.max_completion_tokens_requested + 1),
+                replace(original_call, temperature=0.125),
+                replace(original_call, seed=123456),
+                replace(original_call, messages_hash="0" * 64),
+                replace(original_call, private_request=None),
+                replace(
+                    original_call,
+                    private_request=PrivateProviderContext(disposition="unavailable", canonical=None, reasons=("bounds",)),
+                ),
+                replace(
+                    original_call,
+                    private_request=capture_provider_context(messages=[{"role": "user", "content": "Different"}], tools=None),
+                ),
+            ):
+                with pytest.raises(AuditIntegrityError, match="exact original physical request"):
+                    semantic_sql._physical_source_data(conn, sid, operation, original_effect, changed_call, original_input)
+            assert len(captures) == 2
+            captures.clear()
+            wire = json.loads(canonical_json(list(original_input.messages)))
+            wire[0]["content"] += "\nHistorical data:image/png;base64,AAAA"
+            unavailable = capture_provider_context(messages=wire, tools=None)
+            assert unavailable.disposition == "unavailable" and unavailable.reasons == ("unsupported",)
+            # A defective earlier writer retained this complete unsafe context.
+            # This constructor is comparison DATA, not fresh content admission.
+            context = PrivateProviderContext(
+                disposition="retained",
+                canonical=canonical_json(
+                    {
+                        "schema_version": "composer.provider-context.v1",
+                        "capture_boundary": "prepared_litellm_messages_and_tools",
+                        "messages": wire,
+                        "tools": None,
+                    }
+                ),
+            )
+            changed_call = replace(original_call, messages_hash=stable_hash(wire), private_request=context)
+            changed = conn.begin_nested()
+            changed_effect = _rewrite_actual_semantic_request(conn, sid, operation, original_effect, wire)
+            # The real descriptor reader still reconstructs the entire original
+            # source/evidence/invocation and third-message source document.
+            physical_input = semantic_sql._descriptor_data(conn, sid, operation, changed_effect).physical_input
+            manifest = semantic_sql._decode(
+                semantic_sql._Outcome,
+                semantic_sql._blob(conn, sid, operation, original_effect.result_chunk_key, "composer.semantic-provider-outcome.v1"),
+            )
+            decoded = decode_continuation_response(retained.response)
+            response = encode_continuation_text_response(
+                content=decoded.message.content, provider_metadata=decoded.provider_metadata, audit_call=changed_call
+            )
+            put_chunk(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                key=private_chunk_key(response),
+                payload=response.canonical.encode("utf-8"),
+                codec=response.reference.codec,
+            )
+            changed_manifest = manifest.model_copy(
+                update={
+                    "input_sha256": changed_effect.input_sha256,
+                    "audit_call_json": encode_physical_audit_call(changed_call),
+                    "response": response.reference,
+                }
+            )
+            manifest_text = semantic_sql._canonical(changed_manifest)
+            manifest_key = f"semantic-provider-outcome:{sha256(manifest_text.encode('utf-8')).hexdigest()}"
+            put_chunk(
+                conn,
+                session_id=sid,
+                operation_id=operation,
+                key=manifest_key,
+                payload=manifest_text.encode("utf-8"),
+                codec="composer.semantic-provider-outcome.v1",
+            )
+            conn.execute(update(effects).where(effects.c.effect_key == original_effect.effect_key).values(result_chunk_key=manifest_key))
+            attempt = conn.execute(select(physical).where(physical.c.attempt_id == original_call.call_id)).one()
+            source = ProviderAuditSource(attempt.session_id, attempt.operation_id, attempt.operation_epoch)
+            old_items = tuple(
+                item
+                for draft in provider_attempt_audit_drafts_for_source(original_call, source)
+                if draft.tool_calls is not None
+                for item in draft.tool_calls
+            )
+            new_items = tuple(
+                item
+                for draft in provider_attempt_audit_drafts_for_source(changed_call, source)
+                if draft.tool_calls is not None
+                for item in draft.tool_calls
+            )
+            replacements = {canonical_json(old): new for old, new in zip(old_items, new_items, strict=True)}
+            seen = []
+            rows = conn.execute(
+                select(messages).where(
+                    messages.c.session_id == sid, messages.c.role == "audit", messages.c.writer_principal == "compose_loop"
+                )
+            ).all()
+            for row in rows:
+                if row.tool_calls is None:
+                    continue
+                updated = []
+                for item in row.tool_calls:
+                    key = canonical_json(item)
+                    if key in replacements:
+                        seen.append(key)
+                        updated.append(replacements[key])
+                    else:
+                        updated.append(item)
+                conn.execute(update(messages).where(messages.c.id == row.id).values(tool_calls=json.loads(canonical_json(updated))))
+            assert sorted(seen) == sorted(replacements)
+            actual_effect = conn.execute(select(effects).where(effects.c.effect_key == original_effect.effect_key)).one()
+            actual_manifest = semantic_sql._decode(
+                semantic_sql._Outcome,
+                semantic_sql._blob(conn, sid, operation, actual_effect.result_chunk_key, "composer.semantic-provider-outcome.v1"),
+            )
+            actual_call = decode_physical_audit_call(actual_manifest.audit_call_json)
+            assert actual_call == changed_call
+            # Target the actual descriptor + physical SQL comparison seam.
+            # Recorder/evidence/selected-root reconstruction remains separate;
+            # this fixture does not claim a rebuilt whole paid-result history.
+            semantic_sql._physical_source_data(conn, sid, operation, actual_effect, actual_call, physical_input)
+            assert captures == []
+            ledger_change = conn.begin_nested()
+            conn.execute(update(usage).where(usage.c.entry_id == attempt.ledger_entry_id).values(prompt_tokens=999))
+            with pytest.raises(AuditIntegrityError, match="original complete ledger"):
+                semantic_sql._physical_source_data(conn, sid, operation, actual_effect, actual_call, physical_input)
+            ledger_change.rollback()
+            semantic_sql._physical_source_data(conn, sid, operation, actual_effect, actual_call, physical_input)
+            # The non-retained branch still invokes the original capture and
+            # accepts exactly its unavailable reason, as before this change.
+            semantic_sql._require_historical_request_comparison(replace(actual_call, private_request=unavailable), physical_input)
+            assert captures == [unavailable]
+            changed.rollback()
+            semantic_sql._physical_source_data(conn, sid, operation, original_effect, original_call, original_input)
+        assert _rows(operation_store[0]) == before and len(sdk) == 1
+
+
+@pytest.mark.asyncio
+async def test_semantic_complete_preparation_keeps_full_actual_request_admission(operation_store, tmp_path, monkeypatch):
+    import elspeth.web.sessions.continuation_semantic_advisor as semantic_sql
+    import elspeth.web.sessions.continuation_semantic_v4_complete as complete_sql
+
+    async with _semantic_case(operation_store, tmp_path, monkeypatch) as case:
+        sdk = []
+        checked = []
+        actual_prepare = complete_sql.prepare_v4_semantic_complete_on_connection
+
+        async def completion(**kwargs):
+            sdk.append(kwargs)
+            return _reply(json.dumps(_answer(case["request"])))
+
+        def prepare(conn, *, prepared, admission, observation, recorder):
+            positive = actual_prepare(conn, prepared=prepared, admission=admission, observation=observation, recorder=recorder)
+            before = _rows_on_connection(conn)
+            sid, operation = str(case["running"].claim.session_id), case["running"].claim.operation_id
+            effect = conn.execute(select(effects).where(effects.c.effect_key == prepared.binding.effect_key)).one()
+            original = semantic_sql._descriptor_data(conn, sid, operation, effect).physical_input
+            wire = json.loads(canonical_json(list(original.messages)))
+            wire[0]["content"] += "\nHistorical data:image/png;base64,AAAA"
+            assert capture_provider_context(messages=wire, tools=None).disposition == "unavailable"
+            context = PrivateProviderContext(
+                disposition="retained",
+                canonical=canonical_json(
+                    {
+                        "schema_version": "composer.provider-context.v1",
+                        "capture_boundary": "prepared_litellm_messages_and_tools",
+                        "messages": wire,
+                        "tools": None,
+                    }
+                ),
+            )
+            call = replace(observation.audit_call, messages_hash=stable_hash(wire), private_request=context)
+            changed = conn.begin_nested()
+            changed_effect = _rewrite_actual_semantic_request(conn, sid, operation, effect, wire)
+            root = decode_continuation_snapshot(admission.selected.payload_json)
+            changed_root = root.model_copy(
+                update={
+                    "frames": (
+                        *root.frames[:-1],
+                        root.frames[-1].model_copy(update={"provider_input_sha256": changed_effect.input_sha256}),
+                    )
+                }
+            )
+            snapshot = encode_continuation_snapshot(changed_root).encode("utf-8")
+            snapshot_key = conn.execute(
+                select(checkpoints.c.snapshot_chunk_key).where(
+                    checkpoints.c.session_id == sid,
+                    checkpoints.c.operation_id == operation,
+                    checkpoints.c.checkpoint_id == admission.selected.checkpoint_id,
+                )
+            ).scalar_one()
+            conn.execute(
+                update(chunks)
+                .where(chunks.c.session_id == sid, chunks.c.operation_id == operation, chunks.c.chunk_key == snapshot_key)
+                .values(payload=snapshot, sha256=sha256(snapshot).hexdigest(), byte_length=len(snapshot))
+            )
+            selected = load_snapshot(conn, session_id=sid, operation_id=operation)
+            assert selected.payload_json == snapshot.decode("utf-8")
+            actual_input = semantic_sql._original_input_data(conn, sid, operation, changed_root, changed_effect).physical_input
+            semantic_sql._require_historical_request_comparison(call, actual_input)
+            changed_rows = _rows_on_connection(conn)
+            with pytest.raises(AuditIntegrityError, match="exact original physical request"):
+                actual_prepare(
+                    conn,
+                    prepared=prepared,
+                    admission=replace(admission, selected=selected),
+                    observation=replace(observation, audit_call=call),
+                    recorder=recorder,
+                )
+            assert _rows_on_connection(conn) == changed_rows
+            changed.rollback()
+            assert _rows_on_connection(conn) == before
+            checked.append(True)
+            return positive
+
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        monkeypatch.setattr(complete_sql, "prepare_v4_semantic_complete_on_connection", prepare)
+        _prepared, retained = await _run_paid_semantic(case, monkeypatch)
+        assert retained.audit_call.private_request.disposition == "retained"
+        assert checked == [True] and len(sdk) == 1
+
+
+@pytest.mark.asyncio
+async def test_semantic_fresh_sdk_path_refuses_unsafe_complete_request(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer.continuation_semantic_advisor_phase import run_continuation_semantic_advisor
+
+    async with _semantic_case(operation_store, tmp_path, monkeypatch) as case:
+        owner = case["request"].owner
+        monkeypatch.setattr(owner, "_composer_skill_text", owner._composer_skill_text + "\nUnsafe data:image/png;base64,AAAA")
+        sdk = []
+
+        async def completion(**kwargs):
+            sdk.append(kwargs)
+            raise AssertionError("unsafe semantic request must not reach the SDK")
+
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        with pytest.raises(AuditIntegrityError, match="lost its complete physical request capture"):
+            await run_continuation_semantic_advisor(_semantic_phases(case), case["runtime"].source.selected)
+        assert sdk == []
+        with operation_store[0].connect() as conn:
+            assert conn.execute(select(physical)).all() == []
+            assert conn.execute(select(usage)).all() == []
 
 
 @pytest.mark.asyncio
