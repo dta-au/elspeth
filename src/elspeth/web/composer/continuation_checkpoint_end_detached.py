@@ -2,25 +2,38 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_caches import capture_continuation_caches, decode_continuation_caches, encode_continuation_caches
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
-from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
-from elspeth.web.composer.continuation_iteration import capture_continuation_iteration, encode_continuation_iteration
+from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, materialize_continuation_env_inventory
+from elspeth.web.composer.continuation_iteration import (
+    capture_continuation_iteration,
+    decode_continuation_iteration,
+    encode_continuation_iteration,
+)
+from elspeth.web.composer.continuation_prompt_producers import _CurrentProducerInputs, current_message_producers_from_runtime_source
 from elspeth.web.composer.continuation_runtime import (
     CapturedContinuationRuntime,
     RestoredContinuationRuntime,
     _capture_owners,
+    _CapturedRuntimeData,
     _compose,
+    _registered_read,
+    _restore_runtime_from_inputs,
+    _RuntimeRestorationInputs,
     _selected_chunks,
     capture_continuation_runtime_owners,
     restore_checkpoint_projection_runtime,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
-from elspeth.web.sessions.continuation_runtime import runtime_chunk
+from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope
+from elspeth.web.sessions.continuation import load_snapshot
+from elspeth.web.sessions.continuation_runtime import _runtime_source_from_inputs_on_connection, runtime_chunk
+from elspeth.web.sessions.locking import session_data_read_transaction
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
@@ -139,6 +152,115 @@ def expected_prepared_end_capture(*, phase_owner: CheckpointPhaseOwner, selected
     frames[index] = frame.model_copy(update={"caches": caches.reference, "iteration": iteration.reference})
     root = selected.stack.model_copy(update={"frames": tuple(frames)})
     return CapturedContinuationRuntime(selected, root, _selected_chunks(root, selected.chunks, (caches, iteration)))
+
+
+def _prepared_capture_inputs(
+    *,
+    phase_owner: CheckpointPhaseOwner,
+    prepared: CheckpointPreparedSource,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    capture_data: _CapturedRuntimeData,
+) -> _RuntimeRestorationInputs:
+    """Join actual captured DATA to the complete fresh prepared SQL closure."""
+    running = inventory.running
+    phases = phase_owner.phases
+    admitted = capture_data.admitted_evidence
+    _, frame = _compose(selected)
+    if (
+        capture_data.captured.selected is not phase_owner.selected
+        or inventory.running is not phases.work.running
+        or admitted.env_ref_names != inventory.names
+        or runtime_chunk(selected, frame.evidence) != admitted.source_chunk
+    ):
+        raise AuditIntegrityError("END prepared evidence changed its actual capture or environment")
+    original = phase_owner.runtime.source
+    iteration = decode_continuation_iteration(runtime_chunk(selected, frame.iteration), env_ref_names=inventory.names)
+    inputs = _CurrentProducerInputs(
+        original.bootstrap,
+        original.original,
+        iteration.producer_inputs,
+        runtime_chunk(selected, frame.transcript).canonical,
+        admitted,
+    )
+    with (
+        session_data_read_transaction(phases.authority._engine, str(running.claim.session_id)) as conn,
+        borrow_v4_preparation_memo_scope(),
+    ):
+        if (
+            load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+            != prepared.prepared_selected
+        ):
+            raise AuditIntegrityError("END prepared capture lost its current SQL head")
+        # This factory freshly loads and compares the COMPLETE selected closure,
+        # then reads current cost, clock and attachments. The admission owns only
+        # its evidence/recorder/application subset, joined by actual references.
+        source = _runtime_source_from_inputs_on_connection(conn, running, selected=selected, inventory=inventory, inputs=inputs)
+        for dependency in admitted.dependency_chunks:
+            if runtime_chunk(selected, dependency.reference) != dependency:
+                raise AuditIntegrityError("END prepared evidence changed an actual captured dependency")
+    producers = current_message_producers_from_runtime_source(
+        service=phases.service,
+        authority=phases.authority,
+        selected=selected,
+        inventory=inventory,
+        source=source,
+    )
+    return _RuntimeRestorationInputs(source, producers)
+
+
+async def restore_captured_end_runtime(
+    *, phase_owner: CheckpointPhaseOwner, prepared: CheckpointPreparedSource, capture_data: _CapturedRuntimeData
+) -> tuple[RestoredContinuationRuntime, CapturedContinuationRuntime]:
+    """Read the retained warm source, before any physical binding/attempt/H."""
+    phases = phase_owner.phases
+    running = phases.work.running
+    captured = capture_data.captured
+    if running is None or prepared.phase != "end" or prepared.source.checkpoint_id != phase_owner.selected.checkpoint_id:
+        raise AuditIntegrityError("END detached restore changed its original source-prepared transition")
+    selected = await load_selected_continuation(
+        authority=phases.authority, running=running, selected=prepared.prepared_selected, required_work=phases.work
+    )
+    if selected.stack != decode_continuation_snapshot(
+        prepared.prepared_selected.payload_json
+    ) or selected.stack != captured.stack.model_copy(update={"cursor": selected.stack.cursor}):
+        raise AuditIntegrityError("END prepared root is not its exact captured warm source")
+    inventory = await materialize_continuation_env_inventory(
+        advisor=phases.service._advisor_checkpoint,
+        authority=phases.authority,
+        selected=selected,
+        required_work=phases.work,
+    )
+    if inventory.names != phase_owner.inventory.names:
+        raise AuditIntegrityError("END prepared source changed its current credential-reference inventory")
+    monotonic_before_read = time.monotonic()
+    inputs = await _registered_read(
+        phases.work,
+        _RuntimeRestorationInputs,
+        lambda: _prepared_capture_inputs(
+            phase_owner=phase_owner, prepared=prepared, selected=selected, inventory=inventory, capture_data=capture_data
+        ),
+    )
+    detached = await _restore_runtime_from_inputs(
+        service=phases.service,
+        authority=phases.authority,
+        selected=selected,
+        inventory=inventory,
+        required_work=phases.work,
+        provider_owner=phases.provider_owner,
+        inputs=inputs,
+        monotonic_before_read=monotonic_before_read,
+        progress=None,
+        finish_read=None,
+        detached_disclosure=SchemaDisclosureTracker(),
+    )
+    require_detached_end_owners(detached, phase_owner.runtime)
+    # Construction consumes the actual captured admission and retains the full
+    # final source read in _restore_live. Do not serialize that new constructor
+    # result merely to read it back here. The consequence owner checks the real
+    # detached graph against this baseline before using it after provider return.
+    expected = expected_prepared_end_capture(phase_owner=phase_owner, selected=selected)
+    return detached, expected
 
 
 async def restore_prepared_end_runtime(

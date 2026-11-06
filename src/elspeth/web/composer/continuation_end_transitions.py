@@ -22,6 +22,7 @@ The entry transitions are:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import insert, update
@@ -69,6 +70,21 @@ END_EFFECT_OWNER = "composer_end"
 type EndTransition = Literal["end_entered", "recovery_entered", "end_review_dispatched", "end_repair_continued"]
 
 
+@dataclass(frozen=True, slots=True)
+class EndReviewDispatchData:
+    """The actual writer's predecessor, successor and outer effect locator."""
+
+    predecessor: SelectedContinuationState
+    selected: StoredContinuationSnapshot
+    effect_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedEndTransition:
+    selected: StoredContinuationSnapshot
+    effect_key: str
+
+
 def _quiescent_compose(stack_frames: tuple[object, ...]) -> ComposeFrame:
     compose = stack_frames[0]
     if type(compose) is not ComposeFrame or compose.phase != "response_retained" or compose.pending_response is None:
@@ -109,6 +125,39 @@ def retain_end_transition(
     candidate: PrivateChunk | None = None,
     captured: CapturedContinuationRuntime | None = None,
 ) -> StoredContinuationSnapshot:
+    return _retain_end_transition(
+        authority,
+        running,
+        selected=selected,
+        inventory=inventory,
+        transition=transition,
+        candidate=candidate,
+        captured=captured,
+    ).selected
+
+
+def retain_end_review_dispatch(
+    authority: ComposerAsyncOperationAuthority,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+) -> EndReviewDispatchData:
+    """Retain the complete dispatch proof and return its actual useful DATA."""
+    retained = _retain_end_transition(authority, running, selected=selected, inventory=inventory, transition="end_review_dispatched")
+    return EndReviewDispatchData(selected, retained.selected, retained.effect_key)
+
+
+def _retain_end_transition(
+    authority: ComposerAsyncOperationAuthority,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    transition: EndTransition,
+    candidate: PrivateChunk | None = None,
+    captured: CapturedContinuationRuntime | None = None,
+) -> _RetainedEndTransition:
     from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope
 
     if transition not in ("end_entered", "recovery_entered", "end_review_dispatched", "end_repair_continued"):
@@ -395,4 +444,4 @@ def retain_end_transition(
                 added = (PrivateChunk(frontier, canonical),)
             current = SelectedContinuationState(retained.checkpoint_id, root, _selected_chunks(root, captured.chunks, added))
             read_selected_turn_evidence_graph_on_connection(conn, running, selected=current, names=inventory.names)
-        return retained
+        return _RetainedEndTransition(retained, key)

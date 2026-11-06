@@ -42,7 +42,7 @@ from elspeth.web.composer.continuation_codec import PrivateChunk, encode_mandato
 from elspeth.web.composer.continuation_current_evidence import _assemble_runtime_turn_evidence
 from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence import encode_turn_evidence
+from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, capture_turn_evidence
 from elspeth.web.composer.continuation_iteration import capture_continuation_iteration, encode_continuation_iteration, iteration_values
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
@@ -101,6 +101,14 @@ class CapturedContinuationRuntime:
     selected: SelectedContinuationState
     stack: ContinuationFrameStack
     chunks: tuple[PrivateChunk, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedRuntimeData:
+    """The actual capture and its independently admitted evidence graph."""
+
+    captured: CapturedContinuationRuntime
+    admitted_evidence: AdmittedTurnEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -560,6 +568,36 @@ async def _restore_runtime(
     inputs = await _registered_read(required_work, _RuntimeRestorationInputs, read_inputs)
     if type(inputs) is not _RuntimeRestorationInputs:
         raise AuditIntegrityError("runtime read returned another restoration input owner")
+    return await _restore_runtime_from_inputs(
+        service=service,
+        authority=authority,
+        selected=selected,
+        inventory=inventory,
+        required_work=required_work,
+        provider_owner=provider_owner,
+        inputs=inputs,
+        monotonic_before_read=monotonic_before_read,
+        progress=progress,
+        finish_read=finish_read,
+        detached_disclosure=detached_disclosure,
+    )
+
+
+async def _restore_runtime_from_inputs(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    required_work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+    inputs: _RuntimeRestorationInputs,
+    monotonic_before_read: float,
+    progress: ComposerProgressSink | None,
+    finish_read: ContinuationFinishRead | None,
+    detached_disclosure: SchemaDisclosureTracker | None,
+) -> RestoredContinuationRuntime:
+    """Assemble actual acquired DATA; retain the complete final source proof."""
     source = inputs.source
     graph = await _assemble_runtime_turn_evidence(
         service=service,
@@ -743,6 +781,12 @@ def _selected_chunks(
 def _capture_owners(
     runtime: RestoredContinuationRuntime, *, source: ContinuationRuntimeSource, inventory: CurrentContinuationEnvInventory
 ) -> CapturedContinuationRuntime:
+    return _capture_owner_data(runtime, source=source, inventory=inventory).captured
+
+
+def _capture_owner_data(
+    runtime: RestoredContinuationRuntime, *, source: ContinuationRuntimeSource, inventory: CurrentContinuationEnvInventory
+) -> _CapturedRuntimeData:
     live, bindings = runtime.live, runtime.bindings
     selected = source.selected
     root = selected.stack
@@ -1002,7 +1046,7 @@ def _capture_owners(
     changed_root = root.model_copy(update={"frames": tuple(frames)})
     chunks = _selected_chunks(changed_root, selected.chunks, added)
     SelectedContinuationState(selected.checkpoint_id, changed_root, chunks)
-    return CapturedContinuationRuntime(selected, changed_root, chunks)
+    return _CapturedRuntimeData(CapturedContinuationRuntime(selected, changed_root, chunks), admitted)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1056,6 +1100,13 @@ async def capture_metadata_preparation_runtime(
 async def capture_continuation_runtime_owners(
     runtime: RestoredContinuationRuntime, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
 ) -> CapturedContinuationRuntime:
+    return (await capture_continuation_runtime_data(runtime, selected=selected, inventory=inventory)).captured
+
+
+async def capture_continuation_runtime_data(
+    runtime: RestoredContinuationRuntime, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+) -> _CapturedRuntimeData:
+    """Keep the admitted graph beside the capture through an adjacent DATA handoff."""
     if type(runtime) is not RestoredContinuationRuntime:
         raise TypeError("runtime capture requires its actual restored live owners")
     work = runtime.bindings.required_work
@@ -1064,7 +1115,7 @@ async def capture_continuation_runtime_owners(
     authority = runtime.materialization.authority
     running = _work_owners(authority, inventory, work)
 
-    def capture_scoped(memo: RetentionStageMemo) -> CapturedContinuationRuntime:
+    def capture_scoped(memo: RetentionStageMemo) -> _CapturedRuntimeData:
         from elspeth.web.composer.continuation_evidence import state_from_evidence_json
         from elspeth.web.composer.protocol import ComposerContextUnsupported
 
@@ -1078,7 +1129,7 @@ async def capture_continuation_runtime_owners(
         else:
             source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
         try:
-            captured = _capture_owners(runtime, source=source, inventory=inventory)
+            captured = _capture_owner_data(runtime, source=source, inventory=inventory)
         except ComposerContextUnsupported as refused:
             try:
                 authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
@@ -1097,13 +1148,13 @@ async def capture_continuation_runtime_owners(
         authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
         return captured
 
-    def capture() -> CapturedContinuationRuntime:
+    def capture() -> _CapturedRuntimeData:
         # One actual physical invocation owns this pure cache. Each facade
         # call still opens and proves its own current SQL DATA transaction.
         with borrow_v4_preparation_memo_scope() as memo:
             return capture_scoped(memo)
 
-    result = await _registered_read(work, CapturedContinuationRuntime, capture)
-    if type(result) is not CapturedContinuationRuntime:
+    result = await _registered_read(work, _CapturedRuntimeData, capture)
+    if type(result) is not _CapturedRuntimeData:
         raise AuditIntegrityError("runtime capture returned another nominal owner")
     return result

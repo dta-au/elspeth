@@ -329,8 +329,13 @@ async def handover_to_next_primary(store, owner, running, monkeypatch, *, expect
 
 async def post_p4_primary_input(store, tmp_path, monkeypatch):
     """Reach later PRIMARY through the original driver and a real handover."""
+    from functools import partial
+
     from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from elspeth.web.composer.no_tool_policy import state_is_structurally_empty
+    from elspeth.web.plugin_policy.models import PluginId
     from tests.integration.web.composer.test_freeform_pipeline_planner import _pipeline
+    from tests.unit.web.sessions import test_continuation_initialization
     from tests.unit.web.sessions.test_continuation_live_phases import _phase_case
     from tests.unit.web.sessions.test_continuation_tool_failure import _install_original_deadline
 
@@ -343,37 +348,51 @@ async def post_p4_primary_input(store, tmp_path, monkeypatch):
     joint, roles, ready_cuts = [], [], []
     actual_prepare = ContinuationLiveP4.prepare
 
-    async with _phase_case(
-        store,
-        tmp_path,
-        monkeypatch,
-        tool_call=("joint_authoring", "set_pipeline", _pipeline(tmp_path, str(store[4]))),
-    ) as (owner, running, _primary, primary_sdk):
-        operation_id = running.claim.operation_id
-        request_text = owner.runtime.bindings.message
+    with monkeypatch.context() as factory_config:
+        factory_config.setattr(
+            test_continuation_initialization,
+            "current_service",
+            partial(
+                test_continuation_initialization.current_service,
+                available_plugins=frozenset({PluginId("source", "csv"), PluginId("sink", "json")}),
+            ),
+        )
+        async with _phase_case(
+            store,
+            tmp_path,
+            monkeypatch,
+            tool_call=("joint_authoring", "set_pipeline", _pipeline(tmp_path, str(store[4]))),
+        ) as (owner, running, _primary, primary_sdk):
+            operation_id = running.claim.operation_id
+            request_text = owner.runtime.bindings.message
 
-        async def observe_prepared(p4, prepared):
-            result = await actual_prepare(p4, prepared)
-            if p4.inventory.running.claim.operation_id == operation_id:
-                captured = p4.captured
-                assert captured is not None and not joint
-                compose = captured.stack.frames[0]
-                evidence = decode_turn_evidence(
-                    next(chunk for chunk in captured.chunks if chunk.reference == compose.evidence),
-                    env_ref_names=p4.inventory.names,
-                    source_chunks=captured.chunks,
+            async def observe_prepared(p4, prepared):
+                result = await actual_prepare(p4, prepared)
+                if p4.inventory.running.claim.operation_id == operation_id:
+                    captured = p4.captured
+                    assert captured is not None and not joint
+                    compose = captured.stack.frames[0]
+                    evidence = decode_turn_evidence(
+                        next(chunk for chunk in captured.chunks if chunk.reference == compose.evidence),
+                        env_ref_names=p4.inventory.names,
+                        source_chunks=captured.chunks,
+                    )
+                    assert evidence.snapshot.joint_graph_json is not None
+                    assert evidence.graph is not None
+                    assert state_is_structurally_empty(evidence.graph.selected.batch.entry_state)
+                    assert not state_is_structurally_empty(evidence.graph.selected.batch.state)
+                    joint.append(evidence)
+                return result
+
+            with monkeypatch.context() as capture:
+                capture.setattr(ContinuationLiveP4, "prepare", observe_prepared)
+                _handover, ready, roles = await handover_to_next_primary(
+                    store, owner, running, capture, expected_roles=("early", "semantic")
                 )
-                assert evidence.snapshot.joint_graph_json is not None
-                joint.append(evidence)
-            return result
-
-        with monkeypatch.context() as capture:
-            capture.setattr(ContinuationLiveP4, "prepare", observe_prepared)
-            _handover, ready, roles = await handover_to_next_primary(store, owner, running, capture, expected_roles=("early", "semantic"))
-        ready_cuts.append(ready)
-        assert len(primary_sdk) == len(ready_cuts) == len(joint) == 1
-        assert roles == ("early", "semantic")
-        service = owner.service
+            ready_cuts.append(ready)
+            assert len(primary_sdk) == len(ready_cuts) == len(joint) == 1
+            assert roles == ("early", "semantic")
+            service = owner.service
     owner.work.coordinator.assert_completed()
 
     (claim,) = store[2].claim_segment(limit=1)

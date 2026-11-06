@@ -36,6 +36,7 @@ from elspeth.web.composer.continuation_checkpoint_end_terminal import (
     EndCheckpointRepairContinued,
     observe_end_checkpoint_terminal,
 )
+from elspeth.web.composer.continuation_end_dispatch import dispatch_and_adopt_end_review
 from elspeth.web.composer.continuation_end_transitions import (
     EndTransition,
     end_candidate_for,
@@ -269,8 +270,8 @@ async def _execute_continuation_end_review(
     top = selected.stack.frames[-1]
     if type(top) is not EndFrame or top.phase != "review_needed":
         raise AuditIntegrityError("END review has no landed owner for this END phase")
-    await _primary(phases, selected)
-    phase_read = await _retain(phases, selected, "end_review_dispatched")
+    initial_runtime, _initial_result = await _primary(phases, selected)
+    phase_read, phase_source = await dispatch_and_adopt_end_review(phases, selected, initial_runtime)
     current = phase_read.selected
     runtime, result = await _primary(phases, current, phase_read=phase_read)
     service = phases.service
@@ -295,12 +296,14 @@ async def _execute_continuation_end_review(
     from elspeth.web.composer.service import _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE
 
     if type(runtime.source.policy) is ContinuationAdmissionPolicyV4:
-        from elspeth.web.composer.continuation_checkpoint_phase import prepare_checkpoint_phase_owner
+        from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner
 
-        checkpoint_phase_owner = await prepare_checkpoint_phase_owner(
+        checkpoint_phase_owner = CheckpointPhaseOwner(
             phases,
             runtime,
             current,
+            phase_read.inventory,
+            phase_source,
             superseded_reply_index=superseded_reply_index,
             elide_advisor_exchange=_ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE,
         )

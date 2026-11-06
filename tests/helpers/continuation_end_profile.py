@@ -407,7 +407,7 @@ class EndTextMemoObservation:
 
 
 class EndPreparationProfile:
-    FIRST_CAPTURE_PARENT = "elspeth.web.composer.continuation_checkpoint_end_physical.capture_continuation_runtime_owners"
+    FIRST_CAPTURE_PARENT = "elspeth.web.composer.continuation_checkpoint_end_physical.capture_continuation_runtime_data"
 
     def __init__(
         self, *, enabled: bool, cpu_profile: bool = False, cpu_selection: str = "all_workers", sample_worker_marker: bool = False
@@ -894,7 +894,7 @@ class EndPreparationProfile:
         original_capture_scope = runtime.borrow_v4_preparation_memo_scope
         capture_codes = [
             value
-            for value in runtime.capture_continuation_runtime_owners.__code__.co_consts
+            for value in runtime.capture_continuation_runtime_data.__code__.co_consts
             if type(value) is CodeType and value.co_name == "capture"
         ]
 
@@ -937,7 +937,7 @@ class EndPreparationProfile:
             (physical, "bind_checkpoint_end_physical_request", physical.bind_checkpoint_end_physical_request),
             (physical, "require_original_checkpoint_end_physical_source", physical.require_original_checkpoint_end_physical_source),
             (producer, "build_checkpoint_end_input", producer.build_checkpoint_end_input),
-            (runtime, "_capture_owners", runtime._capture_owners),
+            (runtime, "_capture_owner_data", runtime._capture_owner_data),
             (provider_input, "prepare_provider_input", provider_input.prepare_provider_input),
             (paid, "prepare_v4_checkpoint_source_on_connection", paid.prepare_v4_checkpoint_source_on_connection),
             (ComposerAsyncOperationAuthority, "read_continuation_runtime", ComposerAsyncOperationAuthority.read_continuation_runtime),
@@ -946,13 +946,15 @@ class EndPreparationProfile:
         asynchronous = (
             (end, "_primary", end._primary),
             (end, "_retain", end._retain),
+            (end, "dispatch_and_adopt_end_review", end.dispatch_and_adopt_end_review),
             (phase, "prepare_checkpoint_phase_owner", phase.prepare_checkpoint_phase_owner),
             (ContinuationLivePhases, "current", ContinuationLivePhases.current),
             (CompositionCompletion, "_try_terminate_no_tools", CompositionCompletion._try_terminate_no_tools),
             (AdvisorCheckpointOwner, "_run_advisor_checkpoint", AdvisorCheckpointOwner._run_advisor_checkpoint),
             (AdvisorCheckpointOwner, "_call_advisor_with_audit_body", AdvisorCheckpointOwner._call_advisor_with_audit_body),
-            (physical, "capture_continuation_runtime_owners", physical.capture_continuation_runtime_owners),
+            (physical, "capture_continuation_runtime_data", physical.capture_continuation_runtime_data),
             (detached, "capture_continuation_runtime_owners", detached.capture_continuation_runtime_owners),
+            (detached, "restore_captured_end_runtime", detached.restore_captured_end_runtime),
             (detached, "restore_prepared_end_runtime", detached.restore_prepared_end_runtime),
             (first_return, "prepare_checkpoint_end_physical_source", first_return.prepare_checkpoint_end_physical_source),
             (runtime, "_restore_runtime", runtime._restore_runtime),
@@ -971,7 +973,7 @@ class EndPreparationProfile:
                         runtime,
                         "borrow_v4_preparation_memo_scope",
                         self._first_capture_scope_observer(
-                            original_capture_scope, capture_codes[0], runtime.capture_continuation_runtime_owners.__module__
+                            original_capture_scope, capture_codes[0], runtime.capture_continuation_runtime_data.__module__
                         ),
                     )
             for target, name, original in synchronous:
@@ -1054,7 +1056,7 @@ class EndPreparationProfile:
                     "selected_method_span": row.get("cprofile_method_span"),
                     "scope": (
                         "original first physical capture memo scope in original worker; queue and gate excluded; "
-                        "initial capture Python frame entry excluded; both authority reads and _capture_owners included; "
+                        "initial capture Python frame entry excluded; both authority reads and _capture_owner_data included; "
                         "cProfile overhead included; complete library/builtin/caller stats"
                         if row.get("cprofile_scope") == "original_first_capture_scope"
                         else "original current-evidence memo scope in original worker; queue and gate excluded; "

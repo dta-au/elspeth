@@ -954,7 +954,7 @@ async def test_first_capture_cpu_selects_original_scope_once_and_preserves_worke
             assert captured["witness"] == selected.identity and captured["clock"] == id(clock)
             assert "initial capture Python frame entry excluded" in captured["scope"]
             assert "queue and gate excluded" in captured["scope"]
-            assert captured["selected_method"]["qualname"] == "capture_continuation_runtime_owners.<locals>.capture"
+            assert captured["selected_method"]["qualname"] == "capture_continuation_runtime_data.<locals>.capture"
             names = {entry["function"]: entry for entry in captured["entries"]}
             assert names["authority_read_control"]["total_calls"] == 2
             assert names["capture_owners_control"]["total_calls"] == 1
