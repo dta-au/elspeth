@@ -1159,16 +1159,13 @@ def _decode_graph(
     *,
     prepared: bool = False,
     memory_completion: bool = False,
-    application: bool = False,
-    recorder_source: ApplicationRecorderSource | None = None,
 ) -> RestoredBatchData | RestoredPreparedBatchData | RestoredMemoryCompletionBatchData | ApplicationGraph:
+    """Decode standalone batch DATA; application graphs require their full codec."""
     return _decode_graph_values(
         encoded,
         env_ref_names,
         prepared=prepared,
         memory_completion=memory_completion,
-        application=application,
-        recorder_source=recorder_source,
     )[0]
 
 

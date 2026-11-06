@@ -403,7 +403,7 @@ def read_tool_no_execution_refusal_on_connection(
         source_cursor=receipt.source_cursor,
         response=frame.response,
     )
-    calls = decode_continuation_response(response).tool_batch.calls
+    calls = response.completion.tool_batch.calls
     if (
         data.calls != calls
         or data.batch.phase != "call_ready"

@@ -203,11 +203,14 @@ async def test_current_paid_install_matches_original_writes_and_reproves_changed
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ("read", "review"))
 async def test_paid_source_reuses_actual_recorder_and_preserves_standalone_extension(operation_store, tmp_path, monkeypatch, kind):
+    from elspeth.web.composer import continuation_evidence_application_data as application_data
+
     async with _paid_install_case(operation_store, tmp_path, monkeypatch, kind) as (case, selected, effect_key):
         with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
             original_decode = semantic_sql.decode_recorder_snapshot
             original_extend = semantic_sql._extend_admitted_evidence
-            decoder_inputs, decoded, extensions = [], [], []
+            original_compare = application_data.require_retained_call_extension
+            decoder_inputs, decoded, extensions, comparisons = [], [], [], []
 
             def decode(chunk):
                 decoder_inputs.append(chunk)
@@ -220,17 +223,34 @@ async def test_paid_source_reuses_actual_recorder_and_preserves_standalone_exten
                 extensions.append((data, original, admitted, call, snapshot, result))
                 return result
 
+            def compare(admitted, *, call, recorder, retained_evidence, env_ref_names):
+                result = original_compare(
+                    admitted, call=call, recorder=recorder, retained_evidence=retained_evidence, env_ref_names=env_ref_names
+                )
+                comparisons.append((admitted, call, recorder, retained_evidence, env_ref_names, result))
+                return result
+
             monkeypatch.setattr(semantic_sql, "decode_recorder_snapshot", decode)
             monkeypatch.setattr(semantic_sql, "_extend_admitted_evidence", extend)
+            monkeypatch.setattr(application_data, "require_retained_call_extension", compare)
             before = _rows_on_connection(conn)
             running = case["running"]
             root = decode_continuation_snapshot(selected.payload_json)
-            result, data, _paid_root = semantic_sql._paid_result_data(
+            actual = semantic_sql._paid_result_data(
                 conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key
             )
-            assert len(extensions) == 1
-            observed_data, original, admitted, call, snapshot, expected = extensions[0]
-            assert observed_data is data and call is result.audit_call and snapshot.llm_calls[-1] is call
+            result, data = actual.result, actual.invocation
+            assert len(comparisons) == 1 and extensions == []
+            admitted, call, snapshot, retained_evidence, names, expected = comparisons[0]
+            original = decode_continuation_snapshot(data.source.selected_snapshot_json)
+            assert admitted.source_chunk == data.source.evidence and names == data.source.env_ref_names
+            assert call is result.audit_call and snapshot.llm_calls[-1] is call
+            assert expected.evidence is retained_evidence and expected.recorder == result.recorder
+            assert retained_evidence.reference == semantic_sql._parent(root).evidence
+            assert (
+                semantic_sql._ref(conn, str(running.claim.session_id), running.claim.operation_id, retained_evidence.reference)
+                == retained_evidence
+            )
             matching = [(chunk, value) for chunk, value in decoded if chunk == result.recorder]
             assert len(matching) == 1
             assert matching[0][0] is result.recorder and matching[0][1] is snapshot
@@ -243,7 +263,8 @@ async def test_paid_source_reuses_actual_recorder_and_preserves_standalone_exten
             standalone = semantic_sql._extended_evidence_data(
                 conn, str(running.claim.session_id), running.claim.operation_id, data, equal_call, result.recorder
             )
-            assert standalone == expected
+            assert standalone.evidence == expected.evidence and standalone.applied_batch is None
+            assert len(extensions) == 1 and extensions[0][0] is data and extensions[0][5] is standalone
             matching = [(chunk, value) for chunk, value in decoded if chunk == result.recorder]
             assert len(matching) == 2 and all(chunk is result.recorder for chunk, _value in matching)
             assert matching[-1][1] is extensions[-1][4] and matching[-1][1] is not snapshot
@@ -254,6 +275,23 @@ async def test_paid_source_reuses_actual_recorder_and_preserves_standalone_exten
                     conn, str(running.claim.session_id), running.claim.operation_id, data, wrong_call, result.recorder
                 )
             wrong_prefix = replace(snapshot, llm_calls=(call, *snapshot.llm_calls))
+            for compared_call, compared_recorder in ((equal_call, snapshot), (call, wrong_prefix)):
+                with pytest.raises(AuditIntegrityError, match="exact original recorder prefix"):
+                    original_compare(
+                        admitted,
+                        call=compared_call,
+                        recorder=compared_recorder,
+                        retained_evidence=retained_evidence,
+                        env_ref_names=names,
+                    )
+            with pytest.raises(AuditIntegrityError):
+                original_compare(
+                    admitted,
+                    call=call,
+                    recorder=snapshot,
+                    retained_evidence=PrivateChunk(retained_evidence.reference, "{"),
+                    env_ref_names=names,
+                )
             with pytest.raises(AuditIntegrityError, match="exact original recorder prefix"):
                 original_extend(data, original, admitted, call, wrong_prefix)
             with pytest.raises(AuditIntegrityError, match="exact original recorder prefix"):
@@ -308,8 +346,15 @@ async def test_installed_source_reuses_actual_derivation_and_refuses_substituted
             before = _rows_on_connection(conn)
             admitted = require_installed_semantic_action_on_connection(conn, running, selected=installed, effect_key=effect_key)
             assert len(pairs) == 1
-            paid, original = pairs[0]
+            paid, original, primary_response = pairs[0]
             assert paid.invocation is original and admitted.paid is paid
+            assert admitted.original_primary_response is primary_response
+            if kind == "review":
+                assert primary_response is not None
+                assert primary_response.source_checkpoint_id == original.source.checkpoint_id
+                assert primary_response.source_cursor == original.source.cursor
+            else:
+                assert primary_response is None
             assert sum(source is original.source for source in sources) == 1
             assert _rows_on_connection(conn) == before
 
@@ -317,18 +362,19 @@ async def test_installed_source_reuses_actual_derivation_and_refuses_substituted
             original.verify(original.source)
             assert sum(source is original.source for source in sources) == 2
             independently_verified = action_sql._admit_paid(conn, paid)
-            assert independently_verified == admitted
+            assert independently_verified.original_primary_response is None
+            assert replace(independently_verified, original_primary_response=primary_response) == admitted
             assert sum(source is original.source for source in sources) == 3
             assert _rows_on_connection(conn) == before
 
             for change in ("derived", "equal_copy", "original_copy"):
 
                 def substituted(connection, session_id, operation_id, snapshot, root, key, *, change=change):
-                    actual_paid, actual_original = original_pair(connection, session_id, operation_id, snapshot, root, key)
+                    actual_paid, actual_original, actual_primary = original_pair(connection, session_id, operation_id, snapshot, root, key)
                     if snapshot.checkpoint_id != installed.checkpoint_id or key != effect_key:
-                        return actual_paid, actual_original
+                        return actual_paid, actual_original, actual_primary
                     if change == "original_copy":
-                        return actual_paid, replace(actual_original)
+                        return actual_paid, replace(actual_original), actual_primary
                     replacement = replace(actual_original)
                     if change == "derived":
                         replacement = replace(
@@ -337,7 +383,7 @@ async def test_installed_source_reuses_actual_derivation_and_refuses_substituted
                         )
                     else:
                         assert replacement == actual_original and replacement is not actual_original
-                    return replace(actual_paid, invocation=replacement), actual_original
+                    return replace(actual_paid, invocation=replacement), actual_original, actual_primary
 
                 monkeypatch.setattr(action_sql, "_original_paid_for_selected", substituted)
                 with pytest.raises(AuditIntegrityError, match="substituted its original derived invocation"):

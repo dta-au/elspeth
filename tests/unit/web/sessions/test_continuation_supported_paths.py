@@ -300,14 +300,14 @@ async def test_supported_driver_closes_original_paid_malformed_semantic_return(t
                 attempt = conn.execute(select(physical).where(physical.c.attempt_id == reached[0])).one()
                 hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == reached[0])).one()
                 ledger = conn.execute(select(usage).where(usage.c.entry_id == attempt.ledger_entry_id)).one()
-                cold, _input, _root = semantic_sql._paid_result_data(
+                cold = semantic_sql._paid_result_data(
                     conn,
                     str(harness.session_id),
                     operation_id,
                     paid.snapshot,
                     decode_continuation_snapshot(paid.snapshot.payload_json),
                     prepared.binding.effect_key,
-                )
+                ).result
             assert attempt.settled_at is not None and hold.state == "consumed"
             assert len(attempts) == 2 and all(item.settled_at is not None for item in attempts)
             assert ledger.prompt_tokens == 7 and ledger.completion_tokens == 3

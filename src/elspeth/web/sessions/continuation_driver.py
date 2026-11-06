@@ -2360,14 +2360,14 @@ class _SegmentDriver:
                         expected: SemanticAdvisorProviderResult = invalid_paid,
                     ) -> SemanticAdvisorProviderResult:
                         with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
-                            actual, _data, _root = _paid_result_data(
+                            actual = _paid_result_data(
                                 conn,
                                 str(self.running.claim.session_id),
                                 self.running.claim.operation_id,
                                 expected.snapshot,
                                 decode_continuation_snapshot(expected.snapshot.payload_json),
                                 expected.effect_key,
-                            )
+                            ).result
                         if actual != expected:
                             raise AuditIntegrityError("Semantic paid invalid lost its exact original cold result")
                         return actual

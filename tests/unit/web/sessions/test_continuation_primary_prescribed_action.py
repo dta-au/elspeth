@@ -109,7 +109,11 @@ async def test_historical_paid_primary_reader_survives_new_head_but_refuses_corr
                 source_cursor=result.snapshot.cursor,
                 response=result.response.reference,
             )
-            assert historical == result.response
+            assert historical.response == result.response
+            assert historical.source_checkpoint_id == result.snapshot.checkpoint_id
+            assert historical.source_cursor == result.snapshot.cursor
+            assert historical.completion == primary_sql.decode_continuation_response(result.response)
+            assert historical.call == primary_sql.decode_retained_physical_audit_call(result.response)
             savepoint = conn.begin_nested()
             conn.execute(update(usage).where(usage.c.session_id == sid).values(prompt_tokens=999))
             with pytest.raises(AuditIntegrityError, match="original complete token ledger"):
@@ -130,7 +134,7 @@ async def test_historical_paid_primary_reader_survives_new_head_but_refuses_corr
                     source_checkpoint_id=result.snapshot.checkpoint_id,
                     source_cursor=result.snapshot.cursor,
                     response=result.response.reference,
-                )
+                ).response
                 == result.response
             )
         assert len(sdk) == 1

@@ -18,7 +18,7 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.continuation import ComposeFrame, EffectFrontierEntry, PrivateChunkRef, ToolBatchFrame
 from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
 from elspeth.web.composer.continuation_batch_data import decode_coupled_batch_chunk
-from elspeth.web.composer.continuation_codec import decode_continuation_response, decode_continuation_snapshot
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4, decode_continuation_policy
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.sessions.continuation import private_chunk_key, read_chunk
@@ -177,9 +177,9 @@ def read_value_batch_preparation_refusal_on_connection(
         source_cursor=previous.cursor,
         response=source.response,
     )
-    if paid != original[source.response]:
+    if paid.response != original[source.response]:
         raise AuditIntegrityError("value preparation refusal changed its original paid response")
-    calls = decode_continuation_response(paid).tool_batch.calls
+    calls = paid.completion.tool_batch.calls
     index = source.tool_index
     if (
         index >= len(calls)

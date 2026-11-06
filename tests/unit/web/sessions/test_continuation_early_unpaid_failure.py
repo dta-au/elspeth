@@ -45,6 +45,108 @@ operation_store = _operation_store
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("opponent", ("ledger", "early_input"))
+async def test_acquired_early_retry_still_reproves_late_child_corruption_before_second_sdk(
+    operation_store, tmp_path, monkeypatch, opponent
+):
+    from elspeth.web.composer import continuation_checkpoint_early_physical as physical_boundary
+    from elspeth.web.sessions import continuation_checkpoint_early_retry as retry_sql
+
+    async with _early_case(operation_store, tmp_path, monkeypatch) as (_store, owner, running, selected, primary_sdk):
+        sdk = []
+
+        async def malformed_first(**_request):
+            sdk.append(1)
+            return _reply(None)
+
+        monkeypatch.setattr(litellm, "acompletion", malformed_first)
+        async with _early_attempt(owner, selected) as first:
+            with pytest.raises(_MalformedLLMResponseError):
+                await _invoke_early(first)
+            completed, _returned, _projected = await _complete_original(first)
+            assert completed.retry is not None
+        assert len(sdk) == 1 and len(primary_sdk) == 1
+        selected = await _admit_original_retry(owner, running, completed.completed)
+        sessions = owner.service._sessions_service
+        original_prepare = sessions.prepare_v4_checkpoint_source_sync
+        original_retry = retry_sql.read_early_format_retry_on_connection
+        preparation_reads = []
+        reached = []
+        preparing = False
+        engine = operation_store[0]
+        sid, operation = str(running.claim.session_id), running.claim.operation_id
+
+        def read_retry(conn, **kwargs):
+            if preparing:
+                assert conn.in_transaction()
+                preparation_reads.append(kwargs["selected"])
+            return original_retry(conn, **kwargs)
+
+        async with _early_attempt(owner, selected) as source:
+            acquired = physical_boundary.checkpoint_early_format_retry(source)
+            assert acquired is not None and acquired is source.phase_owner.phase_source.early_retry
+            assert acquired.selected == completed.completed
+
+            def corrupt_before_prepare(*, prepared):
+                nonlocal preparing
+                assert not reached and prepared.selected is selected
+                assert physical_boundary.checkpoint_early_format_retry(source) is acquired
+                before = stored_rows(engine)
+                with engine.begin() as conn:
+                    assert load_snapshot(conn, session_id=sid, operation_id=operation) == acquired.selected
+                    if opponent == "ledger":
+                        attempt = conn.execute(select(physical).where(physical.c.attempt_id == acquired.child.owed.attempt_id)).one()
+                        assert attempt.settled_at is not None and attempt.ledger_entry_id is not None
+                        row = conn.execute(select(ledger).where(ledger.c.entry_id == attempt.ledger_entry_id)).one()
+                        changed = conn.execute(
+                            update(ledger).where(ledger.c.entry_id == row.entry_id).values(prompt_tokens=row.prompt_tokens + 1)
+                        )
+                    else:
+                        reference = acquired.child.owed.source.early_input_ref
+                        assert reference is not None
+                        key = f"value:{reference.codec}:{reference.digest}"
+                        row = conn.execute(
+                            select(chunks).where(chunks.c.session_id == sid, chunks.c.operation_id == operation, chunks.c.chunk_key == key)
+                        ).one()
+                        changed = conn.execute(
+                            update(chunks)
+                            .where(chunks.c.session_id == sid, chunks.c.operation_id == operation, chunks.c.chunk_key == key)
+                            .values(payload=b"{}", byte_length=2, sha256=sha256(b"{}").hexdigest())
+                        )
+                    assert changed.rowcount == 1
+                    assert load_snapshot(conn, session_id=sid, operation_id=operation) == acquired.selected
+                reached.append(opponent)
+                preparing = True
+                try:
+                    return original_prepare(prepared=prepared)
+                finally:
+                    preparing = False
+                    with engine.begin() as conn:
+                        if opponent == "ledger":
+                            restored = conn.execute(
+                                update(ledger).where(ledger.c.entry_id == row.entry_id).values(prompt_tokens=row.prompt_tokens)
+                            )
+                        else:
+                            restored = conn.execute(
+                                update(chunks)
+                                .where(chunks.c.session_id == sid, chunks.c.operation_id == operation, chunks.c.chunk_key == row.chunk_key)
+                                .values(payload=row.payload, byte_length=row.byte_length, sha256=row.sha256)
+                            )
+                        assert restored.rowcount == 1
+                    assert stored_rows(engine) == before
+
+            with monkeypatch.context() as corrupt:
+                corrupt.setattr(sessions, "prepare_v4_checkpoint_source_sync", corrupt_before_prepare)
+                corrupt.setattr(retry_sql, "read_early_format_retry_on_connection", read_retry)
+                with pytest.raises(AuditIntegrityError):
+                    await _invoke_early(source)
+            assert reached == [opponent]
+            assert acquired.selected in preparation_reads
+            assert physical_boundary.checkpoint_early_format_retry(source) is acquired
+        assert len(sdk) == 1 and len(primary_sdk) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retry", (False, True))
 async def test_actual_early_prepared_source_failure_proves_input_and_original_retry(operation_store, tmp_path, monkeypatch, retry):
     from elspeth.web.composer import continuation_checkpoint_end_detached as detached

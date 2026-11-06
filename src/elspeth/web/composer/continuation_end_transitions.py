@@ -57,7 +57,10 @@ from elspeth.web.sessions.continuation import (
     read_chunk,
     retain_action_execution_receipt_on_connection,
 )
-from elspeth.web.sessions.continuation_primary import read_committed_primary_response_on_connection
+from elspeth.web.sessions.continuation_primary import (
+    read_committed_primary_response_on_connection,
+    require_current_primary_from_original_response_on_connection,
+)
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
@@ -226,9 +229,25 @@ def _retain_end_transition(
         )
         if open_effects != expected_open:
             raise AuditIntegrityError("END transition found another open effect")
-        response = decode_continuation_response(
-            read_committed_primary_response_on_connection(conn, running, selected=selected, reference=paid)
-        )
+        if review_admission is not None and transition == "end_review_dispatched":
+            original_primary = review_admission.original_primary_response
+            original_source = review_admission.paid.invocation.source
+            if original_primary is None or (original_primary.source_checkpoint_id, original_primary.source_cursor) != (
+                original_source.checkpoint_id,
+                original_source.cursor,
+            ):
+                raise AuditIntegrityError("END dispatch lost its Review's actual original PRIMARY source")
+            # The Review read above produced these actual bytes and prescription
+            # in this synchronous locked invocation. No callback, await or write
+            # intervenes. Current PRIMARY facts below remain freshly compared;
+            # later writers still reconstruct their own historical source.
+            response = require_current_primary_from_original_response_on_connection(
+                conn, running, selected=selected, reference=paid, original=original_primary
+            )
+        else:
+            response = decode_continuation_response(
+                read_committed_primary_response_on_connection(conn, running, selected=selected, reference=paid)
+            )
         if response.tool_batch.calls and transition != "recovery_entered":
             raise AuditIntegrityError("END requires a PRIMARY response that issued no tool calls")
         policy = decode_continuation_policy(before.admission_policy_json, before.policy_hash)

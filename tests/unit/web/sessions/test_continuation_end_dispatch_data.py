@@ -217,3 +217,158 @@ async def test_prescribed_end_keeps_full_history_proof_after_warm_handoff(operat
             ).scalars()
         )
     assert attempts_before == [after]
+
+
+@pytest.mark.asyncio
+async def test_prescribed_first_end_reuses_original_primary_data_and_rechecks_current_sql(tmp_path, monkeypatch):
+    """Actual prescribed ancestor, bounded at dispatch before any END SDK."""
+    from uuid import uuid4
+
+    from elspeth.web.composer import continuation_end_transitions as transitions
+    from elspeth.web.sessions import continuation_semantic_actions as actions
+    from elspeth.web.sessions import continuation_semantic_advisor as semantic
+    from elspeth.web.sessions.models import composer_provider_terminal_holds_table as holds
+    from tests.helpers.composer_operations import message_body
+    from tests.helpers.continuation_app import (
+        ScriptedSDK,
+        continuation_app,
+        install_sdk,
+        semantic_primary_response,
+        semantic_review_response,
+        submit_and_settle,
+        tool_call,
+    )
+
+    operation = str(uuid4())
+    actual_retain = transitions._retain_end_transition
+    actual_paid = semantic._paid_result_data
+    actual_current = transitions.require_current_primary_from_original_response_on_connection
+    dispatches, comparisons, fresh_reads = [], [], []
+
+    def compare_current(conn, running, **kwargs):
+        original = kwargs["original"]
+        assert original.action_source is not None and original.action_json is not None
+        assert original.effect_key == "provider:0:1"
+        assert actual_current(conn, running, **kwargs) is original.completion
+        # Exact values from another source or different complete bytes cannot
+        # borrow the earlier history, even when the reference is unchanged.
+        opponents = (
+            replace(original, session_id=uuid4()),
+            replace(original, effect_key="provider:0:0"),
+            replace(original, input_sha256="0" * 64),
+            replace(original, action_source=None),
+            replace(original, response=replace(original.response, canonical=original.response.canonical + " ")),
+        )
+        for opponent in opponents:
+            with pytest.raises(AuditIntegrityError):
+                actual_current(conn, running, **{**kwargs, "original": opponent})
+        effect = conn.execute(
+            select(effects).where(effects.c.session_id == str(running.claim.session_id), effects.c.effect_key == original.effect_key)
+        ).one()
+        physical = conn.execute(select(attempts).where(attempts.c.attempt_id == original.call.call_id)).one()
+        entry = conn.execute(select(usage).where(usage.c.entry_id == physical.ledger_entry_id)).one()
+        hold = conn.execute(select(holds).where(holds.c.provider_attempt_id == original.call.call_id)).one()
+        changes = (
+            update(effects)
+            .where(effects.c.session_id == effect.session_id, effects.c.effect_key == effect.effect_key)
+            .values(disposition="refused"),
+            update(effects)
+            .where(effects.c.session_id == effect.session_id, effects.c.effect_key == effect.effect_key)
+            .values(response_finished_at=None),
+            update(usage).where(usage.c.entry_id == entry.entry_id).values(prompt_tokens=entry.prompt_tokens + 1),
+            update(holds)
+            .where(holds.c.session_id == hold.session_id, holds.c.operation_id == hold.operation_id, holds.c.effect_key == hold.effect_key)
+            .values(state="active", consumed_at=None),
+        )
+        for statement in changes:
+            savepoint = conn.begin_nested()
+            try:
+                assert conn.execute(statement).rowcount == 1
+                with pytest.raises(AuditIntegrityError):
+                    actual_current(conn, running, **kwargs)
+            finally:
+                savepoint.rollback()
+            assert actual_current(conn, running, **kwargs) is original.completion
+        comparisons.append(original)
+        return original.completion
+
+    def retain(authority, running, **kwargs):
+        if kwargs["transition"] != "end_review_dispatched" or running.claim.operation_id != operation:
+            return actual_retain(authority, running, **kwargs)
+        current_review = kwargs["selected"].stack.active_action_source
+        assert current_review is not None
+        reconstructed = []
+
+        def paid(conn, sid, operation_id, selected, root, effect_key):
+            reconstructed.append(effect_key)
+            return actual_paid(conn, sid, operation_id, selected, root, effect_key)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(semantic, "_paid_result_data", paid)
+            patch.setattr(actions, "_paid_result_data", paid)
+            patch.setattr(transitions, "require_current_primary_from_original_response_on_connection", compare_current)
+            result = actual_retain(authority, running, **kwargs)
+        assert len(comparisons) == 1
+        original = comparisons[0]
+        ancestor = original.action_source
+        assert ancestor is not None and ancestor.effect_key != current_review.effect_key
+        assert reconstructed.count(current_review.effect_key) == 1
+        assert reconstructed.count(ancestor.effect_key) == 1
+        dispatches.append((current_review.effect_key, ancestor.effect_key))
+
+        # This is the historical reader used by the later source-preparation
+        # writer, on a new locked transaction after dispatch committed.
+        with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
+            arguments = {
+                "session_id": running.claim.session_id,
+                "operation_id": operation,
+                "dispatch_checkpoint_id": result.selected.checkpoint_id,
+                "semantic_effect_key": current_review.effect_key,
+            }
+            fresh = actions.read_original_dispatched_semantic_review_on_connection(conn, **arguments)
+            assert fresh.original_primary_response == original
+            ancestor_effect = conn.execute(
+                select(effects).where(effects.c.session_id == str(running.claim.session_id), effects.c.effect_key == ancestor.effect_key)
+            ).one()
+            physical = conn.execute(select(attempts).where(attempts.c.attempt_id == ancestor_effect.provider_attempt_id)).one()
+            entry = conn.execute(select(usage).where(usage.c.entry_id == physical.ledger_entry_id)).one()
+            savepoint = conn.begin_nested()
+            try:
+                assert (
+                    conn.execute(
+                        update(usage).where(usage.c.entry_id == entry.entry_id).values(prompt_tokens=entry.prompt_tokens + 1)
+                    ).rowcount
+                    == 1
+                )
+                with pytest.raises(AuditIntegrityError, match="ledger"):
+                    actions.read_original_dispatched_semantic_review_on_connection(conn, **arguments)
+            finally:
+                savepoint.rollback()
+            assert actions.read_original_dispatched_semantic_review_on_connection(conn, **arguments) == fresh
+            fresh_reads.append(fresh)
+        # A controlled original worker failure stops this correctness fixture;
+        # no provider allowance or preparation clock is extended for the probes.
+        raise AuditIntegrityError("controlled stop after actual PRIMARY dispatch comparisons")
+
+    monkeypatch.setattr(transitions, "_retain_end_transition", retain)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+
+        def first_primary(app):
+            return "Inspecting the current pipeline.", [tool_call(app, "historical_data_read", "get_pipeline_state", {})]
+
+        sdk = ScriptedSDK(
+            [
+                ("primary", first_primary),
+                ("semantic", semantic_primary_response),
+                ("primary", ("The inspected pipeline is ready for explanation.", None)),
+                ("semantic", semantic_review_response),
+            ],
+            app_ref=[harness.app],
+        )
+        install_sdk(monkeypatch, sdk)
+        terminal = await submit_and_settle(
+            harness, message_body("Inspect the requested pipeline, then explain the result.", operation_id=operation), rounds=720
+        )
+        assert terminal.status == "failed"
+        assert sdk.roles == ["primary", "semantic", "primary", "semantic"] and not sdk.steps
+        assert len(dispatches) == len(comparisons) == len(fresh_reads) == 1

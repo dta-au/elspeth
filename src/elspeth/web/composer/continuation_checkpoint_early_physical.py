@@ -21,7 +21,6 @@ from elspeth.web.composer.continuation_checkpoint_no_sdk import CheckpointNoSdkI
 from elspeth.web.composer.continuation_checkpoint_phase import CheckpointPhaseOwner, prepare_checkpoint_phase_owner
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import owned_json
-from elspeth.web.composer.continuation_env_inventory import require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_initialization import _registered
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash
@@ -219,41 +218,21 @@ async def prepare_checkpoint_early_physical_source(
     owner = await prepare_checkpoint_phase_owner(phases, runtime, selected, superseded_reply_index=None, elide_advisor_exchange=False)
     if len(owner.phase_source.completed_children) > 1:
         raise AuditIntegrityError("EARLY source exceeded its one original format retry")
-    retry = None
-    if owner.phase_source.completed_children:
-        from elspeth.web.composer.continuation_runtime import _registered_read
-        from elspeth.web.sessions.continuation import _require_current_continuation_running, load_snapshot
-        from elspeth.web.sessions.continuation_checkpoint_early_retry import read_early_format_retry_on_connection
-        from elspeth.web.sessions.locking import locked_session_transaction
-
-        running = phases.work.running
-        if running is None:
-            raise AuditIntegrityError("EARLY retry lost its original running work")
-
-        def read_retry() -> VerifiedEarlyFormatRetry:
-            with locked_session_transaction(phases.authority._engine, str(running.claim.session_id)) as conn:
-                _require_current_continuation_running(conn, running)
-                stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
-                if stored != owner.phase_source.current:
-                    raise AuditIntegrityError("EARLY retry changed its actual driver-admitted head")
-                require_current_env_inventory_on_connection(
-                    conn,
-                    running,
-                    inventory=owner.inventory,
-                    expected_checkpoint_id=stored.checkpoint_id,
-                    expected_cursor=stored.cursor,
-                )
-                result = read_early_format_retry_on_connection(
-                    conn,
-                    session_id=str(running.claim.session_id),
-                    operation_id=running.claim.operation_id,
-                    selected=stored,
-                )
-                if result is None or owner.phase_source.completed_children != (result.marker.effect_key,):
-                    raise AuditIntegrityError("EARLY retry lost its original consumed first complete child")
-                return result
-
-        retry = await _registered_read(phases.work, VerifiedEarlyFormatRetry, read_retry)
+    phase = owner.phase_source
+    retry = phase.early_retry
+    if retry is None:
+        if phase.completed_children:
+            raise AuditIntegrityError("EARLY retry lost its original consumed first complete child")
+    elif (
+        type(retry) is not VerifiedEarlyFormatRetry
+        or phase.phase != "early"
+        or phase.kind != "iteration_early"
+        or retry.selected is not phase.current
+        or retry.child.original_stage is not phase.source
+        or retry.marker.outer_effect_key != phase.outer_effect_key
+        or phase.completed_children != (retry.marker.effect_key,)
+    ):
+        raise AuditIntegrityError("EARLY retry changed its acquired phase DATA")
     phases.action_clock.require_preparation_time()
     capture_data = await capture_continuation_runtime_data(runtime, selected=selected, inventory=runtime.materialization.inventory)
     phases.action_clock.require_preparation_time()

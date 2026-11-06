@@ -38,7 +38,7 @@ from elspeth.web.composer.continuation_audit_buffer import (
     validate_recorder_projection,
 )
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData
-from elspeth.web.composer.continuation_codec import PrivateChunk, owned_json
+from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
 from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
@@ -393,13 +393,17 @@ def application_recorder_chunk(snapshot: RecorderSnapshot, *, recorder_source: A
         # Observe the current graph's complete projection. Exact equality with
         # the already admitted bytes needs no second parse or credential scan;
         # ordinary value equality would conflate distinct JSON field types.
-        if recorder_snapshot_json(snapshot) == recorder_source.chunk.canonical:
+        canonical = recorder_snapshot_json(snapshot)
+        if canonical == recorder_source.chunk.canonical:
             return recorder_source.chunk
-    if type(recorder_source) is ProspectiveApplicationRecorderSource:
+    elif type(recorder_source) is ProspectiveApplicationRecorderSource:
         require_application_recorder_source(recorder_source, recorder_source.env_ref_names)
-        if recorder_snapshot_json(snapshot) == recorder_source.chunk.canonical:
+        canonical = recorder_snapshot_json(snapshot)
+        if canonical == recorder_source.chunk.canonical:
             return recorder_source.chunk
-    return encode_recorder_snapshot(snapshot)
+    else:
+        return encode_recorder_snapshot(snapshot)
+    return encode_private_chunk(codec=RECORDER_CODEC, canonical=canonical)
 
 
 def application_recorder_slots(
@@ -506,6 +510,8 @@ def application_members(
             "authored_state_hash": value.authored_state_hash,
         }
     if type(value) is RecorderSnapshot:
+        # The directional visitor reaches every historical snapshot and retains
+        # its identity, so admit each distinct snapshot here before its fields.
         if selected_recorder is None or value is not selected_recorder.graph.recorder:
             application_recorder_chunk(value, recorder_source=recorder_source)
         else:
@@ -685,7 +691,6 @@ def application_result_tools(
         for snapshot in (cut.recorder_before, cut.recorder_after):
             if type(snapshot) is not RecorderSnapshot:
                 raise TypeError("application cut lost its actual recorder")
-            application_recorder_chunk(snapshot, recorder_source=recorder_source)
     return result_tools
 
 
@@ -702,8 +707,6 @@ def _application_graph_projection(
 
     checked_source = _ValidatedRecorderSource.capture(recorder_source, env_ref_names)
     encoded = _encode(graph.selected, env_ref_names, application=graph, recorder_source=recorder_source, checked_source=checked_source)
-    if application_recorder_chunk(graph.recorder, recorder_source=recorder_source) != recorder_source.chunk:
-        raise AuditIntegrityError("application graph changed its complete selected recorder")
     require_application_recorder_source(recorder_source, env_ref_names)
     return encoded
 
@@ -737,12 +740,6 @@ def encode_application_graph(graph: ApplicationGraph, *, env_ref_names: frozense
         != encoded
     ):
         raise AuditIntegrityError("application constructors changed the actual alias partition")
-    # Both originals can contain nested mutable values. Reprove them after
-    # every constructor and alias check, before returning this wire source.
-    if application_recorder_chunk(graph.recorder, recorder_source=recorder_source) != recorder_source.chunk:
-        raise AuditIntegrityError("application graph changed its complete selected recorder")
-    if application_recorder_chunk(restored.recorder, recorder_source=recorder_source) != recorder_source.chunk:
-        raise AuditIntegrityError("application constructors changed their complete selected recorder")
     require_application_recorder_source(recorder_source, env_ref_names)
     return encoded
 
@@ -777,8 +774,6 @@ def decode_application_graph(
         != encoded
     ):
         raise AuditIntegrityError("application graph lost complete values or aliases")
-    if application_recorder_chunk(restored.recorder, recorder_source=recorder_source) != recorder_source.chunk:
-        raise AuditIntegrityError("application graph changed its complete selected recorder")
     require_application_recorder_source(recorder_source, env_ref_names)
     return restored
 

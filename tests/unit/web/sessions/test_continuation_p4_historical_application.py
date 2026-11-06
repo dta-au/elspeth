@@ -125,9 +125,95 @@ def portable_historical_data_owners(running, admitted, prepared, names):
 
 
 @asynccontextmanager
+async def _genuine_metadata_portable_case(store, tmp_path, monkeypatch):
+    """Observe current atomic publication, then expose only its historical DATA."""
+    from elspeth.web.composer import continuation_metadata_admission as admission
+    from elspeth.web.sessions.continuation_next_iteration import is_applied_batch_cut
+
+    descriptor = ("original-metadata-change", "set_metadata", {"patch": {"name": "after"}})
+    async with _phase_case(store, tmp_path, monkeypatch, tool_call=descriptor) as (owner, running, _primary, sdk):
+        original_prepare = admission._prepare_detached
+        original_apply = admission.apply_committing_p4_application_on_connection
+        prepared, applied = [], []
+
+        async def prepare(actual_owner, runtime, selected, inventory):
+            data = await original_prepare(actual_owner, runtime, selected, inventory)
+            prepared.append((data, inventory))
+            return data
+
+        def apply(conn, commit, **kwargs):
+            stored = original_apply(conn, commit, **kwargs)
+            applied.append((commit, stored))
+            return stored
+
+        with monkeypatch.context() as observation:
+            observation.setattr(admission, "_prepare_detached", prepare)
+            observation.setattr(admission, "apply_committing_p4_application_on_connection", apply)
+            await _advance(owner)
+        assert len(prepared) == len(applied) == len(sdk) == 1
+        (data, inventory), (commit, stored) = prepared[0], applied[0]
+        assert type(stored) is StoredP4Application and commit.running is running and inventory.running is running
+        assert owner.runtime is None and owner.primary is None and owner.p4 is None and owner.finished_batch is None
+        assert owner.latest_snapshot is stored.snapshot
+        current = await load_selected_continuation(
+            authority=owner.authority, running=running, selected=stored.snapshot, required_work=owner.work
+        )
+        assert is_applied_batch_cut(current)
+        assert current.checkpoint_id == stored.snapshot.checkpoint_id and current.stack.cursor == stored.snapshot.cursor
+        bundle = stored.bundle
+        (record,) = bundle.entry.applications
+        current_compose = current.stack.frames[0]
+        assert type(current_compose) is ComposeFrame and current_compose.evidence == bundle.evidence_chunk.reference
+        assert bundle.evidence_chunk in current.chunks
+        assert record.effect_key == commit.effect_key and record.input_sha256 == commit.input_sha256
+        assert record.pending_batch == data.pending_batch.reference
+        assert bundle.result.receipt.prepared_p4_json == encode_prepared_p4(data.prepared, env_ref_names=inventory.names)
+        assert not data.prepared.crash_pending and not bundle.result.outcome.unwind_audit_failed
+        checkpoint = bundle.result.outcome.checkpoint
+        assert checkpoint is not None and checkpoint.inserted_state_ids
+        assert record.creator_operation_id == running.session_operation_context.fence.operation_id
+        assert record.creator_operation_epoch == running.session_operation_context.fence.operation_epoch
+        assert record.creator_sequence == running.claim.segment_sequence and record.creator_generation == running.claim.ownership_generation
+        compose = data.pending_capture.stack.frames[0]
+        assert type(compose) is ComposeFrame
+        original_chunk = next(chunk for chunk in data.pending_capture.chunks if chunk.reference == compose.evidence)
+        before = decode_turn_evidence(original_chunk, env_ref_names=inventory.names, source_chunks=data.pending_capture.chunks)
+        assert before.recorder_chunk.reference == compose.audit_buffer
+        assert before.snapshot.application_entry is None and before.graph is not None and before.graph.selected.batch.phase == "p4_pending"
+        pending = decode_p4_pending_batch_chunk(data.pending_batch, env_ref_names=inventory.names)
+        assert pending.batch.p4_input_json == bundle.result.receipt.prepared_p4_json
+        assert len(pending.batch.tool_outcomes) == 1
+        assert pending.batch.state.version == pending.batch.entry_state.version + 1 and pending.batch.state.metadata.name == "after"
+        assert all(outcome.call is pending.calls[index] for index, outcome in enumerate(pending.batch.tool_outcomes))
+        # No live runtime/P4 owner survives the accepted current tail. Finish
+        # the real lease before codec consumers use the original DATA below.
+        await _close_released_lease(store, owner, running)
+        values = {
+            "logical": bundle.entry.logical,
+            "checkpoint_id": record.checkpoint_id,
+            "cursor": record.cursor,
+            "response_chunk": bundle.evidence_after.sources.chunk(record.response),
+            "pending_batch_chunk": data.pending_batch,
+            "evidence_snapshot": before,
+            "result_chunk": bundle.evidence_after.sources.chunk(record.result),
+            "result": bundle.result,
+            "producer": P4EffectProducerData(
+                record.creator_sequence, record.creator_generation, record.creator_operation_id, record.creator_operation_epoch
+            ),
+            "env_ref_names": inventory.names,
+        }
+        yield running, data.prepared, inventory, bundle.result.outcome, values
+        assert owner.runtime is None and owner.primary is None and owner.p4 is None and owner.latest_snapshot is stored.snapshot
+
+
+@asynccontextmanager
 async def genuine_portable_case(store, tmp_path, monkeypatch, *, kind):
     """Actual atomic P4 publication; historical DATA augmentation is separate."""
     assert kind in ("graph", "nongraph", "revoked", "crash", "unavailable")
+    if kind == "graph":
+        async with _genuine_metadata_portable_case(store, tmp_path, monkeypatch) as values:
+            yield values
+        return
     coded_crash = kind in ("crash", "unavailable")
     descriptor = (
         (

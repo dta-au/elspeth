@@ -89,6 +89,7 @@ from elspeth.web.sessions.models import composer_continuation_events_table as ev
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_semantic_invocation import SemanticAdvisorInvocationData
     from elspeth.web.sessions.continuation_checkpoint_paid_terminal import VerifiedCheckpointPaidOverflowTerminal
+    from elspeth.web.sessions.continuation_primary import HistoricalPrimaryResponseData
     from elspeth.web.sessions.continuation_semantic_review_result import SemanticReviewCommitted
 
 
@@ -105,6 +106,7 @@ class SemanticActionAdmission:
     owner_effect_key: str | None = None
     review_candidate: EndContinuationCandidate | None = None
     review_candidate_source: PrivateChunkRef | None = None
+    original_primary_response: HistoricalPrimaryResponseData | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,9 +373,10 @@ def _original_paid_for_selected(
     selected: StoredContinuationSnapshot,
     root: ContinuationFrameStack,
     effect_key: str,
-) -> tuple[SemanticAdvisorPaidDecisionData, SemanticAdvisorInvocationData]:
+) -> tuple[SemanticAdvisorPaidDecisionData, SemanticAdvisorInvocationData, HistoricalPrimaryResponseData | None]:
     sid, operation = str(session_id), operation_id
-    result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
+    actual = _paid_result_data(conn, sid, operation, selected, root, effect_key)
+    result, data, paid_root = actual.result, actual.invocation, actual.paid_root
     if result.outcome is not SemanticAdvisorProviderOutcome.SUCCESS or result.decision is None or result.response is None:
         raise AuditIntegrityError("installed semantic action lost its original paid successful response")
     effect = _effect_data(conn, sid, operation, root, effect_key)
@@ -398,7 +401,7 @@ def _original_paid_for_selected(
         creator_operation_epoch=creator.session_operation_epoch,
         creator_lease_token=creator.session_operation_lease_token,
     )
-    return paid, data
+    return paid, data, actual.primary_response
 
 
 def _reprove_installed_snapshot(
@@ -411,12 +414,12 @@ def _reprove_installed_snapshot(
     from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
     root = decode_continuation_snapshot(selected.payload_json)
-    paid, original_invocation = _original_paid_for_selected(conn, session_id, operation_id, selected, root, effect_key)
+    paid, original_invocation, primary_response = _original_paid_for_selected(conn, session_id, operation_id, selected, root, effect_key)
     original_selected = semantic_recovery_source(conn, str(session_id), operation_id, selected).snapshot
     if type(paid) is not SemanticAdvisorPaidDecisionData:
         raise TypeError("semantic action requires its SQL-proved paid decision")
     evidence = _derive_paid_semantic_evidence_from_original_invocation(paid, original_invocation, end_candidate=_end_candidate(conn, paid))
-    admission = _admit_paid_evidence(paid, evidence)
+    admission = replace(_admit_paid_evidence(paid, evidence), original_primary_response=primary_response)
     expected = admission.expected_root.model_copy(update={"cursor": selected.cursor})
     if root != expected:
         raise AuditIntegrityError("installed semantic action changed its complete original paid/admitted root")

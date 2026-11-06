@@ -119,7 +119,10 @@ from elspeth.web.sessions.continuation import (
 )
 from elspeth.web.sessions.continuation_paid_overflow import PaidOverflowIdentity
 from elspeth.web.sessions.continuation_paid_overflow_quota import preflight_v4_requested_model
-from elspeth.web.sessions.continuation_primary import read_original_committed_primary_response_data_on_connection
+from elspeth.web.sessions.continuation_primary import (
+    HistoricalPrimaryResponseData,
+    read_original_committed_primary_response_data_on_connection,
+)
 from elspeth.web.sessions.continuation_retained_capacity import (
     ProspectiveContinuationChunk,
     ProviderTerminalHoldSource,
@@ -413,6 +416,7 @@ class _SemanticEndSourceObservation:
     review: SemanticReviewCommitted | None = None
     iteration_return: IterationReturnCommitted | None = None
     recovery_response: PrivateChunk | None = None
+    primary_response: HistoricalPrimaryResponseData | None = None
 
 
 def _input_end_source_observation(
@@ -477,14 +481,14 @@ def _input_end_source_observation(
             source_cursor=cursor,
             response=parent.pending_response,
         )
-        response = decode_continuation_response(original)
+        response = original.completion
         try:
             intent = parse_recovery_tool_batch(response.tool_batch)
         except (TypeError, ValueError) as error:
             raise AuditIntegrityError("Semantic recovery END changed its sole original control") from error
         if intent is None or candidate != recovery_candidate_for(parent, message=intent.message):
             raise AuditIntegrityError("Semantic recovery END substituted its paid provider-authored intent")
-        return _SemanticEndSourceObservation(candidate, recovery_response=original)
+        return _SemanticEndSourceObservation(candidate, recovery_response=original.response)
     if candidate.semantic_source is not None:
         from elspeth.web.sessions.continuation_semantic_actions import read_original_semantic_review_for_advisor_on_connection
 
@@ -506,7 +510,7 @@ def _input_end_source_observation(
         source_cursor=cursor,
         response=parent.pending_response,
     )
-    response = decode_continuation_response(original)
+    response = original.completion
     if response.tool_batch.calls:
         raise AuditIntegrityError("Semantic END reply cannot invent a candidate from a tool response")
     expected = EndContinuationCandidate(
@@ -521,7 +525,7 @@ def _input_end_source_observation(
     )
     if candidate != expected:
         raise AuditIntegrityError("Semantic END input substituted its exact original paid candidate/source")
-    return _SemanticEndSourceObservation(candidate)
+    return _SemanticEndSourceObservation(candidate, primary_response=original)
 
 
 def _input_end_source_data(
@@ -622,7 +626,10 @@ def _descriptor_data(conn: Connection, sid: str, operation: str, effect: Row[Any
     )
     data = make_semantic_advisor_invocation(raw)
     physical_input = _decode(_PhysicalInput, value.physical_request_json)
-    retained_inputs = _retained_inputs_data(conn, sid, operation, original, checkpoint_id=body.checkpoint_id, cursor=body.cursor)
+    observation = _input_end_source_observation(conn, sid, operation, original, checkpoint_id=body.checkpoint_id, cursor=body.cursor)
+    retained_inputs = _retained_inputs_from_observation(
+        conn, sid, operation, original, checkpoint_id=body.checkpoint_id, cursor=body.cursor, original=observation
+    )
     original_evidence = _require_retained_input_document(
         conn, sid, operation, original, physical_input, retained_inputs, env_ref_names=frozenset(body.env_ref_names)
     )
@@ -638,7 +645,7 @@ def _descriptor_data(conn: Connection, sid: str, operation: str, effect: Row[Any
         raise AuditIntegrityError("Semantic physical descriptor changed its complete original preimage")
     if original_evidence is None:
         raise AuditIntegrityError("Semantic cold descriptor lost its original admitted evidence")
-    return _SemanticOriginalInput(value, data, physical_input, original_evidence)
+    return _SemanticOriginalInput(value, data, physical_input, original_evidence, observation.primary_response)
 
 
 def _append(
@@ -1602,7 +1609,7 @@ def _outcome_event(value: _Outcome, key: str) -> str:
 
 def _paid_result(
     conn: Connection, running: ComposerOperationRunning, selected: StoredContinuationSnapshot, effect_key: str
-) -> tuple[SemanticAdvisorProviderResult, SemanticAdvisorInvocationData, ContinuationFrameStack]:
+) -> _SemanticPaidResultData:
     root = _current(conn, running, selected)
     return _paid_result_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key)
 
@@ -1614,7 +1621,7 @@ def _paid_result_data(
     selected: StoredContinuationSnapshot,
     root: ContinuationFrameStack,
     effect_key: str,
-) -> tuple[SemanticAdvisorProviderResult, SemanticAdvisorInvocationData, ContinuationFrameStack]:
+) -> _SemanticPaidResultData:
     """Reconstruct immutable physical DATA after a separate admission proof.
 
     Primitive identities identify stored facts. They grant no current claim,
@@ -1825,14 +1832,18 @@ def _paid_result_data(
         tag="response_retained",
         payload=_outcome_event(manifest, effect.result_chunk_key),
     )
-    return SemanticAdvisorProviderResult(selected, effect_key, call, response, record, decision, manifest.outcome), data, paid_root
+    return _SemanticPaidResultData(
+        SemanticAdvisorProviderResult(selected, effect_key, call, response, record, decision, manifest.outcome),
+        data,
+        paid_root,
+        original_input.primary_response,
+    )
 
 
 def read_semantic_advisor_outcome_on_connection(
     conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
 ) -> SemanticAdvisorProviderResult:
-    result, _data, _paid_root = _paid_result(conn, running, selected, effect_key)
-    return result
+    return _paid_result(conn, running, selected, effect_key).result
 
 
 def read_current_paid_semantic_decision_on_connection(
@@ -1846,8 +1857,8 @@ def read_current_paid_semantic_decision_on_connection(
     """
     root = _current(conn, running, selected)
     sid, operation = str(running.claim.session_id), running.claim.operation_id
-    result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
-    return _paid_decision_from_result(conn, running, selected, root, effect_key, result, data, paid_root)
+    actual = _paid_result_data(conn, sid, operation, selected, root, effect_key)
+    return _paid_decision_from_result(conn, running, selected, root, effect_key, actual.result, actual.invocation, actual.paid_root)
 
 
 def _paid_decision_from_result(
@@ -1906,11 +1917,11 @@ def install_current_semantic_decision_on_connection(
     from elspeth.web.sessions.continuation_semantic_actions import _install_semantic_action_from_paid_on_connection
 
     root = _current(conn, running, selected)
-    result, data, paid_root = _paid_result_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key)
-    paid = _paid_decision_from_result(conn, running, selected, root, effect_key, result, data, paid_root)
+    actual = _paid_result_data(conn, str(running.claim.session_id), running.claim.operation_id, selected, root, effect_key)
+    paid = _paid_decision_from_result(conn, running, selected, root, effect_key, actual.result, actual.invocation, actual.paid_root)
     if type(paid.decision.prescribed_action) is PrimaryContinuationAction:
         return _install_semantic_advisor_decision_from_result(
-            conn, running, selected=selected, effect_key=effect_key, result=result, data=data
+            conn, running, selected=selected, effect_key=effect_key, result=actual.result, data=actual.invocation
         )
     return _install_semantic_action_from_paid_on_connection(conn, running, selected=selected, paid=paid)
 
@@ -1918,8 +1929,10 @@ def install_current_semantic_decision_on_connection(
 def install_semantic_advisor_decision_on_connection(
     conn: Connection, running: ComposerOperationRunning, *, selected: StoredContinuationSnapshot, effect_key: str
 ) -> StoredContinuationSnapshot:
-    result, data, _paid_root = _paid_result(conn, running, selected, effect_key)
-    return _install_semantic_advisor_decision_from_result(conn, running, selected=selected, effect_key=effect_key, result=result, data=data)
+    actual = _paid_result(conn, running, selected, effect_key)
+    return _install_semantic_advisor_decision_from_result(
+        conn, running, selected=selected, effect_key=effect_key, result=actual.result, data=actual.invocation
+    )
 
 
 def _install_semantic_advisor_decision_from_result(
@@ -2023,7 +2036,8 @@ def _decision_data(
 ) -> SemanticAdvisorDecisionData:
     from elspeth.web.sessions.continuation_semantic_recovery import semantic_recovery_source
 
-    result, data, paid_root = _paid_result_data(conn, sid, operation, selected, root, effect_key)
+    actual = _paid_result_data(conn, sid, operation, selected, root, effect_key)
+    result, data, paid_root = actual.result, actual.invocation, actual.paid_root
     original_selected = semantic_recovery_source(conn, sid, operation, selected).snapshot
     if (
         _advisor(root).phase != "decision_ready"
@@ -3360,6 +3374,17 @@ class _SemanticOriginalInput:
     data: SemanticAdvisorInvocationData
     physical_input: _PhysicalInput
     original_evidence: _SemanticOriginalEvidence
+    primary_response: HistoricalPrimaryResponseData | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SemanticPaidResultData:
+    """Complete paid result and the immutable original DATA read alongside it."""
+
+    result: SemanticAdvisorProviderResult
+    invocation: SemanticAdvisorInvocationData
+    paid_root: ContinuationFrameStack
+    primary_response: HistoricalPrimaryResponseData | None
 
 
 @dataclass(frozen=True, slots=True)

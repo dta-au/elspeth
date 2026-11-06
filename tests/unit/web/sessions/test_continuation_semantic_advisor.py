@@ -1527,14 +1527,14 @@ async def test_paid_malformed_semantic_text_is_bound_to_original_raised_outcome(
             ).one()
             assert entry.entry_id == attempt.ledger_entry_id
             assert entry.prompt_tokens == paid.audit_call.prompt_tokens and entry.completion_tokens == paid.audit_call.completion_tokens
-            cold, _data, _root = semantic_sql._paid_result_data(
+            cold = semantic_sql._paid_result_data(
                 conn,
                 str(operation_store[4]),
                 case["running"].claim.operation_id,
                 paid.snapshot,
                 decode_continuation_snapshot(paid.snapshot.payload_json),
                 paid.effect_key,
-            )
+            ).result
             assert cold == paid and cold.outcome is semantic_sql.SemanticAdvisorProviderOutcome.PAID_INVALID
             assert cold.response is not None and decode_continuation_response(cold.response).message.content == original_text
             parent = conn.execute(

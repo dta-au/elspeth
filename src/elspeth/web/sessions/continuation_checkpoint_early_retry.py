@@ -221,5 +221,11 @@ def read_early_format_retry_phase_on_connection(
     if retry is None:
         return None
     return CheckpointPhaseSource(
-        "early", "iteration_early", retry.child.original_stage, selected, retry.marker.outer_effect_key, (retry.marker.effect_key,)
+        "early",
+        "iteration_early",
+        retry.child.original_stage,
+        selected,
+        retry.marker.outer_effect_key,
+        (retry.marker.effect_key,),
+        early_retry=retry,
     )

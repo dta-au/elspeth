@@ -364,9 +364,9 @@ def persist_v4_semantic_complete_on_connection(
             prepared_append=batch.batch.append,
         )
         settle_provider_attempt_on_connection(conn, session_id=sid, attempt_id=admission.attempt.attempt_id, entry=batch.quota_entry)
-        actual, _data, _root = _paid_result_data(
+        actual = _paid_result_data(
             conn, sid, operation, stored, decode_continuation_snapshot(stored.payload_json), source.effect_key
-        )
+        ).result
         if actual.response != batch.response or actual.recorder != batch.recorder or actual.audit_call != batch.audit_call:
             raise AuditIntegrityError("V4 semantic complete lost original cold response, recorder or audit")
         if batch.terminal is None:

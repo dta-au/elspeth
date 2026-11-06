@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_clock import ContinuationActionClock
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from elspeth.web.sessions.continuation_checkpoint_early_retry import VerifiedEarlyFormatRetry
     from elspeth.web.sessions.service import SessionServiceImpl
 
 type CheckpointPhase = Literal["early", "end"]
@@ -96,6 +97,7 @@ class CheckpointPhaseSource:
     outer_effect_key: str
     completed_children: tuple[str, ...] = ()
     terminal: bool = False
+    early_retry: VerifiedEarlyFormatRetry | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)

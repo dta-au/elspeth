@@ -28,6 +28,7 @@ from elspeth.web.composer.continuation_runtime import (
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
+from elspeth.web.composer.state import ValidationSummary
 from elspeth.web.continuation_retention_memo import borrow_v4_preparation_memo_scope
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_runtime import _runtime_source_from_inputs_on_connection, runtime_chunk
@@ -101,15 +102,23 @@ def require_detached_capture_matches(observed: CapturedContinuationRuntime, *, e
         raise AuditIntegrityError("END detached graph changed its complete pre-admission capture")
 
 
-def expected_prepared_end_capture(*, phase_owner: CheckpointPhaseOwner, selected: SelectedContinuationState) -> CapturedContinuationRuntime:
+def expected_prepared_end_capture(
+    *, phase_owner: CheckpointPhaseOwner, selected: SelectedContinuationState, detached: RestoredContinuationRuntime
+) -> CapturedContinuationRuntime:
     """Account for the exact cache observation and current validation refresh.
 
     Runtime capture appends cache history even without graph changes. Runtime
-    restore independently refreshes policy validation. Neither makes the full
-    capture idempotent; all other selected fields and bytes must remain exact.
+    restore independently refreshes policy validation. Freeze that actual result
+    here, before provider work; all other selected fields and bytes remain exact.
     """
     original = phase_owner.runtime
     live, bindings = original.live, original.bindings
+    if live.state != detached.live.state:
+        raise AuditIntegrityError("END detached expectation changed its original validated state")
+    snapshot = detached.bindings.plugin_snapshot
+    validation = detached.live.last_validation
+    if type(validation) is not ValidationSummary:
+        raise AuditIntegrityError("END detached expectation lost its actual restored validation")
     index, frame = _compose(selected)
     context = bindings.session_operation_context
     if context is None:
@@ -126,14 +135,12 @@ def expected_prepared_end_capture(*, phase_owner: CheckpointPhaseOwner, selected
         ),
         env_ref_names=names,
     )
-    snapshot, catalog = original.materialization.service._policy_context.build(bindings.user_id)
     if snapshot.snapshot_hash != bindings.plugin_snapshot.snapshot_hash or snapshot.policy_hash != bindings.plugin_snapshot.policy_hash:
         raise AuditIntegrityError("END detached expectation changed its actual current policy")
-    current = catalog.validate_composition_state(live.state)
     iteration = encode_continuation_iteration(
         capture_continuation_iteration(
             producer_inputs=original.materialization.snapshot_inputs(),
-            last_validation=current.validation,
+            last_validation=validation,
             advisor_review=live.advisor_review_state,
             failed_turn=live.failed_turn,
             anti_anchor=live.anti_anchor.snapshot_for_continuation(),
@@ -262,5 +269,5 @@ async def restore_captured_checkpoint_runtime(
     # final source read in _restore_live. Do not serialize that new constructor
     # result merely to read it back here. The consequence owner checks the real
     # detached graph against this baseline before using it after provider return.
-    expected = expected_prepared_end_capture(phase_owner=phase_owner, selected=selected)
+    expected = expected_prepared_end_capture(phase_owner=phase_owner, selected=selected, detached=detached)
     return detached, expected

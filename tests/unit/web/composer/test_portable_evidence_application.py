@@ -198,7 +198,7 @@ async def test_source_owned_admission_decodes_once_without_replacing_work_with_g
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra", ("decoder", "encoder", "low_decoder", "low_encoder"))
+@pytest.mark.parametrize("extra", ("decoder", "encoder", "low_encoder"))
 async def test_source_admission_count_oracle_refuses_real_redundant_codec_work(
     operation_store, extra, record_property, tmp_path, monkeypatch
 ):
@@ -223,10 +223,6 @@ async def test_source_admission_count_oracle_refuses_real_redundant_codec_work(
                 )
             elif extra == "encoder":
                 encode_application_graph(graph, env_ref_names=names, recorder_source=_recorder_source(bundle.evidence_after))
-            elif extra == "low_decoder":
-                batch_codec._decode_graph(
-                    bundle.entry.graph_json, names, application=True, recorder_source=_recorder_source(bundle.evidence_after)
-                )
             else:
                 batch_codec._encode(graph.selected, names, application=graph, recorder_source=_recorder_source(bundle.evidence_after))
         record_property(
@@ -699,10 +695,25 @@ async def test_later_real_journal_record_refuses_before_snapshot_locator_compari
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ("graph", "nongraph", "revoked", "crash", "unavailable"))
 async def test_complete_portable_projection_retains_real_outcome_all_channels_and_shared_graph(
-    operation_store, monkeypatch, kind, tmp_path
+    operation_store, monkeypatch, kind, tmp_path, record_property
 ):
+    from elspeth.web.composer.continuation_prepared_p4 import decode_prepared_p4, prepared_p4_members
+
     async with portable_input(operation_store, tmp_path, monkeypatch, kind=kind) as (running, args, values, audit, _messages):
         before = args["evidence"].effects
+        original_recorder = args["recorder"].snapshot_for_continuation(drained=args["drained"])
+        original_prepared = args["data"].batch.p4_input_json
+        assert original_prepared is not None and original_prepared == values["result"].receipt.prepared_p4_json
+        original_members = prepared_p4_members(
+            decode_prepared_p4(original_prepared, env_ref_names=values["env_ref_names"]), env_ref_names=values["env_ref_names"]
+        )
+        expected_withheld = (
+            ("planner_prose_unadmitted", "prior withheld"),
+            *((reply.origin, reply.content) for reply in original_members.withheld_replies),
+            ("planner_prose_unadmitted", "later withheld"),
+        )
+        assert tuple((reply.origin, reply.content) for reply in original_recorder.withheld_replies) == expected_withheld
+        record_property("original_prepared_withheld_count", len(original_members.withheld_replies))
         bundle = build_portable_p4_application(**values)
         assert args["evidence"].effects is before and args["evidence"]._historical_p4_applications == {}
         assert bundle.batch_after.batch.phase == "complete" and bundle.batch_after.batch.p4 is None
@@ -745,11 +756,23 @@ async def test_complete_portable_projection_retains_real_outcome_all_channels_an
         assert restored.recorder.visible_tool_events[0][0] is restored.recorder.invocations[1]
         assert len(graph.recorder.llm_calls) == len(graph.recorder.planner_attempts) == len(graph.recorder.private_candidates) == 1
         assert graph.recorder.drained.llm_calls == graph.recorder.drained.planner_attempts == graph.recorder.drained.private_candidates == 0
+        assert cut.recorder_before.drained.withheld_replies == original_recorder.drained.withheld_replies
+        for actual_recorder in (cut.recorder_before, cut.recorder_after, graph.recorder):
+            assert tuple((reply.origin, reply.content) for reply in actual_recorder.withheld_replies) == expected_withheld
+            for index, original_reply in enumerate(original_recorder.withheld_replies):
+                assert actual_recorder.withheld_replies[index] is cut.recorder_before.withheld_replies[index]
+                for other_index, other_original in enumerate(original_recorder.withheld_replies):
+                    assert (actual_recorder.withheld_replies[index] is actual_recorder.withheld_replies[other_index]) is (
+                        original_reply is other_original
+                    )
         if kind == "unavailable":
             assert cut.recorder_after is cut.recorder_before and graph.effects is cut.effects_before
             assert graph.recorder.drained.invocations == 1
+            assert graph.recorder.drained.withheld_replies == original_recorder.drained.withheld_replies
         else:
-            assert graph.recorder.drained.invocations == graph.recorder.drained.withheld_replies == 2
+            assert graph.recorder.drained.invocations == 2
+            expected_withheld_cursor = original_recorder.drained.withheld_replies + len(original_members.withheld_replies)
+            assert cut.recorder_after.drained.withheld_replies == graph.recorder.drained.withheld_replies == expected_withheld_cursor
             assert graph.recorder.drained.visible_tool_events == graph.recorder.drained.private_authorings == 1
         assert (
             encode_application_graph(graph, env_ref_names=values["env_ref_names"], recorder_source=_recorder_source(bundle.evidence_after))

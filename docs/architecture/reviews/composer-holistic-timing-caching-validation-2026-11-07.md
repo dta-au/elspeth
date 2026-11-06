@@ -29,7 +29,7 @@ independently of the timing fix; an investigation is not a completed repair.
 | --- | --- |
 | O1: repeated full reads | Blanket deletion rejected by source review: writers lack some fresh relational checks. Preserve refusal/publication boundaries; investigate verification without discarded graph construction. |
 | O2–O3: repeated chunk loads and canonical checks | Three-module repair under receiving review: reuse one complete fresh closure inside the transaction. Preserve the original guard count and smaller-allowance SQL bounds; acknowledge one additional root/contract read. The existing canonical memo remains; no digest-only cache or larger budget added. |
-| O4: self round trips | Removed the repeated immutable-snapshot transfer encoding after correcting ownership. Initial writer/decode checks remain; remaining round trips are being classified by their actual boundary. |
+| O4: self round trips | Normalized ownership, immutable-transfer removal, constructor-bound admission and trailing selected-recorder simplification retain initial/raw decode and fresh source checks. R391 recorder/codec/graph/source controls pass. R390 reaches first END under its preparation limit, then fails retry evidence capacity; focused source-proof success is not complete retry or release acceptance. |
 | O5: state parsing and credential passes | Exact-equal state parsing/hash and successful credential-scan reuse implemented; focused receiving pending. Both stored hashes and distinct-version/credential roles remain checked. Structural and whole-text scans differ; neither was removed on an unsupported equivalence claim. |
 | O6: settled semantic history replay | John separately approved historical request comparison for already-paid semantic calls. Implemented request/context/hash/scalar comparison with full new-call/publication admission and unchanged descriptor/evidence/current SQL facts; focused native receiving pending. Broader semantic source/action proofs remain. |
 | O7: repeated state/policy validation | Deleted the capture comparison that validated state, discarded the verdict and compared the returned authored input to itself. Policy acquisition, hashes/tools and actual source/credential checks remain. Used validation outputs at restore and expected-capture boundaries stay. |
@@ -39,7 +39,7 @@ independently of the timing fix; an investigation is not a completed repair.
 | U3: PostgreSQL | Correct preparation count is 3,570 SQL statements, not 5,755. PostgreSQL execution and lock-duration evidence remain owed. |
 | U4: input-controlled scanner work | R353 controlled public-detector probe passed: 6,096 distinct benign URLs in 262,128 bytes took a 60.292 ms median; 16/64/256 KiB cases scaled approximately linearly. This is synthetic/default-cap evidence, not a worst-case proof. Keep bounds; lazy first-hit iteration is a measured-priority candidate, not the demonstrated timing fix. |
 | U5: session-lifetime audit work | Actual semantic producer expects at most four items, ordinarily three: local repeated counting is already linear per proof. Counter substitution rejected as a false remedy. Whole-session JSON retrieval/canonicalization and cumulative history scaling remain open; a selective query needs real cohort bindings, not guessed columns. |
-| U6: legal history versus time allowance | Still open: original uninstrumented END preparation exceeds the unchanged five-second allowance. No cap/deadline increase is proposed to conceal it. |
+| U6: legal history versus time allowance | R390 now reaches first physical END under the original five-second preparation limit. Retry evidence-pair capacity then exposes a missing nominal terminal route; complete retry, timing and legal-history acceptance remain open. No limit/deadline increase is proposed. |
 | U7: caller-owned snapshot | Confirmed red through actual admission, then repaired by retaining the existing strict decoder's normalized value. R341: 32/32 focused controls pass, native exit 0, frozen tree, cleanup complete. Both direct-input variants retain `AdvisorAbandonmentResponse`, not caller dictionaries. |
 
 R339's larger 62-item cohort timed out in two existing async fixture paths and
@@ -62,14 +62,33 @@ lifetime control, and evidence state/ownership controls. The former object-ID
 lifetime census was not a reliable ownership observation. R355 is an interrupted
 diagnostic with four reported failures; it is not a qualifying gate.
 
-The memo working-set follow-up also changes the priority assessment: R333's
-distinct-key weight estimate is approximately 37.33 MiB, above the 32 MiB memo
-budget, with eleven recorder recomputations. A controlled 64 MiB memo experiment
-is justified before inventing more cache mechanisms. This is engineering memo
-residence, distinct from the unchanged 16 MiB operation-payload allowance and
-1 MiB document limits. Four concurrent 64 MiB parents would charge up to 256 MiB
-per process; that is not an RSS guarantee. Neither a budget change nor a timing
-gain has yet been adopted or qualified here.
+The subsequent controlled memo experiment did not recover the deadline:
+32 MiB took 5.643582874 seconds and 64 MiB 5.532289734 seconds; both failed
+five seconds. Production remains 32 MiB. This preparation memo is distinct
+from the 16 MiB retained-payload default and 1 MiB document/evidence limits;
+logical memo charge is not RSS. The memo follow-up preserves its earlier
+conditional recommendation separately from that receiving result.
+
+### Current receiving boundary — R390/R391
+
+R390 now reaches first physical END under the original preparation limit,
+then fails evidence-pair capacity after the malformed result. SDK/retention
+wall time is not preparation time. Actual ComposerContextUnsupported carries
+an exact ContinuationMandatoryCaptureOverflow cause that the integrity-only
+retry handler misses; polling later returns executor_unavailable. R392 is a
+precise warm/cold routing plan, not implementation. Preserve original nominal
+witness/source/cost/ledger settlement and propagate unrelated context refusal.
+
+R391 completes 289 recorder, codec-opponent, graph-channel, attribute and
+masquerade controls, native0/frozen/cleanup complete. EARLY True remains
+unreceived; no full workflow/release/deployment acceptance follows.
+
+Read-only current source E+R totals 990,577 bytes. A lossless one-level system
+prefix candidate reproduces old bytes and saves 141,330 bytes on that current
+recorder; it is not production implementation, the failed appended-pair size
+or proof of sufficient headroom. Fix terminal correctness before adopting a
+size change. Keep original clocks, 32 MiB preparation cache, 16 MiB retained
+payload default and 1 MiB document/evidence limits unchanged.
 
 Pinned target `c900eebd9c`; `git diff --stat c900eebd9c -- src tests/helpers` is empty, so every source citation below is the pinned source. Read-only: nothing was executed, imported, edited or connected to. This is a source review plus counts taken from existing lane artifacts. It is not test or release acceptance.
 

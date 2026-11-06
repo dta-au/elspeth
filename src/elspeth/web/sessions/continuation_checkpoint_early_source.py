@@ -236,6 +236,11 @@ def resolve_early_original_stage_on_connection(
 
     original_compose, original_batch = applied_batch_cut(decode_continuation_snapshot(origin.payload_json).frames)
     current_compose, current_batch = applied_batch_cut(decode_continuation_snapshot(source.origin.payload_json).frames)
+    if source.retry_ordinal == 1:
+        # The full retry-child proof above verifies the refreshed accumulator:
+        # its shared graph includes the first paid call's appended recorder.
+        # Compare the remaining batch invariants with the pre-call stage.
+        current_batch = current_batch.model_copy(update={"accumulator": original_batch.accumulator})
     if (
         source.outer_effect_key != f"advance-early:{original_batch.response.digest}"
         or current_batch != original_batch

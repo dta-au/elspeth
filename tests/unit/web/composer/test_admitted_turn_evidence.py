@@ -392,7 +392,7 @@ async def test_actual_carrier_admits_once_then_reuses_without_application_codec_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra", ("decoder", "encoder", "low_decoder", "low_encoder"))
+@pytest.mark.parametrize("extra", ("decoder", "encoder", "low_encoder"))
 async def test_reuse_count_oracle_rejects_real_extra_application_codec_work(operation_store, extra, record_property, tmp_path, monkeypatch):
     async with portable_input(operation_store, tmp_path, monkeypatch) as (_running, _args, values, _audit, _messages):
         bundle = build_portable_p4_application(**values)
@@ -406,8 +406,6 @@ async def test_reuse_count_oracle_rejects_real_extra_application_codec_work(oper
                 decode_application_graph(bundle.entry.graph_json, env_ref_names=names, recorder_source=_recorder_source(admitted))
             elif extra == "encoder":
                 encode_application_graph(admitted.graph, env_ref_names=names, recorder_source=_recorder_source(admitted))
-            elif extra == "low_decoder":
-                batch_codec._decode_graph(bundle.entry.graph_json, names, application=True, recorder_source=_recorder_source(admitted))
             else:
                 batch_codec._encode(admitted.graph.selected, names, application=admitted.graph, recorder_source=_recorder_source(admitted))
         record_property(

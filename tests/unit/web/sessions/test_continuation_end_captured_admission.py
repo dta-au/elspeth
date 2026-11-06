@@ -23,6 +23,7 @@ from elspeth.web.composer.continuation_policy_settings import continuation_polic
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
+from elspeth.web.composer.state import ValidationEntry, ValidationSummary
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
@@ -163,7 +164,47 @@ async def test_actual_early_cold_projection_preserves_history_and_exact_observat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retry", (False, True))
 async def test_actual_early_capture_pair_preserves_isolation_and_rejects_late_mutation(operation_store, tmp_path, monkeypatch, retry):
-    async with _early_case(operation_store, tmp_path, monkeypatch) as (_store, owner, running, selected, primary_sdk):
+    import traceback
+
+    from elspeth.web.composer import continuation_checkpoint_phase as phase_module
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
+    from elspeth.web.composer.continuation_iteration_transitions import applied_batch_cut
+    from elspeth.web.sessions import continuation_checkpoint_early_retry as retry_sql
+    from elspeth.web.sessions import continuation_checkpoint_early_source as source_sql
+
+    journal = tmp_path / "early-capture-stages.jsonl"
+
+    def record_stage(label, outcome, error=None):
+        record = {"stage": label, "outcome": outcome, "monotonic": time.monotonic(), "retry": retry}
+        if error is not None:
+            record["exception_type"] = type(error).__qualname__
+            record["frames"] = [
+                {"file": frame.f_code.co_filename, "function": frame.f_code.co_name, "line": line}
+                for frame, line in traceback.walk_tb(error.__traceback__)
+            ]
+        try:
+            with journal.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(record) + "\n")
+        except OSError as recording_error:
+            if error is None:
+                raise
+            error.add_note("EARLY diagnostic journal write failed: " + type(recording_error).__qualname__)
+
+    @asynccontextmanager
+    async def stage(label):
+        record_stage(label, "entered")
+        try:
+            yield
+        except BaseException as original:
+            record_stage(label, "raised", original)
+            raise
+        else:
+            record_stage(label, "returned")
+
+    async with (
+        _early_case(operation_store, tmp_path, monkeypatch) as (_store, owner, running, selected, primary_sdk),
+        stage("test_body"),
+    ):
         requests = []
 
         async def complete(**arguments):
@@ -173,22 +214,66 @@ async def test_actual_early_capture_pair_preserves_isolation_and_rejects_late_mu
         monkeypatch.setattr(litellm, "acompletion", complete)
         first_admission = None
         if retry:
-            async with _early_attempt(owner, selected) as first:
+            async with stage("first_preparation_and_attempt"), _early_attempt(owner, selected) as first:
                 with pytest.raises(_MalformedLLMResponseError):
-                    await _invoke_early(first)
+                    async with stage("first_sdk"):
+                        await _invoke_early(first)
                 first_admission = early_module.checkpoint_early_detached_runtime(first).source.admitted_evidence
-                completed, _returned, _projected = await _complete_original(first)
+                async with stage("first_completion"):
+                    completed, _returned, _projected = await _complete_original(first)
                 assert completed.retry is not None
-            selected = await _admit_original_retry(owner, running, completed.completed)
+            async with stage("retry_admission"):
+                selected = await _admit_original_retry(owner, running, completed.completed)
 
         pairs, bodies, final_reads = [], [], []
         original_capture = early_module.capture_continuation_runtime_data
         original_body = runtime_module._capture_owner_data
         original_read = owner.authority.read_continuation_runtime
         original_baseline = early_module.require_checkpoint_early_detached_source
+        original_phase = early_module.prepare_checkpoint_phase_owner
+        original_retry = retry_sql.read_early_format_retry_on_connection
+        original_inventory = phase_module.require_current_env_inventory_on_connection
         baseline_stages = []
+        acquired_phases, acquired_retries, inventory_checks = [], [], []
+        retry_read_selections, rejected_source_changes = [], []
+        between_phase_and_capture = False
+        acquiring_phase = False
+
+        async def acquire_phase(*args, **kwargs):
+            nonlocal acquiring_phase, between_phase_and_capture
+            acquiring_phase = True
+            try:
+                result = await original_phase(*args, **kwargs)
+            finally:
+                acquiring_phase = False
+            acquired_phases.append(result)
+            between_phase_and_capture = True
+            return result
+
+        def read_retry(*args, **kwargs):
+            assert not between_phase_and_capture, "issuance reread the retry DATA already returned with its phase"
+            retry_read_selections.append(kwargs["selected"])
+            result = original_retry(*args, **kwargs)
+            if acquiring_phase:
+                acquired_retries.append(result)
+            return result
+
+        def inventory(conn, actual_running, **kwargs):
+            assert acquiring_phase and conn.in_transaction() and actual_running is running
+            result = original_inventory(conn, actual_running, **kwargs)
+            current_inventory = kwargs["inventory"]
+            changed = replace(
+                current_inventory, selection=replace(current_inventory.selection, cursor=current_inventory.selection.cursor + 1)
+            )
+            with pytest.raises(AuditIntegrityError, match="inventory belongs to another selected checkpoint"):
+                original_inventory(conn, actual_running, **{**kwargs, "inventory": changed})
+            inventory_checks.append(current_inventory)
+            return result
 
         async def capture(*args, **kwargs):
+            nonlocal between_phase_and_capture
+            assert between_phase_and_capture
+            between_phase_and_capture = False
             result = await original_capture(*args, **kwargs)
             pairs.append(result)
             return result
@@ -214,8 +299,26 @@ async def test_actual_early_capture_pair_preserves_isolation_and_rejects_late_mu
             observe.setattr(runtime_module, "_capture_owner_data", body)
             observe.setattr(owner.authority, "read_continuation_runtime", read)
             observe.setattr(early_module, "require_checkpoint_early_detached_source", baseline)
-            async with _early_attempt(owner, selected) as source:
-                await _invoke_early(source)
+            observe.setattr(early_module, "prepare_checkpoint_phase_owner", acquire_phase)
+            observe.setattr(retry_sql, "read_early_format_retry_on_connection", read_retry)
+            observe.setattr(phase_module, "require_current_env_inventory_on_connection", inventory)
+            async with stage("selected_preparation_and_attempt"), _early_attempt(owner, selected) as source:
+                record_stage("selected_preparation", "returned")
+                assert acquired_phases == [source.phase_owner]
+                acquired_retry = early_module.checkpoint_early_format_retry(source)
+                assert acquired_retry is source.phase_owner.phase_source.early_retry
+                if retry:
+                    assert acquired_retry is not None and any(value is acquired_retry for value in acquired_retries)
+                    assert acquired_retry.selected is source.phase_owner.phase_source.current
+                    assert acquired_retry.child.original_stage is source.phase_owner.phase_source.source
+                    assert inventory_checks == [source.phase_owner.inventory]
+                else:
+                    assert acquired_retry is None and not inventory_checks
+                async with stage("selected_sdk"):
+                    await _invoke_early(source)
+                custody = early_module.checkpoint_early_physical_custody(source)
+                assert custody.continuation_checkpoint_v4 is not None
+                assert custody.continuation_checkpoint_v4.retry_ordinal == int(retry)
                 detached = early_module.checkpoint_early_detached_runtime(source)
                 warm = source.phase_owner.runtime
                 assert len(pairs) == 1 and bodies == [warm]
@@ -234,6 +337,7 @@ async def test_actual_early_capture_pair_preserves_isolation_and_rejects_late_mu
                     await _complete_original(source)
                 assert baseline_stages[-1] == "entered"
                 detached.live.state = state
+                record_stage("state_mutation_opponent", "refused")
                 early_module.require_checkpoint_early_detached_source(source, detached=detached, original=warm)
 
                 warm_messages = list(warm.live.llm_messages)
@@ -243,8 +347,64 @@ async def test_actual_early_capture_pair_preserves_isolation_and_rejects_late_mu
                     await _complete_original(source)
                 assert baseline_stages[-1] == "entered"
                 detached.live.llm_messages.pop()
-                completed, _returned, _projected = await _complete_original(source)
+                record_stage("message_mutation_opponent", "refused")
+                original_resolve = source_sql.resolve_early_original_stage_on_connection
+
+                def resolve_original(conn, *, source, names):
+                    resolved = original_resolve(conn, source=source, names=names)
+                    if source.retry_ordinal == 1 and not rejected_source_changes:
+                        assert acquired_retry is not None
+                        assert resolved == acquired_retry.child.original_stage
+                        root = decode_continuation_snapshot(source.origin.payload_json)
+                        compose, batch = applied_batch_cut(root.frames)
+                        old_compose, old_batch = applied_batch_cut(decode_continuation_snapshot(resolved.payload_json).frames)
+                        assert batch.accumulator != old_batch.accumulator
+                        assert batch.model_copy(update={"accumulator": old_batch.accumulator}) == old_batch
+                        assert compose.state == old_compose.state
+                        changed_state = compose.state.model_copy(
+                            update={"digest": "0" * 64 if compose.state.digest != "0" * 64 else "1" * 64}
+                        )
+                        for label, changed_compose, changed_batch in (
+                            ("accumulator", compose, batch.model_copy(update={"accumulator": old_batch.accumulator})),
+                            ("state", compose.model_copy(update={"state": changed_state}), batch),
+                            ("tool_index", compose, batch.model_copy(update={"next_tool_index": batch.next_tool_index + 1})),
+                        ):
+                            changed_root = root.model_copy(update={"frames": (changed_compose, changed_batch)})
+                            changed_origin = replace(source.origin, payload_json=encode_continuation_snapshot(changed_root))
+                            before_reads = len(retry_read_selections)
+                            record_stage("resolver_opponent_" + label, "entered")
+                            # The resolver must run its actual retry proof before
+                            # permitting the known paid-recorder accumulator change.
+                            with pytest.raises(AuditIntegrityError, match="EARLY retry changed its complete original child successor"):
+                                original_resolve(conn, source=replace(source, origin=changed_origin), names=names)
+                            assert retry_read_selections[before_reads:] == [changed_origin]
+                            rejected_source_changes.append(label)
+                            record_stage("resolver_opponent_" + label, "refused")
+                    return resolved
+
+                def resolve(conn, *, source, names):
+                    if source.retry_ordinal != 1 or rejected_source_changes:
+                        return resolve_original(conn, source=source, names=names)
+                    record_stage("retry_resolver", "entered")
+                    try:
+                        result = resolve_original(conn, source=source, names=names)
+                    except BaseException as original:
+                        record_stage("retry_resolver", "raised", original)
+                        raise
+                    record_stage("retry_resolver", "returned")
+                    return result
+
+                with monkeypatch.context() as completion:
+                    completion.setattr(source_sql, "resolve_early_original_stage_on_connection", resolve)
+                    async with stage("final_completion"):
+                        completed, _returned, projected = await _complete_original(source)
                 assert completed.retry is None
+                assert projected.accounting.provider_attempts == 1 + int(retry)
+                if acquired_retry is not None:
+                    assert rejected_source_changes == ["accumulator", "state", "tool_index"]
+                    assert projected.accounting.first_attempt_schema_valid == acquired_retry.marker.first_attempt_schema_valid
+                    assert projected.accounting.first_attempt_accepted == acquired_retry.child.accounting.first_attempt_accepted
+                    assert projected.accounting.format_reprompt_sent == acquired_retry.marker.format_reprompt_required
         assert len(primary_sdk) == 1 and len(requests) == 1 + int(retry)
 
 
@@ -483,6 +643,7 @@ async def _actual_end(operation_store, tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_actual_end_reuses_capture_admission_and_constructs_isolated_owners(operation_store, tmp_path, monkeypatch):
     async with _actual_end(operation_store, tmp_path, monkeypatch) as (phases, selected, _primary):
+        paid_before = _paid_preparation_rows(operation_store[0])
         pairs = []
         final_reads = []
         bodies = []
@@ -524,6 +685,19 @@ async def test_actual_end_reuses_capture_admission_and_constructs_isolated_owner
             # Constructor equivalence belongs in this focused control; later
             # consequence owners still check the actual graph before using it.
             physical_module.require_checkpoint_end_detached_source(source)
+            validation = source.detached.live.last_validation
+            assert type(validation) is ValidationSummary
+            source.detached.live.last_validation = replace(
+                validation,
+                warnings=(
+                    *validation.warnings,
+                    ValidationEntry(component="pipeline", message="Later validation observation", severity="low"),
+                ),
+            )
+            with pytest.raises(AuditIntegrityError, match="changed its complete pre-admission capture"):
+                physical_module.require_checkpoint_end_detached_source(source)
+            source.detached.live.last_validation = validation
+            physical_module.require_checkpoint_end_detached_source(source)
             state = source.detached.live.state
             source.detached.live.state = replace(state, version=state.version + 1)
             assert owner.runtime.live.state.version == state.version
@@ -542,6 +716,56 @@ async def test_actual_end_reuses_capture_admission_and_constructs_isolated_owner
         with pytest.raises(_PreparedEndObserved):
             await execute_continuation_end_review(phases, selected)
         assert len(pairs) == 1
+        assert _paid_preparation_rows(operation_store[0]) == paid_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_original_state", (False, True))
+async def test_detached_baseline_requires_original_state_used_by_actual_validation(
+    operation_store, tmp_path, monkeypatch, replace_original_state
+):
+    async with _actual_end(operation_store, tmp_path, monkeypatch) as (phases, selected, _primary):
+        paid_before = _paid_preparation_rows(operation_store[0])
+        original_restore = detached_module._restore_runtime_from_inputs
+        restored = []
+
+        async def gate(**arguments):
+            owner = arguments["checkpoint_phase_owner"]
+            original_state = owner.runtime.live.state
+
+            async def restore(**kwargs):
+                detached = await original_restore(**kwargs)
+                assert detached.live.state == original_state
+                assert detached.live.state is not original_state
+                assert type(detached.live.last_validation) is ValidationSummary
+                restored.append(detached)
+                if replace_original_state:
+                    owner.runtime.live.state = replace(original_state, version=original_state.version + 1)
+                return detached
+
+            try:
+                with monkeypatch.context() as observe:
+                    observe.setattr(detached_module, "_restore_runtime_from_inputs", restore)
+                    if replace_original_state:
+                        with pytest.raises(AuditIntegrityError, match="changed its original validated state"):
+                            await physical_module.prepare_checkpoint_end_physical_source(
+                                phase_owner=owner, gate_locals=arguments["checkpoint_end_input"]
+                            )
+                    else:
+                        source = await physical_module.prepare_checkpoint_end_physical_source(
+                            phase_owner=owner, gate_locals=arguments["checkpoint_end_input"]
+                        )
+                        assert source.detached is restored[0]
+                        physical_module.require_checkpoint_end_detached_source(source)
+            finally:
+                owner.runtime.live.state = original_state
+            raise _PreparedEndObserved
+
+        monkeypatch.setattr(phases.service._advisor_checkpoint, "_run_advisor_checkpoint", gate)
+        with pytest.raises(_PreparedEndObserved):
+            await execute_continuation_end_review(phases, selected)
+        assert len(restored) == 1
+        assert _paid_preparation_rows(operation_store[0]) == paid_before
 
 
 @pytest.mark.asyncio

@@ -47,7 +47,7 @@ async def test_paid_semantic_read_reuses_original_admission_but_reads_complete_c
         def read_and_assert():
             with locked_session_transaction(operation_store[0], sid) as conn:
                 expected = semantic_sql._paid_result_data(conn, sid, operation, retained.snapshot, root, prepared.binding.effect_key)
-                source = expected[1].source
+                source = expected.invocation.source
                 actual_load = semantic_sql.load_private_chunks
                 actual_decode = semantic_sql.decode_turn_evidence
                 actual_document = semantic_sql._require_retained_input_document
@@ -82,9 +82,9 @@ async def test_paid_semantic_read_reuses_original_admission_but_reads_complete_c
                     patch.setattr(semantic_sql, "_require_retained_input_document", document)
                     patch.setattr(application_data, "require_retained_call_extension", compare)
                     actual = semantic_sql._paid_result_data(conn, sid, operation, retained.snapshot, root, prepared.binding.effect_key)
-                    assert actual == expected and actual[0] == retained
-                    assert actual[0].snapshot.payload_json == retained.snapshot.payload_json
-                    assert encode_continuation_snapshot(actual[2]) == retained.snapshot.payload_json
+                    assert actual == expected and actual.result == retained
+                    assert actual.result.snapshot.payload_json == retained.snapshot.payload_json
+                    assert encode_continuation_snapshot(actual.paid_root) == retained.snapshot.payload_json
                     assert len(loads) == 2 and loads[0] == loads[1]
                     assert len(decodes) == len(documents) == len(extensions) == 1
                     assert documents[0].admitted is decodes[0]
@@ -102,7 +102,9 @@ async def test_paid_semantic_read_reuses_original_admission_but_reads_complete_c
                         canonical_json(decodes[0].snapshot.model_dump(mode="json", by_alias=True, exclude={"transcript"})),
                     )
                     for prior in (None, projection):
-                        original, admitted = semantic_sql._original_evidence_data(conn, sid, operation, actual[1], original_evidence=prior)
+                        original, admitted = semantic_sql._original_evidence_data(
+                            conn, sid, operation, actual.invocation, original_evidence=prior
+                        )
                         assert encode_continuation_snapshot(original) == source.selected_snapshot_json
                         assert admitted.source_chunk == source.evidence and admitted is not decodes[0]
                     assert len(loads) == 4 and len(decodes) == 3 and len(extensions) == 1

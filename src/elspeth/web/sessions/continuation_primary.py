@@ -28,7 +28,7 @@ from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, 
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.audit_storage import private_diagnostic_drafts
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
-from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, PrivateChunkRef
+from elspeth.web.composer.continuation import ComposeFrame, ContinuationActionSource, ContinuationFrameStack, PrivateChunkRef
 from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot, decode_recorder_snapshot, encode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
@@ -111,6 +111,27 @@ from elspeth.web.sessions.time_normalization import restore_utc
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_primary_observation import PrimaryCompleteObservation, PrimaryPaidObservation
     from elspeth.web.sessions.service import SessionServiceImpl
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalPrimaryResponseData:
+    """Actual response and prescription DATA from one original SQL source.
+
+    This grants no current-head or writer authority. The END dispatch owner
+    consumes it only within the synchronous transaction that read it.
+    """
+
+    session_id: UUID
+    operation_id: str
+    source_checkpoint_id: str
+    source_cursor: int
+    effect_key: str
+    input_sha256: str
+    action_json: str | None
+    action_source: ContinuationActionSource | None
+    response: PrivateChunk
+    completion: _AdmittedLLMCompletion
+    call: ComposerLLMCall
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,18 +252,12 @@ def _require_primary_effect_action_on_connection(
     stack: ContinuationFrameStack,
     effect: Row[Any],
     current_effect: bool,
-) -> None:
+) -> ContinuationActionSource | None:
     """Join an exact PRIMARY effect to its original paid prescription and receipt."""
     if effect.action_json is None:
         if current_effect and stack.active_action_json is not None:
             raise AuditIntegrityError("ordinary PRIMARY effect cannot consume an unrelated prescribed action")
-        return
-    from elspeth.web.composer.continuation_progress import (
-        continuation_action_key,
-        current_action_receipts,
-        decode_continuation_frontier,
-        decode_prescribed_continuation_action,
-    )
+        return None
     from elspeth.web.sessions.continuation_semantic_advisor import read_original_prescribed_primary_source_on_connection
 
     primary_action_wire_message(effect.action_json)
@@ -253,6 +268,31 @@ def _require_primary_effect_action_on_connection(
         action_json=effect.action_json,
         effect_key=effect.effect_key,
     )
+    _require_primary_effect_action_receipt_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, stack=stack, effect=effect, current_effect=current_effect, source=source
+    )
+    return source
+
+
+def _require_primary_effect_action_receipt_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    stack: ContinuationFrameStack,
+    effect: Row[Any],
+    current_effect: bool,
+    source: ContinuationActionSource,
+) -> None:
+    """Join actual prescribed action DATA to the freshly selected receipt."""
+    from elspeth.web.composer.continuation_progress import (
+        continuation_action_key,
+        current_action_receipts,
+        decode_continuation_frontier,
+        decode_prescribed_continuation_action,
+    )
+
+    primary_action_wire_message(effect.action_json)
     if current_effect:
         active = stack.active_action_json
         if active is None:
@@ -2219,7 +2259,7 @@ def _read_committed_primary_response_data_on_connection(
         operation_id=running.claim.operation_id,
         selected=selected,
         reference=reference,
-    )
+    ).response
 
 
 def read_committed_primary_response_data_on_connection(
@@ -2248,7 +2288,7 @@ def read_committed_primary_response_data_on_connection(
         raise ContinuationCASConflict("primary source read changed its complete selected chunk cohort")
     return _verify_committed_primary_response_data_on_connection(
         conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=reference
-    )
+    ).response
 
 
 def read_original_committed_primary_response_data_on_connection(
@@ -2259,7 +2299,7 @@ def read_original_committed_primary_response_data_on_connection(
     source_checkpoint_id: str,
     source_cursor: int,
     response: PrivateChunkRef,
-) -> PrivateChunk:
+) -> HistoricalPrimaryResponseData:
     """Prove immutable PRIMARY paid DATA from one original checkpoint.
 
     This grants no current-head, effect-write, provider or replay authority.
@@ -2308,7 +2348,40 @@ def _verify_committed_primary_response_data_on_connection(
     operation_id: str,
     selected: SelectedContinuationState,
     reference: PrivateChunkRef,
-) -> PrivateChunk:
+) -> HistoricalPrimaryResponseData:
+    effect = _committed_primary_effect_data(conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=reference)
+    action_source = _require_primary_effect_action_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, stack=selected.stack, effect=effect, current_effect=False
+    )
+    response = _chunk_data(conn, session_id, operation_id, reference)
+    completion = decode_continuation_response(response)
+    call = decode_retained_physical_audit_call(response)
+    _require_committed_primary_physical_data(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, effect=effect, completion=completion, call=call
+    )
+    return HistoricalPrimaryResponseData(
+        session_id,
+        operation_id,
+        selected.checkpoint_id,
+        selected.stack.cursor,
+        effect.effect_key,
+        effect.input_sha256,
+        effect.action_json,
+        action_source,
+        response,
+        completion,
+        call,
+    )
+
+
+def _committed_primary_effect_data(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    reference: PrivateChunkRef,
+) -> Row[Any]:
     if type(reference) is not PrivateChunkRef or reference.codec != "composer.response.v1":
         raise AuditIntegrityError("historical primary response lost its actual source codec")
     key = f"value:{reference.codec}:{reference.digest}"
@@ -2345,12 +2418,19 @@ def _verify_committed_primary_response_data_on_connection(
         or (frontier[0].disposition, frontier[0].receipt_id) != ("committed", effect.receipt_key)
     ):
         raise AuditIntegrityError("historical primary response lost its exact committed current frontier")
-    _require_primary_effect_action_on_connection(
-        conn, session_id=session_id, operation_id=operation_id, stack=selected.stack, effect=effect, current_effect=False
-    )
-    response = _chunk_data(conn, session_id, operation_id, reference)
-    completion = decode_continuation_response(response)
-    call = decode_retained_physical_audit_call(response)
+    return effect
+
+
+def _require_committed_primary_physical_data(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    effect: Row[Any],
+    completion: _AdmittedLLMCompletion,
+    call: ComposerLLMCall,
+) -> None:
     if (
         call.call_id is None
         or effect.provider_attempt_id != call.call_id
@@ -2366,4 +2446,61 @@ def _verify_committed_primary_response_data_on_connection(
         conn, session_id=session_id, operation_id=operation_id, stack=selected.stack, effect=effect, call=call
     )
     _require_primary_response_audit(selected.stack, completion, call)
-    return response
+
+
+def require_current_primary_from_original_response_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    reference: PrivateChunkRef,
+    original: HistoricalPrimaryResponseData,
+) -> _AdmittedLLMCompletion:
+    """Finish END dispatch's PRIMARY read using its own historical response.
+
+    The sole consumer obtains this DATA through its Review reconstruction in
+    the same synchronous locked invocation, before any write or callback.
+    Current SQL facts remain fresh. This removes a second observation of the
+    historical prescription, not the first proof or any later writer's proof.
+    """
+    if type(original) is not HistoricalPrimaryResponseData or (original.session_id, original.operation_id, original.response.reference) != (
+        running.claim.session_id,
+        running.claim.operation_id,
+        reference,
+    ):
+        raise AuditIntegrityError("END dispatch changed its original PRIMARY response source")
+    _require_current_continuation_running(conn, running)
+    _require_selected_primary_source(conn, running, selected)
+    effect = _committed_primary_effect_data(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, selected=selected, reference=reference
+    )
+    if (effect.effect_key, effect.input_sha256, effect.action_json) != (original.effect_key, original.input_sha256, original.action_json):
+        raise AuditIntegrityError("END dispatch changed its original PRIMARY effect/prescription")
+    if effect.action_json is None:
+        if original.action_source is not None:
+            raise AuditIntegrityError("ordinary PRIMARY response cannot carry a prescription")
+    else:
+        if original.action_source is None:
+            raise AuditIntegrityError("prescribed PRIMARY response lost its original paid source")
+        _require_primary_effect_action_receipt_on_connection(
+            conn,
+            session_id=running.claim.session_id,
+            operation_id=running.claim.operation_id,
+            stack=selected.stack,
+            effect=effect,
+            current_effect=False,
+            source=original.action_source,
+        )
+    response = _chunk_data(conn, running.claim.session_id, running.claim.operation_id, reference)
+    if response != original.response:
+        raise AuditIntegrityError("END dispatch changed its complete original PRIMARY response bytes")
+    _require_committed_primary_physical_data(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        effect=effect,
+        completion=original.completion,
+        call=original.call,
+    )
+    return original.completion

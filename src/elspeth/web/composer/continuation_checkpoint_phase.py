@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
+from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV4
 from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime, _registered_read
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -88,6 +88,14 @@ async def prepare_checkpoint_phase_owner(
             )
             if source is None or source.terminal:
                 raise AuditIntegrityError("checkpoint phase preparation lacks an original runnable outer source")
+            if source.phase == "early" and source.completed_children:
+                require_current_env_inventory_on_connection(
+                    conn,
+                    running,
+                    inventory=runtime.materialization.inventory,
+                    expected_checkpoint_id=stored.checkpoint_id,
+                    expected_cursor=stored.cursor,
+                )
             return CheckpointPhaseOwner(
                 phases, runtime, selected, runtime.materialization.inventory, source, superseded_reply_index, elide_advisor_exchange
             )
