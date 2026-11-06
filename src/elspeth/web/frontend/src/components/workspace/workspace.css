@@ -261,6 +261,14 @@
   color: var(--color-text);
 }
 
+/* Muted is ALSO shared.css's :disabled colour, so in the track a gated tab
+   (Spec/YAML/Checks before there is a composition) would read exactly like an
+   available inactive one. Dim it, the same 0.6 the disabled .switch uses;
+   WCAG 1.4.3 exempts inactive controls from the text floor. */
+:where(.artifact-workspace-toolbar, .workspace-view-tabs) .artifact-tab:disabled {
+  opacity: 0.6;
+}
+
 /* The pill's edge is a real border, not the shadow alone: light --color-pill
    on --color-track is 1.35:1, so the selected-state boundary needs a token at
    3:1 against the track (muted: 4.59 light / 4.89 dark, gated in

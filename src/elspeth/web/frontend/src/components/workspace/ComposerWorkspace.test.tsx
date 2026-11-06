@@ -203,6 +203,24 @@ describe("ComposerWorkspace", () => {
     expect(restore.closest(".workspace-pane-header")).toBeNull();
   });
 
+  it("names the authoring title bar from authoringTitle when a host supplies one", () => {
+    // ARGOnite: the tutorial run turn reuses this frame for run output, not a
+    // conversation; the host names the pane, "Conversation" is the default.
+    render(
+      <ComposerWorkspace
+        authoring={<p>Run output</p>}
+        artifact={<button type="button">Artifact control</button>}
+        actionBar={<button type="button">Primary action</button>}
+        authoringTitle="Run results"
+      />,
+    );
+    const pane = screen.getByRole("region", { name: "Authoring pane" });
+    expect(
+      within(pane).getByRole("heading", { level: 2, name: "Run results" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Conversation" })).toBeNull();
+  });
+
   it.each([
     // width, collapse?, narrow view, expected: collapse shown, bar shown
     [1280, false, "compose", true, true],

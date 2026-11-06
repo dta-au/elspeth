@@ -35,6 +35,9 @@ export interface ComposerWorkspaceProps {
   authoring: ReactNode;
   artifact: ReactNode;
   actionBar: ReactNode;
+  /** The authoring pane's title-bar heading. Hosts whose authoring content
+   *  is not a conversation (the tutorial run turn) name it for what it holds. */
+  authoringTitle?: string;
   collapsedStatus?: ReactNode | {
     text: string;
     tone: "neutral" | "busy" | "error";
@@ -69,6 +72,7 @@ export function ComposerWorkspace({
   authoring,
   artifact,
   actionBar,
+  authoringTitle = "Conversation",
   collapsedStatus = {
     text: "Authoring pane collapsed",
     tone: "neutral",
@@ -344,7 +348,7 @@ export function ComposerWorkspace({
             {/* ARGOnite title bar: the pane's name only. The collapse and
                 restore controls stay in the bar row below (design doc). */}
             <header className="workspace-pane-header">
-              <h2 className="workspace-pane-title">Conversation</h2>
+              <h2 className="workspace-pane-title">{authoringTitle}</h2>
             </header>
             <div
               id={narrow ? "workspace-authoring-panel" : undefined}
