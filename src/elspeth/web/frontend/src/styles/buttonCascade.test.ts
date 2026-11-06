@@ -144,6 +144,32 @@ describe("ARGOnite pill buttons", () => {
     }
   });
 
+  it("keeps blocked buttons (native and aria-disabled) from taking a variant hover fill", () => {
+    const variantHovers = [".btn-primary:hover", ".btn-danger:hover"].map(findSelectorStartingWith);
+    const reassertions = [
+      ".btn:disabled:hover",
+      '.btn[aria-disabled="true"]:hover',
+      ".btn-compact:disabled:hover",
+      '.btn-compact[aria-disabled="true"]:hover',
+    ];
+    const lastVariantHoverIndex = Math.max(
+      ...variantHovers.map((selector) => cssWithoutComments.indexOf(selector)),
+    );
+    for (const selector of reassertions) {
+      const body = ruleBodyFor(selector);
+      expect(body).toContain("background-color: var(--color-well)");
+      expect(body).toContain("color: var(--color-text-muted)");
+      expect(body).toContain("box-shadow: none");
+      for (const hover of variantHovers) {
+        expect(classLevelSpecificity(selector)).toBeGreaterThanOrEqual(
+          classLevelSpecificity(hover),
+        );
+      }
+      // Equal specificity: the re-assertion must come later to win the tie.
+      expect(cssWithoutComments.indexOf(selector)).toBeGreaterThan(lastVariantHoverIndex);
+    }
+  });
+
   it("gives .btn and .btn-compact the pill shape, strong border and well hover", () => {
     for (const selector of [".btn", ".btn-compact"]) {
       const body = ruleBodyFor(selector);

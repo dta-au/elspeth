@@ -422,9 +422,28 @@
   outline-offset: 2px;
 }
 
-.switch-input:disabled + .switch-track {
+.switch-input:disabled + .switch-track,
+.switch-input:disabled ~ .switch-label {
   opacity: 0.6;
+}
+
+.switch:has(.switch-input:disabled) {
   cursor: not-allowed;
+}
+
+/* ARGOnite: a blocked button must not look runnable under the pointer. Variant
+   hovers (.btn-primary:hover:not(:disabled), 0,3,0) exclude native :disabled
+   but not aria-disabled, so a hovered aria-disabled Run would take the live
+   fill. Re-assert the disabled look at equal specificity, AFTER the variant
+   hovers (order wins the tie). Gated by styles/buttonCascade.test.ts. */
+.btn:disabled:hover,
+.btn[aria-disabled="true"]:hover,
+.btn-compact:disabled:hover,
+.btn-compact[aria-disabled="true"]:hover {
+  background-color: var(--color-well);
+  border-color: var(--color-border-strong);
+  color: var(--color-text-muted);
+  box-shadow: none;
 }
 
 /* .btn-small predates .btn-compact and is retained at its existing call sites.
