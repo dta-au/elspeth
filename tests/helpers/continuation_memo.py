@@ -111,7 +111,11 @@ _LOW_CODE_OBJECTS = (
     (continuation_codec._private_chunk_canonical_text_bytes.__code__, "chunk_work"),
     (credential_material.find_credential_material.__code__, "detector_work"),
     (continuation_codec._verify_private_chunk_canonical.__code__, "chunk_work"),
+    (credential_material._find_credential_material_with_classifier.__code__, "detector_work"),
 )
+_CLASSIFIED_DETECTOR = credential_material._find_credential_material_with_classifier
+_CLASSIFIED_GUARD = credential_guard._find_with_credential_text_memo
+_CATEGORY_QUERY = RetentionStageMemo.credential_string_category
 _LOW_CODES = {id(code): label for code, label in _LOW_CODE_OBJECTS}
 _PARSE = json_parser.parse_json_strict.__code__
 _STRICT_PARSE = json_parser.parse_json_strict
@@ -2935,6 +2939,7 @@ _CHUNK_SOURCE_SITE = _direct_call_site(_LOAD_CHUNKS, "verify_private_chunk", arg
 _CHUNK_PARSE_SITE = _direct_call_site(_CHUNK_WORK_CODE, "parse_json_strict", arguments=1)
 _CHUNK_ONLY_PARSE_SITE = _direct_call_site(_CHUNK_ONLY_WORK_CODE, "parse_json_strict", arguments=1)
 _CHUNK_PREPARATION_SIZE_SITE = _direct_call_site(_CHUNK_WORK_CODE, "utf8_size", arguments=2, keywords=("limit",))
+_CATEGORY_SIZE_SITE = _direct_call_site(_CATEGORY_QUERY.__code__, "utf8_size", arguments=3, keywords=("errors", "limit"))
 _SNAPSHOT_PARSE_SITE = _direct_call_site(
     continuation_codec._decode_continuation_snapshot_uncached.__code__, "parse_json_strict", arguments=1
 )
@@ -3275,6 +3280,7 @@ class _ScannerSizeInspection:
     profile_offset: int | None = None
     private_resource: bool = False
     canonical_preparation: bool = False
+    category_preparation: bool = False
     chunks: int = 0
     encoded_bytes: int = 0
     branch: Literal["length_excess", "ascii", "encoded_excess", "encoded"] | None = None
@@ -3542,6 +3548,7 @@ class RetentionMemoTrace:
         self._byte_size_pending: dict[int, _ScannerSizeInspection] = {}
         self._byte_size_frames: dict[int, _ScannerSizeInspection] = {}
         self._byte_size_inspections: list[_ScannerSizeInspection] = []
+        self._byte_category_inspections: list[_ScannerSizeInspection] = []
         self._byte_canonical_buffers: dict[int, tuple[int, int]] = {}
         self._byte_canonical_owners: dict[int, MemoInspection | ContextCanonicalInspection] = {}
         self.context_canonical_inspections: list[ContextCanonicalInspection] = []
@@ -6642,6 +6649,50 @@ class RetentionMemoTrace:
         owner.byte_calls["scanner_size"] += 1
         return True
 
+    def _category_size_call(self, frame: FrameType, expected_id: int | None) -> bool:
+        """Account memo admission separately from traversal's bounded scanner."""
+        parent = frame.f_back
+        if parent is None or not self._at_site(parent, _CATEGORY_QUERY.__code__, _CATEGORY_SIZE_SITE):
+            return False
+        owner = self._ancestor(parent)
+        actual = current_retention_stage_memo()
+        receiver = parent.f_locals.get("self")
+        text = parent.f_locals.get("text")
+        if (
+            owner is None
+            or owner.family not in ("credential", "state")
+            or owner.memo is not actual
+            or type(receiver) is not RetentionStageMemo
+            or (receiver is not actual and (actual is None or actual._text_parent is not receiver))
+            or RetentionStageMemo.credential_string_category is not _CATEGORY_QUERY
+            or parent.f_globals is not retention_memo.__dict__
+            or retention_memo.utf8_size is not _UTF8_SIZE
+            or type(text) is not str
+            or frame.f_locals.get("text") is not text
+            or frame.f_locals.get("errors") != "replace"
+            or frame.f_locals.get("limit") != retention_memo.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+            or self._byte_carrier(expected_id, frame) is not actual
+        ):
+            self._byte_error("category size lost its actual memo/input/limit owner", frame, expected_id, owner)
+            return True
+        inspection = _ScannerSizeInspection(
+            owner,
+            id(parent),
+            id(text),
+            str.__len__(text),
+            frame.f_locals["limit"],
+            get_ident(),
+            expected_id,
+            call_code=parent.f_code,
+            call_offset=parent.f_lasti,
+            profile_offset=parent.f_lasti,
+            category_preparation=True,
+        )
+        self._byte_size_frames[id(frame)] = inspection
+        self._byte_category_inspections.append(inspection)
+        owner.byte_calls["category_size"] += 1
+        return True
+
     def _scanner_size_profile(self, frame: FrameType, event: str, arg: object, expected_id: int | None) -> None:
         if frame.f_code in _SCANNER_SIZE_SITES:
             if event == "return" and self._byte_size_pending.pop(id(frame), None) is not None:
@@ -6653,6 +6704,8 @@ class RetentionMemoTrace:
             parent = frame.f_back
             inspection = self._byte_size_pending.pop(id(parent), None)
             if inspection is None:
+                if self._category_size_call(frame, expected_id):
+                    return
                 if self._private_size_call(frame, expected_id):
                     return
                 if self._canonical_size_call(frame, expected_id):
@@ -6733,7 +6786,7 @@ class RetentionMemoTrace:
     def _byte_profile(self, frame: FrameType, event: str, arg: object, expected_id: int | None) -> None:
         code = frame.f_code
         self._scanner_size_profile(frame, event, arg, expected_id)
-        if code is _LOW_CODE_OBJECTS[2][0] and event == "call" and not _scanner_sources_current():
+        if _LOW_CODES.get(id(code)) == "detector_work" and event == "call" and not _scanner_sources_current():
             self._byte_error("bounded scanner original source changed", frame, expected_id)
         if code is _CHUNK_REQUEST and event == "return":
             for pending in self._byte_pending_parses.pop(id(frame), ()):
@@ -6777,7 +6830,7 @@ class RetentionMemoTrace:
                 and self._byte_carrier(expected_id, frame) is not None
             ):
                 self._byte_private_payloads[id(parent)] = (id(arg), len(arg))
-        if event == "return" and code is _LOW_CODE_OBJECTS[2][0]:
+        if event == "return" and _LOW_CODES.get(id(code)) == "detector_work":
             self._byte_detector_frames.pop(id(frame), None)
         if event == "return" and code is _CANONICAL_DUMPS_CODE:
             parent = frame.f_back
@@ -7033,6 +7086,8 @@ class RetentionMemoTrace:
                     inspection.encoded_bytes += len(operand)
                     if inspection.private_resource:
                         return
+                    if inspection.category_preparation:
+                        channel = "category_extent"
                 owner.byte_calls[channel] += 1
                 owner.byte_counts[channel] += size
         except Exception as error:
@@ -7276,6 +7331,23 @@ class RetentionMemoTrace:
                 return
             label = _LOW_CODES[id(code)]
             if label == "detector_work":
+                if code is _CLASSIFIED_DETECTOR.__code__:
+                    caller = frame.f_back
+                    if (
+                        credential_material._find_credential_material_with_classifier is not _CLASSIFIED_DETECTOR
+                        or credential_guard._find_with_credential_text_memo is not _CLASSIFIED_GUARD
+                        or caller is None
+                        or caller.f_code is not _CLASSIFIED_GUARD.__code__
+                        or caller.f_globals is not credential_guard.__dict__
+                        or caller.f_locals.get("value") is not frame.f_locals.get("value")
+                        or caller.f_locals.get("policy") is not frame.f_locals.get("policy")
+                        or caller.f_locals.get("classify") is not frame.f_locals.get("classifier")
+                        or caller.f_locals.get("memo") is not actual
+                        or caller.f_locals.get("detector") is not credential_guard._ORIGINAL_CREDENTIAL_DETECTOR
+                        or caller.f_locals.get("classifier") is not credential_guard._ORIGINAL_STRING_CLASSIFIER
+                    ):
+                        self._byte_error("classified detector lost its original guard/value/policy/memo", frame, expected_id, record)
+                        return
                 self.detector_attempts[actual] += 1
                 if self._uncached_metadata_attempt(frame, actual, expected_id):
                     if self.require_native_bytes:
@@ -7598,6 +7670,7 @@ class RetentionMemoTrace:
             and not self._byte_size_pending
             and not self._byte_size_frames
             and all(inspection.branch is not None for inspection in self._byte_size_inspections)
+            and all(inspection.branch is not None for inspection in self._byte_category_inspections)
             and not self._byte_canonical_buffers
             and not self._byte_canonical_owners
             and not self._byte_sources
@@ -7609,6 +7682,12 @@ class RetentionMemoTrace:
             and all(record.exited for record in self.context_canonical_inspections)
         ), "native byte work remains active"
         self._assert_private_size_work()
+        assert all(
+            item.call_code is _CATEGORY_QUERY.__code__
+            and item.call_offset in _CATEGORY_SIZE_SITE[0]
+            and item.profile_offset in _CATEGORY_SIZE_SITE[0]
+            for item in self._byte_category_inspections
+        ), "category size lost its original native CALL origin"
         assert all(
             item.call_code is not None
             and type(item.call_offset) is int
@@ -7626,6 +7705,12 @@ class RetentionMemoTrace:
         ), "bounded scanner lost its original native CALL origin"
         for _stage, _family, _key, _producer, _invocation, records in self._byte_rows():
             for record in records:
+                category = [item for item in self._byte_category_inspections if item.owner is record]
+                assert (
+                    record.byte_calls["category_size"] == len(category)
+                    and record.byte_calls["category_extent"] == sum(item.chunks for item in category)
+                    and record.byte_counts["category_extent"] == sum(item.encoded_bytes for item in category)
+                ), "category admission lost or duplicated its independent native charge"
                 inspections = [inspection for inspection in self._byte_size_inspections if inspection.owner is record]
                 assert (
                     record.byte_calls["scanner_size"] == len(inspections)

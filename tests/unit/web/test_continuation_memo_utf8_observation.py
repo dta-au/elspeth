@@ -78,8 +78,81 @@ def test_bounded_scanner_counts_real_invocations_and_only_actual_chunk_bytes(mon
         limits=_native_byte_limits(scanner_size=(1, 0), scanner_extent=(chunks, size), key_preparation=(2, 2 * preparation)),
     )
     trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
+    assert [(item.chunks, item.encoded_bytes, item.returned_size) for item in trace._byte_category_inspections] == [
+        (chunks, size, preparation)
+    ]
     assert [(row.calls, row.bytes) for row in trace.native_byte_totals() if row.channel == "scanner_size"] == [(1, 0)]
     assert [(row.calls, row.bytes) for row in trace.native_byte_totals() if row.channel == "scanner_extent"] == [(chunks, size)]
+
+
+@pytest.mark.parametrize("charge_delta", (-1, 1))
+def test_category_admission_keeps_its_independent_native_charge(monkeypatch, request, charge_delta):
+    trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
+    with clock.retention_stage_memo_scope():
+        assert (
+            guard._retention_credential_finding(
+                "café☃", policy=CredentialTraversalPolicy(), surface="native-bytes-control", scanner_role="generic"
+            )
+            is None
+        )
+    (category,) = trace._byte_category_inspections
+    assert category.branch == "encoded" and category.returned_size == 8
+    assert category.chunks == 1 and category.encoded_bytes == 8
+    category.owner.byte_calls["category_extent"] += charge_delta
+    with pytest.raises(AssertionError, match="category admission lost or duplicated its independent native charge"):
+        trace.finish(stages=1, require_snapshot=False, native_byte_limits=(_native_scan_budget(1, "café☃", 8, requests=1),))
+
+
+def test_classified_detector_cannot_borrow_owner_from_an_unregistered_caller(monkeypatch, request):
+    trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
+    with clock.retention_stage_memo_scope():
+        assert (
+            credential_material._find_credential_material_with_classifier(
+                "ordinary", CredentialTraversalPolicy(), credential_material._classify_string
+            )
+            is None
+        )
+    assert "classified detector lost its original guard/value/policy/memo" in trace.byte_errors
+    with pytest.raises(AssertionError, match="native byte provenance invalid"):
+        trace.finish(stages=1, require_snapshot=False)
+
+
+def test_category_admission_refuses_changed_actual_limit(monkeypatch, request):
+    from tests.helpers import continuation_memo as helper
+
+    saved = sys.getprofile()
+    assert saved is None
+    changed = []
+    locals_to_fast = ctypes.PYFUNCTYPE(None, ctypes.py_object, ctypes.c_int)(("PyFrame_LocalsToFast", ctypes.pythonapi))
+
+    def previous(frame, event, _arg):
+        if event != "call" or frame.f_code is not helper._UTF8_CODE:
+            return
+        parent = frame.f_back
+        if parent is None or parent.f_code is not helper._CATEGORY_QUERY.__code__:
+            return
+        assert not changed
+        frame.f_locals["limit"] -= 1
+        locals_to_fast(frame, 0)
+        changed.append(True)
+
+    sys.setprofile(previous)
+    try:
+        trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
+        with clock.retention_stage_memo_scope():
+            assert (
+                guard._retention_credential_finding(
+                    "café☃", policy=CredentialTraversalPolicy(), surface="native-bytes-control", scanner_role="generic"
+                )
+                is None
+            )
+        assert changed == [True]
+        assert "category size lost its actual memo/input/limit owner" in trace.byte_errors
+        with pytest.raises(AssertionError, match="native byte provenance invalid"):
+            trace.finish(stages=1, require_snapshot=False, native_byte_limits=(_native_scan_budget(1, "café☃", 8, requests=1),))
+        assert sys.getprofile() is previous
+    finally:
+        sys.setprofile(saved)
 
 
 @pytest.mark.parametrize(
@@ -321,7 +394,8 @@ def test_bounded_scanner_admits_only_its_exact_originating_call_and_caches(monke
         if event != "call" or frame.f_code is not helper._UTF8_CODE or trace is None:
             return
         parent = frame.f_back
-        assert parent is not None and parent.f_code is helper._FIND
+        if parent is None or parent.f_code is not helper._FIND:
+            return
         inspection = trace._byte_size_pending[id(parent)]
         assert inspection.call_code is helper._FIND and type(inspection.call_offset) is int
         offset = inspection.call_offset
@@ -391,7 +465,8 @@ def test_bounded_scanner_refuses_equal_result_with_altered_native_arguments(monk
             return
         assert bounded_serialization.utf8_size is native_size and native_size.__code__ is native_code
         parent = frame.f_back
-        assert parent is not None and parent.f_code is caller_code
+        if parent is None or parent.f_code is not caller_code:
+            return
         if event == "call":
             assert not mutations, "the control must mutate exactly one original native invocation"
             local_values = frame.f_locals
