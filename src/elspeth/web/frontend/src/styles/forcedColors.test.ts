@@ -60,7 +60,7 @@ describe("forced-colors: active boundaries", () => {
     ".chat-input-send-btn",
     ".graph-checksum-actions > .btn-compact",
     ".graph-checksum-value",
-    ".react-flow__controls",
+    ":root .react-flow__controls",
     ".graph-node-badge",
     ".artifact-tab-badge",
   ])("%s keeps a 1px system-colour boundary", (selector) => {
@@ -97,5 +97,75 @@ describe("prefers-reduced-motion: reduce", () => {
     ".artifact-tab",
   ])("%s has no transition", (selector) => {
     expect(declarations(reduced, selector)).toMatch(/transition:\s*none/);
+  });
+});
+
+// A forced-colours rule that is LESS specific than the normal-mode rule it
+// must override is dead (themes.css wins only ties, by source order). This
+// compares each border-setting forced rule against every barrel rule that
+// sets border on the same final compound selector.
+function specificity(selector: string): number {
+  const s = selector.replace(/:where\([^)]*\)/g, "");
+  const ids = (s.match(/#[\w-]+/g) ?? []).length;
+  const classes = (
+    s.match(/\.[\w-]+|\[[^\]]*\]|:(?!:)(?!root\b)[\w-]+(?:\([^)]*\))?/g) ?? []
+  ).length;
+  const root = (s.match(/:root\b/g) ?? []).length;
+  const els = (
+    s
+      .replace(/\[[^\]]*\]|\([^)]*\)/g, "")
+      .match(/(?:^|[\s>+~])[a-zA-Z][\w-]*/g) ?? []
+  ).length;
+  return ids * 10000 + (classes + root) * 100 + els;
+}
+
+function lastCompound(selector: string): string {
+  return selector.split(/\s*[\s>+~]\s*/).filter(Boolean).pop() ?? selector;
+}
+
+const sheets = [
+  "shared.css",
+  "../components/workspace/workspace.css",
+  "../components/inspector/inspector.css",
+  "../components/chat/chat.css",
+]
+  .map((f) =>
+    readFileSync(join("src", "styles", f), "utf8").replace(/\/\*[\s\S]*?\*\//g, ""),
+  )
+  .join("\n");
+
+describe("forced-colours rules are not out-specified", () => {
+  const borderTargets = [
+    ".artifact-tab[aria-selected=\"true\"]",
+    ".switch-track",
+    ".switch-thumb",
+    ".graph-view-canvas",
+    ".chat-input-row",
+    ".chat-input-icon-btn",
+    ".chat-input-send-btn",
+    ".graph-checksum-actions > .btn-compact",
+    ".graph-checksum-value",
+    ":root .react-flow__controls",
+    ".graph-node-badge",
+    ".artifact-tab-badge",
+  ];
+
+  it.each(borderTargets)("%s", (target) => {
+    const forcedSpec = specificity(target);
+    const key = lastCompound(target);
+    for (const m of sheets.matchAll(/([^{}@]+)\{([^{}]*)\}/g)) {
+      if (!/(?:^|;|\s)border(?:-color|-style)?\s*:/.test(m[2])) continue;
+      // :where() holds zero specificity, so drop it before splitting the list.
+      const list = m[1].replace(/:where\((?:[^()]|\([^)]*\))*\)/g, "");
+      for (const sel of list.split(",").map((x) => x.trim())) {
+        // State variants (:checked etc.) are restated by their own forced rule.
+        if (/:(?:checked|hover|focus|focus-visible|disabled|active)/.test(sel)) continue;
+        if (lastCompound(sel) !== key) continue;
+        expect(
+          forcedSpec,
+          `forced "${target}" must be >= normal "${sel}"`,
+        ).toBeGreaterThanOrEqual(specificity(sel));
+      }
+    }
   });
 });
