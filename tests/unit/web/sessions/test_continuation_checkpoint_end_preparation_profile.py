@@ -200,7 +200,7 @@ async def test_actual_end_review_preparation_profile(operation_store, tmp_path, 
     profile = EndPreparationProfile(enabled=mode == "1", cpu_profile=cpu_mode == "1", cpu_selection=cpu_selection)
     default_budget_mib = memo_module.CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES // 1_048_576
     budget_mib = os.environ.get(TEXT_MEMO_BUDGET_FLAG, str(default_budget_mib))
-    assert budget_mib in {"1", "5", "6"}
+    assert budget_mib in {"1", "5", "6", str(default_budget_mib)}
     monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", int(budget_mib) * 1_048_576)
     record_property("end_preparation_text_memo_budget_mib", int(budget_mib))
     profile.text_memo_budget_bytes = int(budget_mib) * 1_048_576
@@ -229,12 +229,23 @@ async def test_actual_end_review_preparation_profile(operation_store, tmp_path, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("budget_mib", (1, 5))
 async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_ordinary_negative(monkeypatch, budget_mib):
+    from elspeth.contracts.credential_material import _classify_string
+    from tests.unit.web.test_continuation_retention_memo import (
+        _admit_uncached_recorder_data,
+        _evidence_key,
+        _produce_uncached_recorder_data,
+        _recorder_data_chunk,
+    )
+
     monkeypatch.setattr(memo_module, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", budget_mib * 1_048_576)
     observer = EndTextMemoObservation()
     calls = []
     original_error = RuntimeError("original canonical producer failure")
     first = CanonicalTextVerificationKey("sensitive-observer-control" + "a" * 600_000, 1_048_576)
     second = CanonicalTextVerificationKey("b" * 600_000, 1_048_576)
+    evidence_key = _evidence_key()
+    recorder_chunk = _recorder_data_chunk()
+    recorder_key = memo_module.PrivateChunkVerificationKey(recorder_chunk.reference, recorder_chunk.canonical)
 
     def verify(text):
         calls.append(len(text))
@@ -251,6 +262,9 @@ async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_
     def request(_key):
         return RecorderRequestTextProof("{}", ())
 
+    def evidence(_text):
+        return (evidence_key.reference,)
+
     with observer.install(monkeypatch):
         with retention_stage_memo_scope() as ordinary:
             ordinary.canonical_text_verification(first, verify)
@@ -265,10 +279,15 @@ async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_
                 parent.canonical_text_proof(full_key, encode, hashlib.sha256)
                 parent.recorder_block_hash(block_key, block)
                 parent.v4_recorder_request_text(
-                    RecorderRequestTextKey("request", 100),
+                    # The retained request includes dependency/reverse-index
+                    # metadata. A 100-byte allocation cannot admit that entry.
+                    RecorderRequestTextKey("request", 4096),
                     RecorderRequestTextDependencies(encode, encode, hashlib.sha256, frozenset({"shape"})),
                     request,
                 )
+                assert parent.credential_string_category("ordinary calibration text", _classify_string) is None
+                parent.evidence_references(evidence_key, evidence)
+                parent.recorder_data(recorder_key, _produce_uncached_recorder_data, _admit_uncached_recorder_data)
             with pytest.raises(RuntimeError) as raised:
                 parent.canonical_text_verification(CanonicalTextVerificationKey("fails", 100), fails)
             assert raised.value is original_error
@@ -280,7 +299,37 @@ async def test_text_memo_observer_calibrates_hit_miss_eviction_error_closed_and_
     assert canonical["evictions"] == (2 if budget_mib == 1 else 0)
     assert canonical["recomputations"] == (2 if budget_mib == 1 else 1)
     assert len(calls) == (5 if budget_mib == 1 else 4)
-    assert all(snapshot["families"][family]["hits"] == 1 for family in ("full", "block", "request"))
+    fields = ("requests", "misses", "hits", "errors", "admissions", "evictions", "recomputations", "unretained")
+    expected = {
+        "canonical": (
+            5,
+            5 if budget_mib == 1 else 4,
+            0 if budget_mib == 1 else 1,
+            1,
+            3 if budget_mib == 1 else 2,
+            2 if budget_mib == 1 else 0,
+            2 if budget_mib == 1 else 1,
+            1,
+        ),
+        "full": (2, 1, 1, 0, 1, 0, 0, 0),
+        "block": (2, 1, 1, 0, 1, 0, 0, 0),
+        "request": (2, 1, 1, 0, 1, 0, 0, 0),
+        "credential": (2, 1, 1, 0, 1, 0, 0, 0),
+        "evidence": (2, 1, 1, 0, 1, 0, 0, 0),
+        "recorder": (2, 1, 1, 0, 1, 0, 0, 0),
+    }
+
+    def require_exact_events(families):
+        assert {family: tuple(counts[field] for field in fields) for family, counts in families.items()} == expected
+
+    require_exact_events(snapshot["families"])
+    omitted = {family: counts for family, counts in snapshot["families"].items() if family != "recorder"}
+    with pytest.raises(AssertionError):
+        require_exact_events(omitted)
+    drifted = {family: dict(counts) for family, counts in snapshot["families"].items()}
+    drifted["request"]["hits"] += 1
+    with pytest.raises(AssertionError):
+        require_exact_events(drifted)
     assert snapshot["parents"] == [{"budget": budget_mib * 1_048_576, "closed_empty": True}]
     assert snapshot["observer_errors"] == snapshot["overlapping_calls"] == snapshot["budget_violations"] == 0
     assert snapshot["peak_retained_bytes"] <= budget_mib * 1_048_576 and snapshot["observer_ns"] > 0

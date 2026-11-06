@@ -38,6 +38,7 @@ from tests.helpers.continuation_app import (
     tool_call,
 )
 from tests.helpers.continuation_early_profile import semantic_preparation_profile
+from tests.helpers.continuation_end_profile import driver_end_preparation_profile
 
 
 @pytest.mark.asyncio
@@ -46,6 +47,7 @@ async def test_supported_driver_reaches_original_paid_transitions(tmp_path, monk
     operation_id = str(uuid4())
     checkpoint_dispatches = []
     early_action_cuts = []
+    end_action_cuts = []
     original_dispatch = ProviderCallCustody.require_cost_dispatch
 
     def observe_checkpoint_dispatch(custody):
@@ -54,6 +56,29 @@ async def test_supported_driver_reaches_original_paid_transitions(tmp_path, monk
         admission = custody.continuation_checkpoint_v4_admission
         if prepared is not None and admission is not None and prepared.running.claim.operation_id == operation_id:
             checkpoint_dispatches.append((prepared.prepared_source.phase, prepared.retry_ordinal, admission.attempt.attempt_id))
+            if route == "read_end_retry" and prepared.prepared_source.phase == "end":
+                entries = [
+                    (index, event)
+                    for index, event in enumerate(observed.events)
+                    if event["boundary"] == "advance" and event["event"] == "entry"
+                ]
+                index, current = entries[-1]
+                assert current["action_kind"] == "advisor" and current["clock_bound"] and current["sql_owner_bound"]
+                cut = (current["segment"], current["generation"], current["attempt"], current["action_ordinal_before"])
+                if end_action_cuts:
+                    previous_index, previous, previous_cut = end_action_cuts[-1]
+                    assert cut != previous_cut
+                    exits = [
+                        event
+                        for event in observed.events[previous_index + 1 : index]
+                        if event["boundary"] == "advance"
+                        and event["event"] == "exit"
+                        and event["driver_id"] == previous["driver_id"]
+                        and event["task_id"] == previous["task_id"]
+                        and event["cursor"] == previous["cursor"]
+                    ]
+                    assert len(exits) == 1 and "original" not in exits[0] and not exits[0]["clock_identity_changed"]
+                end_action_cuts.append((index, current, cut))
         return result
 
     monkeypatch.setattr(ProviderCallCustody, "require_cost_dispatch", observe_checkpoint_dispatch)
@@ -147,6 +172,12 @@ async def test_supported_driver_reaches_original_paid_transitions(tmp_path, monk
         install_sdk(monkeypatch, sdk)
         artifact = tmp_path / f"supported-{route}-driver.json"
         with (
+            driver_end_preparation_profile(
+                monkeypatch,
+                harness.app.state.session_engine,
+                session_id=harness.session_id,
+                operation_id=operation_id,
+            ),
             semantic_preparation_profile(
                 monkeypatch,
                 harness.app.state.session_engine,
@@ -171,6 +202,7 @@ async def test_supported_driver_reaches_original_paid_transitions(tmp_path, monk
             expected_checkpoints.append(("end", 0))
             if route == "read_end_retry":
                 expected_checkpoints.append(("end", 1))
+                assert len(end_action_cuts) == 2
             assert [(phase, ordinal) for phase, ordinal, _attempt in checkpoint_dispatches] == expected_checkpoints
             assert len(early_action_cuts) == sum(phase == "early" for phase, _ordinal in expected_checkpoints)
             assert len({attempt for _phase, _ordinal, attempt in checkpoint_dispatches}) == len(expected_checkpoints)

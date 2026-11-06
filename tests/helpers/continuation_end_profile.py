@@ -141,7 +141,7 @@ class EndTextMemoObservation:
     these observations never authorize cache hits or product behavior.
     """
 
-    families = ("full", "canonical", "block", "request", "credential", "evidence")
+    families = ("full", "canonical", "block", "request", "credential", "evidence", "recorder")
 
     def __init__(self, *, max_fingerprints: int = 1024, include=None) -> None:
         self.max_fingerprints = max_fingerprints
@@ -151,6 +151,7 @@ class EndTextMemoObservation:
         self._parent_states = {}
         self._fingerprints = OrderedDict()
         self._active = {}
+        self._nested = {}
         self.fingerprint_drops = 0
         self.observer_errors = 0
         self.overlapping_calls = 0
@@ -182,6 +183,7 @@ class EndTextMemoObservation:
                 memo._v4_recorder_requests,
                 memo._credential_strings,
                 memo._evidence_references,
+                memo._recorder_data,
             )
             weights = (
                 memo._canonical_proof_bytes,
@@ -190,11 +192,16 @@ class EndTextMemoObservation:
                 memo._v4_recorder_request_bytes,
                 memo._credential_string_bytes,
                 memo._evidence_reference_bytes,
+                memo._recorder_data_bytes,
             )
             selected = entries[self.families.index(family)]
             hit = cache_key in selected
             value = selected[cache_key] if hit else None
-            weight = value.retained_bytes if hit and family in {"full", "request", "credential", "evidence"} else (value if hit else 0)
+            weight = (
+                value.retained_bytes
+                if hit and family in {"full", "request", "credential", "evidence", "recorder"}
+                else (value if hit else 0)
+            )
             return hit, weight, tuple(len(items) for items in entries), weights, memo._shared_text_budget_bytes, not memo._closed
 
     def _observe(self, memo, family, key, producer, digest_producer, operation):
@@ -205,10 +212,14 @@ class EndTextMemoObservation:
         before_ns = time.monotonic_ns()
         cache_key = (producer, digest_producer, key) if family in {"full", "request"} else (producer, key)
         try:
-            before = self._state(memo, family, cache_key)
             dependency_fingerprint = hash(digest_producer) if family == "request" else id(digest_producer)
             fingerprint = (family, id(producer), dependency_fingerprint, hash(key))
             with self._lock:
+                # Lock order is observer bookkeeping, then the short memo
+                # snapshot lock. Product operations/close never run under
+                # this lock. A second start cannot consume a stale snapshot
+                # before the first invocation registers its active frame.
+                before = self._state(memo, family, cache_key)
                 ordinal = self._parents.get(memo)
                 if ordinal is None:
                     if len(self._parent_states) >= 32:
@@ -217,8 +228,14 @@ class EndTextMemoObservation:
                     self._parents[memo] = ordinal
                     self._parent_states[ordinal] = {"budget": before[4], "closed_empty": False}
                 fingerprint = (ordinal, *fingerprint)
-                self.overlapping_calls += self._active.get(ordinal, 0) > 0
+                thread_key = (ordinal, threading.get_ident())
+                nested = self._nested.setdefault(thread_key, [])
+                # Complete recorder production/admission calls other memo
+                # families synchronously. Only another thread is overlapping.
+                self.overlapping_calls += self._active.get(ordinal, 0) > len(nested)
                 self._active[ordinal] = self._active.get(ordinal, 0) + 1
+                child_delta = ([0] * len(self.families), [0] * len(self.families))
+                nested.append(child_delta)
                 self.counts[family]["requests"] += 1
                 self.counts[family]["hits" if before[0] else "misses"] += 1
                 self.observer_ns += time.monotonic_ns() - before_ns
@@ -233,10 +250,10 @@ class EndTextMemoObservation:
             return result
         finally:
             after_ns = time.monotonic_ns()
+            after = None
             try:
                 after = self._state(memo, family, cache_key)
                 with self._lock:
-                    self._active[ordinal] -= 1
                     self.counts[family]["errors"] += not success
                     self.peak_retained_bytes = max(self.peak_retained_bytes, sum(before[3]), sum(after[3]))
                     self.budget_violations += sum(after[3]) > after[4]
@@ -254,15 +271,32 @@ class EndTextMemoObservation:
                         if after[5]:
                             for index, evicted_family in enumerate(self.families):
                                 added = admitted and family == evicted_family
-                                self.counts[evicted_family]["evictions"] += max(0, before[2][index] + added - after[2][index])
+                                self.counts[evicted_family]["evictions"] += max(
+                                    0, before[2][index] + child_delta[0][index] + added - after[2][index]
+                                )
                                 self.counts[evicted_family]["evicted_bytes"] += max(
-                                    0, before[3][index] + (after[1] if added else 0) - after[3][index]
+                                    0, before[3][index] + child_delta[1][index] + (after[1] if added else 0) - after[3][index]
                                 )
             except Exception:
                 with self._lock:
                     self.observer_errors += 1
             finally:
                 with self._lock:
+                    self._active[ordinal] -= 1
+                    nested = self._nested.get(thread_key)
+                    if not nested or nested[-1] is not child_delta:
+                        self.observer_errors += 1
+                        self._nested.pop(thread_key, None)
+                    else:
+                        nested.pop()
+                        if nested and after is not None:
+                            # Only direct children contribute: each child's
+                            # net delta already includes its descendants.
+                            for index in range(len(self.families)):
+                                nested[-1][0][index] += after[2][index] - before[2][index]
+                                nested[-1][1][index] += after[3][index] - before[3][index]
+                        if not nested:
+                            del self._nested[thread_key]
                     self.observer_ns += time.monotonic_ns() - after_ns
 
     @contextmanager
@@ -276,6 +310,7 @@ class EndTextMemoObservation:
         original_reverse = RetentionStageMemo.v4_restored_recorder_request_text
         original_credential = RetentionStageMemo.credential_string_category
         original_evidence = RetentionStageMemo.evidence_references
+        original_recorder = RetentionStageMemo.recorder_data
         original_close = RetentionStageMemo.close
 
         def full(memo, key, producer, digest_producer):
@@ -315,6 +350,9 @@ class EndTextMemoObservation:
         def evidence(memo, key, producer):
             return self._observe(memo, "evidence", key, producer, None, lambda: original_evidence(memo, key, producer))
 
+        def recorder(memo, key, producer, admit):
+            return self._observe(memo, "recorder", key, producer, None, lambda: original_recorder(memo, key, producer, admit))
+
         def close(memo):
             original_close(memo)
             state = self._state(memo, "full", None)
@@ -337,6 +375,7 @@ class EndTextMemoObservation:
             patch.setattr(RetentionStageMemo, "v4_restored_recorder_request_text", reverse)
             patch.setattr(RetentionStageMemo, "credential_string_category", credential)
             patch.setattr(RetentionStageMemo, "evidence_references", evidence)
+            patch.setattr(RetentionStageMemo, "recorder_data", recorder)
             patch.setattr(RetentionStageMemo, "close", close)
             yield self
 

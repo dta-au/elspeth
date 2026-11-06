@@ -513,26 +513,63 @@ def test_bounded_scanner_refuses_equal_result_with_altered_native_arguments(monk
 @pytest.mark.parametrize("marker_type", [RuntimeError, KeyboardInterrupt, SystemExit])
 def test_bounded_scanner_preserves_the_original_exception_after_real_size_work(monkeypatch, request, marker_type):
     marker = marker_type("original scanner classification marker")
+    actual_size, sizes = credential_material.utf8_size, []
+
+    def size(text, *, errors="strict", limit=None):
+        result = actual_size(text, errors=errors, limit=limit)
+        sizes.append((text, errors, limit, result))
+        return result
 
     def interrupted(_value):
+        assert sizes == [("café☃", "replace", 262_144, 8)]
         raise marker
 
     monkeypatch.setattr(credential_material, "_classify_string", interrupted)
-    trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
-    with clock.retention_stage_memo_scope():
+    monkeypatch.setattr(credential_material, "utf8_size", size)
+    # Replacing the classifier deliberately takes the public guard's uncached
+    # branch. Its real size work has no keyed NativeByteBudget identity.
+    with clock.retention_stage_memo_scope() as memo:
         with pytest.raises(marker_type) as caught:
             guard._retention_credential_finding(
                 "café☃", policy=CredentialTraversalPolicy(), surface="native-bytes-control", scanner_role="generic"
             )
         assert caught.value is marker
+        assert memo.cached_entry_count == 0
+    assert sizes == [("café☃", "replace", 262_144, 8)]
+
+
+@pytest.mark.parametrize("marker_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_keyed_credential_producer_exception_keeps_actual_native_byte_budget(monkeypatch, request, marker_type):
+    marker = marker_type("original keyed producer classification marker")
+    original_producer = guard._credential_finding_from_key
+
+    def interrupted(_value):
+        raise marker
+
+    def produce(key):
+        # Change the classifier only after the public guard constructed its
+        # actual key and selected this actual producer. The original producer
+        # and native detector still perform all sizing and raise the marker.
+        with monkeypatch.context() as patch:
+            patch.setattr(credential_material, "_classify_string", interrupted)
+            return original_producer(key)
+
+    monkeypatch.setattr(guard, "_credential_finding_from_key", produce)
+    trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
+    with clock.retention_stage_memo_scope() as memo:
+        with pytest.raises(marker_type) as caught:
+            guard._retention_credential_finding(
+                "café☃", policy=CredentialTraversalPolicy(), surface="native-bytes-control", scanner_role="generic"
+            )
+        assert caught.value is marker and memo.cached_entry_count == 0
     trace.finish(
         stages=1, require_snapshot=False, require_population=False, native_byte_limits=(_native_scan_budget(1, "café☃", 8, requests=1),)
     )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("omitted", (None, "credential", "evidence"))
-async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_charges(monkeypatch, omitted):
+@pytest.mark.parametrize("omitted", (None, "credential", "evidence", "recorder"))
+async def test_end_text_observer_accounts_all_seven_families_and_detects_omitted_charges(monkeypatch, omitted):
     from hashlib import sha256
 
     from elspeth.web import continuation_retention_memo as memo
@@ -540,13 +577,19 @@ async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_c
     from tests.helpers.continuation_end_profile import EndTextMemoObservation
     from tests.unit.web.composer.test_continuation_evidence_graph import rich_evidence
     from tests.unit.web.composer.test_continuation_evidence_graph import snapshot as capture_snapshot
-    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+    from tests.unit.web.test_continuation_retention_memo import (
+        _admit_uncached_recorder_data,
+        _advisor_clock,
+        _produce_uncached_recorder_data,
+        _recorder_data_chunk,
+    )
 
     evidence, messages, recorder, logical, _policy = rich_evidence()
     captured = capture_snapshot(evidence, messages, recorder, logical)
     chunk = captured.source_chunk
     canonical = '{"message":"observer"}'
     calls = dict.fromkeys(EndTextMemoObservation.families, 0)
+    recorder_chunk = _recorder_data_chunk()
 
     def encode(key):
         calls["full"] += 1
@@ -570,6 +613,10 @@ async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_c
     def references(text):
         calls["evidence"] += 1
         return _evidence_private_references(text)
+
+    def recorder_data(text):
+        calls["recorder"] += 1
+        return _produce_uncached_recorder_data(text)
 
     def current():
         return True
@@ -598,6 +645,11 @@ async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_c
                 assert child.evidence_references(memo.PrivateChunkVerificationKey(chunk.reference, chunk.canonical), references) == (
                     captured.snapshot.recorder,
                 )
+                child.recorder_data(
+                    memo.PrivateChunkVerificationKey(recorder_chunk.reference, recorder_chunk.canonical),
+                    recorder_data,
+                    _admit_uncached_recorder_data,
+                )
         entries = (
             parent._canonical_proofs,
             parent._canonical_verifications,
@@ -605,6 +657,7 @@ async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_c
             parent._v4_recorder_requests,
             parent._credential_strings,
             parent._evidence_references,
+            parent._recorder_data,
         )
         retained = (
             sum(entry.retained_bytes for entry in parent._canonical_proofs.values()),
@@ -613,6 +666,7 @@ async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_c
             sum(entry.retained_bytes for entry in parent._v4_recorder_requests.values()),
             sum(entry.retained_bytes for entry in parent._credential_strings.values()),
             sum(entry.retained_bytes for entry in parent._evidence_references.values()),
+            sum(entry.retained_bytes for entry in parent._recorder_data.values()),
         )
         assert all(entries) and all(weight > 0 for weight in retained)
         assert retained == (
@@ -622,10 +676,11 @@ async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_c
             parent._v4_recorder_request_bytes,
             parent._credential_string_bytes,
             parent._evidence_reference_bytes,
+            parent._recorder_data_bytes,
         )
         assert all(count == 1 for count in calls.values())
         result = observation.snapshot()
-        assert set(result["families"]) == {"full", "canonical", "block", "request", "credential", "evidence"}
+        assert set(result["families"]) == {"full", "canonical", "block", "request", "credential", "evidence", "recorder"}
         for counts in result["families"].values():
             assert (counts["requests"], counts["misses"], counts["hits"], counts["admissions"]) == (2, 1, 1, 1)
         if omitted is None:
@@ -638,3 +693,343 @@ async def test_end_text_observer_accounts_all_six_families_and_detects_omitted_c
     result = observation.snapshot()
     assert result["parents"] and all(row["closed_empty"] for row in result["parents"])
     assert result["observer_errors"] == result["budget_violations"] == result["fingerprint_drops"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recorder_observer_real_public_decoder_counts_nested_cold_and_warm_work(monkeypatch):
+    from elspeth.web import continuation_retention_memo as memo
+    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot, encode_recorder_snapshot
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+    from tests.unit.web.composer.test_continuation_audit_buffer_blocks import _snapshot
+    from tests.unit.web.test_continuation_retention_memo import _advisor_clock
+
+    snapshot = _snapshot(1)
+    chunk = encode_recorder_snapshot(snapshot)
+    observation = EndTextMemoObservation()
+    with observation.install(monkeypatch), memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
+        for _ in range(2):
+            with memo.borrow_v4_preparation_memo_scope():
+                assert decode_recorder_snapshot(chunk) == snapshot
+        result = observation.snapshot()
+        counts = result["families"]["recorder"]
+        assert (counts["requests"], counts["misses"], counts["hits"], counts["admissions"], counts["unretained"]) == (2, 1, 1, 1, 0)
+        assert result["families"]["full"]["requests"] >= 4  # Fresh verification and admission on each call.
+        assert result["families"]["request"]["requests"] > 0
+        assert result["families"]["credential"]["requests"] >= 2
+        retained = (
+            sum(entry.retained_bytes for entry in parent._canonical_proofs.values())
+            + sum(parent._canonical_verifications.values())
+            + sum(parent._recorder_block_hashes.values())
+            + sum(entry.retained_bytes for entry in parent._v4_recorder_requests.values())
+            + sum(entry.retained_bytes for entry in parent._credential_strings.values())
+            + sum(entry.retained_bytes for entry in parent._evidence_references.values())
+            + sum(entry.retained_bytes for entry in parent._recorder_data.values())
+        )
+        assert result["peak_retained_bytes"] == retained
+        assert result["observer_errors"] == result["overlapping_calls"] == result["budget_violations"] == 0
+        assert not observation._nested and not any(observation._active.values())
+    assert observation.snapshot()["parents"] == [{"budget": parent._shared_text_budget_bytes, "closed_empty": True}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omit_child_delta", (None, "count", "bytes"))
+async def test_recorder_observer_attributes_actual_nested_pressure_once(monkeypatch, omit_child_delta):
+    import threading
+
+    from elspeth.web import continuation_retention_memo as memo
+    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+    from tests.unit.web.test_continuation_retention_memo import (
+        _admit_uncached_recorder_data,
+        _advisor_clock,
+        _produce_uncached_recorder_data,
+        _recorder_data_chunk,
+    )
+
+    monkeypatch.setattr(memo, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", 1_048_576)
+    seed, following = _recorder_data_chunk("a" * 70_000), _recorder_data_chunk("b" * 220_000)
+    observation = EndTextMemoObservation()
+    actual_state, omissions = observation._state, []
+
+    def verify(text):
+        assert text == "c" * 300_000
+
+    def state(owner, family, cache_key):
+        result = actual_state(owner, family, cache_key)
+        if (
+            omit_child_delta is not None
+            and family == "recorder"
+            and cache_key is not None
+            and cache_key[1].canonical == following.canonical
+        ):
+            frames = observation._nested.get((observation._parents.get(owner), threading.get_ident()))
+            if frames:
+                vector = frames[-1][0 if omit_child_delta == "count" else 1]
+                assert any(value < 0 for value in vector), "opposition needs a real nested eviction"
+                omissions.append(tuple(vector))
+                vector[:] = [0] * len(vector)
+        return result
+
+    monkeypatch.setattr(observation, "_state", state)
+    with observation.install(monkeypatch), memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
+        parent.recorder_data(
+            memo.PrivateChunkVerificationKey(seed.reference, seed.canonical),
+            _produce_uncached_recorder_data,
+            _admit_uncached_recorder_data,
+        )
+        seed_charge = parent._recorder_data_bytes
+        parent.canonical_text_verification(memo.CanonicalTextVerificationKey("c" * 300_000, 1_048_576), verify)
+        canonical_charge = parent._canonical_verification_bytes
+        # These entries fit alongside initial source verification. The real
+        # nested credential admission removes canonical; outer recorder
+        # publication then removes the prior recorder and full text proof.
+        assert seed_charge + canonical_charge + 2 * following.reference.byte_length + 100 < 1_048_576
+        with memo.borrow_v4_preparation_memo_scope():
+            result = decode_recorder_snapshot(following)
+        assert result.withheld_replies[0].content == "b" * 220_000
+        counts = observation.snapshot()["families"]
+        # Admissions minus evictions must agree with independent actual entry
+        # membership even when nested work evicts an outer recorder entry.
+        entries = (
+            parent._canonical_proofs,
+            parent._canonical_verifications,
+            parent._recorder_block_hashes,
+            parent._v4_recorder_requests,
+            parent._credential_strings,
+            parent._evidence_references,
+            parent._recorder_data,
+        )
+
+        def require_actual_accounting():
+            assert counts["recorder"]["evictions"] == 1 and counts["recorder"]["evicted_bytes"] == seed_charge
+            assert counts["canonical"]["evictions"] == 1 and counts["canonical"]["evicted_bytes"] == canonical_charge
+            assert counts["full"]["evictions"] >= 1
+            for family, values in zip(observation.families, entries, strict=True):
+                assert counts[family]["admissions"] - counts[family]["evictions"] == len(values)
+
+        if omit_child_delta is None:
+            require_actual_accounting()
+            assert not omissions
+        else:
+            assert len(omissions) == 1
+            with pytest.raises(AssertionError):
+                require_actual_accounting()
+        result = observation.snapshot()
+        assert result["observer_errors"] == result["overlapping_calls"] == result["budget_violations"] == 0
+        assert not observation._nested and not any(observation._active.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("orphan", (None, "entries", "bytes"))
+async def test_recorder_observer_unretained_work_and_closed_orphan_opposition(monkeypatch, orphan):
+    from elspeth.web import continuation_retention_memo as memo
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+    from tests.unit.web.test_continuation_retention_memo import (
+        _admit_uncached_recorder_data,
+        _advisor_clock,
+        _produce_uncached_recorder_data,
+        _recorder_data_chunk,
+    )
+
+    chunk = _recorder_data_chunk()
+    key = memo.PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    actual_close = memo.RetentionStageMemo.close
+
+    def close_with_orphan(owner):
+        entries, charge = dict(owner._recorder_data), owner._recorder_data_bytes
+        actual_close(owner)
+        if orphan == "entries":
+            owner._recorder_data.update(entries)
+        elif orphan == "bytes":
+            owner._recorder_data_bytes = charge
+
+    monkeypatch.setattr(memo.RetentionStageMemo, "close", close_with_orphan)
+    observation = EndTextMemoObservation()
+    with observation.install(monkeypatch):
+        with memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
+            parent.recorder_data(key, _produce_uncached_recorder_data, _admit_uncached_recorder_data)
+            assert parent._recorder_data_bytes > 0
+        monkeypatch.setattr(memo, "CONTINUATION_V4_PREPARATION_TEXT_MEMO_MAX_RETAINED_BYTES", 1)
+        with memo.v4_preparation_memo_scope(_advisor_clock()) as too_small:
+            for _ in range(2):
+                data = too_small.recorder_data(key, _produce_uncached_recorder_data, _admit_uncached_recorder_data)
+                assert data.canonical == chunk.canonical
+                assert not too_small._recorder_data and too_small._recorder_data_bytes == 0
+    result = observation.snapshot()
+    counts = result["families"]["recorder"]
+    assert (counts["requests"], counts["misses"], counts["hits"], counts["admissions"], counts["unretained"]) == (3, 3, 0, 1, 2)
+    assert result["parents"] == [
+        {"budget": parent._shared_text_budget_bytes, "closed_empty": orphan is None},
+        {"budget": 1, "closed_empty": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recorder_observer_actual_other_thread_overlap_still_invalidates(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from elspeth.web import continuation_retention_memo as memo
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+    from tests.unit.web.test_continuation_retention_memo import (
+        _admit_uncached_recorder_data,
+        _advisor_clock,
+        _produce_uncached_recorder_data,
+        _recorder_data_chunk,
+    )
+
+    chunk = _recorder_data_chunk()
+    key = memo.PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    rendezvous = threading.Barrier(2)
+
+    def produce(text):
+        data = _produce_uncached_recorder_data(text)
+        rendezvous.wait(timeout=5)
+        return data
+
+    observation = EndTextMemoObservation()
+    with (
+        observation.install(monkeypatch),
+        memo.v4_preparation_memo_scope(_advisor_clock()) as parent,
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        first = executor.submit(parent.recorder_data, key, produce, _admit_uncached_recorder_data)
+        second = executor.submit(parent.recorder_data, key, produce, _admit_uncached_recorder_data)
+        assert first.result(timeout=5) == second.result(timeout=5)
+        result = observation.snapshot()
+        assert result["overlapping_calls"] > 0 and result["observer_errors"] == 0
+        assert not observation._nested and not any(observation._active.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restore_old_gap", (False, True), ids=("atomic-start", "old-start-gap-opposition"))
+async def test_recorder_observer_state_capture_and_registration_are_one_atomic_start(monkeypatch, restore_old_gap):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from elspeth.web import continuation_retention_memo as memo
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+    from tests.unit.web.test_continuation_retention_memo import (
+        _admit_uncached_recorder_data,
+        _advisor_clock,
+        _produce_uncached_recorder_data,
+        _recorder_data_chunk,
+    )
+
+    chunk = _recorder_data_chunk()
+    key = memo.PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    observation = EndTextMemoObservation()
+    actual_state = observation._state
+    captured, release, second_entered = threading.Event(), threading.Event(), threading.Event()
+    first_thread, paused = [], []
+
+    def state(*args):
+        result = actual_state(*args)
+        if threading.get_ident() == first_thread[0] and not paused:
+            paused.append(True)
+            assert observation._lock.locked(), "initial snapshot must hold the registration lock"
+            if restore_old_gap:
+                # Deliberately restore precisely the reviewed scheduling hole:
+                # source snapshot exists but no active frame is registered.
+                observation._lock.release()
+            captured.set()
+            try:
+                assert release.wait(5)
+            finally:
+                if restore_old_gap:
+                    observation._lock.acquire()
+        return result
+
+    monkeypatch.setattr(observation, "_state", state)
+    with (
+        observation.install(monkeypatch),
+        memo.v4_preparation_memo_scope(_advisor_clock()) as parent,
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+
+        def first_call():
+            first_thread.append(threading.get_ident())
+            return parent.recorder_data(key, _produce_uncached_recorder_data, _admit_uncached_recorder_data)
+
+        def second_call():
+            second_entered.set()
+            return parent.recorder_data(key, _produce_uncached_recorder_data, _admit_uncached_recorder_data)
+
+        first = executor.submit(first_call)
+        second = None
+        try:
+            assert captured.wait(5)
+            second = executor.submit(second_call)
+            assert second_entered.wait(5)
+            if restore_old_gap:
+                second.result(timeout=5)  # Finish completely before T1 registers.
+            else:
+                assert observation._lock.locked()
+        finally:
+            release.set()
+        assert second is not None and first.result(timeout=5) == second.result(timeout=5)
+        result = observation.snapshot()
+        counts = result["families"]["recorder"]
+        assert len(parent._recorder_data) == 1 and result["observer_errors"] == 0
+
+        def require_valid_or_rejected():
+            assert result["overlapping_calls"] > 0 or (
+                counts["requests"] == 2 and counts["misses"] == counts["hits"] == counts["admissions"] == len(parent._recorder_data)
+            )
+
+        if restore_old_gap:
+            assert result["overlapping_calls"] == 0
+            assert (counts["misses"], counts["hits"], counts["admissions"]) == (2, 0, 2)
+            with pytest.raises(AssertionError):
+                require_valid_or_rejected()
+        else:
+            require_valid_or_rejected()
+        assert not observation._nested and not any(observation._active.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("callback", "after_state", "misnested"))
+async def test_recorder_observer_cleans_nested_frames_on_original_and_observer_failures(monkeypatch, failure):
+    from elspeth.web import continuation_retention_memo as memo
+    from tests.helpers.continuation_end_profile import EndTextMemoObservation
+    from tests.unit.web.test_continuation_retention_memo import (
+        _admit_uncached_recorder_data,
+        _advisor_clock,
+        _produce_uncached_recorder_data,
+        _recorder_data_chunk,
+    )
+
+    chunk = _recorder_data_chunk()
+    key = memo.PrivateChunkVerificationKey(chunk.reference, chunk.canonical)
+    observation = EndTextMemoObservation()
+    marker = RuntimeError("original recorder admission failure")
+
+    def admit(candidate, data):
+        _admit_uncached_recorder_data(candidate, data)
+        if failure == "callback":
+            raise marker
+        if failure == "misnested":
+            observation._nested.clear()
+
+    actual_state, calls = observation._state, []
+
+    def state(*args):
+        calls.append(True)
+        if failure == "after_state" and len(calls) == 2:
+            raise RuntimeError("observer state failed")
+        return actual_state(*args)
+
+    monkeypatch.setattr(observation, "_state", state)
+    with observation.install(monkeypatch), memo.v4_preparation_memo_scope(_advisor_clock()) as parent:
+        if failure == "callback":
+            with pytest.raises(RuntimeError) as caught:
+                parent.recorder_data(key, _produce_uncached_recorder_data, admit)
+            assert caught.value is marker and not parent._recorder_data
+        else:
+            assert parent.recorder_data(key, _produce_uncached_recorder_data, admit).canonical == chunk.canonical
+        assert not observation._nested and not any(observation._active.values())
+        result = observation.snapshot()
+        if failure == "callback":
+            assert result["families"]["recorder"]["errors"] == 1 and result["observer_errors"] == 0
+        else:
+            assert result["observer_errors"] > 0

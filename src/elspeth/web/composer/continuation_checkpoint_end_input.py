@@ -294,6 +294,7 @@ def capture_checkpoint_end_input(
         IterationEndCallerLocals,
         OrdinaryEndCallerLocals,
         SourceProofEndCallerLocals,
+        original_end_retry_publication_operation_id,
         require_original_checkpoint_end_gate_locals,
     )
     from elspeth.web.composer.interpretation_surfacing import require_original_pending_review_observation
@@ -412,9 +413,21 @@ def capture_checkpoint_end_input(
     )
     if message != expected_message:
         raise AuditIntegrityError("END gate input changed its original caller's PRIMARY body projection")
-    publication = runtime.live.turn_evidence.review_candidate(
-        candidate=message.content or "", request=runtime.bindings.message, current_state=runtime.live.state
-    )
+    retry_ordinal = 1 if phase_source.completed_children else 0
+    if snapshot.retry_ordinal != retry_ordinal:
+        raise AuditIntegrityError("END gate input changed its original retry ordinal")
+    if retry_ordinal == 1:
+        original_operation_id = original_end_retry_publication_operation_id(gate_locals, phase_owner=phase_owner)
+        publication = runtime.live.turn_evidence.review_candidate_for_source_operation(
+            source_operation_id=original_operation_id,
+            candidate=message.content or "",
+            request=runtime.bindings.message,
+            current_state=runtime.live.state,
+        )
+    else:
+        publication = runtime.live.turn_evidence.review_candidate(
+            candidate=message.content or "", request=runtime.bindings.message, current_state=runtime.live.state
+        )
     if _dump_owned(_PUBLICATION, publication) != snapshot.publication_review_json:
         raise AuditIntegrityError("END gate input changed its original complete publication packet")
     if snapshot.superseded_reply_index is not None:
