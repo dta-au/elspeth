@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from decimal import Decimal
 
 import litellm
 import pytest
@@ -277,17 +278,30 @@ async def test_cost_and_usage_preserve_known_unknown_and_unavailable(
         response.usage = Usage(**(response.usage.model_dump() | {"cost": amount}))
         return response
 
-    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, _provider, context, coordinator, baseline, _custodies):
+    async with _case(operation_store, tmp_path, monkeypatch) as (inputs, provider, context, coordinator, baseline, _custodies):
         request, returned, terminal, error, _original = await _actual_response(inputs, baseline["phases"], monkeypatch, reported_cost)
         call = returned.observation.audit_call
         assert call is not None
+        assert error is None and terminal is None and type(returned) is SemanticAdvisorInvocationV4Finalized
+        assert returned.finalization.result.audit_call == call
         if refusal is not None:
-            assert type(returned) is SemanticAdvisorInvocationRaised
-            assert type(error) is CommonProviderCostRefused and error.code == refusal
-            assert terminal is None
             assert call.provider_cost == (None if amount == "unavailable" else amount)
+            source = "not_available" if amount == "unavailable" else "response_usage.cost"
+            assert call.provider_cost_source == source and call.cost_response_accountable is True
+            budget = provider.cost_budget
+            assert budget is not None
+            settled = budget.snapshot()
+            assert settled.refusal_code == refusal
+            assert settled.physical_calls == len(settled.charges)
+            (charge,) = tuple(charge for charge in settled.charges if charge.call_id == call.call_id)
+            assert charge.cost == (None if amount == "unavailable" else Decimal(str(amount)))
+            assert charge.cost_source == source and charge.response_accountable is True
+            for require_allowed in (budget.require_output, budget.require_dispatch):
+                with pytest.raises(CommonProviderCostRefused) as refused:
+                    require_allowed()
+                assert refused.value.code == refusal and refused.value.call_id == call.call_id
+                assert budget.snapshot() == settled
         else:
-            assert error is None and terminal is None and type(returned) is SemanticAdvisorInvocationV4Finalized
             observed = _observe(request, replace(returned, observation=_with_large_audit(returned)), context, inputs)
             assert isinstance(observed, SemanticIncompleteResponseObservation)
             assert observed.cost.amount == expected and observed.cost.status == "known"

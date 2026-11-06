@@ -206,7 +206,7 @@ async def producer_case(store, *, secret_service=None, retain_ingress=True, admi
     plugin_snapshot, _catalog = service._policy_context.build("alice")
     # Admission intentionally returns metadata without the request body. Read
     # the existing full turn-input owner rather than reconstructing a request.
-    request_record = await asyncio.to_thread(authority.get_for_turn, session_id=sid, operation_id=record.operation_id)
+    request_record = authority.get_for_turn(session_id=sid, operation_id=record.operation_id)
     assert request_record is not None and request_record.request_json is not None
     request_type = SendMessageRequest if root.logical.kind == "compose_message" else RecomposeRequest
     bootstrap = capture_continuation_bootstrap(

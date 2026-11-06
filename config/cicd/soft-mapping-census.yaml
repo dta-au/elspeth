@@ -1100,7 +1100,7 @@ files:
   src/elspeth/web/sessions/continuation_p4.py:
     Mapping[str, Any]: 1
   src/elspeth/web/sessions/continuation_primary.py:
-    dict[str, Any]: 10
+    dict[str, Any]: 12
   src/elspeth/web/sessions/fork_custody.py:
     Mapping[str, Any]: 3
   src/elspeth/web/sessions/interpretation_validation.py:
@@ -1144,6 +1144,6 @@ totals:
   Mapping[str, object]: 327
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1191
+  dict[str, Any]: 1193
   dict[str, object]: 408
-  soft: 2741
+  soft: 2743

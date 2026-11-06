@@ -27,6 +27,7 @@ from elspeth.contracts.session_operation import SessionOperationContext, Session
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion, _CallModelOutcome
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.audit_storage import private_diagnostic_drafts
+from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, PrivateChunkRef
 from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot, decode_recorder_snapshot, encode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import (
@@ -430,12 +431,16 @@ def _original_wire(value: RetainedPrimaryInput) -> tuple[list[dict[str, Any]], l
 def _original_wire_with_context(
     value: RetainedPrimaryInput,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], PrivateProviderContext]:
-    """Actual immutable SDK input for auditing an already committed result.
+    """Admit complete original wire for consumers requiring current content safety."""
+    messages, tools = _parse_original_wire(value)
+    context = capture_provider_context(messages=messages, tools=tools or None)
+    if context.disposition != "retained":
+        raise AuditIntegrityError("primary original input is not its safely retained complete source")
+    return messages, tools, context
 
-    Preparation, dispatch intent and publication separately bind this input to
-    their complete selected messages. A later shelf includes actual new replies
-    and cannot stand in for the original paid request. This data grants no call.
-    """
+
+def _parse_original_wire(value: RetainedPrimaryInput) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read complete canonical original wire without granting fresh admission."""
     messages, message_error = parse_json_strict(value.messages_json)
     tools, tool_error = parse_json_strict(value.tools_json)
     if (
@@ -450,11 +455,43 @@ def _original_wire_with_context(
         or canonical_json(tools) != value.tools_json
     ):
         raise AuditIntegrityError("primary original input lost its complete retained SDK wire")
-    original_tools = tools if tools is not None else []
-    context = capture_provider_context(messages=messages, tools=original_tools or None)
-    if context.disposition != "retained":
-        raise AuditIntegrityError("primary original input is not its safely retained complete source")
-    return messages, original_tools, context
+    return messages, tools if tools is not None else []
+
+
+def _require_original_request_comparison(source: RetainedPrimaryInput, call: ComposerLLMCall) -> None:
+    """Compare historical request DATA, without re-admitting its content policy.
+
+    The SQL owner still reads the complete bounded original descriptor and
+    proves the actual physical attempt, principal, settlement and audit cohort.
+    Protocol, credentials and aggregate traversal admission belong to the
+    original producer; preparation and publication retain their full capture.
+    This comparison preserves strict canonical wire and encoded byte bounds.
+    """
+    _parse_original_wire(source)
+    # The strict roundtrip above proves both complete fragments canonical.
+    # These fixed ASCII keys are in JCS order; absent PRIMARY tools are null.
+    expected = (
+        '{"capture_boundary":"prepared_litellm_messages_and_tools","messages":'
+        + source.messages_json
+        + ',"schema_version":"composer.provider-context.v1","tools":'
+        + source.tools_json
+        + "}"
+    )
+    if len(expected.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES:
+        raise AuditIntegrityError("primary original request context exceeds its encoded bound")
+    context = call.private_request
+    if (
+        call.model_requested != source.model
+        or call.temperature != source.temperature
+        or call.seed != source.seed
+        or call.messages_hash != sha256(source.messages_json.encode("utf-8")).hexdigest()
+        or call.tools_spec_hash != (sha256(source.tools_json.encode("utf-8")).hexdigest() if source.tools_present else None)
+        or context is None
+        or context.disposition != "retained"
+        or context.reasons
+        or context.canonical != expected
+    ):
+        raise AuditIntegrityError("primary physical audit differs from its complete actual prepared input source")
 
 
 def allocate_primary_effect_on_connection(
@@ -1765,16 +1802,7 @@ def _physical_source_data(conn: Connection, session_id: UUID, operation_id: str,
     if type(call) is not ComposerLLMCall or call.call_id is None:
         raise AuditIntegrityError("primary result requires the actual original physical audit")
     source = _stored_descriptor_data(conn, session_id, operation_id, effect)
-    wire, tools, context = _original_wire_with_context(source)
-    if (
-        call.model_requested != source.model
-        or call.temperature != source.temperature
-        or call.seed != source.seed
-        or call.messages_hash != stable_hash(wire)
-        or call.tools_spec_hash != (stable_hash(tools) if tools else None)
-        or call.private_request != context
-    ):
-        raise AuditIntegrityError("primary physical audit differs from its complete actual prepared input source")
+    _require_original_request_comparison(source, call)
     creator = conn.execute(
         select(attempts).where(
             attempts.c.session_id == str(session_id),

@@ -33,7 +33,6 @@ from elspeth.web.composer.continuation_checkpoint_observation import CheckpointR
 from elspeth.web.composer.continuation_clock import ContinuationActionClock
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
-from elspeth.web.composer.continuation_runtime import capture_continuation_runtime_owners
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
@@ -44,6 +43,7 @@ from elspeth.web.sessions import continuation_iteration_return as stages
 from elspeth.web.sessions.composer_drain import ComposerDrainSignal
 from elspeth.web.sessions.continuation import load_snapshot
 from elspeth.web.sessions.continuation_checkpoint_source_replay import read_checkpoint_provider_source_on_connection
+from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -58,6 +58,7 @@ from tests.unit.web.sessions import test_continuation_live_phases as phase_fixtu
 from tests.unit.web.sessions import test_continuation_v4_metadata_live as v4_fixture
 from tests.unit.web.sessions.test_continuation_primary_result import stored_rows
 from tests.unit.web.sessions.test_continuation_prompt_producers import current_service
+from tests.unit.web.sessions.test_continuation_tool_failure import _actual_failure_driver
 from tests.unit.web.sessions.test_continuation_v4_pipeline_live import _PIPELINE_PLUGINS, _arguments, _uploaded_source
 
 operation_store = phase_fixture.operation_store
@@ -123,12 +124,27 @@ async def _early_case(store, tmp_path, monkeypatch):
         applied = owner.latest_snapshot
         assert applied is not None and owner.tool_refusal is None
         selected = await load_selected_continuation(authority=owner.authority, running=running, selected=applied, required_work=owner.work)
-        phase_read = await owner.restore_finished_batch(selected)
-        runtime, inventory = phase_read.runtime, phase_read.inventory
-        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
-        ready = stages.retain_iteration_prepared(owner.authority, running, selected=selected, inventory=inventory, captured=captured)
+        deadline = owner.work.coordinator.sql_deadline_owner
+        assert deadline is not None
+        with locked_session_transaction(store[0], str(running.claim.session_id)) as conn:
+            assert stages.read_iteration_stage_on_connection(conn, running, selected=applied) is None
+        driver = _actual_failure_driver(current_store, owner, running, drain_signal=deadline.drain_signal)
+        # Applied P4 DATA still carries the pre-publication Compose fields.
+        # Use the real no-paid fold before retaining its prepared stage.
+        assert await advance_continuation_iteration(owner, driver.services, selected) is None
+        ready = owner.authority.load_continuation_snapshot(running)
+        with locked_session_transaction(store[0], str(running.claim.session_id)) as conn:
+            stage = stages.read_iteration_stage_on_connection(conn, running, selected=ready)
+        assert stage is not None and stage.stage == "early_ready"
+        assert ready.cursor == applied.cursor + 1 and len(primary_sdk) == 1
         selected = await load_selected_continuation(authority=owner.authority, running=running, selected=ready, required_work=owner.work)
         runtime, inventory = await owner.current(selected)
+        assert owner.finished_batch is not None
+        _dispatch, persist, _before = owner.finished_batch
+        assert runtime.live.persisted_assistant_message_id == persist.persisted_assistant_message_id
+        assert runtime.live.persisted_assistant_content == persist.persisted_assistant_content
+        assert runtime.live.persisted_tool_call_turn is persist.persisted_tool_call_turn is True
+        assert runtime.live.failed_turn == persist.failed_turn
         dispatched = stages.begin_iteration_paid_stage(owner.authority, running, selected=selected, inventory=inventory, stage="early")
         selected = await load_selected_continuation(
             authority=owner.authority, running=running, selected=dispatched, required_work=owner.work

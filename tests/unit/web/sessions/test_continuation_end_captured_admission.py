@@ -123,8 +123,9 @@ async def test_actual_early_cold_projection_preserves_history_and_exact_observat
             prior_shelf = decode_message_shelf(writer._held_chunk(conn, owed, prior_frame.transcript))
             transcript_chunk = next(chunk for chunk in chunks if chunk.reference == frame.transcript)
             shelf = decode_message_shelf(transcript_chunk)
-            assert shelf.observed[: len(prior_shelf.observed)] == prior_shelf.observed
-            assert len(shelf.observed) == len(prior_shelf.observed) + 1
+            # The actual post-P4 fold already observed these messages before
+            # EARLY; observing the unchanged shelf preserves that history.
+            assert shelf.observed == prior_shelf.observed
             observed.append(result)
             if opponent == "caches":
                 changed = encode_continuation_caches(
