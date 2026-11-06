@@ -197,6 +197,22 @@
   .chat-input-send-btn {
     border: 1px solid ButtonText;
   }
+
+  /* Header controls: header.css draws them as tint-only pills (border: 0,
+     restated on hover), and the tint is stripped here. Each selector matches
+     its header.css twin's specificity, base (0,2,0) and hover (0,3,0), and
+     wins on source order. */
+  .app-header .header-session-switcher-trigger,
+  .app-header .version-selector-trigger,
+  .app-header .user-menu-trigger,
+  .app-header .workflow-mailbox-badge,
+  .app-header .header-session-switcher-trigger:hover,
+  .app-header .version-selector-trigger:hover,
+  .app-header .user-menu-trigger:hover,
+  .app-header .workflow-mailbox-badge:hover,
+  .app-header .user-menu-trigger:focus-visible {
+    border: 1px solid ButtonText;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

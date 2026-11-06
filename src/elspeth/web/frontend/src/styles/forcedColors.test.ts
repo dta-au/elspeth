@@ -63,6 +63,18 @@ describe("forced-colors: active boundaries", () => {
     ":root .react-flow__controls",
     ".graph-node-badge",
     ".artifact-tab-badge",
+    // ARGOnite: header controls are tint-only pills (header.css sets
+    // border: 0, on hover too), and forced colours strips the tint.
+    ".app-header .header-session-switcher-trigger",
+    ".app-header .version-selector-trigger",
+    ".app-header .user-menu-trigger",
+    ".app-header .workflow-mailbox-badge",
+    // The hover rules re-set border: 0 at (0,3,0), so each needs its own.
+    ".app-header .header-session-switcher-trigger:hover",
+    ".app-header .version-selector-trigger:hover",
+    ".app-header .user-menu-trigger:hover",
+    ".app-header .workflow-mailbox-badge:hover",
+    ".app-header .user-menu-trigger:focus-visible",
   ])("%s keeps a 1px system-colour boundary", (selector) => {
     const rule = declarations(forced, selector);
     expect(rule).toMatch(BOUNDARY);
@@ -128,6 +140,7 @@ const sheets = [
   "../components/workspace/workspace.css",
   "../components/inspector/inspector.css",
   "../components/chat/chat.css",
+  "../components/header/header.css",
 ]
   .map((f) =>
     readFileSync(join("src", "styles", f), "utf8").replace(/\/\*[\s\S]*?\*\//g, ""),
@@ -148,6 +161,10 @@ describe("forced-colours rules are not out-specified", () => {
     ":root .react-flow__controls",
     ".graph-node-badge",
     ".artifact-tab-badge",
+    ".app-header .header-session-switcher-trigger",
+    ".app-header .version-selector-trigger",
+    ".app-header .user-menu-trigger",
+    ".app-header .workflow-mailbox-badge",
   ];
 
   it.each(borderTargets)("%s", (target) => {
