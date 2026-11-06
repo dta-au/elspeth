@@ -131,4 +131,78 @@
   .identity-admin-tab[aria-selected="true"] {
     border-bottom-color: Highlight;
   }
+
+  /* ARGOnite: depth is fills and shadows, which forced colours strips. Each
+     boundary below is restated as a 1px system-colour border or outline.
+     Selectors match the specificity of the rules they sit beside. */
+
+  /* Selected workspace tab: Highlight edge (the pill fill is dropped).
+     Forced colours paints a transparent border, so inactive tabs are set to
+     Canvas first or every tab would look selected. */
+  .artifact-tab {
+    border-color: Canvas;
+  }
+
+  .artifact-tab[aria-selected="true"] {
+    border: 1px solid Highlight;
+  }
+
+  .artifact-tab-badge,
+  .graph-node-badge {
+    box-sizing: border-box;
+    border: 1px solid CanvasText;
+  }
+
+  /* Switch: track and thumb keep an edge; checked = Highlight track with a
+     HighlightText thumb that has also moved 16px, so it never reads by colour
+     alone. */
+  .switch-track,
+  .switch-thumb {
+    border: 1px solid ButtonText;
+  }
+
+  .switch-input:checked + .switch-track {
+    background-color: Highlight;
+  }
+
+  .switch-input:checked + .switch-track .switch-thumb {
+    background-color: HighlightText;
+    border-color: HighlightText;
+  }
+
+  /* Graph: the well and checksum pill are fill/inset-shadow only. */
+  .graph-view-canvas,
+  .graph-checksum-value {
+    border: 1px solid CanvasText;
+  }
+
+  .react-flow__controls {
+    border: 1px solid ButtonText;
+  }
+
+  .graph-checksum-actions > .btn-compact {
+    border: 1px solid ButtonText;
+  }
+
+  /* The selected node's box-shadow ring is the only selection indicator and
+     is dropped; outline is not set inline, so no !important is needed. */
+  .react-flow__node.graph-node--selected {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  /* Chat input: well, icon buttons and the send button (border: none). */
+  .chat-input-row,
+  .chat-input-icon-btn,
+  .chat-input-send-btn {
+    border: 1px solid ButtonText;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch-track,
+  .switch-thumb,
+  .artifact-tab {
+    transition: none;
+  }
 }
