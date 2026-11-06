@@ -480,11 +480,17 @@ describe("ARGOnite pane cards, title bars and tab track", () => {
     // raised pill on it, inactive tabs are muted text in the track. The tab
     // rules stay at shared.css's (0,2,0)/(0,1,0) specificity via :where() and
     // win on source order (workspace.css imports after shared.css).
-    const track = '.artifact-workspace-toolbar [role="tablist"]';
-    expect(listedDeclaration(track, "box-shadow")).toBe("var(--shadow-track)");
-    expect(listedDeclaration(track, "background-color")).toBe("var(--color-track)");
-    expect(listedDeclaration(track, "border-radius")).toBe("var(--radius-pill)");
-    expect(listedDeclaration(track, "padding")).toBe("4px");
+    // Both tablists sit in the track: the artifact tabs and the narrow-mode
+    // Compose/Pipeline view tabs.
+    for (const track of [
+      '.artifact-workspace-toolbar [role="tablist"]',
+      '.composer-workspace[data-layout-mode="narrow"] .workspace-view-tabs',
+    ]) {
+      expect(listedDeclaration(track, "box-shadow")).toBe("var(--shadow-track)");
+      expect(listedDeclaration(track, "background-color")).toBe("var(--color-track)");
+      expect(listedDeclaration(track, "border-radius")).toBe("var(--radius-pill)");
+      expect(listedDeclaration(track, "padding")).toBe("4px");
+    }
 
     const scope = ":where(.artifact-workspace-toolbar, .workspace-view-tabs)";
     const selected = `${scope} .artifact-tab[aria-selected="true"]`;
@@ -503,6 +509,19 @@ describe("ARGOnite pane cards, title bars and tab track", () => {
     expect(declaration(`${scope} .artifact-tab`, "border-radius")).toBe(
       "var(--radius-pill)",
     );
+  });
+
+  it("keeps a disabled tab distinguishable from an enabled inactive one", () => {
+    // Inactive tabs in the track are --color-text-muted, which is exactly
+    // shared.css's :disabled colour, so colour alone no longer separates a
+    // gated tab (Spec/YAML/Checks with no composition) from an available one.
+    // The track's disabled rule adds a dimming cue on top, the same 0.6 the
+    // disabled .switch uses (WCAG 1.4.3 exempts inactive controls).
+    const scope = ":where(.artifact-workspace-toolbar, .workspace-view-tabs)";
+    expect(declaration(`${scope} .artifact-tab`, "color")).toBe(
+      "var(--color-text-muted)",
+    );
+    expect(declaration(`${scope} .artifact-tab:disabled`, "opacity")).toBe("0.6");
   });
 
   it("draws both panes as cards with the gutter between and around them", () => {
