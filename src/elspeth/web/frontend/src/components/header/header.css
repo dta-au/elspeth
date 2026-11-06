@@ -368,8 +368,9 @@
 
 /* Filter strip above the menu (elspeth-8c7ac37d49): these three classes were
    emitted with NO definition anywhere in the barrel, so the filter field and
-   the show-archived checkbox rendered as white UA controls on the dark
-   --color-surface-nav-raised surface. The field takes the .input primitive's
+   the show-archived checkbox rendered as unstyled white UA controls on the
+   popover's --color-surface-nav-raised ground (deep green in the dark theme,
+   pale green in light). The field takes the .input primitive's
    vocabulary (input-border, elevated surface, the contrast-gated
    --color-text-secondary placeholder pair, the app focus-ring idiom) at the
    compact chrome rung this dense strip sits on. */
@@ -667,7 +668,8 @@
    padding/type scale over .input — same dense-context move as
    .catalog-search-input. The primitive's border/focus-ring/placeholder
    vocabulary is adopted deliberately: those were UA-default chrome on the
-   dark popover, the defect class the ui primitives exist to retire. */
+   popover's nav-raised ground, the defect class the ui primitives exist to
+   retire. */
 .header-session-switcher-rename-input {
   min-height: var(--size-control-compact);
   padding: var(--space-2xs) var(--space-sm);
@@ -687,9 +689,11 @@
   /* Same layered recipe as the archive strip above: the error wash is a
      low-alpha tint, and this strip sits on the popover's nav-raised surface —
      a ground the contrast gate's tint matrix does not enumerate. Bare
-     tint-on-nav-raised measured 4.06:1 in the light theme (under AA); riding
-     the tint on background-image over an opaque --color-surface restores the
-     gated error-on-surface pairing in both themes. */
+     tint-on-nav-raised measured 4.06:1 on the pre-ARGOnite light value; on
+     ARGOnite's values it is 4.42:1 in the dark theme (under AA) and 4.63:1
+     in light. Riding the tint on background-image over an opaque
+     --color-surface restores the gated error-on-surface pairing in both
+     themes. */
   background-color: var(--color-surface);
   background-image: linear-gradient(var(--color-error-bg), var(--color-error-bg));
   color: var(--color-error);

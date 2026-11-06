@@ -20,12 +20,15 @@
   /* Navigation family — DTA green band (header chrome). Header text on the
      band is --color-on-nav / --color-on-nav-muted, not body ink.
      --color-surface-nav-raised's only consumer is the session-switcher
-     popover (header.css), which carries BODY text, including muted. It was
-     darkened from ARGO's #13553f to #12513c (lightness only, same hue) so
-     muted text clears AA on it (4.35 → 4.60:1); it stays 4.25 L* above the
-     band. */
+     popover (header.css), which carries BODY text, including muted, and
+     whose item/action :hover/:focus add the 4%-white --color-surface-hover
+     wash under that muted text. It was darkened from ARGO's #13553f to
+     #0f4433 (lightness only, same hue) so muted text clears AA on the washed
+     ground with headroom: bare 4.35 → 5.50:1, washed 3.90 → 4.94:1. It now
+     sits 0.82 L* below the band rather than above it; the popover reads off
+     the band by its border and --shadow-dropdown, not by lightness. */
   --color-surface-nav:        #0f4636;
-  --color-surface-nav-raised: #12513c;
+  --color-surface-nav-raised: #0f4433;
 
   /* Inspection family — desaturated warm neutral (paper modals, inspection
      panels) so they read as paper-on-desk against the green/navy columns
@@ -54,8 +57,8 @@
      background but failed on elevated cards and paper modals, ~46 live axe
      hits (elspeth-dae08efdc9). ARGO's #a9b9c4 clears every surface family:
      bg 8.54, surface 7.02, elevated/raised 6.39, input 5.78, inspector 7.18,
-     paper 6.54, nav-raised 4.60, and 5.68 on the 4%-white hover wash over
-     elevated. Gated by the muted-on-panel-surface composition tests in
+     paper 6.54, nav-raised 5.50, and on the 4%-white hover wash 5.68 over
+     elevated and 4.94 over nav-raised. Gated by the muted-on-panel-surface composition tests in
      colorContrast.test.ts. The website mirror (website/tokens/colors.css)
      still carries the pre-ARGOnite #93b3b3: per the ARGOnite design doc the
      marketing site's tokens follow later, separately. */
@@ -161,8 +164,9 @@
      rgb(51,64,72) and the old value measured 4.304:1, under AA. The lift
      cleared every tinted surface of the pre-ARGOnite palette (worst 4.547:1
      on raised/elevated) and improved the untinted pairings too; on
-     ARGOnite's darker navy panels the worst tinted pair is 4.90:1 (paper). colorContrast.test.ts now enumerates
-     raised and elevated, so this cannot silently regress again. */
+     ARGOnite's darker navy panels the worst tinted pair is 4.90:1 (paper).
+     colorContrast.test.ts now enumerates raised and elevated, so this cannot
+     silently regress again. */
   --color-error:             #f08e8b;
   /* Lifted from #e79761 (+0.032 L, hue and saturation held). Same mechanism as
      --color-error above, and worse here because --color-warning-bg is a 14%
@@ -349,9 +353,10 @@
      dims the page by the same amount: the corpus shipped eleven hand-copied
      rgba backdrops across three alphas (0.3 / 0.45 / 0.5), which made
      modality read differently per overlay. Backdrops consume this token,
-     never a literal. Light theme swaps the base to the pre-ARGOnite teal ink (#0f2d35)
-     at a lower alpha — plain black at 0.45 reads too heavy over light
-     surfaces — the same tinted-base swap the --shadow-* tiers make. */
+     never a literal. Light theme swaps the base to the pre-ARGOnite teal
+     ink (#0f2d35) at a lower alpha — plain black at 0.45 reads too heavy
+     over light surfaces — the same tinted-base swap the --shadow-* tiers
+     make. */
   --color-scrim: rgba(0, 0, 0, 0.45);
 
   /* ── Control heights ─────────────────────────────────────────────────────── */
@@ -489,8 +494,8 @@
   /* ── Semantic colours — slightly darkened for light backgrounds ───────── */
   /* --color-info and --color-link were deepened from #2890b8 to #176d8a so
      they meet WCAG AA (4.5:1) as text on --color-bg (5.24:1 on ARGOnite's
-     #eaf5ef). Verified by
-     colorContrast.test.ts. The semantic-colour-on-tinted-bg pairings (e.g.
+     #eaf5ef). Verified by colorContrast.test.ts. The
+     semantic-colour-on-tinted-bg pairings (e.g.
      --color-info on --color-info-bg) become slightly higher-contrast, which
      is the desired direction. */
   --color-success:           #0b6e6c;
