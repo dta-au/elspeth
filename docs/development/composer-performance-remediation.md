@@ -61,8 +61,8 @@ verifying path), not by the type of the container.
 | 3-T2 | Snapshot-bound per-send stream authorization | High (semantic) | Low code | Developer ruling | not started — ruling needed |
 | 5 | Allocation profiling | — | — | — | after 1 and 2A |
 | 6 | Carry-once validated proposal (no re-freeze/re-hash) | Low–Med | Medium | Unit (proposal, decoder, hashing) | open |
-| 7 | Approval binding reuses the cached runtime manifest | Low | Low | Unit (approval, landscape) | **out of scope** (execution side; maintainer ruling 2026-11-08: this effort is composer only) |
-| 9 | Drop the executor's duplicate input hash | Low | Low | Engine unit + telemetry tests | **out of scope** (execution side; same ruling) |
+| 7 | Approval binding reuses the cached runtime manifest | Low | Low | Unit (approval, landscape) | **out of scope** (execution side; maintainer ruling 2026-11-08) — filed as [#346](https://github.com/dta-au/elspeth/issues/346) |
+| 9 | Drop the executor's duplicate input hash | Low | Low | Engine unit + telemetry tests | **out of scope** (execution side; same ruling) — filed as [#347](https://github.com/dta-au/elspeth/issues/347) |
 | 10 | Load `chat_messages.tool_calls` once per list, filter by id | Low–Med | Medium | Reviewed-writer recipe re-pin; sessions unit | open |
 | 11 | Memoize tool-definition credential scan by tools hash | Low | Low | Unit (provider_context) | open |
 | 12 | Cache `canonical_set_pipeline_schema()` per process | Low | Low | Unit (schema_contract, planner) | open |
