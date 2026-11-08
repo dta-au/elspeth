@@ -852,7 +852,21 @@ Record raw output, not summaries, in each fix's Evidence line.
   `DEPLOYMENT_STATE_MODE=external-postgresql`, the two PostgreSQL URLs,
   `DATA_DIR`, `PAYLOAD_STORE_PATH`, the OpenRouter models and key, and
   `COMPOSER_PROMPT_GUARD_MODE=debug-when-unconfigured` (the documented
-  development mode; records `debug_bypass`, unprotected). Local user `demo`.
+  development mode; records `debug_bypass`, unprotected).
+- Accounts: authoring requires a deployment-wide `user` role, and an
+  identity cannot hold both `admin` and `user` (`role_forbidden_for_identity`).
+  So: `demo` = first administrator via `elspeth composer users bootstrap-admin
+  local demo --username demo --note …`; `pilot` = ordinary local user, granted
+  `user` by `demo` through `POST /api/auth/admin/roles`. The tutorial harness
+  runs as `pilot`. Local accounts created by the CLI are already active (no
+  pending activation step).
+- Tutorial smoke run: the project's `tutorial-reliability.staging` spec
+  requires an HTTPS origin, so a local Node TLS terminator (self-signed,
+  `https://localhost:8443` → `:8451`) fronts the server; the spec runs
+  through an untracked wrapper config under the gitignored
+  `tests/e2e/.harness-results/` that points Playwright at the pre-installed
+  Chromium (`/opt/pw-browsers/chromium`). `NODE_TLS_REJECT_UNAUTHORIZED=0`
+  and `STAGING_IGNORE_HTTPS=1` apply to the test process only.
 - The doctor warns `composer_turn_budget_underfunded`: 240 s funds ~16 turns
   against 34 configured. Left as supplied; revisit if runs time out.
 - Network: this session was moved onto a personal environment allowing
