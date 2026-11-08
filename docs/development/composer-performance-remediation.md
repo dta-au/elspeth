@@ -432,11 +432,26 @@ Record raw output, not summaries, in each fix's Evidence line.
 3. Fix 3: should the 0.25 s watch cadence itself be revisited, or only its
    query shape?
 
-## Session constraints noted while verifying
+## Test environment (cloud session, set up 2026-11-08)
 
-- This cloud container has no `.venv`; system Python is 3.13. Run `uv sync`
-  before any pytest. Testcontainer suites need Docker, which this container
-  may not provide — PostgreSQL verification for fix 3 may need to run
-  elsewhere.
+- `uv sync --all-extras` creates `.venv` (system Python 3.13); frontend built
+  with `npm --prefix src/elspeth/web/frontend ci && … run build` on Node 22
+  (pinned toolchain is 24; the build succeeded).
+- **No Docker.** The `testcontainer`-marked suites cannot run here. A local
+  PostgreSQL 16 cluster (`pg_ctlcluster 16 main start`) with role `elspeth`
+  and databases `elspeth_sessions` / `elspeth_landscape` stands in for the
+  server's own state stores; schema initialized with
+  `elspeth doctor deployment --init-schema`. Contention proofs for fix 3
+  still need a Docker host or CI's Testcontainer job.
+- Server: `elspeth web --host 127.0.0.1 --port 8451` with `.env` providing
+  `DEPLOYMENT_STATE_MODE=external-postgresql`, the two PostgreSQL URLs,
+  `DATA_DIR`, `PAYLOAD_STORE_PATH`, the OpenRouter models and key, and
+  `COMPOSER_PROMPT_GUARD_MODE=debug-when-unconfigured` (the documented
+  development mode; records `debug_bypass`, unprotected). Local user `demo`.
+- The doctor warns `composer_turn_budget_underfunded`: 240 s funds ~16 turns
+  against 34 configured. Left as supplied; revisit if runs time out.
+- Network: this session was moved onto a personal environment allowing
+  `openrouter.ai`; the Default environment was not changed.
 - `scripts/branch-safety-check.sh` and `scripts/full-suite-gate.sh` are the
   canonical pre-commit/pre-merge instruments; use them, not raw commands.
+  The PreToolUse guard refuses `pkill -f`; stop the server with `kill <pid>`.
