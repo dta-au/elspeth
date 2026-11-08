@@ -102,9 +102,17 @@ class DiscoveryKey:
     arguments_key: str
     dependency_revision: str
     policy_snapshot_hash: str = ""
+    registry: RegistryRevision | None = None
 
     def weight_bytes(self) -> int:
-        return 192 + 4 * (len(self.tool_name) + len(self.arguments_key) + len(self.dependency_revision) + len(self.policy_snapshot_hash))
+        registry_weight = (
+            16 * (len(self.registry.sources) + len(self.registry.transforms) + len(self.registry.sinks)) if self.registry is not None else 0
+        )
+        return (
+            192
+            + registry_weight
+            + 4 * (len(self.tool_name) + len(self.arguments_key) + len(self.dependency_revision) + len(self.policy_snapshot_hash))
+        )
 
 
 @dataclass(frozen=True, slots=True)

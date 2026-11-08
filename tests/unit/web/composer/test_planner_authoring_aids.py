@@ -147,14 +147,14 @@ def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -
         return {"key": "value"}
 
     monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
-    catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="snapshot"))
+    catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="snapshot"), projection_revision="catalog-1")
 
     first = planner_authoring_aids.build_planner_authoring_aids(catalog)
     second = planner_authoring_aids.build_planner_authoring_aids(catalog)
 
     assert first == second == {"key": "value"}
     assert first is not second
-    assert dict(memo) == {"snapshot": {"key": "value"}}
+    assert dict(memo) == {("snapshot", "catalog-1"): {"key": "value"}}
 
 
 @pytest.mark.parametrize("snapshot_hashes", [["same"] * 4, ["one", "two", "three", "four"]])
@@ -173,7 +173,9 @@ def test_authoring_aids_concurrent_cold_builds_are_bounded_and_isolated(
         return {"purpose": catalog.snapshot.snapshot_hash}
 
     monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
-    catalogs = [SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash=value)) for value in snapshot_hashes]
+    catalogs = [
+        SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash=value), projection_revision="catalog-1") for value in snapshot_hashes
+    ]
 
     with ThreadPoolExecutor(max_workers=len(catalogs)) as executor:
         results = list(executor.map(planner_authoring_aids.build_planner_authoring_aids, catalogs))
@@ -1558,6 +1560,7 @@ def _llmless_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot, Any]
     )
     assert PluginId("transform", "llm") not in snapshot.available
     profiles = MagicMock(spec=OperatorProfileRegistry)
+    profiles.generation = 0
     view = PolicyCatalogView(catalog, snapshot, profiles)
     # No plugin has a usable alias here, so the projection must short-circuit
     # before the registry: a MagicMock summary reaching the digest would render
@@ -1774,13 +1777,15 @@ class TestModelCatalogAid:
             return {"purpose": identity[0]}
 
         monkeypatch.setattr(planner_authoring_aids, "_build_planner_authoring_aids", build)
-        catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="one-policy-snapshot"))
+        catalog: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="one-policy-snapshot"), projection_revision="catalog-1")
 
         first = planner_authoring_aids.build_planner_authoring_aids(catalog)
         repeat = planner_authoring_aids.build_planner_authoring_aids(catalog)
         identity[0], identity[1] = "live-sha", "live"
         after_prime = planner_authoring_aids.build_planner_authoring_aids(catalog)
-        changed_policy: Any = SimpleNamespace(snapshot=SimpleNamespace(snapshot_hash="another-policy-snapshot"))
+        changed_policy: Any = SimpleNamespace(
+            snapshot=SimpleNamespace(snapshot_hash="another-policy-snapshot"), projection_revision="catalog-1"
+        )
         after_policy_change = planner_authoring_aids.build_planner_authoring_aids(changed_policy)
 
         assert first == repeat == {"purpose": "bundled-sha"}
@@ -1788,8 +1793,8 @@ class TestModelCatalogAid:
         assert after_policy_change == {"purpose": "live-sha"}
         assert builds == ["bundled-sha", "live-sha"]
         assert sorted(planner_authoring_aids._AIDS_MEMO) == [
-            "another-policy-snapshot",
-            "one-policy-snapshot",
+            ("another-policy-snapshot", "catalog-1"),
+            ("one-policy-snapshot", "catalog-1"),
         ]
 
 

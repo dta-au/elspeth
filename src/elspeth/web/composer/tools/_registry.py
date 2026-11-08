@@ -114,6 +114,10 @@ def response_contract_for(tool_name: str) -> ResponseContract | None:
     return _DECLARATIONS_BY_NAME[tool_name].response_contract
 
 
+def declaration_for(tool_name: str) -> ToolDeclaration:
+    return _DECLARATIONS_BY_NAME[tool_name]
+
+
 # Async tools have no synchronous declaration. These are authored-domain
 # effects only; advisor calls still perform network, budget and audit work.
 ASYNC_TOOL_EFFECTS: Final = MappingProxyType(

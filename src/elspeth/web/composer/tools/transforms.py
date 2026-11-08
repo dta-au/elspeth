@@ -77,6 +77,7 @@ from elspeth.web.composer.tools._common import (
 from elspeth.web.composer.tools._naming_disclosure import _disclose_node_name_constraints
 from elspeth.web.composer.tools.blobs import _llm_authored_inline_prompt_surface_error
 from elspeth.web.composer.tools.declarations import (
+    DiscoveryCacheScope,
     ToolDeclaration,
     ToolKind,
 )
@@ -176,6 +177,9 @@ def _handle_list_transforms(
 
 _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
     name="list_transforms",
+    cache_scope=DiscoveryCacheScope.SESSION,
+    argument_model=EmptyToolArgumentsModel,
+    cache_revision="transform-listing-v1",
     response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
     handler=_handle_list_transforms,
     kind=ToolKind.DISCOVERY,
@@ -212,6 +216,9 @@ def _handle_list_sinks(
 
 _LIST_SINKS_DECLARATION = ToolDeclaration(
     name="list_sinks",
+    cache_scope=DiscoveryCacheScope.SESSION,
+    argument_model=EmptyToolArgumentsModel,
+    cache_revision="sink-listing-v1",
     response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
     handler=_handle_list_sinks,
     kind=ToolKind.DISCOVERY,

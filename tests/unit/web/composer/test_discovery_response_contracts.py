@@ -6,13 +6,14 @@ import json
 from dataclasses import fields, replace
 from pathlib import Path
 from types import MappingProxyType
-from unittest.mock import MagicMock
 
 import pytest
 from pydantic import BaseModel
 
 from elspeth.contracts.errors import FrameworkBugError
-from elspeth.web.catalog.protocol import CatalogService
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.composer.pipeline_planner import _ParsedToolCall, _serialize_provider_discovery_result
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolContext, ToolResult
@@ -54,9 +55,11 @@ def test_response_contract_closure_rejects_missing_discovery_contract() -> None:
 
 def _produce(tool_name: str) -> ToolResult:
     state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    full = CatalogServiceImpl(get_shared_plugin_manager())
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(full)
     context = ToolContext(
-        catalog=MagicMock(spec=CatalogService),
-        plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
+        catalog=PolicyCatalogView.for_trained_operator(full, snapshot),
+        plugin_snapshot=snapshot,
     )
     return _declaration(tool_name).handler({}, state, context)
 

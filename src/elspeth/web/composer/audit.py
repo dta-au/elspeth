@@ -1067,6 +1067,7 @@ async def dispatch_with_audit(
     do_dispatch: Callable[[], Awaitable[Any]],
     version_after_provider: Callable[[Any], int],
     arg_error_payload_factory: Callable[[ToolArgumentError], Mapping[str, Any]],
+    cache_hit_provider: Callable[[], bool] | None = None,
 ) -> DispatchOutcome:
     """Run a tool dispatch under the audit envelope.
 
@@ -1254,6 +1255,7 @@ async def dispatch_with_audit(
                     audit,
                     result_payload=_result_to_audit_payload(success_result),
                     version_after=success_version_after,
+                    cache_hit=cache_hit_provider() if cache_hit_provider is not None else False,
                 )
             except Exception as exc:
                 recorder.record(finish_plugin_crash(audit, exc=exc))

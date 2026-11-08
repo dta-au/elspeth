@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from inspect import cleandoc
+from itertools import count
+from threading import RLock
 from typing import Any, cast
 
 from pydantic import BaseModel
@@ -50,6 +52,7 @@ PluginClass = type[SourceProtocol] | type[TransformProtocol] | type[SinkProtocol
 
 # Valid singular plugin type identifiers
 _VALID_TYPES = frozenset({"source", "transform", "sink"})
+_CATALOG_GENERATIONS = count(1)
 
 # ADR-013 declared-input-field checks currently dispatch only for non-batch
 # transforms. Batch-aware transform schemas must not advertise this option
@@ -208,8 +211,9 @@ class CatalogServiceImpl:
     Does NOT call register_builtin_plugins() — the shared singleton factory
     (get_shared_plugin_manager) handles initialization before injection.
 
-    Caches plugin class lists once at construction. The plugin set is
-    fixed for the lifetime of the process.
+    Prepares schemas and summaries once per actual manager registration set.
+    Normal production registration is fixed for the lifetime of the process;
+    replacing registrations rebuilds the preparation atomically.
 
     Schema emission is delegated to ``plugin_cls.get_config_schema()`` so
     that plugins whose config is a discriminated union (e.g. ``LLMTransform``
@@ -219,33 +223,75 @@ class CatalogServiceImpl:
 
     def __init__(self, plugin_manager: PluginManager) -> None:
         self._pm = plugin_manager
-        # Cache plugin classes once
-        self._source_classes = plugin_manager.get_sources()
-        self._transform_classes = plugin_manager.get_transforms()
-        self._sink_classes = plugin_manager.get_sinks()
-        self._schema_cache: dict[tuple[PluginKind, str], PluginSchemaInfo] = {}
-        self._populate_schema_cache("source", self._source_classes)
-        self._populate_schema_cache("transform", self._transform_classes)
-        self._populate_schema_cache("sink", self._sink_classes)
+        self._preparation_lock = RLock()
+        self._prepare()
+
+    def _prepare(self) -> None:
+        sources = self._pm.get_sources()
+        transforms = self._pm.get_transforms()
+        sinks = self._pm.get_sinks()
+        # Immutable wire records keep nested defaults and response models out
+        # of shared state. Schema emission already happened above.
+        groups: tuple[tuple[PluginKind, Sequence[PluginClass]], ...] = (
+            ("source", sources),
+            ("transform", transforms),
+            ("sink", sinks),
+        )
+        schemas = {(kind, cls.name): self._build_schema_info(kind, cls.name, cls) for kind, classes in groups for cls in classes}
+        summaries = {
+            kind: tuple(self._to_summary(cls, kind, schemas[(kind, cls.name)]).model_dump_json() for cls in classes)
+            for kind, classes in groups
+        }
+        self._source_classes = sources
+        self._transform_classes = transforms
+        self._sink_classes = sinks
+        self._schema_cache = schemas
+        self._summaries = summaries
+        self._generation = next(_CATALOG_GENERATIONS)
+
+    @property
+    def cache_revision(self) -> str:
+        """Identify the actual prepared catalog/manager revision."""
+        with self._preparation_lock:
+            self._refresh()
+            return str(self._generation)
+
+    def uses_manager(self, manager: PluginManager) -> bool:
+        return self._pm is manager
+
+    def _refresh(self) -> None:
+        if (
+            self._source_classes != self._pm.get_sources()
+            or self._transform_classes != self._pm.get_transforms()
+            or self._sink_classes != self._pm.get_sinks()
+        ):
+            self._prepare()
+
+    def _listing(self, kind: PluginKind) -> list[PluginSummary]:
+        with self._preparation_lock:
+            self._refresh()
+            records = self._summaries[kind]
+        return [PluginSummary.model_validate_json(item) for item in records]
 
     def list_sources(self) -> list[PluginSummary]:
-        return [self._to_summary(cls, "source") for cls in self._source_classes]
+        return self._listing("source")
 
     def list_transforms(self) -> list[PluginSummary]:
-        return [self._to_summary(cls, "transform") for cls in self._transform_classes]
+        return self._listing("transform")
 
     def list_sinks(self) -> list[PluginSummary]:
-        return [self._to_summary(cls, "sink") for cls in self._sink_classes]
+        return self._listing("sink")
 
     def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
         if plugin_type not in _VALID_TYPES:
             raise ValueError(f"Unknown plugin type: {plugin_type}. Must be one of: {sorted(_VALID_TYPES)}")
 
-        key = (plugin_type, name)
-        if key in self._schema_cache:
-            return self._schema_cache[key]
-
-        available = self._available_names(plugin_type)
+        with self._preparation_lock:
+            self._refresh()
+            key = (plugin_type, name)
+            if key in self._schema_cache:
+                return self._schema_cache[key].model_copy(deep=True)
+            available = self._available_names(plugin_type)
         raise ValueError(f"Unknown {plugin_type} plugin: {name}. Available: {available}")
 
     def post_call_hints(
@@ -269,11 +315,6 @@ class CatalogServiceImpl:
         )
 
     # -- Private helpers --
-
-    def _populate_schema_cache(self, plugin_type: PluginKind, classes: Sequence[PluginClass]) -> None:
-        for plugin_cls in classes:
-            name: str = plugin_cls.name
-            self._schema_cache[(plugin_type, name)] = self._build_schema_info(plugin_type, name, plugin_cls)
 
     def _build_schema_info(
         self,
@@ -386,7 +427,7 @@ class CatalogServiceImpl:
             available = self._available_names(plugin_type)
             raise ValueError(f"Unknown {plugin_type} plugin: {name}. Available: {available}") from exc
 
-    def _to_summary(self, plugin_cls: PluginClass, plugin_type: PluginKind) -> PluginSummary:
+    def _to_summary(self, plugin_cls: PluginClass, plugin_type: PluginKind, prepared: PluginSchemaInfo) -> PluginSummary:
         """Convert a plugin class to a PluginSummary.
 
         Phase 7A: also emits reference-content fields. Audit
@@ -397,7 +438,7 @@ class CatalogServiceImpl:
         """
         name: str = plugin_cls.name
         description = get_plugin_description(plugin_cls)
-        schema = self._catalog_schema(plugin_cls, plugin_type)
+        schema = prepared.json_schema
         config_fields = self._extract_config_fields(schema)
 
         # Direct attribute access: the bases and protocols declare every

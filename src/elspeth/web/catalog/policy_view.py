@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from threading import RLock
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
+from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_assistance import PluginAssistance
+    from elspeth.plugins.infrastructure.manager import PluginManager
     from elspeth.web.composer.analysis import ComposerAnalysis
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.plugin_policy.validation import PluginPolicyValidationResult, ProfileAwareValidationResult
@@ -34,6 +37,8 @@ class PolicyCatalogView:
         self._profiles: OperatorProfileRegistry | None = profiles
         self._analysis = analysis if analysis is not None else ComposerAnalysis()
         self._full_items_cache: dict[PluginKind, list[PluginSummary]] = {}
+        self._full_items_revision: str | None = None
+        self._items_lock = RLock()
 
     @classmethod
     def for_trained_operator(
@@ -54,6 +59,8 @@ class PolicyCatalogView:
         view._profiles = None
         view._analysis = analysis if analysis is not None else ComposerAnalysis()
         view._full_items_cache = {}
+        view._full_items_revision = None
+        view._items_lock = RLock()
         return view
 
     @property
@@ -66,6 +73,37 @@ class PolicyCatalogView:
         if self._profiles is None:
             return type(self).for_trained_operator(self._full, self.snapshot, analysis=analysis)
         return type(self)(self._full, self.snapshot, self._profiles, analysis=analysis)
+
+    @property
+    def projection_revision(self) -> str | None:
+        """Only explicitly prepared catalogs declare a reusable dependency."""
+        if not isinstance(self._full, CatalogServiceImpl):
+            return None
+        revision = self._full.cache_revision
+        generation = self._profiles.generation if self._profiles is not None else 0
+        return f"catalog:{revision}:profiles:{generation}"
+
+    def uses_manager(self, manager: PluginManager) -> bool:
+        return isinstance(self._full, CatalogServiceImpl) and self._full.uses_manager(manager)
+
+    def project_json(self, name: str, compute: Callable[[], str]) -> str:
+        """Memoize public serialized data, never profile bindings or live checks."""
+        from elspeth.web.composer.session_cache import ProjectionKey, projection_weight_bytes
+
+        revision = self.projection_revision
+        cache = self.analysis.cache
+        if revision is None or cache is None:
+            return compute()
+        key = ProjectionKey(name, self.snapshot.snapshot_hash, revision)
+        value = cache.projections.get_or_compute(
+            key,
+            compute,
+            key_weight=key.weight_bytes(),
+            value_weight=projection_weight_bytes,
+            retain=lambda _: self.projection_revision == revision,
+        ).value
+        assert isinstance(value, str)
+        return value
 
     def validate_raw_state(self, state: CompositionState) -> ValidationSummary:
         return self._analysis.validate_raw(state)
@@ -86,14 +124,19 @@ class PolicyCatalogView:
         ``test_cache_hit_rebuilds_result_envelope_from_current_state``
         (exact ``catalog.list_sources.call_count``) in test_service.py.
         """
-        if kind not in self._full_items_cache:
-            if kind == "source":
-                self._full_items_cache[kind] = self._full.list_sources()
-            elif kind == "transform":
-                self._full_items_cache[kind] = self._full.list_transforms()
-            else:
-                self._full_items_cache[kind] = self._full.list_sinks()
-        return self._full_items_cache[kind]
+        with self._items_lock:
+            revision = self.projection_revision
+            if revision != self._full_items_revision:
+                self._full_items_cache.clear()
+                self._full_items_revision = revision
+            if kind not in self._full_items_cache:
+                if kind == "source":
+                    self._full_items_cache[kind] = self._full.list_sources()
+                elif kind == "transform":
+                    self._full_items_cache[kind] = self._full.list_transforms()
+                else:
+                    self._full_items_cache[kind] = self._full.list_sinks()
+            return self._full_items_cache[kind]
 
     def _usable_profile_aliases(self, plugin_id: PluginId) -> tuple[str, ...]:
         """Return the operator-profile aliases this principal may author for ``plugin_id``.
@@ -144,13 +187,23 @@ class PolicyCatalogView:
         return projected
 
     def list_sources(self) -> list[PluginSummary]:
-        return self._visible("source", self._full_items("source"))
+        return self._public_items("source")
 
     def list_transforms(self) -> list[PluginSummary]:
-        return self._visible("transform", self._full_items("transform"))
+        return self._public_items("transform")
 
     def list_sinks(self) -> list[PluginSummary]:
-        return self._visible("sink", self._full_items("sink"))
+        return self._public_items("sink")
+
+    def _public_items(self, kind: PluginKind) -> list[PluginSummary]:
+        from pydantic import TypeAdapter
+
+        adapter = TypeAdapter(list[PluginSummary])
+        serialized = self.project_json(
+            f"listing:{kind}",
+            lambda: adapter.dump_json(self._visible(kind, self._full_items(kind))).decode(),
+        )
+        return adapter.validate_json(serialized)
 
     def _prohibited(self, kind: PluginKind, items: list[PluginSummary]) -> list[PluginSummary]:
         """Return items closed by the categorical ``WEB_SURFACE_PROHIBITED`` ban.
@@ -170,7 +223,7 @@ class PolicyCatalogView:
             for availability in self.snapshot.unavailable
             if availability.reason is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
         }
-        return [item for item in items if PluginId(kind, item.name) in banned]
+        return [item.model_copy(deep=True) for item in items if PluginId(kind, item.name) in banned]
 
     def list_prohibited_sources(self) -> list[PluginSummary]:
         """Return source plugins categorically banned from the web surface."""
@@ -220,6 +273,12 @@ class PolicyCatalogView:
     def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
         plugin_id = PluginId(plugin_type, name)
         self._require_available(plugin_id)
+        return PluginSchemaInfo.model_validate_json(
+            self.project_json(f"schema:{plugin_type}:{name}", lambda: self._public_schema(plugin_type, name).model_dump_json())
+        )
+
+    def _public_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
+        plugin_id = PluginId(plugin_type, name)
         aliases = self._usable_profile_aliases(plugin_id)
         if self._profiles is None:
             return self._full.get_schema(plugin_type, name)

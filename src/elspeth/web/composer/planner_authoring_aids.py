@@ -2649,11 +2649,12 @@ def fork_row_union_exemplar_args(
     }
 
 
-# Payload memo keyed by plugin-policy snapshot hash. Plugin classes are static
-# per process; visibility, profile aliases and control bindings are covered by
-# the snapshot. Model catalogs are discovered on demand and are not memoized
-# here. Callers receive a deep copy so they cannot poison the cached payload.
-_AIDS_MEMO: dict[str, _PlannerAuthoringAids] = {}
+# Bounded application compilation cache of public teaching material. Catalog
+# instance/registration and profile generations join the policy snapshot; no
+# session data or model catalog is retained. Unknown catalog implementations
+# have no revision and bypass. This compilation cache survives session eviction
+# because it contains only public reference material, never disclosure evidence.
+_AIDS_MEMO: dict[tuple[str, str], _PlannerAuthoringAids] = {}
 _AIDS_MEMO_MAX: Final[int] = 8
 _AIDS_MEMO_LOCK = Lock()
 
@@ -2661,11 +2662,14 @@ _AIDS_MEMO_LOCK = Lock()
 def build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthoringAids:
     """Assemble the live authoring-aids payload for one planner call.
 
-    Rendered from the policy-visible catalog and memoized per snapshot hash.
+    Rendered from the policy-visible catalog and its complete public revision.
     Sections whose plugins are policy-hidden are omitted rather than rendered
     with invented names.
     """
-    key = catalog.snapshot.snapshot_hash
+    revision = catalog.projection_revision
+    if revision is None:
+        return _build_planner_authoring_aids(catalog)
+    key = (catalog.snapshot.snapshot_hash, revision)
     with _AIDS_MEMO_LOCK:
         cached = _AIDS_MEMO.get(key)
     if cached is None:

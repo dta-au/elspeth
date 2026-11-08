@@ -56,12 +56,19 @@ from typing import TYPE_CHECKING, Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
+from pydantic import BaseModel
 
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.composer.response_contracts import ResponseContract
 
 if TYPE_CHECKING:
     from elspeth.web.composer.tools._common import ToolHandler
+
+
+class DiscoveryCacheScope(Enum):
+    NONE = "none"
+    OPERATION = "operation"
+    SESSION = "session"
 
 
 class ToolKind(Enum):
@@ -184,6 +191,15 @@ class ToolDeclaration:
     augments_on_failure: bool = False
     argument_effects: Callable[[Mapping[str, Any]], ToolEffects] | None = None
     response_contract: ResponseContract | None = None
+    cache_scope: DiscoveryCacheScope = DiscoveryCacheScope.NONE
+    argument_model: type[BaseModel] | None = None
+    cache_revision: str | None = None
+
+    @property
+    def discovery_cache_scope(self) -> DiscoveryCacheScope:
+        if self.cache_scope is not DiscoveryCacheScope.NONE:
+            return self.cache_scope
+        return DiscoveryCacheScope.OPERATION if self.cacheable else DiscoveryCacheScope.NONE
 
     def resolve_effects(self, arguments: Mapping[str, Any]) -> ToolEffects:
         """Resolve effects purely from declaration metadata and argument shape."""
@@ -199,6 +215,10 @@ class ToolDeclaration:
         raise AssertionError("Unsupported tool kind for effect resolution.")
 
     def __post_init__(self) -> None:
+        if not isinstance(self.cache_scope, DiscoveryCacheScope):
+            raise TypeError("cache_scope must be a DiscoveryCacheScope member")
+        if self.cache_scope is not DiscoveryCacheScope.NONE and not self.cacheable:
+            raise ValueError("Explicit cache scopes require cacheable discovery declarations")
         if self.response_contract is not None and self.kind not in {
             ToolKind.DISCOVERY,
             ToolKind.BLOB_DISCOVERY,

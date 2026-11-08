@@ -4501,8 +4501,12 @@ class TestDiscoveryCache:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("enabled", [True, False], ids=("session-retention", "retention-disabled-control"))
+    @pytest.mark.parametrize(
+        ("discovery_name", "discovery_arguments"),
+        [("get_expression_grammar", {}), ("get_plugin_schema", {"plugin_type": "transform", "name": "passthrough"})],
+    )
     async def test_one_session_shares_exact_graph_across_compose_planner_and_completion(
-        self, enabled: bool, tmp_path: Path, tool_context: Any
+        self, enabled: bool, tmp_path: Path, tool_context: Any, discovery_name: str, discovery_arguments: dict[str, Any]
     ) -> None:
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
         from elspeth.web.catalog.service import CatalogServiceImpl
@@ -4546,11 +4550,12 @@ class TestDiscoveryCache:
         outer_text = "Described the shipped draft."
         planner_text = "Which transformation should we discuss next?"
         responses = [
-            _make_llm_response(tool_calls=[{"id": "outer-grammar", "name": "get_expression_grammar", "arguments": {}}]),
+            _make_llm_response(tool_calls=[{"id": "outer-discovery", "name": discovery_name, "arguments": discovery_arguments}]),
             _make_llm_response(content=outer_text),
         ]
-        planner_provider = _ScriptedCompletion(_response(("get_expression_grammar", {})), _text_response(planner_text))
+        planner_provider = _ScriptedCompletion(_response((discovery_name, discovery_arguments)), _text_response(planner_text))
         planner_audit = BufferingRecorder()
+        planner_disclosures: list[tuple[str, str]] = []
         try:
             with patch.object(CompositionState, "validate", count_target):
                 # The production counter must see a direct target walk and
@@ -4575,9 +4580,9 @@ class TestDiscoveryCache:
                 assert outer_provider.await_count == 2
                 assert outer.state is state and outer.raw_assistant_content == outer_text
                 _assert_checkpoint_reply(outer, outer_text, count=0)
-                assert [(call.tool_name, call.status) for call in outer.tool_invocations] == [
-                    ("get_expression_grammar", ComposerToolStatus.SUCCESS)
-                ]
+                assert [(call.tool_name, call.status) for call in outer.tool_invocations] == [(discovery_name, ComposerToolStatus.SUCCESS)]
+                if discovery_name == "get_plugin_schema":
+                    assert ("transform", "passthrough") in service._schema_disclosure.schemas_loaded_for_session(session_id)
                 assert captured_views
                 operation_view = captured_views[-1]
                 snapshot = operation_view.snapshot
@@ -4598,6 +4603,7 @@ class TestDiscoveryCache:
                             completion=planner_provider,
                             recorder=planner_audit,
                             policy_override=(bound_view, snapshot),
+                            mark_schema_loaded=lambda kind, name: planner_disclosures.append((kind, name)),
                             current_state=state,
                             provider_current_state=state.to_dict(),
                             originating_message=origin,
@@ -4613,8 +4619,11 @@ class TestDiscoveryCache:
                     assert declined.value.decline_text == planner_text
                     assert len(planner_provider.requests) == len(planner_audit.llm_calls) == 2
                     assert [(call.tool_name, call.status) for call in planner_audit.invocations] == [
-                        ("get_expression_grammar", ComposerToolStatus.SUCCESS)
+                        (discovery_name, ComposerToolStatus.SUCCESS)
                     ]
+                    assert planner_disclosures == ([("transform", "passthrough")] if discovery_name == "get_plugin_schema" else [])
+                    assert outer.tool_invocations[0].cache_hit is False
+                    assert planner_audit.invocations[0].cache_hit is enabled
                     with (
                         patch.object(service._preflight, "runtime_preflight") as runtime,
                         patch.object(service._preflight, "cached_runtime_preflight") as cached_runtime,
@@ -4653,10 +4662,12 @@ class TestDiscoveryCache:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("enabled", [True, False])
     async def test_session_analysis_reused_across_real_compose_operations(self, enabled: bool) -> None:
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.web.catalog.service import CatalogServiceImpl
         from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
         from tests.fixtures.composer_session_cache import count_composer_work
 
-        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
+        service, session_id = _composer_service_with_session(CatalogServiceImpl(get_shared_plugin_manager()), _make_settings())
         service._session_caches = ComposerSessionCacheRegistry(enabled=enabled)
         state = _empty_state()
         changed = replace(state, metadata=PipelineMetadata(name="Different content at the same version"))
@@ -4670,7 +4681,19 @@ class TestDiscoveryCache:
             _make_llm_response(tool_calls=[{"id": "changed", "name": "get_expression_grammar", "arguments": {}}]),
             _make_llm_response(content="Described the changed draft."),
         ]
-        with count_composer_work() as counts, patch.object(service._provider_gateway, "_call_llm", side_effect=responses) as provider:
+        logical_repeats: list[bool] = []
+        dispatch_batch = service._dispatch_tool_batch
+
+        async def record_dispatch(*args: Any, **kwargs: Any) -> Any:
+            result = await dispatch_batch(*args, **kwargs)
+            logical_repeats.append(result[0].all_cache_hits)
+            return result
+
+        with (
+            count_composer_work() as counts,
+            patch.object(service._provider_gateway, "_call_llm", side_effect=responses) as provider,
+            patch.object(service, "_dispatch_tool_batch", side_effect=record_dispatch),
+        ):
             first = await service.compose("Describe the tools", [], state, session_id=session_id, user_id="test-user")
             first_walks = counts.validation_walks
             second = await service.compose("Describe the tools again", [], state, session_id=session_id, user_id="test-user")
@@ -4678,6 +4701,10 @@ class TestDiscoveryCache:
             third = await service.compose("Describe the changed draft", [], changed, session_id=session_id, user_id="test-user")
 
         assert provider.await_count == 7
+        assert logical_repeats == [False, True, False, False]
+        assert [item.cache_hit for item in first.tool_invocations] == [False, True]
+        assert [item.cache_hit for item in second.tool_invocations] == [enabled]
+        assert [item.cache_hit for item in third.tool_invocations] == [enabled]
         assert first.state is second.state is state
         assert third.state is changed
         assert first.state.version == third.state.version
@@ -5254,7 +5281,9 @@ class TestDiscoveryCache:
         ):
             result = await service.compose("Describe the pipeline language", [], _empty_state(), session_id=session_id)
 
-        assert dispatch.call_count == 2
+        # The common discovery facade now owns admission before lookup;
+        # malformed calls cannot reach either retained data or the handler.
+        dispatch.assert_not_called()
         cache_payload.assert_not_called()
         assert [entry.status for entry in result.tool_invocations] == [ComposerToolStatus.ARG_ERROR, ComposerToolStatus.ARG_ERROR]
         messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]

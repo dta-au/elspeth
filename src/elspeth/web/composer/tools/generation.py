@@ -103,6 +103,7 @@ from elspeth.web.composer.tools.blobs import (
     _locked_read_ready_blob,
 )
 from elspeth.web.composer.tools.declarations import (
+    DiscoveryCacheScope,
     ToolDeclaration,
     ToolKind,
 )
@@ -326,6 +327,9 @@ def _handle_get_plugin_schema(
 _GET_PLUGIN_SCHEMA_DECLARATION = ToolDeclaration(
     response_contract=PLUGIN_SCHEMA_RESPONSE_CONTRACT,
     name="get_plugin_schema",
+    cache_scope=DiscoveryCacheScope.SESSION,
+    argument_model=GetPluginSchemaArgumentsModel,
+    cache_revision="plugin-schema-v1",
     handler=_handle_get_plugin_schema,
     kind=ToolKind.DISCOVERY,
     description=(
@@ -395,6 +399,9 @@ def _handle_get_expression_grammar(
 _GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
     response_contract=EXPRESSION_GRAMMAR_RESPONSE_CONTRACT,
     name="get_expression_grammar",
+    cache_scope=DiscoveryCacheScope.SESSION,
+    argument_model=EmptyToolArgumentsModel,
+    cache_revision="expression-grammar-v1",
     handler=_handle_get_expression_grammar,
     kind=ToolKind.DISCOVERY,
     description="Get the gate expression syntax reference. The result carries the full reference text under `grammar`.",
@@ -2262,6 +2269,9 @@ def _execute_explain_validation_error(
 
 _EXPLAIN_VALIDATION_ERROR_DECLARATION = ToolDeclaration(
     name="explain_validation_error",
+    cache_scope=DiscoveryCacheScope.SESSION,
+    argument_model=ExplainValidationErrorArgumentsModel,
+    cache_revision="validation-explanation-v1",
     response_contract=EXPLAIN_VALIDATION_ERROR_RESPONSE_CONTRACT,
     handler=_execute_explain_validation_error,
     kind=ToolKind.DISCOVERY,
@@ -2379,6 +2389,9 @@ def _execute_get_plugin_assistance(
 
 _GET_PLUGIN_ASSISTANCE_DECLARATION = ToolDeclaration(
     name="get_plugin_assistance",
+    cache_scope=DiscoveryCacheScope.SESSION,
+    argument_model=GetPluginAssistanceArgumentsModel,
+    cache_revision="plugin-assistance-v1",
     response_contract=PLUGIN_ASSISTANCE_RESPONSE_CONTRACT,
     handler=_execute_get_plugin_assistance,
     kind=ToolKind.DISCOVERY,
@@ -2514,6 +2527,9 @@ def _execute_get_audit_info(
 _GET_AUDIT_INFO_DECLARATION = ToolDeclaration(
     response_contract=AUDIT_INFO_RESPONSE_CONTRACT,
     name="get_audit_info",
+    cache_scope=DiscoveryCacheScope.SESSION,
+    argument_model=EmptyToolArgumentsModel,
+    cache_revision="audit-info-v1",
     handler=_execute_get_audit_info,
     kind=ToolKind.DISCOVERY,
     description=(
@@ -2632,6 +2648,9 @@ def _execute_list_models(
 
 _LIST_MODELS_DECLARATION = ToolDeclaration(
     name="list_models",
+    cache_scope=DiscoveryCacheScope.OPERATION,
+    argument_model=ListModelsArgumentsModel,
+    cache_revision="models-operation-v1",
     response_contract=LIST_MODELS_RESPONSE_CONTRACT,
     handler=_execute_list_models,
     kind=ToolKind.DISCOVERY,

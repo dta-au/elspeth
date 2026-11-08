@@ -85,12 +85,13 @@ from elspeth.web.composer.capability_skill import (
     build_planner_capability_manifest,
 )
 from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
-from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
+from elspeth.web.composer.discovery_cache import CachedDiscoveryPayload, serialize_tool_result, tool_result_content_parts
 from elspeth.web.composer.discovery_response import (
     AdmittedDiscoveryResult,
     admit_discovery_result,
     serialize_admitted_discovery_result,
 )
+from elspeth.web.composer.discovery_session import DiscoveryUse, execute_cached_discovery
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
 from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
@@ -3510,6 +3511,7 @@ async def _plan_pipeline_inner(
     total_cost = Decimal("0")
     continuation_cost_known = True
     discovery_turns = 0
+    discovery_operation_cache: dict[str, CachedDiscoveryPayload] = {}
     composition_turns = 0
     repair_count = 0
     prose_nudges = 0
@@ -4881,6 +4883,7 @@ async def _plan_pipeline_inner(
                 model_config.escape_hatch_tool_contract_dialect if is_hatch_turn else model_config.tool_contract_dialect
             ),
         ) -> tuple[_ParsedToolCall, AdmittedDiscoveryResult | _PlannerArgumentRejection, bool]:
+            physical_cache_hit = False
             dispatch = begin_dispatch(
                 call.call_id,
                 call.name,
@@ -4892,23 +4895,33 @@ async def _plan_pipeline_inner(
             )
 
             async def execute_discovery(call_to_execute: _ParsedToolCall = call) -> _AuditedDiscoveryResult:
+                nonlocal physical_cache_hit
                 if call_to_execute.wire_error is not None:
                     raise call_to_execute.wire_error
                 execution_arguments = cast(dict[str, Any], deep_thaw(call_to_execute.arguments))
-                result = cast(
-                    ToolResult,
+                use = cast(
+                    DiscoveryUse,
                     await run_planner_sync(
-                        execute_discovery_tool_with_context,
+                        execute_cached_discovery,
                         call_to_execute.name,
                         execution_arguments,
                         current_state,
-                        request_context,
+                        policy_catalog,
+                        partial(
+                            execute_discovery_tool_with_context,
+                            call_to_execute.name,
+                            execution_arguments,
+                            current_state,
+                            request_context,
+                        ),
+                        discovery_operation_cache,
                     ),
                 )
+                physical_cache_hit = use.cache_hit
+                result = use.admitted.result
                 if result.updated_state != current_state:
                     raise AuditIntegrityError("read-only planner discovery changed composition state")
-                admitted = admit_discovery_result(call_to_execute.name, result)
-                return _AuditedDiscoveryResult(result, admitted)
+                return _AuditedDiscoveryResult(result, use.admitted)
 
             try:
                 audited = await dispatch_with_audit(
@@ -4916,6 +4929,7 @@ async def _plan_pipeline_inner(
                     audit=dispatch,
                     do_dispatch=execute_discovery,
                     version_after_provider=lambda carrier: carrier.result.updated_state.version,
+                    cache_hit_provider=lambda: physical_cache_hit,
                     arg_error_payload_factory=lambda exc: {
                         "error_class": type(exc).__name__,
                         "error_code": exc.category.value,

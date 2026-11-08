@@ -17,6 +17,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict, cast
 from uuid import UUID
 
@@ -93,9 +94,6 @@ from elspeth.web.composer.discovery_cache import (
     cached_discovery_payload as _cached_discovery_payload,
 )
 from elspeth.web.composer.discovery_cache import (
-    make_cache_key as _make_cache_key,
-)
-from elspeth.web.composer.discovery_cache import (
     result_from_cached_discovery_payload as _result_from_cached_discovery_payload,
 )
 from elspeth.web.composer.discovery_cache import (
@@ -106,10 +104,10 @@ from elspeth.web.composer.discovery_cache import (
 )
 from elspeth.web.composer.discovery_response import (
     AdmittedDiscoveryResult,
-    admit_discovery_result,
     preview_source_proof_stop,
     serialize_admitted_discovery_result,
 )
+from elspeth.web.composer.discovery_session import DiscoveryAudit, execute_cached_discovery, operation_discovery_key
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.pipeline_custody import (
@@ -1591,8 +1589,8 @@ async def run_tool_batch(
 
         # Check discovery cache before executing
         if is_cacheable_discovery_tool(tool_name):
-            cache_key = _make_cache_key(tool_name, arguments)
-            if cache_key in discovery_cache:
+            cache_key = await ctx.policy_catalog.run_in_worker(operation_discovery_key, tool_name, arguments, state, ctx.policy_catalog)
+            if cache_key is not None and cache_key in discovery_cache:
                 # Cache hit — return cached result, no budget charge.
                 # Audit-recorded with cache_hit=True so the trail
                 # captures every LLM decision-point, even those
@@ -3003,6 +3001,8 @@ async def run_tool_batch(
         # iterations or introduce concurrency. Same pattern the
         # adjacent `_make_preflight_callback` already uses for
         # ``preview_preflight``.
+        cache_status = DiscoveryAudit()
+
         async def _do_dispatch(
             _tool_name: str = tool_name,
             _arguments: dict[str, Any] = arguments,
@@ -3020,12 +3020,13 @@ async def run_tool_batch(
             _interpretation_requirements_are_internal: bool = interpretation_requirements_are_internal,
             _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
             _preproposal_exception: BaseException | None = preproposal_exception,
+            _cache_status: DiscoveryAudit = cache_status,
         ) -> Any:
             if _preproposal_exception is not None:
                 raise _preproposal_exception
             if _prevalidated_unapplied_result is not None:
                 return _prevalidated_unapplied_result
-            dispatched_result = await ctx.policy_catalog.run_in_worker(
+            compute = partial(
                 execute_tool,
                 _tool_name,
                 _arguments,
@@ -3056,6 +3057,13 @@ async def run_tool_batch(
                 raise_schema_argument_errors=True,
                 _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
             )
+            if is_discovery_tool(_tool_name) and response_contract_for(_tool_name) is not None:
+                use = await ctx.policy_catalog.run_in_worker(
+                    execute_cached_discovery, _tool_name, _arguments, _state, ctx.policy_catalog, compute
+                )
+                _cache_status.cache_hit = use.cache_hit
+                return use.admitted
+            dispatched_result = await ctx.policy_catalog.run_in_worker(compute)
             if (
                 _tool_name != "set_pipeline"
                 and is_mutation_tool(_tool_name)
@@ -3069,8 +3077,6 @@ async def run_tool_batch(
                     plugin_snapshot=ctx.plugin_snapshot,
                     policy_catalog=ctx.policy_catalog,
                 )
-            if is_discovery_tool(_tool_name) and response_contract_for(_tool_name) is not None:
-                return admit_discovery_result(_tool_name, dispatched_result)
             return dispatched_result
 
         # ``_arg_error_payload`` is a module-level helper (F2 — testable
@@ -3105,6 +3111,7 @@ async def run_tool_batch(
                 do_dispatch=_do_dispatch,
                 version_after_provider=_version_after,
                 arg_error_payload_factory=_arg_error_payload_factory,
+                cache_hit_provider=cache_status.was_hit,
             )
         except ToolArgumentError as exc:
             # The audit record was already written by the helper.
@@ -3386,8 +3393,9 @@ async def run_tool_batch(
 
         # Cached payloads omit rejection entries; only successful discovery is reusable.
         if is_cacheable_discovery_tool(tool_name) and result.success:
-            cache_key = _make_cache_key(tool_name, arguments)
-            discovery_cache[cache_key] = _cached_discovery_payload(admitted_result if admitted_result is not None else result)
+            cache_key = await ctx.policy_catalog.run_in_worker(operation_discovery_key, tool_name, arguments, state, ctx.policy_catalog)
+            if cache_key is not None:
+                discovery_cache[cache_key] = _cached_discovery_payload(admitted_result if admitted_result is not None else result)
 
         llm_messages.append(
             {

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer._attachment_response import AdmittedAttachmentResponse
@@ -139,4 +140,4 @@ def admitted_result_from_cached_discovery_payload(
 
 def make_cache_key(tool_name: str, arguments: dict[str, Any]) -> str:
     """Build a deterministic cache key from tool name + arguments."""
-    return f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+    return f"{tool_name}:{canonical_json(arguments)}"

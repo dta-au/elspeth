@@ -93,6 +93,7 @@ from elspeth.web.composer.tools.blobs import (
     _verify_blob_content_hash,
 )
 from elspeth.web.composer.tools.declarations import (
+    DiscoveryCacheScope,
     ToolDeclaration,
     ToolKind,
 )
@@ -187,6 +188,9 @@ def _handle_list_sources(
 
 _LIST_SOURCES_DECLARATION = ToolDeclaration(
     name="list_sources",
+    cache_scope=DiscoveryCacheScope.SESSION,
+    argument_model=EmptyToolArgumentsModel,
+    cache_revision="source-listing-v1",
     response_contract=PLUGIN_INVENTORY_RESPONSE_CONTRACT,
     handler=_handle_list_sources,
     kind=ToolKind.DISCOVERY,
