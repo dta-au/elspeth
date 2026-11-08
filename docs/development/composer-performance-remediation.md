@@ -180,7 +180,21 @@ regeneration; output is byte-identical to the uncached implementation (compare
 `canonical_json` of the summaries); cross-user snapshots still differ where
 policy differs; CPU per 60-plugin listing drops from ~120 ms to near zero.
 
-**Evidence.** _(fill in: instrument, raw output, commit)_
+**Evidence (landed).** Isolated benchmark (`bench_catalog.py`, 60 plugins,
+50 warm iterations), before → after:
+`warm_listing_cpu_ms 129.9 → 0.0`, `get_config_schema_calls_per_warm_listing
+60 → 0`, `output_sha256 d510e4e87d75e965` unchanged; construction
+132.8 → 136.7 ms (paid once per process). A planted one-character change in
+a summary was detected by the digest (instrument control). Tests: catalog +
+plugin_policy 634 passed; composer `test_service` 270, `test_tools_discovery`
+103; `tests/unit/architecture/` 1982 passed + 1 pre-existing xfail (run with
+`-n 3`; the serial run was stopped after 1494 passes when single fencing
+tests exceeded 20 min). ruff, ruff format, strict mypy clean; keyless lint
+corpus unchanged (3674 lines, empty diff). No registration path adds plugins
+after construction (`web/dependencies.py:51`, `cli_plugins.py:80` both use
+the fully registered shared manager). Not run: full suite, testcontainer.
+Follow-up: `PluginSummary` is not frozen; cached summaries are shared
+objects (same contract `get_schema` already had); consider `frozen=True`.
 
 Full verification notes were produced in lane state at
 `.claude/lanes/perf-eval/01-catalog.md` (gitignored; regenerate if needed).

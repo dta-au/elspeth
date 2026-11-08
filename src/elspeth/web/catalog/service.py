@@ -208,8 +208,8 @@ class CatalogServiceImpl:
     Does NOT call register_builtin_plugins() — the shared singleton factory
     (get_shared_plugin_manager) handles initialization before injection.
 
-    Caches plugin class lists once at construction. The plugin set is
-    fixed for the lifetime of the process.
+    Caches plugin class lists, schemas and summaries once at construction.
+    The plugin set is fixed for the lifetime of the process.
 
     Schema emission is delegated to ``plugin_cls.get_config_schema()`` so
     that plugins whose config is a discriminated union (e.g. ``LLMTransform``
@@ -227,15 +227,26 @@ class CatalogServiceImpl:
         self._populate_schema_cache("source", self._source_classes)
         self._populate_schema_cache("transform", self._transform_classes)
         self._populate_schema_cache("sink", self._sink_classes)
+        # Summaries are a pure function of the plugin classes and the schema
+        # cache above, both fixed at construction, so build them once here.
+        # Rebuilding per call regenerated every plugin's JSON schema on every
+        # composer request (build_plugin_snapshot lists all three kinds).
+        self._source_summaries: tuple[PluginSummary, ...] = tuple(self._to_summary(cls, "source") for cls in self._source_classes)
+        self._transform_summaries: tuple[PluginSummary, ...] = tuple(self._to_summary(cls, "transform") for cls in self._transform_classes)
+        self._sink_summaries: tuple[PluginSummary, ...] = tuple(self._to_summary(cls, "sink") for cls in self._sink_classes)
+
+    # list_* return a fresh list per call over shared summary objects, the
+    # same sharing get_schema already has over _schema_cache. Callers project
+    # with model_copy(update=...) and never mutate a summary in place.
 
     def list_sources(self) -> list[PluginSummary]:
-        return [self._to_summary(cls, "source") for cls in self._source_classes]
+        return list(self._source_summaries)
 
     def list_transforms(self) -> list[PluginSummary]:
-        return [self._to_summary(cls, "transform") for cls in self._transform_classes]
+        return list(self._transform_summaries)
 
     def list_sinks(self) -> list[PluginSummary]:
-        return [self._to_summary(cls, "sink") for cls in self._sink_classes]
+        return list(self._sink_summaries)
 
     def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
         if plugin_type not in _VALID_TYPES:
@@ -397,7 +408,9 @@ class CatalogServiceImpl:
         """
         name: str = plugin_cls.name
         description = get_plugin_description(plugin_cls)
-        schema = self._catalog_schema(plugin_cls, plugin_type)
+        # Read the schema generated once at construction; regenerating it here
+        # is what made every listing re-run pydantic model_json_schema.
+        schema = self._schema_cache[(plugin_type, name)].json_schema
         config_fields = self._extract_config_fields(schema)
 
         # Direct attribute access: the bases and protocols declare every
