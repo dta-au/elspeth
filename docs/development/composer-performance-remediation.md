@@ -597,7 +597,9 @@ passed. Architecture 1982 + 1 xfail (`-n 3`, tree frozen). ruff/mypy clean;
 lint corpus identical; soft-mapping census re-pinned +1 (`Mapping[str, Any]`
 788 → 789). Writer recipes do not pin this file. Not run: full suite,
 testcontainer. S-10/S-11 and the duplicate pair in `reviewed_anchor_hash`
-left for fix 14.
+left for fix 14. Compose smoke gate on fix 1+10+6 code: clean ledger, 3
+provider calls / 3 planner calls in one planner run, 34.2 s model time,
+zero violations.
 
 Lane notes: `.claude/lanes/perf-eval/06-proposal-revalidation.md`.
 
