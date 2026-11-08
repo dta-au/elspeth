@@ -107,8 +107,16 @@ that the existing engine test set is the verification; they run right after
 fix 6 while the engine context is fresh. P-15 and P-16 stay deferred.
 
 Smoke gate per fix in this container: the tutorial's compose transition with
-a clean transition ledger (see Test environment); the Run phase is out of
-scope for this effort. Fixes 1 and 2A remove the noise that would otherwise confound
+a clean transition ledger (see Test environment); the tutorial's Run phase
+cannot complete here (no DNS). For the engine-side fixes (7, 9) the gate is
+the CLI examples instead — `elspeth run --settings examples/<name>/settings.yaml
+--execute` on `transform_pipeline` (5 rows, COMPLETED, exit 0) and
+`error_routing` (17 rows, PARTIAL, exit 1 by design with 4 failed rows, which
+exercises the failed-attempt hashing path), compared against the baseline
+recorded before the change: same exit codes, same row counts, same sink
+output digests, same Landscape `node_states.input_hash`/`output_hash` values
+for the run (fix 9 must leave recorded hashes identical — it removes a
+duplicate computation, not a value). Fixes 1 and 2A remove the noise that would otherwise confound
 the later measurements. Fix 10 comes next because its cost scales with
 history × proposals rather than being a fixed per-request charge; fix 6 is
 CPU-bound and scales with graph size, so both matter more for the larger
