@@ -1,5 +1,8 @@
 # Composer session-cache implementation checkpoint
 
+**Latest durable status:** [quota-conscious handover](composer-cache-handover.md).
+The handover preserves the untested bootstrap patch and supersedes older pending-status paragraphs below.
+
 Continue the implementation plan in `composer-session-cache-implementation-plan.md`.
 The user authorized implementation of all six stages, fixing verified Composer
 bugs, delegation, and Astra review after every stage. The threat model is hostile

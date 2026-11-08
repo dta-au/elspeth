@@ -1,0 +1,23 @@
+{
+  "base": "ad773c656ff6009bf13e7916e1f249076e8da9b2",
+  "files": [
+    "src/elspeth/web/catalog/routes.py",
+    "src/elspeth/web/catalog/schemas.py",
+    "src/elspeth/web/frontend/src/App.test.tsx",
+    "src/elspeth/web/frontend/src/api/catalogBootstrapDecoder.ts",
+    "src/elspeth/web/frontend/src/api/client.catalog.test.ts",
+    "src/elspeth/web/frontend/src/api/client.ts",
+    "src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.test.tsx",
+    "src/elspeth/web/frontend/src/components/execution/InlineRunResults.test.tsx",
+    "src/elspeth/web/frontend/src/hooks/useNarrativeMode.test.ts",
+    "src/elspeth/web/frontend/src/stores/pluginCatalogBootstrap.integration.test.ts",
+    "src/elspeth/web/frontend/src/stores/pluginCatalogStore.test.ts",
+    "src/elspeth/web/frontend/src/stores/pluginCatalogStore.ts",
+    "src/elspeth/web/frontend/src/test/inlineSourceIntegration.test.tsx",
+    "src/elspeth/web/frontend/src/types/index.ts",
+    "tests/unit/web/catalog/test_bootstrap.py"
+  ],
+  "patch_sha256": "1664b42b2f9fc3b8dee1ae8eb3ab9932a41778b58b41b934dbd4d69d231c639c",
+  "reconstruction": "private Git index matches all 15 draft files exactly; no application code executed",
+  "status": "untested isolated draft, NOT applied to this branch"
+}

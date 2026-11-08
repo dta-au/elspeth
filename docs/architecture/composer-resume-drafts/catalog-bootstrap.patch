@@ -1,0 +1,1792 @@
+diff --git a/src/elspeth/web/catalog/routes.py b/src/elspeth/web/catalog/routes.py
+index 961371f97..c198da6f4 100644
+--- a/src/elspeth/web/catalog/routes.py
++++ b/src/elspeth/web/catalog/routes.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++from collections.abc import Sequence
+ from typing import Annotated
+ 
+ from fastapi import APIRouter, Depends, HTTPException, Request, Response
+@@ -12,6 +13,7 @@ from elspeth.web.auth.models import UserIdentity
+ from elspeth.web.catalog.policy_view import PolicyCatalogView
+ from elspeth.web.catalog.protocol import CatalogService
+ from elspeth.web.catalog.schemas import (
++    PluginCatalogBootstrapResponse,
+     PluginKind,
+     PluginPolicyCapabilityGroup,
+     PluginPolicyControlMode,
+@@ -95,6 +97,11 @@ async def get_policy(
+     catalog, snapshot = _get_catalog(request, user)
+     _set_private_headers(response, snapshot)
+     summaries = (*catalog.list_sources(), *catalog.list_transforms(), *catalog.list_sinks())
++    return _policy_response(snapshot, summaries)
++
++
++def _policy_response(snapshot: PluginAvailabilitySnapshot, summaries: Sequence[PluginSummary]) -> PluginPolicyResponse:
++    """Render only from the captured snapshot and its public projections."""
+     grouped: dict[PluginCapability, list[str]] = {}
+     for summary in summaries:
+         plugin_id = str(PluginId(summary.plugin_type, summary.name))
+@@ -115,11 +122,30 @@ async def get_policy(
+         ),
+         control_modes=tuple(
+             PluginPolicyControlMode(capability=capability, mode=mode)
+-            for capability, mode in request.app.state.web_plugin_policy.control_modes
++            for capability, mode in snapshot.control_modes
+         ),
+     )
+ 
+ 
++@catalog_router.get("/bootstrap", response_model=PluginCatalogBootstrapResponse)
++async def get_bootstrap(
++    request: Request,
++    response: Response,
++    user: Annotated[UserIdentity, Depends(get_current_user)],
++) -> PluginCatalogBootstrapResponse:
++    catalog, snapshot = _get_catalog(request, user)
++    _set_private_headers(response, snapshot)
++    sources = catalog.list_sources()
++    transforms = catalog.list_transforms()
++    sinks = catalog.list_sinks()
++    return PluginCatalogBootstrapResponse(
++        policy=_policy_response(snapshot, (*sources, *transforms, *sinks)),
++        sources=sources,
++        transforms=transforms,
++        sinks=sinks,
++    )
++
++
+ @catalog_router.get("/{plugin_type}/{name}/schema", response_model=PluginSchemaInfo)
+ async def get_schema(
+     plugin_type: str,
+diff --git a/src/elspeth/web/catalog/schemas.py b/src/elspeth/web/catalog/schemas.py
+index f0722f2c3..da05c87e6 100644
+--- a/src/elspeth/web/catalog/schemas.py
++++ b/src/elspeth/web/catalog/schemas.py
+@@ -145,3 +145,12 @@ class PluginPolicyResponse(_StrictResponse):
+     capability_groups: tuple[PluginPolicyCapabilityGroup, ...]
+     selections: tuple[PluginPolicySelection, ...]
+     control_modes: tuple[PluginPolicyControlMode, ...]
++
++
++class PluginCatalogBootstrapResponse(_StrictResponse):
++    """Public catalog groups and policy projected from one request snapshot."""
++
++    policy: PluginPolicyResponse
++    sources: list[PluginSummary]
++    transforms: list[PluginSummary]
++    sinks: list[PluginSummary]
+diff --git a/src/elspeth/web/frontend/src/App.test.tsx b/src/elspeth/web/frontend/src/App.test.tsx
+index eff60f770..1038d6ece 100644
+--- a/src/elspeth/web/frontend/src/App.test.tsx
++++ b/src/elspeth/web/frontend/src/App.test.tsx
+@@ -260,6 +260,9 @@ vi.mock("./api/client", async (importOriginal) => ({
+   fetchRuns: vi.fn().mockResolvedValue([]),
+   fetchComposerProgress: vi.fn().mockResolvedValue({ phase: "idle" }),
+   fetchRecoveryTranscript: vi.fn().mockResolvedValue([]),
++  fetchPluginCatalogBootstrap: vi.fn().mockResolvedValue({ snapshotFingerprint: "app-test",
++    data: { policy: { principal_scope: "local:test-001", snapshot_fingerprint: "app-test", policy_hash: "app-test",
++      available_plugin_ids: [], capability_groups: [], selections: [], control_modes: [] }, sources: [], transforms: [], sinks: [] } }),
+   listSources: vi.fn().mockResolvedValue([]),
+   listTransforms: vi.fn().mockResolvedValue([]),
+   listSinks: vi.fn().mockResolvedValue([]),
+diff --git a/src/elspeth/web/frontend/src/api/client.catalog.test.ts b/src/elspeth/web/frontend/src/api/client.catalog.test.ts
+index 22ea6ca35..ec3860f83 100644
+--- a/src/elspeth/web/frontend/src/api/client.catalog.test.ts
++++ b/src/elspeth/web/frontend/src/api/client.catalog.test.ts
+@@ -1,6 +1,6 @@
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+ 
+-import { fetchPluginPolicy, getPluginSchema, listSources } from "./client";
++import { fetchPluginCatalogBootstrap, fetchPluginPolicy, getPluginSchema, listSources } from "./client";
+ 
+ const SNAPSHOT_HEADER = "X-ELSPETH-Plugin-Snapshot";
+ 
+@@ -9,6 +9,35 @@ describe("api/client plugin catalog snapshot metadata", () => {
+     globalThis.fetch = vi.fn();
+   });
+ 
++  const bootstrap = () => ({
++    policy: { principal_scope: "local:alice", snapshot_fingerprint: "snapshot-a", policy_hash: "policy-a",
++      available_plugin_ids: [], capability_groups: [], selections: [], control_modes: [] },
++    sources: [], transforms: [], sinks: [],
++  });
++
++  it("fetches a coherent closed bootstrap with no-store", async () => {
++    const body = bootstrap();
++    vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), {
++      headers: { [SNAPSHOT_HEADER]: "snapshot-a" },
++    }));
++    await expect(fetchPluginCatalogBootstrap()).resolves.toEqual({ data: body, snapshotFingerprint: "snapshot-a" });
++    expect(globalThis.fetch).toHaveBeenCalledWith("/api/catalog/bootstrap", expect.objectContaining({ cache: "no-store" }));
++  });
++
++  it.each(["missing-header", "different-header", "extra-envelope", "wrong-kind", "missing-group", "extra-policy", "inventory-mismatch"])(
++    "refuses malformed bootstrap %s", async (defect) => {
++      const body: Record<string, unknown> = bootstrap();
++      if (defect === "extra-envelope") body.credentials = {};
++      if (defect === "extra-policy") body.policy = { ...bootstrap().policy, credentials: {} };
++      if (defect === "missing-group") delete body.sinks;
++      if (defect === "wrong-kind") body.sources = [{ name: "csv", plugin_type: "sink" }];
++      if (defect === "inventory-mismatch") body.policy = { ...bootstrap().policy, available_plugin_ids: ["source:csv"] };
++      const headers = defect === "missing-header" ? {} : { [SNAPSHOT_HEADER]: defect === "different-header" ? "snapshot-b" : "snapshot-a" };
++      vi.mocked(globalThis.fetch).mockResolvedValueOnce(new Response(JSON.stringify(body), { headers }));
++      await expect(fetchPluginCatalogBootstrap()).rejects.toThrow();
++    },
++  );
++
+   it("returns the policy body with its response snapshot fingerprint", async () => {
+     const body = {
+       principal_scope: "local:alice",
+diff --git a/src/elspeth/web/frontend/src/api/client.ts b/src/elspeth/web/frontend/src/api/client.ts
+index bf5e77ed9..fc1d8cb14 100644
+--- a/src/elspeth/web/frontend/src/api/client.ts
++++ b/src/elspeth/web/frontend/src/api/client.ts
+@@ -10,6 +10,7 @@ import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwns
+ // ============================================================================
+ 
+ import { isValidationCheck, isValidationReadiness } from "./validationReadiness";
++import { decodeCatalogBootstrap } from "./catalogBootstrapDecoder";
+ import type {
+   ApiError,
+   ApiStructuredError,
+@@ -31,6 +32,7 @@ import type {
+   PluginSchemaInfo,
+   PluginPolicyFinding,
+   PluginPolicyResponse,
++  PluginCatalogBootstrapResponse,
+   PluginSnapshotResponse,
+   PluginSummary,
+   Run,
+@@ -1298,6 +1300,16 @@ export async function fetchPluginPolicy(): Promise<PluginSnapshotResponse<Plugin
+   return parsePluginSnapshotResponse<PluginPolicyResponse>(response);
+ }
+ 
++/** Load all catalog groups coherently from one fresh authenticated snapshot. */
++export async function fetchPluginCatalogBootstrap(): Promise<PluginSnapshotResponse<PluginCatalogBootstrapResponse>> {
++  const response = await authFetch("/api/catalog/bootstrap", {
++    headers: authHeaders(),
++    cache: "no-store",
++  });
++  const result = await parsePluginSnapshotResponse<unknown>(response);
++  return { ...result, data: decodeCatalogBootstrap(result.data, result.snapshotFingerprint) };
++}
++
+ /** List available source plugins. */
+ export async function listSources(): Promise<PluginSnapshotResponse<PluginSummary[]>> {
+   const response = await authFetch("/api/catalog/sources", {
+diff --git a/src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.test.tsx b/src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.test.tsx
+index cbf7196ed..d032dff7f 100644
+--- a/src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.test.tsx
++++ b/src/elspeth/web/frontend/src/components/catalog/CatalogDrawer.test.tsx
+@@ -10,8 +10,11 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
+ import { resetStore } from "@/test/store-helpers";
+ import { expectNoIdentifiersInDefaultDom } from "@/test/defaultDomPins";
+ import { unavailablePluginDisplayName } from "./UnavailableComponentRow";
++import type { PluginCatalogBootstrapResponse, PluginSummary } from "@/types/index";
++import { authenticateComposerCustody } from "@/stores/composerOperationCustody";
+ 
+ vi.mock("@/api/client", () => ({
++  fetchPluginCatalogBootstrap: vi.fn(),
+   fetchPluginPolicy: vi.fn().mockResolvedValue({
+     data: {
+       principal_scope: "local:alice",
+@@ -88,9 +91,27 @@ vi.mock("@/api/client", () => ({
+ }));
+ 
+ // Import the mocked client so we can assert on call counts.
+-import { listSources, listTransforms, listSinks } from "@/api/client";
+-
+-beforeEach(() => resetStore(usePreferencesStore));
++import { fetchPluginCatalogBootstrap } from "@/api/client";
++
++type CatalogGroups = Pick<PluginCatalogBootstrapResponse, "sources" | "transforms" | "sinks">;
++let catalogGroups: CatalogGroups;
++function setCatalogGroups(groups: Partial<CatalogGroups>) { catalogGroups = { ...catalogGroups, ...groups }; }
++function summary(name: string, plugin_type: PluginSummary["plugin_type"], description: string): PluginSummary {
++  return { name, plugin_type, description, config_fields: [], usage_when_to_use: null,
++    usage_when_not_to_use: null, example_use: null, capability_tags: [], audit_characteristics: [] };
++}
++beforeEach(() => {
++  resetStore(usePreferencesStore);
++  authenticateComposerCustody({ principalId: "alice", authProvider: "local" });
++  catalogGroups = { sources: [summary("csv", "source", "CSV file source")],
++    transforms: [summary("uppercase", "transform", "Uppercase transform")], sinks: [summary("json", "sink", "JSON file sink")] };
++  vi.mocked(fetchPluginCatalogBootstrap).mockReset().mockImplementation(async () => ({
++    snapshotFingerprint: "catalog-test-snapshot",
++    data: { ...catalogGroups, policy: { principal_scope: "local:alice", snapshot_fingerprint: "catalog-test-snapshot",
++      policy_hash: "catalog-test-policy", available_plugin_ids: Object.values(catalogGroups).flat().map((item) => `${item.plugin_type}:${item.name}`),
++      capability_groups: [], selections: [], control_modes: [] } },
++  }));
++});
+ 
+ describe("CatalogDrawer", () => {
+   beforeEach(() => {
+@@ -119,9 +140,7 @@ describe("CatalogDrawer", () => {
+   it("fetches catalog on first open", async () => {
+     render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+     await waitFor(() => {
+-      expect(listSources).toHaveBeenCalled();
+-      expect(listTransforms).toHaveBeenCalled();
+-      expect(listSinks).toHaveBeenCalled();
++      expect(fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(1);
+     });
+   });
+ 
+@@ -216,24 +235,7 @@ describe("CatalogDrawer", () => {
+   });
+ 
+   it("retries catalog loading inline after an initial fetch failure", async () => {
+-    vi.mocked(listSources)
+-      .mockRejectedValueOnce(new Error("catalog unavailable"))
+-      .mockResolvedValueOnce({
+-        data: [
+-          {
+-            name: "csv",
+-            plugin_type: "source",
+-            description: "CSV file source",
+-            config_fields: [],
+-            usage_when_to_use: null,
+-            usage_when_not_to_use: null,
+-            example_use: null,
+-            capability_tags: [],
+-            audit_characteristics: [],
+-          },
+-        ],
+-        snapshotFingerprint: "catalog-test-snapshot",
+-      });
++    vi.mocked(fetchPluginCatalogBootstrap).mockRejectedValueOnce(new Error("catalog unavailable"));
+     render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+     const user = userEvent.setup();
+ 
+@@ -242,13 +244,13 @@ describe("CatalogDrawer", () => {
+     await user.click(screen.getByRole("button", { name: "Retry loading plugin catalog" }));
+ 
+     await waitFor(() => {
+-      expect(listSources).toHaveBeenCalledTimes(2);
++      expect(fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(2);
+     });
+     expect(await screen.findByText("CSV file source")).toBeInTheDocument();
+   });
+ 
+   it("announces a catalog load failure through an assertive alert (WCAG 4.1.3)", async () => {
+-    vi.mocked(listSources).mockRejectedValueOnce(new Error("catalog unavailable"));
++    vi.mocked(fetchPluginCatalogBootstrap).mockRejectedValueOnce(new Error("catalog unavailable"));
+     render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
+ 
+     const alert = await screen.findByRole("alert");
+@@ -394,18 +396,7 @@ describe("CatalogDrawer — Phase 7B reshape", () => {
+     usePreferencesStore.setState({ showAdvanced: true });
+     usePluginCatalogStore.getState().clear();
+     useSessionStore.setState({ compositionState: null } as never);
+-    vi.mocked(api.listSources).mockResolvedValue({
+-      data: [csv, azure],
+-      snapshotFingerprint: "catalog-test-snapshot",
+-    } as never);
+-    vi.mocked(api.listTransforms).mockResolvedValue({
+-      data: [],
+-      snapshotFingerprint: "catalog-test-snapshot",
+-    } as never);
+-    vi.mocked(api.listSinks).mockResolvedValue({
+-      data: [],
+-      snapshotFingerprint: "catalog-test-snapshot",
+-    } as never);
++    setCatalogGroups({ sources: [csv, azure] as PluginSummary[], transforms: [], sinks: [] });
+   });
+ 
+   it("renders InlineChatSourceEntry as the first row of the Sources tab", async () => {
+@@ -491,8 +482,7 @@ describe("CatalogDrawer — Phase 7B reshape", () => {
+   it("filter state is per-tab — switching tabs does not carry filters over", async () => {
+     // Regression guard for the cross-tab UX trap. An active capability
+     // filter on Sources must NOT silently filter Transforms on tab switch.
+-    vi.mocked(api.listTransforms).mockResolvedValue({
+-      data: [
++    setCatalogGroups({ transforms: [
+         {
+           name: "uppercase",
+           plugin_type: "transform",
+@@ -505,8 +495,7 @@ describe("CatalogDrawer — Phase 7B reshape", () => {
+           audit_characteristics: ["deterministic"],
+         },
+       ],
+-      snapshotFingerprint: "catalog-test-snapshot",
+-    } as never);
++    });
+     render(<CatalogDrawer isOpen onClose={() => {}} />);
+     await waitFor(() => expect(screen.getByText("azure_blob")).toBeInTheDocument());
+ 
+@@ -542,10 +531,7 @@ describe("CatalogDrawer — Phase 7B reshape", () => {
+ 
+   it("shows 'No plugins available.' (not the filter variant) when no filters are active and the list is empty", async () => {
+     // B3 regression gate: empty-state message with no active filters.
+-    vi.mocked(api.listSources).mockResolvedValue({
+-      data: [],
+-      snapshotFingerprint: "catalog-test-snapshot",
+-    } as never);
++    setCatalogGroups({ sources: [] });
+     render(<CatalogDrawer isOpen onClose={() => {}} />);
+     const empty = await screen.findByText("No plugins available.");
+     // M05 (WCAG 4.1.3): announced through a polite live region.
+@@ -667,8 +653,7 @@ describe("CatalogDrawer — internal plugins", () => {
+       isLoading: false,
+     });
+     useSessionStore.setState({ compositionState: null } as never);
+-    vi.mocked(listSources).mockResolvedValue({
+-      data: [
++    setCatalogGroups({ sources: [
+         {
+           name: "csv",
+           plugin_type: "source",
+@@ -692,8 +677,7 @@ describe("CatalogDrawer — internal plugins", () => {
+           audit_characteristics: [],
+         },
+       ],
+-      snapshotFingerprint: "catalog-test-snapshot",
+-    } as never);
++    });
+   });
+ 
+   it("omits the internal resume placeholder from the Sources list", async () => {
+diff --git a/src/elspeth/web/frontend/src/components/execution/InlineRunResults.test.tsx b/src/elspeth/web/frontend/src/components/execution/InlineRunResults.test.tsx
+index 5fb2650e4..a7a17480a 100644
+--- a/src/elspeth/web/frontend/src/components/execution/InlineRunResults.test.tsx
++++ b/src/elspeth/web/frontend/src/components/execution/InlineRunResults.test.tsx
+@@ -17,6 +17,7 @@ import {
+ } from "@/test/composerFixtures";
+ import { _resetNarrativeModeCacheForTesting } from "@/hooks/useNarrativeMode";
+ import * as apiClient from "@/api/client";
++import { authenticateComposerCustody } from "@/stores/composerOperationCustody";
+ 
+ vi.mock("@/components/execution/ProgressView", () => ({
+   ProgressView: () => <div data-testid="progress-view-stub" />,
+@@ -72,11 +73,11 @@ describe("InlineRunResults", () => {
+     resetStore(usePreferencesStore);
+     _resetNarrativeModeCacheForTesting();
+     vi.restoreAllMocks();
++    authenticateComposerCustody({ principalId: "test-user", authProvider: "local" });
+     // Default: empty catalog so useNarrativeMode resolves to false unless
+     // a specific test overrides it. Without these stubs the hook would
+     // make a real fetch against the unconfigured test API client.
+-    vi.spyOn(apiClient, "fetchPluginPolicy").mockResolvedValue({
+-      data: {
++    const policy = {
+         principal_scope: "local:test-user",
+         snapshot_fingerprint: "test-snapshot",
+         policy_hash: "test-policy",
+@@ -84,12 +85,11 @@ describe("InlineRunResults", () => {
+         capability_groups: [],
+         selections: [],
+         control_modes: [],
+-      },
+-      snapshotFingerprint: "test-snapshot",
++    };
++    vi.spyOn(apiClient, "fetchPluginPolicy").mockResolvedValue({ data: policy, snapshotFingerprint: "test-snapshot" });
++    vi.spyOn(apiClient, "fetchPluginCatalogBootstrap").mockResolvedValue({
++      data: { policy, sources: [], transforms: [], sinks: [] }, snapshotFingerprint: "test-snapshot",
+     });
+-    vi.spyOn(apiClient, "listTransforms").mockResolvedValue({ data: [], snapshotFingerprint: "test-snapshot" });
+-    vi.spyOn(apiClient, "listSources").mockResolvedValue({ data: [], snapshotFingerprint: "test-snapshot" });
+-    vi.spyOn(apiClient, "listSinks").mockResolvedValue({ data: [], snapshotFingerprint: "test-snapshot" });
+     useAuthStore.setState({
+       token: "test-token",
+       user: {
+diff --git a/src/elspeth/web/frontend/src/hooks/useNarrativeMode.test.ts b/src/elspeth/web/frontend/src/hooks/useNarrativeMode.test.ts
+index 4b3db525d..d004a1a37 100644
+--- a/src/elspeth/web/frontend/src/hooks/useNarrativeMode.test.ts
++++ b/src/elspeth/web/frontend/src/hooks/useNarrativeMode.test.ts
+@@ -9,13 +9,13 @@ import { useSessionStore } from "@/stores/sessionStore";
+ import { useAuthStore } from "@/stores/authStore";
+ import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
+ import * as apiClient from "@/api/client";
++import { authenticateComposerCustody } from "@/stores/composerOperationCustody";
+ 
+ const TAGGED = { name: "batch_classifier_metrics", capability_tags: ["narrative-summary"] } as any;
+ const UNTAGGED = { name: "passthrough", capability_tags: [] } as any;
+ 
+ function _stubCatalog(transforms: any[], sources: any[] = [], sinks: any[] = []) {
+-  vi.spyOn(apiClient, "fetchPluginPolicy").mockResolvedValue({
+-    data: {
++  const policy = {
+       principal_scope: "local:alice",
+       snapshot_fingerprint: "narrative-snapshot",
+       policy_hash: "narrative-policy",
+@@ -23,12 +23,11 @@ function _stubCatalog(transforms: any[], sources: any[] = [], sinks: any[] = [])
+       capability_groups: [],
+       selections: [],
+       control_modes: [],
+-    },
+-    snapshotFingerprint: "narrative-snapshot",
++  };
++  vi.spyOn(apiClient, "fetchPluginPolicy").mockResolvedValue({ data: policy, snapshotFingerprint: "narrative-snapshot" });
++  vi.spyOn(apiClient, "fetchPluginCatalogBootstrap").mockResolvedValue({
++    data: { policy, sources, transforms, sinks }, snapshotFingerprint: "narrative-snapshot",
+   });
+-  vi.spyOn(apiClient, "listTransforms").mockResolvedValue({ data: transforms, snapshotFingerprint: "narrative-snapshot" });
+-  vi.spyOn(apiClient, "listSources").mockResolvedValue({ data: sources, snapshotFingerprint: "narrative-snapshot" });
+-  vi.spyOn(apiClient, "listSinks").mockResolvedValue({ data: sinks, snapshotFingerprint: "narrative-snapshot" });
+ }
+ 
+ function _setComposition(state: any) {
+@@ -40,6 +39,7 @@ describe("useNarrativeMode", () => {
+     _resetNarrativeModeCacheForTesting();
+     vi.restoreAllMocks();
+     usePluginCatalogStore.getState().clear();
++    authenticateComposerCustody({ principalId: "alice", authProvider: "local" });
+     useAuthStore.setState({
+       token: "narrative-token",
+       user: {
+@@ -129,9 +129,7 @@ describe("useNarrativeMode", () => {
+   });
+ 
+   it("falls back to narrativeMode=false when the catalog fetch fails", async () => {
+-    vi.spyOn(apiClient, "listTransforms").mockRejectedValue(new Error("network"));
+-    vi.spyOn(apiClient, "listSources").mockResolvedValue({ data: [], snapshotFingerprint: "narrative-snapshot" });
+-    vi.spyOn(apiClient, "listSinks").mockResolvedValue({ data: [], snapshotFingerprint: "narrative-snapshot" });
++    vi.spyOn(apiClient, "fetchPluginCatalogBootstrap").mockRejectedValue(new Error("network"));
+     _setComposition({
+       sources: {},
+       nodes: [{ id: "n1", node_type: "transform", plugin: "anything", input: "src", on_success: null, on_error: null, options: {} }],
+diff --git a/src/elspeth/web/frontend/src/stores/pluginCatalogStore.test.ts b/src/elspeth/web/frontend/src/stores/pluginCatalogStore.test.ts
+index c94abb28c..67a4a3080 100644
+--- a/src/elspeth/web/frontend/src/stores/pluginCatalogStore.test.ts
++++ b/src/elspeth/web/frontend/src/stores/pluginCatalogStore.test.ts
+@@ -1,537 +1,310 @@
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+-
+ import * as api from "@/api/client";
+-import type { PluginPolicyResponse, PluginSummary } from "@/types/index";
++import { advanceAuthGeneration } from "@/api/authSession";
++import type { PluginCatalogBootstrapResponse, PluginPolicyResponse, PluginSummary } from "@/types/index";
+ import pluginPolicyMatrixFixture from "./__fixtures__/pluginPolicyMatrix.json";
+ import { composerCustodyScope } from "./composerOperationCustody";
+-import {
+-  createPluginCatalogStore,
+-  PLUGIN_CATALOG_INVALIDATED_EVENT,
+-} from "./pluginCatalogStore";
+-
+-vi.mock("@/api/client", () => ({
+-  fetchPluginPolicy: vi.fn(),
+-  listSources: vi.fn(),
+-  listTransforms: vi.fn(),
+-  listSinks: vi.fn(),
+-  getPluginSchema: vi.fn(),
+-}));
++import { createPluginCatalogStore, PLUGIN_CATALOG_INVALIDATED_EVENT } from "./pluginCatalogStore";
+ 
++vi.mock("@/api/client", () => ({ fetchPluginPolicy: vi.fn(), fetchPluginCatalogBootstrap: vi.fn(),
++  listSources: vi.fn(), listTransforms: vi.fn(), listSinks: vi.fn(), getPluginSchema: vi.fn() }));
+ vi.mock("./composerOperationCustody", () => ({ composerCustodyScope: vi.fn(() => null) }));
+ 
+-const SOURCE = {
+-  name: "csv",
+-  plugin_type: "source" as const,
+-  description: "CSV source",
+-  config_fields: [],
+-  usage_when_to_use: null,
+-  usage_when_not_to_use: null,
+-  example_use: null,
+-  capability_tags: [],
+-  audit_characteristics: [],
+-};
+-
+-interface PluginPolicyMatrixCase extends PluginPolicyResponse {
+-  name: string;
+-  authorized_control_ids: string[];
+-  available_control_ids: string[];
+-}
+-
+-interface PluginPolicyMatrixFixture {
+-  core_plugin_ids: string[];
+-  cases: PluginPolicyMatrixCase[];
+-}
+-
+-const PLUGIN_POLICY_MATRIX = pluginPolicyMatrixFixture as PluginPolicyMatrixFixture;
+-
+-const EXPECTED_CONTROL_IDS: Record<string, string[]> = {
+-  core_only: [],
+-  azure_only: [
+-    "transform:azure_prompt_shield",
+-    "transform:azure_content_safety",
+-  ],
+-  aws_only: [
+-    "transform:aws_bedrock_prompt_shield",
+-    "transform:aws_bedrock_content_safety",
+-  ],
+-  both_with_azure_preference: [
+-    "transform:azure_prompt_shield",
+-    "transform:azure_content_safety",
+-    "transform:aws_bedrock_prompt_shield",
+-    "transform:aws_bedrock_content_safety",
+-  ],
+-  neither_control_implementation: [],
+-};
+-
+-const EXPECTED_CONTROL_SELECTIONS: Record<string, Array<string | null>> = {
+-  core_only: [null, null],
+-  azure_only: [
+-    "transform:azure_prompt_shield",
+-    "transform:azure_content_safety",
+-  ],
+-  aws_only: [
+-    "transform:aws_bedrock_prompt_shield",
+-    "transform:aws_bedrock_content_safety",
+-  ],
+-  both_with_azure_preference: [
+-    "transform:azure_prompt_shield",
+-    "transform:azure_content_safety",
+-  ],
+-  neither_control_implementation: [null, null],
+-};
+-
+-function pluginSummary(pluginId: string): PluginSummary {
+-  const separator = pluginId.indexOf(":");
+-  const kind = pluginId.slice(0, separator);
+-  const name = pluginId.slice(separator + 1);
+-  if (
+-    separator < 1 ||
+-    (kind !== "source" && kind !== "transform" && kind !== "sink")
+-  ) {
+-    throw new Error(`Invalid plugin identity in matrix fixture: ${pluginId}`);
+-  }
+-  return {
+-    ...SOURCE,
+-    name,
+-    plugin_type: kind,
+-    description: `${name} ${kind}`,
+-  };
++const SOURCE: PluginSummary = { name: "csv", plugin_type: "source", description: "CSV source", config_fields: [],
++  usage_when_to_use: null, usage_when_not_to_use: null, example_use: null, capability_tags: [], audit_characteristics: [] };
++function policy(fingerprint = "a", principal = "local:alice"): PluginPolicyResponse {
++  return { principal_scope: principal, snapshot_fingerprint: fingerprint, policy_hash: "policy-1",
++    available_plugin_ids: ["source:csv"], capability_groups: [], selections: [], control_modes: [] };
+ }
+-
+-function policy(
+-  snapshotFingerprint: string,
+-  principalScope = "local:alice",
+-  availablePluginIds = ["source:csv"],
+-) {
+-  return {
+-    principal_scope: principalScope,
+-    snapshot_fingerprint: snapshotFingerprint,
+-    policy_hash: "policy-1",
+-    available_plugin_ids: availablePluginIds,
+-    capability_groups: [],
+-    selections: [],
+-    control_modes: [],
+-  };
+-}
+-
+-function snapshot<T>(data: T, fingerprint: string) {
+-  return { data, snapshotFingerprint: fingerprint };
++function snapshot<T>(data: T, fingerprint: string) { return { data, snapshotFingerprint: fingerprint }; }
++function bundle(fingerprint = "a", principal = "local:alice", sources = [SOURCE]) {
++  return snapshot({ policy: policy(fingerprint, principal), sources, transforms: [], sinks: [] }, fingerprint);
+ }
+-
+ function deferred<T>() {
+   let resolve!: (value: T) => void;
+-  const promise = new Promise<T>((done) => {
+-    resolve = done;
+-  });
++  const promise = new Promise<T>((done) => { resolve = done; });
+   return { promise, resolve };
+ }
++function pendingBundle() { return deferred<ReturnType<typeof bundle>>(); }
+ 
+ describe("pluginCatalogStore", () => {
+   beforeEach(() => {
+-    vi.clearAllMocks();
++    vi.resetAllMocks();
+     vi.mocked(composerCustodyScope).mockReturnValue(null);
+-    vi.mocked(api.listSources).mockResolvedValue(snapshot([SOURCE], "a"));
+-    vi.mocked(api.listTransforms).mockResolvedValue(snapshot([], "a"));
+-    vi.mocked(api.listSinks).mockResolvedValue(snapshot([], "a"));
+-    vi.mocked(api.getPluginSchema).mockResolvedValue(snapshot({
+-      name: "csv",
+-      plugin_type: "source",
+-      description: "CSV source",
+-      json_schema: { type: "object" },
+-      knob_schema: { fields: [] },
+-    }, "a"));
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockResolvedValue(bundle());
++    vi.mocked(api.fetchPluginPolicy).mockResolvedValue(snapshot(policy(), "a"));
++    vi.mocked(api.getPluginSchema).mockResolvedValue(snapshot({ name: "csv", plugin_type: "source",
++      description: "CSV source", json_schema: { type: "object" }, knob_schema: { fields: [] } }, "a"));
++  });
++
++  it("retains the independently pinned five-case policy fixture contract", () => {
++    expect(pluginPolicyMatrixFixture.core_plugin_ids).toEqual(["source:csv", "source:json", "source:text", "transform:field_mapper",
++      "transform:llm", "transform:web_scrape", "sink:csv", "sink:json", "sink:text"]);
++    const expected: Record<string, string[]> = {
++      core_only: [], azure_only: ["transform:azure_prompt_shield", "transform:azure_content_safety"],
++      aws_only: ["transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"],
++      both_with_azure_preference: ["transform:azure_prompt_shield", "transform:azure_content_safety", "transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"],
++      neither_control_implementation: [],
++    };
++    expect(pluginPolicyMatrixFixture.cases.map((item) => item.name)).toEqual(Object.keys(expected));
++    for (const item of pluginPolicyMatrixFixture.cases) {
++      expect(item.principal_scope).toBe(`local:${item.name}`);
++      expect(item.snapshot_fingerprint).toMatch(/^[0-9a-f]{64}$/);
++      expect(item.policy_hash).toMatch(/^[0-9a-f]{64}$/);
++      expect(item.available_control_ids).toEqual(expected[item.name]);
++      expect(item.available_plugin_ids).toEqual([...pluginPolicyMatrixFixture.core_plugin_ids, ...expected[item.name]]);
++      expect(item.capability_groups.every((group) => group.available_plugin_ids.length > 0)).toBe(true);
++      expect(item.capability_groups.flatMap((group) => group.available_plugin_ids).sort())
++        .toEqual(["transform:llm", ...expected[item.name]].sort());
++      const selected = item.name === "aws_only" ? ["transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"]
++        : item.name === "azure_only" || item.name === "both_with_azure_preference" ? ["transform:azure_prompt_shield", "transform:azure_content_safety"] : [null, null];
++      expect(item.selections).toEqual([{ capability: "llm", plugin_id: "transform:llm" },
++        { capability: "prompt_shield", plugin_id: selected[0] }, { capability: "content_safety", plugin_id: selected[1] }]);
++      expect(item.control_modes).toEqual([{ capability: "prompt_shield", mode: "recommend" }, { capability: "content_safety", mode: "recommend" }]);
++    }
++  });
++
++  it("makes one cold request and publishes policy/groups atomically", async () => {
++    const pending = pendingBundle();
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockReturnValueOnce(pending.promise);
++    const store = createPluginCatalogStore();
++    const publications: Array<{ policy: boolean; groups: boolean }> = [];
++    const unsubscribe = store.subscribe((state) => publications.push({ policy: state.policy !== null,
++      groups: state.sources !== null && state.transforms !== null && state.sinks !== null }));
++    const loading = store.getState().load({ principal: "local:alice" });
++    expect(store.getState().policy).toBeNull();
++    pending.resolve(bundle());
++    await loading;
++    expect(store.getState().key).toBe("local:alice:a");
++    expect(publications.every((state) => state.policy === state.groups)).toBe(true);
++    expect(api.fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(1);
++    expect(api.fetchPluginPolicy).not.toHaveBeenCalled();
++    expect(api.listSources).not.toHaveBeenCalled();
++    expect(api.listTransforms).not.toHaveBeenCalled();
++    expect(api.listSinks).not.toHaveBeenCalled();
++    unsubscribe(); store.getState().dispose();
+   });
+ 
+-  it("normalizes an authenticated raw user id and reuses warm lists after fresh policy confirmation", async () => {
++  it("normalizes authenticated raw owner and confirms warm policy even with a matching hint", async () => {
+     vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "local" });
+-    vi.mocked(api.fetchPluginPolicy).mockResolvedValue(snapshot(policy("a"), "a"));
+     const store = createPluginCatalogStore();
+     await store.getState().load({ principal: "alice" });
+-    const priorSources = store.getState().sources;
+-    const policyRefresh = deferred<{ data: ReturnType<typeof policy>; snapshotFingerprint: string }>();
+-    vi.mocked(api.fetchPluginPolicy).mockReturnValueOnce(policyRefresh.promise);
+-    const refresh = store.getState().load({ principal: "alice" });
+-    expect(store.getState().sources).toBe(priorSources);
+-    policyRefresh.resolve(snapshot(policy("a"), "a"));
+-    await refresh;
+-    expect(api.fetchPluginPolicy).toHaveBeenCalledTimes(2);
+-    expect(api.listSources).toHaveBeenCalledTimes(1);
+-    expect(api.listTransforms).toHaveBeenCalledTimes(1);
+-    expect(api.listSinks).toHaveBeenCalledTimes(1);
++    const prior = store.getState().sources;
++    await store.getState().load({ principal: "alice", fingerprint: "a" });
++    expect(api.fetchPluginPolicy).toHaveBeenCalledTimes(1);
++    expect(api.fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(1);
++    expect(store.getState().sources).toBe(prior);
+     expect(store.getState().principal).toBe("local:alice");
+     store.getState().dispose();
+   });
+ 
+-  it("does not normalize a different user or retain the same user across auth providers", async () => {
++  it("does not retain a raw user catalog when the authenticated provider changes", async () => {
+     vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "local" });
+-    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("a"), "a"));
+     const store = createPluginCatalogStore();
+     await store.getState().load({ principal: "alice" });
+     vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "oidc" });
+-    const rotated = deferred<{ data: ReturnType<typeof policy>; snapshotFingerprint: string }>();
+-    vi.mocked(api.fetchPluginPolicy).mockReturnValueOnce(rotated.promise);
+-    const refresh = store.getState().load({ principal: "alice" });
++    const next = pendingBundle();
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockReturnValueOnce(next.promise);
++    const loading = store.getState().load({ principal: "alice" });
+     expect(store.getState().sources).toBeNull();
+-    rotated.resolve(snapshot(policy("a", "oidc:alice"), "a"));
+-    await refresh;
++    next.resolve(bundle("a", "oidc:alice")); await loading;
+     expect(store.getState().principal).toBe("oidc:alice");
+-    expect(api.listSources).toHaveBeenCalledTimes(2);
+-    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("a", "local:bob"), "a"));
+-    await store.getState().load({ principal: "local:bob" });
+-    expect(store.getState().principal).toBe("local:bob");
+-    expect(api.listSources).toHaveBeenCalledTimes(3);
++    expect(api.fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(2);
+     store.getState().dispose();
+   });
+ 
+-  it("refetches raw-owner lists when the confirmed policy fingerprint changes", async () => {
+-    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "local" });
+-    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("a"), "a"));
++  it("installs newer coherent bundle C after warm policy B, without splicing", async () => {
+     const store = createPluginCatalogStore();
+-    await store.getState().load({ principal: "alice" });
++    await store.getState().load({ principal: "local:alice" });
++    await store.getState().loadSchema("source", "csv");
+     vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("b"), "b"));
+-    vi.mocked(api.listSources).mockResolvedValueOnce(snapshot([SOURCE], "b"));
+-    vi.mocked(api.listTransforms).mockResolvedValueOnce(snapshot([], "b"));
+-    vi.mocked(api.listSinks).mockResolvedValueOnce(snapshot([], "b"));
+-    await store.getState().load({ principal: "alice" });
+-    expect(store.getState().fingerprint).toBe("b");
+-    expect(api.listSources).toHaveBeenCalledTimes(2);
++    const next = pendingBundle();
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockReturnValueOnce(next.promise);
++    const loading = store.getState().load({ principal: "local:alice" });
++    await vi.waitFor(() => expect(api.fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(2));
++    expect(store.getState().policy).toBeNull();
++    expect(store.getState().sources).toBeNull();
++    expect(store.getState().schemas).toEqual({});
++    next.resolve(bundle("c")); await loading;
++    expect(store.getState().policy).toEqual(policy("c"));
++    expect(store.getState().key).toBe("local:alice:c");
+     store.getState().dispose();
+   });
+ 
+-  it("ignores a delayed raw-owner response after an authenticated principal change", async () => {
+-    const old = deferred<{ data: ReturnType<typeof policy>; snapshotFingerprint: string }>();
+-    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "alice", authProvider: "local" });
+-    vi.mocked(api.fetchPluginPolicy).mockReturnValueOnce(old.promise);
++  it.each(["force", "known-stale", "invalidate"])("discards aliases immediately on %s and uses a bundle", async (mode) => {
+     const store = createPluginCatalogStore();
+-    const alice = store.getState().load({ principal: "alice" });
+-    vi.mocked(composerCustodyScope).mockReturnValue({ principalId: "bob", authProvider: "local" });
+-    vi.mocked(api.fetchPluginPolicy).mockResolvedValueOnce(snapshot(policy("a", "local:bob"), "a"));
+-    await store.getState().load({ principal: "bob" });
+-    old.resolve(snapshot(policy("a"), "a"));
+-    await alice;
+-    expect(store.getState().principal).toBe("local:bob");
+-    expect(api.listSources).toHaveBeenCalledTimes(1);
++    await store.getState().load({ principal: "local:alice" });
++    await store.getState().loadSchema("source", "csv");
++    const next = pendingBundle();
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockReturnValueOnce(next.promise);
++    const loading = mode === "invalidate" ? store.getState().invalidate()
++      : store.getState().load({ principal: "local:alice", force: mode === "force", fingerprint: mode === "known-stale" ? "b" : undefined });
++    expect(store.getState().key).toBeNull();
++    expect(store.getState().schemas).toEqual({});
++    next.resolve(bundle("b")); await loading;
++    expect(store.getState().key).toBe("local:alice:b");
++    expect(api.fetchPluginPolicy).not.toHaveBeenCalled();
+     store.getState().dispose();
+   });
+ 
+-  it("defines the complete five-case UI policy contract", () => {
+-    expect(PLUGIN_POLICY_MATRIX.core_plugin_ids).toEqual([
+-      "source:csv",
+-      "source:json",
+-      "source:text",
+-      "transform:field_mapper",
+-      "transform:llm",
+-      "transform:web_scrape",
+-      "sink:csv",
+-      "sink:json",
+-      "sink:text",
+-    ]);
+-    expect(PLUGIN_POLICY_MATRIX.cases.map((matrixCase) => matrixCase.name)).toEqual([
+-      "core_only",
+-      "azure_only",
+-      "aws_only",
+-      "both_with_azure_preference",
+-      "neither_control_implementation",
+-    ]);
+-    for (const matrixCase of PLUGIN_POLICY_MATRIX.cases) {
+-      expect(matrixCase.principal_scope).toBe(`local:${matrixCase.name}`);
+-      expect(matrixCase.snapshot_fingerprint).toMatch(/^[0-9a-f]{64}$/);
+-      expect(matrixCase.policy_hash).toMatch(/^[0-9a-f]{64}$/);
+-      expect(matrixCase.available_control_ids).toEqual(
+-        EXPECTED_CONTROL_IDS[matrixCase.name],
+-      );
+-      expect(matrixCase.available_plugin_ids).toEqual([
+-        ...PLUGIN_POLICY_MATRIX.core_plugin_ids,
+-        ...matrixCase.available_control_ids,
+-      ]);
+-      expect(matrixCase.capability_groups.length).toBeGreaterThan(0);
+-      expect(
+-        matrixCase.capability_groups.every(
+-          (group) => group.available_plugin_ids.length > 0,
+-        ),
+-      ).toBe(true);
+-      expect(
+-        matrixCase.capability_groups
+-          .flatMap((group) => group.available_plugin_ids)
+-          .sort(),
+-      ).toEqual(
+-        ["transform:llm", ...matrixCase.available_control_ids].sort(),
+-      );
+-      expect(matrixCase.selections).toEqual([
+-        { capability: "llm", plugin_id: "transform:llm" },
+-        {
+-          capability: "prompt_shield",
+-          plugin_id: EXPECTED_CONTROL_SELECTIONS[matrixCase.name][0],
+-        },
+-        {
+-          capability: "content_safety",
+-          plugin_id: EXPECTED_CONTROL_SELECTIONS[matrixCase.name][1],
+-        },
+-      ]);
+-      expect(matrixCase.control_modes).toEqual([
+-        { capability: "prompt_shield", mode: "recommend" },
+-        { capability: "content_safety", mode: "recommend" },
+-      ]);
+-    }
++  it("handles the secret invalidation event through a fresh bundle", async () => {
++    const store = createPluginCatalogStore();
++    await store.getState().load({ principal: "local:alice" });
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockResolvedValueOnce(bundle("b"));
++    window.dispatchEvent(new Event(PLUGIN_CATALOG_INVALIDATED_EVENT));
++    await vi.waitFor(() => expect(store.getState().key).toBe("local:alice:b"));
++    store.getState().dispose();
+   });
+ 
+-  it.each(PLUGIN_POLICY_MATRIX.cases)(
+-    "loads the real five-configuration policy/catalog projection for $name",
+-    async (matrixCase) => {
+-      const fingerprint = matrixCase.snapshot_fingerprint;
+-      const policyResponse: PluginPolicyResponse = {
+-        principal_scope: matrixCase.principal_scope,
+-        snapshot_fingerprint: fingerprint,
+-        policy_hash: matrixCase.policy_hash,
+-        available_plugin_ids: matrixCase.available_plugin_ids,
+-        capability_groups: matrixCase.capability_groups,
+-        selections: matrixCase.selections,
+-        control_modes: matrixCase.control_modes,
+-      };
+-      const summaries = matrixCase.available_plugin_ids.map(pluginSummary);
+-      vi.mocked(api.fetchPluginPolicy).mockResolvedValue(
+-        snapshot(policyResponse, fingerprint),
+-      );
+-      vi.mocked(api.listSources).mockResolvedValue(
+-        snapshot(
+-          summaries.filter((item) => item.plugin_type === "source"),
+-          fingerprint,
+-        ),
+-      );
+-      vi.mocked(api.listTransforms).mockResolvedValue(
+-        snapshot(
+-          summaries.filter((item) => item.plugin_type === "transform"),
+-          fingerprint,
+-        ),
+-      );
+-      vi.mocked(api.listSinks).mockResolvedValue(
+-        snapshot(
+-          summaries.filter((item) => item.plugin_type === "sink"),
+-          fingerprint,
+-        ),
+-      );
+-      const store = createPluginCatalogStore();
+-
+-      await store.getState().load({
+-        principal: matrixCase.principal_scope,
+-        fingerprint,
+-      });
+-
+-      const state = store.getState();
+-      const rendered = [
+-        ...(state.sources ?? []).map((item) => `source:${item.name}`),
+-        ...(state.transforms ?? []).map((item) => `transform:${item.name}`),
+-        ...(state.sinks ?? []).map((item) => `sink:${item.name}`),
+-      ].sort();
+-      expect(rendered).toEqual([...matrixCase.available_plugin_ids].sort());
+-      expect(state.principal).toBe(matrixCase.principal_scope);
+-      expect(state.fingerprint).toBe(fingerprint);
+-      expect(state.key).toBe(`${matrixCase.principal_scope}:${fingerprint}`);
+-      expect(state.policy).toEqual(policyResponse);
+-      expect(state.policy?.capability_groups).toEqual(
+-        matrixCase.capability_groups,
+-      );
+-      expect(state.policy?.selections).toEqual(matrixCase.selections);
+-      expect(state.policy?.control_modes).toEqual(matrixCase.control_modes);
+-
+-      if (matrixCase.name === "neither_control_implementation") {
+-        expect(matrixCase.authorized_control_ids).toHaveLength(4);
+-        expect(matrixCase.available_control_ids).toEqual([]);
+-        expect(
+-          matrixCase.authorized_control_ids.every(
+-            (pluginId) => !state.policy?.available_plugin_ids.includes(pluginId),
+-          ),
+-        ).toBe(true);
+-        expect(state.policy?.selections).toEqual([
+-          { capability: "llm", plugin_id: "transform:llm" },
+-          { capability: "prompt_shield", plugin_id: null },
+-          { capability: "content_safety", plugin_id: null },
+-        ]);
+-      }
+-      store.getState().dispose();
+-    },
+-  );
+-
+-  it("never reuses a catalog across principal or snapshot fingerprints", async () => {
+-    vi.mocked(api.fetchPluginPolicy)
+-      .mockResolvedValueOnce(snapshot(policy("a", "local:alice"), "a"))
+-      .mockResolvedValueOnce(snapshot(policy("b", "oidc:alice"), "b"));
+-    vi.mocked(api.listSources)
+-      .mockResolvedValueOnce(snapshot([SOURCE], "a"))
+-      .mockResolvedValueOnce(snapshot([SOURCE], "b"));
+-    vi.mocked(api.listTransforms)
+-      .mockResolvedValueOnce(snapshot([], "a"))
+-      .mockResolvedValueOnce(snapshot([], "b"));
+-    vi.mocked(api.listSinks)
+-      .mockResolvedValueOnce(snapshot([], "a"))
+-      .mockResolvedValueOnce(snapshot([], "b"));
++  it.each(["local:bob", "oidc:alice"])("rejects earlier-generation responses after switch to %s", async (principal) => {
++    const old = pendingBundle();
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockReturnValueOnce(old.promise).mockResolvedValueOnce(bundle("b", principal));
+     const store = createPluginCatalogStore();
+-
+-    await store.getState().load({ principal: "local:alice", fingerprint: "a" });
+-    await store.getState().load({ principal: "oidc:alice", fingerprint: "b" });
+-
+-    expect(api.fetchPluginPolicy).toHaveBeenCalledTimes(2);
+-    expect(api.listSources).toHaveBeenCalledTimes(2);
+-    expect(store.getState().key).toBe("oidc:alice:b");
++    const earlier = store.getState().load({ principal: "local:alice" });
++    await store.getState().load({ principal });
++    old.resolve(bundle()); await earlier;
++    expect(store.getState().key).toBe(`${principal}:b`);
+     store.getState().dispose();
+   });
+ 
+-  it("discards list and schema caches when the fingerprint changes", async () => {
+-    vi.mocked(api.fetchPluginPolicy)
+-      .mockResolvedValueOnce(snapshot(policy("a"), "a"))
+-      .mockResolvedValueOnce(snapshot(policy("b"), "b"));
+-    vi.mocked(api.listSources)
+-      .mockResolvedValueOnce(snapshot([SOURCE], "a"))
+-      .mockResolvedValueOnce(snapshot([SOURCE], "b"));
+-    vi.mocked(api.listTransforms)
+-      .mockResolvedValueOnce(snapshot([], "a"))
+-      .mockResolvedValueOnce(snapshot([], "b"));
+-    vi.mocked(api.listSinks)
+-      .mockResolvedValueOnce(snapshot([], "a"))
+-      .mockResolvedValueOnce(snapshot([], "b"));
+-    vi.mocked(api.getPluginSchema).mockResolvedValueOnce(snapshot({
+-      name: "csv",
+-      plugin_type: "source",
+-      description: "CSV source",
+-      json_schema: { type: "object" },
+-      knob_schema: { fields: [] },
+-    }, "a"));
++  it("does not install a wrong principal, even with a matching fingerprint", async () => {
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockResolvedValue(bundle("a", "local:bob"));
+     const store = createPluginCatalogStore();
+-    await store.getState().load({ principal: "local:alice", fingerprint: "a" });
+-    await store.getState().loadSchema("source", "csv");
+-    expect(store.getState().schemas["source:csv"]).toBeDefined();
++    await store.getState().load({ principal: "local:alice" });
++    expect(api.fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(3);
++    expect(store.getState().policy).toBeNull();
++    expect(store.getState().sources).toBeNull();
++    expect(store.getState().error).not.toBeNull();
++    store.getState().dispose();
++  });
+ 
+-    await store.getState().load({ principal: "local:alice", fingerprint: "b" });
++  it("drops a late bootstrap after auth credential generation changes", async () => {
++    const old = pendingBundle();
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockReturnValueOnce(old.promise);
++    const store = createPluginCatalogStore();
++    const loading = store.getState().load({ principal: "local:alice" });
++    advanceAuthGeneration(); old.resolve(bundle()); await loading;
++    expect(store.getState().policy).toBeNull();
++    store.getState().dispose();
++  });
+ 
++  it("does not coalesce a new credential's request into an old same-principal cold load", async () => {
++    const old = pendingBundle();
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockReturnValueOnce(old.promise).mockResolvedValueOnce(bundle("b"));
++    const store = createPluginCatalogStore();
++    const earlier = store.getState().load({ principal: "local:alice" });
++    advanceAuthGeneration();
++    await store.getState().load({ principal: "local:alice" });
++    expect(api.fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(2);
++    old.resolve(bundle()); await earlier;
+     expect(store.getState().key).toBe("local:alice:b");
+-    expect(store.getState().schemas).toEqual({});
+-    expect(api.listSources).toHaveBeenCalledTimes(2);
+     store.getState().dispose();
+   });
+ 
+-  it("clears stale aliases immediately and refetches policy after secret invalidation", async () => {
+-    const refreshed = deferred<{ data: ReturnType<typeof policy>; snapshotFingerprint: string }>();
+-    vi.mocked(api.fetchPluginPolicy)
+-      .mockResolvedValueOnce(snapshot(policy("a"), "a"))
+-      .mockReturnValueOnce(refreshed.promise);
++  it("coalesces overlapping cold requests but force supersedes the earlier response", async () => {
++    const old = pendingBundle();
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockReturnValueOnce(old.promise).mockResolvedValueOnce(bundle("b"));
+     const store = createPluginCatalogStore();
+-    await store.getState().load({ principal: "local:alice", fingerprint: "a" });
+-
+-    window.dispatchEvent(new Event(PLUGIN_CATALOG_INVALIDATED_EVENT));
+-
+-    expect(store.getState().key).toBeNull();
+-    expect(store.getState().sources).toBeNull();
+-    expect(store.getState().isLoading).toBe(true);
+-    vi.mocked(api.listSources).mockResolvedValueOnce(snapshot([SOURCE], "b"));
+-    vi.mocked(api.listTransforms).mockResolvedValueOnce(snapshot([], "b"));
+-    vi.mocked(api.listSinks).mockResolvedValueOnce(snapshot([], "b"));
+-    refreshed.resolve(snapshot(policy("b"), "b"));
+-    await vi.waitFor(() => expect(store.getState().key).toBe("local:alice:b"));
+-    expect(api.fetchPluginPolicy).toHaveBeenCalledTimes(2);
++    const first = store.getState().load({ principal: "local:alice" });
++    const second = store.getState().load({ principal: "local:alice" });
++    expect(api.fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(1);
++    await store.getState().load({ principal: "local:alice", force: true });
++    old.resolve(bundle()); await Promise.all([first, second]);
++    expect(store.getState().key).toBe("local:alice:b");
+     store.getState().dispose();
+   });
+ 
+-  it("ignores a late response from the previous principal", async () => {
+-    const alicePolicy = deferred<{ data: ReturnType<typeof policy>; snapshotFingerprint: string }>();
+-    vi.mocked(api.fetchPluginPolicy)
+-      .mockReturnValueOnce(alicePolicy.promise)
+-      .mockResolvedValueOnce(snapshot(policy("bob", "local:bob"), "bob"));
+-    vi.mocked(api.listSources).mockResolvedValueOnce(snapshot([SOURCE], "bob"));
+-    vi.mocked(api.listTransforms).mockResolvedValueOnce(snapshot([], "bob"));
+-    vi.mocked(api.listSinks).mockResolvedValueOnce(snapshot([], "bob"));
++  it("keeps in-flight same-owner schema across a matching warm policy refresh", async () => {
+     const store = createPluginCatalogStore();
+-
+-    const aliceLoad = store.getState().load({ principal: "local:alice" });
+-    const bobLoad = store.getState().load({ principal: "local:bob" });
+-    await bobLoad;
+-    alicePolicy.resolve(snapshot(policy("alice", "local:alice"), "alice"));
+-    await aliceLoad;
+-
+-    expect(store.getState().key).toBe("local:bob:bob");
++    await store.getState().load({ principal: "local:alice" });
++    const pending = deferred<Awaited<ReturnType<typeof api.getPluginSchema>>>();
++    vi.mocked(api.getPluginSchema).mockReturnValueOnce(pending.promise);
++    const schemaLoad = store.getState().loadSchema("source", "csv");
++    await store.getState().load({ principal: "local:alice" });
++    expect(store.getState().schemaLoading["source:csv"]).toBe(true);
++    pending.resolve(snapshot({ name: "csv", plugin_type: "source", description: "CSV source",
++      json_schema: { type: "object" }, knob_schema: { fields: [] } }, "a"));
++    await schemaLoad;
++    expect(store.getState().schemas["source:csv"]).toBeDefined();
++    expect(store.getState().schemaLoading["source:csv"]).toBe(false);
+     store.getState().dispose();
+   });
+ 
+-  it("restarts when policy A is followed by catalog list responses from snapshot B", async () => {
+-    vi.mocked(api.fetchPluginPolicy)
+-      .mockResolvedValueOnce(snapshot(policy("a"), "a") as never)
+-      .mockResolvedValueOnce(snapshot(policy("b"), "b") as never);
+-    vi.mocked(api.listSources)
+-      .mockResolvedValueOnce(snapshot([SOURCE], "b") as never)
+-      .mockResolvedValueOnce(snapshot([SOURCE], "b") as never);
+-    vi.mocked(api.listTransforms)
+-      .mockResolvedValueOnce(snapshot([], "b") as never)
+-      .mockResolvedValueOnce(snapshot([], "b") as never);
+-    vi.mocked(api.listSinks)
+-      .mockResolvedValueOnce(snapshot([], "b") as never)
+-      .mockResolvedValueOnce(snapshot([], "b") as never);
++  it("drops an old schema after a forced catalog replacement even at the same fingerprint", async () => {
+     const store = createPluginCatalogStore();
++    await store.getState().load({ principal: "local:alice" });
++    const pending = deferred<Awaited<ReturnType<typeof api.getPluginSchema>>>();
++    vi.mocked(api.getPluginSchema).mockReturnValueOnce(pending.promise);
++    const schemaLoad = store.getState().loadSchema("source", "csv");
++    await store.getState().load({ principal: "local:alice", force: true });
++    pending.resolve(snapshot({ name: "csv", plugin_type: "source", description: "obsolete",
++      json_schema: {}, knob_schema: { fields: [] } }, "a"));
++    await schemaLoad;
++    expect(store.getState().schemas).toEqual({});
++    expect(store.getState().schemaLoading).toEqual({});
++    store.getState().dispose();
++  });
+ 
+-    await store.getState().load({ principal: "bootstrap:alice" });
+-
+-    expect(api.fetchPluginPolicy).toHaveBeenCalledTimes(2);
+-    expect(store.getState().key).toBe("local:alice:b");
+-    expect(store.getState().sources).toEqual([SOURCE]);
++  it("clears state after a client wire refusal without retrying malformed data", async () => {
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockRejectedValueOnce(new Error("Malformed plugin catalog bootstrap."));
++    const store = createPluginCatalogStore();
++    await store.getState().load({ principal: "local:alice" });
++    expect(api.fetchPluginCatalogBootstrap).toHaveBeenCalledTimes(1);
++    expect(store.getState()).toMatchObject({ key: null, policy: null, sources: null, transforms: null, sinks: null, schemas: {} });
++    expect(store.getState().error).not.toBeNull();
+     store.getState().dispose();
+   });
+ 
+-  it("restarts and re-owns a schema response when snapshot changes during the request", async () => {
+-    vi.mocked(api.fetchPluginPolicy)
+-      .mockResolvedValueOnce(snapshot(policy("a"), "a") as never)
+-      .mockResolvedValueOnce(snapshot(policy("b"), "b") as never);
+-    vi.mocked(api.listSources)
+-      .mockResolvedValueOnce(snapshot([SOURCE], "a") as never)
+-      .mockResolvedValueOnce(snapshot([SOURCE], "b") as never);
+-    vi.mocked(api.listTransforms)
+-      .mockResolvedValueOnce(snapshot([], "a") as never)
+-      .mockResolvedValueOnce(snapshot([], "b") as never);
+-    vi.mocked(api.listSinks)
+-      .mockResolvedValueOnce(snapshot([], "a") as never)
+-      .mockResolvedValueOnce(snapshot([], "b") as never);
+-    vi.mocked(api.getPluginSchema).mockResolvedValueOnce(snapshot({
+-      name: "csv",
+-      plugin_type: "source",
+-      description: "CSV source",
+-      json_schema: { type: "object" },
+-      knob_schema: { fields: [] },
+-    }, "b") as never);
++  it("clears all retained state when bundle fails", async () => {
+     const store = createPluginCatalogStore();
+-    await store.getState().load({ principal: "bootstrap:alice" });
++    await store.getState().load({ principal: "local:alice" });
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockRejectedValueOnce(new Error("unavailable"));
++    await store.getState().load({ principal: "local:alice", force: true });
++    expect(store.getState()).toMatchObject({ key: null, policy: null, sources: null, transforms: null, sinks: null });
++    expect(store.getState().error).not.toBeNull();
++    store.getState().dispose();
++  });
+ 
++  it.each([false, true])("re-owns schema after rotation or discards policy-refused schema (refused=%s)", async (refused) => {
++    const store = createPluginCatalogStore();
++    await store.getState().load({ principal: "local:alice" });
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockResolvedValueOnce(bundle("b", "local:alice", refused ? [] : [SOURCE]));
++    if (refused) vi.mocked(api.getPluginSchema).mockRejectedValueOnce({ status: 404, snapshot_fingerprint: "b" });
++    else vi.mocked(api.getPluginSchema).mockResolvedValueOnce(snapshot({ name: "csv", plugin_type: "source", description: "CSV source",
++      json_schema: { type: "object" }, knob_schema: { fields: [] } }, "b"));
+     await store.getState().loadSchema("source", "csv");
+-
+-    expect(api.fetchPluginPolicy).toHaveBeenCalledTimes(2);
+     expect(store.getState().key).toBe("local:alice:b");
+-    expect(store.getState().schemas["source:csv"]).toBeDefined();
++    expect(store.getState().schemas["source:csv"] !== undefined).toBe(!refused);
++    expect(store.getState().schemaErrors["source:csv"]).toBe(refused ? undefined : false);
+     store.getState().dispose();
+   });
+ 
+-  it("restarts when an A-enabled schema becomes disabled under snapshot B", async () => {
+-    vi.mocked(api.fetchPluginPolicy)
+-      .mockResolvedValueOnce(snapshot(policy("a"), "a"))
+-      .mockResolvedValueOnce(snapshot(policy("b"), "b"));
+-    vi.mocked(api.listSources)
+-      .mockResolvedValueOnce(snapshot([SOURCE], "a"))
+-      .mockResolvedValueOnce(snapshot([], "b"));
+-    vi.mocked(api.listTransforms)
+-      .mockResolvedValueOnce(snapshot([], "a"))
+-      .mockResolvedValueOnce(snapshot([], "b"));
+-    vi.mocked(api.listSinks)
+-      .mockResolvedValueOnce(snapshot([], "a"))
+-      .mockResolvedValueOnce(snapshot([], "b"));
+-    vi.mocked(api.getPluginSchema).mockRejectedValueOnce({
+-      status: 404,
+-      detail: "plugin_not_enabled",
+-      snapshot_fingerprint: "b",
++  it.each(pluginPolicyMatrixFixture.cases)("preserves complete policy/catalog projection for $name", async (matrixCase) => {
++    const { principal_scope, snapshot_fingerprint, policy_hash, available_plugin_ids, capability_groups, selections, control_modes } = matrixCase;
++    const projected: PluginPolicyResponse = { principal_scope, snapshot_fingerprint, policy_hash, available_plugin_ids,
++      capability_groups: capability_groups as PluginPolicyResponse["capability_groups"],
++      selections: selections as PluginPolicyResponse["selections"], control_modes: control_modes as PluginPolicyResponse["control_modes"] };
++    const summaries = available_plugin_ids.map((id): PluginSummary => {
++      const [kind, name] = id.split(":");
++      if (kind !== "source" && kind !== "transform" && kind !== "sink") throw new Error("invalid fixture kind");
++      return { ...SOURCE, name, plugin_type: kind };
+     });
++    const data: PluginCatalogBootstrapResponse = { policy: projected,
++      sources: summaries.filter((item) => item.plugin_type === "source"), transforms: summaries.filter((item) => item.plugin_type === "transform"),
++      sinks: summaries.filter((item) => item.plugin_type === "sink") };
++    vi.mocked(api.fetchPluginCatalogBootstrap).mockResolvedValueOnce(snapshot(data, snapshot_fingerprint));
+     const store = createPluginCatalogStore();
+-    await store.getState().load({ principal: "bootstrap:alice" });
+-
+-    await store.getState().loadSchema("source", "csv");
+-
+-    expect(api.fetchPluginPolicy).toHaveBeenCalledTimes(2);
+-    expect(store.getState().key).toBe("local:alice:b");
+-    expect(store.getState().schemas["source:csv"]).toBeUndefined();
+-    expect(store.getState().schemaErrors["source:csv"]).toBeUndefined();
++    await store.getState().load({ principal: principal_scope });
++    expect(store.getState().policy).toEqual(projected);
++    const state = store.getState();
++    expect([...(state.sources ?? []), ...(state.transforms ?? []), ...(state.sinks ?? [])].map((item) => `${item.plugin_type}:${item.name}`).sort())
++      .toEqual([...available_plugin_ids].sort());
++    expect(state.key).toBe(`${principal_scope}:${snapshot_fingerprint}`);
++    if (matrixCase.name === "neither_control_implementation") {
++      expect(matrixCase.authorized_control_ids).toHaveLength(4);
++      expect(matrixCase.available_control_ids).toEqual([]);
++      expect(matrixCase.authorized_control_ids.every((id) => !state.policy?.available_plugin_ids.includes(id))).toBe(true);
++    }
+     store.getState().dispose();
+   });
+ });
+diff --git a/src/elspeth/web/frontend/src/stores/pluginCatalogStore.ts b/src/elspeth/web/frontend/src/stores/pluginCatalogStore.ts
+index f90ba4803..5942bd41c 100644
+--- a/src/elspeth/web/frontend/src/stores/pluginCatalogStore.ts
++++ b/src/elspeth/web/frontend/src/stores/pluginCatalogStore.ts
+@@ -1,6 +1,7 @@
+ import { create, type StoreApi, type UseBoundStore } from "zustand";
+ 
+ import * as api from "@/api/client";
++import { currentAuthGeneration, isCurrentAuthGeneration } from "@/api/authSession";
+ import { composerCustodyScope } from "./composerOperationCustody";
+ import type {
+   ApiError,
+@@ -66,9 +67,11 @@ function emptyCatalogState() {
+ 
+ export function createPluginCatalogStore(): PluginCatalogStore {
+   let generation = 0;
++  let catalogGeneration = 0;
+   let activeLoad: {
+     principal: string;
+     fingerprint: string | undefined;
++    authGeneration: number;
+     promise: Promise<void>;
+   } | null = null;
+   let removeInvalidationListener = () => {};
+@@ -86,23 +89,12 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+         ? `${scope.authProvider}:${scope.principalId}`
+         : request.principal;
+       const current = get();
+-      const expectedKey = fingerprint === undefined
+-        ? null
+-        : catalogKey(principal, fingerprint);
+-      if (
+-        !force &&
+-        expectedKey !== null &&
+-        current.key === expectedKey &&
+-        current.sources !== null &&
+-        current.transforms !== null &&
+-        current.sinks !== null
+-      ) {
+-        return;
+-      }
++      const authGeneration = currentAuthGeneration();
+       if (
+         !force &&
+         activeLoad !== null &&
+         activeLoad.principal === principal &&
++        activeLoad.authGeneration === authGeneration &&
+         activeLoad.fingerprint === fingerprint
+       ) {
+         return activeLoad.promise;
+@@ -112,7 +104,10 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+       const knownStale =
+         current.principal !== principal ||
+         (fingerprint !== undefined && current.fingerprint !== fingerprint);
+-      if (knownStale) {
++      const warm = !force && !knownStale && current.key !== null
++        && current.sources !== null && current.transforms !== null && current.sinks !== null;
++      if (!warm) {
++        catalogGeneration += 1;
+         set({
+           ...emptyCatalogState(),
+           principal,
+@@ -124,64 +119,44 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+ 
+       const promise = (async () => {
+         try {
+-          for (let attempt = 0; attempt < 3; attempt += 1) {
++          // A supplied fingerprint is an invalidation hint, not permission to
++          // skip a fresh policy check on an ordinary warm refresh.
++          if (warm) {
+             const policyResponse = await api.fetchPluginPolicy();
+-            if (requestGeneration !== generation) return;
++            if (requestGeneration !== generation || !isCurrentAuthGeneration(authGeneration)) return;
+             const policy = policyResponse.data;
+-            if (policyResponse.snapshotFingerprint !== policy.snapshot_fingerprint) {
+-              continue;
+-            }
+-
+-            const canonicalPrincipal = policy.principal_scope;
+-            const nextKey = catalogKey(
+-              canonicalPrincipal,
+-              policy.snapshot_fingerprint,
+-            );
+-            const afterPolicy = get();
+-            if (
+-              !force &&
+-              afterPolicy.key === nextKey &&
+-              afterPolicy.sources !== null &&
+-              afterPolicy.transforms !== null &&
+-              afterPolicy.sinks !== null
+-            ) {
++            if (policyResponse.snapshotFingerprint === policy.snapshot_fingerprint
++              && policy.principal_scope === principal
++              && get().key === catalogKey(principal, policy.snapshot_fingerprint)) {
+               set({ policy, isLoading: false, error: null });
+               return;
+             }
+-
++            // Drop stale policy, lists and schemas together. The subsequent
++            // bundle may legitimately be newer than the just-observed policy.
++            catalogGeneration += 1;
++            set({ ...emptyCatalogState(), principal, isLoading: true });
++          }
++          for (let attempt = 0; attempt < 3; attempt += 1) {
++            const bundle = await api.fetchPluginCatalogBootstrap();
++            if (requestGeneration !== generation || !isCurrentAuthGeneration(authGeneration)) return;
++            const { policy, sources, transforms, sinks } = bundle.data;
++            if (bundle.snapshotFingerprint !== policy.snapshot_fingerprint
++              || policy.principal_scope !== principal) {
++              continue;
++            }
++            // A single publication owns policy and every group. Never expose
++            // a new policy with old or partly fetched lists.
+             set({
+-              key: nextKey,
+-              principal: canonicalPrincipal,
++              key: catalogKey(principal, policy.snapshot_fingerprint),
++              principal,
+               fingerprint: policy.snapshot_fingerprint,
+               policy,
+-              sources: null,
+-              transforms: null,
+-              sinks: null,
++              sources,
++              transforms,
++              sinks,
+               schemas: {},
+               schemaLoading: {},
+               schemaErrors: {},
+-              isLoading: true,
+-              error: null,
+-            });
+-
+-            const [sources, transforms, sinks] = await Promise.all([
+-              api.listSources(),
+-              api.listTransforms(),
+-              api.listSinks(),
+-            ]);
+-            if (requestGeneration !== generation) return;
+-            const fingerprints = [
+-              sources.snapshotFingerprint,
+-              transforms.snapshotFingerprint,
+-              sinks.snapshotFingerprint,
+-            ];
+-            if (fingerprints.some((value) => value !== policy.snapshot_fingerprint)) {
+-              continue;
+-            }
+-            set({
+-              sources: sources.data,
+-              transforms: transforms.data,
+-              sinks: sinks.data,
+               isLoading: false,
+               error: null,
+             });
+@@ -189,17 +164,17 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+           }
+           throw new Error("Plugin catalog snapshot changed repeatedly while loading.");
+         } catch {
+-          if (requestGeneration !== generation) return;
++          if (requestGeneration !== generation || !isCurrentAuthGeneration(authGeneration)) return;
++          catalogGeneration += 1;
+           set({
+-            sources: null,
+-            transforms: null,
+-            sinks: null,
++            ...emptyCatalogState(),
++            principal,
+             isLoading: false,
+             error: "Failed to load plugin catalog.",
+           });
+         }
+       })();
+-      activeLoad = { principal, fingerprint, promise };
++      activeLoad = { principal, fingerprint, authGeneration, promise };
+       try {
+         await promise;
+       } finally {
+@@ -211,6 +186,8 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+       const cacheKey = `${kind}:${name}`;
+       const state = get();
+       const owningCatalogKey = state.key;
++      const schemaGeneration = catalogGeneration;
++      const authGeneration = currentAuthGeneration();
+       if (
+         owningCatalogKey === null ||
+         state.schemas[cacheKey] !== undefined ||
+@@ -224,10 +201,11 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+       });
+       try {
+         const schema = await api.getPluginSchema(kind, name);
+-        if (get().key !== owningCatalogKey) return;
++        if (get().key !== owningCatalogKey || schemaGeneration !== catalogGeneration || !isCurrentAuthGeneration(authGeneration)) return;
+         if (schema.snapshotFingerprint !== state.fingerprint) {
+           await get().load({ principal: state.principal!, force: true });
+-          if (get().fingerprint !== schema.snapshotFingerprint) return;
++          if (get().principal !== state.principal || get().fingerprint !== schema.snapshotFingerprint
++            || !isCurrentAuthGeneration(authGeneration)) return;
+         }
+         set((latest) => ({
+           schemas: { ...latest.schemas, [cacheKey]: schema.data },
+@@ -235,7 +213,7 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+           schemaErrors: { ...latest.schemaErrors, [cacheKey]: false },
+         }));
+       } catch (error) {
+-        if (get().key !== owningCatalogKey) return;
++        if (get().key !== owningCatalogKey || schemaGeneration !== catalogGeneration || !isCurrentAuthGeneration(authGeneration)) return;
+         const responseFingerprint = (error as ApiError).snapshot_fingerprint;
+         if (
+           responseFingerprint !== undefined &&
+@@ -254,6 +232,7 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+     async invalidate() {
+       const principal = get().principal;
+       generation += 1;
++      catalogGeneration += 1;
+       activeLoad = null;
+       set({
+         ...emptyCatalogState(),
+@@ -267,6 +246,7 @@ export function createPluginCatalogStore(): PluginCatalogStore {
+ 
+     clear() {
+       generation += 1;
++      catalogGeneration += 1;
+       activeLoad = null;
+       set(emptyCatalogState());
+     },
+diff --git a/src/elspeth/web/frontend/src/test/inlineSourceIntegration.test.tsx b/src/elspeth/web/frontend/src/test/inlineSourceIntegration.test.tsx
+index 3c1059a8f..0f5df4a87 100644
+--- a/src/elspeth/web/frontend/src/test/inlineSourceIntegration.test.tsx
++++ b/src/elspeth/web/frontend/src/test/inlineSourceIntegration.test.tsx
+@@ -173,6 +173,9 @@ vi.mock("../api/client", async (importOriginal) => ({
+   fetchRuns: vi.fn().mockResolvedValue([]),
+   fetchComposerProgress: vi.fn().mockResolvedValue({ phase: "idle" }),
+   fetchRecoveryTranscript: vi.fn().mockResolvedValue([]),
++  fetchPluginCatalogBootstrap: vi.fn().mockResolvedValue({ snapshotFingerprint: "inline-test",
++    data: { policy: { principal_scope: "local:test-001", snapshot_fingerprint: "inline-test", policy_hash: "inline-test",
++      available_plugin_ids: [], capability_groups: [], selections: [], control_modes: [] }, sources: [], transforms: [], sinks: [] } }),
+   listSources: vi.fn().mockResolvedValue([]),
+   listTransforms: vi.fn().mockResolvedValue([]),
+   listSinks: vi.fn().mockResolvedValue([]),
+diff --git a/src/elspeth/web/frontend/src/types/index.ts b/src/elspeth/web/frontend/src/types/index.ts
+index d9f79de98..e4f3bfdaf 100644
+--- a/src/elspeth/web/frontend/src/types/index.ts
++++ b/src/elspeth/web/frontend/src/types/index.ts
+@@ -500,6 +500,14 @@ export interface PluginSnapshotResponse<T> {
+   snapshotFingerprint: string;
+ }
+ 
++/** One authenticated snapshot supplies the policy and all public summaries. */
++export interface PluginCatalogBootstrapResponse {
++  policy: PluginPolicyResponse;
++  sources: PluginSummary[];
++  transforms: PluginSummary[];
++  sinks: PluginSummary[];
++}
++
+ export type PluginPolicyUnavailableReason =
+   | "plugin_not_enabled"
+   | "plugin_not_installed"
+diff --git a/src/elspeth/web/frontend/src/api/catalogBootstrapDecoder.ts b/src/elspeth/web/frontend/src/api/catalogBootstrapDecoder.ts
+new file mode 100644
+index 000000000..44c2ad16c
+--- /dev/null
++++ b/src/elspeth/web/frontend/src/api/catalogBootstrapDecoder.ts
+@@ -0,0 +1,60 @@
++import type { PluginCatalogBootstrapResponse } from "@/types/index";
++
++function object(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function strings(value: unknown): value is string[] {
++  return Array.isArray(value) && value.every((item: unknown) => typeof item === "string");
++}
++
++function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
++  return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
++}
++
++function capability(value: unknown): boolean {
++  return value === "llm" || value === "prompt_shield" || value === "content_safety";
++}
++
++function summaries(value: unknown, kind: string): boolean {
++  return Array.isArray(value) && value.every((item: unknown) => object(item)
++    && typeof item.name === "string" && item.name.length > 0
++    && item.plugin_type === kind && typeof item.description === "string"
++    && Array.isArray(item.config_fields) && item.config_fields.every((field: unknown) => object(field)
++      && typeof field.name === "string" && typeof field.type === "string" && typeof field.required === "boolean"
++      && (field.description === null || typeof field.description === "string") && Object.hasOwn(field, "default"))
++    && [item.usage_when_to_use, item.usage_when_not_to_use, item.example_use].every((text) => text === null || typeof text === "string")
++    && strings(item.capability_tags) && strings(item.audit_characteristics));
++}
++
++/** Validate the new closed bundle envelope without trusting a TypeScript cast. */
++export function decodeCatalogBootstrap(value: unknown, fingerprint: string): PluginCatalogBootstrapResponse {
++  if (!object(value) || !exactKeys(value, ["policy", "sources", "transforms", "sinks"]) || !object(value.policy)) {
++    throw new Error("Malformed plugin catalog bootstrap.");
++  }
++  const policy = value.policy;
++  if (!exactKeys(policy, ["principal_scope", "snapshot_fingerprint", "policy_hash", "available_plugin_ids", "capability_groups", "selections", "control_modes"])
++    || typeof policy.principal_scope !== "string" || policy.principal_scope.length === 0
++    || typeof policy.policy_hash !== "string" || policy.policy_hash.length === 0
++    || policy.snapshot_fingerprint !== fingerprint || fingerprint.length === 0
++    || !strings(policy.available_plugin_ids)
++    || !Array.isArray(policy.capability_groups) || !policy.capability_groups.every((group: unknown) => object(group)
++      && exactKeys(group, ["capability", "available_plugin_ids"]) && capability(group.capability) && strings(group.available_plugin_ids))
++    || !Array.isArray(policy.selections) || !policy.selections.every((selection: unknown) => object(selection)
++      && exactKeys(selection, ["capability", "plugin_id"]) && capability(selection.capability)
++      && (selection.plugin_id === null || typeof selection.plugin_id === "string"))
++    || !Array.isArray(policy.control_modes) || !policy.control_modes.every((mode: unknown) => object(mode)
++      && exactKeys(mode, ["capability", "mode"]) && capability(mode.capability) && (mode.mode === "recommend" || mode.mode === "required"))
++    || !summaries(value.sources, "source") || !summaries(value.transforms, "transform") || !summaries(value.sinks, "sink")) {
++    throw new Error("Malformed plugin catalog bootstrap.");
++  }
++  const admitted = value as unknown as PluginCatalogBootstrapResponse;
++  const ids = [...admitted.sources, ...admitted.transforms, ...admitted.sinks]
++    .map((summary) => `${summary.plugin_type}:${summary.name}`).sort();
++  const available = [...admitted.policy.available_plugin_ids].sort();
++  if (new Set(ids).size !== ids.length || ids.length !== available.length
++    || ids.some((id, index) => id !== available[index])) {
++    throw new Error("Plugin catalog groups do not match their policy.");
++  }
++  return admitted;
++}
+diff --git a/src/elspeth/web/frontend/src/stores/pluginCatalogBootstrap.integration.test.ts b/src/elspeth/web/frontend/src/stores/pluginCatalogBootstrap.integration.test.ts
+new file mode 100644
+index 000000000..75bcd93a4
+--- /dev/null
++++ b/src/elspeth/web/frontend/src/stores/pluginCatalogBootstrap.integration.test.ts
+@@ -0,0 +1,28 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { createPluginCatalogStore } from "./pluginCatalogStore";
++
++afterEach(() => vi.unstubAllGlobals());
++
++describe("catalog store through the real client decoder", () => {
++  it.each(["correct", "mismatch"])("handles bootstrap header %s with one real client request", async (header) => {
++    const data = { policy: { principal_scope: "local:alice", snapshot_fingerprint: "a", policy_hash: "p",
++      available_plugin_ids: [], capability_groups: [], selections: [], control_modes: [] },
++    sources: [], transforms: [], sinks: [] };
++    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(data), {
++      status: 200, headers: { "X-ELSPETH-Plugin-Snapshot": header === "correct" ? "a" : "b" },
++    }));
++    vi.stubGlobal("fetch", fetch);
++    const store = createPluginCatalogStore();
++    try {
++      await store.getState().load({ principal: "local:alice" });
++      expect(fetch).toHaveBeenCalledTimes(1);
++      expect(fetch).toHaveBeenCalledWith("/api/catalog/bootstrap", expect.objectContaining({ cache: "no-store" }));
++      if (header === "correct") {
++        expect(store.getState()).toMatchObject({ policy: data.policy, sources: [], transforms: [], sinks: [], error: null });
++      } else {
++        expect(store.getState()).toMatchObject({ policy: null, sources: null, transforms: null, sinks: null, key: null });
++        expect(store.getState().error).not.toBeNull();
++      }
++    } finally { store.getState().dispose(); }
++  });
++});
+diff --git a/tests/unit/web/catalog/test_bootstrap.py b/tests/unit/web/catalog/test_bootstrap.py
+new file mode 100644
+index 000000000..927bef498
+--- /dev/null
++++ b/tests/unit/web/catalog/test_bootstrap.py
+@@ -0,0 +1,207 @@
++"""Authenticated catalog bootstrap parity and live-snapshot custody controls."""
++
++from collections import Counter
++import json
++from pathlib import Path
++from unittest.mock import patch
++
++import httpx
++import pytest
++from pydantic import ValidationError
++
++from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
++from elspeth.web.app import create_app
++from elspeth.web.async_workers import shutdown_async_workers
++from elspeth.web.auth.local import LocalAuthProvider
++from elspeth.web.catalog.policy_view import PolicyCatalogView
++from elspeth.web.catalog.schemas import PluginCatalogBootstrapResponse
++from elspeth.web.config import WebSettings
++from elspeth.web.key_derivation import derive_binding_generation_key
++from elspeth.web.plugin_policy.availability import RequestPluginSnapshotFactory
++from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
++from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
++from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
++from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
++
++ADI = "transform:azure_document_intelligence"
++SECRET_NAME = "AZURE_DOCUMENT_INTELLIGENCE_KEY"
++
++
++@pytest.fixture
++async def bootstrap_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "catalog-bootstrap-test-fingerprint")
++    settings = WebSettings(
++        data_dir=tmp_path,
++        composer_max_composition_turns=4,
++        composer_max_discovery_turns=4,
++        composer_timeout_seconds=60,
++        composer_rate_limit_per_minute=20,
++        composer_boot_probe_enabled=False,
++        shareable_link_signing_key=b"catalog-bootstrap-test-signing-key",
++        user_secrets_enabled=True,
++        plugin_allowlist=(ADI,),
++        azure_document_intelligence_endpoint="https://bootstrap.cognitiveservices.azure.com",
++        llm_profiles={"task-role": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0"}},
++        default_llm_profile="task-role",
++    )
++    app = create_app(settings, process_watchdog_factory=OwnedTestProcessWatchdog)
++    app.state.auth_audit_recorder.start()
++    auth = app.state.auth_provider
++    assert isinstance(auth, LocalAuthProvider)
++    tokens = {}
++    for name in ("alice", "bob"):
++        auth.create_user(name, "synthetic catalog test password", name)
++        with app.state.session_engine.begin() as connection:
++            ensure_test_identity(connection, identity_id=name)
++            grant_test_pipeline_user(connection, identity_id=name)
++        tokens[name] = auth._issuer.mint(identity_id=name, username=name)
++    try:
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++            yield app, client, tokens
++    finally:
++        app.state.composer_session_cache_registry.begin_shutdown()
++        await app.state.composer_async_worker.stop()
++        app.state.composer_async_worker.assert_shutdown_complete()
++        await shutdown_async_workers()
++        await app.state.composer_session_cache_registry.finish_shutdown()
++        app.state.auth_audit_recorder.close()
++        app.state.session_engine.dispose()
++        await app.state.operator_telemetry.shutdown()
++
++
++@pytest.mark.asyncio
++async def test_authenticated_bundle_matches_old_endpoints_with_live_producer_counts(bootstrap_app):
++    app, client, tokens = bootstrap_app
++    app.state.secret_service.set_user_secret("alice", SECRET_NAME, "synthetic-first", auth_provider_type="local")
++    headers = {"Authorization": f"Bearer {tokens['alice']}"}
++    counts: Counter[str] = Counter()
++    original_snapshot = RequestPluginSnapshotFactory.__call__
++    original_sources = PolicyCatalogView.list_sources
++    original_transforms = PolicyCatalogView.list_transforms
++    original_sinks = PolicyCatalogView.list_sinks
++
++    def snapshot(self, user):
++        counts["snapshots"] += 1
++        return original_snapshot(self, user)
++
++    def sources(self):
++        counts["sources"] += 1
++        return original_sources(self)
++
++    def transforms(self):
++        counts["transforms"] += 1
++        return original_transforms(self)
++
++    def sinks(self):
++        counts["sinks"] += 1
++        return original_sinks(self)
++
++    with (
++        patch.object(RequestPluginSnapshotFactory, "__call__", snapshot),
++        patch.object(PolicyCatalogView, "list_sources", sources),
++        patch.object(PolicyCatalogView, "list_transforms", transforms),
++        patch.object(PolicyCatalogView, "list_sinks", sinks),
++    ):
++        bundled = await client.get("/api/catalog/bootstrap", headers=headers)
++        assert bundled.status_code == 200
++        assert counts == {"snapshots": 1, "sources": 1, "transforms": 1, "sinks": 1}
++        counts.clear()
++        prior = {}
++        for group in ("policy", "sources", "transforms", "sinks"):
++            response = await client.get(f"/api/catalog/{group}", headers=headers)
++            assert response.status_code == 200
++            prior[group] = response.json()
++        # Old path is the connected positive counter control, not guessed calls.
++        assert counts == {"snapshots": 4, "sources": 2, "transforms": 2, "sinks": 2}
++    assert bundled.json() == prior
++    assert bundled.headers["cache-control"] == "private, no-store"
++    assert bundled.headers["vary"] == "Authorization, Cookie"
++    assert bundled.headers["x-elspeth-plugin-snapshot"] == prior["policy"]["snapshot_fingerprint"]
++    assert ADI in prior["policy"]["available_plugin_ids"]
++    adi = next(item for item in prior["transforms"] if item["name"] == "azure_document_intelligence")
++    assert not next(field for field in adi["config_fields"] if field["name"] == "endpoint")["required"]
++    llm = next(item for item in prior["transforms"] if item["name"] == "llm")
++    assert "api_key" not in {field["name"] for field in llm["config_fields"]}
++    assert "synthetic-first" not in bundled.text
++
++
++@pytest.mark.asyncio
++async def test_fresh_authentication_principal_inventory_and_generation(bootstrap_app):
++    app, client, tokens = bootstrap_app
++    assert (await client.get("/api/catalog/bootstrap")).status_code == 401
++    headers = {name: {"Authorization": f"Bearer {token}"} for name, token in tokens.items()}
++    before = await client.get("/api/catalog/bootstrap", headers=headers["alice"])
++    assert ADI not in before.json()["policy"]["available_plugin_ids"]
++    app.state.secret_service.set_user_secret("alice", SECRET_NAME, "synthetic-first", auth_provider_type="local")
++    alice = await client.get("/api/catalog/bootstrap", headers=headers["alice"])
++    bob = await client.get("/api/catalog/bootstrap", headers=headers["bob"])
++    assert alice.status_code == bob.status_code == 200
++    assert alice.json()["policy"]["principal_scope"] == "local:alice"
++    assert bob.json()["policy"]["principal_scope"] == "local:bob"
++    assert ADI in alice.json()["policy"]["available_plugin_ids"]
++    assert ADI not in bob.json()["policy"]["available_plugin_ids"]
++    assert all(item["name"] != "azure_document_intelligence" for item in bob.json()["transforms"])
++    app.state.secret_service.set_user_secret("alice", SECRET_NAME, "synthetic-rotated", auth_provider_type="local")
++    rotated = await client.get("/api/catalog/bootstrap", headers=headers["alice"])
++    assert rotated.headers["x-elspeth-plugin-snapshot"] != alice.headers["x-elspeth-plugin-snapshot"]
++    assert rotated.json()["policy"]["available_plugin_ids"] == alice.json()["policy"]["available_plugin_ids"]
++    assert "synthetic-rotated" not in rotated.text
++    app.state.secret_service.delete_user_secret("alice", SECRET_NAME, auth_provider_type="local")
++    deleted = await client.get("/api/catalog/bootstrap", headers=headers["alice"])
++    assert ADI not in deleted.json()["policy"]["available_plugin_ids"]
++
++
++@pytest.mark.asyncio
++async def test_bootstrap_wire_contract_is_closed_and_response_mutation_is_not_retained(bootstrap_app):
++    _, client, tokens = bootstrap_app
++    headers = {"Authorization": f"Bearer {tokens['alice']}"}
++    response = await client.get("/api/catalog/bootstrap", headers=headers)
++    PluginCatalogBootstrapResponse.model_validate_json(response.content)
++    bad = response.json()
++    bad["resolved_credentials"] = {}
++    with pytest.raises(ValidationError, match="extra_forbidden"):
++        PluginCatalogBootstrapResponse.model_validate_json(json.dumps(bad))
++    changed = response.json()
++    changed["sources"][0]["description"] = "client mutation"
++    next_response = await client.get("/api/catalog/bootstrap", headers=headers)
++    assert next_response.json() == response.json()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("change", ["endpoint", "profile", "policy"])
++async def test_new_request_uses_current_configured_snapshot_and_public_projection(bootstrap_app, change):
++    app, client, tokens = bootstrap_app
++    app.state.secret_service.set_user_secret("alice", SECRET_NAME, "synthetic-first", auth_provider_type="local")
++    headers = {"Authorization": f"Bearer {tokens['alice']}"}
++    before = await client.get("/api/catalog/bootstrap", headers=headers)
++    values = app.state.settings.model_dump()
++    if change == "endpoint":
++        values["azure_document_intelligence_endpoint"] = None
++    elif change == "profile":
++        values["llm_profiles"] = {"new-role": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0"}}
++        values["default_llm_profile"] = "new-role"
++    else:
++        values["plugin_allowlist"] = ()
++    settings = WebSettings.model_validate(values)
++    runtime = RuntimeWebPluginConfig.from_settings(settings)
++    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
++    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
++    # Model a replacement of the owned configured services, not an ambient
++    # mutation of the request snapshot or a fake permission verdict.
++    app.state.web_plugin_policy = policy
++    app.state.operator_profile_registry = profiles
++    app.state.plugin_snapshot_factory = RequestPluginSnapshotFactory(
++        policy=policy, catalog=app.state.catalog_service, profiles=profiles,
++        auth_provider=settings.auth_provider, secret_service=app.state.secret_service,
++        server_store=app.state.server_secret_store, user_store=app.state.user_secret_store,
++        generation_key=derive_binding_generation_key(settings.secret_key),
++    )
++    after = await client.get("/api/catalog/bootstrap", headers=headers)
++    assert before.status_code == after.status_code == 200
++    assert before.headers["x-elspeth-plugin-snapshot"] != after.headers["x-elspeth-plugin-snapshot"]
++    assert before.json()["transforms"] != after.json()["transforms"]
++    for group in ("policy", "sources", "transforms", "sinks"):
++        separate = await client.get(f"/api/catalog/{group}", headers=headers)
++        assert separate.status_code == 200
++        assert after.json()[group] == separate.json()
++    assert "synthetic-first" not in after.text
