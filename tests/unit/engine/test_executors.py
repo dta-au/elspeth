@@ -100,6 +100,7 @@ from tests.fixtures.executors import (
     _make_span_factory,
     _make_token,
     _make_transform,
+    _single_complete_node_state_kwargs,
 )
 from tests.fixtures.factories import make_context
 from tests.unit.engine.conftest import make_test_step_resolver as _make_step_resolver
@@ -2067,8 +2068,6 @@ class TestTransformExecutorTerminality:
         NaN/Infinity output, but this happened after the old try/except,
         leaving the state OPEN.
         """
-        from elspeth.core.canonical import stable_hash
-
         factory = _make_factory()
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
         transform = _make_transform()
@@ -2085,16 +2084,14 @@ class TestTransformExecutorTerminality:
         token = _make_token()
         ctx = make_context()
 
-        # Monkey-patch stable_hash to fail on the second call (output hash)
-        # First call is input_hash (succeeds), second is output_hash (fails)
-        original_stable_hash = stable_hash
+        # Monkey-patch the executor's stable_hash to fail. The executor hashes
+        # only the output: the input hash is the one begin_node_state()
+        # recorded, read back from the guard's opened state.
         call_count = 0
 
         def failing_hash(data: Any) -> str:
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
-                return original_stable_hash(data)  # input hash succeeds
             raise ValueError("NaN detected in output")
 
         import elspeth.engine.executors.transform as transform_mod
@@ -2106,6 +2103,8 @@ class TestTransformExecutorTerminality:
                 executor.execute_transform(transform, token, ctx, attempt=0)
         finally:
             transform_mod.stable_hash = original_ref  # type: ignore[attr-defined]
+
+        assert call_count == 1  # output hash only; no executor-side input re-hash
 
         # State must be FAILED (auto-completed by guard), not OPEN
         factory.execution.complete_node_state.assert_called_once()
@@ -2153,6 +2152,68 @@ class TestTransformExecutorTerminality:
         assert message.startswith(f"Transform 'test_transform' emitted non-canonical data at {located} (")
         assert "Error)" in message, "the exception type is reported"
         assert str(bigint) not in repr(factory.execution.complete_node_state.call_args.kwargs["error"])
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+    def test_non_finite_output_still_raises_routable_violation_with_one_executor_hash(self, bad_value: float) -> None:
+        """NaN/Infinity output is a routed Tier-2 violation raised before guard.complete().
+
+        Negative control for dropping the executor's input re-hash: the output
+        hash stays in the executor because it is the canonicalization gate.
+        The executor calls ``stable_hash`` exactly once per attempt (output);
+        the input hash is the repository's, read from the opened state.
+        """
+        import elspeth.engine.executors.transform as transform_mod
+        from elspeth.core.canonical import stable_hash as real_stable_hash
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform()
+        transform.process.return_value = TransformResult.success(
+            make_row({"value": bad_value}, contract=_make_contract()), success_reason={"action": "test"}
+        )
+        executor_hash_calls = 0
+
+        def counting_hash(data: Any) -> str:
+            nonlocal executor_hash_calls
+            executor_hash_calls += 1
+            return real_stable_hash(data)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(transform_mod, "stable_hash", counting_hash)
+            with pytest.raises(PluginContractViolation, match="non-canonical data") as excinfo:
+                executor.execute_transform(transform, _make_token(), make_context(), attempt=0)
+
+        assert not isinstance(excinfo.value, TIER_1_ERRORS), "the violation must stay routable (Tier 2)"
+        assert executor_hash_calls == 1
+        kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert kwargs["error"].phase == "transform_execution"
+        factory.data_flow.record_token_outcome.assert_not_called()
+
+    def test_successful_attempt_hashes_only_output_in_executor(self) -> None:
+        """One executor-side ``stable_hash`` per successful attempt; input hash comes from the opened state."""
+        import elspeth.engine.executors.transform as transform_mod
+        from elspeth.core.canonical import stable_hash as real_stable_hash
+
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        contract = _make_contract()
+        token = _make_token(contract=contract)
+        output_row = make_row({"value": "out"}, contract=contract)
+        transform = _make_transform()
+        transform.process.return_value = TransformResult.success(output_row, success_reason={"action": "test"})
+        hashed: list[Any] = []
+
+        def counting_hash(data: Any) -> str:
+            hashed.append(data)
+            return real_stable_hash(data)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(transform_mod, "stable_hash", counting_hash)
+            result, _, _ = executor.execute_transform(transform, token, make_context(), attempt=0)
+
+        assert hashed == [output_row]
+        assert result.input_hash == factory.execution.begin_node_state.return_value.input_hash
+        assert_stable_hash(result.input_hash, token.row_data.to_dict())
 
     def test_contract_evolution_failure_marks_state_failed(self) -> None:
         """Contract evolution failure → state FAILED, not COMPLETED-then-crash.
