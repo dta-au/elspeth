@@ -88,6 +88,14 @@ describe("durable audit attribution", () => {
     ]);
   });
 
+  it("skips visible tool-event and response-gap companions without counting them", () => {
+    expect(summarizeLlmAuditRows([
+      auditMessage("a1", { _kind: "composer_visible_tool_event", schema: "composer.visible-tool-event.v1" }),
+      auditMessage("a2", { _kind: "composer_visible_response_gap" }),
+      auditMessage("a3", { _kind: "llm_call_audit", call: { planner_call_ordinal: 1, status: "success", latency_ms: 10 } }),
+    ])).toEqual([row("a3", { planner_call_ordinal: 1, latency_ms: 10 })]);
+  });
+
   it("fails closed on unknown or malformed audit data", () => {
     expect(() => summarizeLlmAuditRows([auditMessage("a", { _kind: "mystery" })])).toThrow(/unknown value mystery/);
     expect(() => summarizeLlmAuditRows({ invalid: true })).toThrow(/must be an array/);
