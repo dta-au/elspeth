@@ -66,18 +66,19 @@ verifying path), not by the type of the container.
 | 10 | Load `chat_messages.tool_calls` once per list, filter by id | Low–Med | Medium | Reviewed-writer recipe re-pin; sessions unit | open |
 | 11 | Memoize tool-definition credential scan by tools hash | Low | Low | Unit (provider_context) | open |
 | 12 | Cache `canonical_set_pipeline_schema()` per process | Low | Low | Unit (schema_contract, planner) | open |
+| 13 | Review-card publication: prepare once per candidate, batch fenced reads | Medium | Medium–High | Sessions + interpretation unit; recipe pins | open |
+| 14 | Preserve state identity: single restore, no-op reconcile returns same object, hash once | Low–Med | Medium | Proposal/decoder/sessions unit | open |
+| 15 | Candidate build: drop the third full walk on the identical reconciled object | Low–Med | Low | Planner unit | open — commit rebuild stays |
 
-Reported by the external profile, **not yet verified here** — each gets a
-line-level check (lane report) before it is promoted to a numbered fix:
+Externally reported items verified here and left pending (lane report
+`.claude/lanes/perf-eval/09-pending-p11-p16.md`); P-11/12/13 were promoted
+to fixes 13/14/15 below:
 
-| Pending | Reported mechanism | Reported scale |
+| Pending | Verified mechanism | Status |
 |---|---|---|
-| P-11 Review-card publication | Each interpretation card re-prepares principal/plugin availability, inline preflight config, blob info and validation inputs for the same candidate; inside the transaction each card re-fetches anchor and current-state rows; prior cards are fetched by node/kind and surfacing graphs loaded before term filtering → `0+1+…+(R−1)` lookups, worst case `O(R² × graph)` | Five cards on the complex graph (different node/kind groups, so not quadratic in that run) |
-| P-12 Rehydration / no-op reconstruction | Review-argument projection restores the same authority twice; graph-review read reconstructs the same record twice; reconciliation rebuilds every source/node/state on no change; proposal restoration hashes the audit payload twice and listing a third time. `composition_content_hash()` memoizes correctly but callers discard the instance | 1.2 ms rehydrate+hash, 0.78 ms double restore, 0.39 ms no-op reconcile, 5.8 ms proposal restore — small each, multiplied by publish/accept/list |
-| P-13 Candidate build validation shape | One build = 3 full-graph validations + N small probes; the last two full walks receive the *same* reconciled state object; `prepare_pipeline_commit` then builds the candidate again (that second build backs an integrity comparison — needs a replacement contract, not deletion) | 6.3 / 20.7 / 68.0 ms at 1 / 10 / 40 nodes |
-| P-14 Provider-request preparation | JSON round trip 5.5 ms, manifest 12.5 ms, size serialization 4.8 ms, private capture 62 ms (1.56 MiB transient), hash pair 4.8 ms, retained-payload validation ~15 ms, canonical `set_pipeline` schema built twice at 4.3 ms each | ~310 KB request; follow-on to fix 6 and 4A |
-| P-15 Application fingerprint | Launch/recovery re-reads and hashes 990 source files (~23.8 MB) | 0.19–0.20 s per occurrence |
-| P-16 Recovery envelope | Same serialized envelope parsed three times (validation, input construction, restoration) | per recovery |
+| P-14 Provider-request preparation | JSON round trip 5.5 ms, manifest 12.5 ms, size serialization 4.8 ms, private capture 62 ms (1.56 MiB transient), hash pair 4.8 ms, retained-payload validation ~15 ms; schema double-build is fix 12 | Follow-on to fixes 6, 11, 12 and 4A |
+| P-15 Application fingerprint | **Corrected:** runs per run admission and per restore (a fresh run pays it twice), not at process launch. 990 files / 23,777,024 B confirmed; ~0.085 s hashing + ~0.127 s dependency scan. In a built dev tree the glob also hashes 6 `.py` files under `src/elspeth/web/frontend/node_modules/` — a correctness smell (the fingerprint varies with a frontend install). No test pins the computation | Fix: cache per process keyed on tree mtime/size manifest with explicit invalidation **after** a ruling on whether in-place edits must be detected per run; exclude `node_modules` regardless |
+| P-16 Recovery envelope | **Downgraded:** 3 parses per restore (4 per fresh run) at ~0.1 ms each — negligible. The real redundancy is retained inputs and blobs re-hashed twice on restore (`envelope.py:574/577` vs `:380/390`). The restore parse at `:361` is the trust-boundary one | Low priority; fold the double hash into fix 9's class |
 
 From the in-repo systems scan (`.claude/lanes/perf-eval/07-systems-scan.md`;
 per-turn counts read from code, costs from isolated timing where stated,
@@ -96,9 +97,11 @@ the original list:
 | S-10/11 Accept re-checks own arguments; serialize-then-hash twice | A | Proposal accept re-verifies arguments it just produced (10–81 ms); same value serialized then hashed separately back-to-back | Fold into fix 6 |
 | S-12 Post-turn GET fan-out | F | Frontend fires 6–7 GETs after every turn, beyond fix 2's validate/readiness pair | Extend fix 2B's coordinator |
 
-Order: 1 → 2A → re-measure → 10 → 6 (+S-10/11) → 11 → 12 → 3-T1 → 2B
-(+S-12) → 4A → 7 → 9 → re-measure; other pending items slot in once
-verified and, where marked, ruled on. Fixes 1 and 2A remove the noise that would otherwise confound
+Order: 1 → 2A → re-measure → 10 → 6 (+S-10/11) → 14 → 15 → 11 → 12 →
+3-T1 → 13 → 2B (+S-12) → 4A → 7 → 9 → re-measure; other pending items slot
+in once verified and, where marked, ruled on. Fix 13 sits after 3-T1 because
+it is the widest change to session-write transactions and benefits from
+fixes 1, 14 and 15 having shrunk the per-card cost first. Fixes 1 and 2A remove the noise that would otherwise confound
 the later measurements. Fix 10 comes next because its cost scales with
 history × proposals rather than being a fixed per-request charge; fix 6 is
 CPU-bound and scales with graph size, so both matter more for the larger
@@ -684,6 +687,95 @@ for mutation.
 
 **Tests.** `tests/unit/web/composer/tools/` schema-contract tests; add a
 call-count assertion and a byte-identity check against the uncached result.
+
+**Evidence.** _(fill in)_
+
+---
+
+## Fix 13 — Review-card publication repeats shared preparation per card
+
+**Mechanism (verified).** Publishing R interpretation cards for one
+candidate re-prepares, per card, the principal/plugin snapshot, inline
+preflight config, blob snapshot and validation inputs
+(`sessions/service.py:4996-5019`), and inside the write transaction
+re-selects the anchor and head `composition_states` rows per card
+(`repository.py:1073`, `:1085`) even when they are the same row. Existing
+pending cards at the same (node, kind) are loaded *with their surfacing
+graphs* before term filtering, giving `R(R−1)/2` lookups for R terms at one
+node/kind (derived from code; the complex graph's five cards sit in
+different groups, so that run was linear). The prepared validator is only
+consumed on the review-disabled arm (`pending_interpretation.py:2125`).
+
+**Change.** Prepare shared candidate context once per publication (snapshot,
+inline config, blob snapshot, validation inputs); carry a transaction-local
+map `state_id → verified row + derived graph`; filter terms before loading
+surfacing graphs. Advance the shared context only when a card actually
+changes state. Keep per-card provenance and authorization checks.
+
+**Hazards.** Widest transaction change in the set; writer-recipe pins on
+the interpretation write path (check `reviewed-writer-recipes.json`);
+SQLite vs PostgreSQL fence semantics — needs the Testcontainer job.
+
+**Tests.** `tests/unit/web/sessions/` interpretation publication tests;
+add a statement-count assertion (N cards → one anchor/head read) and a
+quadratic-shape negative control with R terms at one node/kind.
+
+**Evidence.** _(fill in)_
+
+---
+
+## Fix 14 — Preserve state identity across restore / reconcile / hash
+
+**Mechanism (verified, measured).** `composition_content_hash()` memoizes
+correctly on the state instance (0.0007 ms on a hit) but ~10 call sites
+discard the instance and rehydrate from the row. Specific duplicates:
+`owned_composition_state_safe_sources` (`pipeline_proposal.py:528`)
+restores the authority, then calls
+`owned_composition_state_execution_arguments` (`:507`) which restores it
+again; `read_state()` is called twice for the same record
+(`sessions/service.py:6956`, `:6994`); reconcile returns a new object
+unconditionally even on no change (memo lost; ~0.39 ms replacing all node
+option objects); the audit-payload hash is computed twice in proposal
+restore (`proposal_decoder.py:186`, `:258-261`) and a third time on list
+(`service.py:4712`).
+
+**Change.** Thread the restored state through instead of re-restoring;
+make reconcile return the input object when nothing changed (identity, so
+the memo survives); compute the audit-payload hash once in the decoder and
+carry it on the restored proposal. Keep every external/persisted entry
+(`from_dict`, decoder) on the full verification path (ADR-032).
+
+**Tests.** `tests/unit/web/composer/test_pipeline_proposal.py`,
+proposal_decoder tests, sessions list/read tests; add identity assertions
+(`reconcile(x) is x` on no change; one restore per safe-sources call).
+
+**Evidence.** _(fill in)_
+
+---
+
+## Fix 15 — Candidate build walks the same reconciled object twice
+
+**Mechanism (verified, measured).** One candidate build performs three
+full-graph validations plus one probe per source and per transform
+(6.3 / 20.7 / 68.0 ms at 1 / 10 / 40 nodes). Walks 2 and 3 receive the
+*same* reconciled state object (same `id()`); walk 1 extracts
+mutation-blocking invariants from the pre-reconcile state. Only the
+trained-operator path was measured.
+
+**Keep:** `prepare_pipeline_commit` builds a dry-run candidate and the
+audited dispatch builds again; the two are compared —
+`candidate_hash != proposed_content_hash` → `AuditIntegrityError`
+(`pipeline_commit.py:477-478`) and `executor_hash` bound into the dispatch
+(`:557-558`). That is an integrity contract, not redundancy; a single-build
+design needs an explicit replacement binding before it can be considered.
+
+**Change.** Reuse walk 2's result for walk 3 when the object identity is
+unchanged and no policy lowering intervened; policy lowering that changes
+the executable graph still validates the changed representation.
+
+**Tests.** Planner candidate-build tests under `tests/unit/web/composer/`;
+add a walk-count assertion with identity check and a negative control where
+lowering changes the graph and a third walk is still performed.
 
 **Evidence.** _(fill in)_
 
