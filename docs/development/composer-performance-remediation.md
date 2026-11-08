@@ -131,9 +131,17 @@ on; fix 9 is engine-side and scales with rows × retries.
 - Read [CONTRIBUTING.md § Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit)
   before touching anything under `src/elspeth/web`. No new `getattr`, no
   wire-shape changes without updating the pinned templates.
-- Tests: run to a log file, read the exit code, state scope. Fixes that touch
-  SQL, sessions or coordination (fix 3) also need
-  `pytest tests/ -m testcontainer -n 0`.
+- Tests (maintainer ruling 2026-11-08, after fix 9): **per fix**, only the
+  scoped suites that import what changed, the new tests with their negative
+  controls, ruff check/format and mypy on touched files, and
+  `scripts.check_contracts`. **Per batch** (fixes 14+15+11+12, then the next
+  group), one run of the whole-tree gates `tests/unit/architecture/ -n 3`
+  and the keyless lint corpus diff. **Once before merge**,
+  `scripts/full-suite-gate.sh --execute --detach`, plus
+  `pytest tests/ -m testcontainer -n 0` on a Docker host for the SQL/session
+  fixes (3-T1, 10, 13). Run to a log file, read the exit code, state scope.
+  Fixes 1, 10, 6, 7 and 9 each ran the architecture gate individually
+  before this ruling.
 - Compare the keyless `elspeth-lints check --rules all --root src/elspeth`
   finding corpus before and after; never add aliases or padding to reduce it.
 - Composer invariants hold throughout: nothing authors pipeline structure
