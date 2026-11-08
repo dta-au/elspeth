@@ -243,12 +243,67 @@ def test_composer_session_cache_has_one_application_owner(tmp_path: Path, enable
     registry = app.state.composer_session_cache_registry
     assert app.state.composer_service._session_caches is registry
     assert registry.enabled is enabled
+    assert app.state.session_service._retire_composer_session == registry.retire_session
     key = SessionCacheKey("principal-a", "session-a")
     with registry.borrow(key) as first, registry.borrow(key) as second:
         assert first.cache is not None
         assert first.cache is second.cache
     registry.begin_shutdown()
     assert registry.snapshot().retained_sessions == 0
+
+
+@pytest.mark.asyncio
+async def test_cache_shutdown_waits_for_cancelled_request_actual_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer.analysis import ComposerAnalysis
+
+    app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+    registry = app.state.composer_session_cache_registry
+    entered, release, settled = threading.Event(), threading.Event(), threading.Event()
+    closing = asyncio.Event()
+    events: list[str] = []
+    begin, finish = registry.begin_shutdown, registry.finish_shutdown
+
+    def begin_shutdown() -> None:
+        events.append("begin")
+        begin()
+        closing.set()
+
+    async def finish_shutdown() -> None:
+        assert settled.is_set()
+        events.append("finish")
+        await finish()
+
+    def worker() -> None:
+        entered.set()
+        assert release.wait(15), "test must release actual worker"
+        settled.set()
+
+    monkeypatch.setattr(registry, "begin_shutdown", begin_shutdown)
+    monkeypatch.setattr(registry, "finish_shutdown", finish_shutdown)
+
+    async def serve() -> None:
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                with registry.borrow(SessionCacheKey("principal", "session")) as lease:
+                    job = asyncio.create_task(ComposerAnalysis(lease.cache).run_in_worker(worker))
+                    assert await asyncio.to_thread(entered.wait, 5)
+                    job.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await job
+                assert registry.snapshot().pins == 1
+
+    task = asyncio.create_task(serve())
+    try:
+        await asyncio.wait_for(closing.wait(), 10)
+        assert not task.done()
+        assert registry.snapshot().retained_sessions == 1
+        with registry.borrow(SessionCacheKey("other", "other")) as refused:
+            assert refused.cache is None
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 15)
+    assert events[0] == "begin" and "finish" in events
+    assert registry.snapshot().retained_sessions == registry.snapshot().pins == registry.snapshot().weight_bytes == 0
 
 
 def _ensure_test_user(conn: Connection, *, identity_id: str) -> None:

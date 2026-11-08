@@ -790,13 +790,11 @@ class ComposerServiceImpl:
             interpretation_surfacing=self._interpretation_surfacing,
             max_advisor_checkpoint_passes=settings.composer_advisor_checkpoint_max_passes,
         )
-        self._schema_disclosure = SchemaDisclosureTracker()
         self._planning_application = PlanningApplication(
             sessions_service=sessions_service,
             policy_context=self._policy_context,
             chargeable_admission=self._chargeable_admission,
             preflight=self._preflight,
-            schema_disclosure=self._schema_disclosure,
             settings=settings,
             availability=self._availability,
             planner_dialect=self._planner_dialect,
@@ -1475,6 +1473,7 @@ class ComposerServiceImpl:
         failed_turn: FailedTurnMetadata | None,
         provider_owner: ProviderInvocationOwner | None = None,
         turn_evidence: TurnEvidence | None = None,
+        schema_disclosure: SchemaDisclosureTracker | None = None,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
@@ -1505,6 +1504,7 @@ class ComposerServiceImpl:
             discovery_turns_used=discovery_turns_used,
             failed_turn=failed_turn,
             provider_owner=provider_owner,
+            schema_disclosure=schema_disclosure,
         )
         assistant_tool_calls = completion.tool_batch.calls
         self._enforce_tool_call_cap(
@@ -1658,7 +1658,7 @@ class ComposerServiceImpl:
             ),
             redaction_telemetry=self._redaction_telemetry,
             preflight=self._preflight,
-            schema_disclosure=self._schema_disclosure,
+            schema_disclosure=policy_catalog.schema_disclosure,
             advisor_checkpoint=self._advisor_checkpoint,
             provider_owner=provider_owner,
             advisor_max_calls_per_compose=self._settings.composer_advisor_max_calls_per_compose,
@@ -1735,6 +1735,7 @@ class ComposerServiceImpl:
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         analysis: ComposerAnalysis | None = None,
+        schema_disclosure: SchemaDisclosureTracker | None = None,
     ) -> _ClassifyOutcome:
         """Phase P5 of the compose loop — anti-anchor + turn accounting.
 
@@ -2214,6 +2215,7 @@ class ComposerServiceImpl:
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
                     provider_owner=provider_owner,
+                    schema_disclosure=schema_disclosure,
                 )
                 recovery_result = self._terminal_recovery_result(
                     completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
@@ -2594,6 +2596,7 @@ class ComposerServiceImpl:
             # before the provider call and passes this exact value to
             # persist_compose_turn_async as expected_current_state_id.
             call_model = await self._call_model_turn(
+                schema_disclosure=policy_catalog.schema_disclosure,
                 llm_messages=llm_messages,
                 tools=tools,
                 state=state,
@@ -3142,6 +3145,7 @@ class ComposerServiceImpl:
                 raise persist.effect_verification_failure
 
             classify = await self._classify_and_budget_turn(
+                schema_disclosure=policy_catalog.schema_disclosure,
                 analysis=policy_catalog.analysis,
                 dispatch=dispatch,
                 turn_evidence=turn_evidence,
@@ -3252,7 +3256,7 @@ class ComposerServiceImpl:
                 data_dir=self._data_dir,
                 plugin_snapshot=plugin_snapshot,
                 rendered_skill=self._composer_skill_text,
-                schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(session_id),
+                schemas_loaded=policy_catalog.schema_disclosure.schemas_loaded_for_session(session_id),
             )
         except OSError as exc:
             raise ComposerServiceError(f"Failed to load deployment skill ({type(exc).__name__})") from exc
@@ -3277,6 +3281,7 @@ class ComposerServiceImpl:
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
         provider_owner: ProviderInvocationOwner | None = None,
+        schema_disclosure: SchemaDisclosureTracker | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call the LLM with a per-call timeout derived from the deadline.
 
@@ -3331,17 +3336,21 @@ class ComposerServiceImpl:
                 )
             try:
                 if provider_custody is None:
-                    return await self._provider_gateway._call_llm_with_audit(
+                    completion = await self._provider_gateway._call_llm_with_audit(
                         messages, tools, timeout=remaining, recorder=recorder, credential_state=state
                     )
-                return await self._provider_gateway._call_llm_with_audit(
-                    messages,
-                    tools,
-                    timeout=remaining,
-                    recorder=recorder,
-                    provider_custody=provider_custody,
-                    credential_state=state,
-                )
+                else:
+                    completion = await self._provider_gateway._call_llm_with_audit(
+                        messages,
+                        tools,
+                        timeout=remaining,
+                        recorder=recorder,
+                        provider_custody=provider_custody,
+                        credential_state=state,
+                    )
+                if schema_disclosure is not None:
+                    schema_disclosure.confirm_delivery(frozenset(row["tool_call_id"] for row in messages if row["role"] == "tool"))
+                return completion
             except PromptGuardRefused as exc:
                 raise exc.with_evidence(
                     state=state,

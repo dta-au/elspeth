@@ -17,6 +17,7 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry, SessionCacheKey
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.library_authority import RepositoryLibraryAuthority
 from elspeth.web.sessions.models import identities_table, identity_roles_table, library_entries_table, sessions_table
@@ -337,17 +338,26 @@ def test_fork_archives_new_session_if_seed_raises_internal_error(
     actor.identity_id = "bob"
     before = client.get("/api/sessions").json()
     created: list[UUID] = []
+    registry = ComposerSessionCacheRegistry()
+    client.app.state.session_service._retire_composer_session = registry.retire_session
+    owners = []
 
     async def failing_seed(**kwargs: object) -> None:
         session = kwargs["session"]
         assert isinstance(session, SessionRecord)
         created.append(session.id)
+        with registry.borrow(SessionCacheKey("bob", str(session.id))) as lease:
+            assert lease.cache is not None
+            owners.append(lease.cache)
+            lease.cache.mark_schema_loaded("generation", "source", "csv")
         raise RuntimeError("seed failed after session creation")
 
     client.app.state.library_state_seeder = failing_seed
     with pytest.raises(RuntimeError, match="seed failed after session creation"):
         client.post(f"/api/library/{published['entry_id']}/fork")
     assert len(created) == 1
+    assert owners[0].schemas_loaded("generation") == frozenset()
+    assert registry.snapshot().retained_sessions == registry.snapshot().retirements == 0
     with pytest.raises(SessionNotFoundError):
         asyncio.run(client.app.state.session_service.get_session(created[0]))
     assert client.get("/api/sessions").json() == before

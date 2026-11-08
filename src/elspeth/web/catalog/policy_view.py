@@ -31,6 +31,7 @@ class PolicyCatalogView:
         analysis: ComposerAnalysis | None = None,
     ) -> None:
         from elspeth.web.composer.analysis import ComposerAnalysis
+        from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 
         self._full = full
         self.snapshot = snapshot
@@ -39,6 +40,7 @@ class PolicyCatalogView:
         self._full_items_cache: dict[PluginKind, list[PluginSummary]] = {}
         self._full_items_revision: str | None = None
         self._items_lock = RLock()
+        self.schema_disclosure = SchemaDisclosureTracker(self._analysis.cache, self._disclosure_revision)
 
     @classmethod
     def for_trained_operator(
@@ -52,6 +54,7 @@ class PolicyCatalogView:
         if not snapshot.is_trained_operator:
             raise ValueError("trained_operator_snapshot_required")
         from elspeth.web.composer.analysis import ComposerAnalysis
+        from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 
         view = cls.__new__(cls)
         view._full = full
@@ -61,7 +64,12 @@ class PolicyCatalogView:
         view._full_items_cache = {}
         view._full_items_revision = None
         view._items_lock = RLock()
+        view.schema_disclosure = SchemaDisclosureTracker(view._analysis.cache, view._disclosure_revision)
         return view
+
+    def _disclosure_revision(self) -> str | None:
+        revision = self.projection_revision
+        return f"{self.snapshot.snapshot_hash}:{revision}" if revision is not None else None
 
     @property
     def analysis(self) -> ComposerAnalysis:

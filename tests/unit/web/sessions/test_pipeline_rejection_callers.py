@@ -26,7 +26,6 @@ from elspeth.web.composer.composition_completion import CompositionCompletion
 from elspeth.web.composer.pipeline_commit import PipelineCommitError
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.planning_application import PlanningApplication
-from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -354,7 +353,6 @@ async def test_actual_planner_creation_cancel_retains_nonzero_child_rejection_sc
         policy_context=MagicMock(spec=PluginPolicyContextFactory),
         chargeable_admission=MagicMock(spec=ComposerChargeableAdmission),
         preflight=MagicMock(spec=ComposerPreflight),
-        schema_disclosure=SchemaDisclosureTracker(),
         settings=settings,
         availability=ComposerAvailability(True, "test-model", "test"),
         planner_dialect=ToolContractDialect.NONE,

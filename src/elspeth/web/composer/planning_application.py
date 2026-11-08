@@ -100,7 +100,6 @@ from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.required_controls import wire_required_controls
-from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import RuntimePreflight
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent, visible_response_gap
@@ -250,7 +249,6 @@ class PlanningApplication:
         policy_context: PluginPolicyContextFactory,
         chargeable_admission: ComposerChargeableAdmission,
         preflight: ComposerPreflight,
-        schema_disclosure: SchemaDisclosureTracker,
         settings: ComposerSettings,
         availability: ComposerAvailability,
         planner_dialect: ToolContractDialect,
@@ -273,7 +271,6 @@ class PlanningApplication:
         self._policy_context = policy_context
         self._chargeable_admission = chargeable_admission
         self._preflight = preflight
-        self._schema_disclosure = schema_disclosure
         self._settings = settings
         self._availability = availability
         self._planner_dialect = planner_dialect
@@ -1121,8 +1118,8 @@ class PlanningApplication:
                 current_state=state,
                 # Round-trippable planner projection (elspeth-c67fbbbd83).
                 provider_current_state=project_server_owned_option_metadata(state.to_dict()),
-                schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(session_id),
-                mark_schema_loaded=functools.partial(self._schema_disclosure.mark_plugin_schema_loaded, session_id),
+                schemas_loaded=policy_catalog.schema_disclosure.schemas_loaded_for_session(session_id),
+                mark_schema_loaded=functools.partial(policy_catalog.schema_disclosure.mark_plugin_schema_loaded, session_id),
                 policy_catalog=policy_catalog,
                 plugin_snapshot=plugin_snapshot,
                 originating_message=origin,

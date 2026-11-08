@@ -4582,7 +4582,7 @@ class TestDiscoveryCache:
                 _assert_checkpoint_reply(outer, outer_text, count=0)
                 assert [(call.tool_name, call.status) for call in outer.tool_invocations] == [(discovery_name, ComposerToolStatus.SUCCESS)]
                 if discovery_name == "get_plugin_schema":
-                    assert ("transform", "passthrough") in service._schema_disclosure.schemas_loaded_for_session(session_id)
+                    assert ("transform", "passthrough") in captured_views[-1].schema_disclosure.schemas_loaded_for_session(session_id)
                 assert captured_views
                 operation_view = captured_views[-1]
                 snapshot = operation_view.snapshot

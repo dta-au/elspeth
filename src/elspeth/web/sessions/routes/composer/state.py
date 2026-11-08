@@ -19,7 +19,9 @@ from elspeth.web.blobs.protocol import BlobNotFoundError, BlobServiceProtocol
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.compartments import compartment_ingress_record, compartment_marking_header
+from elspeth.web.composer.analysis import ComposerAnalysis
 from elspeth.web.composer.invariants import InvariantError
+from elspeth.web.composer.session_cache import SessionCacheKey
 from elspeth.web.composer.state import CompositionState, SourceSpec
 from elspeth.web.composer.yaml_generator import (
     PUBLIC_EXPORT_REBIND_GUIDANCE,
@@ -666,15 +668,17 @@ async def get_current_state(
     composition = _state_from_record(state) if state is not None else None
     if state is None:
         return None
-    response = _state_response(state, policy_catalog=catalog)
-    # Suggestions belong to this graph version, so reload recomputes the
-    # same Stage-1 advice used after composing.
     if composition is None:
         raise AuditIntegrityError("A decoded current graph lacks its composition")
-    validation = await run_sync_in_worker(composition.validate)
-    response.validation_warnings = _validation_entry_responses(validation.warnings)
-    response.validation_suggestions = _validation_entry_responses(validation.suggestions)
-    return response
+    with request.app.state.composer_session_cache_registry.borrow(SessionCacheKey(_snapshot.principal_scope, str(session.id))) as lease:
+        catalog = catalog.with_analysis(ComposerAnalysis(lease.cache))
+        response = _state_response(state, policy_catalog=catalog)
+        # Ownership, head and hydration remain live. Only raw graph advice is
+        # reusable; _state_response still computes current policy findings.
+        validation = await catalog.analysis.validate_raw_async(composition)
+        response.validation_warnings = _validation_entry_responses(validation.warnings)
+        response.validation_suggestions = _validation_entry_responses(validation.suggestions)
+        return response
 
 
 @router.get("/{session_id}/state/head", response_model=CompositionHeadResponse)

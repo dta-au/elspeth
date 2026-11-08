@@ -1690,6 +1690,10 @@ async def run_tool_batch(
                         ),
                     }
                 )
+                if tool_name == "get_plugin_schema" and cached_result.success:
+                    ctx.schema_disclosure.stage_plugin_schema(
+                        tool_call.id, session_id, str(arguments["plugin_type"]), str(arguments["name"])
+                    )
                 # Carry the current projection forward just as an uncached
                 # discovery does; a previous mutation refusal is not state.
                 last_validation = cached_result.validation
@@ -3324,18 +3328,15 @@ async def run_tool_batch(
         # ``composer_progress.schemas_loaded_this_session`` so
         # the model can compute its own schemas_gap without
         # re-introspecting plugins it has already seen. See
-        # ``SchemaDisclosureTracker.mark_plugin_schema_loaded`` and
+        # ``SchemaDisclosureTracker.stage_plugin_schema`` and
         # ``prompts.build_context_string``.
         #
-        # Lifted from the prior inline compose-loop body into the
-        # extracted ``_dispatch_tool_batch`` helper as part of the
-        # parallel decomposition (commit f918f4269). The RC5.2
-        # commit that introduced this tracker explicitly anticipated
-        # the lift in its message: "the single line that will need
-        # lift-and-shift into ``dispatch_tools`` when the parallel
-        # ``_compose_loop`` decomposition lands".
+        # Stage only operation-local evidence here. A successful subsequent
+        # physical provider round confirms the included tool-call identities;
+        # guard refusal, cancellation and omitted messages cannot claim delivery.
         if tool_name == "get_plugin_schema" and result.success:
-            ctx.schema_disclosure.mark_plugin_schema_loaded(
+            ctx.schema_disclosure.stage_plugin_schema(
+                tool_call.id,
                 session_id,
                 str(arguments["plugin_type"]),
                 str(arguments["name"]),

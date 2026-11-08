@@ -760,6 +760,7 @@ class SessionServiceImpl:
         chargeable_admission_policy: ChargeableAdmissionPolicy | None = None,
         quota_exceeded_recorder: Callable[[QuotaExceeded], None] = _refuse_unrecorded_quota_exceeded,
         approval_supersession_recorder: Callable[[ApprovalSupersession], None] = refuse_unrecorded_approval_supersession,
+        retire_composer_session: Callable[[str], contextlib.AbstractContextManager[object]] = lambda _: contextlib.nullcontext(),
     ) -> None:
         from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 
@@ -781,6 +782,7 @@ class SessionServiceImpl:
         )
         self._quota_exceeded_recorder = quota_exceeded_recorder
         self._approval_supersession_recorder = approval_supersession_recorder
+        self._retire_composer_session = retire_composer_session
         if owner_instance_id is not None and (type(owner_instance_id) is not str or not owner_instance_id.strip()):
             raise ValueError("owner_instance_id must be a nonblank exact string")
         if type(session_operation_lease_seconds) is not int or not 1 <= session_operation_lease_seconds <= 3600:
@@ -2597,6 +2599,14 @@ class SessionServiceImpl:
         return cast(int, await self._run_sync(_sync))
 
     async def archive_session(self, session_id: UUID) -> None:
+        """Retire local advice for the entire cancellation-safe archive attempt."""
+        # Reserve even a cold session, before acquisition can refuse or block.
+        # The existing lease/phase owners join protected workers before this
+        # scope exits, including repeated cancellation and cleanup failure.
+        with self._retire_composer_session(str(session_id)):
+            await self._archive_session_attempt(session_id)
+
+    async def _archive_session_attempt(self, session_id: UUID) -> None:
         """Archive through one exact DB fence and durable filesystem obligation."""
         sid = str(session_id)
 

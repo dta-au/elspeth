@@ -73,6 +73,7 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.session_cache import ComposerSessionCacheRegistry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
@@ -899,6 +900,7 @@ def _make_app(
 
     # Set up app state
     app.state.session_service = service
+    app.state.composer_session_cache_registry = ComposerSessionCacheRegistry()
     # Phase 6A B3 — YAML export route's audit-write reaches into
     # ``app.state.session_engine`` for the composer_completion_events insert.
     app.state.session_engine = engine

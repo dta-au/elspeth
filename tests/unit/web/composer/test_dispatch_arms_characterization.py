@@ -778,11 +778,12 @@ async def test_arm_advisor_arg_error_records_schema_shape_arg_error(
 async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
     fake_composer_service: ComposerServiceImpl,
     result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Arm #17: successful get_plugin_schema records (type, name) in _schemas_loaded.
+    """Arm #17: delivered get_plugin_schema records bounded operation guidance.
 
     tool_batch.py get_plugin_schema success branch.  After a successful ``get_plugin_schema`` dispatch,
-    the loop calls ``schema_disclosure.mark_plugin_schema_loaded(session_id, plugin_type, plugin_name)``
+    the subsequent successful model round confirms the staged tool result
     so the LLM tool-list builder can surface schema-loaded state to the model.
 
     ``fake_composer_service`` uses a mock catalog whose ``get_schema`` returns a
@@ -796,8 +797,18 @@ async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
 
     Pinning:
     - exactly 1 SUCCESS invocation
-    - ``("source", "csv") in fake_composer_service._schema_disclosure.schemas_loaded_for_session(result_session_id)``
+    - ``("source", "csv")`` appears in the operation view's disclosure guidance
     """
+    from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
+
+    observed: list[SchemaDisclosureTracker] = []
+    confirm = SchemaDisclosureTracker.confirm_delivery
+
+    def observe_delivery(tracker: SchemaDisclosureTracker, tool_ids: frozenset[str]) -> None:
+        confirm(tracker, tool_ids)
+        observed.append(tracker)
+
+    monkeypatch.setattr(SchemaDisclosureTracker, "confirm_delivery", observe_delivery)
     first_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(
@@ -825,7 +836,7 @@ async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
         f"SUCCESS not in recorded statuses {statuses!r}; get_plugin_schema with valid args "
         "and a mock catalog that always returns a schema should record finish_success."
     )
-    schemas_loaded = fake_composer_service._schema_disclosure.schemas_loaded_for_session(result_session_id)
+    schemas_loaded = observed[-1].schemas_loaded_for_session(result_session_id)
     assert ("source", "csv") in schemas_loaded, (
         f"('source', 'csv') not in schemas_loaded_for_session({result_session_id!r}); "
         f"got {schemas_loaded!r}.  mark_plugin_schema_loaded must be called after a "

@@ -1197,6 +1197,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             shutdown_failures.append(supervision_failure)
     finally:
         app.state.execution_lease_release_registry.seal()
+        app.state.composer_session_cache_registry.begin_shutdown()
 
         async def observe_shutdown(action: Callable[[], Awaitable[object]]) -> None:
             try:
@@ -1234,6 +1235,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         from elspeth.web.async_workers import shutdown_async_workers
 
         await observe_shutdown(shutdown_async_workers)
+        await observe_shutdown(app.state.composer_session_cache_registry.finish_shutdown)
     failures = ([primary_failure] if primary_failure is not None else []) + shutdown_failures
     if len(failures) == 1:
         raise failures[0]
@@ -2243,6 +2245,7 @@ def _create_app(
         ),
         data_dir=settings.data_dir,
         telemetry=sessions_telemetry,
+        retire_composer_session=app.state.composer_session_cache_registry.retire_session,
         log=structlog.get_logger("sessions"),
         plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
         operator_profile_registry=app.state.operator_profile_registry,
@@ -2315,7 +2318,6 @@ def _create_app(
     )
     app.state.interpretation_surfacing = app.state.composer_service._interpretation_surfacing
     app.state.planning_application = app.state.composer_service._planning_application
-    app.state.schema_disclosure = app.state.composer_service._schema_disclosure
     app.state.composer_availability = app.state.composer_service.get_availability()
     composer_async_authority = ComposerAsyncOperationAuthority(
         session_engine,

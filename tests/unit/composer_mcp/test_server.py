@@ -16,7 +16,7 @@ from elspeth.composer_mcp.session import SessionCheckout, SessionManager
 from elspeth.contracts.composer_audit import ComposerToolRecorder
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.catalog.schemas import PluginSummary
+from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -190,6 +190,9 @@ def _connection_valid_field_mapper_state_without_edges() -> CompositionState:
 
 def _mock_catalog() -> CatalogService:
     catalog = MagicMock(spec=CatalogService)
+    catalog.get_schema.side_effect = lambda kind, name: PluginSchemaInfo(
+        name=name, plugin_type=kind, description="Test plugin", json_schema={}, knob_schema={"fields": []}
+    )
     catalog.list_sources.return_value = [
         PluginSummary(name="csv", description="CSV source", plugin_type="source", config_fields=[]),
     ]
